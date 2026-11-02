@@ -390,3 +390,56 @@ test('Engine resolves target branch conflicts then invalidates checks and review
   assert.match(await read(path.join(result.cwd, 'src/value.mjs')), /remoteAddition = 'kept'/);
   assert.equal(git(fx.project, 'rev-parse', 'HEAD'), fx.base);
 });
+
+test('Engine keeps the per run research ceiling when two failures request research concurrently', async t => {
+  const fx = await fixture(t, { testScript: 'process.exit(0);\n' });
+  const services = fakeServices();
+  services.researcher = async ({ budget }) => {
+    await new Promise(resolve => setImmediate(resolve));
+    return { items: [], requests: budget, errors: [], cache: [] };
+  };
+  const engine = new Engine({ store: fx.openStore(), ...services });
+  const run = await engine.create('Concurrent research fixture', { project: fx.project });
+  run.research = { items: [], requests: 1, errors: [], cache: [] };
+  engine.save(run);
+  await Promise.all([engine.moreResearch(run, 'first failed node'), engine.moreResearch(run, 'second failed node')]);
+  assert.equal(run.research.requests, run.config.researchBudget);
+  assert.equal(engine.store.getRun(run.id).research.requests, run.config.researchBudget);
+});
+
+test('Engine reruns checks and independent review after repairing a confirmed review finding', async t => {
+  const fx = await fixture(t, { config: { repairRounds: 2 }, testScript: "import assert from 'node:assert/strict'; import {value} from './src/value.mjs'; assert.equal(value, 2);\n" });
+  const plan = { summary: 'Set value two.', tasks: [node('feature', 'developer', ['src/value.mjs'])] };
+  let repairs = 0, firstReviewedHead;
+  const services = fakeServices({ plan, onWorker: async request => {
+    if (request.role === 'developer') await writeFile(path.join(request.cwd, 'src/value.mjs'), 'export const value = 2;\n');
+    else {
+      assert.match(request.prompt, /Repair confirmed failures/);
+      repairs++;
+      await writeFile(path.join(request.cwd, 'src/value.mjs'), 'export const value = 2;\nexport const reviewFix = true;\n');
+    }
+    return { sessionId: `review-repair-${services.calls.worker.length}`, output: { summary: 'implemented', checks: [], complete: true } };
+  }, onReview: async (request, calls) => {
+    const head = git(request.cwd, 'rev-parse', 'HEAD');
+    if (calls.review.length === 1) {
+      firstReviewedHead = head;
+      return { sessionId: 'review-finding', output: { passed: false, findings: [{ file: 'src/value.mjs', severity: 'major', problem: 'Required reviewFix marker is absent', fix: 'Add reviewFix=true export' }] } };
+    }
+    assert.notEqual(head, firstReviewedHead);
+    assert.match(request.prompt, /"headSha":"[a-f0-9]+"/);
+    assert.match(await read(path.join(request.cwd, 'src/value.mjs')), /reviewFix = true/);
+    return { sessionId: 'review-after-repair', output: { passed: true, findings: [] } };
+  } });
+  const store = fx.openStore(), engine = new Engine({ store, ...services });
+  const run = await engine.create('Implement value two and the reviewFix marker', { project: fx.project });
+  const result = await engine.run(run.id);
+  assert.equal(result.state, 'succeeded', result.error?.message);
+  assert.equal(repairs, 1);
+  assert.equal(services.calls.review.length, 2);
+  assert.equal(result.review.sessionId, 'review-after-repair');
+  assert.equal(result.checks.headSha, result.headSha);
+  assert.equal(result.review.headSha, result.headSha);
+  assert.notEqual(result.headSha, firstReviewedHead);
+  assert.equal(store.events(run.id).filter(event => event.type === 'check_started').length, 2);
+  assert.equal(await read(path.join(fx.project, 'src/value.mjs')), 'export const value = 0;\n');
+});

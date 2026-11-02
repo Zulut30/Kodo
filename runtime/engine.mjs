@@ -200,7 +200,11 @@ export class Engine {
   async verify(run, signal) {
     for (let attempt = 0; attempt < run.config.repairRounds; attempt++) {
       let checkError;
-      try { await this.checks(run, signal); } catch (error) { checkError = error; }
+      try { await this.checks(run, signal); } catch (error) {
+        if (signal?.aborted || this.store.getRun(run.id).cancelRequested) throw Object.assign(new Error('Запуск отменён'), { code: 'cancelled' });
+        if (['cancelled','quota','auth'].includes(error.code)) throw error;
+        checkError = error;
+      }
       const headSha = await git(run.cwd, ['rev-parse', 'HEAD']);
       let review;
       if (!checkError) {
@@ -255,7 +259,15 @@ export class Engine {
             await git(run.cwd, ['fetch', 'origin', run.config.baseBranch]);
             const base = await git(run.cwd, ['rev-parse', `origin/${run.config.baseBranch}`]);
             const merged = await execute('git', ['merge', '--no-edit', `origin/${run.config.baseBranch}`], { cwd: run.cwd, allowFailure: true });
-            if (merged.code) throw Object.assign(new Error('Конфликт с целевой веткой: требуется перепланирование интеграции'), { code: 'blocked' });
+            if (merged.code) {
+              const conflicts = (await git(run.cwd, ['diff', '--name-only', '--diff-filter=U'])).split('\n').filter(Boolean);
+              if (!conflicts.length) throw new Error(`Не удалось обновить целевую ветку: ${merged.stderr}`);
+              await this.session(run, { client: run.client, model: run.config.primaryModel || defaultModel(run.client), cwd: run.cwd, schema: resultSchema,
+                prompt: `Resolve target branch merge conflicts preserving BOTH the task implementation and incoming upstream changes. Conflicting paths: ${JSON.stringify(conflicts)}. Task: ${run.task}. Do not commit, push, abort the merge, or discard either side. Return structured completion JSON.` }, signal);
+              await git(run.cwd, ['add', '-A']);
+              await execute('git', ['diff', '--cached', '--check'], { cwd: run.cwd });
+              await commitChanges(run.cwd, 'Kodo reconcile target branch');
+            }
             run.baseSha = base; this.save(run); await this.verify(run, signal);
           }
         }
@@ -268,7 +280,7 @@ export class Engine {
       run.state = 'succeeded'; run.error = null; this.save(run); this.log(run, 'succeeded', { headSha: run.headSha, pr: run.delivery?.pr, release: run.release });
       await writeFile(path.join(run.artifacts, 'receipt.json'), JSON.stringify(redact(run, this.secrets), null, 2)); return run;
     } catch (error) {
-      run.state = error.code === 'quota' ? 'waiting_limits' : error.code === 'cancelled' ? 'cancelled' : 'blocked';
+      run.state = error.code === 'quota' ? 'waiting_limits' : error.code === 'cancelled' || signal?.aborted || this.store.getRun(run.id).cancelRequested ? 'cancelled' : 'blocked';
       run.error = { code: error.code || 'error', message: redact(error.message, this.secrets), ...(error.retryAt ? { retryAt: error.retryAt } : {}) };
       this.save(run); this.log(run, run.state, run.error); return run;
     } finally { clearInterval(heartbeat); this.store.releaseLease(token); }

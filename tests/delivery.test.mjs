@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtemp, mkdir, readFile, writeFile, copyFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, writeFile, copyFile, readdir, rm } from 'node:fs/promises';
+import { constants } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import Ajv from 'ajv';
@@ -83,7 +84,11 @@ async function fixture(t, { brokenCli = false } = {}) {
       state.release = { tag, filename: path.basename(artifact), url: `https://github.com/test/kodo/releases/tag/${tag}` };
       return output(state.release.url);
     }
-    if (args[0] === 'release' && args[1] === 'view') return output({ tagName: state.release.tag, url: state.release.url, assets: [{ name: state.release.filename }, { name: 'SHA256SUMS' }] });
+    if (args[0] === 'release' && args[1] === 'view') return output({ tagName: state.release.tag, url: state.release.url, assets: (await readdir(assets)).map(name => ({ name })) });
+    if (args[0] === 'release' && args[1] === 'upload') {
+      assert.ok(!args.includes('--clobber'));
+      await copyFile(args[3], path.join(assets, path.basename(args[3])), constants.COPYFILE_EXCL); return output('');
+    }
     if (args[0] === 'release' && args[1] === 'download') {
       const filename = args[args.indexOf('--pattern') + 1], directory = args[args.indexOf('--dir') + 1];
       await copyFile(path.join(assets, filename), path.join(directory, filename)); return output('');
@@ -170,6 +175,10 @@ test('Release packages exact merged commit installs artifact and reconciles with
   const resumed = await releasePackage({ ...ctx, mergeCommit: delivered.mergeCommit });
   assert.equal(resumed.sha256, release.sha256); assert.equal(resumed.url, release.url);
   assert.equal(ctx.state.publishes, 1); assert.equal(ctx.leases.size, 0);
+  await writeFile(path.join(ctx.project, 'later.txt'), 'newer work\n');
+  await ctx.git('add', 'later.txt'); await ctx.git('commit', '-m', 'later work'); await ctx.git('push', 'origin', 'HEAD:main');
+  assert.equal((await releasePackage({ ...ctx, mergeCommit: delivered.mergeCommit })).sha256, release.sha256);
+  assert.equal(ctx.state.publishes, 1);
 });
 
 test('Release never publishes an old source commit or a package failing installed smoke', async t => {
@@ -201,7 +210,11 @@ test('Published release reconciliation checks saved asset bytes and refuses a ch
   const ctx = await fixture(t);
   const delivered = await deliver(ctx);
   const release = await releasePackage({ ...ctx, mergeCommit: delivered.mergeCommit });
+  const original = await readFile(path.join(ctx.assets, release.artifact));
   await writeFile(path.join(ctx.assets, release.artifact), 'replaced artifact');
+  await assert.rejects(releasePackage({ ...ctx, mergeCommit: delivered.mergeCommit }), { code: 'release_conflict' });
+  await writeFile(path.join(ctx.assets, release.artifact), original);
+  await writeFile(path.join(ctx.assets, 'SHA256SUMS'), 'invalid checksum\n');
   await assert.rejects(releasePackage({ ...ctx, mergeCommit: delivered.mergeCommit }), { code: 'release_conflict' });
   assert.equal(ctx.state.publishes, 1); assert.equal(ctx.leases.size, 0);
 });
@@ -254,4 +267,24 @@ test('Release version preparation bumps past current and latest after target adv
   ctx.state.release.tag = 'v0.2.1'; ctx.run.baseSha = ctx.run.headSha;
   const next = await prepareReleaseVersion(ctx);
   assert.equal(next.version, '0.2.2'); assert.equal(ctx.leases.size, 0);
+});
+
+test('Release reconciliation uploads absent assets without replacing existing ones', async t => {
+  const ctx = await fixture(t);
+  const delivered = await deliver(ctx);
+  const release = await releasePackage({ ...ctx, mergeCommit: delivered.mergeCommit });
+  delete ctx.run.delivery.release; // Simulate crash after publication, before saving its receipt.
+  await rm(path.join(ctx.assets, 'SHA256SUMS'));
+  const resumed = await releasePackage({ ...ctx, mergeCommit: delivered.mergeCommit });
+  assert.equal(resumed.sha256, release.sha256); assert.equal(ctx.state.publishes, 1);
+  assert.equal((await readFile(path.join(ctx.assets, 'SHA256SUMS'), 'utf8')).trim(), `${release.sha256}  ${release.artifact}`);
+  assert.equal(ctx.leases.size, 0);
+});
+
+test('Release refuses a dangling tag pointing to a different commit', async t => {
+  const ctx = await fixture(t);
+  await ctx.git('push', 'origin', `${ctx.run.headSha}:main`);
+  await ctx.git('tag', 'v0.2.0', ctx.run.baseSha); await ctx.git('push', 'origin', 'v0.2.0');
+  await assert.rejects(releasePackage({ ...ctx, mergeCommit: ctx.run.headSha }), { code: 'release_conflict' });
+  assert.equal(ctx.state.publishes, 0); assert.equal(ctx.leases.size, 0);
 });

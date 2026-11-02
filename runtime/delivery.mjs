@@ -336,6 +336,20 @@ export async function prepareReleaseVersion(options) {
   } finally { await releaseOwnedLease(ctx, lease); }
 }
 
+async function verifyPublishedArtifact(ctx, { tag, commit, artifact, sha256: checksum }, directory) {
+  if (!/^v\d+\.\d+\.\d+$/.test(tag ?? '') || path.basename(artifact ?? '') !== artifact || !/^[a-f0-9]{64}$/.test(checksum ?? '')) throw fail('release_conflict', 'Release receipt is invalid');
+  await ctx.command('git', ['fetch', 'origin', '--tags']);
+  const actualCommit = (await ctx.command('git', ['rev-parse', `refs/tags/${tag}^{commit}`])).trim();
+  if (actualCommit !== commit) throw fail('release_conflict', 'Published tag points to a different commit');
+  const info = parse(await ctx.command('gh', ['release', 'view', tag, '--repo', ctx.repository, '--json', 'url,tagName,assets']), 'published release');
+  if (info.tagName !== tag || !info.assets?.some(asset => asset.name === artifact) || !info.assets?.some(asset => asset.name === 'SHA256SUMS')) throw fail('release_conflict', 'Published release has incomplete assets');
+  const downloaded = path.join(directory, `verify-${randomUUID()}`); await mkdir(downloaded);
+  for (const filename of [artifact, 'SHA256SUMS']) await ctx.command('gh', ['release', 'download', tag, '--repo', ctx.repository, '--pattern', filename, '--dir', downloaded]);
+  if (sha256(await readFile(path.join(downloaded, artifact))) !== checksum) throw fail('release_conflict', 'Published package differs from its release receipt');
+  if ((await readFile(path.join(downloaded, 'SHA256SUMS'), 'utf8')).trim() !== `${checksum}  ${artifact}`) throw fail('release_conflict', 'Published checksum file differs from its release receipt');
+  return info;
+}
+
 /**
  * Publish an immutable package for an exact merged SHA. The receipt's tag URL
  * and artifact URL are authoritative. Kodo v1 never changes GitHub's mutable
@@ -352,12 +366,7 @@ export async function releasePackage(options) {
     directory = await mkdtemp(path.join(os.tmpdir(), 'kodo-release-'));
     const savedReceipt = ctx.run.delivery?.release;
     if (savedReceipt?.published === true && savedReceipt.commit === candidate) {
-      const info = parse(await ctx.command('gh', ['release', 'view', savedReceipt.tag, '--repo', ctx.repository, '--json', 'url,tagName,assets']), 'saved release');
-      if (info.tagName !== savedReceipt.tag || !info.assets?.some(asset => asset.name === savedReceipt.artifact) || !info.assets?.some(asset => asset.name === 'SHA256SUMS')) throw fail('release_conflict', 'Saved release no longer has the expected assets');
-      if (path.basename(savedReceipt.artifact) !== savedReceipt.artifact || !/^[a-f0-9]{64}$/.test(savedReceipt.sha256)) throw fail('release_conflict', 'Saved release receipt is invalid');
-      const downloaded = path.join(directory, 'downloaded'); await mkdir(downloaded);
-      await ctx.command('gh', ['release', 'download', savedReceipt.tag, '--repo', ctx.repository, '--pattern', savedReceipt.artifact, '--dir', downloaded]);
-      if (sha256(await readFile(path.join(downloaded, savedReceipt.artifact))) !== savedReceipt.sha256) throw fail('release_conflict', 'Published package differs from the saved receipt');
+      const info = await verifyPublishedArtifact(ctx, savedReceipt, directory);
       return { ...savedReceipt, url: info.url };
     }
     source = path.join(directory, 'source');
@@ -372,6 +381,8 @@ export async function releasePackage(options) {
     const remoteHead = await fetchBase(ctx);
     // Reconciliation of this exact release remains valid after main advances.
     const tag = `v${version}`;
+    const taggedCommit = (await ctx.command('git', ['rev-parse', '--verify', `refs/tags/${tag}^{commit}`], { allowFailure: true })).trim();
+    if (taggedCommit && taggedCommit !== candidate) throw fail('release_conflict', 'The proposed release tag already points to another commit');
     const existing = latest?.tagName === tag && latestSha === candidate;
     if (!existing) assertFreshRelease({ candidateSha: candidate, remoteHead, latestSha, latestVersion: latest?.tagName, version });
     if (Object.keys(manifest.dependencies ?? {}).length || Object.keys(manifest.devDependencies ?? {}).length) {
@@ -392,10 +403,10 @@ export async function releasePackage(options) {
     let url;
     if (existing) {
       const info = parse(await ctx.command('gh', ['release', 'view', tag, '--repo', ctx.repository, '--json', 'url,tagName,assets']), 'existing release');
-      if (!info.assets?.some(asset => asset.name === filename) || !info.assets?.some(asset => asset.name === 'SHA256SUMS')) throw fail('release_conflict', 'Existing release has incomplete or different assets');
-      const downloaded = path.join(directory, 'downloaded'); await mkdir(downloaded);
-      await ctx.command('gh', ['release', 'download', tag, '--repo', ctx.repository, '--pattern', filename, '--dir', downloaded]);
-      if (sha256(await readFile(path.join(downloaded, filename))) !== checksum) throw fail('release_conflict', 'Existing release package checksum differs; refusing to overwrite');
+      // A process can die after creating the release but before uploading every
+      // asset. Upload only absent names; never replace an existing asset.
+      if (!info.assets?.some(asset => asset.name === filename)) await ctx.command('gh', ['release', 'upload', tag, packed.filename, '--repo', ctx.repository]);
+      if (!info.assets?.some(asset => asset.name === 'SHA256SUMS')) await ctx.command('gh', ['release', 'upload', tag, checksumFile, '--repo', ctx.repository]);
       url = info.url;
     } else {
       assertFreshRelease({ candidateSha: candidate, remoteHead: await fetchBase(ctx), latestSha, latestVersion: latest?.tagName, version });
@@ -405,6 +416,8 @@ export async function releasePackage(options) {
       await writeFile(notes, `Kodo ${version}\n\n${ctx.run.task}\n\nCommit: ${candidate}\nRun: ${ctx.run.id}\n\nSHA-256: ${checksum}\n\nPackage installation and CLI smoke checks passed on ${process.platform}, Node.js ${process.version}.\n`);
       url = await ctx.command('gh', ['release', 'create', tag, packed.filename, checksumFile, '--repo', ctx.repository, '--target', candidate, '--title', `Kodo ${version}`, '--notes-file', notes, '--latest=false']);
     }
+    const published = await verifyPublishedArtifact(ctx, { tag, commit: candidate, artifact: filename, sha256: checksum }, directory);
+    url = published.url;
     const receipt = { version, tag, commit: candidate, url, artifact: filename, artifactUrl: `https://github.com/${ctx.repository}/releases/download/${tag}/${filename}`, sha256: checksum, smoke, published: true };
     await ctx.save({ delivery: { ...(ctx.run.delivery ?? {}), mergeCommit: candidate, release: receipt } });
     await ctx.event('delivery.released', receipt);
