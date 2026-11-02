@@ -2,6 +2,7 @@ import path from 'node:path';
 import { readConfig, initConfig } from './config.mjs';
 import { loadSecrets, redact } from './security.mjs';
 import { Store } from './store.mjs';
+import { buildAuditReport, formatAuditReport } from './audit.mjs';
 import { doctorProviders } from './providers.mjs';
 import { openEngine } from './engine.mjs';
 import { migrate } from './migration.mjs';
@@ -10,6 +11,19 @@ import { loadCatalog } from '../cli/catalog.mjs';
 import { planInstallation, applyInstallation } from '../cli/installer.mjs';
 
 export async function runtimeCli(command, args) {
+  // Audit only reads saved state. Keep it before credentials, project config,
+  // provider checks and engine startup (including lease/worktree handling).
+  if (command === 'audit') {
+    if (args.length < 1 || args.length > 2 || typeof args[0] !== 'string' || !args[0].trim() || args[0].startsWith('-') || args.length === 2 && args[1] !== '--json') {
+      throw new Error('Использование: kodo audit RUN_ID [--json]');
+    }
+    const store = new Store();
+    try {
+      const report = buildAuditReport(store.getRun(args[0]));
+      console.log(args[1] === '--json' ? JSON.stringify(report) : formatAuditReport(report));
+    } finally { store.close(); }
+    return;
+  }
   const options = { positional: [] };
   const flags = new Set(['--json', '--live', '--prepare', '--retry-failed']);
   const values = new Set(['--project', '--client', '--model', '--providers', '--plan', '--delivery', '--target']);
