@@ -1,0 +1,36 @@
+{
+  "name": "@zulut30/kodo",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Project-scoped skills, workflows and roles for Codex, Claude Code and OpenCode",
+  "type": "module",
+  "bin": {
+    "kodo": "cli/index.mjs"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "start": "node cli/index.mjs",
+    "validate": "node cli/index.mjs validate",
+    "test": "node --test",
+    "check": "npm run validate && npm test"
+  },
+  "files": [
+    "cli",
+    "adapters",
+    "runtime",
+    "schemas",
+    "skills",
+    "agents",
+    "pipelines",
+    "mcp",
+    "presets",
+    "docs",
+    "registry.json",
+    "README.md"
+  ],
+  "dependencies": {
+    "ajv": "^8.17.1"
+  }
+}

@@ -1,0 +1,4 @@
+[mcp_servers.kodo_browser]
+command = "npx"
+args = ["-y", "@playwright/mcp@latest", "--isolated"]
+enabled = false

@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "repository": "Zulut30/Kodo",
+  "baseBranch": "main",
+  "client": "codex",
+  "primaryModel": "gpt-6.1-sol",
+  "models": {
+    "codex": ["gpt-6.1-sol", "gpt-6-astra", "gpt-6.1-terra"],
+    "claude-code": ["opus", "sonnet"]
+  },
+  "concurrency": 2,
+  "repairRounds": 3,
+  "researchBudget": 40,
+  "commands": {
+    "test": [{ "command": "npm", "args": ["run", "check"] }],
+    "build": [],
+    "deploy": [],
+    "smoke": []
+  },
+  "checks": ["check (ubuntu-latest, 24)", "check (windows-latest, 24)"],
+  "delivery": { "enabled": true, "release": true, "firstVersion": "0.2.0" }
+}

@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "kodo_database": {
+      "type": "http",
+      "url": "https://mcp.supabase.com/mcp?project_ref=REPLACE_WITH_PROJECT_REF&read_only=true&features=database,docs"
+    }
+  }
+}

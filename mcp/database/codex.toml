@@ -1,0 +1,3 @@
+[mcp_servers.kodo_database]
+url = "https://mcp.supabase.com/mcp?project_ref=REPLACE_WITH_PROJECT_REF&read_only=true&features=database,docs"
+enabled = false

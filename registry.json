@@ -1,0 +1,212 @@
+{
+  "schemaVersion": 1,
+  "version": "0.2.0",
+  "components": [
+    {
+      "id": "skills/code-review",
+      "type": "skill",
+      "version": "0.2.0",
+      "description": "Проверка изменений кода с доказуемыми замечаниями",
+      "entry": "SKILL.md",
+      "requires": []
+    },
+    {
+      "id": "skills/ui-audit",
+      "type": "skill",
+      "version": "0.2.0",
+      "description": "Аудит интерфейса и пользовательского сценария",
+      "entry": "SKILL.md",
+      "requires": []
+    },
+    {
+      "id": "skills/bug-hunting",
+      "type": "skill",
+      "version": "0.2.0",
+      "description": "Воспроизведение ошибки и поиск первопричины",
+      "entry": "SKILL.md",
+      "requires": []
+    },
+    {
+      "id": "skills/seo-audit",
+      "type": "skill",
+      "version": "0.2.0",
+      "description": "Технический SEO-аудит с разделением фактов и гипотез",
+      "entry": "SKILL.md",
+      "requires": []
+    },
+    {
+      "id": "agents/architect",
+      "type": "agent",
+      "version": "0.2.0",
+      "description": "Проектирование границ, контрактов и плана изменений",
+      "entry": "AGENT.md",
+      "requires": []
+    },
+    {
+      "id": "agents/developer",
+      "type": "agent",
+      "version": "0.2.0",
+      "description": "Реализация согласованного поведения в коде",
+      "entry": "AGENT.md",
+      "requires": []
+    },
+    {
+      "id": "agents/designer",
+      "type": "agent",
+      "version": "0.2.0",
+      "description": "Проработка пользовательских сценариев и состояний UI",
+      "entry": "AGENT.md",
+      "requires": []
+    },
+    {
+      "id": "agents/qa-engineer",
+      "type": "agent",
+      "version": "0.2.0",
+      "description": "Проверка требований и регрессий на наблюдаемых результатах",
+      "entry": "AGENT.md",
+      "requires": []
+    },
+    {
+      "id": "pipelines/build-feature",
+      "type": "pipeline",
+      "version": "0.2.0",
+      "description": "Реализация функции от требований до проверки",
+      "entry": "pipeline.json",
+      "requires": [
+        "agents/architect",
+        "agents/developer",
+        "agents/qa-engineer",
+        "skills/code-review"
+      ]
+    },
+    {
+      "id": "pipelines/fix-bug",
+      "type": "pipeline",
+      "version": "0.2.0",
+      "description": "Исправление воспроизводимого дефекта",
+      "entry": "pipeline.json",
+      "requires": [
+        "agents/developer",
+        "agents/qa-engineer",
+        "skills/bug-hunting",
+        "skills/code-review"
+      ]
+    },
+    {
+      "id": "pipelines/release-app",
+      "type": "pipeline",
+      "version": "0.2.0",
+      "description": "Подготовка проверяемого релизного артефакта",
+      "entry": "pipeline.json",
+      "requires": [
+        "agents/developer",
+        "agents/qa-engineer",
+        "skills/code-review"
+      ]
+    },
+    {
+      "id": "pipelines/build-website",
+      "type": "pipeline",
+      "version": "0.2.0",
+      "description": "Создание сайта с проверкой UI и SEO",
+      "entry": "pipeline.json",
+      "requires": [
+        "agents/architect",
+        "agents/developer",
+        "agents/designer",
+        "agents/qa-engineer",
+        "skills/ui-audit",
+        "skills/seo-audit",
+        "skills/code-review"
+      ]
+    },
+    {
+      "id": "mcp/github",
+      "type": "mcp",
+      "version": "0.2.0",
+      "description": "Шаблоны GitHub MCP для трёх клиентов",
+      "entry": "README.md",
+      "requires": []
+    },
+    {
+      "id": "mcp/browser",
+      "type": "mcp",
+      "version": "0.2.0",
+      "description": "Шаблоны Playwright MCP с изолированным профилем",
+      "entry": "README.md",
+      "requires": []
+    },
+    {
+      "id": "mcp/database",
+      "type": "mcp",
+      "version": "0.2.0",
+      "description": "Шаблоны Supabase MCP с ограничением на один проект",
+      "entry": "README.md",
+      "requires": []
+    },
+    {
+      "id": "presets/nextjs",
+      "type": "preset",
+      "version": "0.2.0",
+      "description": "Комплект для Next.js-проекта",
+      "entry": "PRESET.md",
+      "requires": [
+        "pipelines/build-feature",
+        "pipelines/fix-bug",
+        "pipelines/build-website",
+        "pipelines/release-app",
+        "mcp/github",
+        "mcp/browser",
+        "skills/kodo-build-feature"
+      ]
+    },
+    {
+      "id": "presets/dotnet",
+      "type": "preset",
+      "version": "0.2.0",
+      "description": "Комплект для .NET-приложения",
+      "entry": "PRESET.md",
+      "requires": [
+        "pipelines/build-feature",
+        "pipelines/fix-bug",
+        "pipelines/release-app",
+        "mcp/github",
+        "skills/kodo-build-feature"
+      ]
+    },
+    {
+      "id": "presets/wordpress",
+      "type": "preset",
+      "version": "0.2.0",
+      "description": "Комплект для WordPress-сайта или плагина",
+      "entry": "PRESET.md",
+      "requires": [
+        "pipelines/build-website",
+        "pipelines/fix-bug",
+        "pipelines/release-app",
+        "mcp/github",
+        "mcp/browser",
+        "skills/kodo-build-feature"
+      ]
+    },
+    {
+      "id": "agents/documenter",
+      "type": "agent",
+      "version": "0.2.0",
+      "description": "Документирование реализованного поведения и команд проекта",
+      "entry": "AGENT.md",
+      "requires": []
+    },
+    {
+      "id": "skills/kodo-build-feature",
+      "type": "skill",
+      "version": "0.2.0",
+      "description": "Выполнение задачи через движок Kodo с анализом планом агентами проверками и доставкой",
+      "entry": "SKILL.md",
+      "requires": [
+        "agents/documenter",
+        "pipelines/build-feature"
+      ]
+    }
+  ]
+}

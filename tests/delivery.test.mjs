@@ -1,0 +1,257 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { mkdtemp, mkdir, readFile, writeFile, copyFile, rm } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import Ajv from 'ajv';
+import { deliver, prepareReleaseVersion, releasePackage, validateChecks, assertFreshRelease, execute } from '../runtime/delivery.mjs';
+
+const digest = value => createHash('sha256').update(value).digest('hex');
+const receiptSchema = {
+  type: 'object', additionalProperties: false,
+  required: ['version', 'tag', 'commit', 'url', 'artifact', 'artifactUrl', 'sha256', 'smoke', 'published'],
+  properties: {
+    version: { type: 'string', pattern: '^\\d+\\.\\d+\\.\\d+$' }, tag: { type: 'string', pattern: '^v\\d+\\.\\d+\\.\\d+$' },
+    commit: { type: 'string', pattern: '^[a-f0-9]{40,64}$' }, url: { type: 'string', pattern: '^https://github\\.com/' },
+    artifact: { type: 'string', pattern: '\\.tgz$' }, artifactUrl: { type: 'string', pattern: '^https://github\\.com/.+/releases/download/' },
+    sha256: { type: 'string', pattern: '^[a-f0-9]{64}$' }, published: { const: true },
+    smoke: { type: 'object', additionalProperties: false, required: ['passed', 'commands', 'node', 'platform'], properties: {
+      passed: { const: true }, commands: { type: 'array', minItems: 1, items: { type: 'string' } }, node: { type: 'string' }, platform: { type: 'string' }
+    } }
+  }
+};
+const validateReceipt = new Ajv({ strict: true }).compile(receiptSchema);
+async function fixture(t, { brokenCli = false } = {}) {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'kodo-delivery-test-'));
+  t.after(async () => {
+    assert.equal(path.dirname(path.resolve(root)), path.resolve(os.tmpdir()));
+    assert.ok(path.basename(root).startsWith('kodo-delivery-test-'));
+    await rm(root, { recursive: true, force: true });
+  });
+  const project = path.join(root, 'project'), remote = path.join(root, 'remote.git');
+  await mkdir(project);
+  const git = async (...args) => (await execute('git', args, { cwd: project })).stdout.trim();
+  await git('init', '--bare', remote);
+  await git('init', '-b', 'main');
+  await git('config', 'user.name', 'Kodo Test'); await git('config', 'user.email', 'kodo-test@example.invalid');
+  await git('config', 'core.autocrlf', 'false');
+  await writeFile(path.join(project, 'package.json'), JSON.stringify({ name: '@kodo-fixture/test', version: '0.2.0', type: 'module', bin: { kodo: 'cli.mjs' }, files: ['cli.mjs'] }));
+  await writeFile(path.join(project, 'cli.mjs'), brokenCli ? "console.log('broken command');\n" : "const arg=process.argv[2]; console.log(arg==='list'?JSON.stringify([{id:'skills/example'}]):arg==='validate'?JSON.stringify({valid:true}):'Kodo fixture help');\n");
+  await git('add', '.'); await git('commit', '-m', 'base'); await git('remote', 'add', 'origin', remote); await git('push', '-u', 'origin', 'main');
+  const baseSha = await git('rev-parse', 'HEAD');
+  await git('switch', '-c', 'kodo/test-run'); await writeFile(path.join(project, 'feature.txt'), 'feature\n');
+  await git('add', '.'); await git('commit', '-m', 'feature');
+  const headSha = await git('rev-parse', 'HEAD');
+  const run = { id: 'run-test', project, branch: 'kodo/test-run', task: 'Implement tested feature', baseSha, headSha };
+  const review = { passed: true, headSha, diffHash: digest((await execute('git', ['diff', '--binary', `${baseSha}...${headSha}`], { cwd: project })).stdout.trimEnd()) };
+  const leases = new Map(), updates = [], events = [], calls = [];
+  const store = {
+    acquireLease(name, owner) { if (leases.has(name)) return null; const token = `${name}:${owner}`; leases.set(name, token); return token; },
+    releaseLease(token) { for (const [name, value] of leases) if (value === token) leases.delete(name); },
+    updateRun(id, patch) { assert.equal(id, run.id); updates.push(structuredClone(patch)); Object.assign(run, patch); },
+    event(id, type, data) { events.push({ id, type, data }); }
+  };
+  const state = { pr: null, creates: 0, merges: 0, check: 'SUCCESS', protected: true, release: null, publishes: 0, status: null };
+  const assets = path.join(root, 'published'); await mkdir(assets);
+  const exec = async (command, args, options) => {
+    calls.push({ command, args });
+    if (command !== 'gh') return execute(command, args, options);
+    const output = value => ({ stdout: typeof value === 'string' ? value : JSON.stringify(value), stderr: '', code: 0 });
+    if (args[0] === 'api' && args[1]?.startsWith('repos/')) return output({ required_status_checks: { strict: state.protected, contexts: ['ci', 'kodo/review'] }, enforce_admins: { enabled: true } });
+    if (args[0] === 'api' && args.includes('POST')) { state.status = 'SUCCESS'; return output({ state: 'success' }); }
+    if (args[0] === 'pr' && args[1] === 'list') return output(state.pr ? [state.pr] : []);
+    if (args[0] === 'pr' && args[1] === 'create') {
+      const body = await readFile(args[args.indexOf('--body-file') + 1], 'utf8');
+      assert.match(body, /<!-- kodo-run:run-test -->/); assert.match(body, /Diff SHA-256/);
+      state.creates++; state.pr = { number: 7, url: 'https://github.com/test/kodo/pull/7', state: 'OPEN' }; return output(state.pr.url);
+    }
+    if (args[0] === 'pr' && args[1] === 'view') return output({ ...state.pr, headRefOid: headSha, baseRefName: 'main', mergeCommit: state.pr?.state === 'MERGED' ? { oid: headSha } : null, statusCheckRollup: [{ name: 'ci', conclusion: state.check }, { context: 'kodo/review', state: state.status ?? 'PENDING' }] });
+    if (args[0] === 'pr' && args[1] === 'merge') {
+      assert.ok(args.includes('--match-head-commit')); assert.ok(!args.includes('--admin'));
+      state.merges++; state.pr.state = 'MERGED'; await git('push', 'origin', `${headSha}:main`); return output('');
+    }
+    if (args[0] === 'release' && args[1] === 'list') return output(state.release ? [{ tagName: state.release.tag, isDraft: false, isPrerelease: false }] : []);
+    if (args[0] === 'release' && args[1] === 'create') {
+      state.publishes++;
+      const tag = args[2], artifact = args[3], sums = args[4];
+      assert.equal(args[args.indexOf('--target') + 1], headSha);
+      assert.ok(!args.includes('--clobber'));
+      assert.ok(args.includes('--latest=false'));
+      await copyFile(artifact, path.join(assets, path.basename(artifact))); await copyFile(sums, path.join(assets, 'SHA256SUMS'));
+      await git('tag', tag, headSha); await git('push', 'origin', tag);
+      state.release = { tag, filename: path.basename(artifact), url: `https://github.com/test/kodo/releases/tag/${tag}` };
+      return output(state.release.url);
+    }
+    if (args[0] === 'release' && args[1] === 'view') return output({ tagName: state.release.tag, url: state.release.url, assets: [{ name: state.release.filename }, { name: 'SHA256SUMS' }] });
+    if (args[0] === 'release' && args[1] === 'download') {
+      const filename = args[args.indexOf('--pattern') + 1], directory = args[args.indexOf('--dir') + 1];
+      await copyFile(path.join(assets, filename), path.join(directory, filename)); return output('');
+    }
+    throw new Error(`Unexpected fake GitHub command: ${args.join(' ')}`);
+  };
+  const config = { repository: 'test/kodo', baseBranch: 'main', checks: ['ci'], commands: { test: [], build: [] }, delivery: { enabled: true, release: true, firstVersion: '0.2.0' } };
+  return { root, project, remote, git, run, review, store, state, calls, leases, updates, events, config, exec, maxWaitMs: 0, pollMs: 1, cwd: project, assets };
+}
+
+test('Delivery checks require success and reject skipped missing duplicate and failed checks', () => {
+  assert.deepEqual(validateChecks([{ name: 'ci', conclusion: 'SUCCESS' }], ['ci']), { ready: true, missing: [], pending: [], failed: [] });
+  assert.equal(validateChecks([{ name: 'ci', conclusion: 'SKIPPED' }], ['ci']).ready, false);
+  assert.deepEqual(validateChecks([], ['ci']).missing, ['ci']);
+  assert.deepEqual(validateChecks([{ name: 'ci', status: 'IN_PROGRESS' }], ['ci']).pending, ['ci']);
+  assert.deepEqual(validateChecks([{ name: 'ci', conclusion: 'FAILURE' }, { name: 'ci', conclusion: 'SUCCESS' }], ['ci']).failed, ['ci']);
+  assert.throws(() => validateChecks([], []), { code: 'configuration' });
+});
+
+test('Release freshness rejects older source and version while permitting exact reconciliation', () => {
+  assert.equal(assertFreshRelease({ candidateSha: 'a', remoteHead: 'a', version: '0.2.0' }), true);
+  assert.throws(() => assertFreshRelease({ candidateSha: 'a', remoteHead: 'b', version: '0.2.0' }), { code: 'stale_release' });
+  assert.throws(() => assertFreshRelease({ candidateSha: 'a', remoteHead: 'a', latestSha: 'b', latestVersion: 'v0.3.0', version: '0.2.0' }), { code: 'stale_release' });
+  assert.throws(() => assertFreshRelease({ candidateSha: 'a', remoteHead: 'a', latestSha: 'b', latestVersion: 'v0.2.0', version: '0.2.0' }), { code: 'stale_release' });
+  assert.equal(assertFreshRelease({ candidateSha: 'a', remoteHead: 'a', latestSha: 'a', latestVersion: 'v0.2.0', version: '0.2.0' }), true);
+  assert.throws(() => assertFreshRelease({ candidateSha: 'a', remoteHead: 'a', version: 'latest' }), { code: 'release_version_mismatch' });
+});
+
+test('Delivery creates one reviewed PR merges after checks and reconciles resume without duplicate actions', async t => {
+  const ctx = await fixture(t);
+  const receipt = await deliver(ctx);
+  assert.equal(receipt.pr.number, 7); assert.equal(receipt.mergeCommit, ctx.run.headSha);
+  assert.equal(ctx.state.creates, 1); assert.equal(ctx.state.merges, 1); assert.equal(ctx.leases.size, 0);
+  assert.ok(ctx.updates.some(patch => patch.delivery?.pr?.number === 7 && !patch.delivery.mergeCommit));
+  const resumed = await deliver(ctx);
+  assert.equal(resumed.mergeCommit, receipt.mergeCommit);
+  assert.equal(ctx.state.creates, 1); assert.equal(ctx.state.merges, 1);
+});
+
+test('Delivery refuses a stale review before push or PR creation', async t => {
+  const ctx = await fixture(t); ctx.review.diffHash = '0'.repeat(64);
+  await assert.rejects(deliver(ctx), { code: 'stale_review' });
+  assert.equal(ctx.state.creates, 0); assert.equal(ctx.state.merges, 0);
+  assert.equal(ctx.calls.some(call => call.command === 'git' && call.args[0] === 'push'), false);
+});
+
+test('Delivery refuses weak branch protection before push', async t => {
+  const ctx = await fixture(t); ctx.state.protected = false;
+  await assert.rejects(deliver(ctx), { code: 'branch_protection' });
+  assert.equal(ctx.state.creates, 0); assert.equal(ctx.state.merges, 0);
+});
+
+test('Delivery preserves created PR and stops on failed or pending CI', async t => {
+  for (const conclusion of ['FAILURE', 'SKIPPED', 'IN_PROGRESS']) {
+    const ctx = await fixture(t); ctx.state.check = conclusion;
+    await assert.rejects(deliver(ctx), { code: conclusion === 'IN_PROGRESS' ? 'checks_pending' : 'checks_failed' });
+    assert.equal(ctx.run.delivery.pr.number, 7); assert.equal(ctx.state.merges, 0); assert.equal(ctx.leases.size, 0);
+  }
+});
+
+test('Delivery rechecks remote base under queue lease and never merges a stale task', async t => {
+  const ctx = await fixture(t);
+  await ctx.git('push', 'origin', `${ctx.run.headSha}:main`);
+  await assert.rejects(deliver(ctx), { code: 'stale_base' });
+  assert.equal(ctx.state.merges, 0); assert.equal(ctx.leases.size, 0);
+  assert.equal(ctx.run.delivery.pr.number, 7);
+});
+
+test('Busy merge queue defers delivery without bypassing the lock', async t => {
+  const ctx = await fixture(t); ctx.leases.set('merge:test/kodo:main', 'other-run');
+  await assert.rejects(deliver(ctx), { code: 'queue_waiting' });
+  assert.equal(ctx.state.merges, 0); assert.equal(ctx.leases.get('merge:test/kodo:main'), 'other-run');
+});
+
+test('Release packages exact merged commit installs artifact and reconciles without republishing', async t => {
+  const ctx = await fixture(t);
+  const delivered = await deliver(ctx);
+  const release = await releasePackage({ ...ctx, mergeCommit: delivered.mergeCommit });
+  assert.equal(validateReceipt(release), true, JSON.stringify(validateReceipt.errors));
+  assert.equal(release.published, true); assert.equal(release.version, '0.2.0');
+  assert.equal(release.commit, ctx.run.headSha); assert.equal(release.smoke.passed, true);
+  assert.equal(release.sha256, digest(await readFile(path.join(ctx.assets, release.artifact))));
+  assert.equal(ctx.state.publishes, 1); assert.equal(ctx.leases.size, 0);
+  const resumed = await releasePackage({ ...ctx, mergeCommit: delivered.mergeCommit });
+  assert.equal(resumed.sha256, release.sha256); assert.equal(resumed.url, release.url);
+  assert.equal(ctx.state.publishes, 1); assert.equal(ctx.leases.size, 0);
+});
+
+test('Release never publishes an old source commit or a package failing installed smoke', async t => {
+  const old = await fixture(t);
+  await old.git('push', 'origin', `${old.run.headSha}:main`);
+  await assert.rejects(releasePackage({ ...old, mergeCommit: old.run.baseSha }), { code: 'stale_release' });
+  assert.equal(old.state.publishes, 0); assert.equal(old.leases.size, 0);
+  const broken = await fixture(t, { brokenCli: true });
+  await broken.git('push', 'origin', `${broken.run.headSha}:main`);
+  await assert.rejects(releasePackage({ ...broken, mergeCommit: broken.run.headSha }), { code: 'smoke_failed' });
+  assert.equal(broken.state.publishes, 0); assert.equal(broken.leases.size, 0);
+});
+
+test('Delivery cancellation does not create a PR and leaves no lease', async t => {
+  const ctx = await fixture(t), controller = new AbortController(); controller.abort();
+  await assert.rejects(deliver({ ...ctx, signal: controller.signal }), { code: 'cancelled' });
+  assert.equal(ctx.state.creates, 0); assert.equal(ctx.leases.size, 0);
+});
+
+test('Resuming a merged PR rejects an unrelated saved head', async t => {
+  const ctx = await fixture(t);
+  await deliver(ctx);
+  ctx.run.headSha = ctx.run.baseSha;
+  await assert.rejects(deliver(ctx), { code: 'stale_review' });
+  assert.equal(ctx.state.creates, 1); assert.equal(ctx.state.merges, 1);
+});
+
+test('Published release reconciliation checks saved asset bytes and refuses a changed package', async t => {
+  const ctx = await fixture(t);
+  const delivered = await deliver(ctx);
+  const release = await releasePackage({ ...ctx, mergeCommit: delivered.mergeCommit });
+  await writeFile(path.join(ctx.assets, release.artifact), 'replaced artifact');
+  await assert.rejects(releasePackage({ ...ctx, mergeCommit: delivered.mergeCommit }), { code: 'release_conflict' });
+  assert.equal(ctx.state.publishes, 1); assert.equal(ctx.leases.size, 0);
+});
+
+test('Native command execution reports nonzero exit and timeout without a shell', async () => {
+  await assert.rejects(execute(process.execPath, ['-e', 'process.exit(4)']), { code: 'command_failed', exitCode: 4 });
+  const result = await execute(process.execPath, ['-e', 'process.stdout.write("expected"); process.exit(5)'], { allowFailure: true });
+  assert.equal(result.code, 5); assert.equal(result.stdout, 'expected');
+  await assert.rejects(execute(process.execPath, ['-e', 'setTimeout(()=>{},10000)'], { timeoutMs: 30 }), { code: 'timeout' });
+});
+
+test('Lost merge lease stops mutation and heartbeat cleanup releases the token', async t => {
+  const ctx = await fixture(t);
+  let signalRenewal;
+  const renewed = new Promise(resolve => signalRenewal = resolve);
+  let renewals = 0;
+  ctx.store.renewLease = () => { renewals++; signalRenewal(); return false; };
+  const runner = ctx.exec;
+  ctx.exec = async (command, args, options) => {
+    if (command === 'git' && args[0] === 'fetch') await renewed;
+    return runner(command, args, options);
+  };
+  await assert.rejects(deliver({ ...ctx, leaseHeartbeatMs: 1 }), { code: 'lease_lost' });
+  assert.ok(renewals > 0); assert.equal(ctx.state.merges, 0); assert.equal(ctx.leases.size, 0);
+});
+
+test('Release version preparation updates only metadata and resumes without another bump', async t => {
+  const ctx = await fixture(t);
+  const manifest = JSON.parse(await readFile(path.join(ctx.project, 'package.json'), 'utf8')); manifest.version = '0.1.0';
+  await writeFile(path.join(ctx.project, 'package.json'), JSON.stringify(manifest));
+  await writeFile(path.join(ctx.project, 'package-lock.json'), JSON.stringify({ name: manifest.name, version: '0.1.0', lockfileVersion: 3, packages: { '': { name: manifest.name, version: '0.1.0' } } }));
+  await writeFile(path.join(ctx.project, 'registry.json'), JSON.stringify({ schemaVersion: 1, version: '0.1.0', components: [{ id: 'skills/example', version: '0.1.0' }] }));
+  const prepared = await prepareReleaseVersion(ctx);
+  assert.equal(prepared.version, '0.2.0');
+  assert.deepEqual(prepared.files, ['package.json', 'package-lock.json', 'registry.json']);
+  assert.equal(JSON.parse(await readFile(path.join(ctx.project, 'package-lock.json'))).packages[''].version, '0.2.0');
+  const registry = JSON.parse(await readFile(path.join(ctx.project, 'registry.json')));
+  assert.equal(registry.version, '0.2.0'); assert.equal(registry.components[0].version, '0.1.0');
+  assert.equal(ctx.run.releaseAssignment.prepared, true);
+  const resumed = await prepareReleaseVersion(ctx);
+  assert.equal(resumed.version, '0.2.0'); assert.equal(resumed.changed, false); assert.equal(ctx.leases.size, 0);
+});
+
+test('Release version preparation bumps past current and latest after target advancement', async t => {
+  const ctx = await fixture(t);
+  ctx.state.release = { tag: 'v0.2.0' };
+  const first = await prepareReleaseVersion(ctx);
+  assert.equal(first.version, '0.2.1');
+  assert.equal((await prepareReleaseVersion(ctx)).version, '0.2.1');
+  ctx.state.release.tag = 'v0.2.1'; ctx.run.baseSha = ctx.run.headSha;
+  const next = await prepareReleaseVersion(ctx);
+  assert.equal(next.version, '0.2.2'); assert.equal(ctx.leases.size, 0);
+});

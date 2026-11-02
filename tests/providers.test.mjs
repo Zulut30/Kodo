@@ -1,0 +1,203 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { runProcess, redact, subscriptionEnvironment } from '../runtime/process.mjs';
+import { ProviderError, requestJson, subscriptionStatus, sessionInvocation, parseSessionEvents, runSession, discoverProviders, analyzeGemini, decideJev, classifyProviderFailure } from '../runtime/providers.mjs';
+import { research } from '../runtime/research.mjs';
+
+const secrets = { GEMINI_API_KEY: 'test-gemini-secret-123', TYPESAFE_API_KEY: 'test-jev-secret-123', SCRAPEDO_TOKEN: 'test-scrape-secret-123', REDDIT_API_KEY: 'test-reddit-secret-123', GETX_API_KEY: 'test-x-secret-123' };
+const response = (value, status = 200, headers = {}) => new Response(typeof value === 'string' ? value : JSON.stringify(value), { status, headers });
+const schema = { type: 'object', properties: { ok: { type: 'boolean' } }, required: ['ok'], additionalProperties: false };
+const models = [{ id: 'codex:gpt-6.1-sol', client: 'codex', model: 'gpt-6.1-sol', available: true }, { id: 'codex:gpt-6-astra', client: 'codex', model: 'gpt-6-astra', available: true }];
+const codexEvents = [ { type: 'thread.started', thread_id: 'session-1' }, { type: 'item.completed', item: { type: 'agent_message', text: '{"ok":true}' } }, { type: 'turn.completed', usage: { input_tokens: 10, output_tokens: 3 } } ];
+
+test('Worker environment strips provider secrets and API overrides while preserving ordinary variables', () => {
+  const environment = subscriptionEnvironment({ ...secrets, OPENAI_API_KEY: 'api-secret', ANTHROPIC_AUTH_TOKEN: 'oauth-secret', OPENAI_BASE_URL: 'https://other.example', ANTHROPIC_BASE_URL: 'https://other.example', GH_TOKEN: 'github-secret', KODO_HOME: '/private/state', CLAUDECODE: '1', KODO_PLAIN: 'state', ordinary: 'keep' });
+  for (const name of [...Object.keys(secrets), 'OPENAI_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'OPENAI_BASE_URL', 'ANTHROPIC_BASE_URL', 'GH_TOKEN', 'KODO_HOME', 'CLAUDECODE', 'KODO_PLAIN']) assert.equal(environment[name], undefined, name);
+  assert.equal(environment.ordinary, 'keep');
+});
+
+test('Redaction removes known credentials, bearer headers and Scrape token URLs', () => {
+  const raw = `https://api.scrape.do/?token=${secrets.SCRAPEDO_TOKEN}&url=public Authorization: Bearer abcdefghijklmnop ${secrets.GEMINI_API_KEY}`;
+  const safe = redact(raw, secrets);
+  assert.equal(safe.includes(secrets.SCRAPEDO_TOKEN), false);
+  assert.equal(safe.includes(secrets.GEMINI_API_KEY), false);
+  assert.equal(safe.includes('abcdefghijklmnop'), false);
+  assert.match(safe, /\?token=\[REDACTED\]&url=public/);
+});
+
+test('Process runner passes literal stdin and streams complete lines without shell interpolation', async () => {
+  const lines = [];
+  const input = 'literal $() `code` & | ;\nsecond';
+  const result = await runProcess({ command: process.execPath, args: ['-e', "process.stdin.setEncoding('utf8');let s='';process.stdin.on('data',c=>s+=c);process.stdin.on('end',()=>process.stdout.write(s));"], input, onLine: line => lines.push(line), timeoutMs: 10000 });
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.stdout, input);
+  assert.deepEqual(lines, ['literal $() `code` & | ;', 'second']);
+});
+
+test('Process runner cancels a running child and bounds captured output', async () => {
+  const controller = new AbortController();
+  const pending = runProcess({ command: process.execPath, args: ['-e', 'setInterval(()=>{},1000)'], signal: controller.signal, timeoutMs: 10000 });
+  controller.abort(new Error('test cancellation'));
+  await assert.rejects(pending, /test cancellation/);
+  await assert.rejects(runProcess({ command: process.execPath, args: ['-e', "process.stdout.write('a'.repeat(8192));setInterval(()=>{},1000)"], maxOutputBytes: 100, timeoutMs: 10000 }), error => error.code === 'KODO_OUTPUT_LIMIT');
+});
+
+test('Subscription checks accept subscription auth and reject API auth without a model call', async () => {
+  const resolveClientImpl = async () => ({ command: 'fixture', args: [] });
+  const codex = await subscriptionStatus('codex', { resolveClientImpl, processImpl: async invocation => { assert.deepEqual(invocation.args, ['login', 'status']); return { exitCode: 0, stdout: '', stderr: 'Logged in using ChatGPT' }; } });
+  assert.equal(codex.auth, 'subscription');
+  await assert.rejects(subscriptionStatus('codex', { resolveClientImpl, processImpl: async () => ({ exitCode: 0, stdout: 'Logged in using API key', stderr: '' }) }), error => error.code === 'auth');
+  const claude = await subscriptionStatus('claude-code', { resolveClientImpl, processImpl: async () => ({ exitCode: 0, stdout: JSON.stringify({ loggedIn: true, authMethod: 'claude.ai', apiProvider: 'firstParty' }), stderr: '' }) });
+  assert.equal(claude.available, true);
+  await assert.rejects(subscriptionStatus('claude-code', { resolveClientImpl, processImpl: async () => ({ exitCode: 0, stdout: JSON.stringify({ loggedIn: true, authMethod: 'api_key' }), stderr: '' }) }), error => error.code === 'auth');
+});
+
+test('Client invocation uses exact session IDs, subscription mode and genuinely read-only reviewers', () => {
+  const fresh = sessionInvocation({ client: 'codex', model: 'gpt-6.1-sol', cwd: '/project', readOnly: true, schemaPath: '/schema.json' });
+  assert.ok(fresh.args.includes('read-only'));
+  assert.ok(fresh.args.includes('forced_login_method="chatgpt"'));
+  assert.equal(fresh.args.at(-1), '-');
+  const resumed = sessionInvocation({ client: 'codex', sessionId: 'exact-session', cwd: '/project' });
+  assert.deepEqual(resumed.args.slice(4), ['exec', 'resume', 'exact-session', '--json', '--ignore-user-config', '-']);
+  assert.equal(resumed.args.includes('--last'), false);
+  assert.throws(() => sessionInvocation({ client: 'codex', readOnly: true, sessionId: 'prior-write-session' }), error => error.code === 'invalid_output');
+  const claude = sessionInvocation({ client: 'claude-code', readOnly: true, schema });
+  assert.equal(claude.args[claude.args.indexOf('--tools') + 1], 'Read,Glob,Grep');
+  assert.ok(claude.args.includes('--strict-mcp-config'));
+  assert.equal(claude.args.includes('--bare'), false);
+  assert.match(claude.sessionId, /^[a-f0-9-]{36}$/);
+  assert.throws(() => sessionInvocation({ client: 'unknown' }), error => error.code === 'unavailable');
+});
+
+test('Provider event parser requires completion, exact output contract and session identity', () => {
+  const result = parseSessionEvents('codex', codexEvents, { schema, model: 'gpt-6.1-sol' });
+  assert.equal(result.sessionId, 'session-1');
+  assert.deepEqual(result.output, { ok: true });
+  assert.equal(result.usage.input_tokens, 10);
+  assert.throws(() => parseSessionEvents('codex', codexEvents.slice(0, 2), { schema }), error => error.code === 'invalid_output');
+  assert.throws(() => parseSessionEvents('codex', [...codexEvents.slice(0, 1), { type: 'item.completed', item: { type: 'agent_message', text: '{"wrong":true}' } }, codexEvents[2]], { schema }), error => error.code === 'invalid_output');
+  const claude = parseSessionEvents('claude-code', [{ type: 'system', subtype: 'init', session_id: 'claude-exact' }, { type: 'result', subtype: 'success', structured_output: { ok: false }, usage: { output_tokens: 2 } }], { schema });
+  assert.deepEqual(claude.output, { ok: false });
+  assert.equal(claude.sessionId, 'claude-exact');
+  assert.throws(() => parseSessionEvents('claude-code', [{ type: 'result', is_error: true, result: 'Usage limit reached' }], { schema, sessionId: 's' }), error => error.code === 'quota');
+});
+
+test('Session adapter emits identity before completion and never streams tool payloads', async () => {
+  const streamed = [], invocations = [];
+  const result = await runSession({ client: 'codex', model: 'gpt-6.1-sol', cwd: process.cwd(), prompt: 'literal prompt with $() &', schema, readOnly: true, env: secrets, onEvent: event => streamed.push(event) }, {
+    resolveClientImpl: async () => ({ command: 'fixture', args: ['launcher.js'] }),
+    processImpl: async invocation => {
+      invocations.push(invocation);
+      if (invocation.args.includes('status')) return { exitCode: 0, stdout: 'Logged in using ChatGPT', stderr: '' };
+      for (const event of [...codexEvents.slice(0, 1), { type: 'item.completed', item: { type: 'command_execution', aggregated_output: secrets.GEMINI_API_KEY } }, ...codexEvents.slice(1)]) invocation.onLine(JSON.stringify(event));
+      return { exitCode: 0, stdout: '', stderr: '' };
+    }
+  });
+  assert.deepEqual(result.output, { ok: true });
+  assert.equal(streamed[0].sessionId, 'session-1');
+  assert.equal(JSON.stringify(streamed).includes(secrets.GEMINI_API_KEY), false);
+  assert.equal(invocations[1].input, 'literal prompt with $() &');
+  assert.equal(invocations[1].env.GEMINI_API_KEY, undefined);
+});
+
+test('Discovery keeps providers isolated by default and excludes unavailable models after live checks', async () => {
+  const options = { statusImpl: async () => ({ available: true }), cacheImpl: async () => [{ slug: 'gpt-6.1-sol' }, { slug: 'gpt-6-astra' }] };
+  const local = await discoverProviders({ client: 'codex' }, options);
+  assert.ok(local.every(item => item.client === 'codex'));
+  assert.equal(local.find(item => item.model === 'gpt-6.1-terra').available, false);
+  const mixed = await discoverProviders({ client: 'claude-code', providers: 'both', primaryModel: 'sonnet' }, { ...options, live: true, sessionImpl: async invocation => { if (invocation.model === 'opus') throw new ProviderError('model unavailable'); return { output: { ok: true } }; } });
+  assert.equal(mixed[0].model, 'sonnet');
+  assert.ok(mixed.some(item => item.client === 'codex'));
+  assert.equal(mixed.find(item => item.model === 'opus').available, false);
+  assert.equal(mixed.find(item => item.model === 'sonnet').verified, true);
+});
+
+test('HTTP requests retry transient service failures but surface auth and quota with redaction', async () => {
+  let calls = 0;
+  const result = await requestJson('https://api.example.test/data', { fetchImpl: async () => ++calls === 1 ? response({ error: 'retry' }, 503) : response({ ok: true }) });
+  assert.deepEqual(result, { ok: true });
+  assert.equal(calls, 2);
+  calls = 0;
+  await assert.rejects(requestJson('https://api.example.test/data', { secrets, fetchImpl: async () => { calls++; return response({ error: secrets.GEMINI_API_KEY }, 401); } }), error => error.code === 'auth' && !error.message.includes(secrets.GEMINI_API_KEY));
+  assert.equal(calls, 1);
+  await assert.rejects(requestJson('https://api.example.test/data', { fetchImpl: async () => response({ error: 'quota' }, 429, { 'Retry-After': '120' }) }), error => error.code === 'quota' && Date.parse(error.retryAt) > Date.now());
+  await assert.rejects(requestJson('https://api.example.test/data', { fetchImpl: async () => response('not-json') }), error => error.code === 'invalid_output');
+  assert.equal(classifyProviderFailure('Model unavailable').code, 'unavailable');
+  assert.equal(classifyProviderFailure('Failed to authenticate: OAuth session expired and could not be refreshed').code, 'auth');
+});
+
+test('Gemini analysis uses the configured model and rejects invented file evidence', async () => {
+  let invocation;
+  const fetchImpl = async (url, options) => { invocation = { url, options }; return response({ modelVersion: 'gemini-4-argon', candidates: [{ content: { parts: [{ text: JSON.stringify({ summary: 'Project inspected', files: ['src/app.mjs'], limitations: ['Runtime not checked'] }) }] } }] }); };
+  const result = await analyzeGemini({ task: 'Add export', files: [{ path: 'src/app.mjs', content: 'export const value=1;' }] }, { secrets, fetchImpl });
+  assert.deepEqual(result.files, ['src/app.mjs']);
+  assert.match(invocation.url, /models\/gemini-4-argon:generateContent$/);
+  assert.equal(invocation.options.headers['x-goog-api-key'], secrets.GEMINI_API_KEY);
+  assert.equal(invocation.url.includes(secrets.GEMINI_API_KEY), false);
+  assert.equal(JSON.parse(invocation.options.body).generationConfig.responseMimeType, 'application/json');
+  await assert.rejects(analyzeGemini({ task: 'test', files: [] }, { secrets, fetchImpl }), error => error.code === 'invalid_output');
+  await assert.rejects(analyzeGemini({ task: 'test' }), error => error.code === 'auth');
+});
+
+function jevOutput({ model = models[0].id, modelConfidence = 0.95, parallel = 'parallel', parallelConfidence = 0.95, session = 'fresh' } = {}) {
+  return { model: 'jev-1.14.0', answers: { model: { type: 'choice', choice: model, confidence: modelConfidence }, execution: { type: 'choice', choice: parallel, confidence: parallelConfidence }, session: { type: 'choice', choice: session, confidence: 0.95 } } };
+}
+
+test('Jev selects only allowed models and falls back conservatively for uncertainty or service failure', async () => {
+  let request;
+  const result = await decideJev({ task: 'Implement export', models, node: { id: 'export' } }, { secrets, fetchImpl: async (url, options) => { request = JSON.parse(options.body); return response(jevOutput()); } });
+  assert.equal(result.model, models[0].id);
+  assert.equal(result.parallel, true);
+  assert.deepEqual(Object.keys(request.questions.model.criteria), models.map(item => item.id));
+  const uncertain = await decideJev({ task: 'Hard change', models, node: { id: 'x' } }, { secrets, fetchImpl: async () => response(jevOutput({ modelConfidence: 0.2, parallelConfidence: 0.3, session: 'continue' })) });
+  assert.equal(uncertain.model, models[1].id);
+  assert.equal(uncertain.parallel, false);
+  assert.equal(uncertain.sessionMode, 'fresh');
+  const invalid = await decideJev({ task: 'test', models }, { secrets, fetchImpl: async () => response(jevOutput({ model: 'unapproved-api' })) });
+  assert.equal(invalid.fallback, true);
+  assert.equal(invalid.model, models[0].id);
+  const failed = await decideJev({ task: 'test', models }, { secrets, fetchImpl: async () => response({ error: 'unauthorized' }, 401) });
+  assert.equal(failed.fallback, true);
+  assert.equal(failed.parallel, false);
+  await assert.rejects(decideJev({ task: 'test', models: [] }, { secrets }), error => error.code === 'unavailable');
+});
+
+test('Research attempts all sources, caches successful lookups and never uses write endpoints', async () => {
+  const calls = [];
+  const fetchImpl = async (url, options) => {
+    calls.push({ url, options });
+    if (url.includes('redditapis')) return response({ data: { children: [{ data: { title: 'Library discussion', permalink: '/r/node/comments/123/library', selftext: 'Useful library' } }] } });
+    if (url.includes('getxapi')) return response({ tweets: [{ id: '456', text: 'A useful sqlite library' }] });
+    const target = new URL(url).searchParams.get('q');
+    if (target.includes('github.com')) return response('<a href="https://github.com/example/library">Library repository</a>');
+    if (target.includes('ycombinator')) return response('<a href="https://news.ycombinator.com/item?id=789">Discussion</a>');
+    return response('<a href="https://nodejs.org/api/sqlite.html">SQLite documentation</a>');
+  };
+  const result = await research({ task: 'nodejs sqlite', budget: 5 }, { secrets, fetchImpl });
+  assert.equal(result.requests, 5);
+  assert.deepEqual([...new Set(result.items.map(item => item.source))].sort(), ['docs', 'github', 'hackernews', 'reddit', 'x']);
+  assert.equal(result.errors.length, 0);
+  assert.ok(calls.every(call => call.options.method === 'GET'));
+  assert.equal(result.items.find(item => item.source === 'reddit').url, 'https://www.reddit.com/r/node/comments/123/library');
+  assert.ok(result.items.every(item => item.verification.startsWith('discovery only')));
+  const again = await research({ task: 'nodejs sqlite', cache: result.cache, budget: 0 }, { secrets, fetchImpl });
+  assert.equal(again.requests, 0);
+  assert.equal(calls.length, 5);
+  assert.deepEqual(again.items, result.items);
+});
+
+test('Research obeys its request ceiling and a failed source does not stop remaining sources', async () => {
+  let calls = 0;
+  const limited = await research({ task: 'sqlite', budget: 2 }, { secrets, fetchImpl: async () => { calls++; return response({ results: [] }); } });
+  assert.equal(calls, 2);
+  assert.equal(limited.requests, 2);
+  assert.equal(limited.errors.filter(item => item.code === 'budget').length, 3);
+  const mixed = await research({ task: 'sqlite', budget: 5 }, { secrets, fetchImpl: async url => url.includes('redditapis') ? response({ error: secrets.REDDIT_API_KEY }, 403) : response({ results: [] }) });
+  assert.equal(mixed.requests, 5);
+  assert.equal(mixed.errors[0].source, 'reddit');
+  assert.equal(mixed.errors[0].code, 'auth');
+  assert.equal(JSON.stringify(mixed.errors).includes(secrets.REDDIT_API_KEY), false);
+  const serviceErrors = await research({ task: 'sqlite', budget: 5 }, { secrets, fetchImpl: async () => response({ status: 'error', message: 'authentication required' }) });
+  assert.equal(serviceErrors.errors.length, 5);
+  assert.ok(serviceErrors.errors.every(error => error.code === 'auth'));
+});
