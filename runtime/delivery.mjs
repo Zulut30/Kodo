@@ -41,6 +41,7 @@ export async function execute(command, args, { cwd, signal, timeoutMs = 120000, 
   }
   return new Promise((resolve, reject) => {
     const child = spawn(executable, argv, { cwd, env: environment, signal, shell: false, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
     let stdout = '', stderr = '', settled = false;
     const timer = setTimeout(() => { child.kill(); finish(fail('timeout', `${command} timed out`)); }, timeoutMs);
     const finish = (error, result) => { if (settled) return; settled = true; clearTimeout(timer); error ? reject(error) : resolve(result); };

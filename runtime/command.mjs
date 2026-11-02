@@ -47,6 +47,7 @@ export async function execute(command, args = [], { cwd, env = process.env, sign
   const resolved = resolveCommand(command, args);
   return new Promise((resolve, reject) => {
     const child = spawn(resolved.command, resolved.args, { cwd, env, windowsHide: true, shell: false, stdio: ['pipe', 'pipe', 'pipe'] });
+    child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
     let stdout = '', stderr = '', stopped = false;
     const stop = () => { stopped = true; if (process.platform === 'win32' && child.pid) { const killer = spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' }); killer.on('error', () => child.kill()); } else child.kill('SIGTERM'); };
     const timeout = setTimeout(stop, timeoutMs); timeout.unref();
