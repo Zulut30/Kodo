@@ -19,6 +19,7 @@ kodo init [--project PATH]
 kodo doctor [--live] [--json]
 kodo run "TASK" --client codex|claude-code [--providers both] [--prepare] [--delivery none|pr|release]
 kodo status|logs|resume|cancel RUN_ID [--json]
+kodo audit RUN_ID [--json]
 kodo resume RUN_ID --plan FILE
 kodo migrate --target PROJECT
 
@@ -57,7 +58,7 @@ function checkOptions(command, options) {
 async function main() {
   const [command, ...argv] = process.argv.slice(2);
   if (!command || ['help', '--help', '-h'].includes(command)) return console.log(help);
-  if (['doctor','run','status','logs','resume','cancel','migrate'].includes(command) || command === 'init' && !argv.includes('--preset')) {
+  if (['doctor','run','status','logs','resume','cancel','migrate','audit'].includes(command) || command === 'init' && !argv.includes('--preset')) {
     const { runtimeCli } = await import('../runtime/cli.mjs');
     return runtimeCli(command, argv);
   }
