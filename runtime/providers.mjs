@@ -63,7 +63,7 @@ function delay(ms, signal) {
   });
 }
 
-export async function subscriptionStatus(client, { env = {}, processImpl = runProcess, resolveClientImpl = resolveClient } = {}) {
+export async function subscriptionStatus(client, { env, processImpl = runProcess, resolveClientImpl = resolveClient } = {}) {
   const environment = subscriptionEnvironment(env);
   let executable;
   try { executable = await resolveClientImpl(client, environment); }
@@ -191,7 +191,7 @@ export function parseSessionEvents(client, events, { schema, sessionId, model } 
   return { sessionId, output, usage, model };
 }
 
-export async function runSession({ client, model, cwd, prompt, schema, sessionId, readOnly = false, signal, onEvent, env = {}, timeoutMs = 1800000 }, { processImpl = runProcess, resolveClientImpl = resolveClient } = {}) {
+export async function runSession({ client, model, cwd, prompt, schema, sessionId, readOnly = false, signal, onEvent, env, timeoutMs = 1800000 }, { processImpl = runProcess, resolveClientImpl = resolveClient } = {}) {
   signal?.throwIfAborted();
   const environment = subscriptionEnvironment(env);
   const { executable } = await subscriptionStatus(client, { env: environment, processImpl, resolveClientImpl });

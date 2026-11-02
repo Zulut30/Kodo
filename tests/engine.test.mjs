@@ -806,3 +806,51 @@ test('Engine completes the owning pending node merge before scheduling earlier r
   assert.equal(await read(path.join(fx.run.cwd, 'src/value.mjs')), combinedModule);
   assert.equal(git(fx.run.cwd, 'status', '--porcelain'), '');
 });
+
+async function refreshFixture(t, onWorker, conflict = false) {
+  const fx = await fixture(t, { testScript: 'process.exit(0);\n' });
+  const task = node('feature', 'developer', ['src/value.mjs']);
+  const services = fakeServices({ plan: { summary: 'Retain own change and upstream', tasks: [task] }, onWorker });
+  const store = fx.openStore(), engine = new Engine({ store, ...services });
+  const run = await engine.create('Refresh interrupted task safely', { project: fx.project }); await engine.prepare(run);
+  run.plan = { summary: 'Retain own change and upstream', tasks: [task] }; run.models = await services.provider.discoverProviders();
+  const cwd = path.join(path.dirname(run.cwd), task.id), branch = `kodo/${run.id}-${task.id}`;
+  await makeWorktree(fx.project, cwd, branch, fx.base);
+  await writeFile(path.join(cwd, 'src/value.mjs'), 'export const value = 2;\n'); git(cwd, 'add', '.'); git(cwd, 'commit', '-m', 'Scoped pending work');
+  if (conflict) await writeFile(path.join(run.cwd, 'src/value.mjs'), 'export const value = 4;\nexport const upstream = true;\n');
+  await writeFile(path.join(run.cwd, 'upstream-fix.txt'), 'incoming outside task scope\n'); git(run.cwd, 'add', '.'); git(run.cwd, 'commit', '-m', 'Upstream integrated fix');
+  const target = git(run.cwd, 'rev-parse', 'HEAD');
+  run.nodes.feature = { id: task.id, attempt: 0, status: 'pending', cwd, branch, baseSha: fx.base };
+  engine.save(run); return { ...fx, task, services, store, engine, run, target, cwd };
+}
+
+test('Engine resumes an interrupted conflicted node refresh against its recorded incoming head and exact repair session', async t => {
+  let repairs = 0;
+  const fx = await refreshFixture(t, async request => {
+    if (!request.role) {
+      repairs++;
+      if (repairs === 1) { request.onEvent({ sessionId: 'refresh-repair-session' }); throw Object.assign(new Error('quota in refresh resolver'), { code: 'quota' }); }
+      assert.equal(request.sessionId, 'refresh-repair-session');
+      await writeFile(path.join(request.cwd, 'src/value.mjs'), 'export const value = 2;\nexport const upstream = true;\n');
+    }
+    return { sessionId: request.role ? 'worker-after-refresh' : 'refresh-repair-session', output: { summary: 'preserved both', checks: [], complete: true } };
+  }, true);
+  await assert.rejects(fx.engine.performNode(fx.run, fx.task), { code: 'quota' });
+  const resumed = fx.store.getRun(fx.run.id);
+  assert.equal(resumed.nodes.feature.pendingRefresh.headSha, fx.target);
+  await fx.engine.performNode(resumed, fx.task);
+  assert.equal(resumed.nodes.feature.status, 'completed'); assert.equal(resumed.nodes.feature.baseSha, fx.target);
+  assert.equal(resumed.nodes.feature.pendingRefresh, undefined); assert.deepEqual(resumed.nodes.feature.changedFiles, ['src/value.mjs']);
+  assert.equal(await read(path.join(fx.cwd, 'upstream-fix.txt')), 'incoming outside task scope\n');
+  assert.match(await read(path.join(fx.cwd, 'src/value.mjs')), /upstream = true/);
+});
+
+test('Engine recovers a completed node refresh merge when its base receipt was not saved', async t => {
+  const fx = await refreshFixture(t, async () => ({ sessionId: 'recovered-refresh-worker', output: { summary: 'done', checks: [], complete: true } }));
+  fx.run.nodes.feature.pendingRefresh = { headSha: fx.target, model: 'codex-sol' }; fx.engine.save(fx.run);
+  git(fx.cwd, 'merge', '--no-edit', fx.target); // Crash after merge, before updating baseSha.
+  const resumed = fx.store.getRun(fx.run.id);
+  await fx.engine.performNode(resumed, fx.task);
+  assert.equal(resumed.nodes.feature.status, 'completed'); assert.equal(resumed.nodes.feature.baseSha, fx.target);
+  assert.deepEqual(resumed.nodes.feature.changedFiles, ['src/value.mjs']);
+});

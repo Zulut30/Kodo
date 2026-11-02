@@ -3,8 +3,7 @@ import { access, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import { parse as parseToml } from 'smol-toml';
-
-const secretName = /(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)/i;
+import { workerEnvironment } from './security.mjs';
 
 export function redact(value, secrets = {}) {
   let result = typeof value === 'string' ? value : JSON.stringify(value);
@@ -18,15 +17,13 @@ export function redact(value, secrets = {}) {
     .replace(/(?:apikey_|get-x-api-|reddit-api-)[A-Za-z0-9_-]{16,}/g, '[REDACTED]');
 }
 
-export function subscriptionEnvironment(extra = {}) {
-  const environment = { ...process.env, ...extra };
+export function subscriptionEnvironment(base = process.env) {
+  // An explicitly supplied worker environment is complete. Merging the parent
+  // here would reintroduce coordinator credentials already removed by Engine.
+  const environment = workerEnvironment(base);
   for (const name of Object.keys(environment)) {
-    if (secretName.test(name) || /^(?:OPENAI_|ANTHROPIC_|CLAUDE_CODE_USE_|KODO_)/i.test(name) || /^CODEX_/i.test(name) && name !== 'CODEX_HOME' || name === 'CLAUDECODE') delete environment[name];
+    if (/^(?:OPENAI_|ANTHROPIC_|CLAUDE_CODE_USE_)/i.test(name) || name === 'CLAUDECODE') delete environment[name];
   }
-  // External provider endpoints must never turn subscription workers into API clients.
-  delete environment.OPENAI_BASE_URL;
-  delete environment.OPENAI_API_BASE;
-  delete environment.ANTHROPIC_BASE_URL;
   return environment;
 }
 

@@ -20,6 +20,61 @@ test('Worker environment strips provider secrets and API overrides while preserv
   assert.equal(environment.CODEX_HOME, '/subscription-home');
 });
 
+test('Explicit clean subscription environments never reintroduce polluted parent variables', async () => {
+  const polluted = { DATABASE_URL: 'fixture-private-database', GH_HOST: 'github.fixture', GH_CONFIG_DIR: '/fixture-github-auth', GITHUB_ENTERPRISE_HOST: 'github.fixture', SERVICE_BASE_URL: 'https://fixture-provider', SUBSCRIPTION_FIXTURE_PARENT_ONLY: 'parent-value' };
+  const before = Object.fromEntries(Object.keys(polluted).map(name => [name, process.env[name]]));
+  Object.assign(process.env, polluted);
+  try {
+    const clean = { PATH: 'fixture-client-path', CODEX_HOME: '/fixture-codex', ordinary: 'keep' };
+    assert.deepEqual(subscriptionEnvironment(clean), clean);
+    const seen = [];
+    const result = await runSession({ client: 'codex', cwd: process.cwd(), prompt: 'fixture request', schema, readOnly: true, env: clean }, {
+      resolveClientImpl: async (client, environment) => { seen.push(environment); return { command: 'fixture', args: [] }; },
+      processImpl: async invocation => {
+        seen.push(invocation.env);
+        if (invocation.args.includes('status')) return { exitCode: 0, stdout: 'Logged in using ChatGPT', stderr: '' };
+        for (const event of codexEvents) invocation.onLine(JSON.stringify(event));
+        return { exitCode: 0, stdout: '', stderr: '' };
+      }
+    });
+    assert.deepEqual(result.output, { ok: true });
+    assert.equal(seen.length, 3);
+    for (const environment of seen) assert.deepEqual(environment, clean);
+  } finally {
+    for (const [name, value] of Object.entries(before)) { if (value === undefined) delete process.env[name]; else process.env[name] = value; }
+  }
+});
+
+test('Default subscription startup filters parent credentials while retaining native client discovery variables', async () => {
+  const polluted = { DATABASE_URL: 'fixture-private-database', GH_HOST: 'github.fixture', GH_CONFIG_DIR: '/fixture-github-auth', GITHUB_USER: 'fixture-user', SERVICE_BASE_URL: 'https://fixture-provider', OPENAI_MODEL: 'api-model', ANTHROPIC_MODEL: 'api-model', ANTHROPIC_API_KEY: 'fixture-api-key', CLAUDECODE: '1', CODEX_APP_TOOLS_PIPE_PATH: 'fixture-pipe', CODEX_HOME: '/fixture-codex-home', SUBSCRIPTION_FIXTURE_ORDINARY: 'keep' };
+  const before = Object.fromEntries(Object.keys(polluted).map(name => [name, process.env[name]]));
+  Object.assign(process.env, polluted);
+  try {
+    const checked = [];
+    const result = await runSession({ client: 'codex', cwd: process.cwd(), prompt: 'fixture request', schema, readOnly: true }, {
+      resolveClientImpl: async (client, environment) => { checked.push(environment); return { command: 'fixture', args: [] }; },
+      processImpl: async invocation => {
+        checked.push(invocation.env);
+        if (invocation.args.includes('status')) return { exitCode: 0, stdout: 'Logged in using ChatGPT', stderr: '' };
+        for (const event of codexEvents) invocation.onLine(JSON.stringify(event));
+        return { exitCode: 0, stdout: '', stderr: '' };
+      }
+    });
+    assert.deepEqual(result.output, { ok: true });
+    assert.equal(checked.length, 3);
+    for (const environment of checked) {
+      for (const name of Object.keys(polluted).filter(name => !['CODEX_HOME', 'SUBSCRIPTION_FIXTURE_ORDINARY'].includes(name))) assert.equal(environment[name], undefined, name);
+      assert.equal(environment.CODEX_HOME, '/fixture-codex-home');
+      assert.equal(environment.SUBSCRIPTION_FIXTURE_ORDINARY, 'keep');
+      const pathName = Object.keys(process.env).find(name => name.toUpperCase() === 'PATH');
+      assert.ok(pathName, 'The native client needs the inherited executable search path');
+      assert.equal(environment[pathName], process.env[pathName]);
+    }
+  } finally {
+    for (const [name, value] of Object.entries(before)) { if (value === undefined) delete process.env[name]; else process.env[name] = value; }
+  }
+});
+
 test('Redaction removes known credentials, bearer headers and Scrape token URLs', () => {
   const raw = `https://api.scrape.do/?token=${secrets.SCRAPEDO_TOKEN}&url=public Authorization: Bearer abcdefghijklmnop ${secrets.GEMINI_API_KEY}`;
   const safe = redact(raw, secrets);

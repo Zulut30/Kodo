@@ -38,11 +38,13 @@ async function fixture(t, { brokenCli = false } = {}) {
   await git('init', '-b', 'main');
   await git('config', 'user.name', 'Kodo Test'); await git('config', 'user.email', 'kodo-test@example.invalid');
   await git('config', 'core.autocrlf', 'false');
-  await writeFile(path.join(project, 'package.json'), JSON.stringify({ name: '@kodo-fixture/test', version: '0.2.0', type: 'module', bin: { kodo: 'cli.mjs' }, files: ['cli.mjs'] }));
+  await writeFile(path.join(project, 'package.json'), JSON.stringify({ name: '@kodo-fixture/test', version: '0.1.0', type: 'module', bin: { kodo: 'cli.mjs' }, files: ['cli.mjs'] }));
   await writeFile(path.join(project, 'cli.mjs'), brokenCli ? "console.log('broken command');\n" : "const arg=process.argv[2]; console.log(arg==='list'?JSON.stringify([{id:'skills/example'}]):arg==='validate'?JSON.stringify({valid:true}):'Kodo fixture help');\n");
   await git('add', '.'); await git('commit', '-m', 'base'); await git('remote', 'add', 'origin', remote); await git('push', '-u', 'origin', 'main');
   const baseSha = await git('rev-parse', 'HEAD');
   await git('switch', '-c', 'kodo/test-run'); await writeFile(path.join(project, 'feature.txt'), 'feature\n');
+  const featureManifest = JSON.parse(await readFile(path.join(project, 'package.json'), 'utf8')); featureManifest.version = '0.2.0';
+  await writeFile(path.join(project, 'package.json'), JSON.stringify(featureManifest));
   await git('add', '.'); await git('commit', '-m', 'feature');
   const headSha = await git('rev-parse', 'HEAD');
   const run = { id: 'run-test', project, branch: 'kodo/test-run', task: 'Implement tested feature', baseSha, headSha, releaseAssignment: { version: '0.2.0', previousVersion: '0.1.0', baseSha, prepared: true } };
@@ -68,7 +70,7 @@ async function fixture(t, { brokenCli = false } = {}) {
       assert.match(body, /<!-- kodo-run:run-test -->/); assert.match(body, /Diff SHA-256/);
       state.creates++; state.pr = { number: 7, url: 'https://github.com/test/kodo/pull/7', state: 'OPEN' }; return output(state.pr.url);
     }
-    if (args[0] === 'pr' && args[1] === 'view') return output({ ...state.pr, headRefOid: headSha, baseRefName: 'main', mergeCommit: state.pr?.state === 'MERGED' ? { oid: state.mergeCommit ?? headSha } : null, statusCheckRollup: [{ name: 'ci', conclusion: state.check }, { context: 'kodo/review', state: state.status ?? 'PENDING' }] });
+    if (args[0] === 'pr' && args[1] === 'view') return output({ ...state.pr, headRefOid: state.prHead ?? headSha, baseRefName: 'main', mergeCommit: state.pr?.state === 'MERGED' ? { oid: state.mergeCommit ?? headSha } : null, statusCheckRollup: [{ name: 'ci', conclusion: state.check }, { context: 'kodo/review', state: state.status ?? 'PENDING' }] });
     if (args[0] === 'pr' && args[1] === 'merge') {
       assert.ok(args.includes('--match-head-commit')); assert.ok(!args.includes('--admin'));
       if (config.delivery.release) assert.ok(leases.has('release:test/kodo:main'));
@@ -528,4 +530,41 @@ test('Delivery reconciliation leaves an open PR unchanged without push or verifi
   assert.equal(ctx.updates.length, updates);
   assert.deepEqual(ctx.calls.map(call => [call.command, ...call.args.slice(0, 2)]), [['gh', 'pr', 'view']]);
   assert.equal(ctx.state.merges, 0);
+});
+
+test('Second assigned run bumps past a merged but unpublished target version', async t => {
+  const ctx = await fixture(t), projectB = path.join(ctx.root, 'project-b');
+  await ctx.git('worktree', 'add', '-b', 'kodo/test-b', projectB, ctx.run.baseSha);
+  const gitB = async (...args) => (await execute('git', args, { cwd: projectB })).stdout.trim();
+  const manifestB = JSON.parse(await readFile(path.join(projectB, 'package.json'), 'utf8')); manifestB.version = '0.2.0';
+  await writeFile(path.join(projectB, 'package.json'), JSON.stringify(manifestB));
+  await writeFile(path.join(projectB, 'task-b.txt'), 'independent task B\n');
+  await gitB('add', '.'); await gitB('commit', '-m', 'task B initially assigned same version');
+  const runB = { ...structuredClone(ctx.run), id: 'run-b', project: projectB, branch: 'kodo/test-b', headSha: await gitB('rev-parse', 'HEAD'), delivery: undefined };
+  const deliveredA = await deliver(ctx);
+  assert.equal(ctx.state.publishes, 0); assert.equal(ctx.state.release, null);
+  await gitB('fetch', 'origin', 'main'); await gitB('merge', '--no-edit', 'origin/main');
+  runB.baseSha = deliveredA.mergeCommit; runB.headSha = await gitB('rev-parse', 'HEAD');
+  const storeB = { ...ctx.store, updateRun(id, patch) { assert.equal(id, runB.id); Object.assign(runB, patch); } };
+  const optionsB = { ...ctx, run: runB, cwd: projectB, store: storeB };
+  const prepared = await prepareReleaseVersion(optionsB);
+  assert.equal(prepared.version, '0.2.1'); assert.equal(prepared.changed, true);
+  assert.equal(JSON.parse(await readFile(path.join(projectB, 'package.json'))).version, '0.2.1');
+  assert.equal((await prepareReleaseVersion(optionsB)).changed, false);
+  assert.equal(ctx.state.publishes, 0); assert.equal(ctx.state.release, null); assert.equal(ctx.leases.size, 0);
+});
+
+test('Merge rejects a target-reserved version even before any release is published', async t => {
+  const ctx = await fixture(t);
+  const reservedHead = ctx.run.headSha;
+  await ctx.git('push', 'origin', `${reservedHead}:main`);
+  await writeFile(path.join(ctx.project, 'task-b.txt'), 'more work with stale assigned version\n');
+  await ctx.git('add', 'task-b.txt'); await ctx.git('commit', '-m', 'second task after first merge');
+  ctx.run.baseSha = reservedHead; ctx.run.headSha = await ctx.git('rev-parse', 'HEAD');
+  ctx.state.prHead = ctx.run.headSha;
+  ctx.review.headSha = ctx.run.headSha;
+  ctx.review.diffHash = digest((await execute('git', ['diff', '--binary', `${ctx.run.baseSha}...${ctx.run.headSha}`], { cwd: ctx.project })).stdout.trimEnd());
+  await assert.rejects(deliver(ctx), { code: 'stale_base', targetVersion: '0.2.0' });
+  assert.equal(ctx.state.merges, 0); assert.equal(ctx.state.publishes, 0); assert.equal(ctx.state.release, null);
+  assert.equal(ctx.leases.size, 0);
 });

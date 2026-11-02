@@ -264,10 +264,11 @@ export async function deliver(options) {
     await awaitChecks(ctx, pr.number, head, required);
     if (ctx.config.delivery?.release) {
       const manifest = parse(await readFile(path.join(ctx.cwd, 'package.json'), 'utf8'), 'reviewed release manifest');
+      const targetManifest = parse(await ctx.command('git', ['show', `${currentBase}:package.json`]), 'target release manifest');
       const assigned = ctx.run.releaseAssignment;
       const latest = (await publishedReleases(ctx)).at(-1);
-      if (!assigned?.prepared || assigned.version !== manifest.version || latest && compareVersion(assigned.version, latest.tagName.replace(/^v/, '')) <= 0) {
-        throw fail('stale_base', 'Release version assignment is stale; prepare, commit, test and review a fresh version before merging', { latestVersion: latest?.tagName });
+      if (!assigned?.prepared || assigned.version !== manifest.version || compareVersion(assigned.version, targetManifest.version) <= 0 || latest && compareVersion(assigned.version, latest.tagName.replace(/^v/, '')) <= 0) {
+        throw fail('stale_base', 'Release version assignment is stale; prepare, commit, test and review a fresh version before merging', { latestVersion: latest?.tagName, targetVersion: targetManifest.version });
       }
     }
     return await ctx.irreversible(async () => {
@@ -351,21 +352,27 @@ export async function prepareReleaseVersion(options) {
     const filename = path.join(ctx.cwd, 'package.json');
     const manifest = parse(await readFile(filename, 'utf8'), 'package.json');
     versionParts(manifest.version);
+    const targetSha = await fetchBase(ctx);
+    const targetVersion = parse(await ctx.command('git', ['show', `${targetSha}:package.json`]), 'target package manifest').version;
+    versionParts(targetVersion);
+    const floor = ctx.config.delivery?.firstVersion ?? '0.2.0';
+    versionParts(floor);
     const releases = parse(await ctx.command('gh', ['release', 'list', '--repo', ctx.repository, '--limit', '100', '--json', 'tagName,isDraft,isPrerelease']), 'release versions');
     const versions = releases.filter(item => !item.isDraft && !item.isPrerelease && /^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(item.tagName)).map(item => item.tagName.replace(/^v/, '')).sort(compareVersion);
     const latest = versions.at(-1);
     const saved = ctx.run.releaseAssignment;
     const previousVersion = saved?.version === manifest.version ? saved.previousVersion : manifest.version;
     let version;
-    if (saved && (manifest.version === saved.version || saved.baseSha === ctx.run.baseSha && manifest.version === saved.previousVersion) && (!latest || compareVersion(saved.version, latest) > 0)) version = saved.version;
+    if (saved && (manifest.version === saved.version || saved.baseSha === ctx.run.baseSha && manifest.version === saved.previousVersion) && compareVersion(saved.version, targetVersion) > 0 && compareVersion(saved.version, floor) >= 0 && (!latest || compareVersion(saved.version, latest) > 0)) version = saved.version;
     else if (ctx.config.delivery?.nextVersion) version = ctx.config.delivery.nextVersion;
-    else if (!latest) version = ctx.config.delivery?.firstVersion ?? '0.2.0';
     else {
-      const greatest = compareVersion(previousVersion, latest) > 0 ? previousVersion : latest;
-      const [major, minor, patch] = versionParts(greatest); version = `${major}.${minor}.${patch + 1}`;
+      const greatest = [previousVersion, targetVersion, latest].filter(Boolean).sort(compareVersion).at(-1);
+      const [major, minor, patch] = versionParts(greatest);
+      const bumped = `${major}.${minor}.${patch + 1}`;
+      version = compareVersion(bumped, floor) >= 0 ? bumped : floor;
     }
     versionParts(version);
-    if (latest && compareVersion(version, latest) <= 0) throw fail('release_version_mismatch', 'Assigned release version must be newer than published releases');
+    if (compareVersion(version, targetVersion) <= 0 || compareVersion(version, floor) < 0 || latest && compareVersion(version, latest) <= 0) throw fail('release_version_mismatch', 'Assigned release version must exceed target/published versions and satisfy the configured floor');
     // Save intent before atomic metadata writes so a crash cannot bump twice.
     const assignment = { version, previousVersion: saved?.version === version ? saved.previousVersion : previousVersion, baseSha: ctx.run.baseSha, prepared: false };
     await ctx.save({ releaseAssignment: assignment });

@@ -61,7 +61,7 @@ export class Engine {
     finally { clearInterval(timer); signal?.removeEventListener('abort', abort); this.store.releaseLease(token); }
   }
   checkCancelled(run, signal) { if (signal?.aborted || this.store.getRun(run.id).cancelRequested) throw Object.assign(new Error('Запуск отменён'), { code: 'cancelled' }); }
-  async session(run, request, signal, node) {
+  async session(run, request, signal, node, identity = node) {
     const stage = node ? run.plan.tasks.find(task => task.id === node.id).role : run.state === 'planning' ? 'plan' : request.readOnly ? 'review' : 'repair';
     request = { ...request, prompt: `${await this.policy(run, stage)}\nCoordinator contract: your completion report concerns the assigned scoped deliverable. Global integrated test/build/release gates are run by the coordinator after all changes and current main are integrated. A test author should run the new targeted tests and record independently confirmed pre-existing failures separately; never change or skip unrelated tests. Do not mark the overall pipeline published or deployed.\n${request.prompt}` };
     return this.withLease(run, `subscription:${request.client}`, run.config.concurrency, async signal => {
@@ -70,7 +70,7 @@ export class Engine {
       const abort = () => controller.abort(); signal?.addEventListener('abort', abort, { once: true });
       const timer = setInterval(() => { if (this.store.getRun(run.id).cancelRequested) controller.abort(); }, 500); timer.unref();
       try { return await this.provider.runSession({ ...request, signal: controller.signal, env: workerEnvironment(), onEvent: event => {
-        if (node && event.sessionId) { node.sessionId = event.sessionId; this.save(run); }
+        if (identity && event.sessionId) { identity.sessionId = event.sessionId; this.save(run); }
         this.log(run, 'session', { node: node?.id, ...event });
       } }); } finally { clearInterval(timer); signal?.removeEventListener('abort', abort); }
     }, signal);
@@ -136,6 +136,44 @@ export class Engine {
     }
     return files;
   }
+  async refreshNode(run, task, node, integratedHead, selected, signal) {
+    while (node.baseSha !== integratedHead || node.pendingRefresh) {
+      this.checkCancelled(run, signal);
+      const target = node.pendingRefresh?.headSha || integratedHead;
+      const pending = await execute('git', ['rev-parse', '--verify', 'MERGE_HEAD'], { cwd: node.cwd, allowFailure: true });
+      if (pending.code === 0 && pending.stdout.trim() !== target) throw Object.assign(new Error('Незавершённое обновление принадлежит другой ветке'), { code: 'merge_state' });
+      const included = await execute('git', ['merge-base', '--is-ancestor', target, 'HEAD'], { cwd: node.cwd, allowFailure: true });
+      if (pending.code !== 0 && included.code === 0) {
+        await this.checkScope(node.cwd, target, task.writePaths);
+        node.baseSha = target; delete node.pendingRefresh; this.save(run); continue;
+      }
+      let merged = { code: 1 };
+      if (pending.code !== 0) {
+        await this.checkScope(node.cwd, node.baseSha, task.writePaths);
+        await commitChanges(node.cwd, `Kodo preserve ${task.id} before base refresh`);
+        node.pendingRefresh = { headSha: target, model: selected.id }; this.save(run);
+        merged = await execute('git', ['merge', '--no-edit', target], { cwd: node.cwd, allowFailure: true });
+      } else if (!node.pendingRefresh) { node.pendingRefresh = { headSha: target, model: selected.id }; this.save(run); }
+      if (merged.code) {
+        if ((await execute('git', ['rev-parse', '--verify', 'MERGE_HEAD'], { cwd: node.cwd, allowFailure: true })).code !== 0) throw new Error(`Не удалось обновить задачу: ${merged.stderr}`);
+        const conflicts = (await git(node.cwd, ['diff', '--name-only', '--diff-filter=U'])).split('\n').filter(Boolean);
+        if (conflicts.some(file => !ownsPath(task.writePaths, file))) throw Object.assign(new Error(`Конфликт обновления вне области задачи: ${conflicts.join(', ')}`), { code: 'scope_conflict' });
+        if (conflicts.length) {
+          const state = node.pendingRefresh;
+          if (state.model !== selected.id) { state.model = selected.id; delete state.sessionId; this.save(run); }
+          const result = await this.session(run, { client: selected.client, model: selected.model, cwd: node.cwd, sessionId: state.sessionId, schema: resultSchema, prompt: `Resolve conflicts ${JSON.stringify(conflicts)} preserving both the assigned task work and current integrated upstream. Edit only ${JSON.stringify(task.writePaths)}. Do not commit, push, abort or change branches. Return completion JSON.` }, signal, undefined, state);
+          if (!result.output.complete) throw new Error('Конфликт обновления задачи не разрешён');
+          state.sessionId = result.sessionId; this.save(run);
+        }
+        await this.checkScope(node.cwd, target, task.writePaths);
+        await git(node.cwd, ['add', '-A']);
+        await execute('git', ['-c', 'core.whitespace=cr-at-eol,-blank-at-eol,-blank-at-eof,-space-before-tab', 'diff', '--cached', '--check'], { cwd: node.cwd });
+        await commitChanges(node.cwd, `Kodo refresh ${task.id}`);
+      }
+      await this.checkScope(node.cwd, target, task.writePaths);
+      node.baseSha = target; delete node.pendingRefresh; this.save(run);
+    }
+  }
   async performNode(run, task, signal) {
     const node = run.nodes[task.id] ||= { id: task.id, attempt: 0, status: 'pending' };
     if (['completed', 'integrated'].includes(node.status)) return;
@@ -147,22 +185,7 @@ export class Engine {
       if (!node.cwd) { node.baseSha = await git(run.cwd, ['rev-parse', 'HEAD']); node.cwd = path.join(run.worktreeRoot || path.dirname(run.cwd), task.id); node.branch = `kodo/${run.id}-${task.id}`; }
       await makeWorktree(run.project, node.cwd, node.branch, node.baseSha);
       const integratedHead = await git(run.cwd, ['rev-parse', 'HEAD']);
-      if (node.baseSha !== integratedHead) {
-        await this.checkScope(node.cwd, node.baseSha, task.writePaths);
-        await commitChanges(node.cwd, `Kodo preserve ${task.id} before base refresh`);
-        const merged = await execute('git', ['merge', '--no-edit', integratedHead], { cwd: node.cwd, allowFailure: true });
-        if (merged.code) {
-          const conflicts = (await git(node.cwd, ['diff', '--name-only', '--diff-filter=U'])).split('\n').filter(Boolean);
-          if (!conflicts.length || conflicts.some(file => !ownsPath(task.writePaths, file))) throw Object.assign(new Error(`Конфликт обновления задачи ${task.id}: ${conflicts.join(', ') || merged.stderr}`), { code: 'scope_conflict' });
-          const result = await this.session(run, { client: selected.client, model: selected.model, cwd: node.cwd, schema: resultSchema, prompt: `Resolve conflicts ${JSON.stringify(conflicts)} preserving both the assigned task work and current integrated upstream. Edit only ${JSON.stringify(task.writePaths)}. Do not commit, push, abort or change branches. Return completion JSON.` }, signal);
-          if (!result.output.complete) throw new Error('Конфликт обновления задачи не разрешён');
-          await this.checkScope(node.cwd, integratedHead, task.writePaths);
-          await git(node.cwd, ['add', '-A']);
-          await execute('git', ['-c', 'core.whitespace=cr-at-eol,-blank-at-eol,-blank-at-eof,-space-before-tab', 'diff', '--cached', '--check'], { cwd: node.cwd });
-          await commitChanges(node.cwd, `Kodo refresh ${task.id}`);
-        }
-        node.baseSha = integratedHead; this.save(run);
-      }
+      await this.refreshNode(run, task, node, integratedHead, selected, signal);
       await this.setup(node.cwd, run, signal);
       node.attempt++; node.status = 'running'; this.save(run);
       try {
