@@ -1,4 +1,13 @@
 import test from 'node:test';
+import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { Engine } from '../runtime/engine.mjs';
+import { Store } from '../runtime/store.mjs';
+import { execute } from '../runtime/command.mjs';
+import { workerEnvironment } from '../runtime/security.mjs';
 
 test('Failed commands retain the actual stdout failure alongside stderr notices for repair diagnosis', async () => {
   await assert.rejects(execute(process.execPath, ['-e', 'console.error("npm-style notice");console.log("required behavior assertion failed");process.exit(7);']), error => {
@@ -7,15 +16,6 @@ test('Failed commands retain the actual stdout failure alongside stderr notices 
     return true;
   });
 });
-import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
-import { chmod, lstat, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
-import os from 'node:os';
-import path from 'node:path';
-import { Engine } from '../runtime/engine.mjs';
-import { Store } from '../runtime/store.mjs';
-import { execute } from '../runtime/command.mjs';
-import { workerEnvironment } from '../runtime/security.mjs';
 
 const nullHooks = process.platform === 'win32' ? 'NUL' : '/dev/null';
 const shell = value => `'${value.replaceAll('\\', '/').replaceAll("'", "'\\''")}'`;
@@ -107,11 +107,11 @@ function foreignEnvironment(env, project) {
 test('Worker Git ignores inherited cross-repository selection variables', async t => {
   const f = await fixture(t), project = await f.repository('requested'), foreign = await f.repository('foreign');
   const contaminated = foreignEnvironment(f.env, foreign);
-  assert.equal(path.resolve(f.raw(project, ['rev-parse', '--show-toplevel'], contaminated)), foreign, 'positive control must select the foreign repository');
+  assert.equal(await realpath(path.resolve(f.raw(project, ['rev-parse', '--show-toplevel'], contaminated))), await realpath(foreign), 'positive control must select the foreign repository');
   const clean = workerEnvironment(contaminated);
   for (const name of selectors) assert.equal(Object.keys(clean).some(key => key.toUpperCase() === name), false, name);
   const child = await execute(process.execPath, ['--input-type=module', '-e', "import {execFileSync} from 'node:child_process'; process.stdout.write(execFileSync('git',['rev-parse','--show-toplevel'],{encoding:'utf8'}));"], { cwd: project, env: clean });
-  assert.equal(path.resolve(child.stdout.trim()), project);
+  assert.equal(await realpath(path.resolve(child.stdout.trim())), await realpath(project));
 });
 
 test('Coordinator Git commits only the requested repository despite inherited Git selectors', async t => {
