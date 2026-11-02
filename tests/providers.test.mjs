@@ -164,6 +164,18 @@ test('Discovery keeps providers isolated by default and excludes unavailable mod
   assert.equal(mixed.find(item => item.model === 'sonnet').verified, true);
 });
 
+test('Discovery respects configured model allowlists and never adds an unapproved primary', async () => {
+  const options = { config: { models: { codex: ['gpt-6.1-sol'], 'claude-code': ['sonnet'] } }, statusImpl: async () => ({ available: true }), cacheImpl: async () => [{ slug: 'gpt-6.1-sol' }, { slug: 'gpt-6-astra' }] };
+  const result = await discoverProviders({ client: 'codex', providers: 'both', primaryModel: 'gpt-6-astra' }, options);
+  assert.deepEqual(result.map(item => item.id), ['codex:gpt-6.1-sol', 'claude-code:sonnet']);
+  assert.ok(result.every(item => item.available));
+  const unavailable = await discoverProviders({ client: 'codex' }, { ...options, config: { models: { codex: ['not-in-catalog'] } } });
+  assert.deepEqual(unavailable.map(item => [item.model, item.available]), [['not-in-catalog', false]]);
+  const empty = await discoverProviders({ client: 'codex' }, { ...options, config: { models: { codex: [] } } });
+  assert.deepEqual(empty, []);
+  await assert.rejects(discoverProviders({ client: 'codex' }, { ...options, config: { models: { codex: 'gpt-6.1-sol' } } }), error => error.code === 'invalid_output');
+});
+
 test('HTTP requests retry transient service failures but surface auth and quota with redaction', async () => {
   let calls = 0;
   const result = await requestJson('https://api.example.test/data', { fetchImpl: async () => ++calls === 1 ? response({ error: 'retry' }, 503) : response({ ok: true }) });

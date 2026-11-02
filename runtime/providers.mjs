@@ -92,8 +92,10 @@ export async function discoverProviders({ client = 'codex', providers = 'current
     let availability;
     try { availability = await statusImpl(current); }
     catch (error) { availability = { available: false, error: error.message, code: error.code }; }
-    const primary = current === selectedClient && primaryModel ? primaryModel : config.primaryModels?.[current] || config.models?.[current]?.primary;
-    const models = [...new Set([primary, ...defaults[current]].filter(Boolean))];
+    const primary = current === selectedClient && primaryModel ? primaryModel : config.primaryModels?.[current];
+    const configured = config.models && Object.hasOwn(config.models, current) ? config.models[current] : defaults[current];
+    if (!Array.isArray(configured) || configured.some(model => typeof model !== 'string' || !/^\S{1,128}$/.test(model))) throw new ProviderError(`Некорректный allowlist моделей ${current}`, 'invalid_output');
+    const models = [...new Set([...(primary && configured.includes(primary) ? [primary] : []), ...configured])];
     for (const model of models) {
       const cached = current !== 'codex' || !cache.length || cachedIds.has(model);
       let entry = { id: `${current}:${model}`, client: current, model, available: availability.available && cached, verified: false, auth: 'subscription', ...(availability.error ? { error: availability.error, code: availability.code } : {}), ...(!cached ? { error: 'Модель отсутствует в каталоге Codex' } : {}) };

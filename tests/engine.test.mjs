@@ -6,7 +6,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { Engine } from '../runtime/engine.mjs';
 import { Store } from '../runtime/store.mjs';
-import { makeWorktree } from '../runtime/workspace.mjs';
+import { makeWorktree, diffHash } from '../runtime/workspace.mjs';
+import { createHash } from 'node:crypto';
 
 const read = filename => readFile(filename, 'utf8');
 async function exists(filename) { try { await access(filename); return true; } catch (error) { if (error.code === 'ENOENT') return false; throw error; } }
@@ -70,6 +71,33 @@ const featurePlan = () => ({
   ]
 });
 
+test('Engine saves cannot overwrite cancellation from another coordinator connection', async t => {
+  const fx = await fixture(t);
+  const store = fx.openStore(), other = fx.openStore();
+  const engine = new Engine({ store });
+  const run = await engine.create('cancel persisted work', { project: fx.project });
+  run.cancelRequested = false;
+  other.updateRun(run.id, { cancelRequested: true, state: 'cancelled' });
+  run.state = 'implementing';
+  engine.save(run);
+  assert.equal(other.getRun(run.id).cancelRequested, true);
+  assert.equal(other.getRun(run.id).state, 'cancelled');
+});
+
+test('Engine allows credential-handling source text and hashes its exact Git diff while rejecting actual secrets', async t => {
+  const fx = await fixture(t);
+  const secret = 'fixture-configured-private-value';
+  const engine = new Engine({ store: fx.openStore(), secrets: { GEMINI_API_KEY: secret } });
+  const file = path.join(fx.project, 'src/value.mjs');
+  await writeFile(file, 'export const auth = token => `Bearer ${token}`;\n');
+  assert.deepEqual(await engine.checkScope(fx.project, fx.base, ['src/value.mjs']), ['src/value.mjs']);
+  git(fx.project, 'add', '.'); git(fx.project, 'commit', '-m', 'credential handling source');
+  const native = git(fx.project, 'diff', '--binary', `${fx.base}...HEAD`);
+  assert.equal(await diffHash(fx.project, fx.base), createHash('sha256').update(native.trimEnd()).digest('hex'));
+  await writeFile(file, `export const accidental = '${secret}';\n`);
+  await assert.rejects(engine.checkScope(fx.project, fx.base, ['src/value.mjs']), /Секрет обнаружен/);
+});
+
 function fakeServices({ plan = featurePlan(), onWorker, onReview, onDiscover } = {}) {
   const calls = { analysis: 0, research: 0, planner: 0, worker: [], review: [], delivery: 0, release: 0, decisions: [] };
   const provider = {
@@ -83,7 +111,7 @@ function fakeServices({ plan = featurePlan(), onWorker, onReview, onDiscover } =
     },
     decideJev: async ({ node: task, attempt }) => {
       calls.decisions.push({ id: task.id, attempt });
-      return { model: 'codex-sol', parallel: true, confidence: 0.95, sessionMode: 'separate' };
+      return { model: 'codex-sol', parallel: true, confidence: 0.95, sessionMode: 'fresh' };
     },
     runSession: async request => {
       if (request.schema.properties.tasks) { calls.planner++; return { sessionId: 'planner-fixture', output: plan }; }
@@ -323,7 +351,7 @@ test('Engine uses one routing decision per attempt so parallel admission matches
     const count = (decisions.get(task.id) || 0) + 1;
     decisions.set(task.id, count);
     if (count > 1) throw Object.assign(new Error('routing is unavailable after admission'), { code: 'unavailable' });
-    return { model: 'codex-sol', parallel: true, confidence: 0.95, sessionMode: 'separate' };
+    return { model: 'codex-sol', parallel: true, confidence: 0.95, sessionMode: 'fresh' };
   };
   const engine = new Engine({ store: fx.openStore(), ...services });
   const run = await engine.create('Create two independent files', { project: fx.project });
@@ -579,4 +607,69 @@ test('Engine scopes review repairs to the repair starting head instead of earlie
   assert.equal(result.checks.headSha, result.headSha);
   assert.equal(result.review.headSha, result.headSha);
   assert.equal(await exists(path.join(fx.project, 'coordinator-release-version.txt')), false);
+});
+
+test('Engine refreshes a retried node from integrated upstream while preserving its scoped unfinished tests', async t => {
+  const fx = await fixture(t, { testScript: 'process.exit(0);\n' });
+  const task = node('tests', 'tester', ['tests/retained.mjs']);
+  const services = fakeServices({ plan: { summary: 'Preserve pending test', tasks: [task] }, onWorker: async request => {
+    assert.equal(await read(path.join(request.cwd, 'upstream-fix.txt')), 'fixed baseline\n');
+    assert.equal(await read(path.join(request.cwd, 'tests/retained.mjs')), 'unfinished test content\n');
+    return { sessionId: 'refreshed-test', output: { summary: 'preserved and checked', checks: ['baseline observed'], complete: true } };
+  } });
+  const store = fx.openStore(), engine = new Engine({ store, ...services });
+  const run = await engine.create('Refresh a retried test', { project: fx.project });
+  await engine.prepare(run); run.plan = { summary: 'Preserve pending test', tasks: [task] }; run.models = await services.provider.discoverProviders();
+  const cwd = path.join(store.home, 'worktrees', run.id, task.id), branch = `kodo/${run.id}-${task.id}`;
+  await makeWorktree(fx.project, cwd, branch, fx.base);
+  await mkdir(path.join(cwd, 'tests')); await writeFile(path.join(cwd, 'tests/retained.mjs'), 'unfinished test content\n');
+  run.nodes[task.id] = { id: task.id, status: 'pending', attempt: 0, cwd, branch, baseSha: fx.base };
+  await writeFile(path.join(run.cwd, 'upstream-fix.txt'), 'fixed baseline\n'); git(run.cwd, 'add', '.'); git(run.cwd, 'commit', '-m', 'Integrated baseline fix');
+  engine.save(run); const head = git(run.cwd, 'rev-parse', 'HEAD');
+  await engine.performNode(run, task);
+  assert.equal(run.nodes.tests.status, 'completed'); assert.equal(run.nodes.tests.baseSha, head);
+  assert.deepEqual(run.nodes.tests.changedFiles, ['tests/retained.mjs']);
+  assert.equal(await exists(path.join(fx.project, 'tests/retained.mjs')), false);
+});
+
+test('Engine reassigns a stale release version and repeats checks and review before retrying delivery', async t => {
+  const fx = await fixture(t, { remote: true, testScript: 'process.exit(0);\n' });
+  const plan = { summary: 'Set value two', tasks: [node('feature', 'developer', ['src/value.mjs'])] };
+  const services = fakeServices({ plan }); let assignments = 0;
+  services.delivery.prepareReleaseVersion = async ({ cwd }) => {
+    assignments++; await writeFile(path.join(cwd, 'assigned-version.txt'), `0.2.${assignments}\n`);
+  };
+  services.delivery.deliver = async ({ run, review }) => {
+    services.calls.delivery++;
+    if (services.calls.delivery === 1) throw Object.assign(new Error('Version claimed by another task'), { code: 'stale_base' });
+    assert.equal(assignments, 2); assert.equal(await read(path.join(run.cwd, 'assigned-version.txt')), '0.2.2\n');
+    assert.equal(review.headSha, git(run.cwd, 'rev-parse', 'HEAD')); assert.equal(run.checks.headSha, review.headSha);
+    return { mergeCommit: review.headSha, pr: { number: 1 } };
+  };
+  const engine = new Engine({ store: fx.openStore(), ...services });
+  const run = await engine.create('Release version refresh', { project: fx.project }); const result = await engine.run(run.id);
+  assert.equal(result.state, 'succeeded', result.error?.message); assert.equal(assignments, 2);
+  assert.equal(services.calls.review.length, 2); assert.equal(services.calls.release, 1);
+});
+
+test('Engine follows Jev fresh session decisions after a defect and uses the configured primary model on fallback', async t => {
+  const fx = await fixture(t, { config: { repairRounds: 2 }, testScript: 'process.exit(0);\n' });
+  const task = node('feature', 'developer', ['src/value.mjs']);
+  const services = fakeServices({ plan: { summary: 'Repair with a fresh session', tasks: [task] }, onWorker: async (request, calls) => {
+    assert.equal(request.sessionId, undefined, 'a confirmed defect with Jev=fresh must get a new session');
+    return { sessionId: `attempt-${calls.worker.length}`, output: { summary: 'attempt', checks: [], complete: calls.worker.length > 1 } };
+  } });
+  services.provider.decideJev = async ({ node: candidate, attempt }) => {
+    if (attempt > 0) assert.equal(candidate.sessionId, 'attempt-1');
+    return { model: 'codex-sol', parallel: false, confidence: 0.95, sessionMode: 'fresh' };
+  };
+  const engine = new Engine({ store: fx.openStore(), ...services });
+  const run = await engine.create('Fresh session after a defect', { project: fx.project }); const result = await engine.run(run.id);
+  assert.equal(result.state, 'succeeded', result.error?.message); assert.equal(services.calls.worker.length, 2);
+  result.config.primaryModel = 'gpt-6-astra';
+  services.provider.decideJev = async () => ({ model: 'codex-sol', fallback: true, confidence: 0, parallel: false });
+  const selected = await engine.route(result, task, { attempt: 0 });
+  assert.equal(selected.id, 'codex-astra');
+  services.provider.decideJev = async () => ({ model: 'codex-sol', parallel: 'yes', confidence: 1.5 });
+  await assert.rejects(engine.route(result, task, { attempt: 0 }), { code: 'invalid_output' });
 });

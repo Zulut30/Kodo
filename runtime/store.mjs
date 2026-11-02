@@ -24,9 +24,17 @@ export class Store {
     this.event(value.id, 'created', { task: value.task }); return value;
   }
   getRun(id) { const row = this.db.prepare('SELECT body FROM runs WHERE id=?').get(id); if (!row) throw new Error(`Запуск не найден: ${id}`); return JSON.parse(row.body); }
-  updateRun(id, patch) {
+  updateRun(id, patch, { preserveCancellation = false } = {}) {
     this.db.exec('BEGIN IMMEDIATE');
-    try { const run = { ...this.getRun(id), ...patch, updatedAt: new Date().toISOString() }; this.db.prepare('UPDATE runs SET body=?,updated=? WHERE id=?').run(JSON.stringify(redact(run, this.secrets)), Date.now(), id); this.db.exec('COMMIT'); return run; }
+    try {
+      const current = this.getRun(id);
+      const run = { ...current, ...patch, updatedAt: new Date().toISOString() };
+      if (preserveCancellation) {
+        run.cancelRequested = Boolean(current.cancelRequested);
+        if (run.cancelRequested && !run.release?.published) run.state = 'cancelled';
+      }
+      this.db.prepare('UPDATE runs SET body=?,updated=? WHERE id=?').run(JSON.stringify(redact(run, this.secrets)), Date.now(), id); this.db.exec('COMMIT'); return run;
+    }
     catch (error) { this.db.exec('ROLLBACK'); throw error; }
   }
   listRuns(project) { return this.db.prepare('SELECT body FROM runs ORDER BY updated DESC').all().map(row => JSON.parse(row.body)).filter(run => !project || projectKey(run.project) === projectKey(project)); }

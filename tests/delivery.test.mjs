@@ -44,7 +44,7 @@ async function fixture(t, { brokenCli = false } = {}) {
   await git('switch', '-c', 'kodo/test-run'); await writeFile(path.join(project, 'feature.txt'), 'feature\n');
   await git('add', '.'); await git('commit', '-m', 'feature');
   const headSha = await git('rev-parse', 'HEAD');
-  const run = { id: 'run-test', project, branch: 'kodo/test-run', task: 'Implement tested feature', baseSha, headSha };
+  const run = { id: 'run-test', project, branch: 'kodo/test-run', task: 'Implement tested feature', baseSha, headSha, releaseAssignment: { version: '0.2.0', previousVersion: '0.1.0', baseSha, prepared: true } };
   const review = { passed: true, headSha, diffHash: digest((await execute('git', ['diff', '--binary', `${baseSha}...${headSha}`], { cwd: project })).stdout.trimEnd()) };
   const leases = new Map(), updates = [], events = [], calls = [];
   const store = {
@@ -53,7 +53,7 @@ async function fixture(t, { brokenCli = false } = {}) {
     updateRun(id, patch) { assert.equal(id, run.id); updates.push(structuredClone(patch)); Object.assign(run, patch); },
     event(id, type, data) { events.push({ id, type, data }); }
   };
-  const state = { pr: null, creates: 0, merges: 0, check: 'SUCCESS', protected: true, release: null, publishes: 0, status: null };
+  const state = { pr: null, creates: 0, merges: 0, check: 'SUCCESS', protected: true, release: null, releaseCreates: 0, uploads: 0, publishes: 0, status: null };
   const assets = path.join(root, 'published'); await mkdir(assets);
   const exec = async (command, args, options) => {
     calls.push({ command, args });
@@ -70,27 +70,43 @@ async function fixture(t, { brokenCli = false } = {}) {
     if (args[0] === 'pr' && args[1] === 'view') return output({ ...state.pr, headRefOid: headSha, baseRefName: 'main', mergeCommit: state.pr?.state === 'MERGED' ? { oid: headSha } : null, statusCheckRollup: [{ name: 'ci', conclusion: state.check }, { context: 'kodo/review', state: state.status ?? 'PENDING' }] });
     if (args[0] === 'pr' && args[1] === 'merge') {
       assert.ok(args.includes('--match-head-commit')); assert.ok(!args.includes('--admin'));
+      if (config.delivery.release) assert.ok(leases.has('release:test/kodo:main'));
       state.merges++; state.pr.state = 'MERGED'; await git('push', 'origin', `${headSha}:main`); return output('');
     }
     if (args[0] === 'release' && args[1] === 'list') {
-      const available = state.releaseList ?? (state.release ? [{ tagName: state.release.tag, isDraft: false, isPrerelease: false }] : []);
+      const available = state.releaseList ?? (state.release ? [{ tagName: state.release.tag, isDraft: Boolean(state.release.isDraft), isPrerelease: Boolean(state.release.isPrerelease) }] : []);
       return output(available.slice(0, Number(args[args.indexOf('--limit') + 1])));
     }
     if (args[0] === 'release' && args[1] === 'create') {
-      state.publishes++;
+      state.releaseCreates++;
       const tag = args[2], artifact = args[3], sums = args[4];
       assert.equal(args[args.indexOf('--target') + 1], headSha);
       assert.ok(!args.includes('--clobber'));
       assert.ok(args.includes('--latest=false'));
       await copyFile(artifact, path.join(assets, path.basename(artifact))); await copyFile(sums, path.join(assets, 'SHA256SUMS'));
-      await git('tag', tag, headSha); await git('push', 'origin', tag);
-      state.release = { tag, filename: path.basename(artifact), url: `https://github.com/test/kodo/releases/tag/${tag}` };
+      const isDraft = args.includes('--draft');
+      if (!isDraft) { state.publishes++; await git('tag', tag, headSha); await git('push', 'origin', tag); }
+      const body = await readFile(args[args.indexOf('--notes-file') + 1], 'utf8');
+      state.release = { tag, filename: path.basename(artifact), url: `https://github.com/test/kodo/releases/tag/${tag}`, isDraft, body, targetCommitish: headSha };
       return output(state.release.url);
     }
-    if (args[0] === 'release' && args[1] === 'view') return output({ tagName: state.release.tag, url: state.release.url, assets: (await readdir(assets)).map(name => ({ name })) });
+    if (args[0] === 'release' && args[1] === 'view') return output({ tagName: state.release.tag, url: state.release.url, assets: (await readdir(assets)).map(name => ({ name })), isDraft: Boolean(state.release.isDraft), isPrerelease: Boolean(state.release.isPrerelease), body: state.release.body ?? '', targetCommitish: state.release.targetCommitish ?? headSha });
     if (args[0] === 'release' && args[1] === 'upload') {
       assert.ok(!args.includes('--clobber'));
+      state.uploads++;
       await copyFile(args[3], path.join(assets, path.basename(args[3])), constants.COPYFILE_EXCL); return output('');
+    }
+    if (args[0] === 'release' && args[1] === 'edit') {
+      assert.ok(args.includes('--draft=false')); assert.ok(args.includes('--latest=false'));
+      assert.equal(args[args.indexOf('--target') + 1], headSha);
+      if (state.release.isDraft) {
+        const current = await execute('git', ['rev-parse', '--verify', `refs/tags/${state.release.tag}^{commit}`], { cwd: project, allowFailure: true });
+        if (current.code) await git('tag', state.release.tag, headSha);
+        else assert.equal(current.stdout.trim(), headSha);
+        await git('push', 'origin', state.release.tag);
+        state.publishes++; state.release.isDraft = false;
+      }
+      return output('');
     }
     if (args[0] === 'release' && args[1] === 'download') {
       const filename = args[args.indexOf('--pattern') + 1], directory = args[args.indexOf('--dir') + 1];
@@ -111,12 +127,15 @@ test('Delivery checks require success and reject skipped missing duplicate and f
   assert.throws(() => validateChecks([], []), { code: 'configuration' });
 });
 
-test('Release freshness rejects older source and version while permitting exact reconciliation', () => {
+test('Release freshness requires ancestry and excludes equal newer or backward publications', () => {
   assert.equal(assertFreshRelease({ candidateSha: 'a', remoteHead: 'a', version: '0.2.0' }), true);
   assert.throws(() => assertFreshRelease({ candidateSha: 'a', remoteHead: 'b', version: '0.2.0' }), { code: 'stale_release' });
   assert.throws(() => assertFreshRelease({ candidateSha: 'a', remoteHead: 'a', latestSha: 'b', latestVersion: 'v0.3.0', version: '0.2.0' }), { code: 'stale_release' });
   assert.throws(() => assertFreshRelease({ candidateSha: 'a', remoteHead: 'a', latestSha: 'b', latestVersion: 'v0.2.0', version: '0.2.0' }), { code: 'stale_release' });
-  assert.equal(assertFreshRelease({ candidateSha: 'a', remoteHead: 'a', latestSha: 'a', latestVersion: 'v0.2.0', version: '0.2.0' }), true);
+  assert.throws(() => assertFreshRelease({ candidateSha: 'a', remoteHead: 'a', latestSha: 'a', latestVersion: 'v0.2.0', version: '0.2.0' }), { code: 'stale_release' });
+  assert.equal(assertFreshRelease({ candidateSha: 'a', remoteHead: 'later', candidateIsAncestor: true, version: '0.2.0' }), true);
+  assert.equal(assertFreshRelease({ candidateSha: 'candidate', remoteHead: 'later', candidateIsAncestor: true, latestSha: 'earlier', containsLatest: true, latestVersion: 'v0.2.0', version: '0.3.0' }), true);
+  assert.throws(() => assertFreshRelease({ candidateSha: 'a', remoteHead: 'later', candidateIsAncestor: true, latestSha: 'published', latestVersion: 'v0.2.0', version: '0.3.0' }), { code: 'stale_release' });
   assert.throws(() => assertFreshRelease({ candidateSha: 'a', remoteHead: 'a', version: 'latest' }), { code: 'release_version_mismatch' });
 });
 
@@ -187,7 +206,9 @@ test('Release packages exact merged commit installs artifact and reconciles with
 test('Release never publishes an old source commit or a package failing installed smoke', async t => {
   const old = await fixture(t);
   await old.git('push', 'origin', `${old.run.headSha}:main`);
-  await assert.rejects(releasePackage({ ...old, mergeCommit: old.run.baseSha }), { code: 'stale_release' });
+  const tree = await old.git('rev-parse', 'HEAD^{tree}');
+  const unrelated = await old.git('commit-tree', tree, '-m', 'unrelated history');
+  await assert.rejects(releasePackage({ ...old, mergeCommit: unrelated }), { code: 'stale_release' });
   assert.equal(old.state.publishes, 0); assert.equal(old.leases.size, 0);
   const broken = await fixture(t, { brokenCli: true });
   await broken.git('push', 'origin', `${broken.run.headSha}:main`);
@@ -366,4 +387,60 @@ test('Cancellation before irreversible publication prevents release creation', a
   };
   await assert.rejects(releasePackage({ ...ctx, mergeCommit: delivered.mergeCommit, signal: controller.signal }), { code: 'cancelled' });
   assert.equal(ctx.state.publishes, 0); assert.equal(ctx.run.delivery.release, undefined); assert.equal(ctx.leases.size, 0);
+});
+
+test('Release publishes an unreleased merged ancestor after main advances', async t => {
+  const ctx = await fixture(t);
+  const delivered = await deliver(ctx);
+  await writeFile(path.join(ctx.project, 'newer-work.txt'), 'parallel task\n');
+  await ctx.git('add', 'newer-work.txt'); await ctx.git('commit', '-m', 'parallel task'); await ctx.git('push', 'origin', 'HEAD:main');
+  assert.notEqual(await ctx.git('rev-parse', 'origin/main'), delivered.mergeCommit);
+  const receipt = await releasePackage({ ...ctx, mergeCommit: delivered.mergeCommit });
+  assert.equal(receipt.commit, delivered.mergeCommit); assert.equal(receipt.published, true);
+  assert.equal(await ctx.git('rev-parse', 'refs/tags/v0.2.0^{commit}'), delivered.mergeCommit);
+  assert.equal(ctx.state.releaseCreates, 1); assert.equal(ctx.state.publishes, 1);
+});
+
+test('Interrupted owned draft is completed and published without a second creation', async t => {
+  const ctx = await fixture(t);
+  const delivered = await deliver(ctx), runner = ctx.exec;
+  ctx.exec = async (command, args, options) => {
+    const result = await runner(command, args, options);
+    if (command === 'gh' && args[0] === 'release' && args[1] === 'create') {
+      await rm(path.join(ctx.assets, 'SHA256SUMS'));
+      throw Object.assign(new Error('interrupted after draft creation'), { code: 'simulated_disconnect' });
+    }
+    return result;
+  };
+  await assert.rejects(releasePackage({ ...ctx, mergeCommit: delivered.mergeCommit }), { code: 'simulated_disconnect' });
+  assert.equal(ctx.state.release.isDraft, true); assert.equal(ctx.state.publishes, 0); assert.equal(ctx.state.releaseCreates, 1);
+  ctx.exec = runner;
+  const receipt = await releasePackage({ ...ctx, mergeCommit: delivered.mergeCommit });
+  assert.equal(receipt.published, true); assert.equal(ctx.state.release.isDraft, false);
+  assert.equal(ctx.state.releaseCreates, 1); assert.equal(ctx.state.publishes, 1); assert.equal(ctx.state.uploads, 1);
+  assert.equal(ctx.run.delivery.release.sha256, receipt.sha256); assert.equal(ctx.leases.size, 0);
+});
+
+test('Release never changes an unrelated matching-tag draft', async t => {
+  const ctx = await fixture(t);
+  await ctx.git('push', 'origin', `${ctx.run.headSha}:main`);
+  ctx.state.release = { tag: 'v0.2.0', isDraft: true, targetCommitish: ctx.run.headSha, body: 'Human draft; unrelated to this Kodo run', url: 'https://github.com/test/kodo/releases/tag/v0.2.0' };
+  await assert.rejects(releasePackage({ ...ctx, mergeCommit: ctx.run.headSha }), { code: 'release_conflict' });
+  assert.equal(ctx.state.release.body, 'Human draft; unrelated to this Kodo run');
+  assert.equal(ctx.state.releaseCreates, 0); assert.equal(ctx.state.publishes, 0); assert.equal(ctx.state.uploads, 0);
+  assert.equal(ctx.calls.some(call => call.command === 'gh' && call.args[0] === 'release' && ['edit', 'upload', 'create'].includes(call.args[1])), false);
+  assert.equal(ctx.leases.size, 0);
+});
+
+test('Merge rechecks release assignment under the shared publication lease after CI', async t => {
+  const ctx = await fixture(t), runner = ctx.exec;
+  let views = 0, checkedWhileLocked = false;
+  ctx.exec = async (command, args, options) => {
+    if (command === 'gh' && args[0] === 'pr' && args[1] === 'view' && ++views === 2) ctx.state.release = { tag: 'v0.2.0' };
+    if (command === 'gh' && args[0] === 'release' && args[1] === 'list') checkedWhileLocked = ctx.leases.has('merge:test/kodo:main') && ctx.leases.has('release:test/kodo:main');
+    return runner(command, args, options);
+  };
+  await assert.rejects(deliver(ctx), { code: 'stale_base' });
+  assert.equal(checkedWhileLocked, true); assert.equal(ctx.state.merges, 0); assert.equal(ctx.run.delivery.pr.number, 7);
+  assert.equal(ctx.leases.size, 0);
 });

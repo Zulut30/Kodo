@@ -4,7 +4,7 @@ import path from 'node:path';
 import { execute } from './command.mjs';
 import { secretFile, redact } from './security.mjs';
 export async function git(cwd, args, options = {}) { return (await execute('git', args, { cwd, ...options })).stdout.trim(); }
-export async function diffHash(cwd, baseSha, headSha = 'HEAD') { return createHash('sha256').update((await execute('git', ['diff', '--binary', `${baseSha}...${headSha}`], { cwd })).stdout.trimEnd()).digest('hex'); }
+export async function diffHash(cwd, baseSha, headSha = 'HEAD') { return createHash('sha256').update((await execute('git', ['diff', '--binary', `${baseSha}...${headSha}`], { cwd, rawOutput: true })).stdout.trimEnd()).digest('hex'); }
 export async function inspectProject(project) {
   const root = await git(project, ['rev-parse', '--show-toplevel']);
   const head = await git(root, ['rev-parse', 'HEAD']);

@@ -33,6 +33,12 @@ test('Worker environment removes all provider secrets and endpoint overrides', (
   const env = workerEnvironment({ PATH: 'allowed', GEMINI_API_KEY: 'private', TYPESAFE_API_KEY: 'private', SCRAPEDO_TOKEN: 'private', GETX_API_KEY: 'private', REDDIT_API_KEY: 'private', GH_TOKEN: 'private', OPENAI_API_KEY: 'private', ANTHROPIC_API_KEY: 'private', OPENAI_BASE_URL: 'private', ANTHROPIC_BASE_URL: 'private', NPM_TOKEN: 'private', AWS_SECRET_ACCESS_KEY: 'private', AWS_SESSION_TOKEN: 'private', DATABASE_URL: 'private', DB_PASSWORD: 'private', KODO_OTHER: 'private', CODEX_APP_TOOLS_PIPE_PATH: 'parent' });
   assert.deepEqual(env, { PATH: 'allowed' }); assert.equal(redact('https://example.test/?token=private&x=1 Bearer abcdefgh123'), 'https://example.test/?token=[REDACTED]&x=1 Bearer [REDACTED]');
 });
+
+test('Redaction preserves JSON structure while removing secrets containing quotes and backslashes', () => {
+  const secret = 'fixture-"quoted"-\\credential';
+  const value = { nested: [{ text: `before ${secret} after` }], literal: 'ordinary "quoted" text' };
+  assert.deepEqual(redact(value, { KEY: secret }), { nested: [{ text: 'before [REDACTED] after' }], literal: value.literal });
+});
 test('Plan contracts reject malformed graphs and forbidden scopes while overlap stays conservative', () => {
   const plan = { summary: 'feature', tasks: [{ id: 'one', role: 'developer', description: 'feature', dependsOn: [], writePaths: ['src/**'], acceptance: ['works'], parallel: true }] };
   assert.equal(validatePlan(plan), plan); assert.equal(ownsPath(['src/**'], 'src/feature.mjs'), true); assert.equal(ownsPath(['src/**'], 'test/feature.mjs'), false);

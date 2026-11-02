@@ -66,7 +66,7 @@ function services({ failWorker = false } = {}) {
       { id: 'codex-sol', client: 'codex', model: 'gpt-6.1-sol', available: true },
       { id: 'codex-astra', client: 'codex', model: 'gpt-6-astra', available: true }
     ],
-    decideJev: async () => ({ model: 'codex-sol', confidence: 0.99, parallel: true, sessionMode: 'separate' }),
+    decideJev: async () => ({ model: 'codex-sol', confidence: 0.99, parallel: true, sessionMode: 'fresh' }),
     runSession: async request => {
       calls.sessions.push(request);
       let output;

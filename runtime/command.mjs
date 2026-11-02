@@ -13,7 +13,7 @@ export function resolveCommand(command, args) {
   }
   return { command, args };
 }
-export async function execute(command, args = [], { cwd, env = process.env, signal, input, timeoutMs = 1800000, allowFailure = false, secrets = {} } = {}) {
+export async function execute(command, args = [], { cwd, env = process.env, signal, input, timeoutMs = 1800000, allowFailure = false, secrets = {}, rawOutput = false } = {}) {
   const resolved = resolveCommand(command, args);
   return new Promise((resolve, reject) => {
     const child = spawn(resolved.command, resolved.args, { cwd, env, windowsHide: true, shell: false, stdio: ['pipe', 'pipe', 'pipe'] });
@@ -26,9 +26,10 @@ export async function execute(command, args = [], { cwd, env = process.env, sign
     child.on('error', error => { clearTimeout(timeout); signal?.removeEventListener('abort', stop); reject(error); });
     child.on('close', code => {
       clearTimeout(timeout); signal?.removeEventListener('abort', stop);
-      const result = { stdout: redact(stdout, secrets), stderr: redact(stderr, secrets), code };
+      const clean = { stdout: redact(stdout, secrets), stderr: redact(stderr, secrets), code };
+      const result = rawOutput ? { stdout, stderr, code } : clean;
       if (stopped) reject(Object.assign(new Error('Команда отменена или превысила лимит времени'), { code: signal?.aborted ? 'cancelled' : 'timeout' }));
-      else if (code && !allowFailure) reject(Object.assign(new Error(`${command} завершился с кодом ${code}: ${result.stderr || result.stdout}`), { code: 'command_failed', result }));
+      else if (code && !allowFailure) reject(Object.assign(new Error(`${command} завершился с кодом ${code}: ${clean.stderr || clean.stdout}`), { code: 'command_failed', result: clean }));
       else resolve(result);
     });
     child.stdin.on('error', () => {}); child.stdin.end(input);

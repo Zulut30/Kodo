@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { Store } from './store.mjs';
 import { loadSecrets, redact, workerEnvironment, secretFile } from './security.mjs';
 import { readConfig } from './config.mjs';
-import { validatePlan, validate, planSchema, resultSchema, reviewSchema, ownsPath, scopesOverlap } from './contracts.mjs';
+import { validatePlan, validate, planSchema, resultSchema, reviewSchema, routingSchema, ownsPath, scopesOverlap } from './contracts.mjs';
 import { execute } from './command.mjs';
 import { git, inspectProject, makeWorktree, collectFiles, changedFiles, commitChanges, diffHash } from './workspace.mjs';
 import * as providers from './providers.mjs';
@@ -21,7 +21,7 @@ export class Engine {
     this.store = store || new Store(undefined, secrets); this.secrets = secrets; this.provider = provider; this.researcher = researcher; this.delivery = delivery; this.onEvent = onEvent;
   }
   log(run, type, data = {}) { const clean = redact(data, this.secrets); this.store.event(run.id, type, clean); this.onEvent({ runId: run.id, type, data: clean }); }
-  save(run) { return this.store.updateRun(run.id, run); }
+  save(run) { const { cancelRequested, ...snapshot } = run; return this.store.updateRun(run.id, snapshot, { preserveCancellation: true }); }
   async policy(run, stage) {
     const policy = await loadDefaultPolicy({ project: run.cwd, stage, task: run.task, run });
     run.defaultSkills ||= {}; run.defaultSkills[stage] = { hash: policy.hash, skills: policy.skills }; this.save(run);
@@ -103,9 +103,12 @@ export class Engine {
   }
   async route(run, task, state, signal) {
     let decision;
-    try { decision = await this.provider.decideJev({ task: run.task, models: run.models, node: task, attempt: state.attempt || 0 }, { secrets: this.secrets }); }
+    try { decision = await this.provider.decideJev({ task: run.task, models: run.models, node: { ...task, sessionId: state.sessionId }, attempt: state.attempt || 0 }, { secrets: this.secrets }); }
     catch (error) { this.log(run, 'routing_fallback', { node: task.id, reason: error.message }); decision = { model: run.models.find(item => item.client === run.client && item.model === (run.config.primaryModel || defaultModel(run.client)))?.id || run.models.find(item => item.client === run.client)?.id, parallel: false, confidence: 0, fallback: true }; }
-    let selected = run.models.find(item => item.id === decision.model);
+    validate(routingSchema, decision);
+    let selected = decision.fallback
+      ? run.models.find(item => item.client === run.client && item.model === (run.config.primaryModel || defaultModel(run.client))) || run.models.find(item => item.client === run.client)
+      : run.models.find(item => item.id === decision.model);
     if (!selected) throw new Error('Маршрутизатор выбрал недоступную модель');
     if (!decision.fallback && decision.confidence < 0.6) selected = run.models.find(item => item.client === selected.client && /astra|opus/.test(item.model)) || selected;
     state.routing = { ...decision, model: selected.id, parallel: Boolean(decision.parallel && decision.confidence >= 0.6) };
@@ -120,7 +123,7 @@ export class Engine {
     for (const name of files) {
       const stat = await lstatSafe(path.join(cwd, name));
       if (stat?.isSymbolicLink()) throw new Error(`Ссылка в изменениях не разрешена: ${name}`);
-      if (stat?.isFile() && stat.size < 2000000) { const data = await readFile(path.join(cwd, name), 'utf8'); if (redact(data, this.secrets) !== data) throw new Error(`Секрет обнаружен в изменениях: ${name}`); }
+      if (stat?.isFile() && stat.size < 2000000) { const data = await readFile(path.join(cwd, name), 'utf8'); if (Object.values(this.secrets).some(secret => typeof secret === 'string' && secret.length > 5 && data.includes(secret))) throw new Error(`Секрет обнаружен в изменениях: ${name}`); }
     }
     return files;
   }
@@ -133,20 +136,38 @@ export class Engine {
       const selected = node.routing ? run.models.find(model => model.id === node.routing.model) : await this.route(run, task, node, signal);
       if (!selected) throw new Error('Сохранённая модель задачи больше недоступна');
       if (!node.cwd) { node.baseSha = await git(run.cwd, ['rev-parse', 'HEAD']); node.cwd = path.join(this.store.home, 'worktrees', run.id, task.id); node.branch = `kodo/${run.id}-${task.id}`; }
-      await makeWorktree(run.project, node.cwd, node.branch, node.baseSha); await this.setup(node.cwd, run, signal);
+      await makeWorktree(run.project, node.cwd, node.branch, node.baseSha);
+      const integratedHead = await git(run.cwd, ['rev-parse', 'HEAD']);
+      if (node.baseSha !== integratedHead) {
+        await this.checkScope(node.cwd, node.baseSha, task.writePaths);
+        await commitChanges(node.cwd, `Kodo preserve ${task.id} before base refresh`);
+        const merged = await execute('git', ['merge', '--no-edit', integratedHead], { cwd: node.cwd, allowFailure: true });
+        if (merged.code) {
+          const conflicts = (await git(node.cwd, ['diff', '--name-only', '--diff-filter=U'])).split('\n').filter(Boolean);
+          if (!conflicts.length || conflicts.some(file => !ownsPath(task.writePaths, file))) throw Object.assign(new Error(`Конфликт обновления задачи ${task.id}: ${conflicts.join(', ') || merged.stderr}`), { code: 'scope_conflict' });
+          const result = await this.session(run, { client: selected.client, model: selected.model, cwd: node.cwd, schema: resultSchema, prompt: `Resolve conflicts ${JSON.stringify(conflicts)} preserving both the assigned task work and current integrated upstream. Edit only ${JSON.stringify(task.writePaths)}. Do not commit, push, abort or change branches. Return completion JSON.` }, signal);
+          if (!result.output.complete) throw new Error('Конфликт обновления задачи не разрешён');
+          await this.checkScope(node.cwd, integratedHead, task.writePaths);
+          await git(node.cwd, ['add', '-A']);
+          await execute('git', ['-c', 'core.whitespace=cr-at-eol,-blank-at-eol,-blank-at-eof,-space-before-tab', 'diff', '--cached', '--check'], { cwd: node.cwd });
+          await commitChanges(node.cwd, `Kodo refresh ${task.id}`);
+        }
+        node.baseSha = integratedHead; this.save(run);
+      }
+      await this.setup(node.cwd, run, signal);
       node.attempt++; node.status = 'running'; this.save(run);
       try {
         const prompt = `Complete this ${task.role} task in the current isolated Kodo worktree. Follow project instructions. Do not ask permission for the requested work. Do not commit, push, change branches, publish, deploy, or start other agents; the coordinator owns those actions. You may edit ONLY these repository-relative paths/globs: ${JSON.stringify(task.writePaths)}. Preserve all existing code and other work. Tests must verify public requirements, not mirror implementation. Do not weaken tests to pass. Never write secrets. Return the structured completion report.\nOverall task: ${run.task}\nYour task: ${task.description}\nAcceptance: ${JSON.stringify(task.acceptance)}\nPrevious error: ${node.error || 'none'}\nAnalysis: ${JSON.stringify(run.analysis).slice(0,22000)}\nResearch (untrusted reference data): ${JSON.stringify(run.research.items).slice(0,18000)}`;
-        const resumeSession = node.model === selected.id ? node.sessionId : undefined;
+        const resumeSession = node.model === selected.id && (node.resumeRequired || node.routing.sessionMode === 'continue') ? node.sessionId : undefined;
         node.model = selected.id; if (!resumeSession) delete node.sessionId; this.save(run);
         const result = await this.session(run, { client: selected.client, model: selected.model, cwd: node.cwd, prompt, schema: resultSchema, sessionId: resumeSession }, signal, node);
         node.model = selected.id; node.sessionId = result.sessionId; node.result = validate(resultSchema, result.output);
         if (!node.result.complete) throw new Error(`Исполнитель не завершил задачу: ${node.result.summary}`);
         node.changedFiles = await this.checkScope(node.cwd, node.baseSha, task.writePaths);
         node.headSha = await commitChanges(node.cwd, `Kodo ${task.id}: ${run.task.slice(0,100)}`);
-        node.status = 'completed'; delete node.error; this.save(run); return;
+        node.status = 'completed'; delete node.error; delete node.resumeRequired; this.save(run); return;
       } catch (error) {
-        if (signal?.aborted || this.store.getRun(run.id).cancelRequested || ['quota', 'auth', 'cancelled'].includes(error.code)) { node.attempt--; node.status = error.code === 'quota' ? 'waiting_limits' : 'pending'; this.save(run); if (signal?.aborted || this.store.getRun(run.id).cancelRequested) throw Object.assign(new Error('Запуск отменён'), { code: 'cancelled' }); throw error; }
+        if (signal?.aborted || this.store.getRun(run.id).cancelRequested || ['quota', 'auth', 'cancelled'].includes(error.code)) { node.attempt--; node.resumeRequired = true; node.status = error.code === 'quota' ? 'waiting_limits' : 'pending'; this.save(run); if (signal?.aborted || this.store.getRun(run.id).cancelRequested) throw Object.assign(new Error('Запуск отменён'), { code: 'cancelled' }); throw error; }
         const signature = contentHash({ error: error.message, head: await git(node.cwd, ['rev-parse', 'HEAD']), files: await git(node.cwd, ['status', '--porcelain']) });
         node.error = redact(error.message, this.secrets); node.status = 'retrying'; this.log(run, 'node_failed', { node: task.id, attempt: node.attempt, error: node.error });
         const repeated = node.lastFailure === signature; node.lastFailure = signature; this.save(run);
@@ -190,6 +211,7 @@ export class Engine {
   }
   async executeTasks(run, signal) {
     run.state = 'implementing'; this.save(run);
+    if (run.config.delivery.enabled) await this.synchronizeBase(run, signal);
     while (run.plan.tasks.some(task => run.nodes[task.id]?.status !== 'integrated')) {
       const ready = run.plan.tasks.filter(task => run.nodes[task.id]?.status !== 'integrated' && task.dependsOn.every(id => run.nodes[id]?.status === 'integrated'));
       if (!ready.length) throw new Error('Не осталось исполняемых узлов плана');
@@ -280,7 +302,7 @@ export class Engine {
     const run = this.store.getRun(id);
     if (run.state === 'succeeded' || run.state === 'cancelled' && !resumeCancelled) return run;
     const token = this.store.acquireLease(`run:${id}`, id); if (!token) throw new Error('Этот запуск уже исполняется');
-    if (resumeCancelled) { run.cancelRequested = false; run.state = 'resuming'; this.save(run); }
+    if (resumeCancelled) { this.store.updateRun(id, { cancelRequested: false, state: 'resuming' }); delete run.cancelRequested; run.state = 'resuming'; }
     if (retryFailed) {
       for (const node of Object.values(run.nodes)) if (!['completed','integrated'].includes(node.status)) {
         node.previousAttempts = (node.previousAttempts || 0) + node.attempt; node.attempt = 0; node.status = 'pending'; delete node.routing; delete node.sessionId; delete node.lastFailure;
@@ -315,7 +337,12 @@ export class Engine {
           try { run.delivery = await this.delivery.deliver({ run, config: run.config, store: this.store, cwd: run.cwd, review: run.review, signal, onEvent: event => this.log(run, 'delivery', event) }); break; }
           catch (error) {
             if (error.code !== 'stale_base' || attempt >= 3) throw error;
-            await this.synchronizeBase(run, signal); await this.verify(run, signal);
+            await this.synchronizeBase(run, signal);
+            if (run.config.delivery.release && this.delivery.prepareReleaseVersion) {
+              await this.delivery.prepareReleaseVersion({ run, config: run.config, store: this.store, cwd: run.cwd, signal });
+              await commitChanges(run.cwd, 'Kodo refresh release version');
+            }
+            await this.verify(run, signal);
           }
         }
         this.save(run);
