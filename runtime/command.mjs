@@ -1,7 +1,29 @@
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
-import { redact } from './security.mjs';
+import { redact, workerEnvironment } from './security.mjs';
+
+function gitBoundary(args, env) {
+  // Put the guard after caller-supplied global options so a -c override cannot
+  // restore hooks. This changes only this Git invocation, never user config.
+  const valuedOptions = new Set(['-c', '-C', '--git-dir', '--work-tree', '--namespace', '--config-env']);
+  let commandIndex = 0;
+  while (commandIndex < args.length && args[commandIndex].startsWith('-')) {
+    const option = args[commandIndex++];
+    if (valuedOptions.has(option)) commandIndex++;
+    if (option === '--') break;
+  }
+  const network = ['fetch', 'push', 'pull', 'clone', 'ls-remote'].includes(args[commandIndex]);
+  const environment = workerEnvironment(env);
+  // Only authenticated transport may receive GitHub credentials. Other API
+  // keys stay absent even while a credential helper handles fetch or push.
+  if (network) for (const [name, value] of Object.entries(env)) {
+    if (/^(?:GH_TOKEN|GITHUB_TOKEN|GH_ENTERPRISE_TOKEN|GITHUB_ENTERPRISE_TOKEN|GH_HOST|GH_CONFIG_DIR)$/i.test(name)) environment[name] = value;
+  }
+  const config = ['-c', `core.hooksPath=${process.platform === 'win32' ? 'NUL' : '/dev/null'}`];
+  if (!network) config.push('-c', 'credential.helper=');
+  return { args: [...args.slice(0, commandIndex), ...config, ...args.slice(commandIndex)], env: environment };
+}
 
 export function resolveCommand(command, args) {
   if (process.platform === 'win32' && ['npm', 'npx'].includes(command)) {
@@ -14,6 +36,7 @@ export function resolveCommand(command, args) {
   return { command, args };
 }
 export async function execute(command, args = [], { cwd, env = process.env, signal, input, timeoutMs = 1800000, allowFailure = false, secrets = {}, rawOutput = false } = {}) {
+  if (/(?:^|[\\/])git(?:\.exe)?$/i.test(command)) ({ args, env } = gitBoundary(args, env));
   const resolved = resolveCommand(command, args);
   return new Promise((resolve, reject) => {
     const child = spawn(resolved.command, resolved.args, { cwd, env, windowsHide: true, shell: false, stdio: ['pipe', 'pipe', 'pipe'] });

@@ -39,7 +39,7 @@
 
 Секреты загружаются из пользовательского хранилища Kodo или окружения координатора. Нужны ключи Gemini, TypeSafe, Scrape.do, Reddit API и GetXAPI для соответствующих интеграций. Они не входят в проектный JSON, аргументы рабочих сессий, планы и отчёты.
 
-Переменные окружения: `KODO_GEMINI_API_KEY`, `KODO_TYPESAFE_API_KEY`, `KODO_SCRAPEDO_TOKEN`, `KODO_REDDIT_API_KEY`, `KODO_GETX_API_KEY`. Пользовательский каталог по умолчанию — `%LOCALAPPDATA%\Kodo` в Windows и `~/.local/state/Kodo` в Linux; `KODO_HOME` переопределяет его для изолированного запуска. Не помещай этот каталог внутрь Git-проекта.
+Переменные окружения: `KODO_GEMINI_API_KEY`, `KODO_TYPESAFE_API_KEY`, `KODO_SCRAPEDO_TOKEN`, `KODO_REDDIT_API_KEY`, `KODO_GETX_API_KEY`. Состояние находится в `%LOCALAPPDATA%\Kodo` в Windows и `~/.local/state/Kodo` в Linux; `KODO_HOME` переопределяет этот каталог. Ключи хранятся отдельно в `%LOCALAPPDATA%\Kodo-Credentials` с шифрованием DPAPI или `$XDG_CONFIG_HOME/kodo/credentials` (`~/.config/kodo/credentials`) с правами `0600`; путь задаётся через `KODO_CREDENTIAL_HOME`. Старый `secrets.json` переносится после проверки защищённой копии. Каталоги ключей и состояния не помещают внутрь Git-проекта. [Хранение и границы доверия](SECURITY.md).
 
 ## Два способа планирования
 

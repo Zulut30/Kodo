@@ -30,6 +30,9 @@ async function npmCommand() {
 export async function execute(command, args, { cwd, signal, timeoutMs = 120000, allowFailure = false, env } = {}) {
   const environment = ['git', 'gh'].includes(command) ? (env ?? process.env) : workerEnvironment(env ?? process.env);
   let executable = command, argv = args;
+  // Coordinator Git processes retain credentials, so repository-authored hooks
+  // must never run inside that boundary, including pre-push and reference hooks.
+  if (command === 'git') argv = ['-c', `core.hooksPath=${os.devNull}`, ...args];
   if (command === 'npm') {
     const [node, prefix] = await npmCommand(); executable = node; argv = [...prefix, ...args];
   }
@@ -292,7 +295,13 @@ async function smokePackage(ctx, artifact, directory, manifest) {
   const bin = typeof manifest.bin === 'string' ? manifest.bin : manifest.bin?.kodo;
   if (!bin || path.isAbsolute(bin) || bin.split(/[\\/]/).includes('..')) throw fail('release_package', 'Package has no valid kodo executable');
   if (!/^(?:@[a-z0-9_.-]+\/)?[a-z0-9_.-]+$/.test(manifest.name ?? '') || manifest.name.split('/').some(part => part === '.' || part === '..')) throw fail('release_package', 'Package name is not valid');
-  const entry = path.join(install, 'node_modules', ...manifest.name.split('/'), bin);
+  const packageRoot = path.join(install, 'node_modules', ...manifest.name.split('/'));
+  let installed;
+  try { installed = parse(await readFile(path.join(packageRoot, 'package.json'), 'utf8'), 'installed package manifest'); }
+  catch { throw fail('release_conflict', 'Downloaded archive does not contain the expected package'); }
+  const installedBin = typeof installed.bin === 'string' ? installed.bin : installed.bin?.kodo;
+  if (installed.name !== manifest.name || installed.version !== manifest.version || installedBin?.replace(/^\.\//, '') !== bin.replace(/^\.\//, '')) throw fail('release_conflict', 'Archive package identity/version differs from the exact release commit');
+  const entry = path.join(packageRoot, bin);
   const help = await ctx.command(process.execPath, [entry, '--help'], { cwd: install });
   if (!/kodo/i.test(help)) throw fail('smoke_failed', 'Installed command did not identify itself as Kodo');
   const list = parse(await ctx.command(process.execPath, [entry, 'list', '--json'], { cwd: install }), 'installed catalog');
@@ -376,7 +385,32 @@ async function verifyReleaseAssets(ctx, info, { tag, artifact, sha256: checksum 
   for (const filename of [artifact, 'SHA256SUMS']) await ctx.command('gh', ['release', 'download', tag, '--repo', ctx.repository, '--pattern', filename, '--dir', downloaded]);
   if (sha256(await readFile(path.join(downloaded, artifact))) !== checksum) throw fail('release_conflict', 'Published package differs from its release receipt');
   if ((await readFile(path.join(downloaded, 'SHA256SUMS'), 'utf8')).trim() !== `${checksum}  ${artifact}`) throw fail('release_conflict', 'Published checksum file differs from its release receipt');
-  return info;
+  return { ...info, downloadedArtifact: path.join(downloaded, artifact) };
+}
+
+async function reusableRemotePackage(ctx, info, { tag, expectedSha }, directory) {
+  const downloaded = path.join(directory, `recover-${randomUUID()}`); await mkdir(downloaded);
+  const checksumFile = path.join(downloaded, 'SHA256SUMS');
+  const hasChecksum = info.assets?.some(asset => asset.name === 'SHA256SUMS');
+  let recorded;
+  if (hasChecksum) {
+    await ctx.command('gh', ['release', 'download', tag, '--repo', ctx.repository, '--pattern', 'SHA256SUMS', '--dir', downloaded]);
+    const content = (await readFile(checksumFile, 'utf8')).trim();
+    const match = /^([a-f0-9]{64})  ([a-zA-Z0-9_.-]+\.tgz)$/.exec(content);
+    if (!match) throw fail('release_conflict', 'Published SHA256SUMS is not a single valid Kodo artifact');
+    recorded = { checksum: match[1], filename: match[2] };
+  }
+  const attested = expectedSha ?? /^SHA-256: ([a-f0-9]{64})\s*$/m.exec(info.body ?? '')?.[1];
+  if (!attested || recorded && recorded.checksum !== attested) throw fail('release_conflict', 'Release checksum is not bound to its original commit attestation');
+  const archives = (info.assets ?? []).filter(asset => /^[a-zA-Z0-9_.-]+\.tgz$/.test(asset.name));
+  const filename = recorded?.filename ?? (archives.length === 1 ? archives[0].name : null);
+  if (archives.length > 1 && !recorded) throw fail('release_conflict', 'Release contains ambiguous package archives');
+  if (!filename || !archives.some(asset => asset.name === filename)) return { missingArchive: true, expectedSha: attested, filename, hasChecksum };
+  await ctx.command('gh', ['release', 'download', tag, '--repo', ctx.repository, '--pattern', filename, '--dir', downloaded]);
+  const archivePath = path.join(downloaded, filename), checksum = sha256(await readFile(archivePath));
+  if (checksum !== attested) throw fail('release_conflict', 'Published archive differs from its original commit attestation');
+  if (!hasChecksum) await writeFile(checksumFile, `${checksum}  ${filename}\n`);
+  return { archivePath, checksumFile, checksum, filename, hasChecksum };
 }
 
 async function getRelease(ctx, tag) {
@@ -435,7 +469,12 @@ export async function releasePackage(options) {
     const savedReceipt = ctx.run.delivery?.release;
     if (savedReceipt?.published === true && savedReceipt.commit === candidate) {
       const info = await verifyPublishedArtifact(ctx, savedReceipt, directory);
-      return { ...savedReceipt, url: info.url };
+      const manifest = parse(await ctx.command('git', ['show', `${candidate}:package.json`]), 'release commit manifest');
+      if (manifest.version !== savedReceipt.version) throw fail('release_conflict', 'Saved release version differs from its exact commit');
+      const smoke = await smokePackage(ctx, info.downloadedArtifact, directory, manifest);
+      const receipt = { ...savedReceipt, url: info.url, smoke };
+      await ctx.save({ delivery: { ...(ctx.run.delivery ?? {}), release: receipt } });
+      return receipt;
     }
     source = path.join(directory, 'source');
     await ctx.command('git', ['fetch', 'origin', ctx.baseBranch, '--tags']);
@@ -456,41 +495,56 @@ export async function releasePackage(options) {
     if (draft) assertOwnedDraft(ctx, await getRelease(ctx, tag), version, candidate);
     if (taggedCommit && !existing && !draft) throw fail('release_conflict', 'The proposed tag is already in use without a matching Kodo release');
     if (!existing) await assertCandidateFresh(ctx, candidate, version, latest);
-    if (Object.keys(manifest.dependencies ?? {}).length || Object.keys(manifest.devDependencies ?? {}).length) {
-      let hasLock = false;
-      try { await access(path.join(source, 'package-lock.json')); hasLock = true; } catch { /* no lock */ }
-      await ctx.command('npm', [hasLock ? 'ci' : 'install', '--ignore-scripts', '--no-audit', '--no-fund', ...(hasLock ? [] : ['--no-package-lock'])], { cwd: source, timeoutMs: 300000 });
-    }
-    for (const check of [...(ctx.config.commands?.test ?? []), ...(ctx.config.commands?.build ?? [])]) {
-      await ctx.command(check.command, check.args ?? [], { cwd: source, timeoutMs: check.timeoutMs ?? 600000 });
-    }
-    const artifacts = path.join(directory, 'artifacts'); await mkdir(artifacts);
-    const packed = await pack(ctx, source, artifacts);
-    const filename = path.basename(packed.filename);
-    const checksum = sha256(await readFile(packed.filename));
-    const checksumFile = path.join(artifacts, 'SHA256SUMS');
-    await writeFile(checksumFile, `${checksum}  ${filename}\n`);
-    const smoke = await smokePackage(ctx, packed.filename, directory, manifest);
-    let existingInfo, notes;
+    let existingInfo, notes, remotePackage;
     if (existing || draft) {
       existingInfo = await getRelease(ctx, tag);
-      if (draft) { assertOwnedDraft(ctx, existingInfo, version, candidate); existing = existingInfo.isDraft === false; }
+      assertOwnedDraft(ctx, existingInfo, version, candidate);
+      if (draft) existing = existingInfo.isDraft === false;
+      remotePackage = await reusableRemotePackage(ctx, existingInfo, { tag }, directory);
     }
+    let artifactPath, filename, checksum, checksumFile, updateDraftAttestation = false;
+    if (remotePackage?.archivePath) {
+      ({ archivePath: artifactPath, filename, checksum, checksumFile } = remotePackage);
+    } else {
+      if (Object.keys(manifest.dependencies ?? {}).length || Object.keys(manifest.devDependencies ?? {}).length) {
+        let hasLock = false;
+        try { await access(path.join(source, 'package-lock.json')); hasLock = true; } catch { /* no lock */ }
+        await ctx.command('npm', [hasLock ? 'ci' : 'install', '--ignore-scripts', '--no-audit', '--no-fund', ...(hasLock ? [] : ['--no-package-lock'])], { cwd: source, timeoutMs: 300000 });
+      }
+      for (const check of [...(ctx.config.commands?.test ?? []), ...(ctx.config.commands?.build ?? [])]) {
+        await ctx.command(check.command, check.args ?? [], { cwd: source, timeoutMs: check.timeoutMs ?? 600000 });
+      }
+      const artifacts = path.join(directory, 'artifacts'); await mkdir(artifacts);
+      const packed = await pack(ctx, source, artifacts);
+      artifactPath = packed.filename; filename = path.basename(artifactPath);
+      checksum = sha256(await readFile(artifactPath));
+      checksumFile = path.join(artifacts, 'SHA256SUMS');
+      await writeFile(checksumFile, `${checksum}  ${filename}\n`);
+      if (remotePackage && (remotePackage.expectedSha !== checksum || remotePackage.filename && remotePackage.filename !== filename)) {
+        // An owned, empty draft has no immutable uploaded bytes yet. A fresh
+        // build of its exact commit may update that draft's checksum notes.
+        if (existingInfo.isDraft && !existingInfo.assets?.length) updateDraftAttestation = true;
+        else throw fail('release_conflict', 'The missing original archive cannot be reproduced without replacing an existing checksum/asset');
+      }
+    }
+    const smoke = await smokePackage(ctx, artifactPath, directory, manifest);
     if (!existing) {
       await assertCandidateFresh(ctx, candidate, version, latest);
       const latestBeforePublish = (await publishedReleases(ctx)).at(-1);
       if (latestBeforePublish?.tagName !== latest?.tagName) throw fail('stale_release', 'Published release state changed while preparing the package; prepare its version again');
       notes = path.join(directory, 'notes.md');
-      await writeFile(notes, `Kodo ${version}\n\n${ctx.run.task}\n\nCommit: ${candidate}\nRun: ${ctx.run.id}\n\nSHA-256: ${checksum}\n\nPackage installation and CLI smoke checks passed on ${process.platform}, Node.js ${process.version}.\n\n<!-- kodo-release:${ctx.run.id}:${candidate} -->\n`);
+      const content = updateDraftAttestation ? existingInfo.body.replace(/^SHA-256: [a-f0-9]{64}\s*$/m, `SHA-256: ${checksum}`) : `Kodo ${version}\n\n${ctx.run.task}\n\nCommit: ${candidate}\nRun: ${ctx.run.id}\n\nSHA-256: ${checksum}\n\nPackage installation and CLI smoke checks passed on ${process.platform}, Node.js ${process.version}.\n\n<!-- kodo-release:${ctx.run.id}:${candidate} -->\n`;
+      await writeFile(notes, content);
     }
     return await ctx.irreversible(async () => {
       if (existingInfo) {
         // A process can die after creating the release but before uploading every
         // asset. Upload only absent names; never replace an existing asset.
-        if (!existingInfo.assets?.some(asset => asset.name === filename)) await ctx.command('gh', ['release', 'upload', tag, packed.filename, '--repo', ctx.repository], { ignoreAbort: true });
+        if (updateDraftAttestation) await ctx.command('gh', ['release', 'edit', tag, '--repo', ctx.repository, '--notes-file', notes, '--draft', '--latest=false', '--target', candidate], { ignoreAbort: true });
+        if (!existingInfo.assets?.some(asset => asset.name === filename)) await ctx.command('gh', ['release', 'upload', tag, artifactPath, '--repo', ctx.repository], { ignoreAbort: true });
         if (!existingInfo.assets?.some(asset => asset.name === 'SHA256SUMS')) await ctx.command('gh', ['release', 'upload', tag, checksumFile, '--repo', ctx.repository], { ignoreAbort: true });
       } else {
-        await ctx.command('gh', ['release', 'create', tag, packed.filename, checksumFile, '--repo', ctx.repository, '--target', candidate, '--title', `Kodo ${version}`, '--notes-file', notes, '--draft', '--latest=false'], { ignoreAbort: true });
+        await ctx.command('gh', ['release', 'create', tag, artifactPath, checksumFile, '--repo', ctx.repository, '--target', candidate, '--title', `Kodo ${version}`, '--notes-file', notes, '--draft', '--latest=false'], { ignoreAbort: true });
       }
       const ready = await getRelease(ctx, tag);
       if (ready.isDraft) {

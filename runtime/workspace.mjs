@@ -36,8 +36,28 @@ export async function collectFiles(cwd, task, secrets = {}) {
   return { files, omitted: names.length - files.length, bytes: size };
 }
 export async function changedFiles(cwd, base) { return (await git(cwd, ['diff', '--no-renames', '--name-only', base])).split('\n').filter(Boolean); }
-export async function commitChanges(cwd, message) {
-  await git(cwd, ['add', '-A']);
+export async function commitChanges(cwd, message, paths) {
+  if (paths === undefined) await git(cwd, ['add', '-A']);
+  else {
+    if (!Array.isArray(paths)) throw new Error('Commit paths must be an array');
+    const selected = paths.map(name => {
+      if (typeof name !== 'string' || /[\x00-\x1f:]/.test(name) || path.win32.isAbsolute(name) || path.posix.isAbsolute(name)) throw new Error('Unsafe commit path');
+      const relative = name.replaceAll('\\', '/');
+      if (relative.split('/').some(part => !part || part === '.' || part === '..')) throw new Error('Unsafe commit path');
+      return relative;
+    });
+    const allowed = new Set(selected);
+    const staged = (await git(cwd, ['diff', '--cached', '--no-renames', '--name-only', '-z'])).split('\0').filter(Boolean);
+    if (staged.some(name => !allowed.has(name))) throw new Error('Unrelated files are already staged; refusing metadata commit');
+    const existing = [];
+    for (const name of allowed) {
+      const stat = await lstat(path.join(cwd, name)).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+      if (!stat) continue;
+      if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`Commit metadata must be a regular file: ${name}`);
+      existing.push(name);
+    }
+    if (existing.length) await git(cwd, ['--literal-pathspecs', 'add', '--all', '--', ...existing]);
+  }
   const result = await execute('git', ['diff', '--cached', '--quiet'], { cwd, allowFailure: true });
   if (result.code === 1) await git(cwd, ['commit', '-m', message]);
   else if (result.code !== 0) throw new Error('Не удалось проверить staged changes');

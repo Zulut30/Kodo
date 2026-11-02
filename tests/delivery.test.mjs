@@ -1,8 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtemp, mkdir, readFile, writeFile, copyFile, readdir, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, writeFile, copyFile, readdir, rm, chmod } from 'node:fs/promises';
 import { constants } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import Ajv from 'ajv';
@@ -97,9 +98,10 @@ async function fixture(t, { brokenCli = false } = {}) {
       await copyFile(args[3], path.join(assets, path.basename(args[3])), constants.COPYFILE_EXCL); return output('');
     }
     if (args[0] === 'release' && args[1] === 'edit') {
-      assert.ok(args.includes('--draft=false')); assert.ok(args.includes('--latest=false'));
+      assert.ok(args.includes('--draft=false') || args.includes('--draft')); assert.ok(args.includes('--latest=false'));
       assert.equal(args[args.indexOf('--target') + 1], headSha);
-      if (state.release.isDraft) {
+      if (args.includes('--notes-file')) state.release.body = await readFile(args[args.indexOf('--notes-file') + 1], 'utf8');
+      if (state.release.isDraft && args.includes('--draft=false')) {
         const current = await execute('git', ['rev-parse', '--verify', `refs/tags/${state.release.tag}^{commit}`], { cwd: project, allowFailure: true });
         if (current.code) await git('tag', state.release.tag, headSha);
         else assert.equal(current.stdout.trim(), headSha);
@@ -414,10 +416,15 @@ test('Interrupted owned draft is completed and published without a second creati
   };
   await assert.rejects(releasePackage({ ...ctx, mergeCommit: delivered.mergeCommit }), { code: 'simulated_disconnect' });
   assert.equal(ctx.state.release.isDraft, true); assert.equal(ctx.state.publishes, 0); assert.equal(ctx.state.releaseCreates, 1);
-  ctx.exec = runner;
+  let recoveryPacks = 0;
+  ctx.exec = async (command, args, options) => {
+    if (command === 'npm' && args[0] === 'pack') { recoveryPacks++; throw new Error('Another npm version would produce different compressed bytes'); }
+    return runner(command, args, options);
+  };
   const receipt = await releasePackage({ ...ctx, mergeCommit: delivered.mergeCommit });
   assert.equal(receipt.published, true); assert.equal(ctx.state.release.isDraft, false);
   assert.equal(ctx.state.releaseCreates, 1); assert.equal(ctx.state.publishes, 1); assert.equal(ctx.state.uploads, 1);
+  assert.equal(recoveryPacks, 0);
   assert.equal(ctx.run.delivery.release.sha256, receipt.sha256); assert.equal(ctx.leases.size, 0);
 });
 
@@ -443,4 +450,43 @@ test('Merge rechecks release assignment under the shared publication lease after
   await assert.rejects(deliver(ctx), { code: 'stale_base' });
   assert.equal(checkedWhileLocked, true); assert.equal(ctx.state.merges, 0); assert.equal(ctx.run.delivery.pr.number, 7);
   assert.equal(ctx.leases.size, 0);
+});
+
+test('Published release recovery verifies and smoke tests remote archive without repacking changed npm output', async t => {
+  const ctx = await fixture(t);
+  const delivered = await deliver(ctx);
+  const first = await releasePackage({ ...ctx, mergeCommit: delivered.mergeCommit });
+  delete ctx.run.delivery.release;
+  const runner = ctx.exec;
+  let packs = 0, installedRemote = false;
+  ctx.exec = async (command, args, options) => {
+    if (command === 'npm' && args[0] === 'pack') { packs++; return { stdout: '{"different-npm":{"filename":"changed-format.tgz"}}', code: 0 }; }
+    if (command === 'npm' && args[0] === 'install') {
+      const archive = args.at(-1);
+      installedRemote = digest(await readFile(archive)) === first.sha256 && archive.includes('recover-');
+    }
+    return runner(command, args, options);
+  };
+  const resumed = await releasePackage({ ...ctx, mergeCommit: delivered.mergeCommit });
+  assert.equal(resumed.sha256, first.sha256); assert.equal(resumed.smoke.passed, true);
+  assert.equal(installedRemote, true); assert.equal(packs, 0);
+  assert.equal(ctx.state.releaseCreates, 1); assert.equal(ctx.state.publishes, 1); assert.equal(ctx.state.uploads, 0);
+});
+
+test('Coordinator Git disables credential-reading repository hooks for push and fetch', async t => {
+  const ctx = await fixture(t), hooks = path.join(ctx.root, 'hostile-hooks'), marker = path.join(ctx.root, 'hook-ran.txt');
+  await mkdir(hooks);
+  const quoted = marker.replaceAll('\\', '/').replaceAll("'", "'\\''");
+  const script = `#!/bin/sh\nprintf '%s' "$GH_TOKEN" > '${quoted}'\nexit 42\n`;
+  for (const name of ['pre-push', 'reference-transaction']) { const filename = path.join(hooks, name); await writeFile(filename, script); await chmod(filename, 0o755); }
+  await ctx.git('config', 'core.hooksPath', hooks);
+  const env = { ...process.env, GH_TOKEN: 'fixture-git-coordinator-secret' };
+  const control = spawnSync('git', ['push', 'origin', 'HEAD:refs/heads/unprotected-proof'], { cwd: ctx.project, env, encoding: 'utf8', windowsHide: true });
+  assert.notEqual(control.status, 0);
+  assert.equal(await readFile(marker, 'utf8'), env.GH_TOKEN);
+  await rm(marker);
+  await execute('git', ['push', 'origin', 'HEAD:refs/heads/protected-proof'], { cwd: ctx.project, env });
+  await execute('git', ['update-ref', 'refs/heads/fetch-proof', ctx.run.headSha], { cwd: ctx.remote, env });
+  await execute('git', ['fetch', 'origin'], { cwd: ctx.project, env });
+  await assert.rejects(readFile(marker), { code: 'ENOENT' });
 });

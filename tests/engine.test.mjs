@@ -594,7 +594,7 @@ test('Engine scopes review repairs to the repair starting head instead of earlie
       : { passed: true, findings: [] }
   }) });
   services.delivery.prepareReleaseVersion = async ({ cwd }) => {
-    await writeFile(path.join(cwd, 'coordinator-release-version.txt'), '0.2.0\n');
+    await writeFile(path.join(cwd, 'registry.json'), '{"version":"0.2.0"}\n');
   };
   const engine = new Engine({ store: fx.openStore(), ...services });
   const run = await engine.create('Implement value two with reviewFix', { project: fx.project });
@@ -602,11 +602,11 @@ test('Engine scopes review repairs to the repair starting head instead of earlie
   assert.equal(result.state, 'succeeded', result.error?.message);
   assert.equal(repairs, 1);
   assert.equal(services.calls.review.length, 2);
-  assert.equal(await read(path.join(result.cwd, 'coordinator-release-version.txt')), '0.2.0\n');
+  assert.equal(JSON.parse(await read(path.join(result.cwd, 'registry.json'))).version, '0.2.0');
   assert.match(await read(path.join(result.cwd, 'src/value.mjs')), /reviewFix = true/);
   assert.equal(result.checks.headSha, result.headSha);
   assert.equal(result.review.headSha, result.headSha);
-  assert.equal(await exists(path.join(fx.project, 'coordinator-release-version.txt')), false);
+  assert.equal(await exists(path.join(fx.project, 'registry.json')), false);
 });
 
 test('Engine refreshes a retried node from integrated upstream while preserving its scoped unfinished tests', async t => {
@@ -637,12 +637,12 @@ test('Engine reassigns a stale release version and repeats checks and review bef
   const plan = { summary: 'Set value two', tasks: [node('feature', 'developer', ['src/value.mjs'])] };
   const services = fakeServices({ plan }); let assignments = 0;
   services.delivery.prepareReleaseVersion = async ({ cwd }) => {
-    assignments++; await writeFile(path.join(cwd, 'assigned-version.txt'), `0.2.${assignments}\n`);
+    assignments++; await writeFile(path.join(cwd, 'registry.json'), JSON.stringify({ version: `0.2.${assignments}` }));
   };
   services.delivery.deliver = async ({ run, review }) => {
     services.calls.delivery++;
     if (services.calls.delivery === 1) throw Object.assign(new Error('Version claimed by another task'), { code: 'stale_base' });
-    assert.equal(assignments, 2); assert.equal(await read(path.join(run.cwd, 'assigned-version.txt')), '0.2.2\n');
+    assert.equal(assignments, 2); assert.equal(JSON.parse(await read(path.join(run.cwd, 'registry.json'))).version, '0.2.2');
     assert.equal(review.headSha, git(run.cwd, 'rev-parse', 'HEAD')); assert.equal(run.checks.headSha, review.headSha);
     return { mergeCommit: review.headSha, pr: { number: 1 } };
   };
@@ -672,4 +672,81 @@ test('Engine follows Jev fresh session decisions after a defect and uses the con
   assert.equal(selected.id, 'codex-astra');
   services.provider.decideJev = async () => ({ model: 'codex-sol', parallel: 'yes', confidence: 1.5 });
   await assert.rejects(engine.route(result, task, { attempt: 0 }), { code: 'invalid_output' });
+});
+
+test('Engine resumes scoped interrupted repair only after committing and rechecking its exact head', async t => {
+  const fx = await fixture(t, { testScript: "import assert from 'node:assert/strict';import{value}from'./src/value.mjs';assert.equal(value,2);\n" });
+  const services = fakeServices({ plan: { summary: 'value two', tasks: [node('feature', 'developer', ['src/value.mjs'])] } });
+  const store = fx.openStore(), engine = new Engine({ store, ...services });
+  const run = await engine.create('Recover interrupted repair', { project: fx.project }); await engine.prepare(run);
+  run.plan = { summary: 'value two', tasks: [node('feature', 'developer', ['src/value.mjs'])] }; run.completed.implementation = true; run.state = 'cancelled';
+  await writeFile(path.join(run.cwd, 'src/value.mjs'), 'export const value = 2;\n');
+  engine.save(run);
+  const result = await engine.run(run.id, { resumeCancelled: true });
+  assert.equal(result.state, 'succeeded', result.error?.message);
+  assert.notEqual(result.headSha, fx.base); assert.equal(result.checks.headSha, result.headSha); assert.equal(result.review.headSha, result.headSha);
+  assert.equal(git(run.cwd, 'status', '--porcelain'), ''); assert.equal(services.calls.worker.length, 0);
+  assert.equal(store.events(run.id).filter(e => e.type === 'repair_recovered').length, 1);
+});
+
+test('Engine refuses interrupted out of scope edits and dirty commit checks before any review', async t => {
+  const fx = await fixture(t, { testScript: 'process.exit(0);\n' });
+  const services = fakeServices(); const store = fx.openStore(), engine = new Engine({ store, ...services });
+  const run = await engine.create('Recover edits safely', { project: fx.project }); await engine.prepare(run);
+  run.plan = featurePlan(); run.completed.implementation = true; engine.save(run);
+  await writeFile(path.join(run.cwd, 'untouched.txt'), 'unexpected interrupted edit\n');
+  await assert.rejects(engine.checks(run), { code: 'dirty_worktree' });
+  const result = await engine.run(run.id);
+  assert.equal(result.state, 'blocked'); assert.equal(result.error.code, 'scope_conflict');
+  assert.equal(git(run.cwd, 'rev-parse', 'HEAD'), fx.base); assert.equal(services.calls.review.length, 0);
+});
+
+test('Engine refuses to finish a node merge whose MERGE_HEAD belongs to another node', async t => {
+  const fx = await integrationConflict(t, async () => { throw new Error('wrong resolver must not be called'); });
+  const merge = spawnSync('git', ['merge', '--no-ff', '--no-edit', fx.run.nodes.second.branch], { cwd: fx.run.cwd, encoding: 'utf8', windowsHide: true });
+  assert.equal(merge.status, 1);
+  fx.run.nodes.first.status = 'completed';
+  await assert.rejects(fx.engine.integrateNode(fx.run, fx.tasks[0]), { code: 'merge_state' });
+  assert.equal(git(fx.run.cwd, 'rev-parse', 'MERGE_HEAD'), fx.run.nodes.second.headSha);
+});
+
+test('Engine recovers interrupted version metadata only when all other fields are unchanged', async t => {
+  for (const tampered of [false, true]) await t.test(tampered ? 'extra-field-rejected' : 'version-only-recovered', async subtest => {
+    const fx = await fixture(subtest, { testScript: 'process.exit(0);\n' });
+    await writeFile(path.join(fx.project, 'package.json'), JSON.stringify({ name: 'fixture-kodo', version: '0.1.0' }));
+    git(fx.project, 'add', '.'); git(fx.project, 'commit', '-m', 'Version baseline');
+    const services = fakeServices(), engine = new Engine({ store: fx.openStore(), ...services });
+    const run = await engine.create('Recover version assignment', { project: fx.project }); await engine.prepare(run);
+    run.plan = { summary: 'value two', tasks: [node('feature', 'developer', ['src/value.mjs'])] };
+    run.config.delivery.release = true; run.releaseAssignment = { version: '0.2.0', prepared: false };
+    const value = { name: 'fixture-kodo', version: '0.2.0', ...(tampered ? { scripts: { preinstall: 'unexpected executable' } } : {}) };
+    await writeFile(path.join(run.cwd, 'package.json'), JSON.stringify(value));
+    const before = git(run.cwd, 'rev-parse', 'HEAD');
+    if (tampered) {
+      await assert.rejects(engine.recoverIntegrationEdits(run), { code: 'scope_conflict' });
+      assert.equal(git(run.cwd, 'rev-parse', 'HEAD'), before);
+    } else {
+      await engine.recoverIntegrationEdits(run);
+      assert.notEqual(git(run.cwd, 'rev-parse', 'HEAD'), before);
+      assert.equal(JSON.parse(git(run.cwd, 'show', 'HEAD:package.json')).version, '0.2.0');
+      assert.equal(git(run.cwd, 'status', '--porcelain'), '');
+    }
+  });
+});
+
+test('Engine aborts a worker action when its subscription lease is lost and releases the old token', async t => {
+  const fx = await fixture(t); const store = fx.openStore();
+  const engine = new Engine({ store, leaseHeartbeatMs: 1 });
+  const run = await engine.create('Guard subscription lease', { project: fx.project });
+  let aborted = false, released = 0;
+  const release = store.releaseLease.bind(store);
+  store.renewLease = () => false;
+  store.releaseLease = token => { released++; release(token); };
+  await assert.rejects(engine.withLease(run, 'subscription:fixture', 1, async signal => {
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(resolve, 1000);
+      signal.addEventListener('abort', () => { aborted = true; clearTimeout(timer); reject(new Error('action aborted')); }, { once: true });
+    });
+  }), { code: 'lease_lost' });
+  assert.equal(aborted, true); assert.equal(released, 1);
 });
