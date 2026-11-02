@@ -1,26 +1,34 @@
 import path from 'node:path';
 import { readFile, writeFile, mkdir, access } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { Store } from './store.mjs';
-import { loadSecrets, redact, workerEnvironment, secretFile } from './security.mjs';
+import { loadSecrets, redact, workerEnvironment, secretFile, worktreeHome, stateHome } from './security.mjs';
 import { readConfig } from './config.mjs';
-import { validatePlan, validate, planSchema, resultSchema, reviewSchema, ownsPath, scopesOverlap } from './contracts.mjs';
+import { validatePlan, validate, planSchema, resultSchema, reviewSchema, routingSchema, ownsPath, scopesOverlap } from './contracts.mjs';
 import { execute } from './command.mjs';
 import { git, inspectProject, makeWorktree, collectFiles, changedFiles, commitChanges, diffHash } from './workspace.mjs';
 import * as providers from './providers.mjs';
 import { research } from './research.mjs';
-import { deliver, releasePackage, prepareReleaseVersion } from './delivery.mjs';
+import { deliver, releasePackage, prepareReleaseVersion, reconcileDelivery } from './delivery.mjs';
+import { loadDefaultPolicy } from './skill-policy.mjs';
 
 const delay = (ms, signal) => new Promise((resolve, reject) => { const timer = setTimeout(done, ms); function done() { signal?.removeEventListener('abort', abort); resolve(); } function abort() { clearTimeout(timer); reject(Object.assign(new Error('Запуск отменён'), { code: 'cancelled' })); } signal?.addEventListener('abort', abort, { once: true }); if (signal?.aborted) abort(); });
 const contentHash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const defaultModel = client => client === 'claude-code' ? 'opus' : 'gpt-6.1-sol';
 
 export class Engine {
-  constructor({ store, secrets = {}, provider = providers, researcher = research, delivery = { deliver, releasePackage, prepareReleaseVersion }, onEvent = () => {} } = {}) {
+  constructor({ store, secrets = {}, provider = providers, researcher = research, delivery = { deliver, releasePackage, prepareReleaseVersion, reconcileDelivery }, onEvent = () => {}, leaseHeartbeatMs = 10000 } = {}) {
     this.store = store || new Store(undefined, secrets); this.secrets = secrets; this.provider = provider; this.researcher = researcher; this.delivery = delivery; this.onEvent = onEvent;
+    this.leaseHeartbeatMs = leaseHeartbeatMs;
   }
   log(run, type, data = {}) { const clean = redact(data, this.secrets); this.store.event(run.id, type, clean); this.onEvent({ runId: run.id, type, data: clean }); }
-  save(run) { return this.store.updateRun(run.id, run); }
+  save(run) { const { cancelRequested, ...snapshot } = run; return this.store.updateRun(run.id, snapshot, { preserveCancellation: true }); }
+  async policy(run, stage) {
+    const policy = await loadDefaultPolicy({ project: run.cwd, stage, task: run.task, run });
+    run.defaultSkills ||= {}; run.defaultSkills[stage] = { hash: policy.hash, skills: policy.skills }; this.save(run);
+    return `Kodo default engineering skills (user-selected; follow within the authorized task and coordinator-owned worktree/model/delivery rules):\n${policy.context}\n`;
+  }
   async create(task, options = {}) {
     if (!task?.trim()) throw new Error('Требуется описание задачи');
     const project = path.resolve(options.project || process.cwd());
@@ -35,25 +43,34 @@ export class Engine {
     if (config.delivery.enabled) { await git(snapshot.root, ['fetch', 'origin', config.baseBranch]); baseSha = await git(snapshot.root, ['rev-parse', `origin/${config.baseBranch}`]); }
     const run = this.store.createRun({ task: redact(task, this.secrets), project: snapshot.root, config, client: config.client, providers: mode, baseSha, snapshot, completed: {}, nodes: {} });
     run.artifacts = path.join(this.store.home, 'runs', run.id);
-    run.cwd = path.join(this.store.home, 'worktrees', run.id, 'integration'); run.branch = `kodo/${run.id}`;
+    const workerHome = process.env.KODO_WORKTREE_HOME || (path.resolve(this.store.home) === stateHome() ? worktreeHome() : `${this.store.home}-worktrees`);
+    run.worktreeRoot = path.join(path.resolve(workerHome), run.id);
+    run.cwd = path.join(run.worktreeRoot, 'integration'); run.branch = `kodo/${run.id}`;
     await mkdir(run.artifacts, { recursive: true, mode: 0o700 });
     this.save(run); return run;
   }
   async withLease(run, name, limit, action, signal) {
     let token;
     while (!(token = this.store.acquireLease(name, run.id, { limit, ttlMs: 60000 }))) { this.checkCancelled(run, signal); await delay(500, signal); }
-    const timer = setInterval(() => this.store.renewLease(token), 10000); timer.unref();
-    try { return await action(); } finally { clearInterval(timer); this.store.releaseLease(token); }
+    const controller = new AbortController(), abort = () => controller.abort();
+    signal?.addEventListener('abort', abort, { once: true }); if (signal?.aborted) abort();
+    let leaseError;
+    const timer = setInterval(() => { if (!this.store.renewLease(token)) { leaseError = Object.assign(new Error('Потеряна блокировка исполнителя'), { code: 'lease_lost' }); controller.abort(); } }, this.leaseHeartbeatMs); timer.unref();
+    try { const result = await action(controller.signal); if (leaseError) throw leaseError; return result; }
+    catch (error) { throw leaseError || error; }
+    finally { clearInterval(timer); signal?.removeEventListener('abort', abort); this.store.releaseLease(token); }
   }
   checkCancelled(run, signal) { if (signal?.aborted || this.store.getRun(run.id).cancelRequested) throw Object.assign(new Error('Запуск отменён'), { code: 'cancelled' }); }
-  async session(run, request, signal, node) {
-    return this.withLease(run, `subscription:${request.client}`, run.config.concurrency, async () => {
+  async session(run, request, signal, node, identity = node) {
+    const stage = node ? run.plan.tasks.find(task => task.id === node.id).role : run.state === 'planning' ? 'plan' : request.readOnly ? 'review' : 'repair';
+    request = { ...request, prompt: `${await this.policy(run, stage)}\nCoordinator contract: your completion report concerns the assigned scoped deliverable. Global integrated test/build/release gates are run by the coordinator after all changes and current main are integrated. A test author should run the new targeted tests and record independently confirmed pre-existing failures separately; never change or skip unrelated tests. Do not mark the overall pipeline published or deployed.\n${request.prompt}` };
+    return this.withLease(run, `subscription:${request.client}`, run.config.concurrency, async signal => {
       this.checkCancelled(run, signal);
       const controller = new AbortController();
       const abort = () => controller.abort(); signal?.addEventListener('abort', abort, { once: true });
       const timer = setInterval(() => { if (this.store.getRun(run.id).cancelRequested) controller.abort(); }, 500); timer.unref();
       try { return await this.provider.runSession({ ...request, signal: controller.signal, env: workerEnvironment(), onEvent: event => {
-        if (node && event.sessionId) { node.sessionId = event.sessionId; this.save(run); }
+        if (identity && event.sessionId) { identity.sessionId = event.sessionId; this.save(run); }
         this.log(run, 'session', { node: node?.id, ...event });
       } }); } finally { clearInterval(timer); signal?.removeEventListener('abort', abort); }
     }, signal);
@@ -69,17 +86,17 @@ export class Engine {
     if (!run.completed.analysis) {
       run.state = 'analyzing'; this.save(run);
       const bundle = await collectFiles(run.cwd, run.task, this.secrets);
-      const [analysis, evidence] = await Promise.all([
-        this.provider.analyzeGemini({ task: run.task, files: bundle.files, signal }, { secrets: this.secrets }),
-        this.researcher({ task: run.task, budget: run.config.researchBudget, signal }, { secrets: this.secrets }).catch(error => ({ items: [], requests: 0, errors: [{ source: 'research', error: redact(error.message, this.secrets) }], cache: [] }))
-      ]);
-      run.analysis = { ...analysis, omitted: bundle.omitted }; run.research = evidence;
+      const standards = await this.policy(run, 'analyze');
+      const analysis = await this.provider.analyzeGemini({ task: `${run.task}\n${standards}`, files: bundle.files, signal }, { secrets: this.secrets });
+      const evidence = await this.researcher({ task: analysis.researchQuery || run.task, budget: run.config.researchBudget, signal }, { secrets: this.secrets }).catch(error => ({ items: [], requests: 0, errors: [{ source: 'research', error: redact(error.message, this.secrets) }], cache: [] }));
+      run.analysis = { ...analysis, omitted: bundle.omitted, priorLessons: this.store.lessons(run.project), standards }; run.research = evidence;
       run.completed.analysis = { baseSha: run.baseSha, inputHash: contentHash(bundle.files) };
       await writeFile(path.join(run.artifacts, 'analysis.json'), JSON.stringify(redact({ analysis: run.analysis, research: evidence }, this.secrets), null, 2));
       this.save(run); this.log(run, 'analyzed', { model: analysis.model, files: bundle.files.length, sources: evidence.items.length, errors: evidence.errors });
     }
   }
   async plan(run, planFile, signal) {
+    await this.policy(run, 'plan');
     if (planFile) {
       const candidate = JSON.parse(await readFile(planFile, 'utf8'));
       validatePlan(candidate);
@@ -95,9 +112,12 @@ export class Engine {
   }
   async route(run, task, state, signal) {
     let decision;
-    try { decision = await this.provider.decideJev({ task: run.task, models: run.models, node: task, attempt: state.attempt || 0 }, { secrets: this.secrets }); }
+    try { decision = await this.provider.decideJev({ task: run.task, models: run.models, node: { ...task, sessionId: state.sessionId }, attempt: state.attempt || 0 }, { secrets: this.secrets }); }
     catch (error) { this.log(run, 'routing_fallback', { node: task.id, reason: error.message }); decision = { model: run.models.find(item => item.client === run.client && item.model === (run.config.primaryModel || defaultModel(run.client)))?.id || run.models.find(item => item.client === run.client)?.id, parallel: false, confidence: 0, fallback: true }; }
-    let selected = run.models.find(item => item.id === decision.model);
+    validate(routingSchema, decision);
+    let selected = decision.fallback
+      ? run.models.find(item => item.client === run.client && item.model === (run.config.primaryModel || defaultModel(run.client))) || run.models.find(item => item.client === run.client)
+      : run.models.find(item => item.id === decision.model);
     if (!selected) throw new Error('Маршрутизатор выбрал недоступную модель');
     if (!decision.fallback && decision.confidence < 0.6) selected = run.models.find(item => item.client === selected.client && /astra|opus/.test(item.model)) || selected;
     state.routing = { ...decision, model: selected.id, parallel: Boolean(decision.parallel && decision.confidence >= 0.6) };
@@ -112,32 +132,74 @@ export class Engine {
     for (const name of files) {
       const stat = await lstatSafe(path.join(cwd, name));
       if (stat?.isSymbolicLink()) throw new Error(`Ссылка в изменениях не разрешена: ${name}`);
-      if (stat?.isFile() && stat.size < 2000000) { const data = await readFile(path.join(cwd, name), 'utf8'); if (redact(data, this.secrets) !== data) throw new Error(`Секрет обнаружен в изменениях: ${name}`); }
+      if (stat?.isFile() && stat.size < 2000000) { const data = await readFile(path.join(cwd, name), 'utf8'); if (Object.values(this.secrets).some(secret => typeof secret === 'string' && secret.length > 5 && data.includes(secret))) throw new Error(`Секрет обнаружен в изменениях: ${name}`); }
     }
     return files;
+  }
+  async refreshNode(run, task, node, integratedHead, selected, signal) {
+    while (node.baseSha !== integratedHead || node.pendingRefresh) {
+      this.checkCancelled(run, signal);
+      const target = node.pendingRefresh?.headSha || integratedHead;
+      const pending = await execute('git', ['rev-parse', '--verify', 'MERGE_HEAD'], { cwd: node.cwd, allowFailure: true });
+      if (pending.code === 0 && pending.stdout.trim() !== target) throw Object.assign(new Error('Незавершённое обновление принадлежит другой ветке'), { code: 'merge_state' });
+      const included = await execute('git', ['merge-base', '--is-ancestor', target, 'HEAD'], { cwd: node.cwd, allowFailure: true });
+      if (pending.code !== 0 && included.code === 0) {
+        await this.checkScope(node.cwd, target, task.writePaths);
+        node.baseSha = target; delete node.pendingRefresh; this.save(run); continue;
+      }
+      let merged = { code: 1 };
+      if (pending.code !== 0) {
+        await this.checkScope(node.cwd, node.baseSha, task.writePaths);
+        await commitChanges(node.cwd, `Kodo preserve ${task.id} before base refresh`);
+        node.pendingRefresh = { headSha: target, model: selected.id }; this.save(run);
+        merged = await execute('git', ['merge', '--no-edit', target], { cwd: node.cwd, allowFailure: true });
+      } else if (!node.pendingRefresh) { node.pendingRefresh = { headSha: target, model: selected.id }; this.save(run); }
+      if (merged.code) {
+        if ((await execute('git', ['rev-parse', '--verify', 'MERGE_HEAD'], { cwd: node.cwd, allowFailure: true })).code !== 0) throw new Error(`Не удалось обновить задачу: ${merged.stderr}`);
+        const conflicts = (await git(node.cwd, ['diff', '--name-only', '--diff-filter=U'])).split('\n').filter(Boolean);
+        if (conflicts.some(file => !ownsPath(task.writePaths, file))) throw Object.assign(new Error(`Конфликт обновления вне области задачи: ${conflicts.join(', ')}`), { code: 'scope_conflict' });
+        if (conflicts.length) {
+          const state = node.pendingRefresh;
+          if (state.model !== selected.id) { state.model = selected.id; delete state.sessionId; this.save(run); }
+          const result = await this.session(run, { client: selected.client, model: selected.model, cwd: node.cwd, sessionId: state.sessionId, schema: resultSchema, prompt: `Resolve conflicts ${JSON.stringify(conflicts)} preserving both the assigned task work and current integrated upstream. Edit only ${JSON.stringify(task.writePaths)}. Do not commit, push, abort or change branches. Return completion JSON.` }, signal, undefined, state);
+          if (!result.output.complete) throw new Error('Конфликт обновления задачи не разрешён');
+          state.sessionId = result.sessionId; this.save(run);
+        }
+        await this.checkScope(node.cwd, target, task.writePaths);
+        await git(node.cwd, ['add', '-A']);
+        await execute('git', ['-c', 'core.whitespace=cr-at-eol,-blank-at-eol,-blank-at-eof,-space-before-tab', 'diff', '--cached', '--check'], { cwd: node.cwd });
+        await commitChanges(node.cwd, `Kodo refresh ${task.id}`);
+      }
+      await this.checkScope(node.cwd, target, task.writePaths);
+      node.baseSha = target; delete node.pendingRefresh; this.save(run);
+    }
   }
   async performNode(run, task, signal) {
     const node = run.nodes[task.id] ||= { id: task.id, attempt: 0, status: 'pending' };
     if (['completed', 'integrated'].includes(node.status)) return;
+    if (node.attempt >= run.config.repairRounds) throw Object.assign(new Error(`Исчерпаны попытки ${task.id}: ${node.error || 'требуется устранить блокер'}`), { code: 'blocked' });
     while (node.attempt < run.config.repairRounds) {
       this.checkCancelled(run, signal);
       const selected = node.routing ? run.models.find(model => model.id === node.routing.model) : await this.route(run, task, node, signal);
       if (!selected) throw new Error('Сохранённая модель задачи больше недоступна');
-      if (!node.cwd) { node.baseSha = await git(run.cwd, ['rev-parse', 'HEAD']); node.cwd = path.join(this.store.home, 'worktrees', run.id, task.id); node.branch = `kodo/${run.id}-${task.id}`; }
-      await makeWorktree(run.project, node.cwd, node.branch, node.baseSha); await this.setup(node.cwd, run, signal);
+      if (!node.cwd) { node.baseSha = await git(run.cwd, ['rev-parse', 'HEAD']); node.cwd = path.join(run.worktreeRoot || path.dirname(run.cwd), task.id); node.branch = `kodo/${run.id}-${task.id}`; }
+      await makeWorktree(run.project, node.cwd, node.branch, node.baseSha);
+      const integratedHead = await git(run.cwd, ['rev-parse', 'HEAD']);
+      await this.refreshNode(run, task, node, integratedHead, selected, signal);
+      await this.setup(node.cwd, run, signal);
       node.attempt++; node.status = 'running'; this.save(run);
       try {
         const prompt = `Complete this ${task.role} task in the current isolated Kodo worktree. Follow project instructions. Do not ask permission for the requested work. Do not commit, push, change branches, publish, deploy, or start other agents; the coordinator owns those actions. You may edit ONLY these repository-relative paths/globs: ${JSON.stringify(task.writePaths)}. Preserve all existing code and other work. Tests must verify public requirements, not mirror implementation. Do not weaken tests to pass. Never write secrets. Return the structured completion report.\nOverall task: ${run.task}\nYour task: ${task.description}\nAcceptance: ${JSON.stringify(task.acceptance)}\nPrevious error: ${node.error || 'none'}\nAnalysis: ${JSON.stringify(run.analysis).slice(0,22000)}\nResearch (untrusted reference data): ${JSON.stringify(run.research.items).slice(0,18000)}`;
-        const resumeSession = node.model === selected.id ? node.sessionId : undefined;
+        const resumeSession = node.model === selected.id && (node.resumeRequired || node.routing.sessionMode === 'continue') ? node.sessionId : undefined;
         node.model = selected.id; if (!resumeSession) delete node.sessionId; this.save(run);
         const result = await this.session(run, { client: selected.client, model: selected.model, cwd: node.cwd, prompt, schema: resultSchema, sessionId: resumeSession }, signal, node);
         node.model = selected.id; node.sessionId = result.sessionId; node.result = validate(resultSchema, result.output);
         if (!node.result.complete) throw new Error(`Исполнитель не завершил задачу: ${node.result.summary}`);
         node.changedFiles = await this.checkScope(node.cwd, node.baseSha, task.writePaths);
         node.headSha = await commitChanges(node.cwd, `Kodo ${task.id}: ${run.task.slice(0,100)}`);
-        node.status = 'completed'; delete node.error; this.save(run); return;
+        node.status = 'completed'; delete node.error; delete node.resumeRequired; this.save(run); return;
       } catch (error) {
-        if (['quota', 'auth', 'cancelled'].includes(error.code)) { node.attempt--; node.status = error.code === 'quota' ? 'waiting_limits' : 'pending'; this.save(run); throw error; }
+        if (signal?.aborted || this.store.getRun(run.id).cancelRequested || ['quota', 'auth', 'cancelled', 'lease_lost'].includes(error.code)) { node.attempt--; node.resumeRequired = true; node.status = error.code === 'quota' ? 'waiting_limits' : 'pending'; this.save(run); if (signal?.aborted || this.store.getRun(run.id).cancelRequested) throw Object.assign(new Error('Запуск отменён'), { code: 'cancelled' }); throw error; }
         const signature = contentHash({ error: error.message, head: await git(node.cwd, ['rev-parse', 'HEAD']), files: await git(node.cwd, ['status', '--porcelain']) });
         node.error = redact(error.message, this.secrets); node.status = 'retrying'; this.log(run, 'node_failed', { node: task.id, attempt: node.attempt, error: node.error });
         const repeated = node.lastFailure === signature; node.lastFailure = signature; this.save(run);
@@ -148,28 +210,44 @@ export class Engine {
     }
   }
   async moreResearch(run, reason, signal) {
-    const remaining = run.config.researchBudget - (run.research.requests || 0); if (remaining <= 0) return;
-    const next = await this.researcher({ task: run.task, reason, budget: remaining, cache: run.research.cache, signal }, { secrets: this.secrets }).catch(error => ({ items: [], requests: 0, cache: run.research.cache, errors: [{ error: error.message }] }));
-    run.research = { items: [...run.research.items, ...next.items], requests: run.research.requests + next.requests, cache: next.cache, errors: [...run.research.errors, ...next.errors] }; this.save(run);
+    return this.withLease(run, `research:${run.id}`, 1, async signal => {
+      const remaining = run.config.researchBudget - (run.research.requests || 0); if (remaining <= 0) return;
+      const next = await this.researcher({ task: run.task, reason, budget: remaining, cache: run.research.cache, signal }, { secrets: this.secrets }).catch(error => ({ items: [], requests: 0, cache: run.research.cache, errors: [{ error: error.message }] }));
+      if (next.requests > remaining) throw new Error('Провайдер исследования превысил выделенный бюджет');
+      run.research = { items: [...run.research.items, ...next.items], requests: run.research.requests + next.requests, cache: next.cache, errors: [...run.research.errors, ...next.errors] }; this.save(run);
+    }, signal);
   }
   async integrateNode(run, task, signal) {
     const node = run.nodes[task.id]; if (node.status === 'integrated') return;
+    const mergeState = await execute('git', ['rev-parse', '--verify', 'MERGE_HEAD'], { cwd: run.cwd, allowFailure: true });
+    const mergeInProgress = mergeState.code === 0;
+    if (mergeInProgress && mergeState.stdout.trim() !== node.headSha) throw Object.assign(new Error('Незавершённый merge принадлежит другой задаче'), { code: 'merge_state' });
     const included = await execute('git', ['merge-base', '--is-ancestor', node.headSha, 'HEAD'], { cwd: run.cwd, allowFailure: true });
-    if (included.code !== 0) {
-      const merged = await execute('git', ['merge', '--no-ff', '--no-edit', node.branch], { cwd: run.cwd, allowFailure: true });
+    if (included.code !== 0 || mergeInProgress) {
+      const beforeMerge = await git(run.cwd, ['rev-parse', 'HEAD']);
+      run.pendingMerge = { kind: 'node', sha: node.headSha, nodeId: task.id }; this.save(run);
+      const merged = mergeInProgress ? { code: 1 } : await execute('git', ['merge', '--no-ff', '--no-edit', node.branch], { cwd: run.cwd, allowFailure: true });
       if (merged.code) {
         const conflicts = (await git(run.cwd, ['diff', '--name-only', '--diff-filter=U'])).split('\n').filter(Boolean);
-        if (!conflicts.length) throw new Error(`Не удалось интегрировать ${task.id}: ${merged.stderr}`);
-        const model = run.config.primaryModel || defaultModel(run.client);
-        await this.session(run, { client: run.client, model, cwd: run.cwd, prompt: `Resolve these Git merge conflicts preserving BOTH tasks: ${JSON.stringify(conflicts)}. Task ${run.task}. Do not commit, abort, push, or discard either implementation. Return completion JSON.`, schema: resultSchema }, signal);
-        if ((await git(run.cwd, ['diff', '--name-only', '--diff-filter=U'])).trim()) throw new Error('Конфликт интеграции не разрешён');
+        const pending = (await execute('git', ['rev-parse', '--verify', 'MERGE_HEAD'], { cwd: run.cwd, allowFailure: true })).code === 0;
+        if (!pending) throw new Error(`Не удалось интегрировать ${task.id}: ${merged.stderr}`);
+        if (conflicts.length) {
+          const model = run.config.primaryModel || defaultModel(run.client);
+          const response = await this.session(run, { client: run.client, model, cwd: run.cwd, prompt: `Resolve these Git merge conflicts preserving BOTH tasks: ${JSON.stringify(conflicts)}. Task ${run.task}. Do not commit, abort, push, or discard either implementation. The coordinator will stage resolved files. Return completion JSON.`, schema: resultSchema }, signal);
+          if (!response.output.complete) throw new Error('Конфликт интеграции не разрешён');
+        }
+        await this.checkScope(run.cwd, beforeMerge, run.plan.tasks.flatMap(item => item.writePaths));
+        await git(run.cwd, ['add', '-A']);
+        await execute('git', ['-c', 'core.whitespace=cr-at-eol,-blank-at-eol,-blank-at-eof,-space-before-tab', 'diff', '--cached', '--check'], { cwd: run.cwd });
         await commitChanges(run.cwd, `Kodo integrate ${task.id}`);
       }
     }
-    node.status = 'integrated'; run.headSha = await git(run.cwd, ['rev-parse', 'HEAD']); this.save(run); this.log(run, 'integrated', { node: task.id, headSha: run.headSha });
+    node.status = 'integrated'; run.pendingMerge = null; run.headSha = await git(run.cwd, ['rev-parse', 'HEAD']); this.save(run); this.log(run, 'integrated', { node: task.id, headSha: run.headSha });
   }
   async executeTasks(run, signal) {
     run.state = 'implementing'; this.save(run);
+    await this.recoverIntegrationEdits(run, signal);
+    if (run.config.delivery.enabled) await this.synchronizeBase(run, signal);
     while (run.plan.tasks.some(task => run.nodes[task.id]?.status !== 'integrated')) {
       const ready = run.plan.tasks.filter(task => run.nodes[task.id]?.status !== 'integrated' && task.dependsOn.every(id => run.nodes[id]?.status === 'integrated'));
       if (!ready.length) throw new Error('Не осталось исполняемых узлов плана');
@@ -188,31 +266,101 @@ export class Engine {
   }
   async checks(run, signal) {
     run.state = 'testing'; this.save(run); await this.setup(run.cwd, run, signal);
+    if (await git(run.cwd, ['status', '--porcelain'])) throw Object.assign(new Error('Проверка commit требует чистого integration worktree'), { code: 'dirty_worktree' });
     const results = [];
     for (const kind of ['test', 'build']) for (const command of run.config.commands[kind]) {
       this.checkCancelled(run, signal); this.log(run, 'check_started', { kind, command });
       const result = await execute(command.command, command.args, { cwd: run.cwd, signal, env: workerEnvironment(), secrets: this.secrets });
+      if (await git(run.cwd, ['status', '--porcelain'])) throw Object.assign(new Error('Команда проверки изменила проверяемые файлы'), { code: 'dirty_worktree' });
       results.push({ kind, command, exitCode: result.code, output: result.stdout.slice(-24000) });
     }
     if (!run.config.commands.test.length) throw new Error('Не настроена команда проверки результата');
     run.checks = { headSha: await git(run.cwd, ['rev-parse', 'HEAD']), results }; this.save(run);
   }
+  async synchronizeBase(run, signal) {
+    await git(run.cwd, ['fetch', 'origin', run.config.baseBranch]);
+    const remoteBase = await git(run.cwd, ['rev-parse', `origin/${run.config.baseBranch}`]);
+    const pending = await execute('git', ['rev-parse', '--verify', 'MERGE_HEAD'], { cwd: run.cwd, allowFailure: true });
+    if (pending.code === 0) {
+      const sha = pending.stdout.trim();
+      const task = run.plan.tasks.find(item => run.nodes[item.id]?.headSha === sha && run.nodes[item.id]?.status !== 'integrated');
+      if (task) { await this.integrateNode(run, task, signal); return this.synchronizeBase(run, signal); }
+      if (run.pendingMerge?.kind === 'node' || sha !== remoteBase && sha !== (run.pendingMerge?.sha || run.pendingMerge?.baseSha)) throw Object.assign(new Error('Незавершённый merge не соответствует целевой ветке'), { code: 'merge_state' });
+    }
+    const base = pending.code === 0 ? pending.stdout.trim() : remoteBase;
+    if (base === run.baseSha && pending.code !== 0) return;
+    run.pendingMerge = { kind: 'base', sha: base, baseSha: base }; this.save(run);
+    const merged = pending.code === 0 ? { code: 1 } : await execute('git', ['merge', '--no-edit', `origin/${run.config.baseBranch}`], { cwd: run.cwd, allowFailure: true });
+    if (merged.code) {
+      const conflicts = (await git(run.cwd, ['diff', '--name-only', '--diff-filter=U'])).split('\n').filter(Boolean);
+      if ((await execute('git', ['rev-parse', '--verify', 'MERGE_HEAD'], { cwd: run.cwd, allowFailure: true })).code !== 0) throw new Error(`Не удалось обновить целевую ветку: ${merged.stderr}`);
+      if (conflicts.length) {
+        const result = await this.session(run, { client: run.client, model: run.config.primaryModel || defaultModel(run.client), cwd: run.cwd, schema: resultSchema,
+          prompt: `Resolve target branch merge conflicts preserving BOTH the task implementation and incoming upstream changes. Conflicting paths: ${JSON.stringify(conflicts)}. Task: ${run.task}. Do not commit, push, abort the merge, or discard either side. Return structured completion JSON.` }, signal);
+        if (!result.output.complete) throw new Error('Конфликт целевой ветки не разрешён');
+      }
+      await this.checkScope(run.cwd, base, [...run.plan.tasks.flatMap(task => task.writePaths), ...conflicts]);
+      await git(run.cwd, ['add', '-A']);
+      await execute('git', ['-c', 'core.whitespace=cr-at-eol,-blank-at-eol,-blank-at-eof,-space-before-tab', 'diff', '--cached', '--check'], { cwd: run.cwd });
+      await commitChanges(run.cwd, 'Kodo reconcile target branch');
+    }
+    run.baseSha = base; run.pendingMerge = null; this.save(run);
+    if (remoteBase !== base) await this.synchronizeBase(run, signal);
+  }
+  async recoverIntegrationEdits(run, signal) {
+    this.checkCancelled(run, signal);
+    if ((await execute('git', ['rev-parse', '--verify', 'MERGE_HEAD'], { cwd: run.cwd, allowFailure: true })).code === 0) {
+      if (run.config.delivery.enabled) await this.synchronizeBase(run, signal);
+      else {
+        const sha = await git(run.cwd, ['rev-parse', 'MERGE_HEAD']);
+        const task = run.plan.tasks.find(item => run.nodes[item.id]?.headSha === sha);
+        if (!task) throw Object.assign(new Error('Неизвестный незавершённый merge'), { code: 'merge_state' });
+        await this.integrateNode(run, task, signal);
+      }
+    }
+    if (await git(run.cwd, ['status', '--porcelain'])) {
+      const scopes = run.plan.tasks.flatMap(task => task.writePaths);
+      if (run.config.delivery.release && run.releaseAssignment?.version) {
+        const changed = await changedFiles(run.cwd, 'HEAD');
+        for (const name of ['package.json', 'package-lock.json', 'registry.json'].filter(file => changed.includes(file))) {
+          const baseline = await execute('git', ['show', `HEAD:${name}`], { cwd: run.cwd, rawOutput: true });
+          const before = JSON.parse(baseline.stdout), after = JSON.parse(await readFile(path.join(run.cwd, name), 'utf8'));
+          if (after.version !== run.releaseAssignment.version) throw Object.assign(new Error(`Неожиданная версия при восстановлении: ${name}`), { code: 'scope_conflict' });
+          after.version = before.version;
+          if (name === 'package-lock.json' && after.packages?.[''] && before.packages?.['']) {
+            if (after.packages[''].version !== run.releaseAssignment.version) throw Object.assign(new Error('Неожиданная версия корневого пакета lock'), { code: 'scope_conflict' });
+            after.packages[''].version = before.packages[''].version;
+          }
+          if (!isDeepStrictEqual(before, after)) throw Object.assign(new Error(`Изменения metadata выходят за назначение версии: ${name}`), { code: 'scope_conflict' });
+          scopes.push(name);
+        }
+      }
+      await this.checkScope(run.cwd, 'HEAD', scopes);
+      run.headSha = await commitChanges(run.cwd, 'Kodo recover scoped interrupted repair');
+      run.checks = null; run.review = null; this.save(run); this.log(run, 'repair_recovered', { headSha: run.headSha });
+    }
+  }
   async verify(run, signal) {
     for (let attempt = 0; attempt < run.config.repairRounds; attempt++) {
       let checkError;
-      try { await this.checks(run, signal); } catch (error) { checkError = error; }
+      try { await this.checks(run, signal); } catch (error) {
+        if (signal?.aborted || this.store.getRun(run.id).cancelRequested) throw Object.assign(new Error('Запуск отменён'), { code: 'cancelled' });
+        if (['cancelled','quota','auth'].includes(error.code)) throw error;
+        checkError = error;
+      }
       const headSha = await git(run.cwd, ['rev-parse', 'HEAD']);
       let review;
       if (!checkError) {
         run.state = 'reviewing'; this.save(run);
         const selected = run.models.find(model => model.client === run.client && /astra|opus/.test(model.model)) || run.models[0];
         const diff = (await execute('git', ['diff', `${run.baseSha}...HEAD`], { cwd: run.cwd })).stdout;
+        const statusBeforeReview = await git(run.cwd, ['status', '--porcelain']);
         const response = await this.session(run, { client: selected.client, model: selected.model, cwd: run.cwd, readOnly: true, schema: reviewSchema,
           prompt: `Independently review the final implementation of this task: ${run.task}. Read project instructions and trace callers. Do not change files or execute write commands. Identify concrete defects and missing requirements. Test evidence: ${JSON.stringify(run.checks)}\nPlan: ${JSON.stringify(run.plan)}\nDiff excerpt (read full git diff if truncated): ${diff.slice(0,100000)}. Return passed=true only with no blocker/major findings.` }, signal);
         review = validate(reviewSchema, response.output);
         if (review.passed && review.findings.some(item => ['major', 'blocker'].includes(item.severity))) review.passed = false;
         const after = await git(run.cwd, ['rev-parse', 'HEAD']);
-        if (after !== headSha || await git(run.cwd, ['status', '--porcelain'])) throw new Error('Ревьюер изменил проверяемые файлы');
+        if (after !== headSha || await git(run.cwd, ['status', '--porcelain']) !== statusBeforeReview) throw new Error('Ревьюер изменил проверяемые файлы');
         if (review.passed) { run.headSha = headSha; run.review = { ...review, sessionId: response.sessionId, model: selected.id, headSha, diffHash: await diffHash(run.cwd, run.baseSha), attempt: attempt + 1 }; this.save(run); return; }
       }
       const problem = checkError?.message || JSON.stringify(review.findings);
@@ -220,58 +368,87 @@ export class Engine {
       if (attempt + 1 >= run.config.repairRounds) throw Object.assign(new Error(`Проверки не пройдены: ${problem}`), { code: 'blocked' });
       await this.moreResearch(run, problem, signal);
       const scopes = run.plan.tasks.flatMap(task => task.writePaths);
+      const beforeRepair = await git(run.cwd, ['rev-parse', 'HEAD']);
       const response = await this.session(run, { client: run.client, model: run.config.primaryModel || defaultModel(run.client), cwd: run.cwd, schema: resultSchema,
         prompt: `Repair confirmed failures in task ${run.task}. Do not commit/push/deploy, do not weaken checks. Change only these scopes ${JSON.stringify(scopes)}. Failures: ${problem}. Return completion JSON.` }, signal);
       if (!response.output.complete) throw new Error('Исправление проверки не завершено');
-      await this.checkScope(run.cwd, run.baseSha, scopes); await commitChanges(run.cwd, `Kodo repair checks ${attempt + 1}`);
+      await this.checkScope(run.cwd, beforeRepair, scopes); await commitChanges(run.cwd, `Kodo repair checks ${attempt + 1}`);
     }
   }
-  async run(id, { prepare = false, planFile, signal } = {}) {
+  async run(id, { prepare = false, planFile, signal, resumeCancelled = false, retryFailed = false } = {}) {
     const run = this.store.getRun(id);
-    if (run.state === 'succeeded' || run.state === 'cancelled') return run;
+    if (run.state === 'succeeded' || run.state === 'cancelled' && !resumeCancelled) return run;
     const token = this.store.acquireLease(`run:${id}`, id); if (!token) throw new Error('Этот запуск уже исполняется');
-    const heartbeat = setInterval(() => this.store.renewLease(token), 10000); heartbeat.unref();
+    if (resumeCancelled) { this.store.updateRun(id, { cancelRequested: false, state: 'resuming' }); delete run.cancelRequested; run.state = 'resuming'; }
+    if (retryFailed) {
+      for (const node of Object.values(run.nodes)) if (!['completed','integrated'].includes(node.status)) {
+        node.previousAttempts = (node.previousAttempts || 0) + node.attempt; node.attempt = 0; node.status = 'pending'; delete node.routing; delete node.sessionId; delete node.lastFailure;
+      }
+      this.save(run); this.log(run, 'retry_requested');
+    }
+    const parentSignal = signal, controller = new AbortController(), cancel = () => controller.abort();
+    let leaseError;
+    const heartbeat = setInterval(() => { if (!this.store.renewLease(token)) { leaseError = Object.assign(new Error('Потеряна блокировка запуска'), { code: 'lease_lost' }); cancel(); } }, this.leaseHeartbeatMs); heartbeat.unref();
+    parentSignal?.addEventListener('abort', cancel, { once: true }); if (parentSignal?.aborted) cancel();
+    signal = controller.signal;
+    const cancellation = setInterval(() => { if (this.store.getRun(id).cancelRequested) cancel(); }, 500); cancellation.unref();
     try {
       this.checkCancelled(run, signal); await this.prepare(run, signal);
-      if (prepare && !run.plan) { run.state = 'awaiting_plan'; await writeFile(path.join(run.artifacts, 'plan.schema.json'), JSON.stringify(planSchema, null, 2)); this.save(run); return run; }
+      if (prepare && !run.plan) { run.state = 'awaiting_plan'; run.planningContext = await this.policy(run, 'plan'); await writeFile(path.join(run.artifacts, 'plan-context.md'), run.planningContext); await writeFile(path.join(run.artifacts, 'plan.schema.json'), JSON.stringify(planSchema, null, 2)); this.save(run); return run; }
       await this.plan(run, planFile, signal);
-      run.models = (await this.provider.discoverProviders({ client: run.client, providers: run.providers, primaryModel: run.config.primaryModel }, { secrets: this.secrets, config: run.config })).filter(item => item.available !== false);
-      if (!run.models.length) throw Object.assign(new Error('Нет доступных моделей по подписке'), { code: 'auth' });
-      this.save(run);
-      if (!run.completed.implementation) { await this.executeTasks(run, signal); run.completed.implementation = true; this.save(run); }
+      if (run.delivery?.pr && this.delivery.reconcileDelivery) {
+        const recovered = await this.delivery.reconcileDelivery({ run, config: run.config, store: this.store, cwd: run.cwd, signal });
+        if (recovered) { run.delivery = recovered; this.save(run); }
+      }
       if (!run.delivery?.mergeCommit) {
+        run.models = (await this.provider.discoverProviders({ client: run.client, providers: run.providers, primaryModel: run.config.primaryModel }, { secrets: this.secrets, config: run.config })).filter(item => item.available !== false);
+        if (!run.models.length) throw Object.assign(new Error('Нет доступных моделей по подписке'), { code: 'auth' });
+        this.save(run);
+        if (!run.completed.implementation) { await this.executeTasks(run, signal); run.completed.implementation = true; this.save(run); }
+        await this.recoverIntegrationEdits(run, signal);
+        if (run.config.delivery.enabled) await this.synchronizeBase(run, signal);
         if (run.config.delivery.release) {
           if (this.delivery.prepareReleaseVersion) await this.delivery.prepareReleaseVersion({ run, config: run.config, store: this.store, cwd: run.cwd, signal });
-          await commitChanges(run.cwd, 'Kodo assign release version');
+          await commitChanges(run.cwd, 'Kodo assign release version', ['package.json', 'package-lock.json', 'registry.json']);
         }
         await this.verify(run, signal);
       }
+      this.checkCancelled(run, signal);
       if (run.config.delivery.enabled) {
         run.state = 'delivering'; this.save(run);
         for (let attempt = 0; ; attempt++) {
           try { run.delivery = await this.delivery.deliver({ run, config: run.config, store: this.store, cwd: run.cwd, review: run.review, signal, onEvent: event => this.log(run, 'delivery', event) }); break; }
           catch (error) {
             if (error.code !== 'stale_base' || attempt >= 3) throw error;
-            await git(run.cwd, ['fetch', 'origin', run.config.baseBranch]);
-            const base = await git(run.cwd, ['rev-parse', `origin/${run.config.baseBranch}`]);
-            const merged = await execute('git', ['merge', '--no-edit', `origin/${run.config.baseBranch}`], { cwd: run.cwd, allowFailure: true });
-            if (merged.code) throw Object.assign(new Error('Конфликт с целевой веткой: требуется перепланирование интеграции'), { code: 'blocked' });
-            run.baseSha = base; this.save(run); await this.verify(run, signal);
+            if (run.delivery?.pr && this.delivery.reconcileDelivery) {
+              const recovered = await this.delivery.reconcileDelivery({ run, config: run.config, store: this.store, cwd: run.cwd, signal });
+              if (recovered) { run.delivery = recovered; break; }
+            }
+            await this.synchronizeBase(run, signal);
+            if (run.config.delivery.release && this.delivery.prepareReleaseVersion) {
+              await this.delivery.prepareReleaseVersion({ run, config: run.config, store: this.store, cwd: run.cwd, signal });
+              await commitChanges(run.cwd, 'Kodo refresh release version', ['package.json', 'package-lock.json', 'registry.json']);
+            }
+            await this.verify(run, signal);
           }
         }
         this.save(run);
+        this.checkCancelled(run, signal);
         if (run.config.delivery.release) {
           run.state = 'releasing'; this.save(run);
           run.release = await this.delivery.releasePackage({ run, config: run.config, store: this.store, cwd: run.cwd, mergeCommit: run.delivery.mergeCommit, signal, onEvent: event => this.log(run, 'release', event) });
         }
       }
+      if (!run.release?.published) this.checkCancelled(run, signal);
       run.state = 'succeeded'; run.error = null; this.save(run); this.log(run, 'succeeded', { headSha: run.headSha, pr: run.delivery?.pr, release: run.release });
+      await this.policy(run, 'complete'); run.knowledge = this.store.remember(run); this.save(run);
       await writeFile(path.join(run.artifacts, 'receipt.json'), JSON.stringify(redact(run, this.secrets), null, 2)); return run;
     } catch (error) {
-      run.state = error.code === 'quota' ? 'waiting_limits' : error.code === 'cancelled' ? 'cancelled' : 'blocked';
+      error = leaseError || error;
+      run.state = this.store.getRun(run.id).cancelRequested ? 'cancelled' : error.code === 'lease_lost' ? 'blocked' : error.code === 'quota' ? 'waiting_limits' : error.code === 'cancelled' || signal?.aborted ? 'cancelled' : 'blocked';
       run.error = { code: error.code || 'error', message: redact(error.message, this.secrets), ...(error.retryAt ? { retryAt: error.retryAt } : {}) };
       this.save(run); this.log(run, run.state, run.error); return run;
-    } finally { clearInterval(heartbeat); this.store.releaseLease(token); }
+    } finally { clearInterval(heartbeat); clearInterval(cancellation); parentSignal?.removeEventListener('abort', cancel); this.store.releaseLease(token); }
   }
 }
 async function lstatSafe(filename) { try { const { lstat } = await import('node:fs/promises'); return await lstat(filename); } catch (error) { if (error.code === 'ENOENT') return null; throw error; } }

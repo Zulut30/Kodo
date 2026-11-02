@@ -3,6 +3,8 @@ import { spawn } from 'node:child_process';
 import { access, mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { workerEnvironment } from './security.mjs';
+import { gitBoundary } from './command.mjs';
 
 const sha256 = value => createHash('sha256').update(value).digest('hex');
 const fail = (code, message, extra = {}) => Object.assign(new Error(message), { code, ...extra });
@@ -26,13 +28,19 @@ async function npmCommand() {
   throw fail('configuration', 'Cannot find npm-cli.js; install npm beside Node.js');
 }
 
-export async function execute(command, args, { cwd, signal, timeoutMs = 120000, allowFailure = false, env = process.env } = {}) {
+export async function execute(command, args, { cwd, signal, timeoutMs = 120000, allowFailure = false, env } = {}) {
+  const baseEnv = env ?? process.env;
+  let environment = workerEnvironment(baseEnv);
   let executable = command, argv = args;
+  // Coordinator Git processes retain credentials, so repository-authored hooks
+  // must never run inside that boundary, including pre-push and reference hooks.
+  if (/(?:^|[\\/])git(?:\.exe)?$/i.test(command)) ({ args: argv, env: environment } = gitBoundary(args, baseEnv));
+  else if (/(?:^|[\\/])gh(?:\.exe)?$/i.test(command)) environment = gitBoundary(['ls-remote'], baseEnv).env;
   if (command === 'npm') {
     const [node, prefix] = await npmCommand(); executable = node; argv = [...prefix, ...args];
   }
   return new Promise((resolve, reject) => {
-    const child = spawn(executable, argv, { cwd, env, signal, shell: false, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(executable, argv, { cwd, env: environment, signal, shell: false, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '', stderr = '', settled = false;
     const timer = setTimeout(() => { child.kill(); finish(fail('timeout', `${command} timed out`)); }, timeoutMs);
     const finish = (error, result) => { if (settled) return; settled = true; clearTimeout(timer); error ? reject(error) : resolve(result); };
@@ -52,16 +60,31 @@ function context(options) {
   const { run, config = {}, cwd = run.project, signal, store } = options;
   const runner = options.exec ?? execute;
   const leaseRegistry = new Map();
+  let finishingIrreversible = false;
+  const checkpoint = () => {
+    if (signal?.aborted) throw fail('cancelled', 'Delivery cancelled');
+    for (const lease of leaseRegistry.values()) if (lease.error) throw lease.error;
+  };
   const command = async (name, args, settings = {}) => {
-    if (signal?.aborted && !settings.ignoreAbort) throw fail('cancelled', 'Delivery cancelled');
-    if (!settings.ignoreAbort) for (const lease of leaseRegistry.values()) if (lease.error) throw lease.error;
-    const result = await runner(name, args, { cwd, signal: settings.ignoreAbort ? undefined : signal, ...settings });
+    if (!settings.reconcile && !finishingIrreversible) checkpoint();
+    const baseEnv = settings.env ?? process.env;
+    const environment = /(?:^|[\\/])git(?:\.exe)?$/i.test(name) ? gitBoundary(args, baseEnv).env
+      : /(?:^|[\\/])gh(?:\.exe)?$/i.test(name) ? gitBoundary(['ls-remote'], baseEnv).env : workerEnvironment(baseEnv);
+    const result = await runner(name, args, { cwd, ...settings, env: environment, signal: settings.ignoreAbort || finishingIrreversible ? undefined : signal });
     if (result.code && !settings.allowFailure) throw fail('command_failed', `${name} failed (${result.code}): ${(result.stderr ?? '').slice(-1500)}`, { exitCode: result.code, stderr: result.stderr });
     return result.stdout?.trimEnd() ?? '';
   };
   const event = async (type, data) => { await store?.event?.(run.id, type, data); await options.onEvent?.({ type, ...data }); };
   const save = async patch => { Object.assign(run, patch); await store?.updateRun?.(run.id, patch); };
-  return { ...options, run, config, cwd, signal, command, event, save, leaseRegistry, repository: config.repository, baseBranch: config.baseBranch ?? 'main' };
+  const irreversible = async action => {
+    checkpoint();
+    // Cancellation is honored before an irreversible unit. Once it has begun,
+    // finish its bounded confirmation/receipt sequence instead of killing a
+    // process whose remote mutation may already have succeeded.
+    const previous = finishingIrreversible; finishingIrreversible = true;
+    try { return await action(); } finally { finishingIrreversible = previous; }
+  };
+  return { ...options, run, config, cwd, signal, command, event, save, irreversible, leaseRegistry, repository: config.repository, baseBranch: config.baseBranch ?? 'main' };
 }
 
 function validateRepository(repository, branch) {
@@ -85,8 +108,8 @@ export function validateChecks(checks, required) {
   return { ready: !missing.length && !pending.length && !failed.length, missing, pending, failed };
 }
 
-export function assertFreshRelease({ candidateSha, remoteHead, latestSha, latestVersion, version }) {
-  if (!candidateSha || candidateSha !== remoteHead) throw fail('stale_release', 'Release candidate is no longer the current target branch head');
+export function assertFreshRelease({ candidateSha, remoteHead, candidateIsAncestor = false, latestSha, containsLatest = false, latestVersion, version }) {
+  if (!candidateSha || candidateSha !== remoteHead && !candidateIsAncestor) throw fail('stale_release', 'Release candidate is not contained in the current target branch');
   if (!/^\d+\.\d+\.\d+$/.test(version ?? '')) throw fail('release_version_mismatch', 'Release version must be X.Y.Z');
   if (latestVersion) {
     const previous = latestVersion.replace(/^v/, '').split('.').map(Number);
@@ -94,7 +117,7 @@ export function assertFreshRelease({ candidateSha, remoteHead, latestSha, latest
     if (previous.some(Number.isNaN) || previous.length !== 3) throw fail('release_version_mismatch', 'Latest release has an unsupported version');
     let comparison = 0;
     for (let index = 0; index < 3 && !comparison; index++) comparison = Math.sign(current[index] - previous[index]);
-    if (comparison < 0 || comparison === 0 && latestSha !== candidateSha) throw fail('stale_release', 'Release would replace the same or a newer published version');
+    if (comparison <= 0 || latestSha && latestSha !== candidateSha && !containsLatest) throw fail('stale_release', 'Release would replace the same or a newer published result');
   }
   return true;
 }
@@ -133,6 +156,28 @@ async function releaseOwnedLease(ctx, token) {
 
 async function getPr(ctx, number) {
   return parse(await ctx.command('gh', ['pr', 'view', String(number), '--repo', ctx.repository, '--json', 'number,url,state,mergedAt,mergeCommit,headRefOid,baseRefName,statusCheckRollup']), 'gh pr view');
+}
+
+function mergedReceipt(ctx, previous, saved, expectedHead) {
+  if (!expectedHead || previous.headRefOid !== expectedHead || previous.baseRefName !== ctx.baseBranch) throw fail('stale_review', 'Saved PR no longer matches its immutable reviewed head and target');
+  const mergeCommit = previous.mergeCommit?.oid;
+  if (!/^[a-f0-9]{40,64}$/.test(mergeCommit ?? '')) throw fail('invalid_output', 'Merged PR is missing a valid merge commit');
+  return { ...saved, pr: { number: previous.number, url: previous.url }, reviewedHead: expectedHead, mergeCommit };
+}
+
+/** Read-only GitHub reconciliation; only the confirmed receipt may be persisted. */
+export async function reconcileDelivery(options) {
+  const ctx = context(options);
+  const saved = ctx.run.delivery;
+  if (!saved?.pr?.number) return null;
+  validateRepository(ctx.repository, ctx.baseBranch);
+  if (!/^\d+$/.test(String(saved.pr.number))) throw fail('configuration', 'Invalid saved pull request number');
+  const previous = await getPr(ctx, saved.pr.number);
+  if (previous.state !== 'MERGED') return null;
+  const expectedHead = saved.reviewedHead || options.review?.headSha || ctx.run.review?.headSha || ctx.run.headSha;
+  const receipt = mergedReceipt(ctx, previous, saved, expectedHead);
+  await ctx.save({ delivery: receipt });
+  return receipt;
 }
 
 async function fetchBase(ctx) {
@@ -179,18 +224,9 @@ export async function deliver(options) {
   validateRepository(ctx.repository, ctx.baseBranch);
   if (!ctx.run.branch || ctx.run.branch === ctx.baseBranch || ctx.run.branch.startsWith('-')) throw fail('configuration', 'Delivery needs a separate task branch');
   // Reconcile a previously merged PR before requiring an obsolete local review.
+  const reconciled = await reconcileDelivery(options);
+  if (reconciled) return reconciled;
   let saved = ctx.run.delivery ?? {};
-  if (saved.pr?.number) {
-    const previous = await getPr(ctx, saved.pr.number);
-    if (previous.state === 'MERGED') {
-      if (previous.headRefOid !== ctx.run.headSha || previous.baseRefName !== ctx.baseBranch) throw fail('stale_review', 'Saved PR no longer matches this run head and target');
-      const mergeCommit = previous.mergeCommit?.oid;
-      if (!mergeCommit) throw fail('invalid_output', 'Merged PR is missing merge commit');
-      const receipt = { ...saved, pr: { number: previous.number, url: previous.url }, mergeCommit };
-      await ctx.save({ delivery: receipt });
-      return receipt;
-    }
-  }
   const { head, diffHash } = await verifyReview(ctx);
   const required = await requiredChecks(ctx);
   await ctx.command('git', ['push', '--set-upstream', 'origin', ctx.run.branch]);
@@ -214,30 +250,46 @@ export async function deliver(options) {
   await ctx.event('delivery.pr_created', { pr: saved.pr });
   if (pr.state === 'MERGED') {
     const merged = await getPr(ctx, pr.number);
-    if (merged.headRefOid !== head || merged.baseRefName !== ctx.baseBranch) throw fail('stale_review', 'Merged PR does not match this run');
-    const receipt = { ...saved, mergeCommit: merged.mergeCommit?.oid };
-    if (!receipt.mergeCommit) throw fail('invalid_output', 'Merged PR is missing merge commit');
+    const receipt = mergedReceipt(ctx, merged, saved, saved.reviewedHead || head);
     await ctx.save({ delivery: receipt }); return receipt;
   }
   await ctx.command('gh', ['api', '--method', 'POST', `repos/${ctx.repository}/statuses/${head}`, '-f', 'state=success', '-f', 'context=kodo/review', '-f', 'description=Independent Kodo review passed for this exact diff']);
   await awaitChecks(ctx, pr.number, head, required);
   const lease = await acquire(ctx, `merge:${ctx.repository}:${ctx.baseBranch}`);
+  let publicationLease;
   try {
+    if (ctx.config.delivery?.release) publicationLease = await acquire(ctx, `release:${ctx.repository}:${ctx.baseBranch}`);
     const currentBase = await fetchBase(ctx);
     if (currentBase !== ctx.run.baseSha) throw fail('stale_base', 'Target branch advanced; synchronize, retest and review before merge', { baseSha: currentBase });
     await awaitChecks(ctx, pr.number, head, required);
-    try { await ctx.command('gh', ['pr', 'merge', String(pr.number), '--repo', ctx.repository, '--squash', '--match-head-commit', head]); }
-    catch (error) {
-      if (await fetchBase(ctx) !== ctx.run.baseSha) throw fail('stale_base', 'Target branch changed while merging; synchronize and retry');
-      throw error;
+    if (ctx.config.delivery?.release) {
+      const manifest = parse(await readFile(path.join(ctx.cwd, 'package.json'), 'utf8'), 'reviewed release manifest');
+      const targetManifest = parse(await ctx.command('git', ['show', `${currentBase}:package.json`]), 'target release manifest');
+      const assigned = ctx.run.releaseAssignment;
+      const latest = (await publishedReleases(ctx)).at(-1);
+      if (!assigned?.prepared || assigned.version !== manifest.version || compareVersion(assigned.version, targetManifest.version) <= 0 || latest && compareVersion(assigned.version, latest.tagName.replace(/^v/, '')) <= 0) {
+        throw fail('stale_base', 'Release version assignment is stale; prepare, commit, test and review a fresh version before merging', { latestVersion: latest?.tagName, targetVersion: targetManifest.version });
+      }
     }
-    const merged = await getPr(ctx, pr.number);
-    if (merged.state !== 'MERGED' || !merged.mergeCommit?.oid) throw fail('merge_pending', 'PR has not been confirmed merged');
-    const receipt = { ...saved, mergeCommit: merged.mergeCommit.oid };
-    await ctx.save({ delivery: receipt });
-    await ctx.event('delivery.merged', { pr: receipt.pr, mergeCommit: receipt.mergeCommit });
-    return receipt;
-  } finally { await releaseOwnedLease(ctx, lease); }
+    return await ctx.irreversible(async () => {
+      let mergeError;
+      try { await ctx.command('gh', ['pr', 'merge', String(pr.number), '--repo', ctx.repository, '--squash', '--match-head-commit', head], { ignoreAbort: true }); }
+      catch (error) { mergeError = error; }
+      const merged = await getPr(ctx, pr.number);
+      if (merged.state !== 'MERGED' || !merged.mergeCommit?.oid) {
+        if (await fetchBase(ctx) !== ctx.run.baseSha) throw fail('stale_base', 'Target branch changed while merging; synchronize and retry');
+        if (mergeError) throw mergeError;
+        throw fail('merge_pending', 'PR has not been confirmed merged');
+      }
+      const receipt = mergedReceipt(ctx, merged, saved, saved.reviewedHead || head);
+      await ctx.save({ delivery: receipt });
+      await ctx.event('delivery.merged', { pr: receipt.pr, mergeCommit: receipt.mergeCommit });
+      return receipt;
+    });
+  } finally {
+    try { if (publicationLease) await releaseOwnedLease(ctx, publicationLease); }
+    finally { await releaseOwnedLease(ctx, lease); }
+  }
 }
 
 async function safeRemove(directory, prefix) {
@@ -260,7 +312,13 @@ async function smokePackage(ctx, artifact, directory, manifest) {
   const bin = typeof manifest.bin === 'string' ? manifest.bin : manifest.bin?.kodo;
   if (!bin || path.isAbsolute(bin) || bin.split(/[\\/]/).includes('..')) throw fail('release_package', 'Package has no valid kodo executable');
   if (!/^(?:@[a-z0-9_.-]+\/)?[a-z0-9_.-]+$/.test(manifest.name ?? '') || manifest.name.split('/').some(part => part === '.' || part === '..')) throw fail('release_package', 'Package name is not valid');
-  const entry = path.join(install, 'node_modules', ...manifest.name.split('/'), bin);
+  const packageRoot = path.join(install, 'node_modules', ...manifest.name.split('/'));
+  let installed;
+  try { installed = parse(await readFile(path.join(packageRoot, 'package.json'), 'utf8'), 'installed package manifest'); }
+  catch { throw fail('release_conflict', 'Downloaded archive does not contain the expected package'); }
+  const installedBin = typeof installed.bin === 'string' ? installed.bin : installed.bin?.kodo;
+  if (installed.name !== manifest.name || installed.version !== manifest.version || installedBin?.replace(/^\.\//, '') !== bin.replace(/^\.\//, '')) throw fail('release_conflict', 'Archive package identity/version differs from the exact release commit');
+  const entry = path.join(packageRoot, bin);
   const help = await ctx.command(process.execPath, [entry, '--help'], { cwd: install });
   if (!/kodo/i.test(help)) throw fail('smoke_failed', 'Installed command did not identify itself as Kodo');
   const list = parse(await ctx.command(process.execPath, [entry, 'list', '--json'], { cwd: install }), 'installed catalog');
@@ -294,22 +352,29 @@ export async function prepareReleaseVersion(options) {
     const filename = path.join(ctx.cwd, 'package.json');
     const manifest = parse(await readFile(filename, 'utf8'), 'package.json');
     versionParts(manifest.version);
+    const targetSha = await fetchBase(ctx);
+    const targetVersion = parse(await ctx.command('git', ['show', `${targetSha}:package.json`]), 'target package manifest').version;
+    versionParts(targetVersion);
+    const floor = ctx.config.delivery?.firstVersion ?? '0.2.0';
+    versionParts(floor);
     const releases = parse(await ctx.command('gh', ['release', 'list', '--repo', ctx.repository, '--limit', '100', '--json', 'tagName,isDraft,isPrerelease']), 'release versions');
     const versions = releases.filter(item => !item.isDraft && !item.isPrerelease && /^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(item.tagName)).map(item => item.tagName.replace(/^v/, '')).sort(compareVersion);
     const latest = versions.at(-1);
     const saved = ctx.run.releaseAssignment;
+    const previousVersion = saved?.version === manifest.version ? saved.previousVersion : manifest.version;
     let version;
-    if (saved?.baseSha === ctx.run.baseSha && [saved.previousVersion, saved.version].includes(manifest.version) && (!latest || compareVersion(saved.version, latest) > 0)) version = saved.version;
+    if (saved && (manifest.version === saved.version || saved.baseSha === ctx.run.baseSha && manifest.version === saved.previousVersion) && compareVersion(saved.version, targetVersion) > 0 && compareVersion(saved.version, floor) >= 0 && (!latest || compareVersion(saved.version, latest) > 0)) version = saved.version;
     else if (ctx.config.delivery?.nextVersion) version = ctx.config.delivery.nextVersion;
-    else if (!latest) version = ctx.config.delivery?.firstVersion ?? '0.2.0';
     else {
-      const greatest = compareVersion(manifest.version, latest) > 0 ? manifest.version : latest;
-      const [major, minor, patch] = versionParts(greatest); version = `${major}.${minor}.${patch + 1}`;
+      const greatest = [previousVersion, targetVersion, latest].filter(Boolean).sort(compareVersion).at(-1);
+      const [major, minor, patch] = versionParts(greatest);
+      const bumped = `${major}.${minor}.${patch + 1}`;
+      version = compareVersion(bumped, floor) >= 0 ? bumped : floor;
     }
     versionParts(version);
-    if (latest && compareVersion(version, latest) <= 0) throw fail('release_version_mismatch', 'Assigned release version must be newer than published releases');
+    if (compareVersion(version, targetVersion) <= 0 || compareVersion(version, floor) < 0 || latest && compareVersion(version, latest) <= 0) throw fail('release_version_mismatch', 'Assigned release version must exceed target/published versions and satisfy the configured floor');
     // Save intent before atomic metadata writes so a crash cannot bump twice.
-    const assignment = { version, previousVersion: saved?.version === version ? saved.previousVersion : manifest.version, baseSha: ctx.run.baseSha, prepared: false };
+    const assignment = { version, previousVersion: saved?.version === version ? saved.previousVersion : previousVersion, baseSha: ctx.run.baseSha, prepared: false };
     await ctx.save({ releaseAssignment: assignment });
     const files = [];
     if (manifest.version !== version) { manifest.version = version; await writeMetadata(filename, manifest); files.push('package.json'); }
@@ -336,6 +401,80 @@ export async function prepareReleaseVersion(options) {
   } finally { await releaseOwnedLease(ctx, lease); }
 }
 
+async function verifyReleaseAssets(ctx, info, { tag, artifact, sha256: checksum }, directory) {
+  if (!/^v\d+\.\d+\.\d+$/.test(tag ?? '') || path.basename(artifact ?? '') !== artifact || !/^[a-f0-9]{64}$/.test(checksum ?? '')) throw fail('release_conflict', 'Release receipt is invalid');
+  if (info.tagName !== tag || !info.assets?.some(asset => asset.name === artifact) || !info.assets?.some(asset => asset.name === 'SHA256SUMS')) throw fail('release_conflict', 'Published release has incomplete assets');
+  const downloaded = path.join(directory, `verify-${randomUUID()}`); await mkdir(downloaded);
+  for (const filename of [artifact, 'SHA256SUMS']) await ctx.command('gh', ['release', 'download', tag, '--repo', ctx.repository, '--pattern', filename, '--dir', downloaded]);
+  if (sha256(await readFile(path.join(downloaded, artifact))) !== checksum) throw fail('release_conflict', 'Published package differs from its release receipt');
+  if ((await readFile(path.join(downloaded, 'SHA256SUMS'), 'utf8')).trim() !== `${checksum}  ${artifact}`) throw fail('release_conflict', 'Published checksum file differs from its release receipt');
+  return { ...info, downloadedArtifact: path.join(downloaded, artifact) };
+}
+
+async function reusableRemotePackage(ctx, info, { tag, expectedSha }, directory) {
+  const downloaded = path.join(directory, `recover-${randomUUID()}`); await mkdir(downloaded);
+  const checksumFile = path.join(downloaded, 'SHA256SUMS');
+  const hasChecksum = info.assets?.some(asset => asset.name === 'SHA256SUMS');
+  let recorded;
+  if (hasChecksum) {
+    await ctx.command('gh', ['release', 'download', tag, '--repo', ctx.repository, '--pattern', 'SHA256SUMS', '--dir', downloaded]);
+    const content = (await readFile(checksumFile, 'utf8')).trim();
+    const match = /^([a-f0-9]{64})  ([a-zA-Z0-9_.-]+\.tgz)$/.exec(content);
+    if (!match) throw fail('release_conflict', 'Published SHA256SUMS is not a single valid Kodo artifact');
+    recorded = { checksum: match[1], filename: match[2] };
+  }
+  const attested = expectedSha ?? /^SHA-256: ([a-f0-9]{64})\s*$/m.exec(info.body ?? '')?.[1];
+  if (!attested || recorded && recorded.checksum !== attested) throw fail('release_conflict', 'Release checksum is not bound to its original commit attestation');
+  const archives = (info.assets ?? []).filter(asset => /^[a-zA-Z0-9_.-]+\.tgz$/.test(asset.name));
+  const filename = recorded?.filename ?? (archives.length === 1 ? archives[0].name : null);
+  if (archives.length > 1 && !recorded) throw fail('release_conflict', 'Release contains ambiguous package archives');
+  if (!filename || !archives.some(asset => asset.name === filename)) return { missingArchive: true, expectedSha: attested, filename, hasChecksum };
+  await ctx.command('gh', ['release', 'download', tag, '--repo', ctx.repository, '--pattern', filename, '--dir', downloaded]);
+  const archivePath = path.join(downloaded, filename), checksum = sha256(await readFile(archivePath));
+  if (checksum !== attested) throw fail('release_conflict', 'Published archive differs from its original commit attestation');
+  if (!hasChecksum) await writeFile(checksumFile, `${checksum}  ${filename}\n`);
+  return { archivePath, checksumFile, checksum, filename, hasChecksum };
+}
+
+async function getRelease(ctx, tag) {
+  return parse(await ctx.command('gh', ['release', 'view', tag, '--repo', ctx.repository, '--json', 'url,tagName,assets,isDraft,isPrerelease,body,targetCommitish']), 'release information');
+}
+
+async function verifyPublishedArtifact(ctx, receipt, directory) {
+  if (!/^v\d+\.\d+\.\d+$/.test(receipt.tag ?? '') || path.basename(receipt.artifact ?? '') !== receipt.artifact || !/^[a-f0-9]{64}$/.test(receipt.sha256 ?? '')) throw fail('release_conflict', 'Release receipt is invalid');
+  await ctx.command('git', ['fetch', 'origin', '--tags']);
+  const actualCommit = (await ctx.command('git', ['rev-parse', `refs/tags/${receipt.tag}^{commit}`])).trim();
+  if (actualCommit !== receipt.commit) throw fail('release_conflict', 'Published tag points to a different commit');
+  const info = await getRelease(ctx, receipt.tag);
+  if (info.isDraft !== false) throw fail('release_conflict', 'Release has not been confirmed published');
+  return verifyReleaseAssets(ctx, info, receipt, directory);
+}
+
+async function releaseInventory(ctx) {
+  return parse(await ctx.command('gh', ['release', 'list', '--repo', ctx.repository, '--limit', '100', '--json', 'tagName,isDraft,isPrerelease']), 'release inventory');
+}
+
+function sortedPublished(releases) {
+  return releases.filter(item => !item.isDraft && !item.isPrerelease && /^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(item.tagName))
+    .sort((a, b) => compareVersion(a.tagName.replace(/^v/, ''), b.tagName.replace(/^v/, '')));
+}
+
+async function publishedReleases(ctx) { return sortedPublished(await releaseInventory(ctx)); }
+
+function assertOwnedDraft(ctx, info, version, candidate) {
+  const marker = `<!-- kodo-release:${ctx.run.id}:${candidate} -->`;
+  const legacy = info.body?.includes(`Kodo ${version}\n`) && info.body.includes(`\nCommit: ${candidate}\n`) && info.body.includes(`\nRun: ${ctx.run.id}\n`);
+  if (info.tagName !== `v${version}` || info.targetCommitish !== candidate || info.isPrerelease || !(info.body?.includes(marker) || legacy)) throw fail('release_conflict', 'An unrelated draft already uses this tag; refusing to modify it');
+}
+
+async function assertCandidateFresh(ctx, candidate, version, latest) {
+  const remoteHead = await fetchBase(ctx);
+  const candidateIsAncestor = (await ctx.command('git', ['merge-base', candidate, remoteHead], { allowFailure: true })).trim() === candidate;
+  const latestSha = latest ? (await ctx.command('git', ['rev-parse', `${latest.tagName}^{commit}`])).trim() : null;
+  const containsLatest = !latestSha || (await ctx.command('git', ['merge-base', latestSha, candidate], { allowFailure: true })).trim() === latestSha;
+  assertFreshRelease({ candidateSha: candidate, remoteHead, candidateIsAncestor, latestSha, containsLatest, latestVersion: latest?.tagName, version });
+}
+
 /**
  * Publish an immutable package for an exact merged SHA. The receipt's tag URL
  * and artifact URL are authoritative. Kodo v1 never changes GitHub's mutable
@@ -352,66 +491,101 @@ export async function releasePackage(options) {
     directory = await mkdtemp(path.join(os.tmpdir(), 'kodo-release-'));
     const savedReceipt = ctx.run.delivery?.release;
     if (savedReceipt?.published === true && savedReceipt.commit === candidate) {
-      const info = parse(await ctx.command('gh', ['release', 'view', savedReceipt.tag, '--repo', ctx.repository, '--json', 'url,tagName,assets']), 'saved release');
-      if (info.tagName !== savedReceipt.tag || !info.assets?.some(asset => asset.name === savedReceipt.artifact) || !info.assets?.some(asset => asset.name === 'SHA256SUMS')) throw fail('release_conflict', 'Saved release no longer has the expected assets');
-      if (path.basename(savedReceipt.artifact) !== savedReceipt.artifact || !/^[a-f0-9]{64}$/.test(savedReceipt.sha256)) throw fail('release_conflict', 'Saved release receipt is invalid');
-      const downloaded = path.join(directory, 'downloaded'); await mkdir(downloaded);
-      await ctx.command('gh', ['release', 'download', savedReceipt.tag, '--repo', ctx.repository, '--pattern', savedReceipt.artifact, '--dir', downloaded]);
-      if (sha256(await readFile(path.join(downloaded, savedReceipt.artifact))) !== savedReceipt.sha256) throw fail('release_conflict', 'Published package differs from the saved receipt');
-      return { ...savedReceipt, url: info.url };
+      const info = await verifyPublishedArtifact(ctx, savedReceipt, directory);
+      const manifest = parse(await ctx.command('git', ['show', `${candidate}:package.json`]), 'release commit manifest');
+      if (manifest.version !== savedReceipt.version) throw fail('release_conflict', 'Saved release version differs from its exact commit');
+      const smoke = await smokePackage(ctx, info.downloadedArtifact, directory, manifest);
+      const receipt = { ...savedReceipt, url: info.url, smoke };
+      await ctx.save({ delivery: { ...(ctx.run.delivery ?? {}), release: receipt } });
+      return receipt;
     }
     source = path.join(directory, 'source');
     await ctx.command('git', ['fetch', 'origin', ctx.baseBranch, '--tags']);
     await ctx.command('git', ['worktree', 'add', '--detach', source, candidate]);
     const manifest = parse(await readFile(path.join(source, 'package.json'), 'utf8'), 'package.json');
     const version = manifest.version;
-    const latest = parse(await ctx.command('gh', ['release', 'list', '--repo', ctx.repository, '--limit', '1', '--json', 'tagName,isDraft,isPrerelease']), 'release list').filter(item => !item.isDraft && !item.isPrerelease)[0];
-    const latestSha = latest ? (await ctx.command('git', ['rev-parse', `${latest.tagName}^{commit}`])).trim() : null;
+    const inventory = await releaseInventory(ctx);
+    const releases = sortedPublished(inventory);
+    const latest = releases.at(-1);
     const expectedVersion = ctx.run.releaseAssignment?.version ?? (latest ? (ctx.config.delivery?.nextVersion ?? version) : (ctx.config.delivery?.firstVersion ?? version));
     if (version !== expectedVersion) throw fail('release_version_mismatch', `Reviewed package version ${version} does not match configured release ${expectedVersion}`);
-    const remoteHead = await fetchBase(ctx);
     // Reconciliation of this exact release remains valid after main advances.
     const tag = `v${version}`;
-    const existing = latest?.tagName === tag && latestSha === candidate;
-    if (!existing) assertFreshRelease({ candidateSha: candidate, remoteHead, latestSha, latestVersion: latest?.tagName, version });
-    if (Object.keys(manifest.dependencies ?? {}).length || Object.keys(manifest.devDependencies ?? {}).length) {
-      let hasLock = false;
-      try { await access(path.join(source, 'package-lock.json')); hasLock = true; } catch { /* no lock */ }
-      await ctx.command('npm', [hasLock ? 'ci' : 'install', '--ignore-scripts', '--no-audit', '--no-fund', ...(hasLock ? [] : ['--no-package-lock'])], { cwd: source, timeoutMs: 300000 });
+    const taggedCommit = (await ctx.command('git', ['rev-parse', '--verify', `refs/tags/${tag}^{commit}`], { allowFailure: true })).trim();
+    if (taggedCommit && taggedCommit !== candidate) throw fail('release_conflict', 'The proposed release tag already points to another commit');
+    let existing = releases.some(item => item.tagName === tag) && taggedCommit === candidate;
+    const draft = inventory.find(item => item.tagName === tag && item.isDraft);
+    if (draft) assertOwnedDraft(ctx, await getRelease(ctx, tag), version, candidate);
+    if (taggedCommit && !existing && !draft) throw fail('release_conflict', 'The proposed tag is already in use without a matching Kodo release');
+    if (!existing) await assertCandidateFresh(ctx, candidate, version, latest);
+    let existingInfo, notes, remotePackage;
+    if (existing || draft) {
+      existingInfo = await getRelease(ctx, tag);
+      assertOwnedDraft(ctx, existingInfo, version, candidate);
+      if (draft) existing = existingInfo.isDraft === false;
+      remotePackage = await reusableRemotePackage(ctx, existingInfo, { tag }, directory);
     }
-    for (const check of [...(ctx.config.commands?.test ?? []), ...(ctx.config.commands?.build ?? [])]) {
-      await ctx.command(check.command, check.args ?? [], { cwd: source, timeoutMs: check.timeoutMs ?? 600000 });
-    }
-    const artifacts = path.join(directory, 'artifacts'); await mkdir(artifacts);
-    const packed = await pack(ctx, source, artifacts);
-    const filename = path.basename(packed.filename);
-    const checksum = sha256(await readFile(packed.filename));
-    const checksumFile = path.join(artifacts, 'SHA256SUMS');
-    await writeFile(checksumFile, `${checksum}  ${filename}\n`);
-    const smoke = await smokePackage(ctx, packed.filename, directory, manifest);
-    let url;
-    if (existing) {
-      const info = parse(await ctx.command('gh', ['release', 'view', tag, '--repo', ctx.repository, '--json', 'url,tagName,assets']), 'existing release');
-      if (!info.assets?.some(asset => asset.name === filename) || !info.assets?.some(asset => asset.name === 'SHA256SUMS')) throw fail('release_conflict', 'Existing release has incomplete or different assets');
-      const downloaded = path.join(directory, 'downloaded'); await mkdir(downloaded);
-      await ctx.command('gh', ['release', 'download', tag, '--repo', ctx.repository, '--pattern', filename, '--dir', downloaded]);
-      if (sha256(await readFile(path.join(downloaded, filename))) !== checksum) throw fail('release_conflict', 'Existing release package checksum differs; refusing to overwrite');
-      url = info.url;
+    let artifactPath, filename, checksum, checksumFile, updateDraftAttestation = false;
+    if (remotePackage?.archivePath) {
+      ({ archivePath: artifactPath, filename, checksum, checksumFile } = remotePackage);
     } else {
-      assertFreshRelease({ candidateSha: candidate, remoteHead: await fetchBase(ctx), latestSha, latestVersion: latest?.tagName, version });
-      const latestBeforePublish = parse(await ctx.command('gh', ['release', 'list', '--repo', ctx.repository, '--limit', '1', '--json', 'tagName,isDraft,isPrerelease']), 'latest release before publication').filter(item => !item.isDraft && !item.isPrerelease)[0];
-      if (latestBeforePublish?.tagName !== latest?.tagName) throw fail('stale_release', 'Published release state changed while preparing the package; prepare its version again');
-      const notes = path.join(directory, 'notes.md');
-      await writeFile(notes, `Kodo ${version}\n\n${ctx.run.task}\n\nCommit: ${candidate}\nRun: ${ctx.run.id}\n\nSHA-256: ${checksum}\n\nPackage installation and CLI smoke checks passed on ${process.platform}, Node.js ${process.version}.\n`);
-      url = await ctx.command('gh', ['release', 'create', tag, packed.filename, checksumFile, '--repo', ctx.repository, '--target', candidate, '--title', `Kodo ${version}`, '--notes-file', notes, '--latest=false']);
+      if (Object.keys(manifest.dependencies ?? {}).length || Object.keys(manifest.devDependencies ?? {}).length) {
+        let hasLock = false;
+        try { await access(path.join(source, 'package-lock.json')); hasLock = true; } catch { /* no lock */ }
+        await ctx.command('npm', [hasLock ? 'ci' : 'install', '--ignore-scripts', '--no-audit', '--no-fund', ...(hasLock ? [] : ['--no-package-lock'])], { cwd: source, timeoutMs: 300000 });
+      }
+      for (const check of [...(ctx.config.commands?.test ?? []), ...(ctx.config.commands?.build ?? [])]) {
+        await ctx.command(check.command, check.args ?? [], { cwd: source, timeoutMs: check.timeoutMs ?? 600000 });
+      }
+      const artifacts = path.join(directory, 'artifacts'); await mkdir(artifacts);
+      const packed = await pack(ctx, source, artifacts);
+      artifactPath = packed.filename; filename = path.basename(artifactPath);
+      checksum = sha256(await readFile(artifactPath));
+      checksumFile = path.join(artifacts, 'SHA256SUMS');
+      await writeFile(checksumFile, `${checksum}  ${filename}\n`);
+      if (remotePackage && (remotePackage.expectedSha !== checksum || remotePackage.filename && remotePackage.filename !== filename)) {
+        // An owned, empty draft has no immutable uploaded bytes yet. A fresh
+        // build of its exact commit may update that draft's checksum notes.
+        if (existingInfo.isDraft && !existingInfo.assets?.length) updateDraftAttestation = true;
+        else throw fail('release_conflict', 'The missing original archive cannot be reproduced without replacing an existing checksum/asset');
+      }
     }
-    const receipt = { version, tag, commit: candidate, url, artifact: filename, artifactUrl: `https://github.com/${ctx.repository}/releases/download/${tag}/${filename}`, sha256: checksum, smoke, published: true };
-    await ctx.save({ delivery: { ...(ctx.run.delivery ?? {}), mergeCommit: candidate, release: receipt } });
-    await ctx.event('delivery.released', receipt);
-    return receipt;
+    const smoke = await smokePackage(ctx, artifactPath, directory, manifest);
+    if (!existing) {
+      await assertCandidateFresh(ctx, candidate, version, latest);
+      const latestBeforePublish = (await publishedReleases(ctx)).at(-1);
+      if (latestBeforePublish?.tagName !== latest?.tagName) throw fail('stale_release', 'Published release state changed while preparing the package; prepare its version again');
+      notes = path.join(directory, 'notes.md');
+      const content = updateDraftAttestation ? existingInfo.body.replace(/^SHA-256: [a-f0-9]{64}\s*$/m, `SHA-256: ${checksum}`) : `Kodo ${version}\n\n${ctx.run.task}\n\nCommit: ${candidate}\nRun: ${ctx.run.id}\n\nSHA-256: ${checksum}\n\nPackage installation and CLI smoke checks passed on ${process.platform}, Node.js ${process.version}.\n\n<!-- kodo-release:${ctx.run.id}:${candidate} -->\n`;
+      await writeFile(notes, content);
+    }
+    return await ctx.irreversible(async () => {
+      if (existingInfo) {
+        // A process can die after creating the release but before uploading every
+        // asset. Upload only absent names; never replace an existing asset.
+        if (updateDraftAttestation) await ctx.command('gh', ['release', 'edit', tag, '--repo', ctx.repository, '--notes-file', notes, '--draft', '--latest=false', '--target', candidate], { ignoreAbort: true });
+        if (!existingInfo.assets?.some(asset => asset.name === filename)) await ctx.command('gh', ['release', 'upload', tag, artifactPath, '--repo', ctx.repository], { ignoreAbort: true });
+        if (!existingInfo.assets?.some(asset => asset.name === 'SHA256SUMS')) await ctx.command('gh', ['release', 'upload', tag, checksumFile, '--repo', ctx.repository], { ignoreAbort: true });
+      } else {
+        await ctx.command('gh', ['release', 'create', tag, artifactPath, checksumFile, '--repo', ctx.repository, '--target', candidate, '--title', `Kodo ${version}`, '--notes-file', notes, '--draft', '--latest=false'], { ignoreAbort: true });
+      }
+      const ready = await getRelease(ctx, tag);
+      if (ready.isDraft) {
+        assertOwnedDraft(ctx, ready, version, candidate);
+        await verifyReleaseAssets(ctx, ready, { tag, artifact: filename, sha256: checksum }, directory);
+        const latestAtPublication = (await publishedReleases(ctx)).at(-1);
+        await assertCandidateFresh(ctx, candidate, version, latestAtPublication);
+        await ctx.command('gh', ['release', 'edit', tag, '--repo', ctx.repository, '--draft=false', '--latest=false', '--target', candidate], { ignoreAbort: true });
+      }
+      const published = await verifyPublishedArtifact(ctx, { tag, commit: candidate, artifact: filename, sha256: checksum }, directory);
+      const receipt = { version, tag, commit: candidate, url: published.url, artifact: filename, artifactUrl: `https://github.com/${ctx.repository}/releases/download/${tag}/${filename}`, sha256: checksum, smoke, published: true };
+      await ctx.save({ delivery: { ...(ctx.run.delivery ?? {}), mergeCommit: candidate, release: receipt } });
+      await ctx.event('delivery.released', receipt);
+      return receipt;
+    });
   } finally {
     try {
-      if (source) await ctx.command('git', ['worktree', 'remove', '--force', source], { allowFailure: true, ignoreAbort: true }).catch(() => {});
+      if (source) await ctx.command('git', ['worktree', 'remove', '--force', source], { allowFailure: true, ignoreAbort: true, reconcile: true }).catch(() => {});
       if (directory) await safeRemove(directory, 'kodo-release-');
     } finally { await releaseOwnedLease(ctx, lease); }
   }
