@@ -7,7 +7,7 @@ import { spawnSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import Ajv from 'ajv';
-import { deliver, prepareReleaseVersion, releasePackage, validateChecks, assertFreshRelease, execute } from '../runtime/delivery.mjs';
+import { deliver, reconcileDelivery, prepareReleaseVersion, releasePackage, validateChecks, assertFreshRelease, execute } from '../runtime/delivery.mjs';
 
 const digest = value => createHash('sha256').update(value).digest('hex');
 const receiptSchema = {
@@ -68,11 +68,12 @@ async function fixture(t, { brokenCli = false } = {}) {
       assert.match(body, /<!-- kodo-run:run-test -->/); assert.match(body, /Diff SHA-256/);
       state.creates++; state.pr = { number: 7, url: 'https://github.com/test/kodo/pull/7', state: 'OPEN' }; return output(state.pr.url);
     }
-    if (args[0] === 'pr' && args[1] === 'view') return output({ ...state.pr, headRefOid: headSha, baseRefName: 'main', mergeCommit: state.pr?.state === 'MERGED' ? { oid: headSha } : null, statusCheckRollup: [{ name: 'ci', conclusion: state.check }, { context: 'kodo/review', state: state.status ?? 'PENDING' }] });
+    if (args[0] === 'pr' && args[1] === 'view') return output({ ...state.pr, headRefOid: headSha, baseRefName: 'main', mergeCommit: state.pr?.state === 'MERGED' ? { oid: state.mergeCommit ?? headSha } : null, statusCheckRollup: [{ name: 'ci', conclusion: state.check }, { context: 'kodo/review', state: state.status ?? 'PENDING' }] });
     if (args[0] === 'pr' && args[1] === 'merge') {
       assert.ok(args.includes('--match-head-commit')); assert.ok(!args.includes('--admin'));
       if (config.delivery.release) assert.ok(leases.has('release:test/kodo:main'));
-      state.merges++; state.pr.state = 'MERGED'; await git('push', 'origin', `${headSha}:main`); return output('');
+      state.mergeCommit = state.squashMerge ? await git('commit-tree', await git('rev-parse', 'HEAD^{tree}'), '-p', baseSha, '-m', 'Genuine GitHub-style squash merge') : headSha;
+      state.merges++; state.pr.state = 'MERGED'; await git('push', 'origin', `${state.mergeCommit}:main`); return output('');
     }
     if (args[0] === 'release' && args[1] === 'list') {
       const available = state.releaseList ?? (state.release ? [{ tagName: state.release.tag, isDraft: Boolean(state.release.isDraft), isPrerelease: Boolean(state.release.isPrerelease) }] : []);
@@ -224,10 +225,10 @@ test('Delivery cancellation does not create a PR and leaves no lease', async t =
   assert.equal(ctx.state.creates, 0); assert.equal(ctx.leases.size, 0);
 });
 
-test('Resuming a merged PR rejects an unrelated saved head', async t => {
+test('Resuming a merged PR rejects an unrelated immutable reviewed head', async t => {
   const ctx = await fixture(t);
   await deliver(ctx);
-  ctx.run.headSha = ctx.run.baseSha;
+  ctx.run.delivery.reviewedHead = ctx.run.baseSha;
   await assert.rejects(deliver(ctx), { code: 'stale_review' });
   assert.equal(ctx.state.creates, 1); assert.equal(ctx.state.merges, 1);
 });
@@ -335,11 +336,14 @@ test('Release subprocess environment excludes inherited credentials from npm tes
   ctx.config.commands.test = [{ command: process.execPath, args: ['cli.mjs', 'validate'] }];
   ctx.config.commands.build = [{ command: process.execPath, args: ['cli.mjs', '--help'] }];
   ctx.exec = async (command, args, options) => {
+    for (const name of Object.keys(hostile).filter(name => name !== 'GH_TOKEN')) assert.equal(options.env[name], undefined, `${command} inherited ${name}`);
+    const githubTransport = command === 'gh' || command === 'git' && ['fetch', 'push', 'pull', 'clone', 'ls-remote'].includes(args[0]);
+    assert.equal(options.env.GH_TOKEN, githubTransport ? hostile.GH_TOKEN : undefined, `${command} GitHub credential boundary`);
     if (!['git', 'gh'].includes(command)) {
       observed.push({ command, args });
       assert.ok(options.env);
       for (const name of Object.keys(hostile)) assert.equal(options.env[name], undefined, `${command} inherited ${name}`);
-    } else assert.equal(options.env.GH_TOKEN, hostile.GH_TOKEN);
+    }
     return runner(command, args, options);
   };
   try {
@@ -489,4 +493,39 @@ test('Coordinator Git disables credential-reading repository hooks for push and 
   await execute('git', ['update-ref', 'refs/heads/fetch-proof', ctx.run.headSha], { cwd: ctx.remote, env });
   await execute('git', ['fetch', 'origin'], { cwd: ctx.project, env });
   await assert.rejects(readFile(marker), { code: 'ENOENT' });
+});
+
+test('Squash merge reconciliation uses immutable reviewed head after the local branch resynchronizes', async t => {
+  const ctx = await fixture(t); ctx.state.squashMerge = true;
+  const originalHead = ctx.run.headSha;
+  const delivered = await deliver(ctx);
+  const squashCommit = delivered.mergeCommit;
+  assert.notEqual(squashCommit, originalHead);
+  await ctx.git('merge', '--no-edit', squashCommit);
+  const synchronizedHead = await ctx.git('rev-parse', 'HEAD');
+  assert.notEqual(synchronizedHead, originalHead); assert.notEqual(synchronizedHead, squashCommit);
+  ctx.run.headSha = synchronizedHead;
+  delete ctx.run.delivery.mergeCommit; // Process died after remote merge, before persisting the result.
+  const before = ctx.calls.length;
+  const reconciled = await reconcileDelivery(ctx);
+  assert.equal(reconciled.mergeCommit, squashCommit);
+  assert.equal(reconciled.reviewedHead, originalHead); assert.equal(ctx.run.headSha, synchronizedHead);
+  assert.deepEqual(ctx.calls.slice(before).map(call => [call.command, ...call.args.slice(0, 2)]), [['gh', 'pr', 'view']]);
+  assert.equal((await deliver(ctx)).mergeCommit, squashCommit);
+  assert.equal(ctx.state.creates, 1); assert.equal(ctx.state.merges, 1);
+  delete ctx.run.delivery.reviewedHead;
+  assert.equal((await reconcileDelivery(ctx)).reviewedHead, originalHead); // Falls back to the persisted/provided review.
+});
+
+test('Delivery reconciliation leaves an open PR unchanged without push or verification', async t => {
+  const ctx = await fixture(t);
+  assert.equal(await reconcileDelivery(ctx), null);
+  assert.equal(ctx.calls.length, 0);
+  ctx.state.pr = { number: 7, url: 'https://github.com/test/kodo/pull/7', state: 'OPEN' };
+  ctx.run.delivery = { pr: { number: 7, url: ctx.state.pr.url }, reviewedHead: ctx.run.headSha };
+  const updates = ctx.updates.length;
+  assert.equal(await reconcileDelivery(ctx), null);
+  assert.equal(ctx.updates.length, updates);
+  assert.deepEqual(ctx.calls.map(call => [call.command, ...call.args.slice(0, 2)]), [['gh', 'pr', 'view']]);
+  assert.equal(ctx.state.merges, 0);
 });

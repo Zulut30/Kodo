@@ -3,7 +3,7 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { redact, workerEnvironment } from './security.mjs';
 
-function gitBoundary(args, env) {
+export function gitBoundary(args, env) {
   // Put the guard after caller-supplied global options so a -c override cannot
   // restore hooks. This changes only this Git invocation, never user config.
   const valuedOptions = new Set(['-c', '-C', '--git-dir', '--work-tree', '--namespace', '--config-env']);

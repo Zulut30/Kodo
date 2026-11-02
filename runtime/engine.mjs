@@ -10,7 +10,7 @@ import { execute } from './command.mjs';
 import { git, inspectProject, makeWorktree, collectFiles, changedFiles, commitChanges, diffHash } from './workspace.mjs';
 import * as providers from './providers.mjs';
 import { research } from './research.mjs';
-import { deliver, releasePackage, prepareReleaseVersion } from './delivery.mjs';
+import { deliver, releasePackage, prepareReleaseVersion, reconcileDelivery } from './delivery.mjs';
 import { loadDefaultPolicy } from './skill-policy.mjs';
 
 const delay = (ms, signal) => new Promise((resolve, reject) => { const timer = setTimeout(done, ms); function done() { signal?.removeEventListener('abort', abort); resolve(); } function abort() { clearTimeout(timer); reject(Object.assign(new Error('Запуск отменён'), { code: 'cancelled' })); } signal?.addEventListener('abort', abort, { once: true }); if (signal?.aborted) abort(); });
@@ -18,7 +18,7 @@ const contentHash = value => createHash('sha256').update(JSON.stringify(value)).
 const defaultModel = client => client === 'claude-code' ? 'opus' : 'gpt-6.1-sol';
 
 export class Engine {
-  constructor({ store, secrets = {}, provider = providers, researcher = research, delivery = { deliver, releasePackage, prepareReleaseVersion }, onEvent = () => {}, leaseHeartbeatMs = 10000 } = {}) {
+  constructor({ store, secrets = {}, provider = providers, researcher = research, delivery = { deliver, releasePackage, prepareReleaseVersion, reconcileDelivery }, onEvent = () => {}, leaseHeartbeatMs = 10000 } = {}) {
     this.store = store || new Store(undefined, secrets); this.secrets = secrets; this.provider = provider; this.researcher = researcher; this.delivery = delivery; this.onEvent = onEvent;
     this.leaseHeartbeatMs = leaseHeartbeatMs;
   }
@@ -223,6 +223,7 @@ export class Engine {
   }
   async executeTasks(run, signal) {
     run.state = 'implementing'; this.save(run);
+    await this.recoverIntegrationEdits(run, signal);
     if (run.config.delivery.enabled) await this.synchronizeBase(run, signal);
     while (run.plan.tasks.some(task => run.nodes[task.id]?.status !== 'integrated')) {
       const ready = run.plan.tasks.filter(task => run.nodes[task.id]?.status !== 'integrated' && task.dependsOn.every(id => run.nodes[id]?.status === 'integrated'));
@@ -372,11 +373,15 @@ export class Engine {
       this.checkCancelled(run, signal); await this.prepare(run, signal);
       if (prepare && !run.plan) { run.state = 'awaiting_plan'; run.planningContext = await this.policy(run, 'plan'); await writeFile(path.join(run.artifacts, 'plan-context.md'), run.planningContext); await writeFile(path.join(run.artifacts, 'plan.schema.json'), JSON.stringify(planSchema, null, 2)); this.save(run); return run; }
       await this.plan(run, planFile, signal);
-      run.models = (await this.provider.discoverProviders({ client: run.client, providers: run.providers, primaryModel: run.config.primaryModel }, { secrets: this.secrets, config: run.config })).filter(item => item.available !== false);
-      if (!run.models.length) throw Object.assign(new Error('Нет доступных моделей по подписке'), { code: 'auth' });
-      this.save(run);
-      if (!run.completed.implementation) { await this.executeTasks(run, signal); run.completed.implementation = true; this.save(run); }
+      if (run.delivery?.pr && this.delivery.reconcileDelivery) {
+        const recovered = await this.delivery.reconcileDelivery({ run, config: run.config, store: this.store, cwd: run.cwd, signal });
+        if (recovered) { run.delivery = recovered; this.save(run); }
+      }
       if (!run.delivery?.mergeCommit) {
+        run.models = (await this.provider.discoverProviders({ client: run.client, providers: run.providers, primaryModel: run.config.primaryModel }, { secrets: this.secrets, config: run.config })).filter(item => item.available !== false);
+        if (!run.models.length) throw Object.assign(new Error('Нет доступных моделей по подписке'), { code: 'auth' });
+        this.save(run);
+        if (!run.completed.implementation) { await this.executeTasks(run, signal); run.completed.implementation = true; this.save(run); }
         await this.recoverIntegrationEdits(run, signal);
         if (run.config.delivery.enabled) await this.synchronizeBase(run, signal);
         if (run.config.delivery.release) {
@@ -392,6 +397,10 @@ export class Engine {
           try { run.delivery = await this.delivery.deliver({ run, config: run.config, store: this.store, cwd: run.cwd, review: run.review, signal, onEvent: event => this.log(run, 'delivery', event) }); break; }
           catch (error) {
             if (error.code !== 'stale_base' || attempt >= 3) throw error;
+            if (run.delivery?.pr && this.delivery.reconcileDelivery) {
+              const recovered = await this.delivery.reconcileDelivery({ run, config: run.config, store: this.store, cwd: run.cwd, signal });
+              if (recovered) { run.delivery = recovered; break; }
+            }
             await this.synchronizeBase(run, signal);
             if (run.config.delivery.release && this.delivery.prepareReleaseVersion) {
               await this.delivery.prepareReleaseVersion({ run, config: run.config, store: this.store, cwd: run.cwd, signal });

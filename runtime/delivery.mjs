@@ -4,6 +4,7 @@ import { access, mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs
 import os from 'node:os';
 import path from 'node:path';
 import { workerEnvironment } from './security.mjs';
+import { gitBoundary } from './command.mjs';
 
 const sha256 = value => createHash('sha256').update(value).digest('hex');
 const fail = (code, message, extra = {}) => Object.assign(new Error(message), { code, ...extra });
@@ -28,11 +29,13 @@ async function npmCommand() {
 }
 
 export async function execute(command, args, { cwd, signal, timeoutMs = 120000, allowFailure = false, env } = {}) {
-  const environment = ['git', 'gh'].includes(command) ? (env ?? process.env) : workerEnvironment(env ?? process.env);
+  const baseEnv = env ?? process.env;
+  let environment = workerEnvironment(baseEnv);
   let executable = command, argv = args;
   // Coordinator Git processes retain credentials, so repository-authored hooks
   // must never run inside that boundary, including pre-push and reference hooks.
-  if (command === 'git') argv = ['-c', `core.hooksPath=${os.devNull}`, ...args];
+  if (/(?:^|[\\/])git(?:\.exe)?$/i.test(command)) ({ args: argv, env: environment } = gitBoundary(args, baseEnv));
+  else if (/(?:^|[\\/])gh(?:\.exe)?$/i.test(command)) environment = gitBoundary(['ls-remote'], baseEnv).env;
   if (command === 'npm') {
     const [node, prefix] = await npmCommand(); executable = node; argv = [...prefix, ...args];
   }
@@ -64,7 +67,9 @@ function context(options) {
   };
   const command = async (name, args, settings = {}) => {
     if (!settings.reconcile && !finishingIrreversible) checkpoint();
-    const environment = ['git', 'gh'].includes(name) ? (settings.env ?? process.env) : workerEnvironment(settings.env ?? process.env);
+    const baseEnv = settings.env ?? process.env;
+    const environment = /(?:^|[\\/])git(?:\.exe)?$/i.test(name) ? gitBoundary(args, baseEnv).env
+      : /(?:^|[\\/])gh(?:\.exe)?$/i.test(name) ? gitBoundary(['ls-remote'], baseEnv).env : workerEnvironment(baseEnv);
     const result = await runner(name, args, { cwd, ...settings, env: environment, signal: settings.ignoreAbort || finishingIrreversible ? undefined : signal });
     if (result.code && !settings.allowFailure) throw fail('command_failed', `${name} failed (${result.code}): ${(result.stderr ?? '').slice(-1500)}`, { exitCode: result.code, stderr: result.stderr });
     return result.stdout?.trimEnd() ?? '';
@@ -153,6 +158,28 @@ async function getPr(ctx, number) {
   return parse(await ctx.command('gh', ['pr', 'view', String(number), '--repo', ctx.repository, '--json', 'number,url,state,mergedAt,mergeCommit,headRefOid,baseRefName,statusCheckRollup']), 'gh pr view');
 }
 
+function mergedReceipt(ctx, previous, saved, expectedHead) {
+  if (!expectedHead || previous.headRefOid !== expectedHead || previous.baseRefName !== ctx.baseBranch) throw fail('stale_review', 'Saved PR no longer matches its immutable reviewed head and target');
+  const mergeCommit = previous.mergeCommit?.oid;
+  if (!/^[a-f0-9]{40,64}$/.test(mergeCommit ?? '')) throw fail('invalid_output', 'Merged PR is missing a valid merge commit');
+  return { ...saved, pr: { number: previous.number, url: previous.url }, reviewedHead: expectedHead, mergeCommit };
+}
+
+/** Read-only GitHub reconciliation; only the confirmed receipt may be persisted. */
+export async function reconcileDelivery(options) {
+  const ctx = context(options);
+  const saved = ctx.run.delivery;
+  if (!saved?.pr?.number) return null;
+  validateRepository(ctx.repository, ctx.baseBranch);
+  if (!/^\d+$/.test(String(saved.pr.number))) throw fail('configuration', 'Invalid saved pull request number');
+  const previous = await getPr(ctx, saved.pr.number);
+  if (previous.state !== 'MERGED') return null;
+  const expectedHead = saved.reviewedHead || options.review?.headSha || ctx.run.review?.headSha || ctx.run.headSha;
+  const receipt = mergedReceipt(ctx, previous, saved, expectedHead);
+  await ctx.save({ delivery: receipt });
+  return receipt;
+}
+
 async function fetchBase(ctx) {
   await ctx.command('git', ['fetch', 'origin', ctx.baseBranch]);
   return (await ctx.command('git', ['rev-parse', `origin/${ctx.baseBranch}`])).trim();
@@ -197,18 +224,9 @@ export async function deliver(options) {
   validateRepository(ctx.repository, ctx.baseBranch);
   if (!ctx.run.branch || ctx.run.branch === ctx.baseBranch || ctx.run.branch.startsWith('-')) throw fail('configuration', 'Delivery needs a separate task branch');
   // Reconcile a previously merged PR before requiring an obsolete local review.
+  const reconciled = await reconcileDelivery(options);
+  if (reconciled) return reconciled;
   let saved = ctx.run.delivery ?? {};
-  if (saved.pr?.number) {
-    const previous = await getPr(ctx, saved.pr.number);
-    if (previous.state === 'MERGED') {
-      if (previous.headRefOid !== ctx.run.headSha || previous.baseRefName !== ctx.baseBranch) throw fail('stale_review', 'Saved PR no longer matches this run head and target');
-      const mergeCommit = previous.mergeCommit?.oid;
-      if (!mergeCommit) throw fail('invalid_output', 'Merged PR is missing merge commit');
-      const receipt = { ...saved, pr: { number: previous.number, url: previous.url }, mergeCommit };
-      await ctx.save({ delivery: receipt });
-      return receipt;
-    }
-  }
   const { head, diffHash } = await verifyReview(ctx);
   const required = await requiredChecks(ctx);
   await ctx.command('git', ['push', '--set-upstream', 'origin', ctx.run.branch]);
@@ -232,9 +250,7 @@ export async function deliver(options) {
   await ctx.event('delivery.pr_created', { pr: saved.pr });
   if (pr.state === 'MERGED') {
     const merged = await getPr(ctx, pr.number);
-    if (merged.headRefOid !== head || merged.baseRefName !== ctx.baseBranch) throw fail('stale_review', 'Merged PR does not match this run');
-    const receipt = { ...saved, mergeCommit: merged.mergeCommit?.oid };
-    if (!receipt.mergeCommit) throw fail('invalid_output', 'Merged PR is missing merge commit');
+    const receipt = mergedReceipt(ctx, merged, saved, saved.reviewedHead || head);
     await ctx.save({ delivery: receipt }); return receipt;
   }
   await ctx.command('gh', ['api', '--method', 'POST', `repos/${ctx.repository}/statuses/${head}`, '-f', 'state=success', '-f', 'context=kodo/review', '-f', 'description=Independent Kodo review passed for this exact diff']);
@@ -264,7 +280,7 @@ export async function deliver(options) {
         if (mergeError) throw mergeError;
         throw fail('merge_pending', 'PR has not been confirmed merged');
       }
-      const receipt = { ...saved, mergeCommit: merged.mergeCommit.oid };
+      const receipt = mergedReceipt(ctx, merged, saved, saved.reviewedHead || head);
       await ctx.save({ delivery: receipt });
       await ctx.event('delivery.merged', { pr: receipt.pr, mergeCommit: receipt.mergeCommit });
       return receipt;

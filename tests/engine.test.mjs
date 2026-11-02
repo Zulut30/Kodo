@@ -750,3 +750,59 @@ test('Engine aborts a worker action when its subscription lease is lost and rele
   }), { code: 'lease_lost' });
   assert.equal(aborted, true); assert.equal(released, 1);
 });
+
+test('Engine reconciles a real squash merge before changing its reviewed head after a missing receipt', async t => {
+  for (const code of ['command_failed', 'stale_base']) await t.test(code, async subtest => {
+    const fx = await fixture(subtest, { remote: true, testScript: "import assert from 'node:assert/strict';import{value}from'./src/value.mjs';assert.equal(value,2);\n" });
+    const plan = { summary: 'Value two through squash merge', tasks: [node('feature', 'developer', ['src/value.mjs'])] };
+    let discovered = 0, merged, reviewed;
+    const services = fakeServices({ plan, onDiscover: async () => { if (++discovered > 1) throw new Error('Merged recovery must not require a new model discovery'); } });
+    const store = fx.openStore(), engine = new Engine({ store, ...services });
+    services.delivery.reconcileDelivery = async ({ run }) => {
+      if (!merged) return null;
+      assert.equal(run.delivery.reviewedHead, reviewed);
+      assert.equal(git(run.cwd, 'rev-parse', 'HEAD'), reviewed, 'do not merge our own squash back into the reviewed branch');
+      return { ...run.delivery, mergeCommit: merged };
+    };
+    services.delivery.deliver = async ({ run, review }) => {
+      services.calls.delivery++;
+      if (merged) return { ...run.delivery, mergeCommit: merged };
+      reviewed = review.headSha;
+      const other = path.join(fx.directory, 'squash-client');
+      git(fx.directory, 'clone', '--branch', 'main', path.join(fx.directory, 'origin.git'), other);
+      git(other, 'config', 'user.name', 'Squash Coordinator'); git(other, 'config', 'user.email', 'squash@example.invalid');
+      git(other, 'fetch', fx.project, run.branch); git(other, 'merge', '--squash', 'FETCH_HEAD');
+      git(other, 'commit', '-m', 'Real squash commit with different history'); git(other, 'push', 'origin', 'main');
+      merged = git(other, 'rev-parse', 'HEAD'); assert.notEqual(merged, reviewed);
+      run.delivery = { pr: { number: 1, url: 'https://example.invalid/pull/1' }, reviewedHead: reviewed };
+      store.updateRun(run.id, { delivery: run.delivery });
+      throw Object.assign(new Error('Interrupted before merge receipt was saved'), { code });
+    };
+    const run = await engine.create('Squash receipt recovery', { project: fx.project });
+    let result = await engine.run(run.id);
+    if (code === 'command_failed') { assert.equal(result.state, 'blocked'); result = await engine.run(run.id); }
+    assert.equal(result.state, 'succeeded', result.error?.message);
+    assert.equal(result.delivery.mergeCommit, merged); assert.equal(result.review.headSha, reviewed);
+    assert.equal(services.calls.review.length, 1); assert.equal(services.calls.release, 1); assert.equal(discovered, 1);
+  });
+});
+
+test('Engine completes the owning pending node merge before scheduling earlier ready nodes without delivery', async t => {
+  let owningRun, thirdStarted = false;
+  const fx = await integrationConflict(t, async request => {
+    if (request.role === 'developer') {
+      assert.equal(owningRun.nodes.second.status, 'integrated'); thirdStarted = true;
+      await writeFile(path.join(request.cwd, 'src/third.mjs'), 'export const third = true;\n');
+    } else await writeFile(path.join(request.cwd, 'src/value.mjs'), combinedModule);
+    return { sessionId: 'pending-owner-recovery', output: { summary: 'completed', checks: [], complete: true } };
+  });
+  owningRun = fx.run;
+  const third = node('third', 'developer', ['src/third.mjs'], ['first']);
+  fx.run.plan.tasks.splice(1, 0, third); fx.engine.save(fx.run);
+  const merge = spawnSync('git', ['merge', '--no-ff', '--no-edit', fx.run.nodes.second.branch], { cwd: fx.run.cwd, encoding: 'utf8', windowsHide: true });
+  assert.equal(merge.status, 1);
+  await fx.engine.executeTasks(fx.run);
+  assert.equal(thirdStarted, true); assert.ok(Object.values(fx.run.nodes).every(node => node.status === 'integrated'));
+  assert.equal(await read(path.join(fx.run.cwd, 'src/value.mjs')), combinedModule);
+  assert.equal(git(fx.run.cwd, 'status', '--porcelain'), '');
+});
