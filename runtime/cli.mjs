@@ -1,6 +1,8 @@
 import path from 'node:path';
+import { existsSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
 import { readConfig, initConfig } from './config.mjs';
-import { loadSecrets, redact } from './security.mjs';
+import { loadSecrets, redact, stateHome } from './security.mjs';
 import { Store } from './store.mjs';
 import { buildAuditReport, formatAuditReport } from './audit.mjs';
 import { doctorProviders } from './providers.mjs';
@@ -17,11 +19,16 @@ export async function runtimeCli(command, args) {
     if (args.length < 1 || args.length > 2 || typeof args[0] !== 'string' || !args[0].trim() || args[0].startsWith('-') || args.length === 2 && args[1] !== '--json') {
       throw new Error('Использование: kodo audit RUN_ID [--json]');
     }
-    const store = new Store();
+    const filename = path.join(stateHome(), 'state.sqlite');
+    if (!existsSync(filename)) throw new Error(`Хранилище состояния отсутствует: ${filename}`);
+    // Store initializes schema and journal mode, so audit opens SQLite directly.
+    const db = new DatabaseSync(filename, { readOnly: true });
     try {
-      const report = buildAuditReport(store.getRun(args[0]));
+      const row = db.prepare('SELECT body FROM runs WHERE id=?').get(args[0]);
+      if (!row) throw new Error(`Запуск не найден: ${args[0]}`);
+      const report = buildAuditReport(JSON.parse(row.body));
       console.log(args[1] === '--json' ? JSON.stringify(report) : formatAuditReport(report));
-    } finally { store.close(); }
+    } finally { db.close(); }
     return;
   }
   const options = { positional: [] };
