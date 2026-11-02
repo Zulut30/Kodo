@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { DatabaseSync } from 'node:sqlite';
 import { mkdtemp, mkdir, writeFile, readFile, readdir, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -189,6 +190,46 @@ test('Audit CLI ignores broken credentials and configs without changing saved st
   assert.deepEqual(await nonDatabaseSnapshot(f.root), beforeFiles, 'no config, credential or worktree writes');
 });
 
+test('Audit CLI unknown run does not initialize a missing state home', async t => {
+  const f = await fixture(t);
+  const absentHome = path.join(f.root, 'never-initialized-state');
+  const beforeFiles = (await readdir(f.root)).sort();
+  const result = invoke(f, ['audit', 'missing-audit-run', '--json'], {
+    env: { ...f.env, KODO_HOME: absentHome }
+  });
+  failure(result);
+  assert.match(result.stderr, /не найден|not found|unknown run|no saved state|хранилище.*отсутств/i);
+  assert.deepEqual((await readdir(f.root)).sort(), beforeFiles, 'read-only audit must not create a state directory or database');
+});
+
+test('Audit CLI reads a legacy saved run without changing database bytes or adding schema', async t => {
+  const f = await fixture(t);
+  const legacyHome = path.join(f.root, 'legacy-state');
+  await mkdir(legacyHome);
+  const filename = path.join(legacyHome, 'state.sqlite');
+  const db = new DatabaseSync(filename);
+  try {
+    db.exec('CREATE TABLE runs(id TEXT PRIMARY KEY, body TEXT NOT NULL, updated INTEGER NOT NULL)');
+    db.prepare('INSERT INTO runs VALUES(?,?,?)').run('legacy-read-only', JSON.stringify({
+      id: 'legacy-read-only', state: 'awaiting_plan'
+    }), 1);
+  } finally { db.close(); }
+  const beforeBytes = await readFile(filename), beforeFiles = (await readdir(legacyHome)).sort();
+  const report = JSON.parse(success(invoke(f, ['audit', 'legacy-read-only', '--json'], {
+    env: { ...f.env, KODO_HOME: legacyHome }
+  })));
+  assert.equal(report.runId, 'legacy-read-only');
+  assert.equal(report.skills.complete, false);
+  const inspected = new DatabaseSync(filename, { readOnly: true });
+  let tableNames;
+  try {
+    tableNames = inspected.prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name").all().map(row => row.name);
+  } finally { inspected.close(); }
+  assert.deepEqual(tableNames, ['runs'], 'read-only audit must not initialize unrelated tables in legacy state');
+  assert.ok((await readFile(filename)).equals(beforeBytes), 'read-only audit must preserve the existing database and journal mode');
+  assert.deepEqual((await readdir(legacyHome)).sort(), beforeFiles, 'read-only audit must not leave new files in legacy state');
+});
+
 test('Audit CLI returns exit zero and incomplete JSON for old saved runs', async t => {
   const f = await fixture(t, { id: 'legacy-audit-run', state: 'awaiting_plan' });
   const report = JSON.parse(success(invoke(f, ['audit', f.id, '--json'])));
@@ -250,6 +291,8 @@ for (const flags of [[], ['--json']]) test(`Audit CLI rejects an unknown run in 
 
 for (const [name, args] of [
   ['missing ID', []], ['JSON without ID', ['--json']], ['empty ID', ['']],
+  ['blank ID', [' \t ']], ['flag before ID', ['--json', 'audit-cli-run']],
+  ['duplicate JSON flag', ['audit-cli-run', '--json', '--json']],
   ['extra ID', ['audit-cli-run', 'other']], ['extra ID with JSON', ['audit-cli-run', '--json', 'other']],
   ['unknown flag', ['audit-cli-run', '--unknown']], ['valued JSON flag', ['audit-cli-run', '--json=true']],
   ['project flag', ['audit-cli-run', '--project', '.']], ['target flag', ['audit-cli-run', '--target', '.']],
