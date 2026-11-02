@@ -12,9 +12,9 @@ const cli = path.join(root, 'cli/index.mjs');
 const registry = JSON.parse(await readFile(path.join(root, 'registry.json'), 'utf8'));
 const expectedStats = {
   version: '0.2.0',
-  total: 20,
-  byType: { skill: 5, agent: 5, pipeline: 4, mcp: 3, preset: 3 },
-  dependencies: 38
+  total: 33,
+  byType: { skill: 18, agent: 5, pipeline: 4, mcp: 3, preset: 3 },
+  dependencies: 51
 };
 
 // Independently checked manifest order and existing text output, including spacing.
@@ -38,9 +38,22 @@ const listRows = [
   ['presets/dotnet', 'presets/dotnet                Комплект для .NET-приложения'],
   ['presets/wordpress', 'presets/wordpress             Комплект для WordPress-сайта или плагина'],
   ['agents/documenter', 'agents/documenter             Документирование реализованного поведения и команд проекта'],
-  ['skills/kodo-build-feature', 'skills/kodo-build-feature     Выполнение задачи через движок Kodo с анализом планом агентами проверками и доставкой']
+  ['skills/kodo-build-feature', 'skills/kodo-build-feature     Выполнение задачи через движок Kodo с анализом планом агентами проверками и доставкой'],
+  ['skills/architecture-patterns', 'skills/architecture-patterns  Стандарт Kodo architecture patterns'],
+  ['skills/architecture-decision-records', 'skills/architecture-decision-records Стандарт Kodo architecture decision records'],
+  ['skills/monorepo-management', 'skills/monorepo-management    Стандарт Kodo monorepo management'],
+  ['skills/e2e-testing-patterns', 'skills/e2e-testing-patterns   Стандарт Kodo e2e testing patterns'],
+  ['skills/subagent-driven-development', 'skills/subagent-driven-development Стандарт Kodo subagent driven development'],
+  ['skills/systematic-debugging', 'skills/systematic-debugging   Стандарт Kodo systematic debugging'],
+  ['skills/test-driven-development', 'skills/test-driven-development Стандарт Kodo test driven development'],
+  ['skills/using-git-worktrees', 'skills/using-git-worktrees    Стандарт Kodo using git worktrees'],
+  ['skills/differential-review', 'skills/differential-review    Стандарт Kodo differential review'],
+  ['skills/react-best-practices', 'skills/react-best-practices   Стандарт Kodo react best practices'],
+  ['skills/composition-patterns', 'skills/composition-patterns   Стандарт Kodo composition patterns'],
+  ['skills/ce-compound', 'skills/ce-compound            Стандарт Kodo ce compound'],
+  ['skills/spec-kit', 'skills/spec-kit               Стандарт Kodo spec kit']
 ];
-const skillRows = [listRows[0], listRows[1], listRows[2], listRows[3], listRows[19]];
+const skillRows = [listRows[0], listRows[1], listRows[2], listRows[3], ...listRows.slice(19)];
 
 function run(args, cwd = root) {
   const result = spawnSync(process.execPath, [cli, ...args], {
@@ -81,9 +94,9 @@ test('Registry stats JSON has exactly the required keys, types and values', asyn
   });
 });
 
-test('Registry dependencies counts 38 direct requires references including repeated targets', () => {
-  // Audited direct edges: 4 + 4 + 3 + 7 + 7 + 5 + 6 + 2 = 38.
-  // There are only 16 distinct targets, and presets point to pipelines with
+test('Registry dependencies counts 51 direct requires references including repeated targets', () => {
+  // Audited direct edges: 4 + 4 + 3 + 7 + 7 + 5 + 6 + 15 = 51.
+  // There are only 29 distinct targets, and presets point to pipelines with
   // dependencies of their own. Deduplication or transitive expansion is wrong.
   const directReferenceCounts = [
     ['pipelines/build-feature', 4],
@@ -93,28 +106,28 @@ test('Registry dependencies counts 38 direct requires references including repea
     ['presets/nextjs', 7],
     ['presets/dotnet', 5],
     ['presets/wordpress', 6],
-    ['skills/kodo-build-feature', 2]
+    ['skills/kodo-build-feature', 15]
   ];
   assert.deepEqual(
     registry.components.filter(item => item.requires.length > 0).map(item => [item.id, item.requires.length]),
     directReferenceCounts
   );
-  assert.equal(new Set(registry.components.flatMap(item => item.requires)).size, 16);
+  assert.equal(new Set(registry.components.flatMap(item => item.requires)).size, 29);
   const stats = JSON.parse(successful(['registry', 'stats', '--json']));
-  assert.equal(stats.dependencies, 38);
+  assert.equal(stats.dependencies, 51);
 });
 
 test('Registry stats table associates every label with its value', async t => {
   const expectedRows = [
     ['Показатель', 'Значение'],
     ['Версия registry', '0.2.0'],
-    ['Всего компонентов', '20'],
-    ['skill', '5'],
+    ['Всего компонентов', '33'],
+    ['skill', '18'],
     ['agent', '5'],
     ['pipeline', '4'],
     ['mcp', '3'],
     ['preset', '3'],
-    ['Ссылок requires', '38']
+    ['Ссылок requires', '51']
   ];
   for (const [name, cwd] of workingDirectories) await t.test(name, () => {
     const stdout = successful(['registry', 'stats'], cwd);
