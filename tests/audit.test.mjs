@@ -118,6 +118,11 @@ test('Audit accepts valid non-applicable decisions without claiming semantic com
 });
 
 for (const [roles, expected] of [
+  [['developer'], ['analyze', 'plan', 'developer', 'review', 'complete']],
+  [['documenter'], ['analyze', 'plan', 'documenter', 'review', 'complete']],
+  [['tester', 'developer'], ['analyze', 'plan', 'developer', 'tester', 'review', 'complete']],
+  [['documenter', 'tester'], ['analyze', 'plan', 'tester', 'documenter', 'review', 'complete']],
+  [['documenter', 'tester', 'developer'], ['analyze', 'plan', 'developer', 'tester', 'documenter', 'review', 'complete']],
   [['tester', 'tester'], ['analyze', 'plan', 'tester', 'review', 'complete']],
   [['documenter', 'developer'], ['analyze', 'plan', 'developer', 'documenter', 'review', 'complete']]
 ]) test(`Audit derives expected stages from subset roles ${roles.join(',')}`, async () => {
@@ -180,6 +185,19 @@ test('Audit rejects unknown recorded stages without leaking their payload', asyn
   assertIncomplete(report);
   assert.deepEqual(report.skills.expectedStages, stages);
   assert.ok(!JSON.stringify(report).includes(privateMarker));
+});
+
+test('Audit cannot replace a missing expected stage with an extra stage of the same count', async () => {
+  const build = await builder();
+  const run = runFixture();
+  delete run.defaultSkills.tester;
+  run.defaultSkills.repair = policy();
+  const report = build(run);
+  assertIncomplete(report);
+  assert.deepEqual(report.skills.expectedStages, ['analyze', 'plan', 'developer', 'tester', 'documenter', 'review', 'repair', 'complete']);
+  assert.deepEqual(report.skills.missingStages, ['tester']);
+  assert.equal(report.skills.recordedStages.length, 7);
+  assert.ok(report.skills.stages.every(entry => entry.valid));
 });
 
 test('Audit keeps old runs inspectable with missing coverage and null receipts', async () => {
@@ -321,6 +339,27 @@ test('Audit does not copy nested arbitrary values through malformed allowlisted 
   assert.equal(report.baseSha, null);
   assert.equal(report.headSha, null);
   assert.ok(!JSON.stringify(report).includes(privateMarker));
+});
+
+test('Audit preserves false receipt booleans and zero exit codes without coercing malformed scalars', async () => {
+  const build = await builder();
+  const run = runFixture();
+  run.checks = { headSha, results: [{ exitCode: 0 }, { exitCode: '0' }, { exitCode: false }] };
+  run.review = { passed: false, headSha, diffHash: hash };
+  run.release = { published: false, smoke: { passed: false, node: 'v24.19.0', platform: 'win32' } };
+  const report = build(run);
+  assert.deepEqual(report.checks, { headSha, results: [{ exitCode: 0 }, {}, {}] });
+  assert.deepEqual(report.review, { passed: false, headSha, diffHash: hash });
+  assert.deepEqual(report.release, { published: false, smoke: { passed: false, node: 'v24.19.0', platform: 'win32' } });
+  for (const value of ['false', 'true', 0, 1, [], {}]) {
+    run.review.passed = value;
+    run.release.published = value;
+    run.release.smoke.passed = value;
+    const invalid = build(run);
+    assert.equal(Object.hasOwn(invalid.review, 'passed'), false);
+    assert.equal(Object.hasOwn(invalid.release, 'published'), false);
+    assert.equal(Object.hasOwn(invalid.release.smoke, 'passed'), false);
+  }
 });
 
 test('Audit malformed policy diagnostics never echo arbitrary fields or invalid object values', async () => {
