@@ -13,6 +13,7 @@ node cli/index.mjs plan <pipelines/name> [--json]
 node cli/index.mjs install <category/name> [...] --client <name|all> --target <project> [--dry-run] [--json]
 node cli/index.mjs init --preset <nextjs|dotnet|wordpress> --client <name|all> --target <project> [--dry-run] [--json]
 node cli/index.mjs validate [--json]
+kodo registry stats [--json]
 
 kodo init [--project PATH]
 kodo doctor [--live] [--json]
@@ -46,7 +47,7 @@ function parse(argv) {
 
 function checkOptions(command, options) {
   const allowed = {
-    list: ['json', 'search'], show: ['json'], plan: ['json'], validate: ['json'],
+    list: ['json', 'search'], show: ['json'], plan: ['json'], validate: ['json'], registry: ['json'],
     install: ['json', 'dry-run', 'target', 'clients'], init: ['json', 'dry-run', 'target', 'clients', 'preset']
   }[command];
   if (!allowed) throw new Error(`Неизвестная команда: ${command}`);
@@ -66,6 +67,30 @@ async function main() {
   const catalog = await loadCatalog(root);
   const ids = options.positional;
   const output = value => console.log(JSON.stringify(value, null, 2));
+  if (command === 'registry') {
+    if (ids.length !== 1 || ids[0] !== 'stats') throw new Error('Использование: kodo registry stats [--json]');
+    const byType = { skill: 0, agent: 0, pipeline: 0, mcp: 0, preset: 0 };
+    let dependencies = 0;
+    for (const component of catalog.registry.components) {
+      byType[component.type]++;
+      dependencies += component.requires.length;
+    }
+    const result = {
+      version: catalog.registry.version,
+      total: catalog.registry.components.length,
+      byType,
+      dependencies
+    };
+    if (options.json) return output(result);
+    const rows = [
+      ['Показатель', 'Значение'],
+      ['Версия registry', result.version],
+      ['Всего компонентов', result.total],
+      ...Object.entries(result.byType),
+      ['Ссылок requires', result.dependencies]
+    ];
+    return console.log(rows.map(([label, value]) => `${label.padEnd(20)} | ${value}`).join('\n'));
+  }
   if (command === 'validate') {
     if (ids.length) throw new Error('validate не принимает аргументы');
     const result = { valid: true, version: catalog.registry.version, components: catalog.registry.components.length };
