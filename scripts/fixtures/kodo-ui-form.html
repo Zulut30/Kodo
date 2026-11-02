@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>Kodo owned UI fixture</title>
+<main><h1>Kodo verification fixture</h1>
+<form id="form"><label for="name">Name</label><input id="name" name="name" autocomplete="off">
+<button id="verify" type="submit">Verify</button></form>
+<p id="result" role="status" aria-live="polite">Not verified</p></main>
+<script>
+document.querySelector('#form').addEventListener('submit', event => {
+  event.preventDefault();
+  document.querySelector('#result').textContent = 'Verified ' + document.querySelector('#name').value;
+});
+</script></html>
