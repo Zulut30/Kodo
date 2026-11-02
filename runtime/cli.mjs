@@ -66,7 +66,7 @@ export async function runtimeCli(command, args) {
         store.updateRun(run.id, { nextRetryAt: new Date(nextRetry).toISOString() });
         if (!options.json) process.stderr.write(`waiting_limits: повтор ${new Date(nextRetry).toISOString()}\n`);
         while (Date.now() < nextRetry && !controller.signal.aborted && !store.getRun(run.id).cancelRequested) await new Promise(resolve => setTimeout(resolve, Math.min(1000, nextRetry - Date.now())));
-        result = await engine.run(run.id, { signal: controller.signal });
+        result = await engine.run(run.id, { prepare: options.prepare, planFile: options.plan, signal: controller.signal });
       }
       print(redact(result, secrets)); if (!['succeeded', 'awaiting_plan'].includes(result.state)) process.exitCode = 2;
     } finally { process.removeListener('SIGINT', abort); process.removeListener('SIGTERM', abort); }
