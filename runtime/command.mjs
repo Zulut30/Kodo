@@ -20,9 +20,16 @@ export function gitBoundary(args, env) {
   if (network) for (const [name, value] of Object.entries(env)) {
     if (/^(?:GH_TOKEN|GITHUB_TOKEN|GH_ENTERPRISE_TOKEN|GITHUB_ENTERPRISE_TOKEN|GH_HOST|GH_CONFIG_DIR)$/i.test(name)) environment[name] = value;
   }
-  const config = ['-c', `core.hooksPath=${process.platform === 'win32' ? 'NUL' : '/dev/null'}`];
+  const config = ['-c', `core.hooksPath=${process.platform === 'win32' ? 'NUL' : '/dev/null'}`, '-c', 'core.fsmonitor=false'];
   if (!network) config.push('-c', 'credential.helper=');
-  return { args: [...args.slice(0, commandIndex), ...config, ...args.slice(commandIndex)], env: environment };
+  let invocation = args.slice(commandIndex);
+  if (invocation[0] === 'diff') {
+    const separator = invocation.indexOf('--');
+    const optionEnd = separator === -1 ? invocation.length : separator;
+    const options = invocation.slice(1, optionEnd).filter(arg => !['--ext-diff', '--textconv'].includes(arg));
+    invocation = ['diff', '--no-ext-diff', '--no-textconv', ...options, ...invocation.slice(optionEnd)];
+  }
+  return { args: [...args.slice(0, commandIndex), ...config, ...invocation], env: environment };
 }
 
 export function resolveCommand(command, args) {
@@ -40,6 +47,7 @@ export async function execute(command, args = [], { cwd, env = process.env, sign
   const resolved = resolveCommand(command, args);
   return new Promise((resolve, reject) => {
     const child = spawn(resolved.command, resolved.args, { cwd, env, windowsHide: true, shell: false, stdio: ['pipe', 'pipe', 'pipe'] });
+    child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
     let stdout = '', stderr = '', stopped = false;
     const stop = () => { stopped = true; if (process.platform === 'win32' && child.pid) { const killer = spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' }); killer.on('error', () => child.kill()); } else child.kill('SIGTERM'); };
     const timeout = setTimeout(stop, timeoutMs); timeout.unref();
@@ -52,7 +60,7 @@ export async function execute(command, args = [], { cwd, env = process.env, sign
       const clean = { stdout: redact(stdout, secrets), stderr: redact(stderr, secrets), code };
       const result = rawOutput ? { stdout, stderr, code } : clean;
       if (stopped) reject(Object.assign(new Error('Команда отменена или превысила лимит времени'), { code: signal?.aborted ? 'cancelled' : 'timeout' }));
-      else if (code && !allowFailure) reject(Object.assign(new Error(`${command} завершился с кодом ${code}: ${clean.stderr || clean.stdout}`), { code: 'command_failed', result: clean }));
+      else if (code && !allowFailure) reject(Object.assign(new Error(`${command} завершился с кодом ${code}: ${[clean.stderr, clean.stdout].filter(Boolean).join('\n').slice(-24000)}`), { code: 'command_failed', result: clean }));
       else resolve(result);
     });
     child.stdin.on('error', () => {}); child.stdin.end(input);

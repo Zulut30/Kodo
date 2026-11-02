@@ -11,7 +11,7 @@ const cli = path.join(root, 'cli/index.mjs');
 // Read the manifest as public data; never import the statistics implementation.
 const registry = JSON.parse(await readFile(path.join(root, 'registry.json'), 'utf8'));
 const expectedStats = {
-  version: '0.2.0',
+  version: registry.version,
   total: 33,
   byType: { skill: 18, agent: 5, pipeline: 4, mcp: 3, preset: 3 },
   dependencies: 51
@@ -120,7 +120,7 @@ test('Registry dependencies counts 51 direct requires references including repea
 test('Registry stats table associates every label with its value', async t => {
   const expectedRows = [
     ['Показатель', 'Значение'],
-    ['Версия registry', '0.2.0'],
+    ['Версия registry', registry.version],
     ['Всего компонентов', '33'],
     ['skill', '18'],
     ['agent', '5'],

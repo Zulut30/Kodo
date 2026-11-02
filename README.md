@@ -4,6 +4,18 @@ Kodo объединяет каталог навыков и локальный и
 
 Нужен Node.js 24. GPT и Claude запускаются через установленные официальные клиенты и активные подписки. Отдельные API GPT/Claude не используются. Gemini, Jev и исследовательские сервисы используют свои ключи. [Репозиторий Kodo](https://github.com/Zulut30/Kodo).
 
+## Установка CLI
+
+Пакет распространяется через [GitHub Release 0.2.1](https://github.com/Zulut30/Kodo/releases/tag/v0.2.1), без публикации в npm:
+
+```powershell
+npm install -g "https://github.com/Zulut30/Kodo/releases/download/v0.2.1/zulut30-kodo-0.2.1.tgz"
+kodo init
+kodo doctor --json
+```
+
+`kodo init` включает [все 13 стандартных навыков](docs/DEFAULT-SKILLS.md) для Codex, Claude Code и OpenCode. Они также входят во все пресеты. Движок рассматривает их на каждом этапе; React/Next.js и monorepo-рекомендации применяются к соответствующим проектам.
+
 ## Запуск из исходников
 
 ```powershell
@@ -48,6 +60,8 @@ OpenCode может загрузить тот же навык и передат�
 
 ```powershell
 kodo list
+kodo list --search "архитектура" --json
+kodo registry stats --json
 kodo show skills/code-review
 kodo plan pipelines/fix-bug
 kodo init --preset nextjs --client all --target "D:\Projects\my-app" --dry-run

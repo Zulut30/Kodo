@@ -70,7 +70,7 @@ async function fixture(t, { brokenCli = false } = {}) {
       assert.match(body, /<!-- kodo-run:run-test -->/); assert.match(body, /Diff SHA-256/);
       state.creates++; state.pr = { number: 7, url: 'https://github.com/test/kodo/pull/7', state: 'OPEN' }; return output(state.pr.url);
     }
-    if (args[0] === 'pr' && args[1] === 'view') return output({ ...state.pr, headRefOid: state.prHead ?? headSha, baseRefName: 'main', mergeCommit: state.pr?.state === 'MERGED' ? { oid: state.mergeCommit ?? headSha } : null, statusCheckRollup: [{ name: 'ci', conclusion: state.check }, { context: 'kodo/review', state: state.status ?? 'PENDING' }] });
+    if (args[0] === 'pr' && args[1] === 'view') return output({ ...state.pr, headRefOid: state.prHead ?? headSha, baseRefName: 'main', baseRefOid: state.prBase ?? run.baseSha, mergeCommit: state.pr?.state === 'MERGED' ? { oid: state.mergeCommit ?? headSha } : null, statusCheckRollup: state.noChecks ? [] : [{ name: 'ci', conclusion: state.check }, { context: 'kodo/review', state: state.status ?? 'PENDING' }] });
     if (args[0] === 'pr' && args[1] === 'merge') {
       assert.ok(args.includes('--match-head-commit')); assert.ok(!args.includes('--admin'));
       if (config.delivery.release) assert.ok(leases.has('release:test/kodo:main'));
@@ -176,12 +176,40 @@ test('Delivery preserves created PR and stops on failed or pending CI', async t 
   }
 });
 
-test('Delivery rechecks remote base under queue lease and never merges a stale task', async t => {
+test('Delivery preflight rejects an advanced target before pushing or creating a PR', async t => {
   const ctx = await fixture(t);
   await ctx.git('push', 'origin', `${ctx.run.headSha}:main`);
   await assert.rejects(deliver(ctx), { code: 'stale_base' });
+  assert.equal(ctx.state.creates, 0); assert.equal(ctx.run.delivery, undefined);
+  assert.equal(ctx.calls.some(call => call.command === 'git' && call.args[0] === 'push'), false);
+  assert.equal(ctx.state.merges, 0); assert.equal(ctx.leases.size, 0);
+});
+
+test('Delivery detects a changed PR base before waiting for pending or missing CI', async t => {
+  for (const noChecks of [false, true]) {
+    const ctx = await fixture(t); ctx.state.check = 'IN_PROGRESS'; ctx.state.noChecks = noChecks;
+    ctx.state.prBase = 'a'.repeat(40);
+    await assert.rejects(deliver(ctx), { code: 'stale_base', baseSha: ctx.state.prBase });
+    assert.equal(ctx.run.delivery.pr.number, 7); assert.equal(ctx.state.merges, 0);
+    assert.equal(ctx.events.some(event => event.type === 'delivery.checks_waiting'), false);
+    assert.equal(ctx.leases.size, 0);
+  }
+});
+
+test('Delivery rechecks remote base under queue lease after an earlier fresh preflight', async t => {
+  const ctx = await fixture(t), runner = ctx.exec;
+  let advanced = false;
+  ctx.exec = async (command, args, options) => {
+    if (!advanced && command === 'gh' && args[0] === 'pr' && args[1] === 'view') {
+      advanced = true;
+      await ctx.git('push', 'origin', `${ctx.run.headSha}:main`);
+    }
+    return runner(command, args, options);
+  };
+  await assert.rejects(deliver(ctx), { code: 'stale_base' });
   assert.equal(ctx.state.merges, 0); assert.equal(ctx.leases.size, 0);
   assert.equal(ctx.run.delivery.pr.number, 7);
+  assert.equal(advanced, true);
 });
 
 test('Busy merge queue defers delivery without bypassing the lock', async t => {
@@ -263,7 +291,7 @@ test('Lost merge lease stops mutation and heartbeat cleanup releases the token',
   ctx.store.renewLease = () => { renewals++; signalRenewal(); return false; };
   const runner = ctx.exec;
   ctx.exec = async (command, args, options) => {
-    if (command === 'git' && args[0] === 'fetch') await renewed;
+    if (command === 'git' && args[0] === 'fetch' && ctx.leases.size) await renewed;
     return runner(command, args, options);
   };
   await assert.rejects(deliver({ ...ctx, leaseHeartbeatMs: 1 }), { code: 'lease_lost' });
@@ -567,4 +595,29 @@ test('Merge rejects a target-reserved version even before any release is publish
   await assert.rejects(deliver(ctx), { code: 'stale_base', targetVersion: '0.2.0' });
   assert.equal(ctx.state.merges, 0); assert.equal(ctx.state.publishes, 0); assert.equal(ctx.state.release, null);
   assert.equal(ctx.leases.size, 0);
+});
+
+test('Release freshness fetches a newly announced tag before resolving its commit', async t => {
+  const ctx = await fixture(t);
+  const delivered = await deliver(ctx), runner = ctx.exec;
+  await ctx.git('config', 'remote.origin.tagOpt', '--no-tags');
+  let announced = false;
+  ctx.exec = async (command, args, options) => {
+    if (command === 'gh' && args[0] === 'release' && args[1] === 'list') {
+      if (!announced) {
+        announced = true;
+        // GitHub reports a release created after releasePackage's initial tag
+        // fetch. This repository deliberately disables automatic tag following.
+        await execute('git', ['update-ref', 'refs/tags/v0.1.0', ctx.run.baseSha], { cwd: ctx.remote });
+      }
+      const inventory = [{ tagName: 'v0.1.0', isDraft: false, isPrerelease: false }];
+      if (ctx.state.release) inventory.push({ tagName: ctx.state.release.tag, isDraft: Boolean(ctx.state.release.isDraft), isPrerelease: false });
+      return { stdout: JSON.stringify(inventory), code: 0 };
+    }
+    return runner(command, args, options);
+  };
+  const receipt = await releasePackage({ ...ctx, mergeCommit: delivered.mergeCommit });
+  assert.equal(receipt.published, true); assert.equal(receipt.commit, delivered.mergeCommit);
+  assert.equal(await ctx.git('rev-parse', 'refs/tags/v0.1.0^{commit}'), ctx.run.baseSha);
+  assert.equal(ctx.state.publishes, 1); assert.equal(ctx.leases.size, 0);
 });
