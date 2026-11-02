@@ -2,8 +2,8 @@ import { spawn, spawnSync } from 'node:child_process';
 import { access, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
-
-const secretName = /(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)/i;
+import { parse as parseToml } from 'smol-toml';
+import { workerEnvironment } from './security.mjs';
 
 export function redact(value, secrets = {}) {
   let result = typeof value === 'string' ? value : JSON.stringify(value);
@@ -17,15 +17,13 @@ export function redact(value, secrets = {}) {
     .replace(/(?:apikey_|get-x-api-|reddit-api-)[A-Za-z0-9_-]{16,}/g, '[REDACTED]');
 }
 
-export function subscriptionEnvironment(extra = {}) {
-  const environment = { ...process.env, ...extra };
+export function subscriptionEnvironment(base = process.env) {
+  // An explicitly supplied worker environment is complete. Merging the parent
+  // here would reintroduce coordinator credentials already removed by Engine.
+  const environment = workerEnvironment(base);
   for (const name of Object.keys(environment)) {
-    if (secretName.test(name) || /^(?:OPENAI_|ANTHROPIC_|CLAUDE_CODE_USE_|KODO_)/i.test(name) || name === 'CLAUDECODE') delete environment[name];
+    if (/^(?:OPENAI_|ANTHROPIC_|CLAUDE_CODE_USE_)/i.test(name) || name === 'CLAUDECODE') delete environment[name];
   }
-  // External provider endpoints must never turn subscription workers into API clients.
-  delete environment.OPENAI_BASE_URL;
-  delete environment.OPENAI_API_BASE;
-  delete environment.ANTHROPIC_BASE_URL;
   return environment;
 }
 
@@ -117,4 +115,32 @@ export async function readCodexModelCache(environment = process.env) {
   const home = environment.CODEX_HOME || path.join(environment.USERPROFILE || os.homedir(), '.codex');
   try { return JSON.parse(await readFile(path.join(home, 'models_cache.json'), 'utf8')).models ?? []; }
   catch { return []; }
+}
+
+export async function codexIsolationOverrides(cwd, environment = process.env) {
+  const home = environment.CODEX_HOME || path.join(environment.USERPROFILE || os.homedir(), '.codex');
+  const filenames = new Set([path.join(home, 'config.toml')]);
+  let current = path.resolve(cwd);
+  for (;;) {
+    filenames.add(path.join(current, '.codex', 'config.toml'));
+    if (await isFile(path.join(current, '.git'))) break;
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  const serverNames = new Set(), pluginNames = new Set();
+  for (const filename of filenames) {
+    let text;
+    try { text = await readFile(filename, 'utf8'); }
+    catch (error) { if (error.code === 'ENOENT') continue; throw new Error('Не удалось прочитать конфигурацию Codex для изоляции рабочих инструментов'); }
+    let config;
+    try { config = parseToml(text.replace(/^\uFEFF/, '')); }
+    catch { throw new Error('Некорректная конфигурация Codex; запуск инструментов не начат'); }
+    for (const name of Object.keys(config.mcp_servers || {})) serverNames.add(name);
+    for (const name of Object.keys(config.plugins || {})) pluginNames.add(name);
+  }
+  const args = ['-c', 'notify=[]', '-c', 'plugins._default.enabled=false'];
+  for (const name of [...serverNames].sort()) args.push('-c', `mcp_servers.${JSON.stringify(name)}.enabled=false`);
+  for (const name of [...pluginNames].filter(name => name !== '_default').sort()) args.push('-c', `plugins.${JSON.stringify(name)}.enabled=false`);
+  return args;
 }

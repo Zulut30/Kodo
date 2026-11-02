@@ -1,0 +1,49 @@
+# Навыки Kodo по умолчанию
+
+Kodo рассматривает все 13 встроенных навыков на каждом этапе. В промпт попадают адаптер и относящиеся к этапу отрывки только применимых материалов; неприменимость также записывается с причиной. Такой выбор не требует дополнительных запросов к API.
+
+Движок сохраняет эти решения и хеши в `run.defaultSkills` для анализа, плана, ролей исполнения, ревью, ремонта и завершения. Для планирования текущей моделью чата материал доступен в `artifacts/plan-context.md` и `run.planningContext`. Локальные Markdown-ссылки контекста разрешаются в абсолютные read-only пути пакета Kodo; целевой проект не обязан содержать собственную копию каталога навыков.
+
+`runtime/skill-policy.mjs` возвращает контекст, список решений и SHA-256 контекста. Для каждого навыка сохраняются `id`, `applies`, `reason`, `source` и точная `revision`. Эти сведения позволяют установить, какие материалы использовались при конкретном запуске.
+
+| Навык | Источник | Основное применение |
+| --- | --- | --- |
+| architecture-patterns | [wshobson/agents](https://github.com/wshobson/agents) | Анализ, границы модулей и адаптеров, проектирование и ревью |
+| architecture-decision-records | [wshobson/agents](https://github.com/wshobson/agents) | Контекст и последствия значимых архитектурных решений |
+| monorepo-management | [wshobson/agents](https://github.com/wshobson/agents) | Workspace-граф и общие зависимости, если монорепозиторий обнаружен или запрошен |
+| e2e-testing-patterns | [wshobson/agents](https://github.com/wshobson/agents) | Критические пользовательские пути, тестирование и ревью |
+| subagent-driven-development | [obra/superpowers](https://github.com/obra/superpowers) | Разбиение задач, передача контекста и независимая проверка |
+| systematic-debugging | [obra/superpowers](https://github.com/obra/superpowers) | Воспроизведение и подтверждение первопричины сбоя |
+| test-driven-development | [obra/superpowers](https://github.com/obra/superpowers) | Проверка изменяемого контракта до исправления и после реализации |
+| using-git-worktrees | [obra/superpowers](https://github.com/obra/superpowers) | Изоляция задачи и сохранность пользовательских изменений |
+| differential-review | [Trail of Bits](https://github.com/trailofbits/skills) | Независимое ревью конкретного diff с доказательствами |
+| react-best-practices | [Vercel](https://github.com/vercel-labs/agent-skills/tree/main/skills/react-best-practices) | React/Next.js производительность при обнаруженном или запрошенном React |
+| composition-patterns | [Vercel](https://github.com/vercel-labs/agent-skills/tree/main/skills/composition-patterns) | React-композиция, границы контекста и API компонентов |
+| ce-compound | [EveryInc](https://github.com/EveryInc/compound-engineering-plugin/tree/main/skills/ce-compound) | Проверенные уроки и предотвращение повторной проблемы |
+| spec-kit | [GitHub Spec Kit](https://github.com/github/spec-kit) | Требования, план и проверяемые задачи на основе реальных шаблонов |
+
+## Источники и целостность
+
+Оригинальные выбранные каталоги и необходимые supporting files находятся в `skills/<name>/references/upstream/`. Они загружены из конкретных commit, а не из плавающей ветки во время запуска. Исходный `SKILL.md` сохранён как `SKILL.md.original`, чтобы клиент не обнаруживал второй самостоятельный навык внутри references. Его байты не менялись.
+
+`third-party-skills.lock.json` содержит репозиторий, полный commit SHA, исходный путь, лицензию, локальные пути, размеры и SHA-256 каждого сохранённого файла. Перед использованием policy проверяет все закреплённые ресурсы. Изменённый или отсутствующий источник останавливает загрузку с `skill_integrity`, вместо незаметного использования других инструкций.
+
+Vercel называет исходные навыки `vercel-react-best-practices` и `vercel-composition-patterns`; каталожные имена Kodo сохранены короткими. Spec Kit не представляет собой upstream SKILL.md: адаптер Kodo использует подлинные шаблоны spec, plan, tasks, checklist и constitution. Specify CLI и команды `/speckit.*` автоматически не устанавливаются.
+
+## Лицензии и адаптация
+
+Материалы wshobson, obra, EveryInc и Spec Kit сохранены с MIT LICENSE. Vercel объявляет MIT в frontmatter навыков и README; эти исходные декларации сохранены, отдельного LICENSE в закреплённом репозитории нет. Материалы differential-review распространяются по CC-BY-SA-4.0, полная лицензия включена. Адаптер differential-review Kodo также помечен CC-BY-SA-4.0 с указанием автора и изменений. Эти лицензии относятся к соответствующим материалам, а не заменяют лицензию остальных частей проекта.
+
+Адаптеры связывают методики с процессом Kodo. Явные инструкции пользователя и ограничения проекта имеют приоритет над справочными материалами. Модели, сессии, worktree, Git, PR, merge и выпуск остаются у координатора. Рабочий агент не запускает дополнительные деревья агентов, не расширяет область записи и не запрашивает повторное разрешение на уже порученный push или выпуск из-за инструкции upstream. Скопированные скрипты не выполняются автоматически.
+
+React определяется по зависимостям корневого и вложенных package.json либо явному требованию задачи. Монорепозиторий — по workspaces и конфигурации pnpm/Lerna/Nx либо явному требованию. Сам факт наличия навыка не заставляет менять стек, внедрять монорепозиторий или устанавливать браузерный тестовый инструмент.
+
+## Проверки
+
+```powershell
+node --test tests/skill-policy.test.mjs
+```
+
+Проверки используют локальные материалы и временные проекты: все навыки рассматриваются на каждом этапе, React/monorepo включаются по условиям, источники соответствуют pin, вмешательство обнаруживается, хеш контекста воспроизводим, адаптер устанавливается вместе с исходными supporting files. Внешних API-вызовов в этих тестах нет.
+
+`tests/default-integration.test.mjs` проверяет включение политики в реальные этапы Engine с подменёнными провайдерами и настоящими временными Git-worktree. Успешный результат сохраняет проверенную ревизию в пользовательской базе знаний; следующий анализ получает её через `priorLessons`. Непроверенная неудача и стадия подготовки не записываются как успешно подтверждённое знание.
