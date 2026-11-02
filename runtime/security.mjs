@@ -202,6 +202,6 @@ export function redact(value, secrets = {}) {
   return text;
 }
 export function workerEnvironment(base = process.env) {
-  return Object.fromEntries(Object.entries(base).filter(([name]) => !/(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|DATABASE_URL|SCRAPEDO|REDDIT_API|GETX|TYPESAFE|GEMINI|OPENROUTER|BASE_URL|USE_BEDROCK|USE_VERTEX|USE_FOUNDRY)/i.test(name) && !/^(?:KODO_|GH_|GITHUB_)/i.test(name) && (!/^CODEX_/i.test(name) || name === 'CODEX_HOME')));
+  return Object.fromEntries(Object.entries(base).filter(([name]) => !/(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|DATABASE_URL|SCRAPEDO|REDDIT_API|GETX|TYPESAFE|GEMINI|OPENROUTER|BASE_URL|USE_BEDROCK|USE_VERTEX|USE_FOUNDRY)/i.test(name) && !/^(?:KODO_|GH_|GITHUB_)/i.test(name) && !/^GIT_(?:DIR|WORK_TREE|INDEX_FILE|COMMON_DIR|OBJECT_DIRECTORY|NAMESPACE)$/i.test(name) && (!/^CODEX_/i.test(name) || name === 'CODEX_HOME')));
 }
 export function secretFile(name) { return /(?:^|\/)(?:\.env(?:\..*)?|auth\.json|secrets?(?:\..*)?|credentials?(?:\..*)?|[^/]*\.(?:pem|key|pfx))$/i.test(name); }

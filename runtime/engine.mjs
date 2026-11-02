@@ -1,12 +1,13 @@
 import path from 'node:path';
-import { readFile, writeFile, mkdir, access } from 'node:fs/promises';
+import os from 'node:os';
+import { readFile, writeFile, mkdir, access, rename } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { Store } from './store.mjs';
 import { loadSecrets, redact, workerEnvironment, secretFile, worktreeHome, stateHome } from './security.mjs';
 import { readConfig } from './config.mjs';
 import { validatePlan, validate, planSchema, resultSchema, reviewSchema, routingSchema, ownsPath, scopesOverlap } from './contracts.mjs';
-import { execute } from './command.mjs';
+import { execute, resolveCommand } from './command.mjs';
 import { git, inspectProject, makeWorktree, collectFiles, changedFiles, commitChanges, diffHash } from './workspace.mjs';
 import * as providers from './providers.mjs';
 import { research } from './research.mjs';
@@ -61,6 +62,23 @@ export class Engine {
     finally { clearInterval(timer); signal?.removeEventListener('abort', abort); this.store.releaseLease(token); }
   }
   checkCancelled(run, signal) { if (signal?.aborted || this.store.getRun(run.id).cancelRequested) throw Object.assign(new Error('Запуск отменён'), { code: 'cancelled' }); }
+  async executionEnvironment(run, cwd) {
+    const environment = workerEnvironment();
+    // Native workspace-write sessions can write OS temp while the user's global
+    // npm cache may be outside their writable roots. Keep caches scoped to a run
+    // and its worktree, without granting access to coordinator state or keys.
+    const cache = path.join(os.tmpdir(), 'kodo-npm-cache', contentHash(run.id).slice(0, 24), contentHash(path.resolve(cwd)).slice(0, 24));
+    await mkdir(cache, { recursive: true, mode: 0o700 });
+    for (const name of Object.keys(environment)) if (name.toUpperCase() === 'NPM_CONFIG_CACHE') delete environment[name];
+    environment.NPM_CONFIG_CACHE = cache;
+    const pathName = Object.keys(environment).find(name => name.toLowerCase() === 'path') || 'PATH';
+    environment[pathName] = [path.dirname(process.execPath), environment[pathName]].filter(Boolean).join(path.delimiter);
+    try {
+      const npm = resolveCommand('npm', []);
+      if (npm.command === process.execPath && npm.args[0]) environment.npm_execpath = npm.args[0];
+    } catch {} // Non-Node projects do not require an npm installation to start a worker.
+    return environment;
+  }
   async session(run, request, signal, node, identity = node) {
     const stage = node ? run.plan.tasks.find(task => task.id === node.id).role : run.state === 'planning' ? 'plan' : request.readOnly ? 'review' : 'repair';
     request = { ...request, prompt: `${await this.policy(run, stage)}\nCoordinator contract: your completion report concerns the assigned scoped deliverable. Global integrated test/build/release gates are run by the coordinator after all changes and current main are integrated. A test author should run the new targeted tests and record independently confirmed pre-existing failures separately; never change or skip unrelated tests. Do not mark the overall pipeline published or deployed.\n${request.prompt}` };
@@ -69,17 +87,36 @@ export class Engine {
       const controller = new AbortController();
       const abort = () => controller.abort(); signal?.addEventListener('abort', abort, { once: true });
       const timer = setInterval(() => { if (this.store.getRun(run.id).cancelRequested) controller.abort(); }, 500); timer.unref();
-      try { return await this.provider.runSession({ ...request, signal: controller.signal, env: workerEnvironment(), onEvent: event => {
+      try { return await this.provider.runSession({ ...request, signal: controller.signal, env: await this.executionEnvironment(run, request.cwd), onEvent: event => {
         if (identity && event.sessionId) { identity.sessionId = event.sessionId; this.save(run); }
         this.log(run, 'session', { node: node?.id, ...event });
       } }); } finally { clearInterval(timer); signal?.removeEventListener('abort', abort); }
     }, signal);
   }
   async setup(cwd, run, signal) {
-    try { await access(path.join(cwd, 'package-lock.json')); } catch { return; }
-    try { await access(path.join(cwd, 'node_modules/ajv')); return; } catch {}
+    let lock;
+    try { lock = await readFile(path.join(cwd, 'package-lock.json')); } catch (error) { if (error.code === 'ENOENT') return; throw error; }
+    const resolved = path.resolve(cwd), runtime = { version: process.version, platform: process.platform, arch: process.arch, modules: process.versions.modules };
+    const lockHash = createHash('sha256').update(lock).digest('hex'), fingerprint = contentHash({ lockHash, runtime });
+    const key = contentHash(process.platform === 'win32' ? resolved.toLowerCase() : resolved);
+    const directory = path.join(this.store.home, 'setup'), receiptFile = path.join(directory, `${key}.json`);
+    const installedIndex = async () => {
+      try {
+        const text = await readFile(path.join(cwd, 'node_modules/.package-lock.json'), 'utf8'), index = JSON.parse(text);
+        if (!Number.isInteger(index.lockfileVersion) || !index.packages || typeof index.packages !== 'object' || Array.isArray(index.packages)) return null;
+        return createHash('sha256').update(text).digest('hex');
+      } catch (error) { if (error.code === 'ENOENT' || error instanceof SyntaxError) return null; throw error; }
+    };
+    let receipt;
+    try { receipt = JSON.parse(await readFile(receiptFile, 'utf8')); } catch (error) { if (error.code !== 'ENOENT' && !(error instanceof SyntaxError)) throw error; }
+    const currentIndex = await installedIndex();
+    if (receipt?.schemaVersion === 1 && receipt.cwd === resolved && receipt.fingerprint === fingerprint && currentIndex && receipt.installedIndexHash === currentIndex) return;
     this.log(run, 'setup', { cwd });
-    await execute('npm', ['ci', '--ignore-scripts'], { cwd, signal, env: workerEnvironment(), secrets: this.secrets });
+    await execute('npm', ['ci', '--ignore-scripts', '--no-audit', '--no-fund'], { cwd, signal, env: await this.executionEnvironment(run, cwd), secrets: this.secrets });
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    const temporary = `${receiptFile}.${process.pid}.tmp`;
+    await writeFile(temporary, JSON.stringify({ schemaVersion: 1, cwd: resolved, lockHash, runtime, fingerprint, installedIndexHash: await installedIndex(), completedAt: new Date().toISOString() }) + '\n', { mode: 0o600 });
+    await rename(temporary, receiptFile);
   }
   async prepare(run, signal) {
     await makeWorktree(run.project, run.cwd, run.branch, run.baseSha);
@@ -322,7 +359,7 @@ export class Engine {
       const scopes = run.plan.tasks.flatMap(task => task.writePaths);
       if (run.config.delivery.release && run.releaseAssignment?.version) {
         const changed = await changedFiles(run.cwd, 'HEAD');
-        for (const name of ['package.json', 'package-lock.json', 'registry.json'].filter(file => changed.includes(file))) {
+        for (const name of ['package.json', 'package-lock.json', 'registry.json'].filter(file => changed.includes(file) && !ownsPath(scopes, file))) {
           const baseline = await execute('git', ['show', `HEAD:${name}`], { cwd: run.cwd, rawOutput: true });
           const before = JSON.parse(baseline.stdout), after = JSON.parse(await readFile(path.join(run.cwd, name), 'utf8'));
           if (after.version !== run.releaseAssignment.version) throw Object.assign(new Error(`Неожиданная версия при восстановлении: ${name}`), { code: 'scope_conflict' });

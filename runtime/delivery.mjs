@@ -155,7 +155,7 @@ async function releaseOwnedLease(ctx, token) {
 }
 
 async function getPr(ctx, number) {
-  return parse(await ctx.command('gh', ['pr', 'view', String(number), '--repo', ctx.repository, '--json', 'number,url,state,mergedAt,mergeCommit,headRefOid,baseRefName,statusCheckRollup']), 'gh pr view');
+  return parse(await ctx.command('gh', ['pr', 'view', String(number), '--repo', ctx.repository, '--json', 'number,url,state,mergedAt,mergeCommit,headRefOid,baseRefName,baseRefOid,statusCheckRollup']), 'gh pr view');
 }
 
 function mergedReceipt(ctx, previous, saved, expectedHead) {
@@ -210,6 +210,9 @@ async function awaitChecks(ctx, number, expectedHead, names) {
     const pr = await getPr(ctx, number);
     if (pr.headRefOid !== expectedHead) throw fail('stale_review', 'PR head changed after review');
     if (pr.baseRefName !== ctx.baseBranch) throw fail('configuration', 'PR targets an unexpected branch');
+    // Conflicting or outdated branches may never receive CI checks. Replan
+    // against the actual target immediately instead of waiting for absent CI.
+    if (pr.baseRefOid !== ctx.run.baseSha) throw fail('stale_base', 'PR target advanced; synchronize, retest and review before waiting for checks', { baseSha: pr.baseRefOid });
     const checks = validateChecks(pr.statusCheckRollup, names);
     if (checks.failed.length) throw fail('checks_failed', `Required checks failed: ${checks.failed.join(', ')}`, { checks });
     if (checks.ready) return pr;
@@ -229,6 +232,8 @@ export async function deliver(options) {
   let saved = ctx.run.delivery ?? {};
   const { head, diffHash } = await verifyReview(ctx);
   const required = await requiredChecks(ctx);
+  const initialBase = await fetchBase(ctx);
+  if (initialBase !== ctx.run.baseSha) throw fail('stale_base', 'Target branch advanced; synchronize, retest and review before publishing the task branch', { baseSha: initialBase });
   await ctx.command('git', ['push', '--set-upstream', 'origin', ctx.run.branch]);
   const matches = parse(await ctx.command('gh', ['pr', 'list', '--repo', ctx.repository, '--head', ctx.run.branch, '--state', 'all', '--json', 'number,url,state']), 'gh pr list');
   if (matches.length > 1) throw fail('ambiguous_pr', 'More than one PR matches the run branch');
@@ -470,6 +475,9 @@ function assertOwnedDraft(ctx, info, version, candidate) {
 async function assertCandidateFresh(ctx, candidate, version, latest) {
   const remoteHead = await fetchBase(ctx);
   const candidateIsAncestor = (await ctx.command('git', ['merge-base', candidate, remoteHead], { allowFailure: true })).trim() === candidate;
+  // Release inventory may announce a tag created after our initial fetch;
+  // explicitly fetch that ref even when origin disables automatic tag following.
+  if (latest) await ctx.command('git', ['fetch', 'origin', 'tag', latest.tagName]);
   const latestSha = latest ? (await ctx.command('git', ['rev-parse', `${latest.tagName}^{commit}`])).trim() : null;
   const containsLatest = !latestSha || (await ctx.command('git', ['merge-base', latestSha, candidate], { allowFailure: true })).trim() === latestSha;
   assertFreshRelease({ candidateSha: candidate, remoteHead, candidateIsAncestor, latestSha, containsLatest, latestVersion: latest?.tagName, version });
