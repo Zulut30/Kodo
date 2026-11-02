@@ -7,7 +7,7 @@ import { planInstallation, applyInstallation } from './installer.mjs';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const help = `Kodo — Codex / Claude Code / OpenCode
 
-node cli/index.mjs list [skill|agent|pipeline|mcp|preset] [--json]
+node cli/index.mjs list [skill|agent|pipeline|mcp|preset] [--search TEXT] [--json]
 node cli/index.mjs show <category/name> [--json]
 node cli/index.mjs plan <pipelines/name> [--json]
 node cli/index.mjs install <category/name> [...] --client <name|all> --target <project> [--dry-run] [--json]
@@ -31,7 +31,7 @@ function parse(argv) {
   for (let index = 0; index < argv.length; index++) {
     const arg = argv[index];
     if (['--json', '--dry-run', '--help'].includes(arg)) options[arg.slice(2)] = true;
-    else if (['--client', '--target', '--preset'].includes(arg)) {
+    else if (['--client', '--target', '--preset', '--search'].includes(arg)) {
       const value = argv[++index];
       if (!value || value.startsWith('--')) throw new Error(`Требуется значение ${arg}`);
       if (arg === '--client') options.clients.push(value);
@@ -47,7 +47,7 @@ function parse(argv) {
 
 function checkOptions(command, options) {
   const allowed = {
-    list: ['json'], show: ['json'], plan: ['json'], validate: ['json'], registry: ['json'],
+    list: ['json', 'search'], show: ['json'], plan: ['json'], validate: ['json'], registry: ['json'],
     install: ['json', 'dry-run', 'target', 'clients'], init: ['json', 'dry-run', 'target', 'clients', 'preset']
   }[command];
   if (!allowed) throw new Error(`Неизвестная команда: ${command}`);
@@ -98,7 +98,11 @@ async function main() {
   }
   if (command === 'list') {
     if (ids.length > 1 || ids[0] && !['skill', 'agent', 'pipeline', 'mcp', 'preset'].includes(ids[0])) throw new Error('Укажи тип: skill, agent, pipeline, mcp или preset');
-    const list = catalog.registry.components.filter(item => !ids[0] || item.type === ids[0]);
+    const normalize = text => String(text ?? '').normalize('NFC').toLocaleLowerCase('ru');
+    const query = options.search === undefined ? '' : normalize(options.search.trim());
+    if (options.search !== undefined && !query) throw new Error('Требуется значение --search');
+    const list = catalog.registry.components.filter(item => (!ids[0] || item.type === ids[0]) && (!query || normalize(item.id).includes(query) || normalize(item.description).includes(query)));
+    if (query && !list.length && !options.json) return;
     return options.json ? output(list) : console.log(list.map(item => `${item.id.padEnd(29)} ${item.description}`).join('\n'));
   }
   if (command === 'show' || command === 'plan') {
