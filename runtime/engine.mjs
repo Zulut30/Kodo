@@ -65,9 +65,11 @@ export class Engine {
   async executionEnvironment(run, cwd) {
     const environment = workerEnvironment();
     // Native workspace-write sessions can write OS temp while the user's global
-    // npm cache may be outside their writable roots. Keep caches scoped to a run
-    // and its worktree, without granting access to coordinator state or keys.
-    const cache = path.join(os.tmpdir(), 'kodo-npm-cache', contentHash(run.id).slice(0, 24), contentHash(path.resolve(cwd)).slice(0, 24));
+    // npm cache may be outside their writable roots. Share npm's content-addressed
+    // cache across this user's runs/worktrees instead of duplicating every
+    // dependency per task. npm supports concurrent writers to its cache.
+    const home = path.resolve(os.homedir());
+    const cache = path.join(os.tmpdir(), 'kodo-npm-cache', contentHash(process.platform === 'win32' ? home.toLowerCase() : home).slice(0, 24));
     await mkdir(cache, { recursive: true, mode: 0o700 });
     for (const name of Object.keys(environment)) if (name.toUpperCase() === 'NPM_CONFIG_CACHE') delete environment[name];
     environment.NPM_CONFIG_CACHE = cache;
@@ -82,6 +84,7 @@ export class Engine {
   async session(run, request, signal, node, identity = node) {
     const stage = node ? run.plan.tasks.find(task => task.id === node.id).role : run.state === 'planning' ? 'plan' : request.readOnly ? 'review' : 'repair';
     request = { ...request, prompt: `${await this.policy(run, stage)}\nCoordinator contract: your completion report concerns the assigned scoped deliverable. Global integrated test/build/release gates are run by the coordinator after all changes and current main are integrated. A test author should run the new targeted tests and record independently confirmed pre-existing failures separately; never change or skip unrelated tests. Do not mark the overall pipeline published or deployed.\n${request.prompt}` };
+    for (const secret of Object.values(this.secrets)) if (typeof secret === 'string' && secret.length > 5) request.prompt = request.prompt.split(secret).join('[REDACTED]');
     return this.withLease(run, `subscription:${request.client}`, run.config.concurrency, async signal => {
       this.checkCancelled(run, signal);
       const controller = new AbortController();

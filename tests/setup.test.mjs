@@ -11,23 +11,15 @@ import { workerEnvironment } from '../runtime/security.mjs';
 async function fixture(t) {
   const root = await mkdtemp(path.join(os.tmpdir(), 'kodo-setup-test-'));
   const project = path.join(root, 'project'), store = new Store(path.join(root, 'state'));
-  const caches = new Set();
   t.after(async () => {
     store.close();
     assert.equal(path.dirname(root), path.resolve(os.tmpdir()));
     assert.ok(path.basename(root).startsWith('kodo-setup-test-'));
     await rm(root, { recursive: true, force: true });
-    for (const cache of caches) {
-      const resolved = path.resolve(cache), cacheRoot = path.join(os.tmpdir(), 'kodo-npm-cache');
-      assert.ok(resolved.startsWith(cacheRoot + path.sep));
-      await rm(resolved, { recursive: true, force: true });
-    }
   });
   await mkdir(project);
   const run = store.createRun({ task: 'Verify local dependency setup', cwd: project, config: { concurrency: 2 }, state: 'planning' });
   const engine = new Engine({ store });
-  const executionEnvironment = engine.executionEnvironment.bind(engine);
-  engine.executionEnvironment = async (...args) => { const environment = await executionEnvironment(...args); caches.add(environment.NPM_CONFIG_CACHE); return environment; };
   const manualEnv = { ...workerEnvironment(), NPM_CONFIG_CACHE: path.join(root, 'manual-cache'), NPM_CONFIG_OFFLINE: 'true' };
   async function useVersion(version) {
     const source = path.join(root, `dependency-${version}`); await mkdir(source);
@@ -38,7 +30,7 @@ async function fixture(t) {
     await writeFile(path.join(project, 'package.json'), JSON.stringify({ name: 'kodo-setup-fixture', version: '1.0.0', private: true, dependencies: { 'kodo-fixture-dependency': `file:../${filename}` } }));
     await execute('npm', ['install', '--package-lock-only', '--ignore-scripts', '--offline', '--no-audit', '--no-fund'], { cwd: project, env: manualEnv });
   }
-  return { root, project, store, run, engine, useVersion, caches };
+  return { root, project, store, run, engine, useVersion };
 }
 async function offline(action) {
   const before = process.env.NPM_CONFIG_OFFLINE; process.env.NPM_CONFIG_OFFLINE = 'true';
@@ -84,16 +76,20 @@ test('Setup reinstalls when the installed dependency index is missing or empty d
   assert.equal(fx.store.events(fx.run.id).filter(event => event.type === 'setup').length, 3);
 }));
 
-test('Worker sessions receive a writable task-local temp npm cache and native Node discovery without coordinator secrets', async t => {
-  const fx = await fixture(t), seen = [];
+test('Worker sessions share one writable per-user temp npm cache across runs and worktrees without coordinator secrets', async t => {
+  const fx = await fixture(t), seen = [], sentinels = new Set();
+  t.after(async () => {
+    for (const sentinel of sentinels) await unlink(sentinel).catch(error => { if (error.code !== 'ENOENT') throw error; });
+  });
   const polluted = { GEMINI_API_KEY: 'fixture-coordinator-private', NPM_TOKEN: 'fixture-npm-private', DATABASE_URL: 'fixture-database-private' };
   const original = Object.fromEntries(Object.keys(polluted).map(name => [name, process.env[name]])); Object.assign(process.env, polluted);
   fx.engine.provider = { runSession: async request => {
     seen.push(request.env); const cache = request.env.NPM_CONFIG_CACHE;
-    assert.equal(typeof cache, 'string'); fx.caches.add(cache);
-    assert.ok(path.resolve(cache).startsWith(path.join(os.tmpdir(), 'kodo-npm-cache') + path.sep));
-    await execute(process.execPath, ['-e', "require('node:fs').writeFileSync(require('node:path').join(process.env.NPM_CONFIG_CACHE, 'worker-write-canary'), 'native cache is writable\\n')"], { cwd: request.cwd, env: request.env });
-    assert.equal(await readFile(path.join(cache, 'worker-write-canary'), 'utf8'), 'native cache is writable\n');
+    assert.equal(typeof cache, 'string');
+    assert.equal(path.dirname(path.resolve(cache)), path.join(os.tmpdir(), 'kodo-npm-cache'));
+    const filename = `canary-${path.basename(fx.root)}-${seen.length}`, sentinel = path.join(cache, filename); sentinels.add(sentinel);
+    await execute(process.execPath, ['-e', "require('node:fs').writeFileSync(require('node:path').join(process.env.NPM_CONFIG_CACHE, process.argv[1]), 'native cache is writable\\n')", filename], { cwd: request.cwd, env: request.env });
+    assert.equal(await readFile(sentinel, 'utf8'), 'native cache is writable\n');
     const pathName = Object.keys(request.env).find(name => name.toLowerCase() === 'path');
     assert.equal(request.env[pathName].split(path.delimiter)[0], path.dirname(process.execPath));
     for (const name of Object.keys(polluted)) assert.equal(request.env[name], undefined);
@@ -106,7 +102,10 @@ test('Worker sessions receive a writable task-local temp npm cache and native No
     await fx.engine.session(fx.run, { client: 'codex', cwd: fx.project, prompt: 'fixture repeat', readOnly: true });
     const other = path.join(fx.root, 'other-task'); await mkdir(other);
     await fx.engine.session(fx.run, { client: 'codex', cwd: other, prompt: 'fixture other task', readOnly: true });
+    const otherRun = fx.store.createRun({ task: 'Separate run shares only the user npm cache', cwd: other, config: { concurrency: 2 }, state: 'planning' });
+    assert.notEqual(otherRun.id, fx.run.id);
+    await fx.engine.session(otherRun, { client: 'codex', cwd: other, prompt: 'fixture second run', readOnly: true });
   } finally { for (const [name, value] of Object.entries(original)) { if (value === undefined) delete process.env[name]; else process.env[name] = value; } }
-  assert.equal(seen[0].NPM_CONFIG_CACHE, seen[1].NPM_CONFIG_CACHE);
-  assert.notEqual(seen[0].NPM_CONFIG_CACHE, seen[2].NPM_CONFIG_CACHE);
+  assert.equal(seen.length, 4);
+  assert.equal(new Set(seen.map(environment => environment.NPM_CONFIG_CACHE)).size, 1);
 });

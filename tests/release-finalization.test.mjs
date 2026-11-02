@@ -20,6 +20,23 @@ import { workerEnvironment } from '../runtime/security.mjs';
 const nullHooks = process.platform === 'win32' ? 'NUL' : '/dev/null';
 const shell = value => `'${value.replaceAll('\\', '/').replaceAll("'", "'\\''")}'`;
 const selectors = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY', 'GIT_NAMESPACE'];
+
+test('Worker prompts remove known credentials from analysis and host plans while preserving credential-handling code examples', async t => {
+  const f = await fixture(t), project = await f.repository('prompt-project');
+  const secrets = { GEMINI_API_KEY: 'fixture-private-analysis-123', TYPESAFE_API_KEY: 'fixture-private-host-plan-456' };
+  let observed = false;
+  const store = f.openStore(), engine = new Engine({ store, secrets, provider: { runSession: async request => {
+    observed = true;
+    for (const value of Object.values(secrets)) assert.equal(request.prompt.includes(value), false, 'a known credential reached the worker prompt');
+    assert.match(request.prompt, /\[REDACTED\]/);
+    assert.ok(request.prompt.includes('Bearer ${token}'), 'generic code text must remain meaningful');
+    return { sessionId: 'clean-prompt-worker', output: { summary: 'checked', checks: [], complete: true } };
+  } } });
+  const run = store.createRun({ project, cwd: project, task: 'safe task', state: 'implementing', config: { concurrency: 1 } });
+  const prompt = `Analysis: ${secrets.GEMINI_API_KEY}; host plan: ${secrets.TYPESAFE_API_KEY}; ` + 'Literal source example: Bearer ${token}';
+  await engine.session(run, { client: 'codex', model: 'gpt-6.1-sol', cwd: project, prompt }, undefined);
+  assert.equal(observed, true);
+});
 async function exists(filename) { try { await lstat(filename); return true; } catch (error) { if (error.code === 'ENOENT') return false; throw error; } }
 
 async function fixture(t) {
