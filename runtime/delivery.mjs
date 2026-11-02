@@ -350,6 +350,12 @@ async function verifyPublishedArtifact(ctx, { tag, commit, artifact, sha256: che
   return info;
 }
 
+async function publishedReleases(ctx) {
+  const releases = parse(await ctx.command('gh', ['release', 'list', '--repo', ctx.repository, '--limit', '100', '--json', 'tagName,isDraft,isPrerelease']), 'published releases');
+  return releases.filter(item => !item.isDraft && !item.isPrerelease && /^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(item.tagName))
+    .sort((a, b) => compareVersion(a.tagName.replace(/^v/, ''), b.tagName.replace(/^v/, '')));
+}
+
 /**
  * Publish an immutable package for an exact merged SHA. The receipt's tag URL
  * and artifact URL are authoritative. Kodo v1 never changes GitHub's mutable
@@ -374,7 +380,8 @@ export async function releasePackage(options) {
     await ctx.command('git', ['worktree', 'add', '--detach', source, candidate]);
     const manifest = parse(await readFile(path.join(source, 'package.json'), 'utf8'), 'package.json');
     const version = manifest.version;
-    const latest = parse(await ctx.command('gh', ['release', 'list', '--repo', ctx.repository, '--limit', '1', '--json', 'tagName,isDraft,isPrerelease']), 'release list').filter(item => !item.isDraft && !item.isPrerelease)[0];
+    const releases = await publishedReleases(ctx);
+    const latest = releases.at(-1);
     const latestSha = latest ? (await ctx.command('git', ['rev-parse', `${latest.tagName}^{commit}`])).trim() : null;
     const expectedVersion = ctx.run.releaseAssignment?.version ?? (latest ? (ctx.config.delivery?.nextVersion ?? version) : (ctx.config.delivery?.firstVersion ?? version));
     if (version !== expectedVersion) throw fail('release_version_mismatch', `Reviewed package version ${version} does not match configured release ${expectedVersion}`);
@@ -383,7 +390,7 @@ export async function releasePackage(options) {
     const tag = `v${version}`;
     const taggedCommit = (await ctx.command('git', ['rev-parse', '--verify', `refs/tags/${tag}^{commit}`], { allowFailure: true })).trim();
     if (taggedCommit && taggedCommit !== candidate) throw fail('release_conflict', 'The proposed release tag already points to another commit');
-    const existing = latest?.tagName === tag && latestSha === candidate;
+    const existing = releases.some(item => item.tagName === tag) && taggedCommit === candidate;
     if (!existing) assertFreshRelease({ candidateSha: candidate, remoteHead, latestSha, latestVersion: latest?.tagName, version });
     if (Object.keys(manifest.dependencies ?? {}).length || Object.keys(manifest.devDependencies ?? {}).length) {
       let hasLock = false;
@@ -410,7 +417,7 @@ export async function releasePackage(options) {
       url = info.url;
     } else {
       assertFreshRelease({ candidateSha: candidate, remoteHead: await fetchBase(ctx), latestSha, latestVersion: latest?.tagName, version });
-      const latestBeforePublish = parse(await ctx.command('gh', ['release', 'list', '--repo', ctx.repository, '--limit', '1', '--json', 'tagName,isDraft,isPrerelease']), 'latest release before publication').filter(item => !item.isDraft && !item.isPrerelease)[0];
+      const latestBeforePublish = (await publishedReleases(ctx)).at(-1);
       if (latestBeforePublish?.tagName !== latest?.tagName) throw fail('stale_release', 'Published release state changed while preparing the package; prepare its version again');
       const notes = path.join(directory, 'notes.md');
       await writeFile(notes, `Kodo ${version}\n\n${ctx.run.task}\n\nCommit: ${candidate}\nRun: ${ctx.run.id}\n\nSHA-256: ${checksum}\n\nPackage installation and CLI smoke checks passed on ${process.platform}, Node.js ${process.version}.\n`);

@@ -443,3 +443,20 @@ test('Engine reruns checks and independent review after repairing a confirmed re
   assert.equal(store.events(run.id).filter(event => event.type === 'check_started').length, 2);
   assert.equal(await read(path.join(fx.project, 'src/value.mjs')), 'export const value = 0;\n');
 });
+
+test('Engine honours persisted cancellation after merge and does not publish a release', async t => {
+  const fx = await fixture(t, { remote: true });
+  const services = fakeServices(), store = fx.openStore();
+  services.delivery.deliver = async ({ run }) => {
+    services.calls.delivery++;
+    store.updateRun(run.id, { cancelRequested: true, state: 'cancelled' });
+    return { pr: { number: 1, url: 'https://example.invalid/pull/1' }, mergeCommit: run.headSha };
+  };
+  const engine = new Engine({ store, ...services });
+  const run = await engine.create('Implement value two', { project: fx.project });
+  const result = await engine.run(run.id);
+  assert.equal(result.state, 'cancelled', result.error?.message);
+  assert.equal(result.delivery.mergeCommit, result.headSha, 'cancellation must retain the already completed merge receipt');
+  assert.equal(services.calls.release, 0, 'cancellation must stop the next external mutation');
+  assert.equal(store.getRun(run.id).cancelRequested, true);
+});

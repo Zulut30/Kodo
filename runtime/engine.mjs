@@ -69,10 +69,8 @@ export class Engine {
     if (!run.completed.analysis) {
       run.state = 'analyzing'; this.save(run);
       const bundle = await collectFiles(run.cwd, run.task, this.secrets);
-      const [analysis, evidence] = await Promise.all([
-        this.provider.analyzeGemini({ task: run.task, files: bundle.files, signal }, { secrets: this.secrets }),
-        this.researcher({ task: run.task, budget: run.config.researchBudget, signal }, { secrets: this.secrets }).catch(error => ({ items: [], requests: 0, errors: [{ source: 'research', error: redact(error.message, this.secrets) }], cache: [] }))
-      ]);
+      const analysis = await this.provider.analyzeGemini({ task: run.task, files: bundle.files, signal }, { secrets: this.secrets });
+      const evidence = await this.researcher({ task: analysis.researchQuery || run.task, budget: run.config.researchBudget, signal }, { secrets: this.secrets }).catch(error => ({ items: [], requests: 0, errors: [{ source: 'research', error: redact(error.message, this.secrets) }], cache: [] }));
       run.analysis = { ...analysis, omitted: bundle.omitted }; run.research = evidence;
       run.completed.analysis = { baseSha: run.baseSha, inputHash: contentHash(bundle.files) };
       await writeFile(path.join(run.artifacts, 'analysis.json'), JSON.stringify(redact({ analysis: run.analysis, research: evidence }, this.secrets), null, 2));
@@ -148,9 +146,12 @@ export class Engine {
     }
   }
   async moreResearch(run, reason, signal) {
-    const remaining = run.config.researchBudget - (run.research.requests || 0); if (remaining <= 0) return;
-    const next = await this.researcher({ task: run.task, reason, budget: remaining, cache: run.research.cache, signal }, { secrets: this.secrets }).catch(error => ({ items: [], requests: 0, cache: run.research.cache, errors: [{ error: error.message }] }));
-    run.research = { items: [...run.research.items, ...next.items], requests: run.research.requests + next.requests, cache: next.cache, errors: [...run.research.errors, ...next.errors] }; this.save(run);
+    return this.withLease(run, `research:${run.id}`, 1, async () => {
+      const remaining = run.config.researchBudget - (run.research.requests || 0); if (remaining <= 0) return;
+      const next = await this.researcher({ task: run.task, reason, budget: remaining, cache: run.research.cache, signal }, { secrets: this.secrets }).catch(error => ({ items: [], requests: 0, cache: run.research.cache, errors: [{ error: error.message }] }));
+      if (next.requests > remaining) throw new Error('Провайдер исследования превысил выделенный бюджет');
+      run.research = { items: [...run.research.items, ...next.items], requests: run.research.requests + next.requests, cache: next.cache, errors: [...run.research.errors, ...next.errors] }; this.save(run);
+    }, signal);
   }
   async integrateNode(run, task, signal) {
     const node = run.nodes[task.id]; if (node.status === 'integrated') return;
@@ -235,6 +236,10 @@ export class Engine {
     if (run.state === 'succeeded' || run.state === 'cancelled') return run;
     const token = this.store.acquireLease(`run:${id}`, id); if (!token) throw new Error('Этот запуск уже исполняется');
     const heartbeat = setInterval(() => this.store.renewLease(token), 10000); heartbeat.unref();
+    const parentSignal = signal, controller = new AbortController(), cancel = () => controller.abort();
+    parentSignal?.addEventListener('abort', cancel, { once: true }); if (parentSignal?.aborted) cancel();
+    signal = controller.signal;
+    const cancellation = setInterval(() => { if (this.store.getRun(id).cancelRequested) cancel(); }, 500); cancellation.unref();
     try {
       this.checkCancelled(run, signal); await this.prepare(run, signal);
       if (prepare && !run.plan) { run.state = 'awaiting_plan'; await writeFile(path.join(run.artifacts, 'plan.schema.json'), JSON.stringify(planSchema, null, 2)); this.save(run); return run; }
@@ -250,6 +255,7 @@ export class Engine {
         }
         await this.verify(run, signal);
       }
+      this.checkCancelled(run, signal);
       if (run.config.delivery.enabled) {
         run.state = 'delivering'; this.save(run);
         for (let attempt = 0; ; attempt++) {
@@ -265,25 +271,27 @@ export class Engine {
               await this.session(run, { client: run.client, model: run.config.primaryModel || defaultModel(run.client), cwd: run.cwd, schema: resultSchema,
                 prompt: `Resolve target branch merge conflicts preserving BOTH the task implementation and incoming upstream changes. Conflicting paths: ${JSON.stringify(conflicts)}. Task: ${run.task}. Do not commit, push, abort the merge, or discard either side. Return structured completion JSON.` }, signal);
               await git(run.cwd, ['add', '-A']);
-              await execute('git', ['diff', '--cached', '--check'], { cwd: run.cwd });
+              await execute('git', ['-c', 'core.whitespace=cr-at-eol,-blank-at-eol,-blank-at-eof,-space-before-tab', 'diff', '--cached', '--check'], { cwd: run.cwd });
               await commitChanges(run.cwd, 'Kodo reconcile target branch');
             }
             run.baseSha = base; this.save(run); await this.verify(run, signal);
           }
         }
         this.save(run);
+        this.checkCancelled(run, signal);
         if (run.config.delivery.release) {
           run.state = 'releasing'; this.save(run);
           run.release = await this.delivery.releasePackage({ run, config: run.config, store: this.store, cwd: run.cwd, mergeCommit: run.delivery.mergeCommit, signal, onEvent: event => this.log(run, 'release', event) });
         }
       }
+      this.checkCancelled(run, signal);
       run.state = 'succeeded'; run.error = null; this.save(run); this.log(run, 'succeeded', { headSha: run.headSha, pr: run.delivery?.pr, release: run.release });
       await writeFile(path.join(run.artifacts, 'receipt.json'), JSON.stringify(redact(run, this.secrets), null, 2)); return run;
     } catch (error) {
       run.state = error.code === 'quota' ? 'waiting_limits' : error.code === 'cancelled' || signal?.aborted || this.store.getRun(run.id).cancelRequested ? 'cancelled' : 'blocked';
       run.error = { code: error.code || 'error', message: redact(error.message, this.secrets), ...(error.retryAt ? { retryAt: error.retryAt } : {}) };
       this.save(run); this.log(run, run.state, run.error); return run;
-    } finally { clearInterval(heartbeat); this.store.releaseLease(token); }
+    } finally { clearInterval(heartbeat); clearInterval(cancellation); parentSignal?.removeEventListener('abort', cancel); this.store.releaseLease(token); }
   }
 }
 async function lstatSafe(filename) { try { const { lstat } = await import('node:fs/promises'); return await lstat(filename); } catch (error) { if (error.code === 'ENOENT') return null; throw error; } }

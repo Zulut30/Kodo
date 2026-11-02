@@ -72,7 +72,10 @@ async function fixture(t, { brokenCli = false } = {}) {
       assert.ok(args.includes('--match-head-commit')); assert.ok(!args.includes('--admin'));
       state.merges++; state.pr.state = 'MERGED'; await git('push', 'origin', `${headSha}:main`); return output('');
     }
-    if (args[0] === 'release' && args[1] === 'list') return output(state.release ? [{ tagName: state.release.tag, isDraft: false, isPrerelease: false }] : []);
+    if (args[0] === 'release' && args[1] === 'list') {
+      const available = state.releaseList ?? (state.release ? [{ tagName: state.release.tag, isDraft: false, isPrerelease: false }] : []);
+      return output(available.slice(0, Number(args[args.indexOf('--limit') + 1])));
+    }
     if (args[0] === 'release' && args[1] === 'create') {
       state.publishes++;
       const tag = args[2], artifact = args[3], sums = args[4];
@@ -269,11 +272,12 @@ test('Release version preparation bumps past current and latest after target adv
   assert.equal(next.version, '0.2.2'); assert.equal(ctx.leases.size, 0);
 });
 
-test('Release reconciliation uploads absent assets without replacing existing ones', async t => {
+test('Release reconciliation skips newer drafts and uploads absent assets without replacement', async t => {
   const ctx = await fixture(t);
   const delivered = await deliver(ctx);
   const release = await releasePackage({ ...ctx, mergeCommit: delivered.mergeCommit });
   delete ctx.run.delivery.release; // Simulate crash after publication, before saving its receipt.
+  ctx.state.releaseList = [{ tagName: 'v9.0.0', isDraft: true, isPrerelease: false }, { tagName: 'v0.2.0', isDraft: false, isPrerelease: false }];
   await rm(path.join(ctx.assets, 'SHA256SUMS'));
   const resumed = await releasePackage({ ...ctx, mergeCommit: delivered.mergeCommit });
   assert.equal(resumed.sha256, release.sha256); assert.equal(ctx.state.publishes, 1);

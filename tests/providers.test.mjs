@@ -139,6 +139,18 @@ test('Gemini analysis uses the configured model and rejects invented file eviden
   await assert.rejects(analyzeGemini({ task: 'test' }), error => error.code === 'auth');
 });
 
+test('Gemini research query remains optional and enforces a nonempty 250 character boundary', async () => {
+  const analyze = researchQuery => analyzeGemini({ task: 'Добавь поиск в каталоге проекта', files: [] }, { secrets, fetchImpl: async (_url, options) => {
+    assert.match(JSON.parse(options.body).contents[0].parts[0].text, /concise English search query of 4-12 technical keywords/);
+    const output = { summary: 'Relevant architecture', files: [], limitations: [], ...(researchQuery === undefined ? {} : { researchQuery }) };
+    return response({ candidates: [{ content: { parts: [{ text: JSON.stringify(output) }] } }] });
+  } });
+  assert.equal((await analyze(undefined)).researchQuery, undefined);
+  assert.equal((await analyze('  Node.js CLI  SQLite search APIs  ')).researchQuery, 'Node.js CLI SQLite search APIs');
+  assert.equal((await analyze('a'.repeat(250))).researchQuery.length, 250);
+  for (const value of ['a'.repeat(251), '', '   ', null, { query: 'sqlite' }]) await assert.rejects(analyze(value), error => error.code === 'invalid_output');
+});
+
 function jevOutput({ model = models[0].id, modelConfidence = 0.95, parallel = 'parallel', parallelConfidence = 0.95, session = 'fresh' } = {}) {
   return { model: 'jev-1.14.0', answers: { model: { type: 'choice', choice: model, confidence: modelConfidence }, execution: { type: 'choice', choice: parallel, confidence: parallelConfidence }, session: { type: 'choice', choice: session, confidence: 0.95 } } };
 }
@@ -200,4 +212,51 @@ test('Research obeys its request ceiling and a failed source does not stop remai
   const serviceErrors = await research({ task: 'sqlite', budget: 5 }, { secrets, fetchImpl: async () => response({ status: 'error', message: 'authentication required' }) });
   assert.equal(serviceErrors.errors.length, 5);
   assert.ok(serviceErrors.errors.every(error => error.code === 'auth'));
+});
+
+test('Research isolates JSON sources and retains only relevant documentation candidates', async () => {
+  const result = await research({ task: 'Node.js sqlite search APIs', budget: 5 }, { secrets, fetchImpl: async url => {
+    if (url.includes('redditapis') || url.includes('getxapi')) return response({ results: [] });
+    const query = new URL(url).searchParams.get('q');
+    if (query.includes('site:github.com')) return response({ organic_results: [
+      { link: 'https://unrelated.test/sqlite', title: 'SQLite repository mirror' },
+      { link: 'https://github.com/topics/sqlite', title: 'SQLite topics' },
+      { link: 'https://github.com/example/sqlite-library', title: 'SQLite library' },
+      { link: 'https://github.com.evil.test/example/sqlite-library', title: 'SQLite misleading host' }
+    ] });
+    if (query.includes('site:news.ycombinator.com')) return response({ organic_results: [
+      { link: 'https://ycombinator.com/companies', title: 'SQLite startup' },
+      { link: 'https://news.ycombinator.com/', title: 'Hacker News sqlite' },
+      { link: 'https://news.ycombinator.com/item?id=12345', title: 'SQLite discussion' },
+      { link: 'https://news.ycombinator.com/item?id=invalid', title: 'Invalid item' }
+    ] });
+    return response({ organic_results: [
+      { link: 'https://keetools.io/explorer/blocks', title: 'Latest blocks' },
+      { link: 'https://docs.unrelated.test/coins', title: 'Digital currencies' },
+      { link: 'https://blog.example.test/sqlite', title: 'SQLite comparison' },
+      { link: 'https://nodejs.org/api/sqlite.html', title: 'Node.js SQLite documentation' },
+      { link: 'https://docs.github.com/en/rest/search', title: 'Search API documentation' }
+    ] });
+  } });
+  assert.deepEqual(result.items.map(item => [item.source, item.url]), [
+    ['github', 'https://github.com/example/sqlite-library'],
+    ['hackernews', 'https://news.ycombinator.com/item?id=12345'],
+    ['docs', 'https://nodejs.org/api/sqlite.html'],
+    ['docs', 'https://docs.github.com/en/rest/search']
+  ]);
+  assert.ok(result.items.every(item => item.verification.startsWith('discovery only')));
+});
+
+test('Research bounds the outgoing query and filters off-source HTML links', async () => {
+  const queries = [];
+  const result = await research({ task: 'sqlite '.repeat(100), budget: 5 }, { secrets, fetchImpl: async url => {
+    const parsed = new URL(url);
+    queries.push(parsed.searchParams.get('q'));
+    if (!url.includes('scrape.do')) return response({ results: [] });
+    return response('<a href="https://unrelated.test/sqlite">Unrelated SQLite</a><a href="https://github.com/example/sqlite">SQLite repository</a><a href="https://news.ycombinator.com/item?id=99">SQLite discussion</a><a href="https://nodejs.org/api/sqlite.html">SQLite docs</a>');
+  } });
+  assert.equal(queries[0].length, 250);
+  assert.equal(queries[1].length, 250);
+  assert.ok(queries.slice(2).every(query => query.length < 280));
+  assert.deepEqual(result.items.map(item => item.source), ['github', 'hackernews', 'docs']);
 });
