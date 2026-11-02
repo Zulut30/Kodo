@@ -1,6 +1,9 @@
 name: Quality
 
-on: [push, pull_request]
+on:
+  push:
+    branches: [main]
+  pull_request:
 
 jobs:
   check:
@@ -17,3 +20,5 @@ jobs:
           node-version: ${{ matrix.node }}
       - run: npm ci --ignore-scripts
       - run: npm run check
+      - name: Verify installed CLI package
+        run: node scripts/package-smoke.mjs

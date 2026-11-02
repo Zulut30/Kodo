@@ -205,8 +205,125 @@
       "entry": "SKILL.md",
       "requires": [
         "agents/documenter",
-        "pipelines/build-feature"
+        "pipelines/build-feature",
+        "skills/architecture-patterns",
+        "skills/architecture-decision-records",
+        "skills/monorepo-management",
+        "skills/e2e-testing-patterns",
+        "skills/subagent-driven-development",
+        "skills/systematic-debugging",
+        "skills/test-driven-development",
+        "skills/using-git-worktrees",
+        "skills/differential-review",
+        "skills/react-best-practices",
+        "skills/composition-patterns",
+        "skills/ce-compound",
+        "skills/spec-kit"
       ]
+    },
+    {
+      "id": "skills/architecture-patterns",
+      "type": "skill",
+      "version": "0.2.0",
+      "description": "Стандарт Kodo architecture patterns",
+      "entry": "SKILL.md",
+      "requires": []
+    },
+    {
+      "id": "skills/architecture-decision-records",
+      "type": "skill",
+      "version": "0.2.0",
+      "description": "Стандарт Kodo architecture decision records",
+      "entry": "SKILL.md",
+      "requires": []
+    },
+    {
+      "id": "skills/monorepo-management",
+      "type": "skill",
+      "version": "0.2.0",
+      "description": "Стандарт Kodo monorepo management",
+      "entry": "SKILL.md",
+      "requires": []
+    },
+    {
+      "id": "skills/e2e-testing-patterns",
+      "type": "skill",
+      "version": "0.2.0",
+      "description": "Стандарт Kodo e2e testing patterns",
+      "entry": "SKILL.md",
+      "requires": []
+    },
+    {
+      "id": "skills/subagent-driven-development",
+      "type": "skill",
+      "version": "0.2.0",
+      "description": "Стандарт Kodo subagent driven development",
+      "entry": "SKILL.md",
+      "requires": []
+    },
+    {
+      "id": "skills/systematic-debugging",
+      "type": "skill",
+      "version": "0.2.0",
+      "description": "Стандарт Kodo systematic debugging",
+      "entry": "SKILL.md",
+      "requires": []
+    },
+    {
+      "id": "skills/test-driven-development",
+      "type": "skill",
+      "version": "0.2.0",
+      "description": "Стандарт Kodo test driven development",
+      "entry": "SKILL.md",
+      "requires": []
+    },
+    {
+      "id": "skills/using-git-worktrees",
+      "type": "skill",
+      "version": "0.2.0",
+      "description": "Стандарт Kodo using git worktrees",
+      "entry": "SKILL.md",
+      "requires": []
+    },
+    {
+      "id": "skills/differential-review",
+      "type": "skill",
+      "version": "0.2.0",
+      "description": "Стандарт Kodo differential review",
+      "entry": "SKILL.md",
+      "requires": []
+    },
+    {
+      "id": "skills/react-best-practices",
+      "type": "skill",
+      "version": "0.2.0",
+      "description": "Стандарт Kodo react best practices",
+      "entry": "SKILL.md",
+      "requires": []
+    },
+    {
+      "id": "skills/composition-patterns",
+      "type": "skill",
+      "version": "0.2.0",
+      "description": "Стандарт Kodo composition patterns",
+      "entry": "SKILL.md",
+      "requires": []
+    },
+    {
+      "id": "skills/ce-compound",
+      "type": "skill",
+      "version": "0.2.0",
+      "description": "Стандарт Kodo ce compound",
+      "entry": "SKILL.md",
+      "requires": []
+    },
+    {
+      "id": "skills/spec-kit",
+      "type": "skill",
+      "version": "0.2.0",
+      "description": "Стандарт Kodo spec kit",
+      "entry": "SKILL.md",
+      "requires": []
     }
   ]
 }
