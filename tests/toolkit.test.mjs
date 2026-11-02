@@ -29,7 +29,7 @@ async function temporary(t) {
 function run(...args) { return spawnSync(process.execPath, [cli, ...args], { encoding: 'utf8', cwd: os.tmpdir() }); }
 
 test('Catalog validates all shipped components and resolves unique dependencies before consumers', () => {
-  assert.equal(catalog.registry.components.length, 20);
+  assert.equal(catalog.registry.components.length, 33);
   const resolved = resolveComponents(catalog.registry, ['pipelines/fix-bug', 'pipelines/build-feature']);
   const ids = resolved.map(item => item.id);
   assert.equal(new Set(ids).size, ids.length);
@@ -283,7 +283,7 @@ test('CLI supports catalog queries, pipeline plans and JSON dry run from another
   const directory = await temporary(t), target = path.join(directory, 'dry-run');
   const list = run('list', 'skill', '--json');
   assert.equal(list.status, 0, list.stderr);
-  assert.deepEqual(JSON.parse(list.stdout).map(item => item.id), ['skills/code-review', 'skills/ui-audit', 'skills/bug-hunting', 'skills/seo-audit', 'skills/kodo-build-feature']);
+  assert.deepEqual(JSON.parse(list.stdout).map(item => item.id), ['skills/code-review', 'skills/ui-audit', 'skills/bug-hunting', 'skills/seo-audit', 'skills/kodo-build-feature', 'skills/architecture-patterns', 'skills/architecture-decision-records', 'skills/monorepo-management', 'skills/e2e-testing-patterns', 'skills/subagent-driven-development', 'skills/systematic-debugging', 'skills/test-driven-development', 'skills/using-git-worktrees', 'skills/differential-review', 'skills/react-best-practices', 'skills/composition-patterns', 'skills/ce-compound', 'skills/spec-kit']);
   const show = run('show', 'agents/designer', '--json');
   assert.equal(show.status, 0, show.stderr);
   assert.match(JSON.parse(show.stdout).content, /Дизайнер/);
