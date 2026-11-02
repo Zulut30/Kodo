@@ -1,0 +1,228 @@
+[
+  {
+    "id": "agent-desktop",
+    "version": "1.0.2",
+    "kind": "npm",
+    "repository": "vercel-labs/agent-desktop",
+    "revision": "060c83af4be63096de33fc22d79fb9c4d02f528e",
+    "license": "Apache-2.0",
+    "integrity": "sha512-k2Qi3f0y1U60YaJOw1dob3EO55P/DuH4HK3WKdI9sMZLjVxpGZAzuG50rIWuIqS0JIVy07g+0pp9Of2JDjTX0w==",
+    "platforms": [
+      "win32-x64",
+      "linux-x64",
+      "darwin-x64",
+      "darwin-arm64",
+      "linux-arm64",
+      "win32-arm64"
+    ],
+    "capability": "Owned desktop accessibility, semantic actions and readback; no recording"
+  },
+  {
+    "id": "browser-use",
+    "version": "0.13.14",
+    "kind": "python",
+    "group": "browser",
+    "repository": "browser-use/browser-use",
+    "revision": "b49a68e4060acb226da8f784194fef301c53a6d7",
+    "license": "MIT",
+    "spec": "browser-use==0.13.14",
+    "module": "browser_use",
+    "platforms": [
+      "win32-x64",
+      "linux-x64",
+      "darwin-x64",
+      "darwin-arm64",
+      "linux-arm64",
+      "win32-arm64"
+    ],
+    "capability": "Coordinator-owned browser agent using configured Google credentials"
+  },
+  {
+    "id": "browser-harness",
+    "version": "0.1.13",
+    "kind": "python",
+    "group": "browser",
+    "repository": "browser-use/browser-harness",
+    "revision": "6e69c7fbe97edded9934e3fb305d9af3536f941f",
+    "license": "MIT",
+    "spec": "browser-harness==0.1.13",
+    "module": "browser_harness",
+    "platforms": [
+      "win32-x64",
+      "linux-x64",
+      "darwin-x64",
+      "darwin-arm64",
+      "linux-arm64",
+      "win32-arm64"
+    ],
+    "capability": "Owned CDP browser control; isolated per-case daemon and recording off"
+  },
+  {
+    "id": "vibetest",
+    "version": "0.1.0",
+    "kind": "python",
+    "group": "browser",
+    "repository": "browser-use/vibetest-use",
+    "revision": "fe0b90ac9d6a129ce06f5b53074241a9f205015b",
+    "license": "MIT",
+    "spec": "vibetest @ git+https://github.com/browser-use/vibetest-use.git@fe0b90ac9d6a129ce06f5b53074241a9f205015b",
+    "module": "vibetest",
+    "platforms": [
+      "win32-x64",
+      "linux-x64",
+      "darwin-x64",
+      "darwin-arm64",
+      "linux-arm64",
+      "win32-arm64"
+    ],
+    "capability": "Upstream scout/QA pool via coordinator bridge; legacy MCP entry is unsupported"
+  },
+  {
+    "id": "jev-ultrafast",
+    "version": "0.1.0",
+    "kind": "python",
+    "group": "browser",
+    "repository": "browser-use/jev-ultrafast",
+    "revision": "8251e272398011cdef648965204d1c20cd838333",
+    "license": "MIT",
+    "spec": "jev-ultrafast @ git+https://github.com/browser-use/jev-ultrafast.git@8251e272398011cdef648965204d1c20cd838333",
+    "module": "jev_ultrafast",
+    "platforms": [
+      "win32-x64",
+      "linux-x64",
+      "darwin-x64",
+      "darwin-arm64",
+      "linux-arm64",
+      "win32-arm64"
+    ],
+    "capability": "TypeSafe choice agent and Google text helper in coordinator-owned browser"
+  },
+  {
+    "id": "chrome-devtools-mcp",
+    "version": "1.12.0",
+    "kind": "npm",
+    "repository": "ChromeDevTools/chrome-devtools-mcp",
+    "license": "Apache-2.0",
+    "integrity": "sha512-lAGpH0zXT1ZdaPefP1KK/MvxwihOlu7VGQ7p4wbhD9OhN17vUC4KWk/ImUYR9DE4s+7r4r0ySV4xr2OkTa7ZMA==",
+    "entry": "build/src/bin/chrome-devtools-mcp.js",
+    "platforms": [
+      "win32-x64",
+      "linux-x64",
+      "darwin-x64",
+      "darwin-arm64",
+      "linux-arm64",
+      "win32-arm64"
+    ],
+    "capability": "Real MCP stdio for an owned Chrome endpoint; telemetry disabled"
+  },
+  {
+    "id": "semgrep",
+    "version": "1.183.0",
+    "kind": "python",
+    "group": "semgrep",
+    "repository": "semgrep/semgrep",
+    "license": "LGPL-2.1-or-later",
+    "licenseSource": "https://raw.githubusercontent.com/semgrep/semgrep/v1.183.0/LICENSE",
+    "spec": "semgrep==1.183.0",
+    "module": "semgrep",
+    "platforms": [
+      "win32-x64",
+      "linux-x64",
+      "darwin-arm64",
+      "linux-arm64"
+    ],
+    "capability": "Local configured rules; metrics/version checks off; no remote rule registry"
+  },
+  {
+    "id": "gitleaks",
+    "version": "8.30.1",
+    "kind": "native",
+    "repository": "gitleaks/gitleaks",
+    "license": "MIT",
+    "capability": "Local redacted secret scanning; findings are failures",
+    "assets": {
+      "win32-x64": {
+        "url": "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_windows_x64.zip",
+        "sha256": "d29144deff3a68aa93ced33dddf84b7fdc26070add4aa0f4513094c8332afc4e",
+        "format": "zip",
+        "executable": "gitleaks.exe"
+      },
+      "linux-x64": {
+        "url": "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz",
+        "sha256": "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb",
+        "format": "tar.gz",
+        "executable": "gitleaks"
+      },
+      "darwin-x64": {
+        "url": "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_darwin_x64.tar.gz",
+        "sha256": "dfe101a4db2255fc85120ac7f3d25e4342c3c20cf749f2c20a18081af1952709",
+        "format": "tar.gz",
+        "executable": "gitleaks"
+      },
+      "darwin-arm64": {
+        "url": "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_darwin_arm64.tar.gz",
+        "sha256": "b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5",
+        "format": "tar.gz",
+        "executable": "gitleaks"
+      },
+      "linux-arm64": {
+        "url": "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_arm64.tar.gz",
+        "sha256": "e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080",
+        "format": "tar.gz",
+        "executable": "gitleaks"
+      },
+      "win32-arm64": {
+        "url": "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_windows_arm64.zip",
+        "sha256": "b95f5e4f5c425cedca7ee203d9afd29597e692c4924a12ed42f970537c72cc0f",
+        "format": "zip",
+        "executable": "gitleaks.exe"
+      }
+    }
+  },
+  {
+    "id": "ripgrep",
+    "version": "15.2.0",
+    "kind": "native",
+    "repository": "BurntSushi/ripgrep",
+    "license": "MIT OR Unlicense",
+    "capability": "Default code search with rg, explicit paths/globs and bounded output",
+    "assets": {
+      "win32-x64": {
+        "url": "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-x86_64-pc-windows-msvc.zip",
+        "sha256": "71b2fef860abe467217a538ff31de02f5258807c0129f771846f87bd029aafc5",
+        "format": "zip",
+        "executable": "ripgrep-15.2.0-x86_64-pc-windows-msvc/rg.exe"
+      },
+      "linux-x64": {
+        "url": "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-x86_64-unknown-linux-musl.tar.gz",
+        "sha256": "33e15bcf1624b25cdd2a55813a47a2f95dbe126268203e76aa6a585d1e7b149c",
+        "format": "tar.gz",
+        "executable": "ripgrep-15.2.0-x86_64-unknown-linux-musl/rg"
+      },
+      "darwin-x64": {
+        "url": "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-x86_64-apple-darwin.tar.gz",
+        "sha256": "af7825fcc69a2afc7a7aea55fc9af90e26421d8f20fe59df32e233c0b8a231c1",
+        "format": "tar.gz",
+        "executable": "ripgrep-15.2.0-x86_64-apple-darwin/rg"
+      },
+      "darwin-arm64": {
+        "url": "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-aarch64-apple-darwin.tar.gz",
+        "sha256": "3750b2e93f37e0c692657da574d7019a101c0084da05a790c83fd335bad973e4",
+        "format": "tar.gz",
+        "executable": "ripgrep-15.2.0-aarch64-apple-darwin/rg"
+      },
+      "linux-arm64": {
+        "url": "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-aarch64-unknown-linux-gnu.tar.gz",
+        "sha256": "a740b91c82eaf9914cfedd353572f2791cbe0162c84101ee0951058f4dcbc90d",
+        "format": "tar.gz",
+        "executable": "ripgrep-15.2.0-aarch64-unknown-linux-gnu/rg"
+      },
+      "win32-arm64": {
+        "url": "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-aarch64-pc-windows-msvc.zip",
+        "sha256": "e4abca10c3a64ebea742667dd7009449d49403db5460dd6873e389fa2945360f",
+        "format": "zip",
+        "executable": "ripgrep-15.2.0-aarch64-pc-windows-msvc/rg.exe"
+      }
+    }
+  }
+]
