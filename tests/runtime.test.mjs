@@ -30,7 +30,7 @@ test('Subscription leases cap concurrent sessions and expire without stealing ac
   const expired = store.acquireLease('expired', 'owner', { ttlMs: -1 }); assert.ok(expired); assert.ok(store.acquireLease('expired', 'next')); assert.equal(store.renewLease(expired), false);
 });
 test('Worker environment removes all provider secrets and endpoint overrides', () => {
-  const env = workerEnvironment({ PATH: 'allowed', GEMINI_API_KEY: 'private', TYPESAFE_API_KEY: 'private', SCRAPEDO_TOKEN: 'private', GETX_API_KEY: 'private', REDDIT_API_KEY: 'private', GH_TOKEN: 'private', OPENAI_API_KEY: 'private', ANTHROPIC_API_KEY: 'private', OPENAI_BASE_URL: 'private', ANTHROPIC_BASE_URL: 'private' });
+  const env = workerEnvironment({ PATH: 'allowed', GEMINI_API_KEY: 'private', TYPESAFE_API_KEY: 'private', SCRAPEDO_TOKEN: 'private', GETX_API_KEY: 'private', REDDIT_API_KEY: 'private', GH_TOKEN: 'private', OPENAI_API_KEY: 'private', ANTHROPIC_API_KEY: 'private', OPENAI_BASE_URL: 'private', ANTHROPIC_BASE_URL: 'private', NPM_TOKEN: 'private', AWS_SECRET_ACCESS_KEY: 'private', AWS_SESSION_TOKEN: 'private', DATABASE_URL: 'private', DB_PASSWORD: 'private', KODO_OTHER: 'private', CODEX_APP_TOOLS_PIPE_PATH: 'parent' });
   assert.deepEqual(env, { PATH: 'allowed' }); assert.equal(redact('https://example.test/?token=private&x=1 Bearer abcdefgh123'), 'https://example.test/?token=[REDACTED]&x=1 Bearer [REDACTED]');
 });
 test('Plan contracts reject malformed graphs and forbidden scopes while overlap stays conservative', () => {
@@ -57,6 +57,9 @@ test('Legacy migration preserves managed content and refuses modified user files
 test('Config initialization never overwrites a project and rejects unsafe execution settings', async t => {
   const root = await temp(t); await initConfig(root); await assert.rejects(initConfig(root), { code: 'EEXIST' });
   assert.equal((await readConfig(root)).concurrency, 2);
+  await writeFile(path.join(root, 'kodo.config.json'), JSON.stringify({ schemaVersion: 1, client: 'codex', primaryModel: 'gpt-6.1-sol' }));
+  assert.equal((await readConfig(root, { client: 'claude-code' })).primaryModel, null);
+  assert.equal((await readConfig(root, { client: 'claude-code', primaryModel: 'opus' })).primaryModel, 'opus');
   await writeFile(path.join(root, 'kodo.config.json'), JSON.stringify({ schemaVersion: 1, concurrency: 3 })); await assert.rejects(readConfig(root), /конфигурация/);
   await writeFile(path.join(root, 'kodo.config.json'), JSON.stringify({ schemaVersion: 1, commands: { test: [{ command: 'npm', args: [17] }] } })); await assert.rejects(readConfig(root), /команды/);
 });

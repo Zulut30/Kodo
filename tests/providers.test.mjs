@@ -1,7 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { runProcess, redact, subscriptionEnvironment } from '../runtime/process.mjs';
-import { ProviderError, requestJson, subscriptionStatus, sessionInvocation, parseSessionEvents, runSession, discoverProviders, analyzeGemini, decideJev, classifyProviderFailure } from '../runtime/providers.mjs';
+import { runProcess, redact, subscriptionEnvironment, codexIsolationOverrides } from '../runtime/process.mjs';
+import { ProviderError, requestJson, subscriptionStatus, sessionInvocation, parseSessionEvents, runSession, discoverProviders, analyzeGemini, decideJev, classifyProviderFailure, providerSchema } from '../runtime/providers.mjs';
+import { readFile, mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import { research } from '../runtime/research.mjs';
 
 const secrets = { GEMINI_API_KEY: 'test-gemini-secret-123', TYPESAFE_API_KEY: 'test-jev-secret-123', SCRAPEDO_TOKEN: 'test-scrape-secret-123', REDDIT_API_KEY: 'test-reddit-secret-123', GETX_API_KEY: 'test-x-secret-123' };
@@ -11,9 +14,10 @@ const models = [{ id: 'codex:gpt-6.1-sol', client: 'codex', model: 'gpt-6.1-sol'
 const codexEvents = [ { type: 'thread.started', thread_id: 'session-1' }, { type: 'item.completed', item: { type: 'agent_message', text: '{"ok":true}' } }, { type: 'turn.completed', usage: { input_tokens: 10, output_tokens: 3 } } ];
 
 test('Worker environment strips provider secrets and API overrides while preserving ordinary variables', () => {
-  const environment = subscriptionEnvironment({ ...secrets, OPENAI_API_KEY: 'api-secret', ANTHROPIC_AUTH_TOKEN: 'oauth-secret', OPENAI_BASE_URL: 'https://other.example', ANTHROPIC_BASE_URL: 'https://other.example', GH_TOKEN: 'github-secret', KODO_HOME: '/private/state', CLAUDECODE: '1', KODO_PLAIN: 'state', ordinary: 'keep' });
-  for (const name of [...Object.keys(secrets), 'OPENAI_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'OPENAI_BASE_URL', 'ANTHROPIC_BASE_URL', 'GH_TOKEN', 'KODO_HOME', 'CLAUDECODE', 'KODO_PLAIN']) assert.equal(environment[name], undefined, name);
+  const environment = subscriptionEnvironment({ ...secrets, OPENAI_API_KEY: 'api-secret', ANTHROPIC_AUTH_TOKEN: 'oauth-secret', OPENAI_BASE_URL: 'https://other.example', ANTHROPIC_BASE_URL: 'https://other.example', GH_TOKEN: 'github-secret', KODO_HOME: '/private/state', CLAUDECODE: '1', KODO_PLAIN: 'state', CODEX_APP_TOOLS_PIPE_PATH: 'parent-tools-pipe', CODEX_SESSION_ID: 'parent-session', CODEX_PERMISSION_PROFILE: 'parent-profile', CODEX_HOME: '/subscription-home', ordinary: 'keep' });
+  for (const name of [...Object.keys(secrets), 'OPENAI_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'OPENAI_BASE_URL', 'ANTHROPIC_BASE_URL', 'GH_TOKEN', 'KODO_HOME', 'CLAUDECODE', 'KODO_PLAIN', 'CODEX_APP_TOOLS_PIPE_PATH', 'CODEX_SESSION_ID', 'CODEX_PERMISSION_PROFILE']) assert.equal(environment[name], undefined, name);
   assert.equal(environment.ordinary, 'keep');
+  assert.equal(environment.CODEX_HOME, '/subscription-home');
 });
 
 test('Redaction removes known credentials, bearer headers and Scrape token URLs', () => {
@@ -55,10 +59,15 @@ test('Subscription checks accept subscription auth and reject API auth without a
 test('Client invocation uses exact session IDs, subscription mode and genuinely read-only reviewers', () => {
   const fresh = sessionInvocation({ client: 'codex', model: 'gpt-6.1-sol', cwd: '/project', readOnly: true, schemaPath: '/schema.json' });
   assert.ok(fresh.args.includes('read-only'));
+  assert.ok(fresh.args.includes('--no-daemon'));
+  assert.ok(fresh.args.includes('sandbox_mode="read-only"'));
+  assert.ok(sessionInvocation({ client: 'codex', cwd: '/project' }).args.includes('sandbox_mode="workspace-write"'));
   assert.ok(fresh.args.includes('forced_login_method="chatgpt"'));
   assert.equal(fresh.args.at(-1), '-');
   const resumed = sessionInvocation({ client: 'codex', sessionId: 'exact-session', cwd: '/project' });
-  assert.deepEqual(resumed.args.slice(4), ['exec', 'resume', 'exact-session', '--json', '--ignore-user-config', '-']);
+  assert.deepEqual(resumed.args.slice(resumed.args.indexOf('exec')), ['exec', 'resume', 'exact-session', '--json', '-']);
+  assert.equal(fresh.args.includes('--ignore-user-config'), false);
+  if (process.platform === 'win32') assert.ok(fresh.args.includes('windows.sandbox="elevated"'));
   assert.equal(resumed.args.includes('--last'), false);
   assert.throws(() => sessionInvocation({ client: 'codex', readOnly: true, sessionId: 'prior-write-session' }), error => error.code === 'invalid_output');
   const claude = sessionInvocation({ client: 'claude-code', readOnly: true, schema });
@@ -67,6 +76,29 @@ test('Client invocation uses exact session IDs, subscription mode and genuinely 
   assert.equal(claude.args.includes('--bare'), false);
   assert.match(claude.sessionId, /^[a-f0-9-]{36}$/);
   assert.throws(() => sessionInvocation({ client: 'unknown' }), error => error.code === 'unavailable');
+});
+
+test('Codex isolation overrides disable configured MCPs and plugins without rewriting user files', async t => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'kodo-isolation-test-'));
+  t.after(async () => {
+    assert.equal(path.dirname(path.resolve(directory)), path.resolve(os.tmpdir()));
+    assert.ok(path.basename(directory).startsWith('kodo-isolation-test-'));
+    await rm(directory, { recursive: true, force: true });
+  });
+  const home = path.join(directory, 'home'), project = path.join(directory, 'project');
+  await mkdir(home); await mkdir(path.join(project, '.codex'), { recursive: true }); await mkdir(path.join(project, '.git'));
+  const userConfig = '[windows]\nsandbox="elevated"\n[mcp_servers."source.with.dot"]\ncommand="some-client"\n[plugins."some-plugin@market"]\nenabled=true\n';
+  const projectConfig = '[mcp_servers.project]\ncommand="project-server"\n';
+  await writeFile(path.join(home, 'config.toml'), userConfig);
+  await writeFile(path.join(project, '.codex/config.toml'), projectConfig);
+  const args = await codexIsolationOverrides(project, { CODEX_HOME: home });
+  assert.ok(args.includes('mcp_servers."source.with.dot".enabled=false'));
+  assert.ok(args.includes('mcp_servers."project".enabled=false'));
+  assert.ok(args.includes('plugins."some-plugin@market".enabled=false'));
+  assert.ok(args.includes('notify=[]'));
+  assert.equal(args.some(value => value.includes('sandbox_mode')), false);
+  assert.equal(await readFile(path.join(home, 'config.toml'), 'utf8'), userConfig);
+  assert.equal(await readFile(path.join(project, '.codex/config.toml'), 'utf8'), projectConfig);
 });
 
 test('Provider event parser requires completion, exact output contract and session identity', () => {
@@ -98,6 +130,26 @@ test('Session adapter emits identity before completion and never streams tool pa
   assert.equal(JSON.stringify(streamed).includes(secrets.GEMINI_API_KEY), false);
   assert.equal(invocations[1].input, 'literal prompt with $() &');
   assert.equal(invocations[1].env.GEMINI_API_KEY, undefined);
+});
+
+test('Provider schema normalization removes unsupported uniqueness only from wire schemas', async () => {
+  const original = { type: 'object', properties: { dependsOn: { type: 'array', items: { type: 'string' }, uniqueItems: true }, uniqueItems: { type: 'string' }, literal: { const: { uniqueItems: true } } }, required: ['dependsOn', 'uniqueItems', 'literal'], additionalProperties: false };
+  const normalized = providerSchema(original);
+  assert.equal(normalized.properties.dependsOn.uniqueItems, undefined);
+  assert.deepEqual(normalized.properties.uniqueItems, { type: 'string' });
+  assert.deepEqual(normalized.properties.literal.const, { uniqueItems: true });
+  assert.equal(original.properties.dependsOn.uniqueItems, true);
+  let observedWireSchema;
+  await assert.rejects(runSession({ client: 'codex', model: 'gpt-6.1-sol', cwd: process.cwd(), prompt: 'Return a dependency list', schema: original, readOnly: true }, {
+    resolveClientImpl: async () => ({ command: 'fixture', args: [] }),
+    processImpl: async invocation => {
+      if (invocation.args.includes('status')) return { exitCode: 0, stdout: 'Logged in using ChatGPT', stderr: '' };
+      observedWireSchema = JSON.parse(await readFile(invocation.args[invocation.args.indexOf('--output-schema') + 1], 'utf8'));
+      for (const event of [{ type: 'thread.started', thread_id: 'schema-session' }, { type: 'item.completed', item: { type: 'agent_message', text: JSON.stringify({ dependsOn: ['task-a', 'task-a'], uniqueItems: 'ordinary property', literal: { uniqueItems: true } }) } }, { type: 'turn.completed' }]) invocation.onLine(JSON.stringify(event));
+      return { exitCode: 0, stdout: '', stderr: '' };
+    }
+  }), error => error.code === 'invalid_output' && /duplicate/.test(error.message));
+  assert.equal(observedWireSchema.properties.dependsOn.uniqueItems, undefined);
 });
 
 test('Discovery keeps providers isolated by default and excludes unavailable models after live checks', async () => {

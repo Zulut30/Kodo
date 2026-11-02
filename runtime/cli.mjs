@@ -5,10 +5,13 @@ import { Store } from './store.mjs';
 import { doctorProviders } from './providers.mjs';
 import { openEngine } from './engine.mjs';
 import { migrate } from './migration.mjs';
+import { fileURLToPath } from 'node:url';
+import { loadCatalog } from '../cli/catalog.mjs';
+import { planInstallation, applyInstallation } from '../cli/installer.mjs';
 
 export async function runtimeCli(command, args) {
   const options = { positional: [] };
-  const flags = new Set(['--json', '--live', '--prepare']);
+  const flags = new Set(['--json', '--live', '--prepare', '--retry-failed']);
   const values = new Set(['--project', '--client', '--model', '--providers', '--plan', '--delivery', '--target']);
   for (let index = 0; index < args.length; index++) {
     const arg = args[index];
@@ -18,13 +21,23 @@ export async function runtimeCli(command, args) {
     else options.positional.push(arg);
   }
   const allowed = {
-    init: ['json','project','target'], doctor: ['json','live','project','client'], run: ['json','prepare','project','client','model','providers','plan','delivery'],
-    resume: ['json','plan'], status: ['json'], logs: ['json'], cancel: ['json'], migrate: ['json','target']
+    init: ['json','project','target','client'], doctor: ['json','live','project','client'], run: ['json','prepare','project','client','model','providers','plan','delivery'],
+    resume: ['json','plan','retry-failed'], status: ['json'], logs: ['json'], cancel: ['json'], migrate: ['json','target']
   }[command];
   for (const key of Object.keys(options)) if (key !== 'positional' && !allowed?.includes(key)) throw new Error(`Параметр ${key} неприменим к ${command}`);
   const print = value => console.log(JSON.stringify(value, null, options.json ? 0 : 2));
   const project = path.resolve(options.project || options.target || process.cwd());
-  if (command === 'init') { if (options.positional.length) throw new Error('init не принимает задачу'); print(await initConfig(project)); return; }
+  if (command === 'init') {
+    if (options.positional.length) throw new Error('init не принимает задачу');
+    const catalog = await loadCatalog(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'));
+    const installation = await planInstallation(catalog, ['skills/kodo-build-feature'], [options.client || 'all'], project);
+    const config = await readConfig(project);
+    await applyInstallation(installation);
+    let created = true;
+    try { await initConfig(project, options.client && options.client !== 'all' && options.client !== 'opencode' ? { client: options.client } : {}); }
+    catch (error) { if (error.code !== 'EEXIST') throw error; created = false; }
+    print({ project, configCreated: created, config: created ? await readConfig(project) : config, clients: installation.clients, components: installation.components }); return;
+  }
   if (command === 'migrate') { print(await migrate(project)); return; }
   const secrets = await loadSecrets();
   if (command === 'doctor') {
@@ -46,7 +59,15 @@ export async function runtimeCli(command, args) {
       let run;
       if (command === 'run') { if (options.positional.length !== 1) throw new Error('run требует одно описание задачи в кавычках'); run = await engine.create(id, { ...options, project }); }
       else run = store.getRun(id);
-      const result = await engine.run(run.id, { prepare: options.prepare, planFile: options.plan, signal: controller.signal });
+      let result = await engine.run(run.id, { prepare: options.prepare, planFile: options.plan, signal: controller.signal, resumeCancelled: command === 'resume', retryFailed: Boolean(options['retry-failed']) });
+      while (result.state === 'waiting_limits' && !controller.signal.aborted) {
+        const parsed = Date.parse(result.error?.retryAt || '');
+        const nextRetry = Number.isFinite(parsed) && parsed > Date.now() ? parsed : Date.now() + 15 * 60 * 1000;
+        store.updateRun(run.id, { nextRetryAt: new Date(nextRetry).toISOString() });
+        if (!options.json) process.stderr.write(`waiting_limits: повтор ${new Date(nextRetry).toISOString()}\n`);
+        while (Date.now() < nextRetry && !controller.signal.aborted && !store.getRun(run.id).cancelRequested) await new Promise(resolve => setTimeout(resolve, Math.min(1000, nextRetry - Date.now())));
+        result = await engine.run(run.id, { signal: controller.signal });
+      }
       print(redact(result, secrets)); if (!['succeeded', 'awaiting_plan'].includes(result.state)) process.exitCode = 2;
     } finally { process.removeListener('SIGINT', abort); process.removeListener('SIGTERM', abort); }
   } finally { store.close(); }

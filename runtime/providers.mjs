@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import Ajv from 'ajv';
-import { resolveClient, runProcess, readCodexModelCache, subscriptionEnvironment, redact } from './process.mjs';
+import { resolveClient, runProcess, readCodexModelCache, subscriptionEnvironment, redact, codexIsolationOverrides } from './process.mjs';
 
 export class ProviderError extends Error {
   constructor(message, code = 'unavailable', retryAt) { super(message); this.name = 'ProviderError'; this.code = code; if (retryAt) this.retryAt = retryAt; }
@@ -109,12 +109,40 @@ export async function discoverProviders({ client = 'codex', providers = 'current
   return result;
 }
 
+export function providerSchema(schema) {
+  const schemaMaps = new Set(['properties', 'patternProperties', '$defs', 'definitions', 'dependentSchemas']);
+  const schemaLists = new Set(['allOf', 'anyOf', 'oneOf', 'prefixItems']);
+  const schemaChildren = new Set(['items', 'additionalProperties', 'contains', 'if', 'then', 'else', 'not', 'propertyNames', 'unevaluatedProperties', 'unevaluatedItems', 'contentSchema']);
+  function normalize(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return structuredClone(value);
+    const result = {};
+    for (const [key, item] of Object.entries(value)) {
+      // Vendor strict output does not accept uniqueItems. Local Ajv validation
+      // still uses the original schema and remains responsible for uniqueness.
+      if (key === 'uniqueItems') continue;
+      if (schemaMaps.has(key) && item && typeof item === 'object') result[key] = Object.fromEntries(Object.entries(item).map(([name, child]) => [name, normalize(child)]));
+      else if (schemaLists.has(key) && Array.isArray(item)) result[key] = item.map(normalize);
+      else if (schemaChildren.has(key) && item && typeof item === 'object') result[key] = Array.isArray(item) ? item.map(normalize) : normalize(item);
+      else result[key] = structuredClone(item);
+    }
+    return result;
+  }
+  return normalize(schema);
+}
+
 export function sessionInvocation({ client, model, cwd, schemaPath, schema, sessionId, readOnly = false }) {
   if (readOnly && sessionId && client === 'codex') throw new ProviderError('Ревью Codex требует новую сессию с read-only sandbox', 'invalid_output');
   if (client === 'codex') {
-    const args = ['--ask-for-approval', 'never', '-c', 'forced_login_method="chatgpt"'];
-    if (sessionId) args.push('exec', 'resume', sessionId, '--json', '--ignore-user-config');
-    else args.push('exec', '--json', '--ignore-user-config', '--sandbox', readOnly ? 'read-only' : 'workspace-write', '--cd', cwd, '-c', 'sandbox_workspace_write.network_access=true');
+    // Dedicated local app-server: shared daemon sessions can retain an earlier
+    // effective permission profile and must not be reused across worker roles.
+    const args = ['--no-daemon', '--ask-for-approval', 'never', '-c', 'forced_login_method="chatgpt"', '-c', `sandbox_mode="${readOnly ? 'read-only' : 'workspace-write'}"`];
+    // Keep the supported native Windows backend explicit. Do not use exec's
+    // --ignore-user-config here: CLI 0.163 downgraded workspace-write requests
+    // to read-only with that option. Disable unrelated MCP/plugins via ordinary
+    // per-invocation config overrides instead; global user files stay untouched.
+    if (process.platform === 'win32') args.push('-c', 'windows.sandbox="elevated"');
+    if (sessionId) args.push('exec', 'resume', sessionId, '--json');
+    else args.push('exec', '--json', '--sandbox', readOnly ? 'read-only' : 'workspace-write', '--cd', cwd, '-c', 'sandbox_workspace_write.network_access=true');
     if (model) args.push('--model', model);
     if (schemaPath) args.push('--output-schema', schemaPath);
     args.push('-');
@@ -123,7 +151,7 @@ export function sessionInvocation({ client, model, cwd, schemaPath, schema, sess
   if (client === 'claude-code') {
     const args = ['-p', '--output-format', 'stream-json', '--verbose', '--permission-mode', 'bypassPermissions', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}', '--tools', readOnly ? 'Read,Glob,Grep' : 'Read,Glob,Grep,Edit,Write,Bash'];
     if (model) args.push('--model', model);
-    if (schema) args.push('--json-schema', JSON.stringify(schema));
+    if (schema) args.push('--json-schema', JSON.stringify(providerSchema(schema)));
     if (sessionId) args.push('--resume', sessionId);
     else { sessionId = randomUUID(); args.push('--session-id', sessionId); }
     return { args, sessionId };
@@ -168,8 +196,9 @@ export async function runSession({ client, model, cwd, prompt, schema, sessionId
   const directory = await mkdtemp(path.join(os.tmpdir(), 'kodo-provider-'));
   try {
     const schemaPath = schema ? path.join(directory, 'output.schema.json') : undefined;
-    if (schema) await writeFile(schemaPath, JSON.stringify(schema), { mode: 0o600 });
+    if (schema) await writeFile(schemaPath, JSON.stringify(providerSchema(schema)), { mode: 0o600 });
     const invocation = sessionInvocation({ client, model, cwd, schemaPath, schema, sessionId, readOnly });
+    if (client === 'codex') invocation.args.splice(invocation.args.indexOf('exec'), 0, ...await codexIsolationOverrides(cwd, environment));
     const events = [];
     const result = await processImpl({ ...executable, args: [...executable.args, ...invocation.args], cwd, input: prompt, env: environment, signal, timeoutMs, onLine: line => {
       if (!line.trim()) return;

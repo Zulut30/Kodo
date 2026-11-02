@@ -22,7 +22,7 @@ export async function makeWorktree(project, directory, branch, base) {
 export async function collectFiles(cwd, task, secrets = {}) {
   const names = (await git(cwd, ['ls-files', '-z'])).split('\0').filter(Boolean);
   const terms = task.toLowerCase().split(/\W+/).filter(word => word.length > 3);
-  const eligible = names.filter(name => !secretFile(name) && !/(^|\/)(node_modules|dist|build|coverage|\.git|vendor)\//.test(name) && !/(lock\.json|lock\.yaml|\.lock)$/.test(name));
+  const eligible = names.filter(name => !secretFile(name) && !/(^|\/)(node_modules|dist|build|coverage|\.git|vendor)\//.test(name) && !/^skills\/[^/]+\/references\/upstream\//.test(name) && !/(lock\.json|lock\.yaml|\.lock)$/.test(name));
   eligible.sort((a, b) => score(b) - score(a) || a.localeCompare(b));
   function score(name) { return (/(package\.json|README|AGENTS|kodo.config)/.test(name) ? 20 : 0) + terms.filter(term => name.toLowerCase().includes(term)).length * 5; }
   const files = []; let size = 0;

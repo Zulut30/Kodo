@@ -1,0 +1,1299 @@
+{
+  "schemaVersion": 1,
+  "retrievedAt": "2026-11-02",
+  "components": [
+    {
+      "id": "skills/architecture-patterns",
+      "repository": "https://github.com/wshobson/agents",
+      "revision": "7e2fb559cf4b824b27f1fec49fe88f7511066d26",
+      "upstreamPath": "plugins/backend-development/skills/architecture-patterns",
+      "license": {
+        "spdx": "MIT",
+        "sourcePath": "LICENSE",
+        "url": "https://github.com/wshobson/agents/blob/7e2fb559cf4b824b27f1fec49fe88f7511066d26/LICENSE",
+        "localPath": "skills/architecture-patterns/references/upstream/LICENSE.upstream"
+      },
+      "files": [
+        {
+          "path": "skills/architecture-patterns/references/upstream/LICENSE.upstream",
+          "upstreamPath": "LICENSE",
+          "sha256": "f89abb55d9f073f38f1703e4518f0613c788c6174be7f13b8dfe48a1c076c746",
+          "bytes": 1068
+        },
+        {
+          "path": "skills/architecture-patterns/references/upstream/SKILL.md.original",
+          "upstreamPath": "plugins/backend-development/skills/architecture-patterns/SKILL.md",
+          "sha256": "350caf22b856b7d2908a10a69a8cc13e743c757ba9838716051b4e29fc1d7595",
+          "bytes": 7942
+        },
+        {
+          "path": "skills/architecture-patterns/references/upstream/references/advanced-patterns.md",
+          "upstreamPath": "plugins/backend-development/skills/architecture-patterns/references/advanced-patterns.md",
+          "sha256": "a3513435c141f177ae6603697e1fbbaeec404943ea89dab14c6b76a0b51b03e3",
+          "bytes": 15592
+        },
+        {
+          "path": "skills/architecture-patterns/references/upstream/references/details.md",
+          "upstreamPath": "plugins/backend-development/skills/architecture-patterns/references/details.md",
+          "sha256": "a53411600b253b343247db9d86140f3136ee7bd26a67aa8411962bcc1f5ff981",
+          "bytes": 10993
+        }
+      ],
+      "entryPoint": "skills/architecture-patterns/references/upstream/SKILL.md.original"
+    },
+    {
+      "id": "skills/architecture-decision-records",
+      "repository": "https://github.com/wshobson/agents",
+      "revision": "7e2fb559cf4b824b27f1fec49fe88f7511066d26",
+      "upstreamPath": "plugins/documentation-generation/skills/architecture-decision-records",
+      "license": {
+        "spdx": "MIT",
+        "sourcePath": "LICENSE",
+        "url": "https://github.com/wshobson/agents/blob/7e2fb559cf4b824b27f1fec49fe88f7511066d26/LICENSE",
+        "localPath": "skills/architecture-decision-records/references/upstream/LICENSE.upstream"
+      },
+      "files": [
+        {
+          "path": "skills/architecture-decision-records/references/upstream/LICENSE.upstream",
+          "upstreamPath": "LICENSE",
+          "sha256": "f89abb55d9f073f38f1703e4518f0613c788c6174be7f13b8dfe48a1c076c746",
+          "bytes": 1068
+        },
+        {
+          "path": "skills/architecture-decision-records/references/upstream/SKILL.md.original",
+          "upstreamPath": "plugins/documentation-generation/skills/architecture-decision-records/SKILL.md",
+          "sha256": "79059f17da8b20cdf27327f6de0ea005c73c2c442f48f70688abca4c77cb6f8f",
+          "bytes": 5048
+        },
+        {
+          "path": "skills/architecture-decision-records/references/upstream/references/decision-templates.md",
+          "upstreamPath": "plugins/documentation-generation/skills/architecture-decision-records/references/decision-templates.md",
+          "sha256": "22cf12aafcad223597451c91c8590f325aad8f1a7c83c1c0690dbfef151f5823",
+          "bytes": 5112
+        },
+        {
+          "path": "skills/architecture-decision-records/references/upstream/references/deprecation-rfc-templates.md",
+          "upstreamPath": "plugins/documentation-generation/skills/architecture-decision-records/references/deprecation-rfc-templates.md",
+          "sha256": "942320bdb31f835ffa4eacf009dae4857472056754dbc9478062c9c82d19741d",
+          "bytes": 3435
+        }
+      ],
+      "entryPoint": "skills/architecture-decision-records/references/upstream/SKILL.md.original"
+    },
+    {
+      "id": "skills/monorepo-management",
+      "repository": "https://github.com/wshobson/agents",
+      "revision": "7e2fb559cf4b824b27f1fec49fe88f7511066d26",
+      "upstreamPath": "plugins/developer-essentials/skills/monorepo-management",
+      "license": {
+        "spdx": "MIT",
+        "sourcePath": "LICENSE",
+        "url": "https://github.com/wshobson/agents/blob/7e2fb559cf4b824b27f1fec49fe88f7511066d26/LICENSE",
+        "localPath": "skills/monorepo-management/references/upstream/LICENSE.upstream"
+      },
+      "files": [
+        {
+          "path": "skills/monorepo-management/references/upstream/LICENSE.upstream",
+          "upstreamPath": "LICENSE",
+          "sha256": "f89abb55d9f073f38f1703e4518f0613c788c6174be7f13b8dfe48a1c076c746",
+          "bytes": 1068
+        },
+        {
+          "path": "skills/monorepo-management/references/upstream/SKILL.md.original",
+          "upstreamPath": "plugins/developer-essentials/skills/monorepo-management/SKILL.md",
+          "sha256": "002666511709bbc0d1dc1eadf321aa7607487bb372079741cbfe294c19f72e60",
+          "bytes": 5376
+        },
+        {
+          "path": "skills/monorepo-management/references/upstream/references/details.md",
+          "upstreamPath": "plugins/developer-essentials/skills/monorepo-management/references/details.md",
+          "sha256": "ef9576ace2d6d38ded18af01f5bf7aaaacabd0919f3edaa09589072de342b70d",
+          "bytes": 7752
+        }
+      ],
+      "entryPoint": "skills/monorepo-management/references/upstream/SKILL.md.original"
+    },
+    {
+      "id": "skills/e2e-testing-patterns",
+      "repository": "https://github.com/wshobson/agents",
+      "revision": "7e2fb559cf4b824b27f1fec49fe88f7511066d26",
+      "upstreamPath": "plugins/developer-essentials/skills/e2e-testing-patterns",
+      "license": {
+        "spdx": "MIT",
+        "sourcePath": "LICENSE",
+        "url": "https://github.com/wshobson/agents/blob/7e2fb559cf4b824b27f1fec49fe88f7511066d26/LICENSE",
+        "localPath": "skills/e2e-testing-patterns/references/upstream/LICENSE.upstream"
+      },
+      "files": [
+        {
+          "path": "skills/e2e-testing-patterns/references/upstream/LICENSE.upstream",
+          "upstreamPath": "LICENSE",
+          "sha256": "f89abb55d9f073f38f1703e4518f0613c788c6174be7f13b8dfe48a1c076c746",
+          "bytes": 1068
+        },
+        {
+          "path": "skills/e2e-testing-patterns/references/upstream/SKILL.md.original",
+          "upstreamPath": "plugins/developer-essentials/skills/e2e-testing-patterns/SKILL.md",
+          "sha256": "b59a3d80c852f41bb73d6941410cd0fc98bbdb63a61d2ed0da2415f8dde0e1c7",
+          "bytes": 4231
+        },
+        {
+          "path": "skills/e2e-testing-patterns/references/upstream/references/details.md",
+          "upstreamPath": "plugins/developer-essentials/skills/e2e-testing-patterns/references/details.md",
+          "sha256": "1b46db6aafff0bdacadfcba48d3c834a0a590e500f28fb6b89bf7f4339267808",
+          "bytes": 10300
+        }
+      ],
+      "entryPoint": "skills/e2e-testing-patterns/references/upstream/SKILL.md.original"
+    },
+    {
+      "id": "skills/subagent-driven-development",
+      "repository": "https://github.com/obra/superpowers",
+      "revision": "2ce8aa15d05bd57213e6f746f953aafb7ded7a8b",
+      "upstreamPath": "skills/subagent-driven-development",
+      "license": {
+        "spdx": "MIT",
+        "sourcePath": "LICENSE",
+        "url": "https://github.com/obra/superpowers/blob/2ce8aa15d05bd57213e6f746f953aafb7ded7a8b/LICENSE",
+        "localPath": "skills/subagent-driven-development/references/upstream/LICENSE.upstream"
+      },
+      "files": [
+        {
+          "path": "skills/subagent-driven-development/references/upstream/LICENSE.upstream",
+          "upstreamPath": "LICENSE",
+          "sha256": "a37e0e9697144819e1d965176ac4ae5bc3fa02d11e7812036bbcadf6dafe2400",
+          "bytes": 1070
+        },
+        {
+          "path": "skills/subagent-driven-development/references/upstream/SKILL.md.original",
+          "upstreamPath": "skills/subagent-driven-development/SKILL.md",
+          "sha256": "ba41f697136cba88a7962d60c8e2f97488ba04a8688b1d0fbeb27f6953808e75",
+          "bytes": 19506
+        },
+        {
+          "path": "skills/subagent-driven-development/references/upstream/implementer-prompt.md",
+          "upstreamPath": "skills/subagent-driven-development/implementer-prompt.md",
+          "sha256": "81dd9d5a3fb0b09b96b5829f03b9796842f3199ef7591d1ba1c2db2a515f64d0",
+          "bytes": 6335
+        },
+        {
+          "path": "skills/subagent-driven-development/references/upstream/re-review-prompt.md",
+          "upstreamPath": "skills/subagent-driven-development/re-review-prompt.md",
+          "sha256": "0828a5e9cbb12ba49f14621dd8c3953c48c0fc383e75bb5494f055ed0d6d824f",
+          "bytes": 4761
+        },
+        {
+          "path": "skills/subagent-driven-development/references/upstream/references/batching.md",
+          "upstreamPath": "skills/subagent-driven-development/references/batching.md",
+          "sha256": "b54dc7e23dbfb90db89bcb2fb3af591aabf6a271a165fbc0da4c6f9439980eac",
+          "bytes": 583
+        },
+        {
+          "path": "skills/subagent-driven-development/references/upstream/references/cannot-verify.md",
+          "upstreamPath": "skills/subagent-driven-development/references/cannot-verify.md",
+          "sha256": "e698713a15e0eabf1a2ab26ffe1bb04bf70c9d6d2e2060d44a0f9a1bdd4408bf",
+          "bytes": 513
+        },
+        {
+          "path": "skills/subagent-driven-development/references/upstream/references/final-review.md",
+          "upstreamPath": "skills/subagent-driven-development/references/final-review.md",
+          "sha256": "2fd999d86e5dd0b9b32aaf93f2a41663ef30b3e3cb78fb2fd5cb450eb59eb9de",
+          "bytes": 2447
+        },
+        {
+          "path": "skills/subagent-driven-development/references/upstream/references/fix-loop.md",
+          "upstreamPath": "skills/subagent-driven-development/references/fix-loop.md",
+          "sha256": "eafff1f801af2ced86e8761f3eeef04b701860d986ba5d0a8b20d506a75104bb",
+          "bytes": 4249
+        },
+        {
+          "path": "skills/subagent-driven-development/references/upstream/references/handling-reports.md",
+          "upstreamPath": "skills/subagent-driven-development/references/handling-reports.md",
+          "sha256": "8f759cdd4936220c38aab05b6d6c48c6df8ac8f146b0f37a6d2facbf87133c67",
+          "bytes": 1062
+        },
+        {
+          "path": "skills/subagent-driven-development/references/upstream/references/preflight.md",
+          "upstreamPath": "skills/subagent-driven-development/references/preflight.md",
+          "sha256": "3ea21c5fc1af1a190ac8a9d19ceb0849b47bf2ffe27b87dffcc21b6a0539776c",
+          "bytes": 1353
+        },
+        {
+          "path": "skills/subagent-driven-development/references/upstream/references/resuming.md",
+          "upstreamPath": "skills/subagent-driven-development/references/resuming.md",
+          "sha256": "ff6e38bde2276faa2a7e93513086caded0ea10edbf2ec7f349a7e3b0d7c668c4",
+          "bytes": 614
+        },
+        {
+          "path": "skills/subagent-driven-development/references/upstream/scripts/review-package",
+          "upstreamPath": "skills/subagent-driven-development/scripts/review-package",
+          "sha256": "f9275175b2276b1d5fdb1bae0bedaadd2a950659b7c6f311ea37ff85e1861b1f",
+          "bytes": 2029
+        },
+        {
+          "path": "skills/subagent-driven-development/references/upstream/scripts/sdd-workspace",
+          "upstreamPath": "skills/subagent-driven-development/scripts/sdd-workspace",
+          "sha256": "4fd9770e7a49b6bde488c0e92bac1b3bd01fcbdaf8f06b6c4efbe3a1abd99f86",
+          "bytes": 3684
+        },
+        {
+          "path": "skills/subagent-driven-development/references/upstream/scripts/task-brief",
+          "upstreamPath": "skills/subagent-driven-development/scripts/task-brief",
+          "sha256": "cc563538e09abf719b34ddf4b2fa7a65cf3b301729039dbfa923cb060f729146",
+          "bytes": 1322
+        },
+        {
+          "path": "skills/subagent-driven-development/references/upstream/task-reviewer-prompt.md",
+          "upstreamPath": "skills/subagent-driven-development/task-reviewer-prompt.md",
+          "sha256": "bfed55c8f19d0ff6ed57b0fe09127c92890e9311c6c73917129598826bf9ebe8",
+          "bytes": 9031
+        }
+      ],
+      "entryPoint": "skills/subagent-driven-development/references/upstream/SKILL.md.original"
+    },
+    {
+      "id": "skills/systematic-debugging",
+      "repository": "https://github.com/obra/superpowers",
+      "revision": "2ce8aa15d05bd57213e6f746f953aafb7ded7a8b",
+      "upstreamPath": "skills/systematic-debugging",
+      "license": {
+        "spdx": "MIT",
+        "sourcePath": "LICENSE",
+        "url": "https://github.com/obra/superpowers/blob/2ce8aa15d05bd57213e6f746f953aafb7ded7a8b/LICENSE",
+        "localPath": "skills/systematic-debugging/references/upstream/LICENSE.upstream"
+      },
+      "files": [
+        {
+          "path": "skills/systematic-debugging/references/upstream/CREATION-LOG.md",
+          "upstreamPath": "skills/systematic-debugging/CREATION-LOG.md",
+          "sha256": "c24733a5b1821bd6bed1fc950261f0b9f4e90097e0bbb96459d8179713730789",
+          "bytes": 4257
+        },
+        {
+          "path": "skills/systematic-debugging/references/upstream/LICENSE.upstream",
+          "upstreamPath": "LICENSE",
+          "sha256": "a37e0e9697144819e1d965176ac4ae5bc3fa02d11e7812036bbcadf6dafe2400",
+          "bytes": 1070
+        },
+        {
+          "path": "skills/systematic-debugging/references/upstream/SKILL.md.original",
+          "upstreamPath": "skills/systematic-debugging/SKILL.md",
+          "sha256": "51c6435d98c83c42c96ba7c35725a0b2c376cd487fb1a4e6bd0ddbe7e33ef202",
+          "bytes": 9530
+        },
+        {
+          "path": "skills/systematic-debugging/references/upstream/condition-based-waiting-example.ts",
+          "upstreamPath": "skills/systematic-debugging/condition-based-waiting-example.ts",
+          "sha256": "40ae5ebe497fdf310200e43fe986552546d0a22837c0d39e855db1cfd33eb88e",
+          "bytes": 5054
+        },
+        {
+          "path": "skills/systematic-debugging/references/upstream/condition-based-waiting.md",
+          "upstreamPath": "skills/systematic-debugging/condition-based-waiting.md",
+          "sha256": "e89fec8400d6cd50f43407cec9fab50976ba4d55d0ec2eb51c0bd68036b54c26",
+          "bytes": 3516
+        },
+        {
+          "path": "skills/systematic-debugging/references/upstream/defense-in-depth.md",
+          "upstreamPath": "skills/systematic-debugging/defense-in-depth.md",
+          "sha256": "1e175fb86fc357e58c6aebf5441e481e1b7868b4380c0456b63a17eefbd18ba7",
+          "bytes": 3650
+        },
+        {
+          "path": "skills/systematic-debugging/references/upstream/find-polluter.sh",
+          "upstreamPath": "skills/systematic-debugging/find-polluter.sh",
+          "sha256": "dd7b8f13c4cc2a24b33ff87b18da9248f3e1c80a085c3316224f69ff0fa5c43c",
+          "bytes": 1986
+        },
+        {
+          "path": "skills/systematic-debugging/references/upstream/root-cause-tracing.md",
+          "upstreamPath": "skills/systematic-debugging/root-cause-tracing.md",
+          "sha256": "75b933b6a8c40bdb2031b10f21654395b56ec6ab6bc7b018c18d3fe57aeb7fb8",
+          "bytes": 5321
+        },
+        {
+          "path": "skills/systematic-debugging/references/upstream/test-academic.md",
+          "upstreamPath": "skills/systematic-debugging/test-academic.md",
+          "sha256": "fe2ba480d78ac0d686dc025f41c2a32a43d642bf533f91b0c6053a04d35d6486",
+          "bytes": 653
+        },
+        {
+          "path": "skills/systematic-debugging/references/upstream/test-pressure-1.md",
+          "upstreamPath": "skills/systematic-debugging/test-pressure-1.md",
+          "sha256": "0b6a915db0054577819834c79be9eb614e97bddba10d73768e1fbe91cfed048a",
+          "bytes": 1900
+        },
+        {
+          "path": "skills/systematic-debugging/references/upstream/test-pressure-2.md",
+          "upstreamPath": "skills/systematic-debugging/test-pressure-2.md",
+          "sha256": "b2030aeffba07050e8ad573ddf87486457c4a016a786bb326235bebd856f2016",
+          "bytes": 2283
+        },
+        {
+          "path": "skills/systematic-debugging/references/upstream/test-pressure-3.md",
+          "upstreamPath": "skills/systematic-debugging/test-pressure-3.md",
+          "sha256": "96b50a52e2c7989c9cf20fb752c47c1e9a3a70dc362f8f7989f8f5b64dac7708",
+          "bytes": 2692
+        }
+      ],
+      "entryPoint": "skills/systematic-debugging/references/upstream/SKILL.md.original"
+    },
+    {
+      "id": "skills/test-driven-development",
+      "repository": "https://github.com/obra/superpowers",
+      "revision": "2ce8aa15d05bd57213e6f746f953aafb7ded7a8b",
+      "upstreamPath": "skills/test-driven-development",
+      "license": {
+        "spdx": "MIT",
+        "sourcePath": "LICENSE",
+        "url": "https://github.com/obra/superpowers/blob/2ce8aa15d05bd57213e6f746f953aafb7ded7a8b/LICENSE",
+        "localPath": "skills/test-driven-development/references/upstream/LICENSE.upstream"
+      },
+      "files": [
+        {
+          "path": "skills/test-driven-development/references/upstream/LICENSE.upstream",
+          "upstreamPath": "LICENSE",
+          "sha256": "a37e0e9697144819e1d965176ac4ae5bc3fa02d11e7812036bbcadf6dafe2400",
+          "bytes": 1070
+        },
+        {
+          "path": "skills/test-driven-development/references/upstream/SKILL.md.original",
+          "upstreamPath": "skills/test-driven-development/SKILL.md",
+          "sha256": "64b03fce4aee5a97a93160cea8111f3ba13a17b7c001db4bd5836d67fd10705d",
+          "bytes": 9578
+        },
+        {
+          "path": "skills/test-driven-development/references/upstream/writing-good-tests.md",
+          "upstreamPath": "skills/test-driven-development/writing-good-tests.md",
+          "sha256": "51471c853306ff92ca8bb41dcaea05f31c0e46b03651f8f3c99754b7172f4ae1",
+          "bytes": 8268
+        }
+      ],
+      "entryPoint": "skills/test-driven-development/references/upstream/SKILL.md.original"
+    },
+    {
+      "id": "skills/using-git-worktrees",
+      "repository": "https://github.com/obra/superpowers",
+      "revision": "2ce8aa15d05bd57213e6f746f953aafb7ded7a8b",
+      "upstreamPath": "skills/using-git-worktrees",
+      "license": {
+        "spdx": "MIT",
+        "sourcePath": "LICENSE",
+        "url": "https://github.com/obra/superpowers/blob/2ce8aa15d05bd57213e6f746f953aafb7ded7a8b/LICENSE",
+        "localPath": "skills/using-git-worktrees/references/upstream/LICENSE.upstream"
+      },
+      "files": [
+        {
+          "path": "skills/using-git-worktrees/references/upstream/LICENSE.upstream",
+          "upstreamPath": "LICENSE",
+          "sha256": "a37e0e9697144819e1d965176ac4ae5bc3fa02d11e7812036bbcadf6dafe2400",
+          "bytes": 1070
+        },
+        {
+          "path": "skills/using-git-worktrees/references/upstream/SKILL.md.original",
+          "upstreamPath": "skills/using-git-worktrees/SKILL.md",
+          "sha256": "8cfb86f121269e8f7f12361e6795c4f6738828340e28964c9229d365666c9edd",
+          "bytes": 6813
+        }
+      ],
+      "entryPoint": "skills/using-git-worktrees/references/upstream/SKILL.md.original"
+    },
+    {
+      "id": "skills/differential-review",
+      "repository": "https://github.com/trailofbits/skills",
+      "revision": "d016e08cc7408ecb1853a299d06d4a56e363ad5e",
+      "upstreamPath": "plugins/differential-review/skills/differential-review",
+      "license": {
+        "spdx": "CC-BY-SA-4.0",
+        "sourcePath": "LICENSE",
+        "url": "https://github.com/trailofbits/skills/blob/d016e08cc7408ecb1853a299d06d4a56e363ad5e/LICENSE",
+        "localPath": "skills/differential-review/references/upstream/LICENSE.upstream"
+      },
+      "files": [
+        {
+          "path": "skills/differential-review/references/upstream/LICENSE.upstream",
+          "upstreamPath": "LICENSE",
+          "sha256": "7abe19ec9bb73b36141b999b861d24ad855e808bafe0f81e84cce28556f6c297",
+          "bytes": 20131
+        },
+        {
+          "path": "skills/differential-review/references/upstream/SKILL.md.original",
+          "upstreamPath": "plugins/differential-review/skills/differential-review/SKILL.md",
+          "sha256": "f9af6a8193fc1a9f8ca3c54bb8d19095a5f20c9472ca6d014488bbde50b67da0",
+          "bytes": 7439
+        },
+        {
+          "path": "skills/differential-review/references/upstream/adversarial.md",
+          "upstreamPath": "plugins/differential-review/skills/differential-review/adversarial.md",
+          "sha256": "3cb823f38c6e551cbcf5f72325d2bb219dacdad774072519c31d50d92db19800",
+          "bytes": 5062
+        },
+        {
+          "path": "skills/differential-review/references/upstream/agents/openai.yaml",
+          "upstreamPath": "plugins/differential-review/skills/differential-review/agents/openai.yaml",
+          "sha256": "0279d56f88dc1a04d4b1941a25fa7672912a3ceb0557b13c38d069908b30ae61",
+          "bytes": 245
+        },
+        {
+          "path": "skills/differential-review/references/upstream/assets/trail-of-bits-mark.svg",
+          "upstreamPath": "plugins/differential-review/skills/differential-review/assets/trail-of-bits-mark.svg",
+          "sha256": "4bf74c789b38dcf6ad762c136b6832363d27ae19fbaa9a18ec18d66ecce6ca05",
+          "bytes": 3084
+        },
+        {
+          "path": "skills/differential-review/references/upstream/methodology.md",
+          "upstreamPath": "plugins/differential-review/skills/differential-review/methodology.md",
+          "sha256": "16b335d24cf2145e3dc4a37f50056550d29db2efa20e6df78fec95ec1e6fb0b4",
+          "bytes": 6738
+        },
+        {
+          "path": "skills/differential-review/references/upstream/patterns.md",
+          "upstreamPath": "plugins/differential-review/skills/differential-review/patterns.md",
+          "sha256": "52abb18abbc73502a3d3b2f36a7a035adc1db40fd812d1d5424cf065036a06e9",
+          "bytes": 6999
+        },
+        {
+          "path": "skills/differential-review/references/upstream/reporting.md",
+          "upstreamPath": "plugins/differential-review/skills/differential-review/reporting.md",
+          "sha256": "0016876dc6f158e926448bff1b6f634796757c7afe09dff177cfe30250724fc4",
+          "bytes": 7006
+        }
+      ],
+      "entryPoint": "skills/differential-review/references/upstream/SKILL.md.original"
+    },
+    {
+      "id": "skills/react-best-practices",
+      "repository": "https://github.com/vercel-labs/agent-skills",
+      "revision": "1a2c79d4e6c4a2283dc2c614b6538cbe1ed5ca62",
+      "upstreamPath": "skills/react-best-practices",
+      "license": {
+        "spdx": "MIT",
+        "sourcePath": "README.md",
+        "url": "https://github.com/vercel-labs/agent-skills/blob/1a2c79d4e6c4a2283dc2c614b6538cbe1ed5ca62/README.md",
+        "localPath": "skills/react-best-practices/references/upstream/REPOSITORY-README.md"
+      },
+      "files": [
+        {
+          "path": "skills/react-best-practices/references/upstream/AGENTS.md",
+          "upstreamPath": "skills/react-best-practices/AGENTS.md",
+          "sha256": "fc93e7421177bbf869cce892bc60a6c83a4517d974bc3bf65c4e2c1e58a6ccf6",
+          "bytes": 108261
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/README.md",
+          "upstreamPath": "skills/react-best-practices/README.md",
+          "sha256": "9eafb2123d3b8b2aef41fba0db2648a3f4f49996f8c7c8bb2c86263befd8b48a",
+          "bytes": 3360
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/REPOSITORY-README.md",
+          "upstreamPath": "README.md",
+          "sha256": "9429e781e3fb2f005e619b96fe18cdc59f8db38b619a4c98f0c46c86357e56a0",
+          "bytes": 7273
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/SKILL.md.original",
+          "upstreamPath": "skills/react-best-practices/SKILL.md",
+          "sha256": "71ed7794962fa6e803ee83030517b5b93a9f70fbfeb431ec4535c5480a8d8355",
+          "bytes": 7251
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/metadata.json",
+          "upstreamPath": "skills/react-best-practices/metadata.json",
+          "sha256": "c4e18bac3290fbe1b471a605867d4df68b03144ea26b8befdbe8f9d8fd124354",
+          "bytes": 921
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/_sections.md",
+          "upstreamPath": "skills/react-best-practices/rules/_sections.md",
+          "sha256": "01c59969e4e867f0708c8f8ef9c6d87fab9a07d0586244f429ff84013db8a115",
+          "bytes": 1554
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/_template.md",
+          "upstreamPath": "skills/react-best-practices/rules/_template.md",
+          "sha256": "99df2a3ea088c6c22de2484ddc7e964d0e9923846f44c63380343ecc64455442",
+          "bytes": 631
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/advanced-effect-event-deps.md",
+          "upstreamPath": "skills/react-best-practices/rules/advanced-effect-event-deps.md",
+          "sha256": "55ed8f9f27a1bff803d6fa55828176207714b02123cbb97ddb8a90d88024a723",
+          "bytes": 1802
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/advanced-event-handler-refs.md",
+          "upstreamPath": "skills/react-best-practices/rules/advanced-event-handler-refs.md",
+          "sha256": "a3097edeecfb2ff6851cd66ed8cdf0617c3c88180504bee824aa6e75a215bbbc",
+          "bytes": 1483
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/advanced-init-once.md",
+          "upstreamPath": "skills/react-best-practices/rules/advanced-init-once.md",
+          "sha256": "3e4dc22173eb0e2b6dcf583e3babd862b8696328f8f59aee7c4d746c5bc05f6c",
+          "bytes": 958
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/advanced-use-latest.md",
+          "upstreamPath": "skills/react-best-practices/rules/advanced-use-latest.md",
+          "sha256": "8a3f64dfe5a77d1564248faf17fe662ae75b55d497a243cb30b38eb07ccbbf9a",
+          "bytes": 1072
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/async-api-routes.md",
+          "upstreamPath": "skills/react-best-practices/rules/async-api-routes.md",
+          "sha256": "523338540d73427dc14c0cbb19f2741ebccdf8b105a7b2c1b33d2905cf237a42",
+          "bytes": 1125
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/async-cheap-condition-before-await.md",
+          "upstreamPath": "skills/react-best-practices/rules/async-cheap-condition-before-await.md",
+          "sha256": "03107c1f70a293cd58a8abc5474c5548e20ea4efdf01b6d45aae7ad0ac1cb32c",
+          "bytes": 1220
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/async-defer-await.md",
+          "upstreamPath": "skills/react-best-practices/rules/async-defer-await.md",
+          "sha256": "f3c142d090615abdcc99d31c123be37b31f0f1ed8d9ec9f7789a3bc6883ae0fb",
+          "bytes": 2208
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/async-dependencies.md",
+          "upstreamPath": "skills/react-best-practices/rules/async-dependencies.md",
+          "sha256": "16ef469f877e30c6b8e1e1b4bc3e527312fa3c6318cb785a4eca186ea236131a",
+          "bytes": 1293
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/async-parallel.md",
+          "upstreamPath": "skills/react-best-practices/rules/async-parallel.md",
+          "sha256": "6d2f841896279e976dfcdc1ac89e70771ac188baadfd43c096b5706cb838b961",
+          "bytes": 654
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/async-suspense-boundaries.md",
+          "upstreamPath": "skills/react-best-practices/rules/async-suspense-boundaries.md",
+          "sha256": "de05fedac2eb7ae563b887b5a424464ec3dfaf84e5b7797467ebe2a796ac8afc",
+          "bytes": 2510
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/bundle-analyzable-paths.md",
+          "upstreamPath": "skills/react-best-practices/rules/bundle-analyzable-paths.md",
+          "sha256": "62090b5c815fd71bf1133dce754f51abc16a9456d0ccd025fd627de27726e92a",
+          "bytes": 2382
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/bundle-barrel-imports.md",
+          "upstreamPath": "skills/react-best-practices/rules/bundle-barrel-imports.md",
+          "sha256": "e648f6d54525f07a691357040ca5bff6ea3424788a91ff63812adb29622a671b",
+          "bytes": 2795
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/bundle-conditional.md",
+          "upstreamPath": "skills/react-best-practices/rules/bundle-conditional.md",
+          "sha256": "09c8259c3efb04fc0abb8e412ccbda217c222ae8118516283e571c995fe3a7d4",
+          "bytes": 949
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/bundle-defer-third-party.md",
+          "upstreamPath": "skills/react-best-practices/rules/bundle-defer-third-party.md",
+          "sha256": "3719fb47b191e8db4fe22686ec88448ad5af9e6838585425abbe103d0b642e37",
+          "bytes": 920
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/bundle-dynamic-imports.md",
+          "upstreamPath": "skills/react-best-practices/rules/bundle-dynamic-imports.md",
+          "sha256": "401817a7369f315fc5a68a1095742ff7d53d0461906880dc9d64a41495ee1986",
+          "bytes": 791
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/bundle-preload.md",
+          "upstreamPath": "skills/react-best-practices/rules/bundle-preload.md",
+          "sha256": "d1f7cc28da7cd5ab249acd287edc5b761afcfb194e9cb62cd44c5f3543db2de2",
+          "bytes": 1149
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/client-event-listeners.md",
+          "upstreamPath": "skills/react-best-practices/rules/client-event-listeners.md",
+          "sha256": "242a873349febc1ce685e85617994784dbab92c2eaa68aed7fed5a83e7680e93",
+          "bytes": 1969
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/client-localstorage-schema.md",
+          "upstreamPath": "skills/react-best-practices/rules/client-localstorage-schema.md",
+          "sha256": "0fb7cdf9dc93fdf22f87e3669f953fb9d4ac9b0be42eec4a29fe9a2560610b88",
+          "bytes": 1950
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/client-passive-event-listeners.md",
+          "upstreamPath": "skills/react-best-practices/rules/client-passive-event-listeners.md",
+          "sha256": "1f35016f9053de69e884ee9be00654e37979c2ca85f5e57764dc2626ff7acb4b",
+          "bytes": 1644
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/client-swr-dedup.md",
+          "upstreamPath": "skills/react-best-practices/rules/client-swr-dedup.md",
+          "sha256": "644652c39c6cc00de8d1c77a7273612e868dc3f7edda30764164c12ec0f764a3",
+          "bytes": 1159
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/js-batch-dom-css.md",
+          "upstreamPath": "skills/react-best-practices/rules/js-batch-dom-css.md",
+          "sha256": "480b891b9eaf96e929dc1e964274a4828e3a78009b7d00ccd965a0d425215959",
+          "bytes": 3266
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/js-cache-function-results.md",
+          "upstreamPath": "skills/react-best-practices/rules/js-cache-function-results.md",
+          "sha256": "3daaa11d24f4295cb6be8bc6f407f2ce83cc7b5bd1f0e68891ea8ab835721dc7",
+          "bytes": 1949
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/js-cache-property-access.md",
+          "upstreamPath": "skills/react-best-practices/rules/js-cache-property-access.md",
+          "sha256": "73e47431e74878a927061bf0ddc7cd91a7556cb35d2573f3421e82300d9ae311",
+          "bytes": 532
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/js-cache-storage.md",
+          "upstreamPath": "skills/react-best-practices/rules/js-cache-storage.md",
+          "sha256": "11b826b0433898c1ece2d3547010d8e77db9fb240185748c45db91493de9b6cc",
+          "bytes": 1651
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/js-combine-iterations.md",
+          "upstreamPath": "skills/react-best-practices/rules/js-combine-iterations.md",
+          "sha256": "71add08aeeb43091d4ff4c0b2842cce8b4bdef8ad3e732cc034bb5a84827e746",
+          "bytes": 753
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/js-early-exit.md",
+          "upstreamPath": "skills/react-best-practices/rules/js-early-exit.md",
+          "sha256": "925ce5ce87f3347186ca62212f29cc6baa2b8c85a96d2720ad07c3d0abf781c0",
+          "bytes": 1133
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/js-flatmap-filter.md",
+          "upstreamPath": "skills/react-best-practices/rules/js-flatmap-filter.md",
+          "sha256": "9e5b166a41914d975bef7635467f8fb32cd98b5c3126c0bc6f163490812fb5f0",
+          "bytes": 1411
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/js-hoist-regexp.md",
+          "upstreamPath": "skills/react-best-practices/rules/js-hoist-regexp.md",
+          "sha256": "f9e9aef2f7c2307dd7310f283df85dcada45fc43e9bb941b0c3aa414dec21ec4",
+          "bytes": 1028
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/js-index-maps.md",
+          "upstreamPath": "skills/react-best-practices/rules/js-index-maps.md",
+          "sha256": "5df1bdc2cfabb2c98abd55d26762e5c18189535c2e686184f426082e62920391",
+          "bytes": 837
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/js-length-check-first.md",
+          "upstreamPath": "skills/react-best-practices/rules/js-length-check-first.md",
+          "sha256": "8b54a311c826b299272f29187fc58bc55772a04c4a72eeb29456ee96dc9fc624",
+          "bytes": 1747
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/js-min-max-loop.md",
+          "upstreamPath": "skills/react-best-practices/rules/js-min-max-loop.md",
+          "sha256": "87dfb67e2f39df6ad8bcfb5b78c5fb364d3c07554ad188a202408d99f3763421",
+          "bytes": 2290
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/js-request-idle-callback.md",
+          "upstreamPath": "skills/react-best-practices/rules/js-request-idle-callback.md",
+          "sha256": "ee08f83905b4011abbc33d594033157d77561b5bbd9b36b04f0f409581ffec32",
+          "bytes": 2647
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/js-set-map-lookups.md",
+          "upstreamPath": "skills/react-best-practices/rules/js-set-map-lookups.md",
+          "sha256": "a7fd781a6ba9ad49065961b6f9a90ef486bf6b648390e1a08704025f98e1642b",
+          "bytes": 532
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/js-tosorted-immutable.md",
+          "upstreamPath": "skills/react-best-practices/rules/js-tosorted-immutable.md",
+          "sha256": "d0a5e1b0fec48a0a81397957e2f068e224329f7c42cb5feeed8aae6fa64025e8",
+          "bytes": 1782
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/rendering-activity.md",
+          "upstreamPath": "skills/react-best-practices/rules/rendering-activity.md",
+          "sha256": "1e5e7eaf3555e61d6a2e900089c676527d26259501db5594f59544b6c664f85a",
+          "bytes": 564
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/rendering-animate-svg-wrapper.md",
+          "upstreamPath": "skills/react-best-practices/rules/rendering-animate-svg-wrapper.md",
+          "sha256": "9c6ae0ca7a51434e803887c64cded760956579a1452ccb80a461a03f9c937c77",
+          "bytes": 1185
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/rendering-conditional-render.md",
+          "upstreamPath": "skills/react-best-practices/rules/rendering-conditional-render.md",
+          "sha256": "2ec2fa23c4148285144687050c52369adba3da2fbe3d486f8d3e0aad8f06f2bc",
+          "bytes": 980
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/rendering-content-visibility.md",
+          "upstreamPath": "skills/react-best-practices/rules/rendering-content-visibility.md",
+          "sha256": "64eee6d5b916fe74df33363994b27fc7f71bea3bcedc7ee04bda23107ca3e6e4",
+          "bytes": 815
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/rendering-hoist-jsx.md",
+          "upstreamPath": "skills/react-best-practices/rules/rendering-hoist-jsx.md",
+          "sha256": "93b229560fae92005ed9a2a829064607b39b2e984e92d221d05b2d41df2b7c0e",
+          "bytes": 1039
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/rendering-hydration-no-flicker.md",
+          "upstreamPath": "skills/react-best-practices/rules/rendering-hydration-no-flicker.md",
+          "sha256": "dc7ab358c67c177bca6e6f360fbc935ebe4efa928c0ba3ebd3f9f3d9e2000ca3",
+          "bytes": 2308
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/rendering-hydration-suppress-warning.md",
+          "upstreamPath": "skills/react-best-practices/rules/rendering-hydration-suppress-warning.md",
+          "sha256": "915bacb934e2927d84b37a3f3d225a47b309ac8f9e494ed2bcb66ce07c5676a2",
+          "bytes": 872
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/rendering-resource-hints.md",
+          "upstreamPath": "skills/react-best-practices/rules/rendering-resource-hints.md",
+          "sha256": "351b1095d641717b930f1b2253282b7120af3023bc74e06c17675168d4286864",
+          "bytes": 2549
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/rendering-script-defer-async.md",
+          "upstreamPath": "skills/react-best-practices/rules/rendering-script-defer-async.md",
+          "sha256": "4cea07b7875ba7fc2c7465ff23b63a2bb334f90aaf2d9293d38d67b05fdb32ab",
+          "bytes": 1868
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/rendering-svg-precision.md",
+          "upstreamPath": "skills/react-best-practices/rules/rendering-svg-precision.md",
+          "sha256": "ed468533f6e95f622859c884b122cf21f9f593ed6bb3d500a54de4b9f9bcb9fb",
+          "bytes": 588
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/rendering-usetransition-loading.md",
+          "upstreamPath": "skills/react-best-practices/rules/rendering-usetransition-loading.md",
+          "sha256": "3a1249c3f13026b6f54ab5712c388df219d6af01b12aa542749acd99a46f4bc1",
+          "bytes": 2074
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/rerender-defer-reads.md",
+          "upstreamPath": "skills/react-best-practices/rules/rerender-defer-reads.md",
+          "sha256": "234050a77faf50cb306be10a9e15bd4421134ab5907e75f13e6d78e2bd262dc9",
+          "bytes": 973
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/rerender-dependencies.md",
+          "upstreamPath": "skills/react-best-practices/rules/rerender-dependencies.md",
+          "sha256": "17eb5830956fb56486fd3cfc7431f5849d39751730c05ad9e77dd4f0c27169c5",
+          "bytes": 824
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/rerender-derived-state-no-effect.md",
+          "upstreamPath": "skills/react-best-practices/rules/rerender-derived-state-no-effect.md",
+          "sha256": "cb11ec76f50aa7b6847269f02d79b120c889a30d9ecd2c1d578f75144419c77a",
+          "bytes": 1201
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/rerender-derived-state.md",
+          "upstreamPath": "skills/react-best-practices/rules/rerender-derived-state.md",
+          "sha256": "1c326bb67b01fb084eb00c8911b0a7cff54681c2315b629f88e49b64eaa6481d",
+          "bytes": 728
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/rerender-functional-setstate.md",
+          "upstreamPath": "skills/react-best-practices/rules/rerender-functional-setstate.md",
+          "sha256": "5e68df6b2ae8058e67f476ff1ac67bde159f5a9d18df439e46eabcdeb7b52e58",
+          "bytes": 2968
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/rerender-lazy-state-init.md",
+          "upstreamPath": "skills/react-best-practices/rules/rerender-lazy-state-init.md",
+          "sha256": "4ae844740f266fc8cbf050701230286624a2440ec5be67b9a63d9edc3c580573",
+          "bytes": 2016
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/rerender-memo-with-default-value.md",
+          "upstreamPath": "skills/react-best-practices/rules/rerender-memo-with-default-value.md",
+          "sha256": "81c47476564ad8a79fc68fc442734255ca7d6829424359464503fda0a9f9a0dd",
+          "bytes": 1173
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/rerender-memo.md",
+          "upstreamPath": "skills/react-best-practices/rules/rerender-memo.md",
+          "sha256": "1f258990c2f27ff6256b3cc5c43300631bb3f0d81f749aed08d07fcdcc131dd1",
+          "bytes": 1148
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/rerender-move-effect-to-event.md",
+          "upstreamPath": "skills/react-best-practices/rules/rerender-move-effect-to-event.md",
+          "sha256": "abc2cbf167bee056743023351e96806a411d3398da8802093620aecf0721f029",
+          "bytes": 1268
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/rerender-no-inline-components.md",
+          "upstreamPath": "skills/react-best-practices/rules/rerender-no-inline-components.md",
+          "sha256": "1cc32907a770272524ba682eef9e7efdd8ad4533b6f89b718a1fcd7d1d0eb6a3",
+          "bytes": 2135
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/rerender-simple-expression-in-memo.md",
+          "upstreamPath": "skills/react-best-practices/rules/rerender-simple-expression-in-memo.md",
+          "sha256": "5bdcf2d1558ba5204e643c887b7b4060f89630969425651eb68e96427d97f800",
+          "bytes": 1018
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/rerender-split-combined-hooks.md",
+          "upstreamPath": "skills/react-best-practices/rules/rerender-split-combined-hooks.md",
+          "sha256": "6f45d703343484ef9acef9388397f3642966ae6a5a258899a0cf1f9977cfbf6c",
+          "bytes": 1844
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/rerender-transitions.md",
+          "upstreamPath": "skills/react-best-practices/rules/rerender-transitions.md",
+          "sha256": "60f4033909a62df5e5b8c601494f9e50a562e2f8c1c2d81eac24f38142265f1c",
+          "bytes": 1055
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/rerender-use-deferred-value.md",
+          "upstreamPath": "skills/react-best-practices/rules/rerender-use-deferred-value.md",
+          "sha256": "8c3579576a61a949884167745dcfaf1d5426ba305cc61fd0a79602d70fda4909",
+          "bytes": 1846
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/rerender-use-ref-transient-values.md",
+          "upstreamPath": "skills/react-best-practices/rules/rerender-use-ref-transient-values.md",
+          "sha256": "f1a649af9d1d0b5c762f6c9c4c1c70c90d7df82aa10296ee87aadb78c1b76c54",
+          "bytes": 1742
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/server-after-nonblocking.md",
+          "upstreamPath": "skills/react-best-practices/rules/server-after-nonblocking.md",
+          "sha256": "d0b8d24a3db9f0f65f9e2bddbf230b0e03a5f60e1229d93a4a18f5e7a991c7c2",
+          "bytes": 2012
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/server-auth-actions.md",
+          "upstreamPath": "skills/react-best-practices/rules/server-auth-actions.md",
+          "sha256": "a2ca8aa102839251c7971ec784560fab943c20b36fe6f80365d4110c13260c23",
+          "bytes": 2649
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/server-cache-lru.md",
+          "upstreamPath": "skills/react-best-practices/rules/server-cache-lru.md",
+          "sha256": "1924b64561841923b88a657085097a0aeba3e0ba2d5470b9f5c15cc10d6ae70f",
+          "bytes": 1353
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/server-cache-react.md",
+          "upstreamPath": "skills/react-best-practices/rules/server-cache-react.md",
+          "sha256": "fddeea6c870bb3da4134b61d54b7d09b83d2603f929b7547cd3dc1dc269edd5c",
+          "bytes": 2228
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/server-dedup-props.md",
+          "upstreamPath": "skills/react-best-practices/rules/server-dedup-props.md",
+          "sha256": "c2747424cdac46be62f835f245a0aa887b0090b416d28e2ac8676702645eeb37",
+          "bytes": 2060
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/server-hoist-static-io.md",
+          "upstreamPath": "skills/react-best-practices/rules/server-hoist-static-io.md",
+          "sha256": "5abea4dd882b13661bd5f7dfb93f9e547d5f08176c61c448ade91b210ed5d49f",
+          "bytes": 4423
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/server-no-shared-module-state.md",
+          "upstreamPath": "skills/react-best-practices/rules/server-no-shared-module-state.md",
+          "sha256": "4d869bf1cd2f1632e5ca4c0e64b1cf0e71c5f5a0f940bc8a22174d205e735ed7",
+          "bytes": 1766
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/server-parallel-fetching.md",
+          "upstreamPath": "skills/react-best-practices/rules/server-parallel-fetching.md",
+          "sha256": "569a2e9fc04f9606686cd75c5894ef8781b502786a7fffe241396846c7733472",
+          "bytes": 1554
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/server-parallel-nested-fetching.md",
+          "upstreamPath": "skills/react-best-practices/rules/server-parallel-nested-fetching.md",
+          "sha256": "ad5d9656984d4a959997a2367bf59cc6632297b4634a1dd13a087939d83f30b3",
+          "bytes": 992
+        },
+        {
+          "path": "skills/react-best-practices/references/upstream/rules/server-serialization.md",
+          "upstreamPath": "skills/react-best-practices/rules/server-serialization.md",
+          "sha256": "f4c7d68b29c82381baad059c4a7f09e868e71ec9c3115a26ad3ae7d24c0dfe1f",
+          "bytes": 996
+        }
+      ],
+      "entryPoint": "skills/react-best-practices/references/upstream/SKILL.md.original"
+    },
+    {
+      "id": "skills/composition-patterns",
+      "repository": "https://github.com/vercel-labs/agent-skills",
+      "revision": "1a2c79d4e6c4a2283dc2c614b6538cbe1ed5ca62",
+      "upstreamPath": "skills/composition-patterns",
+      "license": {
+        "spdx": "MIT",
+        "sourcePath": "README.md",
+        "url": "https://github.com/vercel-labs/agent-skills/blob/1a2c79d4e6c4a2283dc2c614b6538cbe1ed5ca62/README.md",
+        "localPath": "skills/composition-patterns/references/upstream/REPOSITORY-README.md"
+      },
+      "files": [
+        {
+          "path": "skills/composition-patterns/references/upstream/AGENTS.md",
+          "upstreamPath": "skills/composition-patterns/AGENTS.md",
+          "sha256": "89e3ddd58fcf99a53a50e25dfd21b8cde1be5f10b7df6bacd3dfa6796932f516",
+          "bytes": 22627
+        },
+        {
+          "path": "skills/composition-patterns/references/upstream/README.md",
+          "upstreamPath": "skills/composition-patterns/README.md",
+          "sha256": "85915a43a6f0b4efe525e3cf6398dd866166da2025837c4460468a24a940da94",
+          "bytes": 2140
+        },
+        {
+          "path": "skills/composition-patterns/references/upstream/REPOSITORY-README.md",
+          "upstreamPath": "README.md",
+          "sha256": "9429e781e3fb2f005e619b96fe18cdc59f8db38b619a4c98f0c46c86357e56a0",
+          "bytes": 7273
+        },
+        {
+          "path": "skills/composition-patterns/references/upstream/SKILL.md.original",
+          "upstreamPath": "skills/composition-patterns/SKILL.md",
+          "sha256": "e38e0eaa609316b10423a9a138ed95e35099accd3f735585295c8a8f165c28a3",
+          "bytes": 2886
+        },
+        {
+          "path": "skills/composition-patterns/references/upstream/metadata.json",
+          "upstreamPath": "skills/composition-patterns/metadata.json",
+          "sha256": "49262ed5cb4186f31ee980cf8d990be0170c51efed4908d0464a1cff9905bd05",
+          "bytes": 530
+        },
+        {
+          "path": "skills/composition-patterns/references/upstream/rules/_sections.md",
+          "upstreamPath": "skills/composition-patterns/rules/_sections.md",
+          "sha256": "a174213b87e6911e2b766995a2cbaf8d1534057076e82fb79fe3f0ecb38047df",
+          "bytes": 829
+        },
+        {
+          "path": "skills/composition-patterns/references/upstream/rules/_template.md",
+          "upstreamPath": "skills/composition-patterns/rules/_template.md",
+          "sha256": "587f7d16b0660eb61fee4a4d3d7df2b3077d6835de170602c7d6e60bee559131",
+          "bytes": 329
+        },
+        {
+          "path": "skills/composition-patterns/references/upstream/rules/architecture-avoid-boolean-props.md",
+          "upstreamPath": "skills/composition-patterns/rules/architecture-avoid-boolean-props.md",
+          "sha256": "007555ebb020f4d552582a2c4db194db71a1fd33094012e5187bcfa4f8c392d5",
+          "bytes": 2267
+        },
+        {
+          "path": "skills/composition-patterns/references/upstream/rules/architecture-compound-components.md",
+          "upstreamPath": "skills/composition-patterns/rules/architecture-compound-components.md",
+          "sha256": "f246af13dc269b521cf20eb8ad99a0cb645beac381c8c9b117262c34612c8457",
+          "bytes": 2600
+        },
+        {
+          "path": "skills/composition-patterns/references/upstream/rules/patterns-children-over-render-props.md",
+          "upstreamPath": "skills/composition-patterns/rules/patterns-children-over-render-props.md",
+          "sha256": "7c45a0d21b3c4126a32cba916ee31adeae195386ad1dbbe6634aedb7457aa0ad",
+          "bytes": 1886
+        },
+        {
+          "path": "skills/composition-patterns/references/upstream/rules/patterns-explicit-variants.md",
+          "upstreamPath": "skills/composition-patterns/rules/patterns-explicit-variants.md",
+          "sha256": "8c19e596e61807549d01ce8c6954c6358199f97a8511c0c02c625ec0efda8c0e",
+          "bytes": 2395
+        },
+        {
+          "path": "skills/composition-patterns/references/upstream/rules/react19-no-forwardref.md",
+          "upstreamPath": "skills/composition-patterns/rules/react19-no-forwardref.md",
+          "sha256": "881830adb7534c4b2d70db426556646ad9837f5478f744f35641f635ada22227",
+          "bytes": 953
+        },
+        {
+          "path": "skills/composition-patterns/references/upstream/rules/state-context-interface.md",
+          "upstreamPath": "skills/composition-patterns/rules/state-context-interface.md",
+          "sha256": "09e73afbf9285fa416679cc864a287b9e8b821d0969272ab784295386d8c9bc3",
+          "bytes": 4974
+        },
+        {
+          "path": "skills/composition-patterns/references/upstream/rules/state-decouple-implementation.md",
+          "upstreamPath": "skills/composition-patterns/rules/state-decouple-implementation.md",
+          "sha256": "76a8c1eb29a70d8996ab3f71260345af2f7bc89deab815a421d6c87c6591a9c3",
+          "bytes": 2699
+        },
+        {
+          "path": "skills/composition-patterns/references/upstream/rules/state-lift-state.md",
+          "upstreamPath": "skills/composition-patterns/rules/state-lift-state.md",
+          "sha256": "74c54038a6c554c748fe31cec673b80861b5d920b7553cf78cdf10d18b4b759b",
+          "bytes": 3224
+        }
+      ],
+      "entryPoint": "skills/composition-patterns/references/upstream/SKILL.md.original"
+    },
+    {
+      "id": "skills/ce-compound",
+      "repository": "https://github.com/EveryInc/compound-engineering-plugin",
+      "revision": "77cc431daaebea7ee9f33ac530a66eec5404572b",
+      "upstreamPath": "skills/ce-compound",
+      "license": {
+        "spdx": "MIT",
+        "sourcePath": "LICENSE",
+        "url": "https://github.com/EveryInc/compound-engineering-plugin/blob/77cc431daaebea7ee9f33ac530a66eec5404572b/LICENSE",
+        "localPath": "skills/ce-compound/references/upstream/LICENSE.upstream"
+      },
+      "files": [
+        {
+          "path": "skills/ce-compound/references/upstream/LICENSE.upstream",
+          "upstreamPath": "LICENSE",
+          "sha256": "61d89de7646effdaba2d0a4ab7bd0eba60b4094b83efe5bc73c7940e43e93fc6",
+          "bytes": 1062
+        },
+        {
+          "path": "skills/ce-compound/references/upstream/SKILL.md.original",
+          "upstreamPath": "skills/ce-compound/SKILL.md",
+          "sha256": "e14c0bdaef3c43e21e339192c7f6dcca8f79f8377647daf8411bf2852d586f57",
+          "bytes": 7761
+        },
+        {
+          "path": "skills/ce-compound/references/upstream/assets/resolution-template.md",
+          "upstreamPath": "skills/ce-compound/assets/resolution-template.md",
+          "sha256": "7c05dae946af399474b5a08bb06bff499932288bfc44f9c928698d14266954a8",
+          "bytes": 2842
+        },
+        {
+          "path": "skills/ce-compound/references/upstream/references/agents/best-practices-researcher.md",
+          "upstreamPath": "skills/ce-compound/references/agents/best-practices-researcher.md",
+          "sha256": "b229bd061837efcf0fc8a213d55cffcb6c180490ed102b2e8c8a88610508873d",
+          "bytes": 7302
+        },
+        {
+          "path": "skills/ce-compound/references/upstream/references/agents/data-integrity-guardian.md",
+          "upstreamPath": "skills/ce-compound/references/agents/data-integrity-guardian.md",
+          "sha256": "db9cd2ee40e30bdf8b84bb6abaff03f61b44a04218875637a651a66cbf0d7900",
+          "bytes": 3216
+        },
+        {
+          "path": "skills/ce-compound/references/upstream/references/agents/framework-docs-researcher.md",
+          "upstreamPath": "skills/ce-compound/references/agents/framework-docs-researcher.md",
+          "sha256": "ed69994ce16ca470c8a50b521dd9719bd2b3eb8c364958c42348274177bd76b7",
+          "bytes": 5551
+        },
+        {
+          "path": "skills/ce-compound/references/upstream/references/agents/pattern-recognition-specialist.md",
+          "upstreamPath": "skills/ce-compound/references/agents/pattern-recognition-specialist.md",
+          "sha256": "0d73822ccea06dd3e9a25e9e21e1908377cb9c5364b678b940fefef7f84c9580",
+          "bytes": 3675
+        },
+        {
+          "path": "skills/ce-compound/references/upstream/references/agents/performance-oracle.md",
+          "upstreamPath": "skills/ce-compound/references/agents/performance-oracle.md",
+          "sha256": "79abcaee9a66355d996937cc6562a507b4b8d2de52060be3153ecb2088941491",
+          "bytes": 4588
+        },
+        {
+          "path": "skills/ce-compound/references/upstream/references/agents/security-sentinel.md",
+          "upstreamPath": "skills/ce-compound/references/agents/security-sentinel.md",
+          "sha256": "66e7c91aacc31bc733fce2ddb748aa45575e35b088c37e41ee39be1c6112a2ce",
+          "bytes": 4159
+        },
+        {
+          "path": "skills/ce-compound/references/upstream/references/agents/session-historian.md",
+          "upstreamPath": "skills/ce-compound/references/agents/session-historian.md",
+          "sha256": "3bafb55f4a62ea98250a5d08a415fd16a1c9664792b77ff60dff692007c856f1",
+          "bytes": 7078
+        },
+        {
+          "path": "skills/ce-compound/references/upstream/references/assembly.md",
+          "upstreamPath": "skills/ce-compound/references/assembly.md",
+          "sha256": "5148fc5c6426737bc54f43cc38b2b6c81bf448c0ee3a66152c4b0ca89a01a9dc",
+          "bytes": 16887
+        },
+        {
+          "path": "skills/ce-compound/references/upstream/references/concepts-vocabulary.md",
+          "upstreamPath": "skills/ce-compound/references/concepts-vocabulary.md",
+          "sha256": "2f356b5d07c81965181327a0ee416bb8b4a734cc23487204f33bf25875c9e917",
+          "bytes": 9033
+        },
+        {
+          "path": "skills/ce-compound/references/upstream/references/enhancement.md",
+          "upstreamPath": "skills/ce-compound/references/enhancement.md",
+          "sha256": "bb33b6aac6bec47c843d024d0bfc021ab64017c254a4c9e746b05db7a1ed628a",
+          "bytes": 2738
+        },
+        {
+          "path": "skills/ce-compound/references/upstream/references/form.md",
+          "upstreamPath": "skills/ce-compound/references/form.md",
+          "sha256": "94cd23746a87d829a53e1750927a7920e4ad989fab38b40c701665f7d17c5343",
+          "bytes": 4447
+        },
+        {
+          "path": "skills/ce-compound/references/upstream/references/grounding-validation.md",
+          "upstreamPath": "skills/ce-compound/references/grounding-validation.md",
+          "sha256": "7344b3bcfbc44b8ee5bd78b978c2edab78eb4dceb9ef198ba228ae96c40ac5f1",
+          "bytes": 7326
+        },
+        {
+          "path": "skills/ce-compound/references/upstream/references/lightweight.md",
+          "upstreamPath": "skills/ce-compound/references/lightweight.md",
+          "sha256": "33b88905b29af6a56ea295efb37ec95bf46c504ff1990c888cbcd2957100cdda",
+          "bytes": 7480
+        },
+        {
+          "path": "skills/ce-compound/references/upstream/references/modes.md",
+          "upstreamPath": "skills/ce-compound/references/modes.md",
+          "sha256": "9e61b522763e1bce6195eed5bec9ca850e5464c48713fdcbf39b8cf08b269f0f",
+          "bytes": 1818
+        },
+        {
+          "path": "skills/ce-compound/references/upstream/references/refresh-and-discoverability.md",
+          "upstreamPath": "skills/ce-compound/references/refresh-and-discoverability.md",
+          "sha256": "06a90478804eff72824cdc28ed640ba40786862bb1bfedc92f294d07acbb1aef",
+          "bytes": 9868
+        },
+        {
+          "path": "skills/ce-compound/references/upstream/references/report.md",
+          "upstreamPath": "skills/ce-compound/references/report.md",
+          "sha256": "962ac530b5defa928241e9793abeee1f62787053fa33113ae21bb62811a3b3b4",
+          "bytes": 8050
+        },
+        {
+          "path": "skills/ce-compound/references/upstream/references/research.md",
+          "upstreamPath": "skills/ce-compound/references/research.md",
+          "sha256": "d87c23b7b0bb05f5677506cdff0725ad312d69d682ced3aefa933b014b2d2d27",
+          "bytes": 14599
+        },
+        {
+          "path": "skills/ce-compound/references/upstream/references/schema.yaml",
+          "upstreamPath": "skills/ce-compound/references/schema.yaml",
+          "sha256": "3adbcdcebe83593830769ca7b22103e72df82bda3b626f503d8fa2a6b20e8b97",
+          "bytes": 9756
+        },
+        {
+          "path": "skills/ce-compound/references/upstream/references/session-history.md",
+          "upstreamPath": "skills/ce-compound/references/session-history.md",
+          "sha256": "c65fbb9ca4cc0ba2a77eca9d41bec65e352ab6e0f1ae251f3e9b9463baf6f662",
+          "bytes": 9434
+        },
+        {
+          "path": "skills/ce-compound/references/upstream/references/yaml-schema.md",
+          "upstreamPath": "skills/ce-compound/references/yaml-schema.md",
+          "sha256": "b9c7027253398bfeaee503bde228f0b9279a047d01369cca01719b43210efd9a",
+          "bytes": 9203
+        },
+        {
+          "path": "skills/ce-compound/references/upstream/scripts/packs-resolve.py",
+          "upstreamPath": "skills/ce-compound/scripts/packs-resolve.py",
+          "sha256": "39c36946cd1a59ca564e60e4e049934831eb4bfb5cfce9de32ab6b4b522ef228",
+          "bytes": 31561
+        },
+        {
+          "path": "skills/ce-compound/references/upstream/scripts/session-history/discover-sessions.sh",
+          "upstreamPath": "skills/ce-compound/scripts/session-history/discover-sessions.sh",
+          "sha256": "f12ac7d98600d1116cfeed84503553df2fb412ef665caa20eff449b286efba24",
+          "bytes": 11345
+        },
+        {
+          "path": "skills/ce-compound/references/upstream/scripts/session-history/extract-errors.py",
+          "upstreamPath": "skills/ce-compound/scripts/session-history/extract-errors.py",
+          "sha256": "1232b5f148b30cdca0d9753ea5b054e55f766befa399c64a78a698b804ecc086",
+          "bytes": 9270
+        },
+        {
+          "path": "skills/ce-compound/references/upstream/scripts/session-history/extract-metadata.py",
+          "upstreamPath": "skills/ce-compound/scripts/session-history/extract-metadata.py",
+          "sha256": "33fd414ddff18562fd661c1d34b739c6640dfcd7ec5050e424bc11a269742201",
+          "bytes": 20599
+        },
+        {
+          "path": "skills/ce-compound/references/upstream/scripts/session-history/extract-skeleton.py",
+          "upstreamPath": "skills/ce-compound/scripts/session-history/extract-skeleton.py",
+          "sha256": "0ce683e6e97506816deb25fcbf428a8559de48cf81e25e6abbc0ad76933b0ed1",
+          "bytes": 21932
+        },
+        {
+          "path": "skills/ce-compound/references/upstream/scripts/validate-doc-claims.py",
+          "upstreamPath": "skills/ce-compound/scripts/validate-doc-claims.py",
+          "sha256": "24fae245bade400f7cb7a085ee68b08289f4d8b24481155a226ca976a2acf501",
+          "bytes": 20561
+        },
+        {
+          "path": "skills/ce-compound/references/upstream/scripts/validate-frontmatter.py",
+          "upstreamPath": "skills/ce-compound/scripts/validate-frontmatter.py",
+          "sha256": "580815f6b6030f5f3383972283927ff7354649b7b599b008941a9440d5a5e674",
+          "bytes": 5060
+        }
+      ],
+      "entryPoint": "skills/ce-compound/references/upstream/SKILL.md.original"
+    },
+    {
+      "id": "skills/spec-kit",
+      "repository": "https://github.com/github/spec-kit",
+      "revision": "882e42e15b10f71c21f1140173a449118098e8fa",
+      "upstreamPath": "templates",
+      "license": {
+        "spdx": "MIT",
+        "sourcePath": "LICENSE",
+        "url": "https://github.com/github/spec-kit/blob/882e42e15b10f71c21f1140173a449118098e8fa/LICENSE",
+        "localPath": "skills/spec-kit/references/upstream/LICENSE.upstream"
+      },
+      "files": [
+        {
+          "path": "skills/spec-kit/references/upstream/LICENSE.upstream",
+          "upstreamPath": "LICENSE",
+          "sha256": "2510b446bc1f0cf9702453075d20cd88631e20e5642658edb7325d9c1eb534f7",
+          "bytes": 1060
+        },
+        {
+          "path": "skills/spec-kit/references/upstream/REPOSITORY-README.md",
+          "upstreamPath": "README.md",
+          "sha256": "3baa99368443f26244b3a021b40eaf6f167ee591f5759c91315ad50d0a204592",
+          "bytes": 13539
+        },
+        {
+          "path": "skills/spec-kit/references/upstream/checklist-template.md",
+          "upstreamPath": "templates/checklist-template.md",
+          "sha256": "c65b7f10aa9a965ea9c7f4e879d4ab0240665473731c5e9e638c4acb3ca9afc4",
+          "bytes": 2088
+        },
+        {
+          "path": "skills/spec-kit/references/upstream/constitution-template.md",
+          "upstreamPath": "templates/constitution-template.md",
+          "sha256": "ce7549540fa45543cca797a150201d868e64495fdff39dc38246fb17bd4024b3",
+          "bytes": 2346
+        },
+        {
+          "path": "skills/spec-kit/references/upstream/plan-template.md",
+          "upstreamPath": "templates/plan-template.md",
+          "sha256": "dfba43da2b2a207ff8c177a0fba03af074fd45e261696b4b64172041fad2e992",
+          "bytes": 3770
+        },
+        {
+          "path": "skills/spec-kit/references/upstream/spec-template.md",
+          "upstreamPath": "templates/spec-template.md",
+          "sha256": "3945437fc35cd30a5b2bf7beea680337c3516826d3efa5a6b92c4a7eca1ba28e",
+          "bytes": 4556
+        },
+        {
+          "path": "skills/spec-kit/references/upstream/tasks-template.md",
+          "upstreamPath": "templates/tasks-template.md",
+          "sha256": "1e448e9153462e8c5b5a55231a54c756d870a82950d4dd9425a2bf5b7008a0d9",
+          "bytes": 9182
+        }
+      ],
+      "entryPoint": "skills/spec-kit/references/upstream/spec-template.md"
+    }
+  ]
+}

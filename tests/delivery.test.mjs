@@ -267,7 +267,10 @@ test('Release version preparation bumps past current and latest after target adv
   const first = await prepareReleaseVersion(ctx);
   assert.equal(first.version, '0.2.1');
   assert.equal((await prepareReleaseVersion(ctx)).version, '0.2.1');
-  ctx.state.release.tag = 'v0.2.1'; ctx.run.baseSha = ctx.run.headSha;
+  ctx.run.baseSha = ctx.run.headSha;
+  const synchronized = await prepareReleaseVersion(ctx);
+  assert.equal(synchronized.version, '0.2.1'); assert.equal(synchronized.changed, false);
+  ctx.state.release.tag = 'v0.2.1';
   const next = await prepareReleaseVersion(ctx);
   assert.equal(next.version, '0.2.2'); assert.equal(ctx.leases.size, 0);
 });
@@ -279,7 +282,13 @@ test('Release reconciliation skips newer drafts and uploads absent assets withou
   delete ctx.run.delivery.release; // Simulate crash after publication, before saving its receipt.
   ctx.state.releaseList = [{ tagName: 'v9.0.0', isDraft: true, isPrerelease: false }, { tagName: 'v0.2.0', isDraft: false, isPrerelease: false }];
   await rm(path.join(ctx.assets, 'SHA256SUMS'));
-  const resumed = await releasePackage({ ...ctx, mergeCommit: delivered.mergeCommit });
+  const controller = new AbortController(), runner = ctx.exec;
+  ctx.exec = async (command, args, options) => {
+    if (command === 'gh' && args[0] === 'release' && args[1] === 'upload') { assert.equal(options.signal, undefined); controller.abort(); }
+    return runner(command, args, options);
+  };
+  const resumed = await releasePackage({ ...ctx, mergeCommit: delivered.mergeCommit, signal: controller.signal });
+  assert.equal(controller.signal.aborted, true);
   assert.equal(resumed.sha256, release.sha256); assert.equal(ctx.state.publishes, 1);
   assert.equal((await readFile(path.join(ctx.assets, 'SHA256SUMS'), 'utf8')).trim(), `${release.sha256}  ${release.artifact}`);
   assert.equal(ctx.leases.size, 0);
@@ -291,4 +300,70 @@ test('Release refuses a dangling tag pointing to a different commit', async t =>
   await ctx.git('tag', 'v0.2.0', ctx.run.baseSha); await ctx.git('push', 'origin', 'v0.2.0');
   await assert.rejects(releasePackage({ ...ctx, mergeCommit: ctx.run.headSha }), { code: 'release_conflict' });
   assert.equal(ctx.state.publishes, 0); assert.equal(ctx.leases.size, 0);
+});
+
+test('Release subprocess environment excludes inherited credentials from npm tests builds and installed smoke', async t => {
+  const ctx = await fixture(t);
+  const delivered = await deliver(ctx);
+  const hostile = { NPM_TOKEN: 'fixture-npm-secret', AWS_SECRET_ACCESS_KEY: 'fixture-aws-secret', GH_TOKEN: 'fixture-github-secret', GEMINI_API_KEY: 'fixture-google-secret', KODO_GEMINI_API_KEY: 'fixture-kodo-google-secret' };
+  const before = Object.fromEntries(Object.keys(hostile).map(name => [name, process.env[name]]));
+  Object.assign(process.env, hostile);
+  const observed = [], runner = ctx.exec;
+  ctx.config.commands.test = [{ command: process.execPath, args: ['cli.mjs', 'validate'] }];
+  ctx.config.commands.build = [{ command: process.execPath, args: ['cli.mjs', '--help'] }];
+  ctx.exec = async (command, args, options) => {
+    if (!['git', 'gh'].includes(command)) {
+      observed.push({ command, args });
+      assert.ok(options.env);
+      for (const name of Object.keys(hostile)) assert.equal(options.env[name], undefined, `${command} inherited ${name}`);
+    } else assert.equal(options.env.GH_TOKEN, hostile.GH_TOKEN);
+    return runner(command, args, options);
+  };
+  try {
+    const release = await releasePackage({ ...ctx, mergeCommit: delivered.mergeCommit });
+    assert.equal(release.published, true);
+    assert.ok(observed.some(item => item.command === 'npm' && item.args[0] === 'pack'));
+    assert.ok(observed.some(item => item.command === 'npm' && item.args[0] === 'install'));
+    assert.equal(observed.filter(item => item.command === process.execPath).length, 5);
+    const native = await execute(process.execPath, ['-e', 'console.log(JSON.stringify(Object.fromEntries(Object.entries(process.env).filter(([name])=>/NPM_TOKEN|AWS_SECRET_ACCESS_KEY|GH_TOKEN|GEMINI_API_KEY/.test(name)))))']);
+    assert.deepEqual(JSON.parse(native.stdout), {});
+  } finally {
+    for (const [name, value] of Object.entries(before)) if (value === undefined) delete process.env[name]; else process.env[name] = value;
+  }
+});
+
+test('Cancellation during irreversible merge confirms and persists its successful receipt', async t => {
+  const ctx = await fixture(t), controller = new AbortController(), runner = ctx.exec;
+  ctx.exec = async (command, args, options) => {
+    if (command === 'gh' && args[0] === 'pr' && args[1] === 'merge') { assert.equal(options.signal, undefined); controller.abort(); }
+    return runner(command, args, options);
+  };
+  const receipt = await deliver({ ...ctx, signal: controller.signal });
+  assert.equal(controller.signal.aborted, true);
+  assert.equal(receipt.mergeCommit, ctx.run.headSha); assert.equal(ctx.run.delivery.mergeCommit, ctx.run.headSha);
+  assert.equal(ctx.state.merges, 1); assert.equal(ctx.leases.size, 0);
+});
+
+test('Cancellation during release creation verifies publication and saves its receipt', async t => {
+  const ctx = await fixture(t);
+  const delivered = await deliver(ctx), controller = new AbortController(), runner = ctx.exec;
+  ctx.exec = async (command, args, options) => {
+    if (command === 'gh' && args[0] === 'release' && args[1] === 'create') { assert.equal(options.signal, undefined); controller.abort(); }
+    return runner(command, args, options);
+  };
+  const receipt = await releasePackage({ ...ctx, mergeCommit: delivered.mergeCommit, signal: controller.signal });
+  assert.equal(controller.signal.aborted, true); assert.equal(receipt.published, true);
+  assert.equal(ctx.run.delivery.release.sha256, receipt.sha256); assert.equal(ctx.state.publishes, 1); assert.equal(ctx.leases.size, 0);
+});
+
+test('Cancellation before irreversible publication prevents release creation', async t => {
+  const ctx = await fixture(t);
+  const delivered = await deliver(ctx), controller = new AbortController(), runner = ctx.exec;
+  let listings = 0;
+  ctx.exec = async (command, args, options) => {
+    if (command === 'gh' && args[0] === 'release' && args[1] === 'list' && ++listings === 2) controller.abort();
+    return runner(command, args, options);
+  };
+  await assert.rejects(releasePackage({ ...ctx, mergeCommit: delivered.mergeCommit, signal: controller.signal }), { code: 'cancelled' });
+  assert.equal(ctx.state.publishes, 0); assert.equal(ctx.run.delivery.release, undefined); assert.equal(ctx.leases.size, 0);
 });

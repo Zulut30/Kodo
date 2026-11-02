@@ -3,6 +3,7 @@ import { spawn } from 'node:child_process';
 import { access, mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { workerEnvironment } from './security.mjs';
 
 const sha256 = value => createHash('sha256').update(value).digest('hex');
 const fail = (code, message, extra = {}) => Object.assign(new Error(message), { code, ...extra });
@@ -26,13 +27,14 @@ async function npmCommand() {
   throw fail('configuration', 'Cannot find npm-cli.js; install npm beside Node.js');
 }
 
-export async function execute(command, args, { cwd, signal, timeoutMs = 120000, allowFailure = false, env = process.env } = {}) {
+export async function execute(command, args, { cwd, signal, timeoutMs = 120000, allowFailure = false, env } = {}) {
+  const environment = ['git', 'gh'].includes(command) ? (env ?? process.env) : workerEnvironment(env ?? process.env);
   let executable = command, argv = args;
   if (command === 'npm') {
     const [node, prefix] = await npmCommand(); executable = node; argv = [...prefix, ...args];
   }
   return new Promise((resolve, reject) => {
-    const child = spawn(executable, argv, { cwd, env, signal, shell: false, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(executable, argv, { cwd, env: environment, signal, shell: false, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '', stderr = '', settled = false;
     const timer = setTimeout(() => { child.kill(); finish(fail('timeout', `${command} timed out`)); }, timeoutMs);
     const finish = (error, result) => { if (settled) return; settled = true; clearTimeout(timer); error ? reject(error) : resolve(result); };
@@ -52,16 +54,29 @@ function context(options) {
   const { run, config = {}, cwd = run.project, signal, store } = options;
   const runner = options.exec ?? execute;
   const leaseRegistry = new Map();
+  let finishingIrreversible = false;
+  const checkpoint = () => {
+    if (signal?.aborted) throw fail('cancelled', 'Delivery cancelled');
+    for (const lease of leaseRegistry.values()) if (lease.error) throw lease.error;
+  };
   const command = async (name, args, settings = {}) => {
-    if (signal?.aborted && !settings.ignoreAbort) throw fail('cancelled', 'Delivery cancelled');
-    if (!settings.ignoreAbort) for (const lease of leaseRegistry.values()) if (lease.error) throw lease.error;
-    const result = await runner(name, args, { cwd, signal: settings.ignoreAbort ? undefined : signal, ...settings });
+    if (!settings.reconcile && !finishingIrreversible) checkpoint();
+    const environment = ['git', 'gh'].includes(name) ? (settings.env ?? process.env) : workerEnvironment(settings.env ?? process.env);
+    const result = await runner(name, args, { cwd, ...settings, env: environment, signal: settings.ignoreAbort || finishingIrreversible ? undefined : signal });
     if (result.code && !settings.allowFailure) throw fail('command_failed', `${name} failed (${result.code}): ${(result.stderr ?? '').slice(-1500)}`, { exitCode: result.code, stderr: result.stderr });
     return result.stdout?.trimEnd() ?? '';
   };
   const event = async (type, data) => { await store?.event?.(run.id, type, data); await options.onEvent?.({ type, ...data }); };
   const save = async patch => { Object.assign(run, patch); await store?.updateRun?.(run.id, patch); };
-  return { ...options, run, config, cwd, signal, command, event, save, leaseRegistry, repository: config.repository, baseBranch: config.baseBranch ?? 'main' };
+  const irreversible = async action => {
+    checkpoint();
+    // Cancellation is honored before an irreversible unit. Once it has begun,
+    // finish its bounded confirmation/receipt sequence instead of killing a
+    // process whose remote mutation may already have succeeded.
+    const previous = finishingIrreversible; finishingIrreversible = true;
+    try { return await action(); } finally { finishingIrreversible = previous; }
+  };
+  return { ...options, run, config, cwd, signal, command, event, save, irreversible, leaseRegistry, repository: config.repository, baseBranch: config.baseBranch ?? 'main' };
 }
 
 function validateRepository(repository, branch) {
@@ -226,17 +241,21 @@ export async function deliver(options) {
     const currentBase = await fetchBase(ctx);
     if (currentBase !== ctx.run.baseSha) throw fail('stale_base', 'Target branch advanced; synchronize, retest and review before merge', { baseSha: currentBase });
     await awaitChecks(ctx, pr.number, head, required);
-    try { await ctx.command('gh', ['pr', 'merge', String(pr.number), '--repo', ctx.repository, '--squash', '--match-head-commit', head]); }
-    catch (error) {
-      if (await fetchBase(ctx) !== ctx.run.baseSha) throw fail('stale_base', 'Target branch changed while merging; synchronize and retry');
-      throw error;
-    }
-    const merged = await getPr(ctx, pr.number);
-    if (merged.state !== 'MERGED' || !merged.mergeCommit?.oid) throw fail('merge_pending', 'PR has not been confirmed merged');
-    const receipt = { ...saved, mergeCommit: merged.mergeCommit.oid };
-    await ctx.save({ delivery: receipt });
-    await ctx.event('delivery.merged', { pr: receipt.pr, mergeCommit: receipt.mergeCommit });
-    return receipt;
+    return await ctx.irreversible(async () => {
+      let mergeError;
+      try { await ctx.command('gh', ['pr', 'merge', String(pr.number), '--repo', ctx.repository, '--squash', '--match-head-commit', head], { ignoreAbort: true }); }
+      catch (error) { mergeError = error; }
+      const merged = await getPr(ctx, pr.number);
+      if (merged.state !== 'MERGED' || !merged.mergeCommit?.oid) {
+        if (await fetchBase(ctx) !== ctx.run.baseSha) throw fail('stale_base', 'Target branch changed while merging; synchronize and retry');
+        if (mergeError) throw mergeError;
+        throw fail('merge_pending', 'PR has not been confirmed merged');
+      }
+      const receipt = { ...saved, mergeCommit: merged.mergeCommit.oid };
+      await ctx.save({ delivery: receipt });
+      await ctx.event('delivery.merged', { pr: receipt.pr, mergeCommit: receipt.mergeCommit });
+      return receipt;
+    });
   } finally { await releaseOwnedLease(ctx, lease); }
 }
 
@@ -298,18 +317,19 @@ export async function prepareReleaseVersion(options) {
     const versions = releases.filter(item => !item.isDraft && !item.isPrerelease && /^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(item.tagName)).map(item => item.tagName.replace(/^v/, '')).sort(compareVersion);
     const latest = versions.at(-1);
     const saved = ctx.run.releaseAssignment;
+    const previousVersion = saved?.version === manifest.version ? saved.previousVersion : manifest.version;
     let version;
-    if (saved?.baseSha === ctx.run.baseSha && [saved.previousVersion, saved.version].includes(manifest.version) && (!latest || compareVersion(saved.version, latest) > 0)) version = saved.version;
+    if (saved && (manifest.version === saved.version || saved.baseSha === ctx.run.baseSha && manifest.version === saved.previousVersion) && (!latest || compareVersion(saved.version, latest) > 0)) version = saved.version;
     else if (ctx.config.delivery?.nextVersion) version = ctx.config.delivery.nextVersion;
     else if (!latest) version = ctx.config.delivery?.firstVersion ?? '0.2.0';
     else {
-      const greatest = compareVersion(manifest.version, latest) > 0 ? manifest.version : latest;
+      const greatest = compareVersion(previousVersion, latest) > 0 ? previousVersion : latest;
       const [major, minor, patch] = versionParts(greatest); version = `${major}.${minor}.${patch + 1}`;
     }
     versionParts(version);
     if (latest && compareVersion(version, latest) <= 0) throw fail('release_version_mismatch', 'Assigned release version must be newer than published releases');
     // Save intent before atomic metadata writes so a crash cannot bump twice.
-    const assignment = { version, previousVersion: saved?.version === version ? saved.previousVersion : manifest.version, baseSha: ctx.run.baseSha, prepared: false };
+    const assignment = { version, previousVersion: saved?.version === version ? saved.previousVersion : previousVersion, baseSha: ctx.run.baseSha, prepared: false };
     await ctx.save({ releaseAssignment: assignment });
     const files = [];
     if (manifest.version !== version) { manifest.version = version; await writeMetadata(filename, manifest); files.push('package.json'); }
@@ -407,31 +427,34 @@ export async function releasePackage(options) {
     const checksumFile = path.join(artifacts, 'SHA256SUMS');
     await writeFile(checksumFile, `${checksum}  ${filename}\n`);
     const smoke = await smokePackage(ctx, packed.filename, directory, manifest);
-    let url;
+    let existingInfo, notes;
     if (existing) {
-      const info = parse(await ctx.command('gh', ['release', 'view', tag, '--repo', ctx.repository, '--json', 'url,tagName,assets']), 'existing release');
-      // A process can die after creating the release but before uploading every
-      // asset. Upload only absent names; never replace an existing asset.
-      if (!info.assets?.some(asset => asset.name === filename)) await ctx.command('gh', ['release', 'upload', tag, packed.filename, '--repo', ctx.repository]);
-      if (!info.assets?.some(asset => asset.name === 'SHA256SUMS')) await ctx.command('gh', ['release', 'upload', tag, checksumFile, '--repo', ctx.repository]);
-      url = info.url;
+      existingInfo = parse(await ctx.command('gh', ['release', 'view', tag, '--repo', ctx.repository, '--json', 'url,tagName,assets']), 'existing release');
     } else {
       assertFreshRelease({ candidateSha: candidate, remoteHead: await fetchBase(ctx), latestSha, latestVersion: latest?.tagName, version });
       const latestBeforePublish = (await publishedReleases(ctx)).at(-1);
       if (latestBeforePublish?.tagName !== latest?.tagName) throw fail('stale_release', 'Published release state changed while preparing the package; prepare its version again');
-      const notes = path.join(directory, 'notes.md');
+      notes = path.join(directory, 'notes.md');
       await writeFile(notes, `Kodo ${version}\n\n${ctx.run.task}\n\nCommit: ${candidate}\nRun: ${ctx.run.id}\n\nSHA-256: ${checksum}\n\nPackage installation and CLI smoke checks passed on ${process.platform}, Node.js ${process.version}.\n`);
-      url = await ctx.command('gh', ['release', 'create', tag, packed.filename, checksumFile, '--repo', ctx.repository, '--target', candidate, '--title', `Kodo ${version}`, '--notes-file', notes, '--latest=false']);
     }
-    const published = await verifyPublishedArtifact(ctx, { tag, commit: candidate, artifact: filename, sha256: checksum }, directory);
-    url = published.url;
-    const receipt = { version, tag, commit: candidate, url, artifact: filename, artifactUrl: `https://github.com/${ctx.repository}/releases/download/${tag}/${filename}`, sha256: checksum, smoke, published: true };
-    await ctx.save({ delivery: { ...(ctx.run.delivery ?? {}), mergeCommit: candidate, release: receipt } });
-    await ctx.event('delivery.released', receipt);
-    return receipt;
+    return await ctx.irreversible(async () => {
+      if (existing) {
+        // A process can die after creating the release but before uploading every
+        // asset. Upload only absent names; never replace an existing asset.
+        if (!existingInfo.assets?.some(asset => asset.name === filename)) await ctx.command('gh', ['release', 'upload', tag, packed.filename, '--repo', ctx.repository], { ignoreAbort: true });
+        if (!existingInfo.assets?.some(asset => asset.name === 'SHA256SUMS')) await ctx.command('gh', ['release', 'upload', tag, checksumFile, '--repo', ctx.repository], { ignoreAbort: true });
+      } else {
+        await ctx.command('gh', ['release', 'create', tag, packed.filename, checksumFile, '--repo', ctx.repository, '--target', candidate, '--title', `Kodo ${version}`, '--notes-file', notes, '--latest=false'], { ignoreAbort: true });
+      }
+      const published = await verifyPublishedArtifact(ctx, { tag, commit: candidate, artifact: filename, sha256: checksum }, directory);
+      const receipt = { version, tag, commit: candidate, url: published.url, artifact: filename, artifactUrl: `https://github.com/${ctx.repository}/releases/download/${tag}/${filename}`, sha256: checksum, smoke, published: true };
+      await ctx.save({ delivery: { ...(ctx.run.delivery ?? {}), mergeCommit: candidate, release: receipt } });
+      await ctx.event('delivery.released', receipt);
+      return receipt;
+    });
   } finally {
     try {
-      if (source) await ctx.command('git', ['worktree', 'remove', '--force', source], { allowFailure: true, ignoreAbort: true }).catch(() => {});
+      if (source) await ctx.command('git', ['worktree', 'remove', '--force', source], { allowFailure: true, ignoreAbort: true, reconcile: true }).catch(() => {});
       if (directory) await safeRemove(directory, 'kodo-release-');
     } finally { await releaseOwnedLease(ctx, lease); }
   }

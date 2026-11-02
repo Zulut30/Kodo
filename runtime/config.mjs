@@ -12,6 +12,7 @@ export async function readConfig(project, overrides = {}) {
   let file = {};
   try { file = JSON.parse(await readFile(path.join(project, 'kodo.config.json'), 'utf8')); } catch (error) { if (error.code !== 'ENOENT') throw error; }
   const config = { ...defaults, ...file, ...overrides, models: { ...defaults.models, ...file.models }, commands: { ...defaults.commands, ...file.commands }, delivery: { ...defaults.delivery, ...file.delivery } };
+  if (overrides.client && overrides.client !== (file.client || defaults.client) && !Object.hasOwn(overrides, 'primaryModel')) config.primaryModel = file.primaryModels?.[overrides.client] || null;
   if (config.schemaVersion !== 1 || !['codex', 'claude-code'].includes(config.client) || !Number.isInteger(config.concurrency) || config.concurrency < 1 || config.concurrency > 2 || !Number.isInteger(config.repairRounds) || config.repairRounds < 1 || config.repairRounds > 3 || !Number.isInteger(config.researchBudget) || config.researchBudget < 0 || config.researchBudget > 40 || !Array.isArray(config.checks)) throw new Error('Некорректная конфигурация Kodo');
   for (const kind of ['test', 'build', 'deploy', 'smoke']) if (!Array.isArray(config.commands[kind]) || config.commands[kind].some(item => typeof item.command !== 'string' || !Array.isArray(item.args) || item.args.some(arg => typeof arg !== 'string'))) throw new Error(`Некорректные команды ${kind}`);
   return config;

@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { Engine } from '../runtime/engine.mjs';
 import { Store } from '../runtime/store.mjs';
+import { makeWorktree } from '../runtime/workspace.mjs';
 
 const read = filename => readFile(filename, 'utf8');
 async function exists(filename) { try { await access(filename); return true; } catch (error) { if (error.code === 'ENOENT') return false; throw error; } }
@@ -459,4 +460,123 @@ test('Engine honours persisted cancellation after merge and does not publish a r
   assert.equal(result.delivery.mergeCommit, result.headSha, 'cancellation must retain the already completed merge receipt');
   assert.equal(services.calls.release, 0, 'cancellation must stop the next external mutation');
   assert.equal(store.getRun(run.id).cancelRequested, true);
+});
+
+async function integrationConflict(t, resolver, secrets = {}) {
+  const fx = await fixture(t, { testScript: 'process.exit(0);\n' });
+  const tasks = [node('first', 'developer', ['src/value.mjs']), node('second', 'developer', ['src/value.mjs'])];
+  const plan = { summary: 'Preserve both independent changes to the value module.', tasks };
+  const services = fakeServices({ plan, onWorker: resolver });
+  const store = fx.openStore(), engine = new Engine({ store, secrets, ...services });
+  const run = await engine.create('Preserve both changes', { project: fx.project });
+  await engine.prepare(run);
+  run.plan = plan;
+  run.models = await services.provider.discoverProviders();
+  for (const [index, task] of tasks.entries()) {
+    const cwd = path.join(store.home, 'worktrees', run.id, task.id);
+    const branch = `kodo/${run.id}-${task.id}`;
+    await makeWorktree(fx.project, cwd, branch, fx.base);
+    await writeFile(path.join(cwd, 'src/value.mjs'), `export const value = ${index + 2};\nexport const ${task.id}Change = true;\n`);
+    git(cwd, 'add', 'src/value.mjs'); git(cwd, 'commit', '-m', `${task.id} independent change`);
+    run.nodes[task.id] = { id: task.id, attempt: 1, status: 'completed', cwd, branch, baseSha: fx.base, headSha: git(cwd, 'rev-parse', 'HEAD') };
+  }
+  engine.save(run);
+  await engine.integrateNode(run, tasks[0]);
+  return { ...fx, engine, store, run, tasks, services };
+}
+
+const combinedModule = 'export const value = 2;\nexport const firstChange = true;\nexport const secondChange = true;\n';
+
+test('Engine coordinator stages resolver edits before completing a node merge conflict', async t => {
+  let resolutions = 0;
+  const fx = await integrationConflict(t, async request => {
+    resolutions++;
+    assert.match(request.prompt, /conflict/i);
+    await writeFile(path.join(request.cwd, 'src/value.mjs'), combinedModule);
+    // The resolver deliberately does not stage or commit; the coordinator owns Git.
+    return { sessionId: 'edit-only-resolver', output: { summary: 'preserved both changes', checks: [], complete: true } };
+  });
+  await fx.engine.integrateNode(fx.run, fx.tasks[1]);
+  assert.equal(resolutions, 1);
+  assert.equal(fx.run.nodes.second.status, 'integrated');
+  assert.equal(await read(path.join(fx.run.cwd, 'src/value.mjs')), combinedModule);
+  assert.equal(git(fx.run.cwd, 'status', '--porcelain'), '');
+  assert.equal(git(fx.run.cwd, 'rev-parse', 'HEAD'), fx.run.headSha);
+  assert.equal(await exists(path.join(fx.project, 'src/value.mjs')), true);
+  assert.equal(await read(path.join(fx.project, 'src/value.mjs')), 'export const value = 0;\n');
+});
+
+test('Engine resumes a staged resolved node merge without rerunning the resolver', async t => {
+  let resolutions = 0;
+  const fx = await integrationConflict(t, async () => {
+    resolutions++;
+    throw new Error('resolved staged merge must not need another resolver session');
+  });
+  const merge = spawnSync('git', ['merge', '--no-ff', '--no-edit', fx.run.nodes.second.branch], { cwd: fx.run.cwd, encoding: 'utf8', windowsHide: true });
+  assert.equal(merge.status, 1, merge.stderr);
+  assert.match(git(fx.run.cwd, 'diff', '--name-only', '--diff-filter=U'), /src\/value.mjs/);
+  await writeFile(path.join(fx.run.cwd, 'src/value.mjs'), combinedModule);
+  git(fx.run.cwd, 'add', 'src/value.mjs');
+  assert.equal(git(fx.run.cwd, 'diff', '--name-only', '--diff-filter=U'), '');
+  const resumed = fx.store.getRun(fx.run.id);
+  await fx.engine.integrateNode(resumed, fx.tasks[1]);
+  assert.equal(resolutions, 0);
+  assert.equal(resumed.nodes.second.status, 'integrated');
+  assert.equal(await read(path.join(resumed.cwd, 'src/value.mjs')), combinedModule);
+  assert.equal(git(resumed.cwd, 'status', '--porcelain'), '');
+  assert.equal(git(resumed.cwd, 'rev-parse', 'HEAD'), resumed.headSha);
+});
+
+test('Engine rejects resolver scope violations and secret writes before merge commit', async t => {
+  const cases = [
+    { id: 'outside-scope', secret: false, expected: /вне области задачи: untouched.txt/ },
+    { id: 'secret-in-owned-file', secret: true, expected: /Секрет обнаружен/ }
+  ];
+  for (const entry of cases) await t.test(entry.id, async subtest => {
+    const secret = 'fixture-private-secret-for-resolver-only';
+    const fx = await integrationConflict(subtest, async request => {
+      await writeFile(path.join(request.cwd, 'src/value.mjs'), combinedModule + (entry.secret ? `export const accidentalKey = '${secret}';\n` : ''));
+      if (!entry.secret) await writeFile(path.join(request.cwd, 'untouched.txt'), 'unauthorized resolver edit\n');
+      return { sessionId: 'invalid-resolver', output: { summary: 'resolved', checks: [], complete: true } };
+    }, { GEMINI_API_KEY: secret });
+    const before = git(fx.run.cwd, 'rev-parse', 'HEAD');
+    await assert.rejects(fx.engine.integrateNode(fx.run, fx.tasks[1]), entry.expected);
+    assert.equal(git(fx.run.cwd, 'rev-parse', 'HEAD'), before);
+    assert.notEqual(fx.run.nodes.second.status, 'integrated');
+    assert.equal(await read(path.join(fx.project, 'untouched.txt')), 'committed content\n');
+  });
+});
+
+test('Engine scopes review repairs to the repair starting head instead of earlier coordinator release edits', async t => {
+  const fx = await fixture(t, { remote: true, config: { repairRounds: 2 }, testScript: "import assert from 'node:assert/strict'; import {value} from './src/value.mjs'; assert.equal(value, 2);\n" });
+  const plan = { summary: 'Set value two.', tasks: [node('feature', 'developer', ['src/value.mjs'])] };
+  let repairs = 0;
+  const services = fakeServices({ plan, onWorker: async request => {
+    if (request.role === 'developer') await writeFile(path.join(request.cwd, 'src/value.mjs'), 'export const value = 2;\n');
+    else {
+      assert.match(request.prompt, /Repair confirmed failures/);
+      repairs++;
+      await writeFile(path.join(request.cwd, 'src/value.mjs'), 'export const value = 2;\nexport const reviewFix = true;\n');
+    }
+    return { sessionId: `versioned-repair-${services.calls.worker.length}`, output: { summary: 'implemented', checks: [], complete: true } };
+  }, onReview: async (_request, calls) => ({
+    sessionId: `versioned-review-${calls.review.length}`,
+    output: calls.review.length === 1
+      ? { passed: false, findings: [{ file: 'src/value.mjs', severity: 'major', problem: 'reviewFix marker missing', fix: 'Add the marker' }] }
+      : { passed: true, findings: [] }
+  }) });
+  services.delivery.prepareReleaseVersion = async ({ cwd }) => {
+    await writeFile(path.join(cwd, 'coordinator-release-version.txt'), '0.2.0\n');
+  };
+  const engine = new Engine({ store: fx.openStore(), ...services });
+  const run = await engine.create('Implement value two with reviewFix', { project: fx.project });
+  const result = await engine.run(run.id);
+  assert.equal(result.state, 'succeeded', result.error?.message);
+  assert.equal(repairs, 1);
+  assert.equal(services.calls.review.length, 2);
+  assert.equal(await read(path.join(result.cwd, 'coordinator-release-version.txt')), '0.2.0\n');
+  assert.match(await read(path.join(result.cwd, 'src/value.mjs')), /reviewFix = true/);
+  assert.equal(result.checks.headSha, result.headSha);
+  assert.equal(result.review.headSha, result.headSha);
+  assert.equal(await exists(path.join(fx.project, 'coordinator-release-version.txt')), false);
 });
