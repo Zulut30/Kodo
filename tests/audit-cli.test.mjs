@@ -190,6 +190,24 @@ test('Audit CLI ignores broken credentials and configs without changing saved st
   assert.deepEqual(await nonDatabaseSnapshot(f.root), beforeFiles, 'no config, credential or worktree writes');
 });
 
+test('Audit CLI reads saved state with filesystem writes forbidden', async t => {
+  const f = await fixture(t);
+  const beforeState = stateSnapshot(f.home), beforeFiles = await nonDatabaseSnapshot(f.root);
+  // A read-only query must work without granting fs.write to the CLI process.
+  // This detects opening SQLite in write mode even if no run rows are changed.
+  const result = spawnSync(process.execPath, [
+    '--permission', '--allow-fs-read=*', '--import', guardUrl, cli, 'audit', f.id, '--json'
+  ], { cwd: f.cwd, env: f.env, encoding: 'utf8', timeout: 15_000, windowsHide: true });
+  assert.ifError(result.error);
+  assert.equal(result.signal, null, 'CLI must terminate without timeout or signal');
+  const report = JSON.parse(success(result));
+  assert.equal(report.runId, f.id);
+  assert.equal(report.skills.complete, true);
+  assert.equal(report.evidenceLevel, 'recorded-instructions');
+  assert.deepEqual(stateSnapshot(f.home), beforeState);
+  assert.deepEqual(await nonDatabaseSnapshot(f.root), beforeFiles);
+});
+
 test('Audit CLI unknown run does not initialize a missing state home', async t => {
   const f = await fixture(t);
   const absentHome = path.join(f.root, 'never-initialized-state');
