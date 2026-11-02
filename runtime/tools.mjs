@@ -84,7 +84,7 @@ function desktopHelper(platform, arch) {
 }
 function invocation(tool, directory, platform, arch) {
   if (tool.kind === 'python') return {
-    command: pythonPath(directory, platform), args: tool.id === 'semgrep' ? ['-I', '-B', '-m', 'semgrep'] : ['-I', '-B'],
+    command: pythonPath(directory, platform), args: tool.id === 'semgrep' ? ['-I', '-B', '-c', 'from semgrep.console_scripts.entrypoint import main; main()'] : ['-I', '-B'],
     env: { PYTHONDONTWRITEBYTECODE: '1', PYTHONNOUSERSITE: '1', ANONYMIZED_TELEMETRY: 'false', SEMGREP_SEND_METRICS: 'off', SEMGREP_ENABLE_VERSION_CHECK: '0' }
   };
   if (tool.kind === 'native') return { command: path.join(directory, 'native', tool.assets[`${platform}-${arch}`].executable), args: [], env: {} };
@@ -112,7 +112,7 @@ async function verifyNpm(tool, directory, platform, arch, installed = true) {
       const expected = (await readFile(binary + '.sha256', 'utf8')).trim();
       if (!/^[a-f0-9]{64}$/i.test(expected) || await fileHash(binary) !== expected.toLowerCase()) throw new Error('Desktop binary checksum mismatch');
     }
-  } else if (pkg.bin?.['chrome-devtools-mcp'] !== tool.entry) throw new Error('Unexpected Chrome MCP entrypoint');
+  } else if (![tool.entry, './' + tool.entry].includes(pkg.bin?.['chrome-devtools-mcp'])) throw new Error('Unexpected Chrome MCP entrypoint');
 }
 async function validateInstallation(tool, directory, platform, arch) {
   const call = invocation(tool, directory, platform, arch);
@@ -161,6 +161,7 @@ function environment(directory, extra = {}) {
     UV_CACHE_DIR: path.join(privateHome, 'uv-cache'), UV_PYTHON_INSTALL_DIR: path.join(privateHome, 'python'), UV_NO_CONFIG: '1', UV_PYTHON_DOWNLOADS: 'never', UV_KEYRING_PROVIDER: 'disabled',
     PIP_CONFIG_FILE: process.platform === 'win32' ? 'NUL' : '/dev/null', PIP_DISABLE_PIP_VERSION_CHECK: '1', PYTHONNOUSERSITE: '1', PYTHONDONTWRITEBYTECODE: '1',
     GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: path.join(privateHome, 'empty.gitconfig'), GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never',
+    GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.longpaths', GIT_CONFIG_VALUE_0: 'true',
     NO_UPDATE_CHECKS: '1', DO_NOT_TRACK: '1', ANONYMIZED_TELEMETRY: 'false', SEMGREP_SEND_METRICS: 'off', SEMGREP_ENABLE_VERSION_CHECK: '0', ...extra };
 }
 async function run(runner, command, args, directory, signal, extra = {}, timeoutMs = 300000) {

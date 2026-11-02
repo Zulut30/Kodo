@@ -30,7 +30,7 @@ async function fixture(t) {
 
 // This fakes only external installation/probing. Resolver, hashes, receipts and
 // all files they inspect are real. These are never live-tool acceptance results.
-function npmRunner({ badIntegrity = false, badChecksum = false, failProbe = false } = {}) {
+function npmRunner({ badIntegrity = false, badChecksum = false, failProbe = false, binPrefix = '' } = {}) {
   const calls = [];
   const runner = async (command, args, options) => {
     calls.push({ command, args, options });
@@ -46,7 +46,7 @@ function npmRunner({ badIntegrity = false, badChecksum = false, failProbe = fals
       } else {
         const folder = path.join(target, 'node_modules', id);
         await mkdir(path.join(folder, 'bin'), { recursive: true });
-        await writeFile(path.join(folder, 'package.json'), JSON.stringify({ name: id, version, bin: { [id]: 'build/src/bin/chrome-devtools-mcp.js' } }));
+        await writeFile(path.join(folder, 'package.json'), JSON.stringify({ name: id, version, bin: { [id]: binPrefix + 'build/src/bin/chrome-devtools-mcp.js' } }));
         if (id === 'agent-desktop') {
           const name = `agent-desktop-${process.platform}-${process.arch}${process.platform === 'win32' ? '.exe' : ''}`;
           const bytes = Buffer.from('offline native fixture');
@@ -181,7 +181,7 @@ function pythonRunner({ malformed = false, wrongCommit = false, missingAsset = f
       assert.ok(!args.includes('--system') && !args.includes('--upgrade'));
       assert.equal(args[args.indexOf('--link-mode') + 1], 'copy');
       await writeFile(path.join(options.cwd, 'venv', 'package-code.py'), '# offline source fixture');
-    } else if (args.includes('--version')) return { code: 0, stdout: '1.183.0\n', stderr: '' };
+    } else if (args.includes('--version')) return args.includes('-m') && args.includes('semgrep') ? { code: 2, stdout: '', stderr: 'python -m semgrep is deprecated' } : { code: 0, stdout: '1.183.0\n', stderr: '' };
     else {
       if (malformed) return { code: 0, stdout: 'installed!', stderr: '' };
       if (missingAsset) return { code: 1, stdout: '', stderr: 'Missing snapshot asset' };
@@ -192,6 +192,26 @@ function pythonRunner({ malformed = false, wrongCommit = false, missingAsset = f
   };
   return { runner, calls };
 }
+
+test('Chrome MCP accepts the pinned package relative bin spelling and rejects traversal', async t => {
+  const fx = await fixture(t), good = npmRunner({ binPrefix: './' });
+  assert.equal((await installTools(['chrome-devtools-mcp'], { ...fx, runner: good.runner }))[0].ready, true);
+  const other = await fixture(t), bad = npmRunner({ binPrefix: '../' });
+  assert.equal((await installTools(['chrome-devtools-mcp'], { ...other, runner: bad.runner }))[0].ready, false);
+});
+
+test('Semgrep invokes its supported console entry and uv Git uses invocation-local long paths', async t => {
+  const fx = await fixture(t), fake = pythonRunner();
+  const results = await installTools(['semgrep','browser-use'], { ...fx, runner: fake.runner });
+  assert.ok(results.every(r => r.ready), JSON.stringify(results));
+  const semgrep = results[0];
+  assert.ok(semgrep.args.includes('-c'));
+  assert.ok(semgrep.args.some(arg => arg.includes('semgrep.console_scripts.entrypoint')));
+  const pip = fake.calls.find(c => c.command === 'uv' && c.args[0] === 'pip');
+  assert.equal(pip.options.env.GIT_CONFIG_COUNT, '1');
+  assert.equal(pip.options.env.GIT_CONFIG_KEY_0, 'core.longpaths');
+  assert.equal(pip.options.env.GIT_CONFIG_VALUE_0, 'true');
+});
 
 test('Python installs the four compatible pins together and Semgrep separately, never into user/global environments', async t => {
   const fx = await fixture(t), fake = pythonRunner();
