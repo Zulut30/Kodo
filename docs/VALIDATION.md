@@ -27,6 +27,50 @@ node scripts/package-smoke.mjs
 
 Также проверяются отмена, неверные контракты, недоступность Jev и источника исследования, пересекающиеся области записи, сохранность пользовательских файлов, повторные проверки после ревью и изменения main, Git hooks/окружение, свежесть тегов, права хранилища и подмена артефактов. Все три пресета включают стандартные навыки и чат-вход Kodo; dry-run не создаёт целевой каталог.
 
+## Целевые проверки аудита
+
+```powershell
+node --test --test-reporter=spec tests/audit.test.mjs tests/audit-cli.test.mjs
+```
+
+В документирующем worktree на базе `14d724a1d65865150c9abe8c797a48fd75bd547b` 2 ноября 2026 года выполнен локальный прогон на Windows, Node.js `v24.19.0`: **127 passed, 0 failed, 0 skipped**. Проверены существующая реализация и независимые контрактные тесты; код и тесты в этом этапе не менялись. Это целевая локальная проверка, а не результат общего CI, native-клиента, опубликованного пакета или развёртывания. Полные `npm run check`, упаковку и выпуск после интеграции выполняет координатор.
+
+`tests/audit.test.mjs` проверяет публичный `buildAuditReport(run)` на самостоятельно заданных фикстурах. `tests/audit-cli.test.mjs` запускает реальный CLI отдельным процессом с временной SQLite-базой, без проекта и доступных Git-команд. Сетевые обращения, дочерние процессы и чтение файлов ключей/конфигурации перехватываются как ошибки. Отдельный subprocess запускает CLI без права записи файлов. Неизменность проверяется для логических таблиц состояния и файлов вне SQLite; для старой базы также сравниваются байты, список файлов и схема. Это не обращение к реальным провайдерам.
+
+Ниже точные имена ключевых тестов; параметризованные варианты дополнительно проверяют все этапы, допустимые подмножества ролей, типы полей и неверные флаги.
+
+| Требование | Точное имя теста |
+| --- | --- |
+| Синхронный отчёт и точная схема | `Audit report exports a synchronous allowlisted schema with canonical complete coverage` |
+| Все ID совпадают с публичным набором | `Audit fixtures cover all 13 public default skill IDs` |
+| Перестановка решений не нарушает полноту | `Audit normalizes shuffled stage records and skill decisions deterministically` |
+| Только роли текущего плана, без дубликатов | `Audit derives expected stages from subset roles tester,tester` |
+| Отсутствующая стадия | `Audit detects missing expected stage tester` |
+| Отсутствующий или пустой план исключает полноту | `Audit cannot claim completeness with missing tasks`; `Audit cannot claim completeness with empty tasks` |
+| Необязательный repair проверяется при наличии | `Audit includes repair only when recorded and validates it` |
+| Лишний известный этап тоже проверяется | `Audit validates recorded known stages even when their roles are not required` |
+| Неизвестный этап не даёт полного покрытия | `Audit rejects unknown recorded stages without leaking their payload` |
+| Формат хеша, уникальность ID и revision | `Audit invalidates uppercase hash`; `Audit invalidates duplicate default skill`; `Audit invalidates uppercase revision for applicable and non-applicable skills` |
+| Неприменимость учитывается, семантика не доказана | `Audit accepts valid non-applicable decisions without claiming semantic compliance` |
+| Квитанции фильтруются, полнота не равна успеху | `Audit allowlists receipts and omits tasks prompts source paths config and provider output` |
+| Вложенные значения не обходят список полей | `Audit does not copy nested arbitrary values through malformed allowlisted receipt fields` |
+| `false` и `0` сохраняются без приведения типов | `Audit preserves false receipt booleans and zero exit codes without coercing malformed scalars` |
+| Вложенный вход остаётся неизменным | `Audit never mutates nested input including shuffled arrays malformed policies and receipts` |
+| Чистая функция не требует записи или subprocess | `Audit pure builder succeeds with filesystem writes and child processes forbidden` |
+| CLI работает вне проекта | `Audit CLI JSON reads a saved run from an unrelated no-config cwd` |
+| Ключи и конфигурация не читаются, состояние сохраняется | `Audit CLI ignores broken credentials and configs without changing saved state or worktrees` |
+| CLI работает при запрете записи | `Audit CLI reads saved state with filesystem writes forbidden` |
+| Отсутствующая база не создаётся | `Audit CLI unknown run does not initialize a missing state home` |
+| Старая база остаётся без миграции | `Audit CLI reads a legacy saved run without changing database bytes or adding schema` |
+| Старый запуск читается с кодом 0 и неполным покрытием | `Audit CLI returns exit zero and incomplete JSON for old saved runs` |
+| Некорректная политика не превращается в ошибку чтения | `Audit CLI returns exit zero with invalid recorded policy flagged` |
+| Текст объясняет пределы доказательств | `Audit CLI text explains coverage missing and invalid stages applied skills and evidence limits` |
+| Неизвестный ID даёт ошибку без изменения состояния | `Audit CLI rejects an unknown run in JSON mode without state changes` |
+| Неверные аргументы отклоняются | `Audit CLI rejects missing ID`; `Audit CLI rejects duplicate JSON flag`; `Audit CLI rejects unknown flag` |
+| Команда видна в справке | `Audit CLI help advertises audit RUN_ID and optional JSON output` |
+
+Красная фаза TDD и последующая зелёная проверка другим тестовым узлом требуют отдельных свидетельств координатора; этот прогон документации подтверждает только текущее зелёное состояние. Наличие в тесте комментария о RED не доказывает прежнее падение. Для приёмки текущего запуска также нужны независимое ревью, protected PR, merge и проверка выпущенного пакета. Их успех здесь не заявлен. [Граница отчёта](decisions/0001-run-audit-evidence.md).
+
 ## Реальная приёмка пайплайна
 
 | Прогон | Наблюдаемый результат |
