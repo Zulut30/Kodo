@@ -639,17 +639,38 @@ export class Engine {
       run.checks = null; run.review = null; run.uiVerification = null; run.securityChecks = null; this.save(run); this.log(run, 'repair_recovered', { headSha: run.headSha });
     }
   }
+  async repairVerification(run, signal) {
+    const cycle = run.verification, pending = cycle.pendingRepair;
+    const scopes = run.plan.tasks.flatMap(task => task.writePaths);
+    this.checkCancelled(run, signal);
+    if (!pending.complete) {
+      if (!pending.researched) { await this.moreResearch(run, pending.problem, signal); pending.researched = true; this.save(run); }
+      const selected = this.primary(run);
+      const response = await this.session(run, { client: selected.client, model: selected.model, cwd: run.cwd, schema: resultSchema, sessionId: pending.sessionId,
+        prompt: `Repair confirmed failures in task ${run.task.slice(0, 1000)}. Do not commit/push/deploy, do not weaken checks. Change only these scopes ${JSON.stringify(scopes)}. Failures: ${pending.problem.slice(0, 6000)}. Evidence directory (read only relevant gate receipts): ${run.artifacts}. Return completion JSON.` }, signal, undefined, pending);
+      if (!response.output.complete) throw new Error('Исправление проверки не завершено');
+      pending.sessionId = response.sessionId || pending.sessionId; pending.complete = true; this.save(run);
+    }
+    this.checkCancelled(run, signal);
+    await this.checkScope(run.cwd, pending.headSha, scopes); await commitChanges(run.cwd, `Kodo repair checks ${cycle.attempt}`);
+    delete cycle.pendingRepair;
+    run.checks = null; run.review = null; run.uiVerification = null; run.securityChecks = null; this.save(run);
+  }
   async verify(run, signal) {
     const cycle = run.verification ||= { attempt: 0, cycle: 1 };
     if (cycle.stopped || cycle.attempt >= run.config.repairRounds) {
       if (!cycle.stopped) { cycle.stopped = 'repair_budget_exhausted'; this.assess(run, { scope: 'verification', attempts: cycle.attempt, reason: cycle.stopped, problem: run.error?.message || 'Verification budget exhausted; remaining checks require an explicit new cycle' }); }
       throw Object.assign(new Error('Verification repair cycle stopped; use --retry-failed for a new cycle'), { code: 'blocked' });
     }
-    for (let attempt = cycle.attempt; attempt < run.config.repairRounds; attempt++) {
+    while (cycle.attempt < run.config.repairRounds) {
+      // A failed round reserves its repair durably. Interruptions resume that
+      // repair before a new round can interpret the same HEAD as no progress.
+      if (cycle.pendingRepair) await this.repairVerification(run, signal);
+      const attempt = cycle.attempt;
       let checkError;
       try { run.uiVerification = null; run.securityChecks = null; run.review = null; this.save(run); await this.checks(run, signal); await this.verificationGates(run, signal); } catch (error) {
         if (signal?.aborted || this.store.getRun(run.id).cancelRequested) throw Object.assign(new Error('Запуск отменён'), { code: 'cancelled' });
-        if (['cancelled','quota','auth'].includes(error.code)) throw error;
+        if (['cancelled','quota','auth','lease_lost'].includes(error.code)) throw error;
         checkError = error;
       }
       const headSha = await git(run.cwd, ['rev-parse', 'HEAD']);
@@ -678,21 +699,13 @@ export class Engine {
       this.log(run, 'repair_required', { attempt, problem });
       const signature = contentHash({ problem, headSha });
       const repeated = cycle.lastFailure === signature;
-      cycle.attempt = attempt + 1; cycle.lastFailure = signature; this.save(run);
+      cycle.attempt = attempt + 1; cycle.lastFailure = signature;
       if (repeated || cycle.attempt >= run.config.repairRounds) {
         cycle.stopped = cycle.attempt >= run.config.repairRounds ? 'repair_budget_exhausted' : 'no_progress';
         this.assess(run, { scope: 'verification', attempts: cycle.attempt, reason: cycle.stopped, problem });
         throw Object.assign(new Error(`Проверки не пройдены: ${problem}`), { code: 'blocked' });
       }
-      await this.moreResearch(run, problem, signal);
-      const scopes = run.plan.tasks.flatMap(task => task.writePaths);
-      const beforeRepair = await git(run.cwd, ['rev-parse', 'HEAD']);
-      const selected = this.primary(run);
-      const response = await this.session(run, { client: selected.client, model: selected.model, cwd: run.cwd, schema: resultSchema,
-        prompt: `Repair confirmed failures in task ${run.task.slice(0, 1000)}. Do not commit/push/deploy, do not weaken checks. Change only these scopes ${JSON.stringify(scopes)}. Failures: ${problem.slice(0, 6000)}. Evidence directory (read only relevant gate receipts): ${run.artifacts}. Return completion JSON.` }, signal);
-      if (!response.output.complete) throw new Error('Исправление проверки не завершено');
-      await this.checkScope(run.cwd, beforeRepair, scopes); await commitChanges(run.cwd, `Kodo repair checks ${attempt + 1}`);
-      run.checks = null; run.review = null; run.uiVerification = null; run.securityChecks = null; this.save(run);
+      cycle.pendingRepair = { headSha, problem }; this.save(run);
     }
   }
   async run(id, { prepare = false, planFile, signal, resumeCancelled = false, retryFailed = false } = {}) {
