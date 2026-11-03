@@ -48,7 +48,7 @@ async function nodeBudgetFixture(t, limit, { untracked = false } = {}) {
   store = new Store(home, { GEMINI_API_KEY: secret });
   const workerFile = untracked ? 'src/new.mjs' : 'src/value.mjs';
   const requests = [], task = { id: 'feature', role: 'developer', description: 'Implement ' + workerFile,
-    writePaths: [workerFile], acceptance: ['Keep the value finite'], interfaces: ['value is a number'], constraints: ['Subscription only'], dependsOn: [], parallel: false };
+    writePaths: [workerFile], acceptance: ['Keep the value finite', 'Interface: value is a number', 'Constraint: Subscription only'], dependsOn: [], parallel: false };
   const provider = {
     discoverProviders: async () => [{ id: 'subscription-fixture', client: 'codex', model: 'gpt-6.1-sol', available: true }],
     decideJev: async () => ({ model: 'subscription-fixture', parallel: false, confidence: 1, sessionMode: 'fresh' }),
