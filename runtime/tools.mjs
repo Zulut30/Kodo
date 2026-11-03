@@ -14,6 +14,7 @@ import catalog from './tool-catalog.json' with { type: 'json' };
 import { execute } from './command.mjs';
 import { stateHome, workerEnvironment } from './security.mjs';
 import { createVenvScript, downloadScript, extractNativeArchive, fileHash, inside, inventory, noLinks, pythonProbeScript, relativeFile, sha256 } from './toolchains.mjs';
+import { formatRtkContext, isManagedRtkReady } from './rtk.mjs';
 
 function freeze(value) {
   if (value && typeof value === 'object') { for (const item of Object.values(value)) freeze(item); Object.freeze(value); }
@@ -87,7 +88,7 @@ function invocation(tool, directory, platform, arch) {
     command: pythonPath(directory, platform), args: tool.id === 'semgrep' ? ['-I', '-B', '-c', 'from semgrep.console_scripts.entrypoint import main; main()'] : ['-I', '-B'],
     env: { PYTHONDONTWRITEBYTECODE: '1', PYTHONNOUSERSITE: '1', ANONYMIZED_TELEMETRY: 'false', SEMGREP_SEND_METRICS: 'off', SEMGREP_ENABLE_VERSION_CHECK: '0' }
   };
-  if (tool.kind === 'native') return { command: path.join(directory, 'native', tool.assets[`${platform}-${arch}`].executable), args: [], env: {} };
+  if (tool.kind === 'native') return { command: path.join(directory, 'native', tool.assets[`${platform}-${arch}`].executable), args: [], env: tool.id === 'rtk' ? { RTK_RECALL: '0', RTK_TEE: '0', RTK_TELEMETRY_DISABLED: '1' } : {} };
   const root = path.join(directory, 'npm', 'node_modules', tool.id);
   if (tool.id === 'chrome-devtools-mcp') return { command: process.execPath, args: [path.join(root, tool.entry), '--no-usage-statistics', '--no-performance-crux'], env: { NO_UPDATE_CHECKS: '1', CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS: '1' } };
   const helper = desktopHelper(platform, arch);
@@ -120,6 +121,11 @@ async function validateInstallation(tool, directory, platform, arch) {
   const target = tool.id === 'chrome-devtools-mcp' ? call.args[0] : call.command;
   await noLinks(target);
   if (!(await lstat(target)).isFile()) throw new Error('Missing executable');
+  if (tool.kind === 'native' && tool.licenseFile) {
+    const license = path.join(directory, 'native', relativeFile(tool.licenseFile));
+    await noLinks(license);
+    if (!(await lstat(license)).isFile()) throw new Error('Missing native license');
+  }
   if (tool.kind === 'npm') await verifyNpm(tool, directory, platform, arch);
   if (tool.kind === 'python') {
     const cfg = await readFile(path.join(directory, 'venv', 'pyvenv.cfg'), 'utf8');
@@ -191,13 +197,15 @@ async function probe(tool, directory, platform, arch, runner, signal, cwd = dire
     if (tool.id !== 'semgrep') return;
   }
   const flag = tool.id === 'gitleaks' ? 'version' : '--version';
-  const output = await run(runner, call.command, [...call.args, flag], cwd, signal, call.env, 30000);
+  const probeEnv = tool.id === 'rtk' ? { ...call.env, RTK_DB_PATH: path.join(cwd, 'work', 'tracking.db') } : call.env;
+  const output = await run(runner, call.command, [...call.args, flag], cwd, signal, probeEnv, 30000);
   // Native desktop protocol version 2.5 is distinct from package version 1.0.2.
   // Probe only the CLI version command; never snapshot/list applications.
   const text = output.trim(), escaped = tool.version.replaceAll('.', '\\.');
   const pattern = tool.id === 'ripgrep' ? new RegExp(`^ripgrep ${escaped}(?: \\(rev [a-f0-9]+\\))?$`)
     : tool.id === 'agent-desktop' ? new RegExp(`^agent-desktop ${escaped}$`)
-      : tool.id === 'gitleaks' ? new RegExp(`^(?:gitleaks(?: version)? )?${escaped}$`) : new RegExp(`^${escaped}$`);
+      : tool.id === 'gitleaks' ? new RegExp(`^(?:gitleaks(?: version)? )?${escaped}$`)
+        : tool.id === 'rtk' ? new RegExp(`^rtk ${escaped}$`) : new RegExp(`^${escaped}$`);
   if (output.length > 4096 || !pattern.test(tool.id === 'ripgrep' ? text.split(/\r?\n/)[0] : text)) throw new Error('Tool version mismatch');
 }
 async function installNpm(tool, directory, platform, arch, runner, signal) {
@@ -337,8 +345,10 @@ export function formatToolContext({ stage, uiVerification, security, tools = [] 
     `Security gates: ${security?.enabled === true ? 'configured; local rules and redacted findings must pass before review/delivery' : 'disabled'}.`];
   for (const tool of toolCatalog) {
     const states = Array.isArray(tools) ? tools.filter(item => item?.id === tool.id) : [];
-    const available = states.length === 1 && states[0].ready === true && states[0].version === tool.version;
+    const available = states.length === 1 && states[0].ready === true && states[0].version === tool.version
+      && (tool.id !== 'rtk' || isManagedRtkReady(states[0]));
     lines.push(`${tool.id}@${tool.version}: ${available ? 'available' : 'unavailable'}. ${tool.capability}.`);
+    if (tool.id === 'rtk' && available) lines.push(formatRtkContext(states[0]));
   }
   lines.push('Desktop is scoped to the configured owned app/window; never auto-record private content. Browser profiles/endpoints must be owned and isolated. A missing, unsupported, malformed or failed check blocks enabled gates.');
   return lines.join('\n').slice(0, 8000);

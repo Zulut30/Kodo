@@ -344,6 +344,19 @@ function jevOutput({ model = models[0].id, modelConfidence = 0.95, parallel = 'p
   return { model: 'jev-1.14.0', answers: { model: { type: 'choice', choice: model, confidence: modelConfidence }, execution: { type: 'choice', choice: parallel, confidence: parallelConfidence }, session: { type: 'choice', choice: session, confidence: 0.95 } } };
 }
 
+test('Jev scheduling question distinguishes active work from completed ancestors and blocked descendants', async () => {
+  let request;
+  const node = { id: 'context', parallelismFacts: { taskReady: true, compatibleReadyPeers: [{ id: 'qa' }], conflictingActivePeers: [] }, coordination: [{ id: 'ancestor', status: 'integrated' }, { id: 'future', status: 'pending' }] };
+  const result = await decideJev({ task: 'Prepared worktree task', models, node }, { secrets, fetchImpl: async (url, options) => { request = JSON.parse(options.body); return response(jevOutput({ parallelConfidence: .74 })); } });
+  assert.deepEqual(request.state.node, node);
+  assert.match(request.questions.execution.instructions, /parallelismFacts/);
+  assert.match(request.questions.execution.instructions, /completed ancestors.*blocked descendants/i);
+  assert.match(request.questions.execution.instructions, /snapshot/i);
+  assert.match(request.questions.execution.criteria.serial, /active|ready/i);
+  assert.equal(result.parallel, false, 'richer evidence does not override conservative typed confidence');
+  assert.equal(result.parallelConfidence, .74);
+});
+
 test('Jev exposes independent confidence for model execution and session decisions', async () => {
   const models = [{ id: 'sol', client: 'codex', model: 'gpt-6.1-sol' }, { id: 'astra', client: 'codex', model: 'gpt-6-astra' }];
   const value = { model: 'fixture-jev', answers: {

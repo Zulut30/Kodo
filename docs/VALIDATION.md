@@ -27,6 +27,44 @@ node scripts/package-smoke.mjs
 
 Также проверяются отмена, неверные контракты, недоступность Jev и источника исследования, пересекающиеся области записи, сохранность пользовательских файлов, повторные проверки после ревью и изменения main, Git hooks/окружение, свежесть тегов, права хранилища и подмена артефактов. Все три пресета включают стандартные навыки и чат-вход Kodo; dry-run не создаёт целевой каталог.
 
+## Контекст, очередь и RTK
+
+Изменение run `16877cd8-f73a-43de-ab00-5c098211c20e`: [поведение и локальные измерения](EFFICIENCY.md), [ADR-0004](decisions/0004-context-output-and-ready-queue.md). Узел F сверяет интегрированные A/B/C/D и E на исходном HEAD `6a21156d8da652d7b5437e5ced13e2b1bf775854`, изменяет только README/docs и не запускает повторно provider/tool install или общий check. Исторические разделы ниже относятся к своим прежним срезам.
+
+Координатор передал актуальные целевые результаты D: **144 passed, 0 failed, 0 skipped**, Windows, Node.js `v24.19.0`. Команда из приватной квитанции `kodo-engine-efficiency-D/status.md` и `final-scoped.txt`:
+
+```powershell
+node --test tests/efficiency-engine.test.mjs tests/task-context.test.mjs tests/metrics.test.mjs tests/providers.test.mjs tests/context-pack.test.mjs tests/rtk.test.mjs tests/runtime.test.mjs tests/scheduling-engine.test.mjs tests/task-scheduler.test.mjs tests/efficiency-acceptance.test.mjs
+```
+
+Это результат исполнителя D на текущем исходном срезе, прочитанный F, не новый прогон documenter. Предыдущие **168 PASS / 1 POSIX-only skip** относятся к более раннему broad regression до последних snapshot/lease follow-ups; они не складываются с 144 и не подменяют итоговый check. D сохранил RED-воспроизведения mandatory boundaries, immutable evidence, metrics, Unicode paths, typed evidence, snapshot и tool lease; критерии не ослаблялись.
+
+Независимый E: **26/26 PASS** и **13 killed in-memory mutations**, по результату координатора. Его область — A/B public APIs и bounded verified lessons, без утверждения о проверке последующей D wiring самим E. Отдельная provider-регрессия формулировки ready/active routing прошла RED → GREEN вместе с confidence/fallback, **3/3**. Сохранённый typed serial-выбор D оставлен в силе; дополнительного live rerouting не было.
+
+| Публичное требование | Точное имя целевой регрессии |
+| --- | --- |
+| C стартует до конца независимого B, worktree различны, исходный checkout сохранён | `Engine admits downstream before slow sibling finishes using distinct exact Git worktrees` |
+| Completed/pending merge recovery, serial routing, глобальная capacity | `Engine recovers completed work without routing or executing it again`; `Engine recovers the recorded pending merge owner before earlier completed nodes even without MERGE_HEAD`; `Engine honors both plan and Jev serial decisions until prior integration is finished`; `Engine retains the global subscription capacity across two continuously scheduled runs` |
+| Сбой/отмена безопасно дожидаются уже начатой работы | `Acceptance A keeps the first typed failure and drains a sibling when cancellation follows failure`; `Acceptance A cancellation drains pending routing and execution without admitting their dependents` |
+| Unicode, unknown/failed, явные потери и mandatory budget | `Acceptance B measures Unicode bytes and bounds both compactors without corrupting input`; `Acceptance B never promotes stale partial malformed or contradictory check evidence to pass`; `Acceptance B rejects an impossible mandatory boundary instead of clipping commands or evidence paths` |
+| Полезные проверенные знания без raw history | `Acceptance B carries only bounded verified knowledge with matching review and check heads` |
+| Компактный реальный prompt и один сохранённый snapshot | `Engine planner sends compact redacted evidence with readable private immutable head-bound originals`; `Engine compacts one captured evidence snapshot even when research changes during artifact persistence` |
+| Полные criteria, check logs и evidence integrity | `Engine rejects oversized new plans but resumes saved node contracts without dropping late requirements`; `Engine review compacts full diff and check logs while preserving readable command diagnostics and all required criteria`; `Engine rejects evidence changed during a successful review and refuses damaged cached check logs` |
+| Raw failures и bytes при неуспехе | `Engine coordinator checks keep raw Node diagnostics and retain the full failed command output privately`; `Engine retains measured prompt bytes on typed provider failures without inventing native usage` |
+| RTK после lease, приватный env, проверка между сессиями | `Engine session uses verified managed RTK only in a private worker environment and rechecks each new session`; `Engine resolves worker tool integrity only after obtaining the subscription lease and reuses it within that session` |
+| Missing/unsupported, неверный archive и неизменные counts | `RTK missing and unsupported resolution stays raw without installation`; `RTK official archive digest mismatch stops before extraction or native execution`; `RTK pins only verified OSS archives without changing component or skill counts` |
+| Routing соответствует ready frontier | `Routing supplies concrete ready frontier and ignores blocked descendants without overriding Jev`; `Jev scheduling question distinguishes active work from completed ancestors and blocked descendants` |
+
+Тесты Engine используют настоящие временные Git/worktree/filesystem и Windows ACL fixtures при подменённых native providers. Это не живой inference, POSIX permission run, UI/security gate или опубликованный пакет. Policy integrity остаётся отдельным контрактом `tests/skill-policy.test.mjs`: все 13 решений и проверки pinned resources, полный адаптер и resolvable references без длинных upstream excerpts. Catalog содержит 10 tools; registry 33/default skills 13 не менялись.
+
+Собственная проверка F на Node.js `v24.19.0`: `git diff --check` и статическая сверка восьми разрешённых файлов прошли. Проверены 65 локальных Markdown-ссылок/якорей, 6 JSON-примеров, наличие всех 25 названных регрессий в tests, 7 строк измерений с пересчётом процентов по квитанции, RTK pin/platforms и counts 10/33/13. SHA-256 шести production/test файлов совпали с `source-receipt.json` D. Это проверка документации и соответствия исходникам, без повторного выполнения D/E tests.
+
+Локальная квитанция координатора `<OS temp>/kodo-efficiency-20261103/efficiency-measurements.json` содержит фактические UTF-8 размеры одинаковых сохранённых входов, `modelsCalled:0`: policy −51,74…59,36%, inline plan/review −89,15%/−91,79%, managed RTK Git log −63,65% с обоими exit 0 и сохранёнными семью commit IDs. Полные числа и различие исторического baseline/runtime metrics — в EFFICIENCY. Части не складываются в экономию всей сессии. Отрицательная Node/TAP fixture (`rtk-fixture/receipt.json`, `raw.txt`, `rtk.txt` того же scratch) потеряла sentinel при обоих exit 1; её уменьшение 4253 → 100 байт исключено из принятой экономии. Подписочная quota, total native tokens и USD этим способом не измерены.
+
+Отдельный `<KODO_HOME>/runs/<runId>/native-environment-check.json` проверил новый фактический Engine worker environment: Codex/Claude Code subscription auth доступны, managed `rtk 1.1.0 --version` exit 0, private DB/recall0/tee0/telemetry-off. `modelsCalled:0`; это auth/env probe, не новый Claude task run и не E2E всей задачи. Managed install/Git-output проверены отдельно координатором, global RTK 0.50.0 оставлен прежним. F RTK и providers не запускал.
+
+Матрица моделей по-прежнему отложена; новых результатов скорости/победителя нет. **Общий `npm run check`, свежие enabled UI/security gates, независимое финальное review, CI, package/installed release smoke и deployment этого изменения на этапе F ещё не подтверждены.** UI в конфигурации Kodo выключен и нейтрален (`passed:null`), security включён и требует актуальных evidence. Реальная работа в видимых чатах относится к текущему частному host-adapter координатора; generic desktop backend CLI не заявляется.
+
 ## Режимы, метрики и парный benchmark
 
 Контракт режима и методики: [RUNTIME](RUNTIME.md#режимы-исполнения), [BENCHMARK](BENCHMARK.md), [ADR-0003](decisions/0003-execution-modes-and-benchmarks.md). Документирующий worktree основан на `e179d369fe664fa4a2b055eb26c8577f4f41eb6f`; production-код и тесты в нём не менялись. Исправление повторного использования checks координатор добавляет отдельно в integration того же run, поэтому уровни доказательств нельзя объединять в один GREEN.
@@ -199,3 +237,17 @@ Gemini `gemini-4-argon` выполнил анализ проекта; TypeSafe J
 Итоговая квитанция запуска `6ea17f8f-5709-499c-80f0-8e5c5899f63e` содержит PR, merge commit, версию, URL архива, SHA-256, платформу и результаты installed smoke. Выпуск считается опубликованным только после успешного подтверждения этих действий; push не называется деплоем.
 
 MCP-шаблоны проверены как конфигурации. Это не является доказательством живого соединения с произвольным GitHub MCP, браузером или базой данных. Хранение ключей и границы доверия описаны в [SECURITY.md](SECURITY.md).
+
+### Регрессии после общего прогона
+
+Первый полный прогон выявил повреждение безопасного `Bearer ${token}` и ресурсный timeout причинного scheduling-теста. Общий редактор сохраняет только полные буквальные ссылки на переменную/свойство, а известные значения, реальные ключи и смешанные токены по-прежнему скрывает. Optional summary и previous error очищаются до сокращения: проверяется отсутствие префикса ключа на границе. Неизменённый критерий release-finalization прошёл red/green.
+
+Подготовка Windows ACL выполняется один раз на ограниченный пакет evidence: три записи узла используют один защищённый каталог; следующий пакет применяет защиту заново. Истёкший writer и замена/удаление каталога отклоняются; проверки bytes/hash/head сохраняются. Scheduling fixture дожидается остановки активных задач до закрытия БД. Его guard60с учитывает реальные Git/ACL/pin операции под нагрузкой; ordering assertions и handshake сохранены. На финальных байтах24/24 сценария прошли; искусственный wave barrier провалил тот же handshake. Это проверка надёжности и причинного порядка, не гарантия времени произвольной задачи.
+
+Целевой repair-прогон:109 tests,108PASS,1 штатный Unix-onlySKIP на Windows. Дополнительно quota-resume и lease-lost:2/2PASS. Общий check, свежие gates/review, CI и release проверяются отдельно координатором.
+
+### JSON evidence на реальной границе session
+
+Независимое ревью воспроизвело повреждение JSON при повторной очистке сериализованной сводки и потерю backtick/escaped-quote синтаксиса исходного примера. Исправление очищает структурированные поля до упаковки и передаёт JSON через закрытый immutable контракт промпта; identity evidence/metrics проверяется, поддельный prompt или копия metrics не дают обойти очистку. Фактический JSON фрагмент остаётся разбираемым и совпадает по байтам с contextSentBytes. Plan/review/node и gate evidence проверены через actual Engine provider boundary со stubs.
+
+Сохранение полного literal placeholder проверено для backtick и одного синтаксического escape-backslash перед кавычкой. Известные и provider-shaped ключи, смешанные credential suffix и прочие backslash-суффиксы остаются скрытыми. Финальный targeted-прогон этих изменений:50/50PASS, смежные проверки10/10PASS; общий check, CI и новое независимое ревью запускает координатор.

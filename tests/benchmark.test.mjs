@@ -349,16 +349,68 @@ test('Unavailable plain and real Engine developer sessions remain pending and re
 });
 
 test('Abort while account lease is busy saves pending data without invoking a native session', async t => {
-  const root = await temp(t), deps = services(root), controller = new AbortController();
-  const tokens = ['existing-coordinator', 'other-coordinator'].map(owner => deps.accountStore.acquireLease('subscription:codex', owner, { limit: 2 }));
-  assert.ok(tokens.every(Boolean));
-  const operation = runBenchmark({ ...options(path.join(root, 'out')), signal: controller.signal }, deps);
-  setTimeout(() => controller.abort(), 100);
-  const report = await operation;
-  for (const token of tokens) deps.accountStore.releaseLease(token);
-  assert.equal(report.complete, false); assert.equal(report.pause.code, 'cancelled'); assert.equal(deps.calls.length, 0);
-  const final = await resumeBenchmark(path.join(root, 'out'), deps);
-  assert.equal(final.complete, true); assert.equal(deps.calls.length, 4);
+  const root = await temp(t), output = path.join(root, 'out'), deps = services(root);
+  const controller = new AbortController(), resumeController = new AbortController(), blocked = Promise.withResolvers();
+  const acquire = deps.accountStore.acquireLease.bind(deps.accountStore), tokens = [];
+  let operation, watchdog;
+  try {
+    for (const owner of ['existing-coordinator', 'other-coordinator']) tokens.push(acquire('subscription:codex', owner, { limit: 2 }));
+    assert.ok(tokens.every(Boolean));
+    deps.accountStore.acquireLease = (name, owner, options) => {
+      const token = acquire(name, owner, options);
+      if (name === 'subscription:codex' && token === null) blocked.resolve(owner);
+      return token;
+    };
+    // Seed 10 starts with plain's real accountLease wait. ControlledEngine
+    // asserts on a full pool instead of waiting, so seed 17 can fail a trial
+    // before a wall-clock abort and make resume legitimately skip that trial.
+    operation = runBenchmark({ ...options(output), seed: 10, signal: controller.signal }, deps);
+    watchdog = setTimeout(() => {
+      const error = new Error('Benchmark did not reach the busy subscription lease');
+      blocked.reject(error); controller.abort(error);
+    }, 30000);
+    const owner = await Promise.race([
+      blocked.promise,
+      operation.then(() => { throw new Error('Benchmark finished before waiting for the busy subscription lease'); })
+    ]);
+    clearTimeout(watchdog);
+    assert.equal(deps.calls.length, 0);
+    controller.abort();
+    const report = await operation;
+    assert.equal(report.complete, false); assert.equal(report.pause.code, 'cancelled'); assert.equal(deps.calls.length, 0);
+    assert.equal(report.trials.length, 4);
+    const paused = report.trials[0];
+    assert.equal(paused.condition, 'plain'); assert.equal(paused.trialId, owner);
+    assert.deepEqual(paused.attempts.map(row => [row.status, row.error?.code]), [['pending', 'cancelled']]);
+    assert.ok(report.trials.every(cell => cell.status === 'pending' && cell.metrics.sessions === 0));
+    assert.ok(report.trials.slice(1).every(cell => cell.attempts.length === 0));
+    const saved = JSON.parse(await readFile(path.join(output, 'benchmark.json'), 'utf8'));
+    assert.equal(saved.complete, false); assert.equal(saved.pause.code, 'cancelled');
+    assert.ok(saved.trials.every(cell => cell.status === 'pending' && cell.sessions.length === 0));
+    assert.deepEqual(saved.trials[0].attempts.map(row => [row.status, row.error?.code]), [['pending', 'cancelled']]);
+    assert.ok(tokens.every(token => deps.accountStore.renewLease(token)), 'cancellation must preserve both unrelated leases');
+    assert.equal(deps.accountStore.db.prepare('SELECT count(*) AS count FROM leases').get().count, 2, 'cancellation must release the benchmark lease');
+    for (const token of tokens) deps.accountStore.releaseLease(token);
+    operation = resumeBenchmark(output, { ...deps, signal: resumeController.signal });
+    const final = await operation;
+    assert.equal(final.complete, true); assert.equal(deps.calls.length, 4);
+    assert.equal(final.pause, null); assert.equal(final.trials.length, 4);
+    assert.ok(final.trials.every(cell => cell.passed && cell.metrics.sessions === 1));
+    assert.equal(new Set(deps.calls.map(call => call.cwd)).size, 4, 'each trial must invoke exactly one fresh native session');
+    assert.deepEqual(final.trials.find(cell => cell.trialId === paused.trialId).attempts.map(row => row.status), ['pending', 'completed']);
+    assert.ok(final.trials.filter(cell => cell.trialId !== paused.trialId).every(cell => cell.attempts.length === 1));
+    assert.equal(deps.accountStore.db.prepare('SELECT count(*) AS count FROM leases').get().count, 0, 'resume must release all benchmark and subscription leases');
+    operation = resumeBenchmark(output, { ...deps, signal: resumeController.signal });
+    assert.equal((await operation).complete, true); assert.equal(deps.calls.length, 4, 'completed resume must not repeat any native session');
+  } finally {
+    clearTimeout(watchdog); controller.abort(); resumeController.abort();
+    try { await operation; }
+    finally {
+      deps.accountStore.acquireLease = acquire;
+      for (const token of tokens) if (token) deps.accountStore.releaseLease(token);
+      assert.equal(deps.accountStore.db.prepare('SELECT count(*) AS count FROM leases').get().count, 0);
+    }
+  }
 });
 
 test('Held-out scope rejects ignored new files and changed auxiliary declarations independently of correctness', async t => {

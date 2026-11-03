@@ -63,7 +63,7 @@ export function sessionMetrics(client, events, { durationMs, usage } = {}) {
       if (client === 'codex' && event?.type === 'turn.completed' || client === 'claude-code' && event?.type === 'result') usage = event.usage;
     }
   }
-  return { durationMs: duration(durationMs), toolSteps: toolSteps(client, events), nativeRequestCount: null, usage: normalizeUsage(client, usage) };
+  return { durationMs: duration(durationMs), toolSteps: toolSteps(client, events), promptBytes: null, contextOriginalBytes: null, contextSentBytes: null, nativeRequestCount: null, usage: normalizeUsage(client, usage) };
 }
 
 export function aggregateMetrics(receipts = []) {
@@ -80,6 +80,9 @@ export function aggregateMetrics(receipts = []) {
   }
   const durationMs = aggregate(metrics.map(value => value?.durationMs), completeness, 'durationMs', duration);
   const steps = aggregate(metrics.map(value => value?.toolSteps), completeness, 'toolSteps');
+  // Local UTF-8 payload measurements are independent of native token/cache
+  // usage. Missing historical measurements must remain unknown, never zero.
+  const byteMetrics = Object.fromEntries(['promptBytes', 'contextOriginalBytes', 'contextSentBytes'].map(key => [key, aggregate(metrics.map(value => value?.[key]), completeness, key)]));
   // Neither native stream exposes the actual backend HTTP request count.
   completeness.nativeRequestCount = { known: 0, total: metrics.length, complete: false };
   completeness.usage = {};
@@ -87,5 +90,5 @@ export function aggregateMetrics(receipts = []) {
   const semantics = new Set(metrics.map(value => value?.usage?.semantics ?? 'unknown'));
   usage.semantics = semantics.size > 1 ? 'mixed' : semantics.values().next().value ?? 'unknown';
   usage.source = metrics.length ? 'aggregate' : null;
-  return { sessions: metrics.length, durationMs, toolSteps: steps, nativeRequestCount: null, usage, completeness };
+  return { sessions: metrics.length, durationMs, toolSteps: steps, ...byteMetrics, nativeRequestCount: null, usage, completeness };
 }
