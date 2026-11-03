@@ -3,7 +3,7 @@
   "steps": [
     { "id": "reproduce", "skill": "skills/bug-hunting", "task": "Воспроизведи сбой и подтверди причину.", "output": "Минимальное воспроизведение и подтверждённая причина." },
     { "id": "fix", "agent": "agents/developer", "task": "Исправь причину, сохранив окружающие контракты.", "output": "Изменения кода для исправления дефекта." },
-    { "id": "regression", "agent": "agents/qa-engineer", "task": "Повтори исходный сценарий и проверь ближайшие регрессии.", "output": "Сравнение поведения до и после исправления." },
+    { "id": "regression", "agent": "agents/qa-engineer", "task": "Повтори исходный сценарий и проверь ближайшие регрессии с фактическим RED/GREEN evidence. Для UI используй независимые DOM/accessibility assertions; live adapters и включённые security gates выполняет координатор после build/test, до review. Не ослабляй требования для зелёного результата.", "output": "Сравнение до/после и receipts текущего head/config/pins; disabled (passed:null) и блокеры отдельно от PASS." },
     { "id": "review", "skill": "skills/code-review", "task": "Проверь исправление и его побочные эффекты.", "output": "Проверенный diff и ограничения проверки." }
   ]
 }
