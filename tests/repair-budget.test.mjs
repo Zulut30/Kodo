@@ -23,7 +23,7 @@ test('Repair budget defaults to five preserves explicit lower limits and rejects
   }
 });
 
-async function nodeBudgetFixture(t, limit) {
+async function nodeBudgetFixture(t, limit, { untracked = false } = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'kodo-node-budget-'));
   const project = path.join(directory, 'project'), home = path.join(directory, 'state');
   let store;
@@ -46,15 +46,16 @@ async function nodeBudgetFixture(t, limit) {
   const baseSha = git('rev-parse', 'HEAD'), config = await readConfig(project);
   const secret = 'budget-provider-private-fixture';
   store = new Store(home, { GEMINI_API_KEY: secret });
-  const requests = [], task = { id: 'feature', role: 'developer', description: 'Implement src/value.mjs',
-    writePaths: ['src/value.mjs'], acceptance: ['Keep the value finite'], interfaces: ['value is a number'], constraints: ['Subscription only'], dependsOn: [], parallel: false };
+  const workerFile = untracked ? 'src/new.mjs' : 'src/value.mjs';
+  const requests = [], task = { id: 'feature', role: 'developer', description: 'Implement ' + workerFile,
+    writePaths: [workerFile], acceptance: ['Keep the value finite'], interfaces: ['value is a number'], constraints: ['Subscription only'], dependsOn: [], parallel: false };
   const provider = {
     discoverProviders: async () => [{ id: 'subscription-fixture', client: 'codex', model: 'gpt-6.1-sol', available: true }],
     decideJev: async () => ({ model: 'subscription-fixture', parallel: false, confidence: 1, sessionMode: 'fresh' }),
     runSession: async request => {
       requests.push(request);
       assert.equal(request.readOnly, undefined, 'incomplete nodes must never reach review');
-      await writeFile(path.join(request.cwd, 'src/value.mjs'), `export const value = ${requests.length};\n`);
+      await writeFile(path.join(request.cwd, workerFile), `export const value = ${requests.length};\n`);
       return { sessionId: `budget-fixture-${requests.length}`, output: { summary: 'The same acceptance requirement remains unresolved', checks: [], complete: false } };
     }
   };
@@ -116,4 +117,12 @@ test('Engine worker requests preserve scoped acceptance while omitting inherited
   for (const excluded of ['INHERITED_STANDARDS_SENTINEL', 'RAW_HISTORY_SENTINEL', 'RAW_RESEARCH_SENTINEL', fx.secret]) assert.ok(!request.prompt.includes(excluded), excluded);
   for (const key of ['GEMINI_API_KEY', 'TYPESAFE_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'BROWSER_USE_API_KEY']) assert.equal(request.env[key], undefined, key);
   assert.equal(fx.store.getRun(fx.run.id).controllerAssessment.reason, 'repair_budget_exhausted');
+});
+
+test('Engine counts changing contents of a new untracked file as progress within the explicit budget', async t => {
+  const fx = await nodeBudgetFixture(t, 3, { untracked: true });
+  const blocked = await fx.engine.run(fx.run.id);
+  assert.equal(blocked.state, 'blocked'); assert.equal(fx.requests.length, 3);
+  assert.equal(blocked.nodes.feature.stopped, 'repair_budget_exhausted');
+  assert.equal(await readFile(path.join(blocked.nodes.feature.cwd, 'src/new.mjs'), 'utf8'), 'export const value = 3;\n');
 });

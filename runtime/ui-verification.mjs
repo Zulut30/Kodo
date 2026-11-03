@@ -56,7 +56,7 @@ async function bounded(operation, timeoutMs, parent, awaitCleanup = false) {
     throw error;
   } finally { clearTimeout(timer); parent?.removeEventListener('abort', cancel); controller.abort(); }
 }
-function checkedResult(c, result) {
+function checkedResult(c, result, config) {
   if (result?.schemaVersion !== 1 || !['completed', 'blocked', 'failed'].includes(result.status)) throw fail('malformed_output');
   if (result.status !== 'completed') return { status: result.status, assertions: [], reason: safeReasons.has(result.reason) ? result.reason : 'adapter_error' };
   const assertions = assessObservations(c, result.observations);
@@ -65,7 +65,7 @@ function checkedResult(c, result) {
     if (qa?.agents !== 2 || !Array.isArray(qa.observations) || qa.observations.length !== 2 || !Array.isArray(qa.reports) || qa.reports.length !== 2 || !qa.reports.every(r => typeof r === 'string' && r.length <= 12000) || !qa.severity || Object.keys(qa.severity).sort().join(',') !== 'high_severity,low_severity,medium_severity') throw fail('malformed_output');
     if (!Object.values(qa.severity).every(a => Array.isArray(a) && a.length === 0) || !qa.observations.every(o => assessObservations(c, o).every(a => a.passed))) throw fail('assertion_failed');
   }
-  if (result.steps !== undefined && (!Number.isInteger(result.steps) || result.steps < 0 || result.steps > 100)) throw fail('malformed_output');
+  if (result.steps !== undefined && (!Number.isInteger(result.steps) || result.steps < 0 || result.steps > config.maxSteps)) throw fail('malformed_output');
   return { status: assertions.every(a => a.passed) ? 'passed' : 'failed', assertions, ...(assertions.some(a => !a.passed) ? { reason: 'assertion_failed' } : {}), steps: result.steps ?? 0 };
 }
 
@@ -104,7 +104,7 @@ export async function runUIVerification({ cwd = process.cwd(), headSha, config, 
           if (!tool.ready) throw fail('tool_missing', true);
           return runInstalledCase({ case: c, config, tool, evidenceDir, signal: caseSignal, runner, secrets: Object.fromEntries(needed.map(name => [name, secrets[name]])) });
         }, config.timeoutMs, signal, !caseRunner);
-        Object.assign(row, checkedResult(c, result));
+        Object.assign(row, checkedResult(c, result, config));
         // Evidence is allowlisted observed state, not full prompts/history/stdout.
         const content = JSON.stringify(redact({ schemaVersion: 1, headSha, configHash: receipt.configHash, pinsHash: receipt.pinsHash, id: c.id, tool: c.tool, status: result.status, observations: result.observations ?? [], assertions: row.assertions, steps: row.steps ?? 0,
           ...(c.tool === 'vibetest' && result.qa ? { qa: { agents: result.qa.agents, observations: result.qa.observations, severity: result.qa.severity, reports: result.qa.reports } } : {}) }, secrets));
@@ -145,7 +145,7 @@ export function isCurrentUIReceipt(receipt, { headSha, config } = {}) {
       if (hash(bytes) !== e.sha256) return false;
       const data = JSON.parse(bytes);
       if (data.schemaVersion !== 1 || data.headSha !== headSha || data.configHash !== receipt.configHash || data.pinsHash !== receipt.pinsHash || data.id !== c.id || data.tool !== c.tool || data.status !== 'completed') return false;
-      const checked = checkedResult(c, data).assertions;
+      const checked = checkedResult(c, data, config).assertions;
       return checked.every(a => a.passed) && JSON.stringify(checked) === JSON.stringify(row.assertions) && JSON.stringify(checked) === JSON.stringify(data.assertions);
     });
   } catch { return false; }
