@@ -14,6 +14,8 @@ test('Routing supplies concrete ready frontier and ignores blocked descendants w
  assert.equal(captured.node.parallelismFacts?.taskReady,true);
  assert.equal(captured.node.parallelismFacts?.planAllowsParallel,true);
  assert.deepEqual(captured.node.parallelismFacts?.compatibleReadyPeers.map(x=>x.id),['rtk']);
+ assert.deepEqual(captured.node.parallelismFacts.compatibleReadyPeers[0],{id:'rtk',role:'developer',description:'Implement rtk',acceptance:['Behavior holds'],writePaths:['src/rtk.mjs']});
+ assert.match(captured.node.parallelismFacts.rule,/snapshot/i);
  assert.deepEqual(captured.node.parallelismFacts?.conflictingActivePeers,[]);
  assert.ok(captured.task.length<600,'routing objective stays bounded independently of task history');
  assert.equal(run.nodes.context.routing.parallel,false,'facts do not override a serial Jev decision');
