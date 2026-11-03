@@ -325,7 +325,14 @@ export class Engine {
       this.save(run); this.log(run, 'routed', { node: task.id, ...state.routing }); this.checkCancelled(run, signal); return selected;
     }
     let decision;
-    try { decision = await this.logical(run, 'routing', () => this.provider.decideJev({ task: run.task, models: run.models, node: { ...task, sessionId: state.sessionId, coordination: (run.plan?.tasks || []).map(node => ({ id: node.id, dependsOn: node.dependsOn, writePaths: node.writePaths, parallel: node.parallel, status: run.nodes[node.id]?.status || 'pending' })) }, attempt: state.attempt || 0, signal }, { secrets: this.secrets })); }
+    const ready = candidate => candidate.dependsOn.every(id => run.nodes[id]?.status === 'integrated');
+    const parallelismFacts = {
+      taskReady: ready(task), planAllowsParallel: task.parallel,
+      compatibleReadyPeers: (run.plan?.tasks || []).filter(candidate => candidate.id !== task.id && candidate.parallel && ready(candidate) && !['integrated', 'completed'].includes(run.nodes[candidate.id]?.status) && !run.nodes[candidate.id]?.stopped && !scopesOverlap(task.writePaths, candidate.writePaths)).map(candidate => ({ id: candidate.id, writePaths: candidate.writePaths })),
+      conflictingActivePeers: (run.plan?.tasks || []).filter(candidate => candidate.id !== task.id && run.nodes[candidate.id]?.status === 'running' && scopesOverlap(task.writePaths, candidate.writePaths)).map(candidate => candidate.id),
+      rule: 'Only currently active or dependency-ready independent peers matter. Completed ancestors and future blocked descendants are not concurrent work. These prepared nodes use different Git worktrees; coordinator still enforces safety.'
+    };
+    try { decision = await this.logical(run, 'routing', () => this.provider.decideJev({ task: `Choose model/session/scheduling for the prepared node ${task.id}. Objective: ${run.task.slice(0,400)}`, models: run.models, node: { ...task, sessionId: state.sessionId, parallelismFacts, coordination: (run.plan?.tasks || []).map(node => ({ id: node.id, dependsOn: node.dependsOn, writePaths: node.writePaths, parallel: node.parallel, status: run.nodes[node.id]?.status || 'pending' })) }, attempt: state.attempt || 0, signal }, { secrets: this.secrets })); }
     catch (error) {
       if (signal?.aborted || error.name === 'AbortError' || error.code === 'cancelled') throw Object.assign(new Error('Запуск отменён'), { code: 'cancelled' });
       this.log(run, 'routing_fallback', { node: task.id, reason: error.message }); decision = { model: run.models.find(item => item.client === run.client && item.model === (run.config.primaryModel || defaultModel(run.client)))?.id || run.models.find(item => item.client === run.client)?.id, parallel: false, confidence: 0, fallback: true };
