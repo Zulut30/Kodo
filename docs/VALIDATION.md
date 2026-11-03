@@ -27,6 +27,47 @@ node scripts/package-smoke.mjs
 
 Также проверяются отмена, неверные контракты, недоступность Jev и источника исследования, пересекающиеся области записи, сохранность пользовательских файлов, повторные проверки после ревью и изменения main, Git hooks/окружение, свежесть тегов, права хранилища и подмена артефактов. Все три пресета включают стандартные навыки и чат-вход Kodo; dry-run не создаёт целевой каталог.
 
+## Режимы, метрики и парный benchmark
+
+Контракт режима и методики: [RUNTIME](RUNTIME.md#режимы-исполнения), [BENCHMARK](BENCHMARK.md), [ADR-0003](decisions/0003-execution-modes-and-benchmarks.md). Документирующий worktree основан на `e179d369fe664fa4a2b055eb26c8577f4f41eb6f`; production-код и тесты в нём не менялись. Исправление повторного использования checks координатор добавляет отдельно в integration того же run, поэтому уровни доказательств нельзя объединять в один GREEN.
+
+Целевой офлайн-прогон на Windows с Node.js `v24.19.0`:
+
+```powershell
+node --test --test-reporter=spec tests/modes.test.mjs tests/mode-engine.test.mjs tests/metrics.test.mjs tests/benchmark.test.mjs tests/benchmark-cli.test.mjs
+node --test --test-reporter=spec --test-name-pattern="Catalog validates all shipped components|Preset installs for all clients with self-contained pipelines" tests/toolkit.test.mjs
+```
+
+Первая команда завершилась с exit 1: **73 tests, 71 passed, 2 failed, 0 cancelled, 0 skipped**, длительность 186228 ms. Одна самостоятельная причина — известный `unchanged head reuses checks`; второе failed — его родительский тест. Фактически записано `test, build, test, build` вместо `test, build`: старый snapshot повторяет успешные команды после quota-review. Production-исправление не переносилось в этот worktree. Остальные сценарии, включая changed-head, changed test/build-команды и свежий failed UI после quota, прошли.
+
+Вторая команда проверила каталог и установку самодостаточных pipeline/skills для всех клиентов: **2 passed, 0 failed**. Дополнительная локальная проверка подтвердила 35 Markdown-ссылок/anchors, оба pipeline JSON, 33 registry-компонента, 13 default-skill IDs, 9 optional tools и неизменность защищённых production/tests/lock/UI/security путей; `git diff --check` прошёл. Dispatcher-workflow сохранён. Первая команда проверяет следующие публичные требования на настоящих временных Git-worktree с подменёнными provider boundaries:
+
+| Требование | Точное имя теста |
+| --- | --- |
+| Три конечных профиля и меньшие проектные бюджеты | `Modes accept only three public names and keep frozen bounded profiles`; `Profiles clamp smaller explicit project budgets without mutating defaults or config` |
+| Ранняя typed оценка и уверенность auto quick | `Assessment sends one typed atomic Jev batch with task as bounded data`; `Automatic quick requires all low local dimensions at both confidence and probability boundary` |
+| Explicit mode и fallback | `Explicit run mode overrides assessment and project mode while retaining typed receipt`; `Unavailable Jev is honest standard fallback and explicit mode still wins` |
+| Quick: одна реализация, реальный test/build и свежее независимое review | `Quick performs one executor and fresh independent review with actual test build and head-bound gates` |
+| Оценка раньше дорогого анализа, сохранение режима при resume | `Automatic assessment precedes expensive analysis and project mode is overridden by explicit mode`; `Quick prepare persists selection across config changes and resumes without repeated assessment or analysis` |
+| Legacy recovery и предел плана | `Legacy saved analysis receives compatibility standard policy without repeating completed analysis`; `Mode plan limits reject oversized host and native plans before any executor` |
+| Фиксированная модель для всех native-этапов | `Explicit model stays fixed for planner worker reviewer and retries despite uncertain strongest routing` |
+| Провал quick/gates без лишнего research и escalation | `Quick failure keeps actual failed checks and independent review findings without extra research or repair`; `Quick retains configured UI and security gates and missing tools block delivery without escalation` |
+| Противоречивый PASS с серьёзными findings отклоняется | `Quick rejects contradictory passing review receipts with blocker or major findings` |
+| Nullable metrics и разная семантика cache | `Codex totals include cached input once and expose absent cache fields as unknown`; `Claude totals add separate cache reads and writes only when all components are known`; `Aggregation preserves partial and absent evidence instead of fabricating zeros` |
+| Assessment считается один раз | `Benchmark reports authoritative Engine assessment counters without doubling wrapped operations` |
+| Настоящий Engine, модель, lease и свежие состояния пары | `Paired benchmark uses Engine create/run with fixed models mode shared leases and fresh stores`; `Production benchmark executes actual Engine worktrees review and checks using offline provider boundaries` |
+| Скрытый oracle и независимый scope | `Fixtures use identical initial commits and hidden oracle rejects wrong code and auxiliary tampering`; `Held-out scope rejects ignored new files and changed auxiliary declarations independently of correctness` |
+| Quota/abort, продолжение и версия методики | `Quota and interrupted attempts resume without duplicating completed trials`; `Resume rejects changed methodology identity and seeded order is reproducible` |
+| Заверение модели не определяет правильность | `Model success claims do not determine correctness and failures stay in summary denominator` |
+| Полное время, native duration, failures и неизвестные | `Paired reports separate native duration from wall time and keep failed and unknown cells in their denominators` |
+| CLI и отсутствие скрытого paid-прогона | `Benchmark CLI parses selected native client models modes seed and repeats without provider calls`; `Dedicated CLI entry rejects invalid invocation offline and fixture assets belong to the package` |
+
+Поправка local checks сверена чтением фактического `checks()` в integration: exact HEAD, чистота worktree, полный упорядоченный список test/build с exit 0, Node version/ABI/platform/arch входят в условия повторного использования. Это не изменение production документирующим worker. По сообщению координатора same-head регрессия с исправлением уже GREEN; финальное повторение changed-head/config и свежего failed UI в integration — отдельное свидетельство координатора. Эти сведения не являются собственным зелёным повтором исправления на старом срезе. Контрактные тесты — `Review quota recovery reuses successful checks only while their exact head is unchanged` и `Review quota recovery cannot reuse a previous enabled UI pass after observations fail`.
+
+Измеренный 24-trial native pilot ещё не выполнен; реальные числа, победитель или ускорение не опубликованы. План — 2 fixture × 3 доступные Codex-модели × plain/Kodo × 2 повтора. Недоступность модели сокращает фактическую матрицу и отражается в excluded, quota/abort — в pending. В отчёте обязательны условия окружения, версии/hashes, raw trial records, failures и знаменатели; unknown usage/HTTP counts остаются null. Чистое LLM latency и точная цена подписки не наблюдаются.
+
+Полный интегрированный `npm run check`, независимое ревью документации, CI Windows/Linux, реальные provider/UI/security, package smoke/установленный release и deployment принадлежат отдельным этапам координатора. Целевые офлайн результаты их не удостоверяют. Новых registry-компонентов, default-skill IDs или автоматических paid-вызовов этот этап не добавляет.
+
 ## Целевые проверки аудита
 
 ```powershell
