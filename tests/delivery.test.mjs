@@ -1,9 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtemp, mkdir, readFile, writeFile, copyFile, readdir, rm, chmod } from 'node:fs/promises';
-import { constants } from 'node:fs';
-import { spawnSync } from 'node:child_process';
+import { mkdtemp, mkdir, readFile, writeFile, copyFile, readdir, rm, chmod, rename, symlink } from 'node:fs/promises';
+import { constants, watch } from 'node:fs';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+import { spawn, spawnSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import Ajv from 'ajv';
@@ -281,6 +283,273 @@ test('Native command execution reports nonzero exit and timeout without a shell'
   const result = await execute(process.execPath, ['-e', 'process.stdout.write("expected"); process.exit(5)'], { allowFailure: true });
   assert.equal(result.code, 5); assert.equal(result.stdout, 'expected');
   await assert.rejects(execute(process.execPath, ['-e', 'setTimeout(()=>{},10000)'], { timeoutMs: 30 }), { code: 'timeout' });
+});
+
+async function readyFile(directory, name) {
+  const filename = path.join(directory, name);
+  return new Promise((resolve, reject) => {
+    const watcher = watch(directory, check);
+    const watchdog = setTimeout(() => finish(new Error('Fixture readiness watchdog expired')), 20000);
+    function finish(error, value) { clearTimeout(watchdog); watcher.close(); error ? reject(error) : resolve(value); }
+    async function check() {
+      try { const value = JSON.parse(await readFile(filename, 'utf8')); finish(null, value); }
+      catch (error) { if (!['ENOENT', undefined].includes(error.code) && !(error instanceof SyntaxError)) finish(error); }
+    }
+    check();
+  });
+}
+
+async function ownedTree(t, { inheritedPipes = true } = {}) {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'kodo-delivery-test-'));
+  let pids = [];
+  t.after(async () => {
+    // Failure recovery targets only PIDs obtained from this fixture's handshake.
+    for (const pid of pids.slice().reverse()) {
+      if (process.platform === 'win32') spawnSync('taskkill.exe', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+      else { try { process.kill(pid, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; } }
+    }
+    assert.equal(path.dirname(directory), path.resolve(os.tmpdir()));
+    assert.ok(path.basename(directory).startsWith('kodo-delivery-test-'));
+    await rm(directory, { recursive: true, force: true });
+  });
+  const script = `
+    const {spawn}=require('node:child_process'),fs=require('node:fs');
+    const level=Number(process.argv[2]),dir=process.argv[3];
+    process.on('SIGTERM',()=>{});
+    fs.openSync(require('node:path').join(process.cwd(),'held-'+level),'w');
+    const ready=pids=>{
+      if(level===0){fs.watch(dir,(_,name)=>{if(name==='flood')process.stdout.write('x'.repeat(8192));});
+        console.log('owned tree ready');console.error('owned tree stderr ready');fs.writeFileSync(require('node:path').join(dir,'ready.json'),JSON.stringify(pids));}
+      else process.send(pids);
+    };
+    if(level===2)ready([process.pid]);
+    else {const child=spawn(process.execPath,[__filename,String(level+1),dir],{
+      cwd:process.cwd(),windowsHide:true,stdio:['ignore',${JSON.stringify(inheritedPipes ? 'inherit' : 'ignore')},${JSON.stringify(inheritedPipes ? 'inherit' : 'ignore')},'ipc']});
+      child.on('message',pids=>ready([process.pid,...pids]));}
+    setInterval(()=>{},1000);
+  `;
+  // The recursive script is passed as data, with no shell or global processes.
+  const filename = path.join(directory, 'tree.cjs');
+  await writeFile(filename, script);
+  const ready = readyFile(directory, 'ready.json').then(value => { pids = value; return value; });
+  return { directory, filename, ready, disarm: () => { pids = []; } };
+}
+
+async function assertStopped(pids) {
+  for (const pid of pids) {
+    try { process.kill(pid, 0); }
+    catch (error) { if (error.code === 'ESRCH') continue; throw error; }
+    // Linux can retain an already-dead orphan as a zombie until PID 1 reaps it.
+    if (process.platform === 'linux' && /\) Z /.test(await readFile(`/proc/${pid}/stat`, 'utf8'))) continue;
+    assert.fail(`Owned fixture process ${pid} is still running after execute settled`);
+  }
+}
+
+for (const mode of ['timeout', 'abort', 'output-limit']) {
+  test(`Delivery lifecycle awaits owned parent and grandchild shutdown on ${mode}`, { timeout: 40000 }, async t => {
+    const tree = await ownedTree(t, { inheritedPipes: mode !== 'abort' });
+    const canary = spawn(process.execPath, ['-e', "process.on('message',()=>process.exit(0));process.send('ready')"], { windowsHide: true, stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });
+    const canaryClosed = new Promise(resolve => canary.once('close', resolve));
+    t.after(async () => { if (canary.connected) canary.send('exit'); await canaryClosed; });
+    await new Promise((resolve, reject) => { canary.once('message', resolve); canary.once('error', reject); });
+    const controller = new AbortController();
+    const outcome = execute(process.execPath, [tree.filename, '0', tree.directory], {
+      cwd: tree.directory, signal: controller.signal, timeoutMs: mode === 'timeout' ? 4000 : 10000, maxOutputBytes: 1024
+    }).then(value => ({ value }), error => ({ error }));
+    const pids = await tree.ready;
+    assert.equal(pids.length, 3);
+    if (mode === 'abort') controller.abort();
+    if (mode === 'output-limit') await writeFile(path.join(tree.directory, 'flood'), 'go');
+    const { error } = await outcome;
+    assert.equal(error?.code, { timeout: 'timeout', abort: 'cancelled', 'output-limit': 'invalid_output' }[mode]);
+    await assertStopped(pids);
+    tree.disarm();
+    assert.equal(canary.exitCode, null); assert.equal(canary.signalCode, null); assert.equal(process.kill(canary.pid, 0), true);
+    assert.match(error.stdout, /owned tree ready/);
+    assert.equal(error.teardownError, undefined);
+    assert.ok(Buffer.byteLength(error.stdout) + Buffer.byteLength(error.stderr) <= 1024);
+    // Removal happens immediately after settlement, without a retry or sleep.
+    await rm(tree.directory, { recursive: true });
+  });
+}
+
+test('Delivery lifecycle preserves complete bounded stdout and stderr diagnostics safely', async () => {
+  const text = 'failing assertion near the beginning\n' + 'detail\n'.repeat(9000);
+  const secret = 'fixture-private-value';
+  await assert.rejects(execute(process.execPath, ['-e', `process.stdout.write('failing assertion near the beginning\\n'+'detail\\n'.repeat(9000));process.stderr.write('specific failure Bearer ${secret}');process.exitCode=9`]), error => {
+    assert.equal(error.code, 'command_failed'); assert.equal(error.exitCode, 9);
+    assert.equal(error.stdout, text); assert.match(error.stderr, /specific failure Bearer \[REDACTED\]/);
+    assert.match(error.message, /stdout/); assert.match(error.message, /specific failure/);
+    assert.match(error.message, /failing assertion near the beginning/);
+    assert.equal(JSON.stringify(error).includes(secret), false); return true;
+  });
+});
+
+for (const mode of ['timeout', 'abort']) {
+  test(`Release lifecycle awaits real owned tree before source cleanup on ${mode}`, { timeout: 40000 }, async t => {
+    const ctx = await fixture(t), runner = ctx.exec, tree = await ownedTree(t), controller = new AbortController();
+    await ctx.git('push', 'origin', `${ctx.run.headSha}:main`);
+    ctx.config.commands.test = [{ command: process.execPath, args: [tree.filename, '0', tree.directory], timeoutMs: mode === 'timeout' ? 4000 : 15000 }];
+    let source, pids, cleanupObserved = false;
+    ctx.exec = async (command, args, options) => {
+      if (command === process.execPath && args[0] === tree.filename) source = options.cwd;
+      if (command === 'git' && args[0] === 'worktree' && args[1] === 'remove') {
+        await assertStopped(pids); cleanupObserved = true;
+      }
+      return runner(command, args, options);
+    };
+    const outcome = releasePackage({ ...ctx, mergeCommit: ctx.run.headSha, signal: controller.signal }).catch(error => error);
+    pids = await tree.ready;
+    if (mode === 'abort') controller.abort();
+    const error = await outcome;
+    assert.equal(error.code, mode === 'timeout' ? 'timeout' : 'cancelled');
+    assert.match(error.stdout, /owned tree ready/); assert.match(error.stderr, /owned tree stderr ready/);
+    assert.equal(error.cleanupErrors, undefined); assert.equal(error.teardownError, undefined);
+    assert.equal(cleanupObserved, true); await assertStopped(pids);
+    tree.disarm();
+    await assert.rejects(readFile(path.join(source, 'package.json')), { code: 'ENOENT' });
+    assert.equal(ctx.leases.size, 0); assert.equal(ctx.state.releaseCreates, 0); assert.equal(ctx.run.delivery?.release, undefined);
+  });
+}
+
+test('Release lifecycle records complete redacted command diagnostics before cleanup', async t => {
+  const ctx = await fixture(t);
+  await ctx.git('push', 'origin', `${ctx.run.headSha}:main`);
+  ctx.config.commands.test = [{ command: process.execPath, args: ['-e', "process.stdout.write('first assertion\\n'+'detail\\n'.repeat(9000));process.stderr.write('last failure Bearer fixture-private-value');process.exitCode=6"] }];
+  await assert.rejects(releasePackage({ ...ctx, mergeCommit: ctx.run.headSha }), error => {
+    assert.equal(error.code, 'command_failed'); assert.equal(error.exitCode, 6); assert.match(error.message, /first assertion/); return true;
+  });
+  const diagnostic = ctx.events.find(event => event.type === 'delivery.command_failed').data;
+  assert.equal(diagnostic.stdout, 'first assertion\n' + 'detail\n'.repeat(9000));
+  assert.equal(diagnostic.stderr, 'last failure Bearer [REDACTED]');
+  assert.equal(diagnostic.outputTruncated, false); assert.equal(JSON.stringify(diagnostic).includes('fixture-private-value'), false);
+  assert.equal(ctx.leases.size, 0); assert.equal(ctx.state.releaseCreates, 0);
+});
+
+test('Delivery lifecycle preserves cwd environment stdin EOF and allowFailure', async t => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'kodo-delivery-test-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const result = await execute(process.execPath, ['-e', "let input='';process.stdin.on('data',x=>input+=x);process.stdin.on('end',()=>{console.log(JSON.stringify({cwd:process.cwd(),value:process.env.FIXTURE_VALUE,secret:process.env.NPM_TOKEN,input}));process.exit(7)});process.stdin.resume()"], {
+    cwd: directory, env: { ...process.env, FIXTURE_VALUE: 'kept', NPM_TOKEN: 'fixture-never-forward' }, allowFailure: true
+  });
+  assert.equal(result.code, 7);
+  assert.deepEqual(JSON.parse(result.stdout), { cwd: directory, value: 'kept', input: '' });
+});
+
+test('Delivery lifecycle pre-aborted execution never starts a command', async t => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'kodo-delivery-test-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const controller = new AbortController(); controller.abort();
+  await assert.rejects(execute(process.execPath, ['-e', "require('fs').writeFileSync('unexpected','started')"], { cwd: directory, signal: controller.signal }), { code: 'cancelled' });
+  assert.deepEqual(await readdir(directory), []);
+});
+
+test('Release lifecycle forwards explicit and default test and build deadlines', async t => {
+  const ctx = await fixture(t), runner = ctx.exec, observed = [];
+  await ctx.git('push', 'origin', `${ctx.run.headSha}:main`);
+  ctx.config.commands.test = [{ command: 'fixture-check', args: ['explicit'], timeoutMs: 71 }, { command: 'fixture-check', args: ['default-test'] }];
+  ctx.config.commands.build = [{ command: 'fixture-check', args: ['default-build'] }, { command: 'fixture-check', args: ['explicit-build'], timeoutMs: 93 }];
+  ctx.exec = async (command, args, options) => {
+    if (command === 'fixture-check') { observed.push([args[0], options.timeoutMs]); return { stdout: '', code: 0 }; }
+    return runner(command, args, options);
+  };
+  const release = await releasePackage({ ...ctx, mergeCommit: ctx.run.headSha });
+  assert.equal(release.published, true);
+  assert.deepEqual(observed, [['explicit', 71], ['default-test', 1200000], ['default-build', 1200000], ['explicit-build', 93]]);
+  const self = JSON.parse(await readFile(new URL('../kodo.config.json', import.meta.url), 'utf8'));
+  assert.deepEqual(self.commands.test, [{ command: 'npm', args: ['run', 'check'], timeoutMs: 1200000 }]);
+});
+
+for (const code of ['timeout', 'command_failed', 'cancelled']) {
+  test(`Release lifecycle retains primary ${code} when owned cleanup refuses a replaced link`, async t => {
+    const ctx = await fixture(t), runner = ctx.exec;
+    await ctx.git('push', 'origin', `${ctx.run.headSha}:main`);
+    ctx.config.commands.test = [{ command: 'fixture-primary' }];
+    const external = path.join(ctx.root, 'external'); await mkdir(external); await writeFile(path.join(external, 'sentinel'), 'must survive');
+    const primary = Object.assign(new Error('primary diagnostic'), { code, stdout: 'first actionable failure', stderr: 'more detail' });
+    let directory, moved;
+    ctx.exec = async (command, args, options) => {
+      if (command === 'fixture-primary') {
+        directory = path.dirname(options.cwd); moved = `${directory}-displaced`;
+        await rename(directory, moved); await symlink(external, directory, process.platform === 'win32' ? 'junction' : 'dir');
+        throw primary;
+      }
+      return runner(command, args, options);
+    };
+    t.after(async () => {
+      if (directory) await rm(directory, { force: true });
+      if (moved) {
+        assert.equal(path.dirname(moved), path.resolve(os.tmpdir())); assert.ok(path.basename(moved).startsWith('kodo-release-'));
+        await rm(moved, { recursive: true, force: true });
+      }
+    });
+    await assert.rejects(releasePackage({ ...ctx, mergeCommit: ctx.run.headSha }), error => {
+      assert.equal(error, primary); assert.equal(error.stdout, 'first actionable failure');
+      assert.ok(error.cleanupErrors.some(item => item.code === 'unsafe_path')); return true;
+    });
+    assert.equal(await readFile(path.join(external, 'sentinel'), 'utf8'), 'must survive');
+    assert.ok(ctx.events.some(event => event.type === 'delivery.cleanup_failed' && event.data.code === 'unsafe_path'));
+    assert.equal(ctx.leases.size, 0); assert.equal(ctx.state.releaseCreates, 0); assert.equal(ctx.run.delivery?.release, undefined);
+  });
+}
+
+for (const code of ['timeout', 'command_failed', 'cancelled']) {
+  test(`Release lifecycle retains primary ${code} after bounded EBUSY cleanup retries`, async t => {
+    const ctx = await fixture(t), runner = ctx.exec;
+    await ctx.git('push', 'origin', `${ctx.run.headSha}:main`);
+    ctx.config.commands.test = [{ command: 'fixture-primary' }];
+    const primary = Object.assign(new Error('primary fixture failure'), { code, stdout: 'original assertion', stderr: 'original stderr' });
+    let directory, attempts = 0;
+    const nativeRemove = fs.promises.rm;
+    const mocked = t.mock.method(fs.promises, 'rm', async (target, options) => {
+      if (target === directory) { attempts++; throw Object.assign(new Error('fixture locked release directory'), { code: 'EBUSY' }); }
+      return nativeRemove(target, options);
+    });
+    syncBuiltinESMExports();
+    ctx.exec = async (command, args, options) => {
+      if (command === 'fixture-primary') { directory = path.dirname(options.cwd); throw primary; }
+      return runner(command, args, options);
+    };
+    try {
+      await assert.rejects(releasePackage({ ...ctx, mergeCommit: ctx.run.headSha }), error => {
+        assert.equal(error, primary); assert.equal(error.stdout, 'original assertion'); assert.equal(error.stderr, 'original stderr');
+        assert.ok(error.cleanupErrors.some(item => item.code === 'EBUSY')); return true;
+      });
+      assert.equal(attempts, 4);
+      assert.equal(ctx.leases.size, 0); assert.equal(ctx.state.releaseCreates, 0);
+      assert.ok(ctx.events.some(event => event.type === 'delivery.cleanup_failed' && event.data.code === 'EBUSY'));
+    } finally {
+      mocked.mock.restore(); syncBuiltinESMExports();
+      if (directory) { assert.equal(path.dirname(directory), path.resolve(os.tmpdir())); assert.ok(path.basename(directory).startsWith('kodo-release-')); await nativeRemove(directory, { recursive: true, force: true }); }
+    }
+  });
+}
+
+test('Release lifecycle retries transient locks and keeps a confirmed published receipt on persistent cleanup failure', async t => {
+  for (const persistent of [false, true]) {
+    const ctx = await fixture(t), runner = ctx.exec;
+    await ctx.git('push', 'origin', `${ctx.run.headSha}:main`);
+    let directory, attempts = 0;
+    const nativeRemove = fs.promises.rm;
+    const mocked = t.mock.method(fs.promises, 'rm', async (target, options) => {
+      if (target === directory && ++attempts <= (persistent ? 4 : 2)) throw Object.assign(new Error('fixture temporary lock'), { code: 'EBUSY' });
+      return nativeRemove(target, options);
+    });
+    syncBuiltinESMExports();
+    ctx.exec = async (command, args, options) => {
+      if (command === 'git' && args[0] === 'worktree' && args[1] === 'add') directory = path.dirname(args[3]);
+      return runner(command, args, options);
+    };
+    try {
+      const receipt = await releasePackage({ ...ctx, mergeCommit: ctx.run.headSha });
+      assert.equal(receipt.published, true); assert.deepEqual(ctx.run.delivery.release, receipt);
+      assert.equal(attempts, persistent ? 4 : 3); assert.equal(ctx.leases.size, 0);
+      assert.equal(ctx.events.some(event => event.type === 'delivery.cleanup_failed'), persistent);
+    } finally {
+      mocked.mock.restore(); syncBuiltinESMExports();
+      if (directory) { assert.equal(path.dirname(directory), path.resolve(os.tmpdir())); assert.ok(path.basename(directory).startsWith('kodo-release-')); await nativeRemove(directory, { recursive: true, force: true }); }
+    }
+  }
 });
 
 test('Lost merge lease stops mutation and heartbeat cleanup releases the token', async t => {
