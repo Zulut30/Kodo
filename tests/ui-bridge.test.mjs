@@ -4,6 +4,21 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { runDesktopCase, runChromeCase, uiEnvironment, browserEnvironment } from '../runtime/ui-browser.mjs';
 import { assessObservations } from '../runtime/ui-schema.mjs';
+import { readFile } from 'node:fs/promises';
+import { runInNewContext } from 'node:vm';
+
+test('Owned form rejects whitespace names and verifies only a trimmed nonempty name', async () => {
+  const html = await readFile(new URL('../scripts/fixtures/kodo-ui-form.html', import.meta.url), 'utf8');
+  const script = html.split('<script>')[1].split('</script>')[0];
+  const input = { value: '' }, result = { textContent: 'Not verified' }; let submit;
+  const document = { querySelector: selector => ({ '#name': input, '#result': result, '#form': { addEventListener: (event, handler) => { assert.equal(event, 'submit'); submit = handler; } } })[selector] };
+  runInNewContext(script, { document }); let prevented = 0;
+  for (const value of ['', '   ', ' Kodo ']) {
+    input.value = value; submit({ preventDefault() { prevented++; } });
+    assert.equal(result.textContent, value.trim() ? 'Verified Kodo' : 'Enter a name');
+  }
+  assert.equal(prevented, 3);
+});
 
 test('bridge compatibility and failure checks run without installed tools, network or UI', t => {
   const candidates = [process.env.KODO_UI_TEST_PYTHON, 'python3', 'python'].filter(Boolean);
