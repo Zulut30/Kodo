@@ -115,6 +115,70 @@ test('Paired benchmark uses Engine create/run with fixed models mode shared leas
   assert.equal(JSON.stringify(report).includes('PRIVATE RAW OUTPUT'), false);
 });
 
+test('Benchmark probes plain and trial Store workflows share two account slots while trials stay sequential', async t => {
+  const root = await temp(t), deps = services(root), peer = new Store(deps.accountStore.home);
+  const controller = new AbortController(), blocked = Promise.withResolvers(), admitted = Promise.withResolvers();
+  const occupied = peer.acquireLease('subscription:codex', 'other-chat', { limit: 2 });
+  let released = false, second = peer.acquireLease('subscription:codex', 'third-chat', { limit: 2 });
+  assert.ok(occupied); assert.ok(second);
+  const acquire = deps.accountStore.acquireLease.bind(deps.accountStore);
+  deps.accountStore.acquireLease = (name, owner, options) => {
+    const token = acquire(name, owner, options);
+    if (name === 'subscription:codex') (released ? admitted : blocked).resolve(token);
+    return token;
+  };
+  deps.provider.discoverProviders = async ({ client }, { config, sessionImpl }) => {
+    if (sessionImpl) await sessionImpl({ client, model: config.models[client][0], cwd: root, readOnly: true, prompt: 'Capability probe' });
+    return config.models[client].map(model => ({ client, model, available: true, verified: true }));
+  };
+  const TrialEngine = deps.Engine;
+  deps.Engine = class extends TrialEngine {
+    async run(id) {
+      const token = peer.acquireLease('subscription:codex', 'temporary-full-pool', { limit: 2 });
+      assert.ok(token);
+      try {
+        const overflow = this.options.store.acquireLease('subscription:codex', 'overflow-trial', { limit: 3 });
+        if (overflow) this.options.store.releaseLease(overflow);
+        assert.equal(overflow, null, 'trial Store must enforce the account cap even for a higher caller limit');
+      } finally { peer.releaseLease(token); }
+      return super.run(id);
+    }
+  };
+  const calls = []; let active = 0, peak = 0;
+  deps.provider.runSession = async request => {
+    peak = Math.max(peak, ++active); calls.push(request);
+    try {
+      assert.equal(peer.acquireLease('subscription:codex', 'fourth-chat', { limit: 2 }), null, 'probe plain and trial Store sessions must all hold the shared second slot');
+      if (!request.readOnly) {
+        const receipt = JSON.parse(await readFile(path.join(root, 'out', 'benchmark.json'), 'utf8'));
+        assert.equal(receipt.trials.filter(cell => cell.attempts.at(-1)?.status === 'running').length, 1, 'only the current trial may be running');
+        await fix(request.cwd);
+      }
+      return { model: request.model, metrics: metric, output: { complete: true } };
+    } finally { active--; }
+  };
+  const operation = runBenchmark({ ...options(path.join(root, 'out')), signal: controller.signal }, deps);
+  try {
+    assert.equal(await blocked.promise, null, 'a full account pool must block before any native workflow');
+    assert.equal(calls.length, 0);
+    peer.releaseLease(second); second = null; released = true;
+    assert.ok(await admitted.promise, 'releasing one slot must admit the benchmark alongside the other chat');
+    const report = await operation;
+    assert.equal(report.complete, true); assert.ok(report.trials.every(cell => cell.passed));
+    // ControlledEngine requests limit:1, independently exercising trialStore's
+    // account capacity rather than relying on Engine.session to pass limit:2.
+    assert.equal(report.probeMetrics.sessions, 1); assert.equal(deps.creates.length, 2);
+    assert.equal(calls.length, 5); assert.equal(peak, 1, 'benchmark cells and probes must stay sequential');
+    assert.equal(peer.renewLease(occupied), true, 'the unrelated chat lease must survive benchmark completion');
+    const available = peer.acquireLease('subscription:codex', 'after-benchmark', { limit: 2 });
+    assert.ok(available, 'benchmark must release its account slot'); peer.releaseLease(available);
+  } finally {
+    controller.abort(); await operation;
+    if (second) peer.releaseLease(second);
+    peer.releaseLease(occupied); peer.close();
+  }
+});
+
 test('Quota and interrupted attempts resume without duplicating completed trials', async t => {
   const root = await temp(t), output = path.join(root, 'out'); let attempted = 0;
   const deps = services(root, { provider: { runSession: async request => { attempted++; if (attempted === 2) throw Object.assign(new Error('SECRET quota payload'), { code: 'quota', metrics: metric }); await fix(request.cwd); return { metrics: metric, model: request.model }; } } });
@@ -286,11 +350,12 @@ test('Unavailable plain and real Engine developer sessions remain pending and re
 
 test('Abort while account lease is busy saves pending data without invoking a native session', async t => {
   const root = await temp(t), deps = services(root), controller = new AbortController();
-  const token = deps.accountStore.acquireLease('subscription:codex', 'existing-coordinator', { limit: 1 });
+  const tokens = ['existing-coordinator', 'other-coordinator'].map(owner => deps.accountStore.acquireLease('subscription:codex', owner, { limit: 2 }));
+  assert.ok(tokens.every(Boolean));
   const operation = runBenchmark({ ...options(path.join(root, 'out')), signal: controller.signal }, deps);
   setTimeout(() => controller.abort(), 100);
   const report = await operation;
-  deps.accountStore.releaseLease(token);
+  for (const token of tokens) deps.accountStore.releaseLease(token);
   assert.equal(report.complete, false); assert.equal(report.pause.code, 'cancelled'); assert.equal(deps.calls.length, 0);
   const final = await resumeBenchmark(path.join(root, 'out'), deps);
   assert.equal(final.complete, true); assert.equal(deps.calls.length, 4);

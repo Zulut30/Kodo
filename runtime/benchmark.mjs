@@ -120,7 +120,7 @@ function trialStore(store, account) {
   const tokens = new Set(), acquire = store.acquireLease.bind(store), renew = store.renewLease.bind(store), release = store.releaseLease.bind(store);
   store.acquireLease = (name, owner, options = {}) => {
     if (!name.startsWith('subscription:')) return acquire(name, owner, options);
-    const token = account.acquireLease(name, owner, { ...options, limit: Math.min(2, options.limit ?? 1) });
+    const token = account.acquireLease(name, owner, { ...options, limit: 2 });
     if (token) tokens.add(token); return token;
   };
   store.renewLease = (token, ttl) => tokens.has(token) ? account.renewLease(token, ttl) : renew(token, ttl);
@@ -129,7 +129,7 @@ function trialStore(store, account) {
 }
 async function accountLease(account, client, owner, action, signal, heartbeatMs = 10000) {
   let token;
-  while (!(token = account.acquireLease(`subscription:${client}`, owner, { limit: 1, ttlMs: 60000 }))) {
+  while (!(token = account.acquireLease(`subscription:${client}`, owner, { limit: 2, ttlMs: 60000 }))) {
     signal?.throwIfAborted();
     await new Promise((resolve, reject) => {
       const done = () => { signal?.removeEventListener('abort', abort); resolve(); };

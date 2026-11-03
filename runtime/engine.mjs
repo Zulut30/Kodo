@@ -173,7 +173,7 @@ export class Engine {
     const stage = node ? run.plan.tasks.find(task => task.id === node.id).role : run.state === 'planning' ? 'plan' : request.readOnly ? 'review' : 'repair';
     request = { ...request, prompt: `${await this.policy(run, stage)}\n${await this.toolContext(run, stage)}\nCoordinator contract: your completion report concerns the assigned scoped deliverable. Run targeted requirement and regression checks for that deliverable. Do not run repository-wide test/build/pack/release suites in a worker sandbox: the coordinator runs those gates after all changes and current main are integrated, in its own execution environment. Record targeted results and independently confirmed unrelated/environment failures separately; never change or skip unrelated tests. Do not mark the overall pipeline published or deployed.\n${request.prompt}` };
     for (const secret of Object.values(this.secrets)) if (typeof secret === 'string' && secret.length > 5) request.prompt = request.prompt.split(secret).join('[REDACTED]');
-    return this.withLease(run, `subscription:${request.client}`, run.config.concurrency, async signal => {
+    return this.withLease(run, `subscription:${request.client}`, 2, async signal => {
       this.checkCancelled(run, signal);
       const controller = new AbortController();
       const abort = () => controller.abort(); signal?.addEventListener('abort', abort, { once: true });
