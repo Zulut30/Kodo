@@ -749,6 +749,10 @@ export class Engine {
       await this.plan(run, planFile, signal);
       if (!run.delivery?.mergeCommit) {
         if (!run.completed.implementation) { await this.executeTasks(run, signal); run.completed.implementation = true; this.save(run); }
+        // Finish and scope-check the saved repair against its original HEAD
+        // before generic recovery can commit partial writes or base/release
+        // updates can introduce unrelated changes into that scope comparison.
+        if (run.verification?.pendingRepair) await this.repairVerification(run, signal);
         await this.recoverIntegrationEdits(run, signal);
         if (run.config.delivery.enabled) await this.synchronizeBase(run, signal);
         if (run.config.delivery.release) {

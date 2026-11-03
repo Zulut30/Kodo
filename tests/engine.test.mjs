@@ -197,6 +197,124 @@ test('Engine durably resumes pending verification repair after subscription inte
   });
 });
 
+test('Engine completes pending verification repair before upstream main synchronization and release metadata', async t => {
+  const fx = await fixture(t, { remote: true, config: { repairRounds: 2, researchBudget: 0 },
+    testScript: "import assert from 'node:assert/strict'; import {value} from './src/value.mjs'; assert.ok([2, 3].includes(value));\n" });
+  const services = fakeServices({ plan: { summary: 'value three', tasks: [node('feature', 'developer', ['src/value.mjs'])] },
+    onReview: async (request, calls) => {
+      if (calls.review.length === 1) return { output: { passed: false, findings: [{ severity: 'major', file: 'src/value.mjs', problem: 'Expected value three', fix: 'Export three' }] } };
+      assert.equal(await read(path.join(request.cwd, 'src/value.mjs')), 'export const value = 3;\n');
+      assert.equal(await read(path.join(request.cwd, 'untouched.txt')), 'incoming upstream content\n');
+      return { output: { passed: true, findings: [] } };
+    } });
+  const original = services.provider.runSession, repairHeads = [], releaseSnapshots = [], gateHeads = { ui: [], security: [] };
+  services.provider.runSession = async request => {
+    if (!/Repair confirmed failures/.test(request.prompt)) return original(request);
+    repairHeads.push(git(request.cwd, 'rev-parse', 'HEAD'));
+    if (repairHeads.length > 1) assert.equal(request.sessionId, 'upstream-verification-session');
+    request.onEvent({ sessionId: 'upstream-verification-session' });
+    if (repairHeads.length === 1) throw Object.assign(new Error('fixture repair quota'), { code: 'quota' });
+    await writeFile(path.join(request.cwd, 'src/value.mjs'), 'export const value = 3;\n');
+    return { sessionId: 'upstream-verification-session', output: { complete: true, summary: 'value repaired', checks: [] } };
+  };
+  services.delivery.prepareReleaseVersion = async ({ run, cwd }) => {
+    releaseSnapshots.push({ pending: Boolean(run.verification?.pendingRepair), value: git(cwd, 'show', 'HEAD:src/value.mjs'), baseSha: run.baseSha });
+    await writeFile(path.join(cwd, 'registry.json'), '{"version":"0.2.0"}\n');
+  };
+  const observeGates = engine => {
+    for (const [method, key] of [['runUIVerification', 'ui'], ['runSecurityChecks', 'security']]) {
+      const gate = engine.gates[method];
+      engine.gates[method] = async options => { gateHeads[key].push(options.headSha); return gate(options); };
+    }
+  };
+  const firstStore = fx.openStore(), firstEngine = new Engine({ store: firstStore, ...services }); observeGates(firstEngine);
+  const run = await firstEngine.create('Resume repair before updating main', { project: fx.project });
+  const paused = await firstEngine.run(run.id);
+  assert.equal(paused.state, 'waiting_limits', paused.error?.message);
+  const failedHead = git(paused.cwd, 'rev-parse', 'HEAD');
+  assert.equal(paused.verification.pendingRepair.headSha, failedHead);
+  assert.equal(paused.verification.pendingRepair.sessionId, 'upstream-verification-session');
+  assert.notEqual(paused.verification.pendingRepair.complete, true);
+  fx.closeStore(firstStore);
+  const other = path.join(fx.directory, 'other-client');
+  git(fx.directory, 'clone', '--branch', 'main', path.join(fx.directory, 'origin.git'), other);
+  git(other, 'config', 'user.name', 'Other Kodo Task'); git(other, 'config', 'user.email', 'other@example.invalid');
+  await writeFile(path.join(other, 'untouched.txt'), 'incoming upstream content\n');
+  git(other, 'add', 'untouched.txt'); git(other, 'commit', '-m', 'Concurrent out of scope main update'); git(other, 'push', 'origin', 'main');
+  const upstreamSha = git(other, 'rev-parse', 'HEAD');
+  const store = fx.openStore(), engine = new Engine({ store, ...services }); observeGates(engine);
+  const result = await engine.run(run.id);
+  assert.equal(result.state, 'succeeded', result.error?.message);
+  assert.deepEqual(repairHeads, [failedHead, failedHead], 'the exact repair session must finish against its saved scope baseline');
+  assert.equal(result.baseSha, upstreamSha); assert.notEqual(result.headSha, failedHead);
+  assert.equal(git(result.cwd, 'merge-base', upstreamSha, result.headSha), upstreamSha);
+  assert.equal(git(result.cwd, 'show', 'HEAD:untouched.txt'), 'incoming upstream content');
+  assert.equal(releaseSnapshots.length, 2);
+  assert.deepEqual(releaseSnapshots[1], { pending: false, value: 'export const value = 3;', baseSha: upstreamSha });
+  assert.deepEqual(gateHeads, { ui: [failedHead, result.headSha], security: [failedHead, result.headSha] });
+  assert.equal(services.calls.review.length, 2); assert.equal(services.calls.worker.length, 1);
+  assert.equal(result.checks.headSha, result.headSha); assert.equal(result.checks.results[0].exitCode, 0);
+  assert.equal(result.review.headSha, result.headSha); assert.equal(result.uiVerification.headSha, result.headSha); assert.equal(result.securityChecks.headSha, result.headSha);
+  assert.equal(result.verification.pendingRepair, undefined); assert.equal(result.verification.attempt, 1); assert.equal(result.verification.cycle, 1);
+  assert.equal(result.verification.previousCycles, undefined); assert.equal(result.controllerAssessment, undefined);
+  assert.equal(store.events(run.id).filter(event => event.type === 'check_started').length, 2);
+  assert.equal(store.events(run.id).filter(event => event.type === 'retry_requested').length, 0);
+  assert.equal(git(result.cwd, 'status', '--porcelain'), ''); assert.equal(git(fx.project, 'rev-parse', 'HEAD'), fx.base);
+});
+
+test('Engine keeps partial pending verification repair out of HEAD until the exact session completes', async t => {
+  const fx = await fixture(t, { config: { repairRounds: 2, researchBudget: 0 },
+    testScript: "import assert from 'node:assert/strict'; import {value} from './src/value.mjs'; assert.equal(value, 3);\n" });
+  const services = fakeServices({ plan: { summary: 'value three', tasks: [node('feature', 'developer', ['src/value.mjs'])] } });
+  const original = services.provider.runSession, repairSnapshots = [];
+  let store = fx.openStore();
+  services.provider.runSession = async request => {
+    if (!/Repair confirmed failures/.test(request.prompt)) return original(request);
+    repairSnapshots.push({ headSha: git(request.cwd, 'rev-parse', 'HEAD'), committed: git(request.cwd, 'show', 'HEAD:src/value.mjs'),
+      working: await read(path.join(request.cwd, 'src/value.mjs')), complete: store.getRun(run.id).verification.pendingRepair.complete });
+    if (repairSnapshots.length > 1) assert.equal(request.sessionId, 'partial-verification-session');
+    request.onEvent({ sessionId: 'partial-verification-session' });
+    if (repairSnapshots.length <= 2) {
+      await writeFile(path.join(request.cwd, 'src/value.mjs'), 'export const value = 99;\n');
+      throw Object.assign(new Error('fixture quota after partial file write'), { code: 'quota' });
+    }
+    await writeFile(path.join(request.cwd, 'src/value.mjs'), 'export const value = 3;\n');
+    return { sessionId: 'partial-verification-session', output: { complete: true, summary: 'repair completed', checks: [] } };
+  };
+  let engine = new Engine({ store, ...services });
+  const run = await engine.create('Keep unfinished repair uncommitted', { project: fx.project });
+  let failedHead;
+  for (let interruption = 1; interruption <= 2; interruption++) {
+    const paused = await engine.run(run.id);
+    assert.equal(paused.state, 'waiting_limits', paused.error?.message); assert.equal(paused.error.code, 'quota');
+    failedHead ||= paused.verification.pendingRepair.headSha;
+    assert.equal(git(paused.cwd, 'rev-parse', 'HEAD'), failedHead, 'incomplete repair writes must never be committed by generic recovery');
+    assert.equal(git(paused.cwd, 'show', 'HEAD:src/value.mjs'), 'export const value = 2;');
+    assert.equal(await read(path.join(paused.cwd, 'src/value.mjs')), 'export const value = 99;\n');
+    assert.notEqual(git(paused.cwd, 'status', '--porcelain'), '');
+    assert.equal(paused.verification.attempt, 1); assert.notEqual(paused.verification.pendingRepair.complete, true);
+    assert.equal(paused.verification.pendingRepair.sessionId, 'partial-verification-session');
+    fx.closeStore(store); store = fx.openStore(); engine = new Engine({ store, ...services });
+  }
+  const result = await engine.run(run.id);
+  assert.equal(result.state, 'succeeded', result.error?.message); assert.equal(repairSnapshots.length, 3);
+  for (const snapshot of repairSnapshots) {
+    assert.equal(snapshot.headSha, failedHead); assert.equal(snapshot.committed, 'export const value = 2;'); assert.notEqual(snapshot.complete, true);
+  }
+  assert.deepEqual(repairSnapshots.map(snapshot => snapshot.working), ['export const value = 2;\n', 'export const value = 99;\n', 'export const value = 99;\n']);
+  assert.equal(git(result.cwd, 'show', 'HEAD:src/value.mjs'), 'export const value = 3;');
+  assert.equal(git(result.cwd, 'rev-list', '--count', `${failedHead}..HEAD`), '1', 'only the completed repair becomes a commit');
+  assert.equal(result.verification.pendingRepair, undefined); assert.equal(result.verification.attempt, 1); assert.equal(result.verification.cycle, 1);
+  assert.equal(result.verification.previousCycles, undefined); assert.equal(result.controllerAssessment, undefined);
+  assert.equal(result.checks.headSha, result.headSha); assert.equal(result.review.headSha, result.headSha);
+  assert.equal(result.uiVerification.headSha, result.headSha); assert.equal(result.securityChecks.headSha, result.headSha);
+  assert.equal(services.calls.worker.length, 1); assert.equal(services.calls.review.length, 1);
+  assert.equal(store.events(run.id).filter(event => event.type === 'check_started').length, 2);
+  assert.equal(store.events(run.id).filter(event => event.type === 'repair_recovered').length, 0);
+  assert.equal(store.events(run.id).filter(event => event.type === 'retry_requested').length, 0);
+  assert.equal(git(result.cwd, 'status', '--porcelain'), ''); assert.equal(git(fx.project, 'rev-parse', 'HEAD'), fx.base);
+});
+
 test('Engine detects no progress only after a resumed verification repair completes', async t => {
   const fx = await fixture(t, { config: { repairRounds: 3, researchBudget: 0 }, testScript: 'process.exit(0);\n' });
   const services = fakeServices({ plan: { summary: 'one feature', tasks: [node('feature', 'developer', ['src/value.mjs'])] },
