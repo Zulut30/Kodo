@@ -10,7 +10,7 @@ import { gzipSync, deflateRawSync } from 'node:zlib';
 import { toolCatalog, installTools, resolveTool, doctorTools, formatToolContext } from '../runtime/tools.mjs';
 import { extractNativeArchive } from '../runtime/toolchains.mjs';
 
-const pins = { 'agent-desktop': '1.0.2', 'browser-use': '0.13.14', 'browser-harness': '0.1.13', vibetest: '0.1.0', 'jev-ultrafast': '0.1.0', 'chrome-devtools-mcp': '1.12.0', semgrep: '1.183.0', gitleaks: '8.30.1', ripgrep: '15.2.0' };
+const pins = { 'agent-desktop': '1.0.2', 'browser-use': '0.13.14', 'browser-harness': '0.1.13', vibetest: '0.1.0', 'jev-ultrafast': '0.1.0', 'chrome-devtools-mcp': '1.12.0', semgrep: '1.183.0', gitleaks: '8.30.1', ripgrep: '15.2.0', rtk: '1.1.0' };
 const npmIntegrity = {
   'agent-desktop': 'sha512-k2Qi3f0y1U60YaJOw1dob3EO55P/DuH4HK3WKdI9sMZLjVxpGZAzuG50rIWuIqS0JIVy07g+0pp9Of2JDjTX0w==',
   'chrome-devtools-mcp': 'sha512-lAGpH0zXT1ZdaPefP1KK/MvxwihOlu7VGQ7p4wbhD9OhN17vUC4KWk/ImUYR9DE4s+7r4r0ySV4xr2OkTa7ZMA=='
@@ -87,8 +87,11 @@ test('Import, missing resolve and doctor do not install or contact browsers', as
   assert.equal(result.status, 0, result.stderr);
   let calls = 0;
   const reports = await doctorTools({ ...fx, live: true, runner: async () => { calls++; throw new Error('unexpected execution'); } });
-  assert.equal(reports.length, 9); assert.equal(calls, 0);
-  for (const report of reports) { assert.equal(report.ready, false); assert.equal(report.status, 'missing'); }
+  assert.equal(reports.length, 10); assert.equal(calls, 0);
+  for (const report of reports) {
+    assert.equal(report.ready, false);
+    assert.equal(report.status, report.id === 'rtk' && !['win32-x64', 'linux-x64'].includes(`${process.platform}-${process.arch}`) ? 'unsupported' : 'missing');
+  }
   await assert.rejects(readFile(path.join(fx.home, '.kodo-tools.json')), { code: 'ENOENT' });
 });
 
