@@ -303,7 +303,7 @@ export class Engine {
         node.status = 'completed'; delete node.error; delete node.resumeRequired; this.save(run); return;
       } catch (error) {
         if (signal?.aborted || this.store.getRun(run.id).cancelRequested || ['quota', 'auth', 'cancelled', 'lease_lost'].includes(error.code)) { node.attempt--; node.resumeRequired = true; node.status = error.code === 'quota' ? 'waiting_limits' : 'pending'; this.save(run); if (signal?.aborted || this.store.getRun(run.id).cancelRequested) throw Object.assign(new Error('Запуск отменён'), { code: 'cancelled' }); throw error; }
-        const signature = contentHash({ error: error.message, head: await git(node.cwd, ['rev-parse', 'HEAD']), files: await git(node.cwd, ['status', '--porcelain']) });
+        const signature = contentHash({ error: error.message, workspace: await this.failureFingerprint(node.cwd) });
         node.error = redact(error.message, this.secrets); node.status = 'retrying'; this.log(run, 'node_failed', { node: task.id, attempt: node.attempt, error: node.error });
         const repeated = node.lastFailure === signature; node.lastFailure = signature; this.save(run);
         if (repeated || node.attempt >= run.config.repairRounds) {
@@ -315,6 +315,23 @@ export class Engine {
         delete node.routing; this.save(run); return;
       }
     }
+  }
+  async failureFingerprint(cwd) {
+    const tracked = (await execute('git', ['diff', '--binary', 'HEAD'], { cwd })).stdout;
+    const names = (await git(cwd, ['ls-files', '--others', '--exclude-standard', '-z'])).split('\0').filter(Boolean);
+    const untracked = []; let remaining = 8 * 1024 * 1024;
+    for (const name of names.slice(0, 256)) {
+      if (secretFile(name)) continue;
+      const filename = path.join(cwd, name), info = await lstat(filename).catch(() => null);
+      if (!info) { untracked.push({ name, missing: true }); continue; }
+      const row = { name, size: info.size, modified: info.mtimeMs, regular: info.isFile() && !info.isSymbolicLink() };
+      if (row.regular && info.size <= Math.min(2 * 1024 * 1024, remaining)) {
+        row.hash = createHash('sha256').update(await readFile(filename)).digest('hex'); remaining -= info.size;
+      }
+      untracked.push(row);
+    }
+    // Only hashes/metadata are retained, never source or secret-bearing diff.
+    return { head: await git(cwd, ['rev-parse', 'HEAD']), tracked: contentHash(tracked), untracked, untrackedCount: names.length };
   }
   async moreResearch(run, reason, signal) {
     return this.withLease(run, `research:${run.id}`, 1, async signal => {
