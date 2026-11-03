@@ -13,18 +13,44 @@ import * as providers from './providers.mjs';
 import { research } from './research.mjs';
 import { deliver, releasePackage, prepareReleaseVersion, reconcileDelivery } from './delivery.mjs';
 import { loadDefaultPolicy } from './skill-policy.mjs';
+import { buildTaskContext } from './task-context.mjs';
+import { writeProgress, assertPrivateArtifactPath } from './progress.mjs';
+import { resolveTool, formatToolContext } from './tools.mjs';
+import { runUIVerification, isCurrentUIReceipt } from './ui-verification.mjs';
+import { runSecurityChecks, isCurrentSecurityReceipt } from './security-gates.mjs';
 
 const delay = (ms, signal) => new Promise((resolve, reject) => { const timer = setTimeout(done, ms); function done() { signal?.removeEventListener('abort', abort); resolve(); } function abort() { clearTimeout(timer); reject(Object.assign(new Error('Запуск отменён'), { code: 'cancelled' })); } signal?.addEventListener('abort', abort, { once: true }); if (signal?.aborted) abort(); });
 const contentHash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const defaultModel = client => client === 'claude-code' ? 'opus' : 'gpt-6.1-sol';
 
 export class Engine {
-  constructor({ store, secrets = {}, provider = providers, researcher = research, delivery = { deliver, releasePackage, prepareReleaseVersion, reconcileDelivery }, onEvent = () => {}, leaseHeartbeatMs = 10000 } = {}) {
+  constructor({ store, secrets = {}, provider = providers, researcher = research, delivery = { deliver, releasePackage, prepareReleaseVersion, reconcileDelivery }, gates = {}, tools = {}, onEvent = () => {}, leaseHeartbeatMs = 10000 } = {}) {
     this.store = store || new Store(undefined, secrets); this.secrets = secrets; this.provider = provider; this.researcher = researcher; this.delivery = delivery; this.onEvent = onEvent;
     this.leaseHeartbeatMs = leaseHeartbeatMs;
+    this.gates = { runUIVerification, isCurrentUIReceipt, runSecurityChecks, isCurrentSecurityReceipt, ...gates };
+    this.tools = { resolveTool, formatToolContext, ...tools };
   }
   log(run, type, data = {}) { const clean = redact(data, this.secrets); this.store.event(run.id, type, clean); this.onEvent({ runId: run.id, type, data: clean }); }
-  save(run) { const { cancelRequested, ...snapshot } = run; return this.store.updateRun(run.id, snapshot, { preserveCancellation: true }); }
+  save(run) {
+    const { cancelRequested, ...snapshot } = run;
+    const saved = this.store.updateRun(run.id, snapshot, { preserveCancellation: true });
+    // Write the saved snapshot, including cancellation from another connection.
+    writeProgress(saved, { home: saved.artifacts ? path.resolve(saved.artifacts, '../..') : this.store.home, secrets: this.secrets });
+    return saved;
+  }
+  assess(run, { scope, attempts, reason, problem }) {
+    const assessment = { scope, attempts, limit: run.config.repairRounds, reason, automaticRetries: false,
+      summary: redact(String(problem).slice(0, 2000), this.secrets), assessedAt: new Date().toISOString() };
+    run.controllerAssessment = assessment;
+    run.controllerAssessments = [...(run.controllerAssessments || []), assessment].slice(-20);
+    this.save(run); this.log(run, 'controller_assessment', assessment);
+  }
+  async toolContext(run, stage) {
+    // Workers use rg; expensive browser/scanner installation verification stays
+    // with their coordinator gates. Unchecked capabilities remain unavailable.
+    const tools = [await this.tools.resolveTool('ripgrep', { project: run.cwd }).catch(() => ({ id: 'ripgrep', ready: false }))];
+    return this.tools.formatToolContext({ stage, uiVerification: run.config.uiVerification, security: run.config.security, tools });
+  }
   async policy(run, stage) {
     const policy = await loadDefaultPolicy({ project: run.cwd, stage, task: run.task, run });
     run.defaultSkills ||= {}; run.defaultSkills[stage] = { hash: policy.hash, skills: policy.skills }; this.save(run);
@@ -43,11 +69,15 @@ export class Engine {
     let baseSha = snapshot.head;
     if (config.delivery.enabled) { await git(snapshot.root, ['fetch', 'origin', config.baseBranch]); baseSha = await git(snapshot.root, ['rev-parse', `origin/${config.baseBranch}`]); }
     const run = this.store.createRun({ task: redact(task, this.secrets), project: snapshot.root, config, client: config.client, providers: mode, baseSha, snapshot, completed: {}, nodes: {} });
-    run.artifacts = path.join(this.store.home, 'runs', run.id);
-    const workerHome = process.env.KODO_WORKTREE_HOME || (path.resolve(this.store.home) === stateHome() ? worktreeHome() : `${this.store.home}-worktrees`);
+    // A caller may keep SQLite in a fixture/project directory. Private artifacts
+    // and worktrees still belong outside Git, without changing that store.
+    const stateInGit = (await execute('git', ['rev-parse', '--show-toplevel'], { cwd: this.store.home, allowFailure: true })).code === 0;
+    const artifactHome = stateInGit ? await mkdtemp(path.join(await realpath(os.tmpdir()), 'kodo-artifacts-')) : this.store.home;
+    run.artifacts = path.join(artifactHome, 'runs', run.id);
+    const workerHome = process.env.KODO_WORKTREE_HOME || (stateInGit ? `${artifactHome}-worktrees` : path.resolve(this.store.home) === stateHome() ? worktreeHome() : `${this.store.home}-worktrees`);
     run.worktreeRoot = path.join(path.resolve(workerHome), run.id);
     run.cwd = path.join(run.worktreeRoot, 'integration'); run.branch = `kodo/${run.id}`;
-    await mkdir(run.artifacts, { recursive: true, mode: 0o700 });
+    assertPrivateArtifactPath(run.artifacts); await mkdir(run.artifacts, { recursive: true, mode: 0o700 });
     this.save(run); return run;
   }
   async withLease(run, name, limit, action, signal) {
@@ -103,6 +133,8 @@ export class Engine {
     environment.NPM_CONFIG_CACHE = cache;
     const pathName = Object.keys(environment).find(name => name.toLowerCase() === 'path') || 'PATH';
     environment[pathName] = [path.dirname(process.execPath), environment[pathName]].filter(Boolean).join(path.delimiter);
+    const rg = await this.tools.resolveTool('ripgrep', { project: cwd }).catch(() => null);
+    if (rg?.ready) environment[pathName] = [path.dirname(rg.command), environment[pathName]].join(path.delimiter);
     try {
       const npm = resolveCommand('npm', []);
       if (npm.command === process.execPath && npm.args[0]) environment.npm_execpath = npm.args[0];
@@ -111,7 +143,7 @@ export class Engine {
   }
   async session(run, request, signal, node, identity = node) {
     const stage = node ? run.plan.tasks.find(task => task.id === node.id).role : run.state === 'planning' ? 'plan' : request.readOnly ? 'review' : 'repair';
-    request = { ...request, prompt: `${await this.policy(run, stage)}\nCoordinator contract: your completion report concerns the assigned scoped deliverable. Run targeted requirement and regression checks for that deliverable. Do not run repository-wide test/build/pack/release suites in a worker sandbox: the coordinator runs those gates after all changes and current main are integrated, in its own execution environment. Record targeted results and independently confirmed unrelated/environment failures separately; never change or skip unrelated tests. Do not mark the overall pipeline published or deployed.\n${request.prompt}` };
+    request = { ...request, prompt: `${await this.policy(run, stage)}\n${await this.toolContext(run, stage)}\nCoordinator contract: your completion report concerns the assigned scoped deliverable. Run targeted requirement and regression checks for that deliverable. Do not run repository-wide test/build/pack/release suites in a worker sandbox: the coordinator runs those gates after all changes and current main are integrated, in its own execution environment. Record targeted results and independently confirmed unrelated/environment failures separately; never change or skip unrelated tests. Do not mark the overall pipeline published or deployed.\n${request.prompt}` };
     for (const secret of Object.values(this.secrets)) if (typeof secret === 'string' && secret.length > 5) request.prompt = request.prompt.split(secret).join('[REDACTED]');
     return this.withLease(run, `subscription:${request.client}`, run.config.concurrency, async signal => {
       this.checkCancelled(run, signal);
@@ -155,7 +187,7 @@ export class Engine {
       run.state = 'analyzing'; this.save(run);
       const bundle = await collectFiles(run.cwd, run.task, this.secrets);
       const standards = await this.policy(run, 'analyze');
-      const analysis = await this.provider.analyzeGemini({ task: `${run.task}\n${standards}`, files: bundle.files, signal }, { secrets: this.secrets });
+      const analysis = await this.provider.analyzeGemini({ task: `${run.task}\n${standards}\n${await this.toolContext(run, 'analyze')}`, files: bundle.files, signal }, { secrets: this.secrets });
       const evidence = await this.researcher({ task: analysis.researchQuery || run.task, budget: run.config.researchBudget, signal }, { secrets: this.secrets }).catch(error => ({ items: [], requests: 0, errors: [{ source: 'research', error: redact(error.message, this.secrets) }], cache: [] }));
       run.analysis = { ...analysis, omitted: bundle.omitted, priorLessons: this.store.lessons(run.project), standards }; run.research = evidence;
       run.completed.analysis = { baseSha: run.baseSha, inputHash: contentHash(bundle.files) };
@@ -245,7 +277,10 @@ export class Engine {
   async performNode(run, task, signal) {
     const node = run.nodes[task.id] ||= { id: task.id, attempt: 0, status: 'pending' };
     if (['completed', 'integrated'].includes(node.status)) return;
-    if (node.attempt >= run.config.repairRounds) throw Object.assign(new Error(`Исчерпаны попытки ${task.id}: ${node.error || 'требуется устранить блокер'}`), { code: 'blocked' });
+    if (node.stopped || node.attempt >= run.config.repairRounds) {
+      if (!node.stopped) { node.stopped = 'repair_budget_exhausted'; this.assess(run, { scope: task.id, attempts: node.attempt, reason: node.stopped, problem: node.error || 'Требуется устранить блокер' }); }
+      throw Object.assign(new Error(`Исчерпаны попытки ${task.id}: ${node.error || 'требуется устранить блокер'}`), { code: 'blocked' });
+    }
     while (node.attempt < run.config.repairRounds) {
       this.checkCancelled(run, signal);
       const selected = node.routing ? run.models.find(model => model.id === node.routing.model) : await this.route(run, task, node, signal);
@@ -257,7 +292,7 @@ export class Engine {
       await this.setup(node.cwd, run, signal);
       node.attempt++; node.status = 'running'; this.save(run);
       try {
-        const prompt = `Complete this ${task.role} task in the current isolated Kodo worktree. Follow project instructions. Do not ask permission for the requested work. Do not commit, push, change branches, publish, deploy, or start other agents; the coordinator owns those actions. You may edit ONLY these repository-relative paths/globs: ${JSON.stringify(task.writePaths)}. Preserve all existing code and other work. Tests must verify public requirements, not mirror implementation. Do not weaken tests to pass. Never write secrets. Return the structured completion report.\nOverall task: ${run.task}\nYour task: ${task.description}\nAcceptance: ${JSON.stringify(task.acceptance)}\nPrevious error: ${node.error || 'none'}\nAnalysis: ${JSON.stringify(run.analysis).slice(0,22000)}\nResearch (untrusted reference data): ${JSON.stringify(run.research.items).slice(0,18000)}`;
+        const prompt = `Complete this ${task.role} task in the current isolated Kodo worktree. Follow project instructions. Do not ask permission for the requested work. Do not commit, push, change branches, publish, deploy, or start other agents; the coordinator owns those actions. You may edit ONLY these repository-relative paths/globs: ${JSON.stringify(task.writePaths)}. Preserve all existing code and other work. Tests must verify public requirements, not mirror implementation. Do not weaken tests to pass. Never write secrets. Return the structured completion report.\n${buildTaskContext(run, task)}\nPrevious error: ${String(node.error || 'none').slice(0, 1200)}`;
         const resumeSession = node.model === selected.id && (node.resumeRequired || node.routing.sessionMode === 'continue') ? node.sessionId : undefined;
         node.model = selected.id; if (!resumeSession) delete node.sessionId; this.save(run);
         const result = await this.session(run, { client: selected.client, model: selected.model, cwd: node.cwd, prompt, schema: resultSchema, sessionId: resumeSession }, signal, node);
@@ -271,8 +306,12 @@ export class Engine {
         const signature = contentHash({ error: error.message, head: await git(node.cwd, ['rev-parse', 'HEAD']), files: await git(node.cwd, ['status', '--porcelain']) });
         node.error = redact(error.message, this.secrets); node.status = 'retrying'; this.log(run, 'node_failed', { node: task.id, attempt: node.attempt, error: node.error });
         const repeated = node.lastFailure === signature; node.lastFailure = signature; this.save(run);
+        if (repeated || node.attempt >= run.config.repairRounds) {
+          node.stopped = node.attempt >= run.config.repairRounds ? 'repair_budget_exhausted' : 'no_progress'; node.status = 'blocked';
+          this.assess(run, { scope: task.id, attempts: node.attempt, reason: node.stopped, problem: node.error });
+          throw Object.assign(new Error(`Нет прогресса в ${task.id}: ${node.error}`), { code: 'blocked' });
+        }
         await this.moreResearch(run, node.error, signal);
-        if (repeated || node.attempt >= run.config.repairRounds) throw Object.assign(new Error(`Нет прогресса в ${task.id}: ${node.error}`), { code: 'blocked' });
         delete node.routing; this.save(run); return;
       }
     }
@@ -345,6 +384,44 @@ export class Engine {
     if (!run.config.commands.test.length) throw new Error('Не настроена команда проверки результата');
     run.checks = { headSha: await git(run.cwd, ['rev-parse', 'HEAD']), results }; this.save(run);
   }
+  async verificationGates(run, signal) {
+    const headSha = await git(run.cwd, ['rev-parse', 'HEAD']);
+    const clean = async () => {
+      if (await git(run.cwd, ['rev-parse', 'HEAD']) !== headSha || await git(run.cwd, ['status', '--porcelain'])) {
+        run.uiVerification = null; run.securityChecks = null; run.review = null; this.save(run);
+        throw Object.assign(new Error('UI/security gate changed the checked worktree'), { code: 'dirty_worktree' });
+      }
+    };
+    await clean();
+    if (run.checks?.headSha !== headSha) throw Object.assign(new Error('Local check head is stale'), { code: 'stale_checks' });
+    run.state = 'verifying'; run.review = null; this.save(run);
+    const failures = [];
+    for (const [field, config, executeGate, current] of [
+      ['uiVerification', run.config.uiVerification, this.gates.runUIVerification, this.gates.isCurrentUIReceipt],
+      ['securityChecks', run.config.security, this.gates.runSecurityChecks, this.gates.isCurrentSecurityReceipt]
+    ]) {
+      this.checkCancelled(run, signal);
+      // Never retain a previous passing receipt when the next invocation fails.
+      const previous = run[field]; run[field] = null; this.save(run);
+      try { run[field] = await executeGate({ cwd: run.cwd, headSha, config, artifacts: run.artifacts, previous, secrets: this.secrets, signal }); }
+      catch (error) {
+        if (signal?.aborted || ['cancelled', 'quota', 'auth', 'lease_lost'].includes(error.code)) throw error;
+        run[field] = { headSha, status: 'blocked', passed: false };
+      }
+      this.save(run); await clean();
+      if (!current(run[field], { headSha, config })) {
+        const receipt = run[field];
+        const findings = (receipt?.tools || []).slice(0, 5).flatMap(row => (row.findings || []).slice(0, 10).map(f => ({ ruleId: String(f.ruleId || '').slice(0, 160), file: String(f.file || '').slice(0, 240), line: Number.isSafeInteger(f.line) ? f.line : undefined, severity: String(f.severity || '').slice(0, 20) })));
+        const statuses = new Set(['passed', 'failed', 'blocked', 'error']);
+        const cases = (run.config.uiVerification?.cases || []).slice(0, 20).filter(() => field === 'uiVerification').map(c => {
+          const row = receipt?.cases?.find(r => r.id === c.id);
+          return { id: c.id, tool: c.tool, status: statuses.has(row?.status) ? row.status : 'invalid', failedAssertions: (row?.assertions || []).flatMap((a, index) => a.passed === false ? [index] : []).slice(0, 30) };
+        });
+        failures.push({ gate: field, status: ['failed', 'blocked', 'disabled'].includes(receipt?.status) ? receipt.status : 'invalid', findings, cases });
+      }
+    }
+    if (failures.length) throw Object.assign(new Error(`UI/security verification requires current complete evidence: ${JSON.stringify(redact(failures, this.secrets))}`), { code: 'verification_failed' });
+  }
   async synchronizeBase(run, signal) {
     await git(run.cwd, ['fetch', 'origin', run.config.baseBranch]);
     const remoteBase = await git(run.cwd, ['rev-parse', `origin/${run.config.baseBranch}`]);
@@ -405,13 +482,18 @@ export class Engine {
       }
       await this.checkScope(run.cwd, 'HEAD', scopes);
       run.headSha = await commitChanges(run.cwd, 'Kodo recover scoped interrupted repair');
-      run.checks = null; run.review = null; this.save(run); this.log(run, 'repair_recovered', { headSha: run.headSha });
+      run.checks = null; run.review = null; run.uiVerification = null; run.securityChecks = null; this.save(run); this.log(run, 'repair_recovered', { headSha: run.headSha });
     }
   }
   async verify(run, signal) {
-    for (let attempt = 0; attempt < run.config.repairRounds; attempt++) {
+    const cycle = run.verification ||= { attempt: 0, cycle: 1 };
+    if (cycle.stopped || cycle.attempt >= run.config.repairRounds) {
+      if (!cycle.stopped) { cycle.stopped = 'repair_budget_exhausted'; this.assess(run, { scope: 'verification', attempts: cycle.attempt, reason: cycle.stopped, problem: run.error?.message || 'Verification budget exhausted; remaining checks require an explicit new cycle' }); }
+      throw Object.assign(new Error('Verification repair cycle stopped; use --retry-failed for a new cycle'), { code: 'blocked' });
+    }
+    for (let attempt = cycle.attempt; attempt < run.config.repairRounds; attempt++) {
       let checkError;
-      try { await this.checks(run, signal); } catch (error) {
+      try { run.uiVerification = null; run.securityChecks = null; run.review = null; this.save(run); await this.checks(run, signal); await this.verificationGates(run, signal); } catch (error) {
         if (signal?.aborted || this.store.getRun(run.id).cancelRequested) throw Object.assign(new Error('Запуск отменён'), { code: 'cancelled' });
         if (['cancelled','quota','auth'].includes(error.code)) throw error;
         checkError = error;
@@ -424,34 +506,54 @@ export class Engine {
         const diff = (await execute('git', ['diff', `${run.baseSha}...HEAD`], { cwd: run.cwd })).stdout;
         const statusBeforeReview = await git(run.cwd, ['status', '--porcelain']);
         const response = await this.session(run, { client: selected.client, model: selected.model, cwd: run.cwd, readOnly: true, schema: reviewSchema,
-          prompt: `Independently review the final implementation of this task: ${run.task}. Read project instructions and trace callers. Do not change files or execute write commands. Identify concrete defects and missing requirements. Test evidence: ${JSON.stringify(run.checks)}\nPlan: ${JSON.stringify(run.plan)}\nDiff excerpt (read full git diff if truncated): ${diff.slice(0,100000)}. Return passed=true only with no blocker/major findings.` }, signal);
+          prompt: `Independently review the final implementation of this task: ${run.task}. Read project instructions and trace callers. Do not change files or execute write commands. Identify concrete defects and missing requirements. Test evidence: ${JSON.stringify(run.checks)}\nGate evidence: ${JSON.stringify([run.uiVerification, run.securityChecks].map(receipt => ({ status: receipt.status, headSha: receipt.headSha, configHash: receipt.configHash, evidenceRoot: receipt.evidenceRoot })))}\nPlan: ${JSON.stringify(run.plan)}\nDiff excerpt (read full git diff if truncated): ${diff.slice(0,100000)}. Return passed=true only with no blocker/major findings.` }, signal);
         review = validate(reviewSchema, response.output);
         if (review.passed && review.findings.some(item => ['major', 'blocker'].includes(item.severity))) review.passed = false;
         const after = await git(run.cwd, ['rev-parse', 'HEAD']);
         if (after !== headSha || await git(run.cwd, ['status', '--porcelain']) !== statusBeforeReview) throw new Error('Ревьюер изменил проверяемые файлы');
-        if (review.passed) { run.headSha = headSha; run.review = { ...review, sessionId: response.sessionId, model: selected.id, headSha, diffHash: await diffHash(run.cwd, run.baseSha), attempt: attempt + 1 }; this.save(run); return; }
+        if (review.passed) {
+          if (!this.gates.isCurrentUIReceipt(run.uiVerification, { headSha, config: run.config.uiVerification }) || !this.gates.isCurrentSecurityReceipt(run.securityChecks, { headSha, config: run.config.security })) {
+            run.uiVerification = null; run.securityChecks = null; this.save(run);
+            throw Object.assign(new Error('Gate evidence changed during independent review'), { code: 'stale_verification' });
+          }
+          run.headSha = headSha; run.review = { ...review, sessionId: response.sessionId, model: selected.id, headSha, diffHash: await diffHash(run.cwd, run.baseSha), attempt: attempt + 1 }; this.save(run); return;
+        }
       }
       const problem = checkError?.message || JSON.stringify(review.findings);
       this.log(run, 'repair_required', { attempt, problem });
-      if (attempt + 1 >= run.config.repairRounds) throw Object.assign(new Error(`Проверки не пройдены: ${problem}`), { code: 'blocked' });
+      const signature = contentHash({ problem, headSha });
+      const repeated = cycle.lastFailure === signature;
+      cycle.attempt = attempt + 1; cycle.lastFailure = signature; this.save(run);
+      if (repeated || cycle.attempt >= run.config.repairRounds) {
+        cycle.stopped = cycle.attempt >= run.config.repairRounds ? 'repair_budget_exhausted' : 'no_progress';
+        this.assess(run, { scope: 'verification', attempts: cycle.attempt, reason: cycle.stopped, problem });
+        throw Object.assign(new Error(`Проверки не пройдены: ${problem}`), { code: 'blocked' });
+      }
       await this.moreResearch(run, problem, signal);
       const scopes = run.plan.tasks.flatMap(task => task.writePaths);
       const beforeRepair = await git(run.cwd, ['rev-parse', 'HEAD']);
       const response = await this.session(run, { client: run.client, model: run.config.primaryModel || defaultModel(run.client), cwd: run.cwd, schema: resultSchema,
-        prompt: `Repair confirmed failures in task ${run.task}. Do not commit/push/deploy, do not weaken checks. Change only these scopes ${JSON.stringify(scopes)}. Failures: ${problem}. Return completion JSON.` }, signal);
+        prompt: `Repair confirmed failures in task ${run.task.slice(0, 1000)}. Do not commit/push/deploy, do not weaken checks. Change only these scopes ${JSON.stringify(scopes)}. Failures: ${problem.slice(0, 6000)}. Evidence directory (read only relevant gate receipts): ${run.artifacts}. Return completion JSON.` }, signal);
       if (!response.output.complete) throw new Error('Исправление проверки не завершено');
       await this.checkScope(run.cwd, beforeRepair, scopes); await commitChanges(run.cwd, `Kodo repair checks ${attempt + 1}`);
+      run.checks = null; run.review = null; run.uiVerification = null; run.securityChecks = null; this.save(run);
     }
   }
   async run(id, { prepare = false, planFile, signal, resumeCancelled = false, retryFailed = false } = {}) {
     const run = this.store.getRun(id);
+    writeProgress(run, { home: run.artifacts ? path.resolve(run.artifacts, '../..') : this.store.home, secrets: this.secrets });
     if (run.state === 'succeeded' || run.state === 'cancelled' && !resumeCancelled) return run;
     const token = this.store.acquireLease(`run:${id}`, id); if (!token) throw new Error('Этот запуск уже исполняется');
     if (resumeCancelled) { this.store.updateRun(id, { cancelRequested: false, state: 'resuming' }); delete run.cancelRequested; run.state = 'resuming'; }
     if (retryFailed) {
       for (const node of Object.values(run.nodes)) if (!['completed','integrated'].includes(node.status)) {
-        node.previousAttempts = (node.previousAttempts || 0) + node.attempt; node.attempt = 0; node.status = 'pending'; delete node.routing; delete node.sessionId; delete node.lastFailure;
+        node.previousAttempts = (node.previousAttempts || 0) + node.attempt;
+        node.previousCycles = [...(node.previousCycles || []), { attempt: node.attempt, error: node.error, sessionId: node.sessionId, stopped: node.stopped }].slice(-20);
+        node.attempt = 0; node.status = 'pending'; delete node.routing; delete node.sessionId; delete node.lastFailure; delete node.stopped;
       }
+      const previous = run.verification;
+      if (previous) run.verification = { attempt: 0, cycle: (previous.cycle || 1) + 1, previousCycles: [...(previous.previousCycles || []), { attempt: previous.attempt, cycle: previous.cycle, stopped: previous.stopped }].slice(-20) };
+      delete run.controllerAssessment;
       this.save(run); this.log(run, 'retry_requested');
     }
     const parentSignal = signal, controller = new AbortController(), cancel = () => controller.abort();
@@ -464,6 +566,7 @@ export class Engine {
       this.checkCancelled(run, signal); await this.prepare(run, signal);
       if (prepare && !run.plan) { run.state = 'awaiting_plan'; run.planningContext = await this.policy(run, 'plan'); await writeFile(path.join(run.artifacts, 'plan-context.md'), run.planningContext); await writeFile(path.join(run.artifacts, 'plan.schema.json'), JSON.stringify(planSchema, null, 2)); this.save(run); return run; }
       await this.plan(run, planFile, signal);
+      if (run.verification?.stopped) throw Object.assign(new Error('Verification repair cycle stopped; use --retry-failed for a new cycle'), { code: 'blocked' });
       if (run.delivery?.pr && this.delivery.reconcileDelivery) {
         const recovered = await this.delivery.reconcileDelivery({ run, config: run.config, store: this.store, cwd: run.cwd, signal });
         if (recovered) { run.delivery = recovered; this.save(run); }
