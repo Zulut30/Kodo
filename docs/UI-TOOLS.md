@@ -1,6 +1,6 @@
 # Инструменты UI и локальной проверки
 
-Kodo управляет девятью необязательными инструментами через `runtime/tools.mjs`. Каталог `runtime/tool-catalog.json` закрепляет версии, Git-ревизии, npm integrity и SHA-256 нативных архивов. Это отдельный механизм: в registry остаются 33 компонента, в политике — 13 стандартных навыков. Базовый CLI, чтение конфигурации и обычные тесты не устанавливают инструменты и не обращаются к моделям.
+Kodo управляет десятью необязательными инструментами через `runtime/tools.mjs`. Каталог `runtime/tool-catalog.json` закрепляет версии, Git-ревизии, npm integrity и SHA-256 нативных архивов. Это отдельный механизм: в registry остаются 33 компонента, в политике — 13 стандартных навыков. Базовый CLI, чтение конфигурации и обычные тесты не устанавливают инструменты и не обращаются к моделям.
 
 ## Роли, версии и лицензии
 
@@ -15,8 +15,9 @@ Kodo управляет девятью необязательными инстр
 | `semgrep` | Python `1.183.0` | LGPL-2.1-or-later | Локальные правила опасных exec/eval-паттернов JS/Python |
 | `gitleaks` | native `8.30.1` | MIT | Поиск секретов в текущем tracked source; ограниченная история по явной настройке |
 | `ripgrep` | native `15.2.0` | MIT OR Unlicense | Поиск кода по явным путям/glob с ограниченным выводом |
+| `rtk` | OSS native `1.1.0`, `753a3b0e939f2e4490fc24e3a1984010f40a103c` | Apache-2.0 | Необязательная явная фильтрация поддерживаемого человекочитаемого shell-вывода |
 
-Исходники: [Agent Desktop](https://github.com/vercel-labs/agent-desktop), [Browser Use](https://github.com/browser-use/browser-use), [Browser Harness](https://github.com/browser-use/browser-harness), [Vibetest](https://github.com/browser-use/vibetest-use), [Jev Ultrafast](https://github.com/browser-use/jev-ultrafast), [Chrome DevTools MCP](https://github.com/ChromeDevTools/chrome-devtools-mcp), [Semgrep](https://github.com/semgrep/semgrep), [Gitleaks](https://github.com/gitleaks/gitleaks), [ripgrep](https://github.com/BurntSushi/ripgrep). Pin и лицензия относятся к конкретному инструменту, а не ко всему Kodo. Полные digest и платформенные assets находятся в каталоге, а не подбираются по `latest` во время установки.
+Исходники: [Agent Desktop](https://github.com/vercel-labs/agent-desktop), [Browser Use](https://github.com/browser-use/browser-use), [Browser Harness](https://github.com/browser-use/browser-harness), [Vibetest](https://github.com/browser-use/vibetest-use), [Jev Ultrafast](https://github.com/browser-use/jev-ultrafast), [Chrome DevTools MCP](https://github.com/ChromeDevTools/chrome-devtools-mcp), [Semgrep](https://github.com/semgrep/semgrep), [Gitleaks](https://github.com/gitleaks/gitleaks), [ripgrep](https://github.com/BurntSushi/ripgrep), [RTK pinned source](https://github.com/rtk-ai/rtk/tree/753a3b0e939f2e4490fc24e3a1984010f40a103c). Pin и лицензия относятся к конкретному инструменту, а не ко всему Kodo. Полные digest и платформенные assets находятся в каталоге, а не подбираются по `latest` во время установки.
 
 ## Управляемая установка и doctor
 
@@ -38,7 +39,17 @@ kodo security verify --project "D:\Projects\my-app" --json
 
 Инструменты находятся вне Git: `KODO_TOOL_HOME` либо соседний с каталогом состояния `Kodo-Tools`. Принимается только отдельный безопасный каталог, без ссылок и пересечения с проектом. Установки сериализуются, повторно используются только точные pins с проверенной квитанцией и хешами файлов. npm lifecycle scripts отключены; Agent Desktop использует комплектный бинарник с соседним `.sha256`. Нативные архивы проверяются до безопасной распаковки. Глобальные инструменты и исследовательские окружения не изменяются. Установка происходит по явной `tools install` либо по `autoInstall: true` у включённого gate; doctor никогда не устанавливает.
 
-Для UI нужен установленный Chrome/Chromium, при необходимости абсолютный `uiVerification.executablePath`, либо доступное собственное desktop-приложение. Матрица пакетов охватывает Windows/Linux/macOS x64/arm64; Semgrep pin объявлен только для Windows x64, Linux x64/arm64 и macOS arm64. Доступность пакета на платформе не доказывает работу её accessibility API или UI-сценария.
+Для UI нужен установленный Chrome/Chromium, при необходимости абсолютный `uiVerification.executablePath`, либо доступное собственное desktop-приложение. Матрица пакетов охватывает Windows/Linux/macOS x64/arm64, но зависит от инструмента: Semgrep pin объявлен для Windows x64, Linux x64/arm64 и macOS arm64; RTK — только Windows x64/Linux x64. Доступность пакета на платформе не доказывает работу её accessibility API или UI-сценария.
+
+## RTK и вывод shell
+
+Координатор устанавливает `rtk` тем же managed installer, с проверкой SHA-256 до распаковки, лицензии, версии и полного inventory. Pin OSS 1.1.0 использует `rtk-oss-x86_64-pc-windows-msvc.zip` и `rtk-oss-x86_64-unknown-linux-musl.tar.gz`; checksum и executable path заданы в `runtime/tool-catalog.json`. Это локальный output-фильтр, без model API routing/`rtk-proxy`. Пользовательский global RTK 0.50.0 не заменяется.
+
+После lease Engine проверяет ready tool один раз для сессии и использует результат в guidance/env; новая сессия перепроверяет файлы. Managed binary находится перед inherited PATH только native worker, с private `RTK_DB_PATH`, `RTK_RECALL=0`, `RTK_TEE=0`, `RTK_TELEMETRY_DISABLED=1`. Native HOME/auth остаются прежними. App-host/видимый чат не наследует native env автоматически: shell-вызову нужны точный managed binary и приватные overrides координатора. Не следует проверять это через произвольный global `rtk`.
+
+Применять явно к проверенным человекочитаемым командам, например `rtk git status` и `rtk git diff --stat`; неизвестная поддержка, missing/unsupported — исходная команда без фильтра и per-session install. JSON, porcelain, `-z`/NUL, протоколы и любой parsed output остаются сырыми. Node `node:test`/TAP и generic `rtk test` не совмещаются: реальная fixture сохранила exit 1, но потеряла полезную причину неуспеха. Checks координатора, CI, UI/security и delivery также выполняются сырыми.
+
+Сохраняй исходный exit code и полную диагностику. При потерях повтори raw command и сохрани полный redacted evidence вне Git; потеря ошибок не считается экономией. Не запускать `init`/config-save, не добавлять global hooks и не обходить trust. RTK может читать существующий global config; Kodo не сохраняет его изменения и отдельно задаёт private tracking/recall/tee/telemetry. [Измерения и ограничения](EFFICIENCY.md), [приватность](SECURITY.md#приватные-evidence-и-rtk).
 
 ## Конфигурация UI
 
