@@ -132,9 +132,8 @@ export class Engine {
     for (const name of Object.keys(environment)) if (name.toUpperCase() === 'NPM_CONFIG_CACHE') delete environment[name];
     environment.NPM_CONFIG_CACHE = cache;
     const pathName = Object.keys(environment).find(name => name.toLowerCase() === 'path') || 'PATH';
-    environment[pathName] = [path.dirname(process.execPath), environment[pathName]].filter(Boolean).join(path.delimiter);
     const rg = await this.tools.resolveTool('ripgrep', { project: cwd }).catch(() => null);
-    if (rg?.ready) environment[pathName] = [path.dirname(rg.command), environment[pathName]].join(path.delimiter);
+    environment[pathName] = [path.dirname(process.execPath), rg?.ready ? path.dirname(rg.command) : null, environment[pathName]].filter(Boolean).join(path.delimiter);
     try {
       const npm = resolveCommand('npm', []);
       if (npm.command === process.execPath && npm.args[0]) environment.npm_execpath = npm.args[0];
