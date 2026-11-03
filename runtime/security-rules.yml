@@ -1,0 +1,42 @@
+# A small local OSS gate, not a security certification. No registry or uploads.
+rules:
+  - id: kodo.javascript.eval
+    languages: [javascript, typescript]
+    message: Avoid executing strings as JavaScript code.
+    severity: ERROR
+    pattern: eval(...)
+  - id: kodo.javascript.function-constructor
+    languages: [javascript, typescript]
+    message: Avoid constructing executable JavaScript from strings.
+    severity: ERROR
+    pattern: new Function(...)
+  - id: kodo.javascript.shell-exec
+    languages: [javascript, typescript]
+    message: Review shell command execution; prefer argument arrays and shell false.
+    severity: WARNING
+    pattern-either:
+      - pattern: child_process.exec(...)
+      - pattern: child_process.execSync(...)
+      - pattern: |
+          import { exec as $EXEC } from 'node:child_process';
+          ...
+          $EXEC(...)
+      - pattern: |
+          import { execSync as $EXEC } from 'node:child_process';
+          ...
+          $EXEC(...)
+  - id: kodo.python.dynamic-code
+    languages: [python]
+    message: Avoid executing strings as Python code.
+    severity: ERROR
+    pattern-either:
+      - pattern: eval(...)
+      - pattern: exec(...)
+  - id: kodo.python.shell-execution
+    languages: [python]
+    message: Review shell execution; prefer argument arrays with shell false.
+    severity: WARNING
+    pattern-either:
+      - pattern: subprocess.$CALL(..., shell=True, ...)
+      - pattern: os.system(...)
+      - pattern: os.popen(...)

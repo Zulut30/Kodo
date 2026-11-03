@@ -1,5 +1,8 @@
 import path from 'node:path';
 import { existsSync } from 'node:fs';
+import { mkdir, mkdtemp, realpath, writeFile } from 'node:fs/promises';
+import os from 'node:os';
+import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { readConfig, initConfig } from './config.mjs';
 import { loadSecrets, redact, stateHome } from './security.mjs';
@@ -11,6 +14,11 @@ import { migrate } from './migration.mjs';
 import { fileURLToPath } from 'node:url';
 import { loadCatalog } from '../cli/catalog.mjs';
 import { planInstallation, applyInstallation } from '../cli/installer.mjs';
+import { toolCatalog, doctorTools, installTools } from './tools.mjs';
+import { runUIVerification, isCurrentUIReceipt } from './ui-verification.mjs';
+import { runSecurityChecks, isCurrentSecurityReceipt } from './security-gates.mjs';
+import { git } from './workspace.mjs';
+import { writeProgress, assertPrivateArtifactPath } from './progress.mjs';
 
 export async function runtimeCli(command, args) {
   // Audit only reads saved state. Keep it before credentials, project config,
@@ -36,18 +44,54 @@ export async function runtimeCli(command, args) {
   const values = new Set(['--project', '--client', '--model', '--providers', '--plan', '--delivery', '--target']);
   for (let index = 0; index < args.length; index++) {
     const arg = args[index];
-    if (flags.has(arg)) options[arg.slice(2)] = true;
+    if (flags.has(arg)) { if (options[arg.slice(2)] !== undefined) throw new Error(`Повторный параметр ${arg}`); options[arg.slice(2)] = true; }
     else if (values.has(arg)) { if (!args[index + 1] || args[index + 1].startsWith('--')) throw new Error(`Требуется значение ${arg}`); if (options[arg.slice(2)]) throw new Error(`Повторный параметр ${arg}`); options[arg.slice(2)] = args[++index]; }
     else if (arg.startsWith('-')) throw new Error(`Неизвестный параметр ${arg}`);
     else options.positional.push(arg);
   }
   const allowed = {
     init: ['json','project','target','client'], doctor: ['json','live','project','client'], run: ['json','prepare','project','client','model','providers','plan','delivery'],
-    resume: ['json','plan','retry-failed'], status: ['json'], logs: ['json'], cancel: ['json'], migrate: ['json','target']
+    resume: ['json','plan','retry-failed'], status: ['json'], logs: ['json'], cancel: ['json'], migrate: ['json','target'],
+    tools: ['json','project','live'], ui: ['json','project'], security: ['json','project']
   }[command];
+  if (!allowed) throw new Error(`Неизвестная команда ${command}`);
   for (const key of Object.keys(options)) if (key !== 'positional' && !allowed?.includes(key)) throw new Error(`Параметр ${key} неприменим к ${command}`);
   const print = value => console.log(JSON.stringify(value, null, options.json ? 0 : 2));
   const project = path.resolve(options.project || options.target || process.cwd());
+  // Metadata and tool setup never open the provider credential store or engine.
+  if (command === 'tools') {
+    const [action, id, ...extra] = options.positional;
+    if (!['list', 'doctor', 'install'].includes(action) || extra.length || action !== 'install' && id !== undefined || action === 'install' && !id || options.live && action !== 'doctor' || options.project && action === 'list') throw new Error('Использование: kodo tools list [--json] | doctor [--live] [--project PATH] [--json] | install <id|all> [--project PATH] [--json]');
+    if (action === 'list') { print(toolCatalog); return; }
+    if (action === 'doctor') { const checks = await doctorTools({ project, live: Boolean(options.live) }); print(checks); if (checks.some(check => !check.ready)) process.exitCode = 2; return; }
+    if (id !== 'all' && !toolCatalog.some(tool => tool.id === id)) throw new Error(`Неизвестный инструмент ${id}`);
+    const result = await installTools(id === 'all' ? toolCatalog.map(tool => tool.id) : [id], { project });
+    print(result); if (result.some(check => !check.ready)) process.exitCode = 2; return;
+  }
+  if (command === 'ui' || command === 'security') {
+    if (options.positional.length !== 1 || options.positional[0] !== 'verify') throw new Error(`Использование: kodo ${command} verify [--project PATH] [--json]`);
+    const cwd = await git(project, ['rev-parse', '--show-toplevel']), headSha = await git(cwd, ['rev-parse', 'HEAD']);
+    const clean = async () => {
+      if (await git(cwd, ['rev-parse', 'HEAD']) !== headSha || await git(cwd, ['status', '--porcelain'])) throw new Error('Verification requires a clean unchanged Git head');
+    };
+    await clean();
+    const config = await readConfig(cwd), ui = command === 'ui', selected = ui ? config.uiVerification : config.security;
+    const secrets = ui && selected.enabled && selected.cases.some(c => ['browser-use', 'vibetest', 'jev-ultrafast'].includes(c.tool)) ? await loadSecrets() : {};
+    let artifacts = path.join(stateHome(), 'verifications', randomUUID());
+    try { assertPrivateArtifactPath(artifacts); }
+    catch (error) { if (error.code !== 'artifacts_in_git') throw error; artifacts = await mkdtemp(path.join(await realpath(os.tmpdir()), 'kodo-verification-')); assertPrivateArtifactPath(artifacts); }
+    await mkdir(artifacts, { recursive: true, mode: 0o700 });
+    const controller = new AbortController(), abort = () => controller.abort();
+    process.once('SIGINT', abort); process.once('SIGTERM', abort);
+    try {
+      const receipt = await (ui ? runUIVerification : runSecurityChecks)({ cwd, headSha, config: selected, artifacts, secrets, signal: controller.signal });
+      await clean();
+      const current = (ui ? isCurrentUIReceipt : isCurrentSecurityReceipt)(receipt, { headSha, config: selected });
+      await writeFile(path.join(artifacts, `${command}-receipt.json`), JSON.stringify(redact(receipt, secrets), null, 2) + '\n', { mode: 0o600 });
+      print(redact(receipt, secrets)); if (!current) process.exitCode = 2;
+    } finally { process.removeListener('SIGINT', abort); process.removeListener('SIGTERM', abort); }
+    return;
+  }
   if (command === 'init') {
     if (options.positional.length) throw new Error('init не принимает задачу');
     const catalog = await loadCatalog(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'));
@@ -73,7 +117,10 @@ export async function runtimeCli(command, args) {
     const id = options.positional[0];
     if (command === 'status') { print(store.getRun(id)); return; }
     if (command === 'logs') { print(store.events(id)); return; }
-    if (command === 'cancel') { const run = store.getRun(id); print(['succeeded','cancelled'].includes(run.state) ? run : store.updateRun(id, { cancelRequested: true, state: 'cancelled' })); return; }
+    if (command === 'cancel') {
+      const run = store.getRun(id), saved = ['succeeded','cancelled'].includes(run.state) ? run : store.updateRun(id, { cancelRequested: true, state: 'cancelled' });
+      writeProgress(saved, { home: saved.artifacts ? path.resolve(saved.artifacts, '../..') : store.home, secrets }); print(saved); return;
+    }
     const engine = await openEngine({ store, secrets, onEvent: event => { if (!options.json) process.stderr.write(`${event.type}: ${JSON.stringify(event.data)}\n`); } });
     const controller = new AbortController(); const abort = () => controller.abort(); process.once('SIGINT', abort); process.once('SIGTERM', abort);
     try {

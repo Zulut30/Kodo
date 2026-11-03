@@ -8,6 +8,7 @@ import { Engine } from '../runtime/engine.mjs';
 import { Store } from '../runtime/store.mjs';
 import { makeWorktree, diffHash } from '../runtime/workspace.mjs';
 import { createHash } from 'node:crypto';
+import { runUIVerification } from '../runtime/ui-verification.mjs';
 
 const read = filename => readFile(filename, 'utf8');
 async function exists(filename) { try { await access(filename); return true; } catch (error) { if (error.code === 'ENOENT') return false; throw error; } }
@@ -71,6 +72,97 @@ const featurePlan = () => ({
   ]
 });
 
+test('Engine gates checks before review persists disabled receipts and rebuilds progress on resume', async t => {
+  const fx = await fixture(t), services = fakeServices(), engine = new Engine({ store: fx.openStore(), ...services });
+  const run = await engine.create('Gate the feature', { project: fx.project });
+  const result = await engine.run(run.id);
+  assert.equal(result.state, 'succeeded', result.error?.message);
+  assert.equal(result.uiVerification.status, 'disabled'); assert.equal(result.uiVerification.passed, null);
+  assert.equal(result.securityChecks.status, 'disabled'); assert.equal(result.securityChecks.passed, null);
+  assert.equal(result.uiVerification.headSha, result.review.headSha); assert.equal(result.securityChecks.headSha, result.review.headSha);
+  for (const request of services.calls.worker) {
+    assert.doesNotMatch(request.prompt, /Kodo default skill policy v1, stage analyze/);
+    assert.match(request.prompt, /Kodo optional tools/);
+  }
+  const progress = path.join(result.artifacts, 'progress.md');
+  assert.match(await read(progress), /succeeded/);
+  await writeFile(progress, 'stale recovery file');
+  const workers = services.calls.worker.length;
+  await engine.run(run.id);
+  assert.match(await read(progress), /succeeded/); assert.equal(services.calls.worker.length, workers);
+});
+
+test('Engine configured gates block review and repairs receive only safe findings', async t => {
+  const fx = await fixture(t, { config: { repairRounds: 2, security: { enabled: true } } }), services = fakeServices();
+  const gates = {
+    runSecurityChecks: async ({ headSha }) => ({ headSha, status: 'failed', passed: false, tools: [{ tool: 'semgrep', status: 'failed', findings: [{ ruleId: 'safe-rule', file: 'src/value.mjs', line: 1, severity: 'ERROR', Secret: 'RAW_PRIVATE_FINDING' }], stderr: 'RAW_PRIVATE_STDERR' }] }),
+    isCurrentSecurityReceipt: () => false
+  };
+  const original = services.provider.runSession;
+  services.provider.runSession = async request => {
+    if (/Repair confirmed failures/.test(request.prompt)) {
+      assert.match(request.prompt, /safe-rule/); assert.doesNotMatch(request.prompt, /RAW_PRIVATE/);
+      return { output: { summary: 'No code fix', checks: [], complete: true } };
+    }
+    return original(request);
+  };
+  const engine = new Engine({ store: fx.openStore(), ...services, gates }), run = await engine.create('Scan feature', { project: fx.project });
+  const result = await engine.run(run.id);
+  assert.equal(result.state, 'blocked'); assert.equal(result.securityChecks.status, 'failed'); assert.equal(services.calls.review.length, 0);
+  assert.ok(result.controllerAssessment); assert.equal(result.controllerAssessment.automaticRetries, false);
+});
+
+test('Engine five verification rounds stop with persisted controller assessment until explicit retry', async t => {
+  const fx = await fixture(t, { config: { repairRounds: 5 }, testScript: 'process.exit(0);\n' });
+  const services = fakeServices({ plan: { summary: 'one', tasks: [node('feature', 'developer', ['src/value.mjs'])] } });
+  services.provider.runSession = async request => {
+    if (request.schema.properties.tasks) return { output: { summary: 'one', tasks: [node('feature', 'developer', ['src/value.mjs'])] } };
+    if (request.schema.properties.passed) { services.calls.review.push(request); return { output: { passed: false, findings: [{ severity: 'major', file: 'src/value.mjs', problem: `remaining ${services.calls.review.length}`, fix: 'Implement remaining requirement' }] } }; }
+    await writeFile(path.join(request.cwd, 'src/value.mjs'), `export const value = ${services.calls.review.length};\n`);
+    return { output: { summary: 'changed', checks: [], complete: true } };
+  };
+  const engine = new Engine({ store: fx.openStore(), ...services }), run = await engine.create('Bound repairs', { project: fx.project });
+  const blocked = await engine.run(run.id);
+  assert.equal(blocked.state, 'blocked'); assert.equal(services.calls.review.length, 5);
+  assert.equal(blocked.controllerAssessment.reason, 'repair_budget_exhausted'); assert.equal(blocked.controllerAssessment.attempts, 5);
+  await engine.run(run.id); assert.equal(services.calls.review.length, 5, 'ordinary resume must not reset the budget');
+  await engine.run(run.id, { retryFailed: true }); assert.equal(services.calls.review.length, 10);
+  assert.equal(engine.store.getRun(run.id).verification.previousCycles[0].attempt, 5);
+});
+
+test('Engine node budgets stop after five or earlier identical no progress and persist the assessment', async t => {
+  for (const repeated of [false, true]) await t.test(repeated ? 'identical-no-progress' : 'five-distinct-attempts', async subtest => {
+    const fx = await fixture(subtest, { config: { repairRounds: 5 }, testScript: 'process.exit(0);\n' });
+    let workers = 0;
+    const services = fakeServices({ plan: { summary: 'one', tasks: [node('feature', 'developer', ['src/value.mjs'])] }, onWorker: async () => ({ output: { complete: false, checks: [], summary: repeated ? 'same unresolved requirement' : `remaining requirement ${++workers}` } }) });
+    if (repeated) { const original = services.provider.runSession; services.provider.runSession = request => { if (!request.schema.properties.tasks) workers++; return original(request); }; }
+    const engine = new Engine({ store: fx.openStore(), ...services }), run = await engine.create('Bound node repairs', { project: fx.project });
+    const blocked = await engine.run(run.id), expected = repeated ? 2 : 5;
+    assert.equal(blocked.state, 'blocked'); assert.equal(workers, expected); assert.equal(blocked.nodes.feature.status, 'blocked');
+    assert.equal(blocked.controllerAssessment.attempts, expected); assert.equal(blocked.controllerAssessment.reason, repeated ? 'no_progress' : 'repair_budget_exhausted');
+    await engine.run(run.id); assert.equal(workers, expected);
+  });
+});
+
+test('Engine runs enabled UI after local checks and rejects evidence changed during independent review', async t => {
+  const fx = await fixture(t, { config: { uiVerification: { enabled: true, autoInstall: false, cases: [{ id: 'fixture', tool: 'browser-harness', url: 'http://127.0.0.1:1', assertions: [{ selector: 'body', text: 'Ready' }] }] } } });
+  const services = fakeServices(), store = fx.openStore(); let created, gateCalls = 0;
+  const gates = { runUIVerification: async options => {
+    const saved = store.getRun(created.id); assert.equal(saved.checks.headSha, options.headSha); assert.equal(saved.checks.results[0].exitCode, 0); gateCalls++;
+    return runUIVerification({ ...options, caseRunner: async () => ({ schemaVersion: 1, status: 'completed', observations: [{ exists: true, count: 1, text: 'Ready', value: null }] }) });
+  } };
+  services.provider.runSession = ((original) => async request => {
+    if (request.schema.properties.passed) {
+      assert.equal(gateCalls, 1); const saved = store.getRun(created.id); assert.equal(saved.uiVerification.status, 'passed');
+      await writeFile(saved.uiVerification.cases[0].evidence[0].path, 'tampered after gate');
+    }
+    return original(request);
+  })(services.provider.runSession);
+  const engine = new Engine({ store, ...services, gates }); created = await engine.create('Bind UI evidence', { project: fx.project });
+  const blocked = await engine.run(created.id);
+  assert.equal(blocked.state, 'blocked'); assert.equal(blocked.error.code, 'stale_verification'); assert.equal(blocked.review, null); assert.equal(blocked.uiVerification, null);
+});
+
 test('Engine saves cannot overwrite cancellation from another coordinator connection', async t => {
   const fx = await fixture(t);
   const store = fx.openStore(), other = fx.openStore();
@@ -82,6 +174,16 @@ test('Engine saves cannot overwrite cancellation from another coordinator connec
   engine.save(run);
   assert.equal(other.getRun(run.id).cancelRequested, true);
   assert.equal(other.getRun(run.id).state, 'cancelled');
+});
+
+test('Engine exposes only managed ready ripgrep on worker PATH while provider credentials stay scrubbed', async t => {
+  const fx = await fixture(t), command = path.join(fx.directory, 'managed-tools', 'rg.exe');
+  const engine = new Engine({ store: fx.openStore(), secrets: { GEMINI_API_KEY: 'private-fixture-key' }, tools: { resolveTool: async id => { assert.equal(id, 'ripgrep'); return { id, ready: true, command, args: [] }; } } });
+  const run = await engine.create('Scoped code search', { project: fx.project });
+  const environment = await engine.executionEnvironment(run, fx.project);
+  const pathKey = Object.keys(environment).find(key => key.toLowerCase() === 'path');
+  assert.equal(environment[pathKey].split(path.delimiter)[0], path.dirname(command));
+  assert.equal(environment.GEMINI_API_KEY, undefined); assert.equal(environment.TYPESAFE_API_KEY, undefined); assert.equal(environment.OPENAI_API_KEY, undefined);
 });
 
 test('Engine allows credential-handling source text and hashes its exact Git diff while rejecting actual secrets', async t => {
