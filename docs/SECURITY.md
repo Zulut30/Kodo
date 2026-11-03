@@ -20,6 +20,16 @@
 
 DPAPI защищает ключи на диске от чтения другими пользователями и копирования на другой компьютер. Процесс того же пользователя обычно может вызвать DPAPI и расшифровать данные; Unix-права также не блокируют процессы владельца. Поэтому Kodo не обещает защиту ключей от вредоносного кода, запущенного тем же пользователем. Для недоверенных проектов требуется отдельная учётная запись или внешняя изолированная среда с собственными правами доступа. Ключи координатора рабочим агентам не нужны и не должны запрашиваться ими.
 
+## Приватные evidence и RTK
+
+Engine сохраняет полные данные analysis/research, node contracts, review/diff и command stdout/stderr после redaction известных секретов вне Git, в `runs/<runId>/evidence/`. Сводка строится из того же снимка. Content-addressed JSON включает base/head; ссылки несут hash/bytes/head. На POSIX каталоги закрыты `0700`, файлы evidence — `0400`; на Windows owned evidence/worker directories получают защищённый ACL текущего пользователя и SYSTEM, без изменения subscription homes. Символьные ссылки и пути внутри Git-репозитория отклоняются. Это защита локального хранения, а не sandbox от кода того же пользователя.
+
+Engine проверяет hash/head полных evidence до и после native-сессии, а check logs — также перед reuse успешных checks. Повреждение или исчезновение блокирует работу с `evidence_integrity`, сохраняя unfinished worker state без автоматического code repair/research. Сокращённый prompt с явными omissions не скрывает failed/skipped/unknown и не заменяет полные диагностические данные. Старый check без полного `outputPath` остаётся историческим отрывком. [Контракты и границы](EFFICIENCY.md).
+
+Managed RTK OSS 1.1.0 разрешён только для явного поддерживаемого human-readable worker output. Проверка inventory выполняется после subscription lease, результат переиспользуется в одной сессии и проверяется заново в следующей. Private tracking DB располагается в отдельном `worker-tools/rtk-*` вне Git, `RTK_RECALL=0`, `RTK_TEE=0`, `RTK_TELEMETRY_DISABLED=1`; inherited RTK overrides удаляются перед назначением безопасных. HOME/USERPROFILE/auth не перенаправляются. RTK может читать global config, но Kodo не вызывает init/config-save и не изменяет его. Global RTK 0.50.0, hooks и пользовательская tracking DB не заменяются.
+
+RTK не применяется к JSON/protocol/porcelain/NUL, Node/TAP, scanners, UI receipts, CI или delivery. Утрата actionable errors требует raw-повтора с полным redacted evidence и не считается экономией. Установка и live probes остаются у координатора; отсутствующий/неподдерживаемый RTK использует raw commands. API/proxy fallback для GPT/Claude не добавляется. [RTK pins и guidance](UI-TOOLS.md#rtk-и-вывод-shell).
+
 ## Локальные security gates
 
 ```json
