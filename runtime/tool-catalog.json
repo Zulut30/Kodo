@@ -224,5 +224,30 @@
         "executable": "ripgrep-15.2.0-aarch64-pc-windows-msvc/rg.exe"
       }
     }
+  },
+  {
+    "id": "rtk",
+    "version": "1.1.0",
+    "kind": "native",
+    "repository": "rtk-ai/rtk",
+    "revision": "753a3b0e939f2e4490fc24e3a1984010f40a103c",
+    "license": "Apache-2.0",
+    "licenseSource": "https://raw.githubusercontent.com/rtk-ai/rtk/753a3b0e939f2e4490fc24e3a1984010f40a103c/LICENSE",
+    "licenseFile": "LICENSE",
+    "capability": "Optional OSS local human-readable output filtering; raw protocols, full diagnostics and coordinator checks stay raw",
+    "assets": {
+      "win32-x64": {
+        "url": "https://github.com/rtk-ai/rtk/releases/download/v1.1.0/rtk-oss-x86_64-pc-windows-msvc.zip",
+        "sha256": "9b076379be9d86011ca3f3a0264d0be4851da5535453a47f67fa46b4e893fbb2",
+        "format": "zip",
+        "executable": "rtk.exe"
+      },
+      "linux-x64": {
+        "url": "https://github.com/rtk-ai/rtk/releases/download/v1.1.0/rtk-oss-x86_64-unknown-linux-musl.tar.gz",
+        "sha256": "4dec94a64035e08189ae82fd5408fe4ae9ae27a665fc07e3e3ec3c4c2d8e8a3e",
+        "format": "tar.gz",
+        "executable": "rtk"
+      }
+    }
   }
 ]
