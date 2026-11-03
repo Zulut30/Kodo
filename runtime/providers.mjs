@@ -268,7 +268,7 @@ export async function decideJev({ task, models, node, attempt = 0 }, { secrets =
     if (confidenceValues.some(value => typeof value !== 'number' || value < 0 || value > 1)) throw new ProviderError('Jev вернул некорректную уверенность', 'invalid_output');
     const modelConfidence = modelAnswer?.confidence ?? 1;
     const chosen = modelConfidence < 0.65 ? strongest(available).id : modelAnswer?.choice ?? available[0].id;
-    return { model: chosen, parallel: execution.choice === 'parallel' && execution.confidence >= 0.75, confidence: Math.min(...confidenceValues), sessionMode: session.choice === 'continue' && session.confidence >= 0.75 && node?.sessionId ? 'continue' : 'fresh', fallback: false, jevModel: result.model };
+    return { model: chosen, modelConfidence, parallelConfidence: execution.confidence, sessionConfidence: session.confidence, parallel: execution.choice === 'parallel' && execution.confidence >= 0.75, confidence: Math.min(...confidenceValues), sessionMode: session.choice === 'continue' && session.confidence >= 0.75 && node?.sessionId ? 'continue' : 'fresh', fallback: false, jevModel: result.model };
   } catch (error) { return fallback(redact(error.message, secrets)); }
 }
 

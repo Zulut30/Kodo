@@ -344,6 +344,18 @@ function jevOutput({ model = models[0].id, modelConfidence = 0.95, parallel = 'p
   return { model: 'jev-1.14.0', answers: { model: { type: 'choice', choice: model, confidence: modelConfidence }, execution: { type: 'choice', choice: parallel, confidence: parallelConfidence }, session: { type: 'choice', choice: session, confidence: 0.95 } } };
 }
 
+test('Jev exposes independent confidence for model execution and session decisions', async () => {
+  const models = [{ id: 'sol', client: 'codex', model: 'gpt-6.1-sol' }, { id: 'astra', client: 'codex', model: 'gpt-6-astra' }];
+  const value = { model: 'fixture-jev', answers: {
+    model: { type: 'choice', choice: 'sol', confidence: .2 },
+    execution: { type: 'choice', choice: 'parallel', confidence: .95 },
+    session: { type: 'choice', choice: 'fresh', confidence: .1 }
+  } };
+  const result = await decideJev({ task: 'Independent prepared module', models, node: { id: 'module', parallel: true } }, { secrets, fetchImpl: async () => new Response(JSON.stringify(value), { status: 200, headers: { 'content-type': 'application/json' } }) });
+  assert.equal(result.model, 'astra'); assert.equal(result.parallel, true);
+  assert.equal(result.modelConfidence, .2); assert.equal(result.parallelConfidence, .95); assert.equal(result.sessionConfidence, .1); assert.equal(result.confidence, .1);
+});
+
 test('Jev selects only allowed models and falls back conservatively for uncertainty or service failure', async () => {
   let request;
   const result = await decideJev({ task: 'Implement export', models, node: { id: 'export' } }, { secrets, fetchImpl: async (url, options) => { request = JSON.parse(options.body); return response(jevOutput()); } });

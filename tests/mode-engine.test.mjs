@@ -77,6 +77,31 @@ test('Quick performs one executor and fresh independent review with actual test 
   assert.equal(await readFile(path.join(fx.project, 'value.mjs'), 'utf8'), 'export const value = 0;\n');
 });
 
+test('Independent task routing separates parallel confidence from model uncertainty and sends the prepared graph', async t => {
+  const fx = await fixture(t);
+  const run = await fx.engine.create('Implement independent module contracts', { project: fx.project, mode: 'deep' });
+  await fx.engine.prepare(run);
+  run.models = await fx.provider.discoverProviders();
+  run.plan = { summary: 'Two isolated module deliverables', tasks: [
+    { ...task('first'), writePaths: ['first.mjs'], parallel: true },
+    { ...task('second'), writePaths: ['second.mjs'], parallel: true }
+  ] };
+  const state = run.nodes.first = { id: 'first', attempt: 0 };
+  fx.engine.save(run);
+  fx.provider.decideJev = async request => {
+    assert.deepEqual(request.node.coordination.map(n => n.id), ['first','second']);
+    assert.deepEqual(request.node.coordination.map(n => n.writePaths), [['first.mjs'],['second.mjs']]);
+    return { model: 'sol', parallel: true, confidence: .1, modelConfidence: .2, parallelConfidence: .95, sessionConfidence: .1 };
+  };
+  const selected = await fx.engine.route(run, run.plan.tasks[0], state);
+  assert.equal(selected.id, 'astra'); assert.equal(state.routing.parallel, true);
+  fx.provider.decideJev = async () => ({ model: 'sol', parallel: true, confidence: .9, modelConfidence: .9, parallelConfidence: .2 });
+  await fx.engine.route(run, run.plan.tasks[0], state);
+  assert.equal(state.routing.parallel, false);
+  fx.provider.decideJev = async () => ({ model: 'sol', parallel: true, confidence: .9, parallelConfidence: 2 });
+  await assert.rejects(fx.engine.route(run, run.plan.tasks[0], state), /контракт/i);
+});
+
 test('Automatic assessment precedes expensive analysis and project mode is overridden by explicit mode', async t => {
   const fx = await fixture(t, { config: { executionMode: 'deep', researchBudget: 2, repairRounds: 2, concurrency: 1 } });
   const explicit = await fx.engine.create('Set value to one', { project: fx.project, mode: 'standard' });

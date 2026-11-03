@@ -315,7 +315,7 @@ export class Engine {
   planInstructions(run) {
     return `Execution mode ${run.executionMode.selected}; at most ${run.executionMode.profile.maxTasks} tasks. ` + (run.executionMode.selected === 'quick'
       ? 'Use a single developer task with tests and documentation as scoped acceptance in the same deliverable. Do not create unconditional separate tester or documenter tasks. Actual configured tests, build, UI/security gates and fresh independent review remain mandatory.'
-      : 'Create separate tester or documenter tasks only where the requirements need those independent deliverables; declare dependencies. Actual configured tests, build, UI/security gates and fresh independent review remain mandatory.');
+      : 'Split substantial work into small cohesive module deliverables with explicit interfaces and narrow non-overlapping write scopes. Define shared interface contracts before parallel implementation. Mark independent prepared nodes parallel=true; add only real dependencies, and let module tests and documentation start as their own prerequisites finish rather than waiting for all implementation. Avoid one giant developer task and unnecessary global dependency chains. Create separate tester or documenter tasks only where requirements need independent deliverables. Each worker receives its own scoped context, acceptance and dependency outcomes. Actual configured tests, build, UI/security gates and fresh independent review remain mandatory.');
   }
   async route(run, task, state, signal) {
     if (run.fixedModel || run.executionMode.selected === 'quick') {
@@ -324,7 +324,7 @@ export class Engine {
       this.save(run); this.log(run, 'routed', { node: task.id, ...state.routing }); this.checkCancelled(run, signal); return selected;
     }
     let decision;
-    try { decision = await this.logical(run, 'routing', () => this.provider.decideJev({ task: run.task, models: run.models, node: { ...task, sessionId: state.sessionId }, attempt: state.attempt || 0, signal }, { secrets: this.secrets })); }
+    try { decision = await this.logical(run, 'routing', () => this.provider.decideJev({ task: run.task, models: run.models, node: { ...task, sessionId: state.sessionId, coordination: (run.plan?.tasks || []).map(node => ({ id: node.id, dependsOn: node.dependsOn, writePaths: node.writePaths, parallel: node.parallel, status: run.nodes[node.id]?.status || 'pending' })) }, attempt: state.attempt || 0, signal }, { secrets: this.secrets })); }
     catch (error) {
       if (signal?.aborted || error.name === 'AbortError' || error.code === 'cancelled') throw Object.assign(new Error('Запуск отменён'), { code: 'cancelled' });
       this.log(run, 'routing_fallback', { node: task.id, reason: error.message }); decision = { model: run.models.find(item => item.client === run.client && item.model === (run.config.primaryModel || defaultModel(run.client)))?.id || run.models.find(item => item.client === run.client)?.id, parallel: false, confidence: 0, fallback: true };
@@ -334,14 +334,14 @@ export class Engine {
       ? run.models.find(item => item.client === run.client && item.model === (run.config.primaryModel || defaultModel(run.client))) || run.models.find(item => item.client === run.client)
       : run.models.find(item => item.id === decision.model);
     if (!selected) throw new Error('Маршрутизатор выбрал недоступную модель');
-    if (!decision.fallback && decision.confidence < 0.6 && !state.escalation) {
+    if (!decision.fallback && (decision.modelConfidence ?? decision.confidence) < 0.6 && !state.escalation) {
       const stronger = run.models.find(item => item.client === selected.client && /astra|opus/.test(item.model));
       if (stronger && stronger.id !== selected.id) {
         state.escalation = { from: selected.id, to: stronger.id, reason: 'Typed routing uncertainty', confidence: decision.confidence, attempt: state.attempt || 0 };
         selected = stronger; this.log(run, 'model_escalated', { node: task.id, ...state.escalation });
       }
     }
-    state.routing = { ...decision, model: selected.id, parallel: Boolean(decision.parallel && decision.confidence >= 0.6) };
+    state.routing = { ...decision, model: selected.id, parallel: Boolean(decision.parallel && (decision.parallelConfidence ?? decision.confidence) >= 0.75) };
     this.log(run, 'routed', { node: task.id, ...state.routing }); this.save(run); this.checkCancelled(run, signal); return selected;
   }
   async checkScope(cwd, baseSha, scopes) {
@@ -519,17 +519,23 @@ export class Engine {
   async checks(run, signal) {
     run.state = 'testing'; this.save(run); await this.setup(run.cwd, run, signal);
     if (await git(run.cwd, ['status', '--porcelain'])) throw Object.assign(new Error('Проверка commit требует чистого integration worktree'), { code: 'dirty_worktree' });
+    const headSha = await git(run.cwd, ['rev-parse', 'HEAD']);
+    const expected = ['test','build'].flatMap(kind => run.config.commands[kind].map(command => ({ kind, command })));
+    const fingerprint = contentHash({ headSha, expected, runtime: { node: process.version, abi: process.versions.modules, platform: process.platform, arch: process.arch } });
+    if (run.config.commands.test.length && run.checks?.schemaVersion === 2 && run.checks.complete === true && run.checks.headSha === headSha && run.checks.fingerprint === fingerprint && Array.isArray(run.checks.results) && run.checks.results.length === expected.length && run.checks.results.every((row, index) => row.exitCode === 0 && row.kind === expected[index].kind && isDeepStrictEqual(row.command, expected[index].command))) {
+      this.log(run, 'checks_reused', { headSha, fingerprint, checks: expected.length }); return;
+    }
     const results = [];
-    run.checks = { headSha: await git(run.cwd, ['rev-parse', 'HEAD']), results }; this.save(run);
+    run.checks = { schemaVersion: 2, headSha, fingerprint, complete: false, results }; this.save(run);
     for (const kind of ['test', 'build']) for (const command of run.config.commands[kind]) {
       this.checkCancelled(run, signal); this.log(run, 'check_started', { kind, command });
       const result = await execute(command.command, command.args, { cwd: run.cwd, signal, env: workerEnvironment(), secrets: this.secrets, allowFailure: true });
-      if (await git(run.cwd, ['status', '--porcelain'])) throw Object.assign(new Error('Команда проверки изменила проверяемые файлы'), { code: 'dirty_worktree' });
+      if (await git(run.cwd, ['rev-parse', 'HEAD']) !== headSha || await git(run.cwd, ['status', '--porcelain'])) throw Object.assign(new Error('Команда проверки изменила проверяемый commit или файлы'), { code: 'dirty_worktree' });
       results.push({ kind, command, exitCode: result.code, output: (result.stdout + result.stderr).slice(-24000) }); this.save(run);
       if (result.code !== 0) throw Object.assign(new Error(`Проверка ${kind} не пройдена (exit ${result.code}): ${(result.stdout + result.stderr).slice(-6000)}`), { code: 'check_failed' });
     }
     if (!run.config.commands.test.length) throw new Error('Не настроена команда проверки результата');
-    run.checks = { headSha: await git(run.cwd, ['rev-parse', 'HEAD']), results }; this.save(run);
+    run.checks = { schemaVersion: 2, headSha, fingerprint, complete: true, results }; this.save(run);
   }
   async verificationGates(run, signal) {
     const headSha = await git(run.cwd, ['rev-parse', 'HEAD']);
