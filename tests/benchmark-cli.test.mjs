@@ -3,10 +3,12 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
+import path from 'node:path';
+import os from 'node:os';
 import { parseBenchmarkArgs, benchmarkCli } from '../runtime/benchmark-cli.mjs';
 
 test('Benchmark CLI parses selected native client models modes seed and repeats without provider calls', async () => {
-  const parsed = parseBenchmarkArgs(['run', '--models', 'gpt-6.1-sol,gpt-6-astra', '--client', 'codex', '--mode', 'deep', '--repeats', '2', '--seed', '42', '--output', process.cwd(), '--json']);
+  const parsed = parseBenchmarkArgs(['run', '--models', 'gpt-6.1-sol,gpt-6-astra', '--client', 'codex', '--mode', 'deep', '--repeats', '2', '--seed', '42', '--output', path.join(os.tmpdir(), 'kb-cli'), '--json']);
   assert.deepEqual(parsed.options.models, ['gpt-6.1-sol', 'gpt-6-astra']);
   assert.equal(parsed.options.mode, 'deep'); assert.equal(parsed.options.seed, 42); assert.equal(parsed.options.repeats, 2);
   let call;
