@@ -113,7 +113,7 @@ test('Engine configured gates block review and repairs receive only safe finding
 });
 
 test('Engine five verification rounds stop with persisted controller assessment until explicit retry', async t => {
-  const fx = await fixture(t, { config: { repairRounds: 5 }, testScript: 'process.exit(0);\n' });
+  const fx = await fixture(t, { config: { executionMode: 'deep', repairRounds: 5 }, testScript: 'process.exit(0);\n' });
   const services = fakeServices({ plan: { summary: 'one', tasks: [node('feature', 'developer', ['src/value.mjs'])] } });
   services.provider.runSession = async request => {
     if (request.schema.properties.tasks) return { output: { summary: 'one', tasks: [node('feature', 'developer', ['src/value.mjs'])] } };
@@ -132,7 +132,7 @@ test('Engine five verification rounds stop with persisted controller assessment 
 
 test('Engine node budgets stop after five or earlier identical no progress and persist the assessment', async t => {
   for (const repeated of [false, true]) await t.test(repeated ? 'identical-no-progress' : 'five-distinct-attempts', async subtest => {
-    const fx = await fixture(subtest, { config: { repairRounds: 5 }, testScript: 'process.exit(0);\n' });
+    const fx = await fixture(subtest, { config: { executionMode: 'deep', repairRounds: 5 }, testScript: 'process.exit(0);\n' });
     let workers = 0;
     const services = fakeServices({ plan: { summary: 'one', tasks: [node('feature', 'developer', ['src/value.mjs'])] }, onWorker: async () => ({ output: { complete: false, checks: [], summary: repeated ? 'same unresolved requirement' : `remaining requirement ${++workers}` } }) });
     if (repeated) { const original = services.provider.runSession; services.provider.runSession = request => { if (!request.schema.properties.tasks) workers++; return original(request); }; }

@@ -17,7 +17,9 @@ kodo registry stats [--json]
 
 kodo init [--project PATH]
 kodo doctor [--live] [--json]
-kodo run "TASK" --client codex|claude-code [--providers both] [--prepare] [--delivery none|pr|release]
+kodo run "TASK" --client codex|claude-code [--model MODEL] [--mode quick|standard|deep] [--providers both] [--prepare] [--delivery none|pr|release]
+kodo benchmark run --models MODEL,... [--client codex|claude-code] [--mode quick|standard|deep] [--repeats N] [--seed N] [--output ABSOLUTE_DIR] [--json]
+kodo benchmark resume|report PATH [--json]
 kodo status|logs|resume|cancel RUN_ID [--json]
 kodo audit RUN_ID [--json]
 kodo tools list|doctor [--live] [--json]
@@ -62,6 +64,12 @@ function checkOptions(command, options) {
 async function main() {
   const [command, ...argv] = process.argv.slice(2);
   if (!command || ['help', '--help', '-h'].includes(command)) return console.log(help);
+  // Offline reports and argument errors must not initialize the runtime's
+  // SQLite store or credential/provider startup path.
+  if (command === 'benchmark') {
+    const { benchmarkCli } = await import('../runtime/benchmark-cli.mjs');
+    const result = await benchmarkCli(argv); console.log(result.output); process.exitCode = result.exitCode; return;
+  }
   if (['doctor','run','status','logs','resume','cancel','migrate','audit','tools','ui','security'].includes(command) || command === 'init' && !argv.includes('--preset')) {
     const { runtimeCli } = await import('../runtime/cli.mjs');
     return runtimeCli(command, argv);
