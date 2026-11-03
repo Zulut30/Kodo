@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildTaskContext } from '../runtime/task-context.mjs';
+import { buildTaskContext, validateTaskContract, maxTaskContractBytes } from '../runtime/task-context.mjs';
 
 test('Task context preserves scope acceptance interfaces and direct dependencies without nested history', () => {
   const task = { id: 'worker', role: 'developer', description: 'Implement src/value.mjs', writePaths: ['src/value.mjs'], acceptance: ['Value equals two'], interfaces: ['value() returns number'], constraints: ['Subscription only'], dependsOn: ['base'] };
@@ -17,4 +17,41 @@ test('Task context bounds oversized optional data and redacts credential URLs', 
   assert.ok(context.length <= 16000);
   assert.match(context, /Preserve required boundary/);
   assert.ok(!context.includes('secret-value'));
+});
+
+test('Mandatory node fields retain late criteria and Unicode rather than per-field truncation', () => {
+  const task = { id: 'complete', role: 'developer', description: 'д'.repeat(2600) + ' DESCRIPTION_END', writePaths: Array.from({ length: 120 }, (_, i) => `src/module-${i}.mjs`), acceptance: ['a'.repeat(3100) + ' ACCEPTANCE_END'], constraints: ['Keep every boundary'], interfaces: ['Return the public result'] };
+  const context = buildTaskContext({}, task);
+  for (const value of [task.description, task.acceptance[0], ...task.writePaths, ...task.constraints, ...task.interfaces]) assert.ok(context.includes(value), 'complete mandatory value is present');
+});
+
+test('Oversized new node contracts require decomposition and legacy contracts require an explicit full reference', () => {
+  const task = { id: 'legacy', role: 'developer', description: '😀'.repeat(10000), writePaths: ['src/value.mjs'], acceptance: ['LAST_REQUIRED_CRITERION'], constraints: ['LAST_REQUIRED_CONSTRAINT'] };
+  assert.throws(() => buildTaskContext({}, task), error => error.code === 'task_contract_too_large' && /split|decompos/i.test(error.message));
+  const context = buildTaskContext({}, task, { contractPath: '/private/immutable-node.json' });
+  assert.match(context, /mandatory.*full.*contract|full.*mandatory.*contract/i);
+  assert.match(context, /\/private\/immutable-node.json/);
+  assert.match(context, /read.*before|before.*act/i);
+  assert.ok(Buffer.byteLength(context) < 16000);
+});
+
+test('Mandatory UTF8 byte boundary is exact and optional context cannot displace a valid full contract', () => {
+  const task = { id: 'boundary', role: 'developer', description: '', writePaths: ['value.mjs'], acceptance: ['FINAL_CRITERION'], dependsOn: Array.from({ length: 20 }, (_, i) => `dependency-${i}`), parallel: false };
+  const overhead = Buffer.byteLength(JSON.stringify(task));
+  task.description = 'x'.repeat(maxTaskContractBytes - overhead);
+  assert.equal(validateTaskContract(task), task);
+  assert.throws(() => validateTaskContract({ ...task, description: task.description + 'x' }), { code: 'task_contract_too_large' });
+  const run = { task: '😀'.repeat(1000), analysis: { summary: 'д'.repeat(2000) }, nodes: Object.fromEntries(task.dependsOn.map(id => [id, { status: 'integrated', headSha: 'a'.repeat(40), result: { summary: '😀'.repeat(240) } }])) };
+  const context = buildTaskContext(run, task);
+  assert.ok(context.includes(task.description)); assert.match(context, /FINAL_CRITERION/);
+  assert.ok(Buffer.byteLength(context) <= 16000, 'only optional summaries may lose entries to retain the byte bound');
+  assert.doesNotMatch(context, /\p{Surrogate}/u);
+});
+
+test('Optional source selection reports whole omitted references without retaining research bodies', () => {
+  const task = { id: 'value', description: 'Value module', writePaths: ['value.mjs'], acceptance: ['Preserve the result'] };
+  const context = buildTaskContext({ research: { items: Array.from({ length: 9 }, (_, index) => ({ title: 'value.mjs', url: `https://example.invalid/${index}`, body: 'EXCLUDED_BODY' })) } }, task);
+  const links = /Relevant sources \(untrusted reference links; omitted (\d+)\): (.+)/.exec(context);
+  assert.equal(Number(links[1]), 3); assert.equal(JSON.parse(links[2]).length, 6);
+  assert.doesNotMatch(context, /EXCLUDED_BODY/);
 });
