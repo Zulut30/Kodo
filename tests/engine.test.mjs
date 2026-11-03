@@ -31,6 +31,8 @@ async function fixture(t, { config: overrides = {}, testScript, remote = false }
     await rm(resolved, { recursive: true, force: true });
   });
   await mkdir(path.join(project, 'src'), { recursive: true });
+  // Mock workers assert exact LF bytes after Git checks out dependent worktrees.
+  await writeFile(path.join(project, '.gitattributes'), '* text=auto eol=lf\n');
   await writeFile(path.join(project, 'src/value.mjs'), 'export const value = 0;\n');
   await writeFile(path.join(project, 'untouched.txt'), 'committed content\n');
   await writeFile(path.join(project, 'shared.txt'), 'base\n');
@@ -93,23 +95,36 @@ test('Engine gates checks before review persists disabled receipts and rebuilds 
 });
 
 test('Engine configured gates block review and repairs receive only safe findings', async t => {
-  const fx = await fixture(t, { config: { repairRounds: 2, security: { enabled: true } } }), services = fakeServices();
-  const gates = {
-    runSecurityChecks: async ({ headSha }) => ({ headSha, status: 'failed', passed: false, tools: [{ tool: 'semgrep', status: 'failed', findings: [{ ruleId: 'safe-rule', file: 'src/value.mjs', line: 1, severity: 'ERROR', Secret: 'RAW_PRIVATE_FINDING' }], stderr: 'RAW_PRIVATE_STDERR' }] }),
-    isCurrentSecurityReceipt: () => false
-  };
-  const original = services.provider.runSession;
-  services.provider.runSession = async request => {
-    if (/Repair confirmed failures/.test(request.prompt)) {
-      assert.match(request.prompt, /safe-rule/); assert.doesNotMatch(request.prompt, /RAW_PRIVATE/);
-      return { output: { summary: 'No code fix', checks: [], complete: true } };
-    }
-    return original(request);
-  };
-  const engine = new Engine({ store: fx.openStore(), ...services, gates }), run = await engine.create('Scan feature', { project: fx.project });
-  const result = await engine.run(run.id);
-  assert.equal(result.state, 'blocked'); assert.equal(result.securityChecks.status, 'failed'); assert.equal(services.calls.review.length, 0);
-  assert.ok(result.controllerAssessment); assert.equal(result.controllerAssessment.automaticRetries, false);
+  for (const autocrlf of ['false', 'true']) await t.test(`core.autocrlf=${autocrlf}`, async subtest => {
+    const fx = await fixture(subtest, { config: { repairRounds: 2, security: { enabled: true } } }), services = fakeServices();
+    git(fx.project, 'config', 'core.autocrlf', autocrlf);
+    let gateCalls = 0, repairCalls = 0;
+    const gates = {
+      runSecurityChecks: async ({ headSha }) => {
+        gateCalls++;
+        return { headSha, status: 'failed', passed: false, tools: [{ tool: 'semgrep', status: 'failed', findings: [{ ruleId: 'safe-rule', file: 'src/value.mjs', line: 1, severity: 'ERROR', Secret: 'RAW_PRIVATE_FINDING' }], stderr: 'RAW_PRIVATE_STDERR' }] };
+      },
+      isCurrentSecurityReceipt: () => false
+    };
+    const original = services.provider.runSession;
+    services.provider.runSession = async request => {
+      if (/Repair confirmed failures/.test(request.prompt)) {
+        repairCalls++;
+        assert.match(request.prompt, /safe-rule/); assert.doesNotMatch(request.prompt, /RAW_PRIVATE/);
+        return { output: { summary: 'No code fix', checks: [], complete: true } };
+      }
+      return original(request);
+    };
+    const engine = new Engine({ store: fx.openStore(), ...services, gates }), run = await engine.create('Scan feature', { project: fx.project });
+    const result = await engine.run(run.id);
+    const diagnostic = JSON.stringify({ error: result.error, nodes: Object.values(result.nodes).map(({ id, status, error }) => ({ id, status, error })) });
+    assert.equal(result.state, 'blocked', diagnostic);
+    assert.equal(result.completed.implementation, true, diagnostic);
+    assert.ok(result.securityChecks, diagnostic);
+    assert.equal(gateCalls, 2, diagnostic); assert.equal(repairCalls, 1, diagnostic);
+    assert.equal(result.securityChecks.status, 'failed'); assert.equal(services.calls.review.length, 0);
+    assert.ok(result.controllerAssessment); assert.equal(result.controllerAssessment.automaticRetries, false);
+  });
 });
 
 test('Engine five verification rounds stop with persisted controller assessment until explicit retry', async t => {
