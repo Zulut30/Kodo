@@ -22,6 +22,28 @@ function fixture(t) {
   const run = args => spawnSync(process.execPath, [cli, ...args], { cwd: project, env, encoding: 'utf8', windowsHide: true });
   return { home, project, env, run };
 }
+test('Worker PATH keeps the current Node runtime first and only ready managed ripgrep before inherited entries', async t => {
+  const fx = fixture(t), nodeDirectory = path.dirname(process.execPath), rgDirectory = path.join(fx.home, 'managed-rg');
+  const pathName = Object.keys(process.env).find(name => name.toLowerCase() === 'path') || 'PATH';
+  const inheritedEntries = process.env[pathName] ? process.env[pathName].split(path.delimiter) : [];
+  for (const ready of [true, false]) {
+    const calls = [], engine = new Engine({ store: { home: fx.env.KODO_HOME }, tools: {
+      resolveTool: async (id, options) => {
+        calls.push({ id, options });
+        return { id, ready, command: path.join(rgDirectory, process.platform === 'win32' ? 'rg.exe' : 'rg') };
+      }
+    } });
+    // Cache initialization has dedicated setup tests; isolate the PATH contract.
+    engine.withLease = async () => path.join(fx.home, 'cache');
+    const environment = await engine.executionEnvironment({}, fx.project);
+    const entries = environment[pathName].split(path.delimiter);
+    assert.deepEqual(calls, [{ id: 'ripgrep', options: { project: fx.project } }]);
+    assert.equal(entries[0], nodeDirectory);
+    assert.deepEqual(entries, ready ? [nodeDirectory, rgDirectory, ...inheritedEntries] : [nodeDirectory, ...inheritedEntries]);
+    assert.equal(entries.includes(rgDirectory), ready);
+  }
+});
+
 test('Tools CLI metadata is offline and validates subcommands arity and flags before side effects', t => {
   const fx = fixture(t), result = fx.run(['tools', 'list', '--json']);
   assert.equal(result.status, 0, result.stderr); assert.equal(JSON.parse(result.stdout).length, 9);

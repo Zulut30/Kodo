@@ -1,6 +1,6 @@
 {
   "name": "@zulut30/kodo",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "private": true,
   "description": "Project-scoped skills, workflows and roles for Codex, Claude Code and OpenCode",
   "type": "module",
