@@ -20,6 +20,7 @@ import { runUIVerification, isCurrentUIReceipt } from './ui-verification.mjs';
 import { runSecurityChecks, isCurrentSecurityReceipt } from './security-gates.mjs';
 import { assessTask, normalizeMode, resolveMode } from './modes.mjs';
 import { aggregateMetrics, normalizeUsage } from './metrics.mjs';
+import { runReadyQueue } from './task-scheduler.mjs';
 
 const delay = (ms, signal) => new Promise((resolve, reject) => { const timer = setTimeout(done, ms); function done() { signal?.removeEventListener('abort', abort); resolve(); } function abort() { clearTimeout(timer); reject(Object.assign(new Error('Запуск отменён'), { code: 'cancelled' })); } signal?.addEventListener('abort', abort, { once: true }); if (signal?.aborted) abort(); });
 const contentHash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
@@ -499,22 +500,37 @@ export class Engine {
   async executeTasks(run, signal) {
     run.state = 'implementing'; this.save(run);
     await this.recoverIntegrationEdits(run, signal);
-    if (run.config.delivery.enabled) await this.synchronizeBase(run, signal);
-    while (run.plan.tasks.some(task => run.nodes[task.id]?.status !== 'integrated')) {
-      const ready = run.plan.tasks.filter(task => run.nodes[task.id]?.status !== 'integrated' && task.dependsOn.every(id => run.nodes[id]?.status === 'integrated'));
-      if (!ready.length) throw new Error('Не осталось исполняемых узлов плана');
-      const batch = [];
-      for (const task of ready) {
-        if (batch.length >= run.config.concurrency) break;
-        const state = run.nodes[task.id] ||= { id: task.id, attempt: 0, status: 'pending' };
-        if (!state.routing) await this.route(run, task, state, signal);
-        if (batch.length && (!task.parallel || !state.routing.parallel || batch.some(other => !other.parallel || !run.nodes[other.id].routing.parallel || scopesOverlap(task.writePaths, other.writePaths)))) continue;
-        batch.push(task);
-      }
-      const results = await Promise.allSettled(batch.map(task => this.performNode(run, task, signal)));
-      for (let index = 0; index < batch.length; index++) if (results[index].status === 'fulfilled' && run.nodes[batch[index].id].status === 'completed') await this.integrateNode(run, batch[index], signal);
-      const failure = results.find(item => item.status === 'rejected'); if (failure) throw failure.reason;
+    // A failed merge command can leave an owner receipt even without MERGE_HEAD.
+    // Recover that exact completed node before scheduling another integration.
+    if (run.pendingMerge?.kind === 'node') {
+      const task = run.plan.tasks.find(task => task.id === run.pendingMerge.nodeId && run.nodes[task.id]?.headSha === run.pendingMerge.sha);
+      if (!task || run.nodes[task.id].status !== 'completed') throw Object.assign(new Error('Неизвестный владелец незавершённой интеграции'), { code: 'merge_state' });
+      this.checkCancelled(run, signal); await this.integrateNode(run, task, signal);
     }
+    this.checkCancelled(run, signal);
+    if (run.config.delivery.enabled) await this.synchronizeBase(run, signal);
+    this.checkCancelled(run, signal);
+    if (run.pendingMerge) throw Object.assign(new Error('Не восстановлена незавершённая интеграция'), { code: 'merge_state' });
+    await runReadyQueue({
+      tasks: run.plan.tasks, limit: run.config.concurrency, signal,
+      isIntegrated: task => run.nodes[task.id]?.status === 'integrated',
+      prepare: async task => {
+        this.checkCancelled(run, signal);
+        const state = run.nodes[task.id] ||= { id: task.id, attempt: 0, status: 'pending' };
+        if (state.status !== 'completed' && !state.routing) await this.route(run, task, state, signal);
+        this.checkCancelled(run, signal);
+      },
+      compatible: (task, active) => !active.length || Boolean(task.parallel && run.nodes[task.id].routing?.parallel && active.every(other => other.parallel && run.nodes[other.id].routing?.parallel && !scopesOverlap(task.writePaths, other.writePaths))),
+      execute: async task => {
+        this.checkCancelled(run, signal);
+        if (run.nodes[task.id].status !== 'completed') await this.performNode(run, task, signal);
+      },
+      integrate: async task => {
+        this.checkCancelled(run, signal);
+        if (run.nodes[task.id].status === 'completed') await this.integrateNode(run, task, signal);
+        this.checkCancelled(run, signal);
+      }
+    });
   }
   async checks(run, signal) {
     run.state = 'testing'; this.save(run); await this.setup(run.cwd, run, signal);
