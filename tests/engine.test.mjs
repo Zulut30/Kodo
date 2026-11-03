@@ -8,6 +8,7 @@ import { Engine } from '../runtime/engine.mjs';
 import { Store } from '../runtime/store.mjs';
 import { makeWorktree, diffHash } from '../runtime/workspace.mjs';
 import { createHash } from 'node:crypto';
+import { runUIVerification } from '../runtime/ui-verification.mjs';
 
 const read = filename => readFile(filename, 'utf8');
 async function exists(filename) { try { await access(filename); return true; } catch (error) { if (error.code === 'ENOENT') return false; throw error; } }
@@ -30,6 +31,8 @@ async function fixture(t, { config: overrides = {}, testScript, remote = false }
     await rm(resolved, { recursive: true, force: true });
   });
   await mkdir(path.join(project, 'src'), { recursive: true });
+  // Mock workers assert exact LF bytes after Git checks out dependent worktrees.
+  await writeFile(path.join(project, '.gitattributes'), '* text=auto eol=lf\n');
   await writeFile(path.join(project, 'src/value.mjs'), 'export const value = 0;\n');
   await writeFile(path.join(project, 'untouched.txt'), 'committed content\n');
   await writeFile(path.join(project, 'shared.txt'), 'base\n');
@@ -71,6 +74,407 @@ const featurePlan = () => ({
   ]
 });
 
+test('Engine gates checks before review persists disabled receipts and rebuilds progress on resume', async t => {
+  const fx = await fixture(t), services = fakeServices(), engine = new Engine({ store: fx.openStore(), ...services });
+  const run = await engine.create('Gate the feature', { project: fx.project });
+  const result = await engine.run(run.id);
+  assert.equal(result.state, 'succeeded', result.error?.message);
+  assert.equal(result.uiVerification.status, 'disabled'); assert.equal(result.uiVerification.passed, null);
+  assert.equal(result.securityChecks.status, 'disabled'); assert.equal(result.securityChecks.passed, null);
+  assert.equal(result.uiVerification.headSha, result.review.headSha); assert.equal(result.securityChecks.headSha, result.review.headSha);
+  for (const request of services.calls.worker) {
+    assert.doesNotMatch(request.prompt, /Kodo default skill policy v1, stage analyze/);
+    assert.match(request.prompt, /Kodo optional tools/);
+  }
+  const progress = path.join(result.artifacts, 'progress.md');
+  assert.match(await read(progress), /succeeded/);
+  await writeFile(progress, 'stale recovery file');
+  const workers = services.calls.worker.length;
+  await engine.run(run.id);
+  assert.match(await read(progress), /succeeded/); assert.equal(services.calls.worker.length, workers);
+});
+
+test('Engine configured gates block review and repairs receive only safe findings', async t => {
+  for (const autocrlf of ['false', 'true']) await t.test(`core.autocrlf=${autocrlf}`, async subtest => {
+    const fx = await fixture(subtest, { config: { repairRounds: 2, security: { enabled: true } } }), services = fakeServices();
+    git(fx.project, 'config', 'core.autocrlf', autocrlf);
+    let gateCalls = 0, repairCalls = 0;
+    const gates = {
+      runSecurityChecks: async ({ headSha }) => {
+        gateCalls++;
+        return { headSha, status: 'failed', passed: false, tools: [{ tool: 'semgrep', status: 'failed', findings: [{ ruleId: 'safe-rule', file: 'src/value.mjs', line: 1, severity: 'ERROR', Secret: 'RAW_PRIVATE_FINDING' }], stderr: 'RAW_PRIVATE_STDERR' }] };
+      },
+      isCurrentSecurityReceipt: () => false
+    };
+    const original = services.provider.runSession;
+    services.provider.runSession = async request => {
+      if (/Repair confirmed failures/.test(request.prompt)) {
+        repairCalls++;
+        assert.match(request.prompt, /safe-rule/); assert.doesNotMatch(request.prompt, /RAW_PRIVATE/);
+        return { output: { summary: 'No code fix', checks: [], complete: true } };
+      }
+      return original(request);
+    };
+    const engine = new Engine({ store: fx.openStore(), ...services, gates }), run = await engine.create('Scan feature', { project: fx.project });
+    const result = await engine.run(run.id);
+    const diagnostic = JSON.stringify({ error: result.error, nodes: Object.values(result.nodes).map(({ id, status, error }) => ({ id, status, error })) });
+    assert.equal(result.state, 'blocked', diagnostic);
+    assert.equal(result.completed.implementation, true, diagnostic);
+    assert.ok(result.securityChecks, diagnostic);
+    assert.equal(gateCalls, 2, diagnostic); assert.equal(repairCalls, 1, diagnostic);
+    assert.equal(result.securityChecks.status, 'failed'); assert.equal(services.calls.review.length, 0);
+    assert.ok(result.controllerAssessment); assert.equal(result.controllerAssessment.automaticRetries, false);
+  });
+});
+
+test('Engine five verification rounds stop with persisted controller assessment until explicit retry', async t => {
+  const fx = await fixture(t, { config: { executionMode: 'deep', repairRounds: 5 }, testScript: 'process.exit(0);\n' });
+  const services = fakeServices({ plan: { summary: 'one', tasks: [node('feature', 'developer', ['src/value.mjs'])] } });
+  services.provider.runSession = async request => {
+    if (request.schema.properties.tasks) return { output: { summary: 'one', tasks: [node('feature', 'developer', ['src/value.mjs'])] } };
+    if (request.schema.properties.passed) { services.calls.review.push(request); return { output: { passed: false, findings: [{ severity: 'major', file: 'src/value.mjs', problem: `remaining ${services.calls.review.length}`, fix: 'Implement remaining requirement' }] } }; }
+    await writeFile(path.join(request.cwd, 'src/value.mjs'), `export const value = ${services.calls.review.length};\n`);
+    return { output: { summary: 'changed', checks: [], complete: true } };
+  };
+  const engine = new Engine({ store: fx.openStore(), ...services }), run = await engine.create('Bound repairs', { project: fx.project });
+  const blocked = await engine.run(run.id);
+  assert.equal(blocked.state, 'blocked'); assert.equal(services.calls.review.length, 5);
+  assert.equal(blocked.controllerAssessment.reason, 'repair_budget_exhausted'); assert.equal(blocked.controllerAssessment.attempts, 5);
+  await engine.run(run.id); assert.equal(services.calls.review.length, 5, 'ordinary resume must not reset the budget');
+  await engine.run(run.id, { retryFailed: true }); assert.equal(services.calls.review.length, 10);
+  assert.equal(engine.store.getRun(run.id).verification.previousCycles[0].attempt, 5);
+});
+
+test('Engine durably resumes pending verification repair after subscription interruption', async t => {
+  for (const code of ['quota', 'auth', 'cancelled', 'lease_lost']) await t.test(code, async subtest => {
+    const fx = await fixture(subtest, { config: { repairRounds: 2, researchBudget: 0 },
+      testScript: "import assert from 'node:assert/strict'; import {value} from './src/value.mjs'; assert.equal(value, 3);\n" });
+    const services = fakeServices({ plan: { summary: 'value three', tasks: [node('feature', 'developer', ['src/value.mjs'])] } });
+    const original = services.provider.runSession, repairs = [];
+    let controller = new AbortController();
+    services.provider.runSession = async request => {
+      if (!/Repair confirmed failures/.test(request.prompt)) return original(request);
+      repairs.push(request);
+      if (repairs.length > 1) assert.equal(request.sessionId, 'pending-verification-session');
+      request.onEvent({ sessionId: 'pending-verification-session' });
+      if (repairs.length <= 2) {
+        assert.equal(await read(path.join(request.cwd, 'src/value.mjs')), 'export const value = 2;\n', 'interruption occurs before repair writes');
+        if (code === 'cancelled') controller.abort();
+        throw Object.assign(new Error(`fixture repair ${code}`), { code });
+      }
+      await writeFile(path.join(request.cwd, 'src/value.mjs'), 'export const value = 3;\n');
+      return { sessionId: 'pending-verification-session', output: { complete: true, summary: 'value repaired', checks: [] } };
+    };
+    let store = fx.openStore(), engine = new Engine({ store, ...services });
+    const run = await engine.create('Implement value three', { project: fx.project });
+    let completed;
+    for (let interruption = 1; interruption <= 2; interruption++) {
+      const paused = await engine.run(run.id, { signal: controller.signal, resumeCancelled: code === 'cancelled' });
+      assert.equal(paused.state, code === 'quota' ? 'waiting_limits' : code === 'cancelled' ? 'cancelled' : 'blocked', paused.error?.message);
+      assert.equal(paused.error.code, code, 'ordinary resume must reach the unfinished repair instead of a budget/no-progress blocker');
+      assert.equal(repairs.length, interruption);
+      assert.equal(paused.verification.attempt, 1, 'interruption must not consume another verification round');
+      assert.equal(paused.verification.stopped, undefined); assert.equal(paused.controllerAssessment, undefined);
+      assert.equal(paused.completed.implementation, true); assert.equal(paused.nodes.feature.status, 'integrated');
+      if (completed) assert.deepEqual(paused.completed, completed); else completed = paused.completed;
+      assert.equal(git(paused.cwd, 'status', '--porcelain'), '');
+      fx.closeStore(store); store = fx.openStore(); engine = new Engine({ store, ...services }); controller = new AbortController();
+    }
+    const result = await engine.run(run.id, { resumeCancelled: code === 'cancelled' });
+    assert.equal(result.state, 'succeeded', result.error?.message);
+    assert.equal(repairs.length, 3); assert.equal(result.verification.attempt, 1); assert.equal(result.verification.cycle, 1);
+    assert.equal(result.verification.pendingRepair, undefined); assert.equal(result.verification.previousCycles, undefined);
+    assert.deepEqual(result.completed, completed);
+    assert.equal(services.calls.analysis, 1); assert.equal(services.calls.planner, 1); assert.equal(services.calls.worker.length, 1);
+    assert.equal(services.calls.review.length, 1, 'review runs only after local checks pass on the repaired head');
+    assert.equal(result.checks.headSha, result.headSha); assert.equal(result.review.headSha, result.headSha);
+    assert.equal(result.uiVerification.headSha, result.headSha); assert.equal(result.securityChecks.headSha, result.headSha);
+    assert.equal(result.error, null); assert.equal(git(result.cwd, 'status', '--porcelain'), '');
+    assert.equal(await read(path.join(result.cwd, 'src/value.mjs')), 'export const value = 3;\n');
+    assert.equal(store.events(run.id).filter(event => event.type === 'retry_requested').length, 0);
+    assert.equal(store.events(run.id).filter(event => event.type === 'check_started').length, 2, 'checks rerun on the completed repair, with no cached passing result');
+    assert.equal(git(fx.project, 'rev-parse', 'HEAD'), fx.base);
+  });
+});
+
+test('Engine completes pending verification repair before upstream main synchronization and release metadata', async t => {
+  const fx = await fixture(t, { remote: true, config: { repairRounds: 2, researchBudget: 0 },
+    testScript: "import assert from 'node:assert/strict'; import {value} from './src/value.mjs'; assert.ok([2, 3].includes(value));\n" });
+  const services = fakeServices({ plan: { summary: 'value three', tasks: [node('feature', 'developer', ['src/value.mjs'])] },
+    onReview: async (request, calls) => {
+      if (calls.review.length === 1) return { output: { passed: false, findings: [{ severity: 'major', file: 'src/value.mjs', problem: 'Expected value three', fix: 'Export three' }] } };
+      assert.equal(await read(path.join(request.cwd, 'src/value.mjs')), 'export const value = 3;\n');
+      assert.equal(await read(path.join(request.cwd, 'untouched.txt')), 'incoming upstream content\n');
+      return { output: { passed: true, findings: [] } };
+    } });
+  const original = services.provider.runSession, repairHeads = [], releaseSnapshots = [], gateHeads = { ui: [], security: [] };
+  services.provider.runSession = async request => {
+    if (!/Repair confirmed failures/.test(request.prompt)) return original(request);
+    repairHeads.push(git(request.cwd, 'rev-parse', 'HEAD'));
+    if (repairHeads.length > 1) assert.equal(request.sessionId, 'upstream-verification-session');
+    request.onEvent({ sessionId: 'upstream-verification-session' });
+    if (repairHeads.length === 1) throw Object.assign(new Error('fixture repair quota'), { code: 'quota' });
+    await writeFile(path.join(request.cwd, 'src/value.mjs'), 'export const value = 3;\n');
+    return { sessionId: 'upstream-verification-session', output: { complete: true, summary: 'value repaired', checks: [] } };
+  };
+  services.delivery.prepareReleaseVersion = async ({ run, cwd }) => {
+    releaseSnapshots.push({ pending: Boolean(run.verification?.pendingRepair), value: git(cwd, 'show', 'HEAD:src/value.mjs'), baseSha: run.baseSha });
+    await writeFile(path.join(cwd, 'registry.json'), '{"version":"0.2.0"}\n');
+  };
+  const observeGates = engine => {
+    for (const [method, key] of [['runUIVerification', 'ui'], ['runSecurityChecks', 'security']]) {
+      const gate = engine.gates[method];
+      engine.gates[method] = async options => { gateHeads[key].push(options.headSha); return gate(options); };
+    }
+  };
+  const firstStore = fx.openStore(), firstEngine = new Engine({ store: firstStore, ...services }); observeGates(firstEngine);
+  const run = await firstEngine.create('Resume repair before updating main', { project: fx.project });
+  const paused = await firstEngine.run(run.id);
+  assert.equal(paused.state, 'waiting_limits', paused.error?.message);
+  const failedHead = git(paused.cwd, 'rev-parse', 'HEAD');
+  assert.equal(paused.verification.pendingRepair.headSha, failedHead);
+  assert.equal(paused.verification.pendingRepair.sessionId, 'upstream-verification-session');
+  assert.notEqual(paused.verification.pendingRepair.complete, true);
+  fx.closeStore(firstStore);
+  const other = path.join(fx.directory, 'other-client');
+  git(fx.directory, 'clone', '--branch', 'main', path.join(fx.directory, 'origin.git'), other);
+  git(other, 'config', 'user.name', 'Other Kodo Task'); git(other, 'config', 'user.email', 'other@example.invalid');
+  await writeFile(path.join(other, 'untouched.txt'), 'incoming upstream content\n');
+  git(other, 'add', 'untouched.txt'); git(other, 'commit', '-m', 'Concurrent out of scope main update'); git(other, 'push', 'origin', 'main');
+  const upstreamSha = git(other, 'rev-parse', 'HEAD');
+  const store = fx.openStore(), engine = new Engine({ store, ...services }); observeGates(engine);
+  const result = await engine.run(run.id);
+  assert.equal(result.state, 'succeeded', result.error?.message);
+  assert.deepEqual(repairHeads, [failedHead, failedHead], 'the exact repair session must finish against its saved scope baseline');
+  assert.equal(result.baseSha, upstreamSha); assert.notEqual(result.headSha, failedHead);
+  assert.equal(git(result.cwd, 'merge-base', upstreamSha, result.headSha), upstreamSha);
+  assert.equal(git(result.cwd, 'show', 'HEAD:untouched.txt'), 'incoming upstream content');
+  assert.equal(releaseSnapshots.length, 2);
+  assert.deepEqual(releaseSnapshots[1], { pending: false, value: 'export const value = 3;', baseSha: upstreamSha });
+  assert.deepEqual(gateHeads, { ui: [failedHead, result.headSha], security: [failedHead, result.headSha] });
+  assert.equal(services.calls.review.length, 2); assert.equal(services.calls.worker.length, 1);
+  assert.equal(result.checks.headSha, result.headSha); assert.equal(result.checks.results[0].exitCode, 0);
+  assert.equal(result.review.headSha, result.headSha); assert.equal(result.uiVerification.headSha, result.headSha); assert.equal(result.securityChecks.headSha, result.headSha);
+  assert.equal(result.verification.pendingRepair, undefined); assert.equal(result.verification.attempt, 1); assert.equal(result.verification.cycle, 1);
+  assert.equal(result.verification.previousCycles, undefined); assert.equal(result.controllerAssessment, undefined);
+  assert.equal(store.events(run.id).filter(event => event.type === 'check_started').length, 2);
+  assert.equal(store.events(run.id).filter(event => event.type === 'retry_requested').length, 0);
+  assert.equal(git(result.cwd, 'status', '--porcelain'), ''); assert.equal(git(fx.project, 'rev-parse', 'HEAD'), fx.base);
+});
+
+test('Engine keeps partial pending verification repair out of HEAD until the exact session completes', async t => {
+  const fx = await fixture(t, { config: { repairRounds: 2, researchBudget: 0 },
+    testScript: "import assert from 'node:assert/strict'; import {value} from './src/value.mjs'; assert.equal(value, 3);\n" });
+  const services = fakeServices({ plan: { summary: 'value three', tasks: [node('feature', 'developer', ['src/value.mjs'])] } });
+  const original = services.provider.runSession, repairSnapshots = [];
+  let store = fx.openStore();
+  services.provider.runSession = async request => {
+    if (!/Repair confirmed failures/.test(request.prompt)) return original(request);
+    repairSnapshots.push({ headSha: git(request.cwd, 'rev-parse', 'HEAD'), committed: git(request.cwd, 'show', 'HEAD:src/value.mjs'),
+      working: await read(path.join(request.cwd, 'src/value.mjs')), complete: store.getRun(run.id).verification.pendingRepair.complete });
+    if (repairSnapshots.length > 1) assert.equal(request.sessionId, 'partial-verification-session');
+    request.onEvent({ sessionId: 'partial-verification-session' });
+    if (repairSnapshots.length <= 2) {
+      await writeFile(path.join(request.cwd, 'src/value.mjs'), 'export const value = 99;\n');
+      throw Object.assign(new Error('fixture quota after partial file write'), { code: 'quota' });
+    }
+    await writeFile(path.join(request.cwd, 'src/value.mjs'), 'export const value = 3;\n');
+    return { sessionId: 'partial-verification-session', output: { complete: true, summary: 'repair completed', checks: [] } };
+  };
+  let engine = new Engine({ store, ...services });
+  const run = await engine.create('Keep unfinished repair uncommitted', { project: fx.project });
+  let failedHead;
+  for (let interruption = 1; interruption <= 2; interruption++) {
+    const paused = await engine.run(run.id);
+    assert.equal(paused.state, 'waiting_limits', paused.error?.message); assert.equal(paused.error.code, 'quota');
+    failedHead ||= paused.verification.pendingRepair.headSha;
+    assert.equal(git(paused.cwd, 'rev-parse', 'HEAD'), failedHead, 'incomplete repair writes must never be committed by generic recovery');
+    assert.equal(git(paused.cwd, 'show', 'HEAD:src/value.mjs'), 'export const value = 2;');
+    assert.equal(await read(path.join(paused.cwd, 'src/value.mjs')), 'export const value = 99;\n');
+    assert.notEqual(git(paused.cwd, 'status', '--porcelain'), '');
+    assert.equal(paused.verification.attempt, 1); assert.notEqual(paused.verification.pendingRepair.complete, true);
+    assert.equal(paused.verification.pendingRepair.sessionId, 'partial-verification-session');
+    fx.closeStore(store); store = fx.openStore(); engine = new Engine({ store, ...services });
+  }
+  const result = await engine.run(run.id);
+  assert.equal(result.state, 'succeeded', result.error?.message); assert.equal(repairSnapshots.length, 3);
+  for (const snapshot of repairSnapshots) {
+    assert.equal(snapshot.headSha, failedHead); assert.equal(snapshot.committed, 'export const value = 2;'); assert.notEqual(snapshot.complete, true);
+  }
+  assert.deepEqual(repairSnapshots.map(snapshot => snapshot.working), ['export const value = 2;\n', 'export const value = 99;\n', 'export const value = 99;\n']);
+  assert.equal(git(result.cwd, 'show', 'HEAD:src/value.mjs'), 'export const value = 3;');
+  assert.equal(git(result.cwd, 'rev-list', '--count', `${failedHead}..HEAD`), '1', 'only the completed repair becomes a commit');
+  assert.equal(result.verification.pendingRepair, undefined); assert.equal(result.verification.attempt, 1); assert.equal(result.verification.cycle, 1);
+  assert.equal(result.verification.previousCycles, undefined); assert.equal(result.controllerAssessment, undefined);
+  assert.equal(result.checks.headSha, result.headSha); assert.equal(result.review.headSha, result.headSha);
+  assert.equal(result.uiVerification.headSha, result.headSha); assert.equal(result.securityChecks.headSha, result.headSha);
+  assert.equal(services.calls.worker.length, 1); assert.equal(services.calls.review.length, 1);
+  assert.equal(store.events(run.id).filter(event => event.type === 'check_started').length, 2);
+  assert.equal(store.events(run.id).filter(event => event.type === 'repair_recovered').length, 0);
+  assert.equal(store.events(run.id).filter(event => event.type === 'retry_requested').length, 0);
+  assert.equal(git(result.cwd, 'status', '--porcelain'), ''); assert.equal(git(fx.project, 'rev-parse', 'HEAD'), fx.base);
+});
+
+test('Engine retry-failed preserves pending verification repair before resetting its cycle', async t => {
+  for (const complete of [false, true]) await t.test(complete ? 'completed-before-commit' : 'quota-with-partial-writes', async subtest => {
+    const fx = await fixture(subtest, { config: { repairRounds: 2, researchBudget: 0 },
+      testScript: "import assert from 'node:assert/strict'; import {value} from './src/value.mjs'; assert.equal(value, 3);\n" });
+    const services = fakeServices({ plan: { summary: 'value three', tasks: [node('feature', 'developer', ['src/value.mjs'])] } });
+    const original = services.provider.runSession, controller = new AbortController(), repairSnapshots = [];
+    let store = fx.openStore();
+    services.provider.runSession = async request => {
+      if (!/Repair confirmed failures/.test(request.prompt)) return original(request);
+      repairSnapshots.push({ sessionId: request.sessionId, headSha: git(request.cwd, 'rev-parse', 'HEAD'),
+        committed: git(request.cwd, 'show', 'HEAD:src/value.mjs'), working: await read(path.join(request.cwd, 'src/value.mjs')) });
+      request.onEvent({ sessionId: 'retry-pending-verification-session' });
+      if (!complete && repairSnapshots.length <= 2) {
+        await writeFile(path.join(request.cwd, 'src/value.mjs'), 'export const value = 99;\n');
+        throw Object.assign(new Error('fixture quota after partial repair write'), { code: 'quota' });
+      }
+      await writeFile(path.join(request.cwd, 'src/value.mjs'), 'export const value = 3;\n');
+      if (complete) controller.abort();
+      return { sessionId: 'retry-pending-verification-session', output: { complete: true, summary: 'repair completed', checks: [] } };
+    };
+    let engine = new Engine({ store, ...services });
+    const run = await engine.create('Retry the reserved verification repair', { project: fx.project });
+    const history = [{ attempt: 2, cycle: 1, stopped: 'repair_budget_exhausted' }];
+    run.verification = { attempt: 0, cycle: 2, previousCycles: history }; engine.save(run);
+    let reserved;
+    for (let interruption = 1; interruption <= (complete ? 1 : 2); interruption++) {
+      const paused = await engine.run(run.id, { signal: controller.signal, retryFailed: interruption > 1 });
+      reserved ||= structuredClone(paused.verification);
+      assert.equal(git(paused.cwd, 'rev-parse', 'HEAD'), reserved.pendingRepair.headSha, 'retry-failed must leave unfinished writes out of HEAD');
+      assert.equal(git(paused.cwd, 'show', 'HEAD:src/value.mjs'), 'export const value = 2;');
+      assert.equal(paused.state, complete ? 'cancelled' : 'waiting_limits', paused.error?.message);
+      assert.equal(paused.error.code, complete ? 'cancelled' : 'quota');
+      assert.deepEqual(paused.verification, reserved, 'retry-failed must retain the entire reserved round and its history');
+      assert.equal(paused.verification.attempt, 1); assert.equal(paused.verification.cycle, 2);
+      assert.deepEqual(paused.verification.previousCycles, history);
+      assert.equal(paused.verification.pendingRepair.sessionId, 'retry-pending-verification-session');
+      assert.equal(paused.verification.pendingRepair.complete === true, complete);
+      assert.equal(await read(path.join(paused.cwd, 'src/value.mjs')), complete ? 'export const value = 3;\n' : 'export const value = 99;\n');
+      assert.equal(services.calls.review.length, 0);
+      fx.closeStore(store); store = fx.openStore(); engine = new Engine({ store, ...services });
+    }
+    const result = await engine.run(run.id, { retryFailed: true, resumeCancelled: complete });
+    assert.equal(result.state, 'succeeded', result.error?.message);
+    assert.equal(repairSnapshots.length, complete ? 1 : 3, 'completed output must not reopen the session; unfinished output must resume it');
+    assert.deepEqual(repairSnapshots.map(snapshot => snapshot.sessionId), complete ? [undefined] : [undefined, 'retry-pending-verification-session', 'retry-pending-verification-session']);
+    for (const snapshot of repairSnapshots) {
+      assert.equal(snapshot.headSha, reserved.pendingRepair.headSha); assert.equal(snapshot.committed, 'export const value = 2;');
+    }
+    assert.deepEqual(repairSnapshots.map(snapshot => snapshot.working), complete ? ['export const value = 2;\n'] : ['export const value = 2;\n', 'export const value = 99;\n', 'export const value = 99;\n']);
+    assert.equal(result.verification.pendingRepair, undefined); assert.equal(result.verification.attempt, 1); assert.equal(result.verification.cycle, 2);
+    assert.deepEqual(result.verification.previousCycles, history); assert.equal(result.verification.lastFailure, reserved.lastFailure);
+    assert.equal(git(result.cwd, 'show', 'HEAD:src/value.mjs'), 'export const value = 3;');
+    assert.equal(git(result.cwd, 'rev-list', '--count', `${reserved.pendingRepair.headSha}..HEAD`), '1');
+    assert.equal(git(result.cwd, 'log', '-1', '--format=%s'), 'Kodo repair checks 1');
+    assert.equal(store.events(run.id).filter(event => event.type === 'repair_recovered').length, 0);
+    assert.equal(store.events(run.id).filter(event => event.type === 'check_started').length, 2);
+    assert.equal(store.events(run.id).filter(event => event.type === 'retry_requested').length, complete ? 1 : 2);
+    assert.equal(services.calls.worker.length, 1); assert.equal(services.calls.review.length, 1);
+    assert.equal(result.checks.headSha, result.headSha); assert.equal(result.review.headSha, result.headSha);
+    assert.equal(result.uiVerification.headSha, result.headSha); assert.equal(result.securityChecks.headSha, result.headSha);
+    assert.equal(git(result.cwd, 'status', '--porcelain'), ''); assert.equal(git(fx.project, 'rev-parse', 'HEAD'), fx.base);
+  });
+});
+
+test('Engine detects no progress only after a resumed verification repair completes', async t => {
+  const fx = await fixture(t, { config: { repairRounds: 3, researchBudget: 0 }, testScript: 'process.exit(0);\n' });
+  const services = fakeServices({ plan: { summary: 'one feature', tasks: [node('feature', 'developer', ['src/value.mjs'])] },
+    onReview: async () => ({ output: { passed: false, findings: [{ severity: 'major', file: 'src/value.mjs', problem: 'Requirement still missing', fix: 'Implement the requirement' }] } }) });
+  const original = services.provider.runSession; let repairs = 0;
+  services.provider.runSession = async request => {
+    if (!/Repair confirmed failures/.test(request.prompt)) return original(request);
+    repairs++;
+    if (repairs === 1) throw Object.assign(new Error('fixture repair quota'), { code: 'quota' });
+    return { output: { complete: true, summary: 'Finished without resolving the finding', checks: [] } };
+  };
+  const firstStore = fx.openStore(), firstEngine = new Engine({ store: firstStore, ...services });
+  const run = await firstEngine.create('Keep verification bounded', { project: fx.project });
+  const paused = await firstEngine.run(run.id);
+  assert.equal(paused.state, 'waiting_limits'); assert.equal(paused.verification.attempt, 1);
+  const failedHead = git(paused.cwd, 'rev-parse', 'HEAD');
+  fx.closeStore(firstStore);
+  const store = fx.openStore(), engine = new Engine({ store, ...services });
+  const blocked = await engine.run(run.id);
+  assert.equal(repairs, 2, 'the pending repair must actually finish before identical failure can mean no progress');
+  assert.equal(blocked.state, 'blocked'); assert.equal(blocked.verification.attempt, 2);
+  assert.equal(blocked.verification.stopped, 'no_progress'); assert.equal(blocked.verification.pendingRepair, undefined);
+  assert.equal(blocked.controllerAssessment.reason, 'no_progress'); assert.equal(blocked.controllerAssessment.attempts, 2);
+  assert.equal(services.calls.review.length, 2); assert.equal(git(blocked.cwd, 'rev-parse', 'HEAD'), failedHead);
+  await engine.run(run.id);
+  assert.equal(repairs, 2); assert.equal(services.calls.review.length, 2, 'ordinary resume cannot reset the completed repair budget');
+});
+
+test('Engine distinguishes incomplete verification output from a completed repair interrupted before commit', async t => {
+  for (const complete of [false, true]) await t.test(complete ? 'completed-before-cancel' : 'incomplete-output', async subtest => {
+    const fx = await fixture(subtest, { config: { repairRounds: 2, researchBudget: 0 },
+      testScript: "import assert from 'node:assert/strict'; import {value} from './src/value.mjs'; assert.equal(value, 3);\n" });
+    const services = fakeServices({ plan: { summary: 'value three', tasks: [node('feature', 'developer', ['src/value.mjs'])] } });
+    const original = services.provider.runSession, controller = new AbortController(); let repairs = 0;
+    services.provider.runSession = async request => {
+      if (!/Repair confirmed failures/.test(request.prompt)) return original(request);
+      repairs++; request.onEvent({ sessionId: 'verification-completion-session' });
+      if (repairs === 1 && !complete) return { sessionId: 'verification-completion-session', output: { complete: false, summary: 'Unfinished repair', checks: [] } };
+      if (repairs > 1) assert.equal(request.sessionId, 'verification-completion-session');
+      await writeFile(path.join(request.cwd, 'src/value.mjs'), 'export const value = 3;\n');
+      if (complete) controller.abort();
+      return { sessionId: 'verification-completion-session', output: { complete: true, summary: 'Repaired value', checks: [] } };
+    };
+    const firstStore = fx.openStore(), firstEngine = new Engine({ store: firstStore, ...services });
+    const run = await firstEngine.create('Persist verification completion', { project: fx.project });
+    const paused = await firstEngine.run(run.id, { signal: controller.signal });
+    assert.equal(paused.state, complete ? 'cancelled' : 'blocked', paused.error?.message);
+    assert.equal(paused.verification.attempt, 1); assert.equal(paused.verification.stopped, undefined);
+    assert.equal(services.calls.review.length, 0);
+    if (complete) assert.notEqual(git(paused.cwd, 'status', '--porcelain'), '', 'cancellation leaves the completed repair for scoped commit recovery');
+    fx.closeStore(firstStore);
+    const store = fx.openStore(), engine = new Engine({ store, ...services });
+    const result = await engine.run(run.id, { resumeCancelled: complete });
+    assert.equal(result.state, 'succeeded', result.error?.message);
+    assert.equal(repairs, complete ? 1 : 2, 'completed repair output survives reopening SQLite and must not launch another repair session');
+    assert.equal(result.verification.pendingRepair, undefined); assert.equal(result.verification.attempt, 1);
+    assert.equal(result.checks.headSha, result.headSha); assert.equal(result.review.headSha, result.headSha);
+    assert.equal(services.calls.worker.length, 1); assert.equal(services.calls.review.length, 1);
+    assert.equal(store.events(run.id).filter(event => event.type === 'check_started').length, 2);
+    assert.equal(git(result.cwd, 'status', '--porcelain'), '');
+  });
+});
+
+test('Engine node budgets stop after five or earlier identical no progress and persist the assessment', async t => {
+  for (const repeated of [false, true]) await t.test(repeated ? 'identical-no-progress' : 'five-distinct-attempts', async subtest => {
+    const fx = await fixture(subtest, { config: { executionMode: 'deep', repairRounds: 5 }, testScript: 'process.exit(0);\n' });
+    let workers = 0;
+    const services = fakeServices({ plan: { summary: 'one', tasks: [node('feature', 'developer', ['src/value.mjs'])] }, onWorker: async () => ({ output: { complete: false, checks: [], summary: repeated ? 'same unresolved requirement' : `remaining requirement ${++workers}` } }) });
+    if (repeated) { const original = services.provider.runSession; services.provider.runSession = request => { if (!request.schema.properties.tasks) workers++; return original(request); }; }
+    const engine = new Engine({ store: fx.openStore(), ...services }), run = await engine.create('Bound node repairs', { project: fx.project });
+    const blocked = await engine.run(run.id), expected = repeated ? 2 : 5;
+    assert.equal(blocked.state, 'blocked'); assert.equal(workers, expected); assert.equal(blocked.nodes.feature.status, 'blocked');
+    assert.equal(blocked.controllerAssessment.attempts, expected); assert.equal(blocked.controllerAssessment.reason, repeated ? 'no_progress' : 'repair_budget_exhausted');
+    await engine.run(run.id); assert.equal(workers, expected);
+  });
+});
+
+test('Engine runs enabled UI after local checks and rejects evidence changed during independent review', async t => {
+  const fx = await fixture(t, { config: { uiVerification: { enabled: true, autoInstall: false, cases: [{ id: 'fixture', tool: 'browser-harness', url: 'http://127.0.0.1:1', assertions: [{ selector: 'body', text: 'Ready' }] }] } } });
+  const services = fakeServices(), store = fx.openStore(); let created, gateCalls = 0;
+  const gates = { runUIVerification: async options => {
+    const saved = store.getRun(created.id); assert.equal(saved.checks.headSha, options.headSha); assert.equal(saved.checks.results[0].exitCode, 0); gateCalls++;
+    return runUIVerification({ ...options, caseRunner: async () => ({ schemaVersion: 1, status: 'completed', observations: [{ exists: true, count: 1, text: 'Ready', value: null }] }) });
+  } };
+  services.provider.runSession = ((original) => async request => {
+    if (request.schema.properties.passed) {
+      assert.equal(gateCalls, 1); const saved = store.getRun(created.id); assert.equal(saved.uiVerification.status, 'passed');
+      await writeFile(saved.uiVerification.cases[0].evidence[0].path, 'tampered after gate');
+    }
+    return original(request);
+  })(services.provider.runSession);
+  const engine = new Engine({ store, ...services, gates }); created = await engine.create('Bind UI evidence', { project: fx.project });
+  const blocked = await engine.run(created.id);
+  assert.equal(blocked.state, 'blocked'); assert.equal(blocked.error.code, 'stale_verification'); assert.equal(blocked.review, null); assert.equal(blocked.uiVerification, null);
+});
+
 test('Engine saves cannot overwrite cancellation from another coordinator connection', async t => {
   const fx = await fixture(t);
   const store = fx.openStore(), other = fx.openStore();
@@ -82,6 +486,16 @@ test('Engine saves cannot overwrite cancellation from another coordinator connec
   engine.save(run);
   assert.equal(other.getRun(run.id).cancelRequested, true);
   assert.equal(other.getRun(run.id).state, 'cancelled');
+});
+
+test('Engine exposes only managed ready ripgrep on worker PATH while provider credentials stay scrubbed', async t => {
+  const fx = await fixture(t), command = path.join(fx.directory, 'managed-tools', 'rg.exe');
+  const engine = new Engine({ store: fx.openStore(), secrets: { GEMINI_API_KEY: 'private-fixture-key' }, tools: { resolveTool: async id => { assert.equal(id, 'ripgrep'); return { id, ready: true, command, args: [] }; } } });
+  const run = await engine.create('Scoped code search', { project: fx.project });
+  const environment = await engine.executionEnvironment(run, fx.project);
+  const pathKey = Object.keys(environment).find(key => key.toLowerCase() === 'path');
+  assert.deepEqual(environment[pathKey].split(path.delimiter).slice(0, 2), [path.dirname(process.execPath), path.dirname(command)]);
+  assert.equal(environment.GEMINI_API_KEY, undefined); assert.equal(environment.TYPESAFE_API_KEY, undefined); assert.equal(environment.OPENAI_API_KEY, undefined);
 });
 
 test('Engine allows credential-handling source text and hashes its exact Git diff while rejecting actual secrets', async t => {

@@ -27,7 +27,7 @@ export const reviewSchema = { type: 'object', additionalProperties: false, requi
   } } }
 } };
 export const routingSchema = { type: 'object', required: ['model', 'parallel', 'confidence'], properties: {
-  model: { type: 'string', minLength: 1 }, parallel: { type: 'boolean' }, confidence: { type: 'number', minimum: 0, maximum: 1 }, sessionMode: { enum: ['fresh', 'continue'] }, fallback: { type: 'boolean' }
+  model: { type: 'string', minLength: 1 }, parallel: { type: 'boolean' }, confidence: { type: 'number', minimum: 0, maximum: 1 }, modelConfidence: { type: 'number', minimum: 0, maximum: 1 }, parallelConfidence: { type: 'number', minimum: 0, maximum: 1 }, sessionConfidence: { type: 'number', minimum: 0, maximum: 1 }, sessionMode: { enum: ['fresh', 'continue'] }, fallback: { type: 'boolean' }
 } };
 const checks = new Map();
 export function validate(schema, value) {

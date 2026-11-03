@@ -67,7 +67,7 @@ async function fixture(t, { brokenCli = false } = {}) {
     if (args[0] === 'pr' && args[1] === 'list') return output(state.pr ? [state.pr] : []);
     if (args[0] === 'pr' && args[1] === 'create') {
       const body = await readFile(args[args.indexOf('--body-file') + 1], 'utf8');
-      assert.match(body, /<!-- kodo-run:run-test -->/); assert.match(body, /Diff SHA-256/);
+      assert.ok(body.includes('<!-- kodo-run:run-test -->')); assert.match(body, /Diff SHA-256/);
       state.creates++; state.pr = { number: 7, url: 'https://github.com/test/kodo/pull/7', state: 'OPEN' }; return output(state.pr.url);
     }
     if (args[0] === 'pr' && args[1] === 'view') return output({ ...state.pr, headRefOid: state.prHead ?? headSha, baseRefName: 'main', baseRefOid: state.prBase ?? run.baseSha, mergeCommit: state.pr?.state === 'MERGED' ? { oid: state.mergeCommit ?? headSha } : null, statusCheckRollup: state.noChecks ? [] : [{ name: 'ci', conclusion: state.check }, { context: 'kodo/review', state: state.status ?? 'PENDING' }] });

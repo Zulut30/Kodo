@@ -2,3 +2,9 @@
 command = "npx"
 args = ["-y", "@playwright/mcp@latest", "--isolated"]
 enabled = false
+
+[mcp_servers.kodo_chrome_devtools]
+command = "npx"
+args = ["-y", "chrome-devtools-mcp@1.12.0", "--isolated", "--no-usage-statistics", "--no-performance-crux"]
+env = { NO_UPDATE_CHECKS = "1", CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS = "1" }
+enabled = false

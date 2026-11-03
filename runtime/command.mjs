@@ -21,6 +21,7 @@ export function gitBoundary(args, env) {
     if (/^(?:GH_TOKEN|GITHUB_TOKEN|GH_ENTERPRISE_TOKEN|GITHUB_ENTERPRISE_TOKEN|GH_HOST|GH_CONFIG_DIR)$/i.test(name)) environment[name] = value;
   }
   const config = ['-c', `core.hooksPath=${process.platform === 'win32' ? 'NUL' : '/dev/null'}`, '-c', 'core.fsmonitor=false'];
+  if (process.platform === 'win32') config.push('-c', 'core.longpaths=true');
   if (!network) config.push('-c', 'credential.helper=');
   let invocation = args.slice(commandIndex);
   if (invocation[0] === 'diff') {

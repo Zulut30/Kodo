@@ -2,8 +2,10 @@ import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
 import Ajv from 'ajv';
 import { resolveClient, runProcess, readCodexModelCache, subscriptionEnvironment, redact, codexIsolationOverrides } from './process.mjs';
+import { sessionMetrics } from './metrics.mjs';
 
 export class ProviderError extends Error {
   constructor(message, code = 'unavailable', retryAt) { super(message); this.name = 'ProviderError'; this.code = code; if (retryAt) this.retryAt = retryAt; }
@@ -161,7 +163,7 @@ export function sessionInvocation({ client, model, cwd, schemaPath, schema, sess
   throw new ProviderError(`Неподдерживаемый исполнитель ${client}`, 'unavailable');
 }
 
-export function parseSessionEvents(client, events, { schema, sessionId, model } = {}) {
+export function parseSessionEvents(client, events, { schema, sessionId, model, durationMs } = {}) {
   let output, usage, failure, completed = false;
   for (const event of events) {
     sessionId = event.thread_id ?? event.session_id ?? sessionId;
@@ -188,20 +190,21 @@ export function parseSessionEvents(client, events, { schema, sessionId, model } 
     catch { throw new ProviderError('Некорректная JSON Schema результата', 'invalid_output'); }
     if (!validate(output)) throw new ProviderError(`Итог модели не соответствует контракту: ${ajv.errorsText(validate.errors)}`, 'invalid_output');
   }
-  return { sessionId, output, usage, model };
+  return { sessionId, output, usage, model, metrics: sessionMetrics(client, events, { durationMs, usage }) };
 }
 
-export async function runSession({ client, model, cwd, prompt, schema, sessionId, readOnly = false, signal, onEvent, env, timeoutMs = 1800000 }, { processImpl = runProcess, resolveClientImpl = resolveClient } = {}) {
+export async function runSession({ client, model, cwd, prompt, schema, sessionId, readOnly = false, signal, onEvent, env, timeoutMs = 1800000 }, { processImpl = runProcess, resolveClientImpl = resolveClient, nowImpl = () => performance.now() } = {}) {
   signal?.throwIfAborted();
+  const started = nowImpl(), events = [];
+  let directory;
   const environment = subscriptionEnvironment(env);
-  const { executable } = await subscriptionStatus(client, { env: environment, processImpl, resolveClientImpl });
-  const directory = await mkdtemp(path.join(os.tmpdir(), 'kodo-provider-'));
   try {
+    const { executable } = await subscriptionStatus(client, { env: environment, processImpl, resolveClientImpl });
+    directory = await mkdtemp(path.join(os.tmpdir(), 'kodo-provider-'));
     const schemaPath = schema ? path.join(directory, 'output.schema.json') : undefined;
     if (schema) await writeFile(schemaPath, JSON.stringify(providerSchema(schema)), { mode: 0o600 });
     const invocation = sessionInvocation({ client, model, cwd, schemaPath, schema, sessionId, readOnly });
     if (client === 'codex') invocation.args.splice(invocation.args.indexOf('exec'), 0, ...await codexIsolationOverrides(cwd, environment));
-    const events = [];
     const result = await processImpl({ ...executable, args: [...executable.args, ...invocation.args], cwd, input: prompt, env: environment, signal, timeoutMs, onLine: line => {
       if (!line.trim()) return;
       let event;
@@ -215,12 +218,13 @@ export async function runSession({ client, model, cwd, prompt, schema, sessionId
       catch (error) { if (error.code && error.code !== 'invalid_output') throw error; }
       throw classifyProviderFailure(result.stderr || result.stdout || `Клиент завершился с кодом ${result.exitCode}`);
     }
-    return parseSessionEvents(client, events, { schema, sessionId: invocation.sessionId, model });
+    return parseSessionEvents(client, events, { schema, sessionId: invocation.sessionId, model, durationMs: nowImpl() - started });
   } catch (error) {
-    if (error instanceof ProviderError || signal?.aborted) throw error;
-    throw new ProviderError(redact(error.message), 'unavailable');
+    const failure = error instanceof ProviderError || signal?.aborted ? error : new ProviderError(redact(error.message), 'unavailable');
+    if (failure instanceof Error && Object.isExtensible(failure)) failure.metrics = sessionMetrics(client, events, { durationMs: nowImpl() - started });
+    throw failure;
   } finally {
-    if (path.dirname(directory) === path.resolve(os.tmpdir()) && path.basename(directory).startsWith('kodo-provider-')) await rm(directory, { recursive: true, force: true });
+    if (directory && path.dirname(directory) === path.resolve(os.tmpdir()) && path.basename(directory).startsWith('kodo-provider-')) await rm(directory, { recursive: true, force: true });
   }
 }
 
@@ -264,7 +268,7 @@ export async function decideJev({ task, models, node, attempt = 0 }, { secrets =
     if (confidenceValues.some(value => typeof value !== 'number' || value < 0 || value > 1)) throw new ProviderError('Jev вернул некорректную уверенность', 'invalid_output');
     const modelConfidence = modelAnswer?.confidence ?? 1;
     const chosen = modelConfidence < 0.65 ? strongest(available).id : modelAnswer?.choice ?? available[0].id;
-    return { model: chosen, parallel: execution.choice === 'parallel' && execution.confidence >= 0.75, confidence: Math.min(...confidenceValues), sessionMode: session.choice === 'continue' && session.confidence >= 0.75 && node?.sessionId ? 'continue' : 'fresh', fallback: false, jevModel: result.model };
+    return { model: chosen, modelConfidence, parallelConfidence: execution.confidence, sessionConfidence: session.confidence, parallel: execution.choice === 'parallel' && execution.confidence >= 0.75, confidence: Math.min(...confidenceValues), sessionMode: session.choice === 'continue' && session.confidence >= 0.75 && node?.sessionId ? 'continue' : 'fresh', fallback: false, jevModel: result.model };
   } catch (error) { return fallback(redact(error.message, secrets)); }
 }
 

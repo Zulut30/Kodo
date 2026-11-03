@@ -169,6 +169,76 @@ test('Provider event parser requires completion, exact output contract and sessi
   assert.throws(() => parseSessionEvents('claude-code', [{ type: 'result', is_error: true, result: 'Usage limit reached' }], { schema, sessionId: 's' }), error => error.code === 'quota');
 });
 
+test('Native parser adds nullable metrics while preserving the original usage result', () => {
+  const events = [...codexEvents.slice(0, 2), { type: 'turn.completed', usage: { input_tokens: 100, cached_input_tokens: 80, output_tokens: 20 } }];
+  const result = parseSessionEvents('codex', events, { schema, durationMs: 25 });
+  assert.equal(result.usage.cached_input_tokens, 80);
+  assert.equal(result.metrics.usage.totalTokens, 120);
+  assert.equal(result.metrics.durationMs, 25);
+  assert.equal(result.metrics.nativeRequestCount, null);
+});
+
+test('Native session returns monotonic metrics and sanitized completed tool counts', async () => {
+  let now = 100;
+  const result = await runSession({ client: 'codex', cwd: process.cwd(), prompt: 'fixture task', schema }, {
+    nowImpl: () => now,
+    resolveClientImpl: async () => ({ command: 'fixture', args: [] }),
+    processImpl: async invocation => {
+      if (invocation.args.includes('status')) return { exitCode: 0, stdout: 'Logged in using ChatGPT', stderr: '' };
+      const item = { id: 'cmd-1', type: 'command_execution', command: secrets.GEMINI_API_KEY };
+      for (const event of [{ type: 'item.started', item }, { type: 'item.completed', item }, { type: 'item.completed', item }, ...codexEvents]) invocation.onLine(JSON.stringify(event));
+      now = 137.5;
+      return { exitCode: 0, stdout: '', stderr: '' };
+    }
+  });
+  assert.equal(result.metrics.durationMs, 37.5);
+  assert.equal(result.metrics.toolSteps, 1);
+  assert.equal(result.metrics.usage.totalTokens, 13);
+  assert.equal(JSON.stringify(result.metrics).includes(secrets.GEMINI_API_KEY), false);
+});
+
+test('Native failures retain safe attempt metrics and observed usage on the error', async () => {
+  await assert.rejects(runSession({ client: 'codex', cwd: process.cwd(), prompt: 'fixture task', schema }, {
+    resolveClientImpl: async () => ({ command: 'fixture', args: [] }),
+    processImpl: async invocation => {
+      if (invocation.args.includes('status')) return { exitCode: 0, stdout: 'Logged in using ChatGPT', stderr: '' };
+      for (const event of [{ type: 'item.completed', item: { id: 'failed-command', type: 'command_execution' } }, ...codexEvents, { type: 'turn.failed', error: { message: 'Usage limit reached' } }]) invocation.onLine(JSON.stringify(event));
+      return { exitCode: 1, stdout: '', stderr: 'Usage limit reached' };
+    }
+  }), error => error.code === 'quota' && error.metrics.toolSteps === 1 && error.metrics.usage.totalTokens === 13 && error.metrics.durationMs >= 0);
+});
+
+test('Claude native metrics retain separate cache semantics without retaining tool payloads', async () => {
+  const result = await runSession({ client: 'claude-code', cwd: process.cwd(), prompt: 'fixture task', schema, env: {} }, {
+    resolveClientImpl: async () => ({ command: 'fixture', args: [] }),
+    processImpl: async invocation => {
+      if (invocation.args.includes('status')) return { exitCode: 0, stdout: JSON.stringify({ loggedIn: true, authMethod: 'claude.ai' }), stderr: '' };
+      const assistant = { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'claude-tool-1', name: 'Read', input: secrets }] } };
+      for (const event of [assistant, assistant, { type: 'result', subtype: 'success', structured_output: { ok: true }, usage: { input_tokens: 2, cache_read_input_tokens: 10, cache_creation_input_tokens: 3, output_tokens: 4 } }]) invocation.onLine(JSON.stringify(event));
+      return { exitCode: 0, stdout: '', stderr: '' };
+    }
+  });
+  assert.equal(result.usage.input_tokens, 2);
+  assert.equal(result.metrics.usage.totalTokens, 19);
+  assert.equal(result.metrics.toolSteps, 1);
+  assert.equal(JSON.stringify(result.metrics).includes(secrets.GEMINI_API_KEY), false);
+});
+
+test('Invalid native output and interrupted processes retain unknown usage and preserve abort identity', async () => {
+  const controller = new AbortController(), reason = new Error('fixture cancelled');
+  const dependencies = {
+    resolveClientImpl: async () => ({ command: 'fixture', args: [] }),
+    processImpl: async invocation => {
+      if (invocation.args.includes('status')) return { exitCode: 0, stdout: 'Logged in using ChatGPT', stderr: '' };
+      invocation.onLine(JSON.stringify({ type: 'item.completed', item: { id: 'cmd-1', type: 'command_execution' } }));
+      if (invocation.signal) { controller.abort(reason); throw reason; }
+      return { exitCode: 0, stdout: '', stderr: '' };
+    }
+  };
+  await assert.rejects(runSession({ client: 'codex', cwd: process.cwd(), prompt: 'fixture task', schema }, dependencies), error => error.code === 'invalid_output' && error.metrics.usage.totalTokens === null && error.metrics.toolSteps === 1);
+  await assert.rejects(runSession({ client: 'codex', cwd: process.cwd(), prompt: 'fixture task', signal: controller.signal }, dependencies), error => error === reason && error.metrics.toolSteps === 1 && error.metrics.nativeRequestCount === null);
+});
+
 test('Session adapter emits identity before completion and never streams tool payloads', async () => {
   const streamed = [], invocations = [];
   const result = await runSession({ client: 'codex', model: 'gpt-6.1-sol', cwd: process.cwd(), prompt: 'literal prompt with $() &', schema, readOnly: true, env: secrets, onEvent: event => streamed.push(event) }, {
@@ -273,6 +343,18 @@ test('Gemini research query remains optional and enforces a nonempty 250 charact
 function jevOutput({ model = models[0].id, modelConfidence = 0.95, parallel = 'parallel', parallelConfidence = 0.95, session = 'fresh' } = {}) {
   return { model: 'jev-1.14.0', answers: { model: { type: 'choice', choice: model, confidence: modelConfidence }, execution: { type: 'choice', choice: parallel, confidence: parallelConfidence }, session: { type: 'choice', choice: session, confidence: 0.95 } } };
 }
+
+test('Jev exposes independent confidence for model execution and session decisions', async () => {
+  const models = [{ id: 'sol', client: 'codex', model: 'gpt-6.1-sol' }, { id: 'astra', client: 'codex', model: 'gpt-6-astra' }];
+  const value = { model: 'fixture-jev', answers: {
+    model: { type: 'choice', choice: 'sol', confidence: .2 },
+    execution: { type: 'choice', choice: 'parallel', confidence: .95 },
+    session: { type: 'choice', choice: 'fresh', confidence: .1 }
+  } };
+  const result = await decideJev({ task: 'Independent prepared module', models, node: { id: 'module', parallel: true } }, { secrets, fetchImpl: async () => new Response(JSON.stringify(value), { status: 200, headers: { 'content-type': 'application/json' } }) });
+  assert.equal(result.model, 'astra'); assert.equal(result.parallel, true);
+  assert.equal(result.modelConfidence, .2); assert.equal(result.parallelConfidence, .95); assert.equal(result.sessionConfidence, .1); assert.equal(result.confidence, .1);
+});
 
 test('Jev selects only allowed models and falls back conservatively for uncertainty or service failure', async () => {
   let request;

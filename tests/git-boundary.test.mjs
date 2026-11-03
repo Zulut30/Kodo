@@ -11,6 +11,21 @@ import { commitChanges, makeWorktree } from '../runtime/workspace.mjs';
 const shell = value => `'${value.replaceAll('\\', '/').replaceAll("'", "'\\''")}'`;
 const fakeToken = 'fixture-github-value-never-send';
 const disabledHooks = process.platform === 'win32' ? 'NUL' : '/dev/null';
+
+test('Coordinator Git creates long Windows worktree refs without changing global config', { skip: process.platform !== 'win32' }, async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'kodo-git-paths-'));
+  t.after(async () => { assert.equal(path.dirname(root), path.resolve(os.tmpdir())); assert.ok(path.basename(root).startsWith('kodo-git-paths-')); await rm(root, { recursive: true, force: true }); });
+  const project = path.join(root, 'project');
+  await mkdir(project, { recursive: true });
+  const call = args => execute('git', ['-c', 'core.longpaths=false', '-c', 'commit.gpgsign=false', '-c', 'user.name=Kodo Fixture', '-c', 'user.email=kodo@example.invalid', ...args], { cwd: project });
+  await call(['init','-b','main']);
+  await writeFile(path.join(project, 'value.txt'), 'baseline\n');
+  await call(['add','.']); await call(['commit','-m','Baseline']);
+  const worktree = path.join(root, 'worktree');
+  await call(['worktree','add','-b','kodo/'+ 'a'.repeat(80)+'/'+ 'b'.repeat(80)+'/'+ 'c'.repeat(50),worktree]);
+  assert.equal((await readFile(path.join(worktree, 'value.txt'), 'utf8')).replaceAll('\r\n', '\n'), 'baseline\n');
+  assert.equal((await execute('git', ['config','--get','core.longpaths'], { cwd: worktree })).stdout.trim(), 'true');
+});
 async function exists(filename) { try { await lstat(filename); return true; } catch (error) { if (error.code === 'ENOENT') return false; throw error; } }
 
 async function fixture(t) {

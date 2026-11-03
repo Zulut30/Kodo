@@ -1,6 +1,6 @@
 {
   "name": "@zulut30/kodo",
-  "version": "0.2.2",
+  "version": "0.2.4",
   "private": true,
   "description": "Project-scoped skills, workflows and roles for Codex, Claude Code and OpenCode",
   "type": "module",
@@ -32,6 +32,7 @@
     "third-party-skills.lock.json"
   ],
   "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.2",
     "ajv": "^8.17.1",
     "smol-toml": "^1.9.1"
   }

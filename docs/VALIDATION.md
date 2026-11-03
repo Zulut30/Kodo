@@ -1,6 +1,6 @@
 # Проверки Kodo
 
-Состояние на 2 ноября 2026 года. Результаты разделены на автоматические проверки, реальные подписочные сессии и проверку выпуска.
+Состояние на 3 ноября 2026 года. Исторические результаты 2 ноября сохранены; новая интеграция UI/security имеет отдельные свидетельства ниже. Локальные/CI, реальные подписочные/UI проверки, опубликованный артефакт и deployment оцениваются раздельно.
 
 ## Автоматические проверки
 
@@ -26,6 +26,47 @@ node scripts/package-smoke.mjs
 | Выпуск устанавливается и восстанавливается без повторной публикации | `Release packages exact merged commit installs artifact and reconciles without republishing` |
 
 Также проверяются отмена, неверные контракты, недоступность Jev и источника исследования, пересекающиеся области записи, сохранность пользовательских файлов, повторные проверки после ревью и изменения main, Git hooks/окружение, свежесть тегов, права хранилища и подмена артефактов. Все три пресета включают стандартные навыки и чат-вход Kodo; dry-run не создаёт целевой каталог.
+
+## Режимы, метрики и парный benchmark
+
+Контракт режима и методики: [RUNTIME](RUNTIME.md#режимы-исполнения), [BENCHMARK](BENCHMARK.md), [ADR-0003](decisions/0003-execution-modes-and-benchmarks.md). Документирующий worktree основан на `e179d369fe664fa4a2b055eb26c8577f4f41eb6f`; production-код и тесты в нём не менялись. Исправление повторного использования checks координатор добавляет отдельно в integration того же run, поэтому уровни доказательств нельзя объединять в один GREEN.
+
+Целевой офлайн-прогон на Windows с Node.js `v24.19.0`:
+
+```powershell
+node --test --test-reporter=spec tests/modes.test.mjs tests/mode-engine.test.mjs tests/metrics.test.mjs tests/benchmark.test.mjs tests/benchmark-cli.test.mjs
+node --test --test-reporter=spec --test-name-pattern="Catalog validates all shipped components|Preset installs for all clients with self-contained pipelines" tests/toolkit.test.mjs
+```
+
+Первая команда завершилась с exit 1: **73 tests, 71 passed, 2 failed, 0 cancelled, 0 skipped**, длительность 186228 ms. Одна самостоятельная причина — известный `unchanged head reuses checks`; второе failed — его родительский тест. Фактически записано `test, build, test, build` вместо `test, build`: старый snapshot повторяет успешные команды после quota-review. Production-исправление не переносилось в этот worktree. Остальные сценарии, включая changed-head, changed test/build-команды и свежий failed UI после quota, прошли.
+
+Вторая команда проверила каталог и установку самодостаточных pipeline/skills для всех клиентов: **2 passed, 0 failed**. Дополнительная локальная проверка подтвердила 35 Markdown-ссылок/anchors, оба pipeline JSON, 33 registry-компонента, 13 default-skill IDs, 9 optional tools и неизменность защищённых production/tests/lock/UI/security путей; `git diff --check` прошёл. Dispatcher-workflow сохранён. Первая команда проверяет следующие публичные требования на настоящих временных Git-worktree с подменёнными provider boundaries:
+
+| Требование | Точное имя теста |
+| --- | --- |
+| Три конечных профиля и меньшие проектные бюджеты | `Modes accept only three public names and keep frozen bounded profiles`; `Profiles clamp smaller explicit project budgets without mutating defaults or config` |
+| Ранняя typed оценка и уверенность auto quick | `Assessment sends one typed atomic Jev batch with task as bounded data`; `Automatic quick requires all low local dimensions at both confidence and probability boundary` |
+| Explicit mode и fallback | `Explicit run mode overrides assessment and project mode while retaining typed receipt`; `Unavailable Jev is honest standard fallback and explicit mode still wins` |
+| Quick: одна реализация, реальный test/build и свежее независимое review | `Quick performs one executor and fresh independent review with actual test build and head-bound gates` |
+| Оценка раньше дорогого анализа, сохранение режима при resume | `Automatic assessment precedes expensive analysis and project mode is overridden by explicit mode`; `Quick prepare persists selection across config changes and resumes without repeated assessment or analysis` |
+| Legacy recovery и предел плана | `Legacy saved analysis receives compatibility standard policy without repeating completed analysis`; `Mode plan limits reject oversized host and native plans before any executor` |
+| Фиксированная модель для всех native-этапов | `Explicit model stays fixed for planner worker reviewer and retries despite uncertain strongest routing` |
+| Провал quick/gates без лишнего research и escalation | `Quick failure keeps actual failed checks and independent review findings without extra research or repair`; `Quick retains configured UI and security gates and missing tools block delivery without escalation` |
+| Противоречивый PASS с серьёзными findings отклоняется | `Quick rejects contradictory passing review receipts with blocker or major findings` |
+| Nullable metrics и разная семантика cache | `Codex totals include cached input once and expose absent cache fields as unknown`; `Claude totals add separate cache reads and writes only when all components are known`; `Aggregation preserves partial and absent evidence instead of fabricating zeros` |
+| Assessment считается один раз | `Benchmark reports authoritative Engine assessment counters without doubling wrapped operations` |
+| Настоящий Engine, модель, lease и свежие состояния пары | `Paired benchmark uses Engine create/run with fixed models mode shared leases and fresh stores`; `Production benchmark executes actual Engine worktrees review and checks using offline provider boundaries` |
+| Скрытый oracle и независимый scope | `Fixtures use identical initial commits and hidden oracle rejects wrong code and auxiliary tampering`; `Held-out scope rejects ignored new files and changed auxiliary declarations independently of correctness` |
+| Quota/abort, продолжение и версия методики | `Quota and interrupted attempts resume without duplicating completed trials`; `Resume rejects changed methodology identity and seeded order is reproducible` |
+| Заверение модели не определяет правильность | `Model success claims do not determine correctness and failures stay in summary denominator` |
+| Полное время, native duration, failures и неизвестные | `Paired reports separate native duration from wall time and keep failed and unknown cells in their denominators` |
+| CLI и отсутствие скрытого paid-прогона | `Benchmark CLI parses selected native client models modes seed and repeats without provider calls`; `Dedicated CLI entry rejects invalid invocation offline and fixture assets belong to the package` |
+
+Поправка local checks сверена чтением фактического `checks()` в integration: exact HEAD, чистота worktree, полный упорядоченный список test/build с exit 0, Node version/ABI/platform/arch входят в условия повторного использования. Это не изменение production документирующим worker. По сообщению координатора same-head регрессия с исправлением уже GREEN; финальное повторение changed-head/config и свежего failed UI в integration — отдельное свидетельство координатора. Эти сведения не являются собственным зелёным повтором исправления на старом срезе. Контрактные тесты — `Review quota recovery reuses successful checks only while their exact head is unchanged` и `Review quota recovery cannot reuse a previous enabled UI pass after observations fail`.
+
+Полный 24-trial native pilot не завершён: 3 ноября пользователь отложил бенчмарки ради MVP после 9 испытаний. Частичные квитанции и замороженные исходники сохранены; победитель или ускорение не заявлены. Отложенная матрица — 2 fixture × 3 доступные Codex-модели × plain/Kodo × 2 повтора. Недоступность модели сокращает фактическую матрицу и отражается в excluded, quota/abort — в pending. В будущем отчёте обязательны условия окружения, версии/hashes, raw trial records, failures и знаменатели; unknown usage/HTTP counts остаются null. Чистое LLM latency и точная цена подписки не наблюдаются. Публикация MVP требует отдельных проверок пайплайна и установленного CLI, а не завершения отложенного сравнения.
+
+Полный интегрированный `npm run check`, независимое ревью документации, CI Windows/Linux, реальные provider/UI/security, package smoke/установленный release и deployment принадлежат отдельным этапам координатора. Целевые офлайн результаты их не удостоверяют. Новых registry-компонентов, default-skill IDs или автоматических paid-вызовов этот этап не добавляет.
 
 ## Целевые проверки аудита
 
@@ -70,6 +111,68 @@ node --test --test-reporter=spec tests/audit.test.mjs tests/audit-cli.test.mjs
 | Команда видна в справке | `Audit CLI help advertises audit RUN_ID and optional JSON output` |
 
 Красная фаза TDD и последующая зелёная проверка другим тестовым узлом требуют отдельных свидетельств координатора; этот прогон документации подтверждает только текущее зелёное состояние. Наличие в тесте комментария о RED не доказывает прежнее падение. Для приёмки текущего запуска также нужны независимое ревью, protected PR, merge и проверка выпущенного пакета. Их успех здесь не заявлен. [Граница отчёта](decisions/0001-run-audit-evidence.md).
+
+## Интеграция UI, security и контекста
+
+Задание документации run `9fc232f4-c2fc-4d21-8822-9dcca700c309`, отдельный `integration-docs` worktree на исходном `bd6c06fed5092cb7f78550986270e27263858a49`. Production-код, registry/defaultskill IDs, исследовательские окружения и глобальные инструменты не изменялись. Full `npm run check`, package/build/release suites выполняет координатор на объединённом результате, не этот worker.
+
+В начальной RED-проверке требуемые `docs/UI-TOOLS.md` и ADR-0002 отсутствовали: assertion на первый файл завершился с exit 1. После добавления документационный контракт прошёл: 5 JSON-примеров нормализованы настоящими config ports, 3 MCP-шаблона разобраны JSON/TOML parser, Chrome pins/изоляция/telemetry flags проверены, прежние Playwright-секции совпали с HEAD. Также прошли 4 pipeline JSON, 33 registry-компонента, 13 skill pins, локальные ссылки и scope всех 20 изменённых файлов. Это проверка документации и конфигурации, отдельно от runtime-регрессий.
+
+Локальные целевые прогоны documenter без GUI, установки инструментов и платных вызовов:
+
+```powershell
+node --test --test-name-pattern='Catalog validates|Adapters emit|Preset installs' tests/toolkit.test.mjs
+node --test tests/task-context.test.mjs tests/progress.test.mjs tests/ui-bridge.test.mjs
+node --test --test-name-pattern='Default policy evaluates|Context is bounded|Catalog exposes|Import, missing resolve|Chrome MCP accepts|Semgrep invokes|Python installs' tests/skill-policy.test.mjs tests/tools.test.mjs
+```
+
+Результаты: **3/3**, **15/15** и **7/7** соответственно. В 15 входит offline Python compatibility/failure wrapper и настоящий SDK stdio с локальной protocol fixture; это не живой Chrome и не провайдер. Установка для трёх клиентов проверяет обнаруживаемые навыки и самодостаточные pipeline bundles.
+
+| Требование | Точное имя прошедшей локальной проверки |
+| --- | --- |
+| 13 навыков не заменены tool policy | `Default policy evaluates all thirteen pinned skills at every runtime stage without network calls` |
+| Девять закреплённых инструментов | `Catalog exposes exactly the approved pins and immutable native digests` |
+| Метаданные не запускают UI/install | `Import, missing resolve and doctor do not install or contact browsers` |
+| Tool guidance ограничен и приватен | `Context is bounded, capability-specific and never reflects arbitrary private input` |
+| Pins Python и отдельный Semgrep venv | `Python installs the four compatible pins together and Semgrep separately, never into user/global environments` |
+| Реальные особенности пакетов | `Chrome MCP accepts the pinned package relative bin spelling and rejects traversal`; `Semgrep invokes its supported console entry and uv Git uses invocation-local long paths` |
+| Scoped context без истории | `Task context preserves scope acceptance interfaces and direct dependencies without nested history`; `Task context bounds oversized optional data and redacts credential URLs` |
+| Восстановление progress из состояния | `Progress is bounded allowlisted recovery evidence and atomically replaced from authoritative state`; `Progress refuses repository destinations and unsafe run identifiers` |
+| Trim/nonempty имя fixture | `Owned form rejects whitespace names and verifies only a trimmed nonempty name` |
+| Windows Chrome env без ложного профиля | `Windows owned Chrome omits fabricated account folders without inheriting personal state or keys` |
+| Desktop uncertain delivery | `desktop observes uncertain final delivery once and requires independent state assertions`; `desktop does not continue mutations after uncertain intermediate delivery` |
+| Независимый readback через MCP | `Chrome MCP navigates and acts on observed UIDs, reads DOM independently and closes transport`; `Chrome adapter exercises the official SDK stdio transport against an offline protocol fixture` |
+| Сохранение клиентских bundles | `Catalog validates all shipped components and resolves unique dependencies before consumers`; `Adapters emit the documented layout and role format for each client`; `Preset installs for all clients with self-contained pipelines and repeatable files` |
+
+Отдельно documenter воспроизвёл **2/2 RED** на исходном дереве:
+
+```powershell
+node --test --test-name-pattern='UI rejects bridge results above|Engine counts changed contents' tests/ui-verification.test.mjs tests/repair-budget.test.mjs
+```
+
+`Engine counts changed contents of the same uncommitted file as progress through the fifth node round` завершился на второй попытке с `no_progress` вместо пятой с `repair_budget_exhausted`. `UI rejects bridge results above the configured step budget despite passing independent observations` принял 3 шага при `maxSteps:2` и признал квитанцию актуальной. Тесты и ожидания не ослаблялись.
+
+Последнее `QA FIX RESULTS` integration-contract фиксирует последующее исправление координатором: fingerprint tracked diff + ограниченных untracked bytes и передача normalized config в live/persisted UI result validation. **25 целевых тестов PASS**, затем **`Engine counts changing contents of a new untracked file as progress within the explicit budget` PASS**. Documenter прочитал исправленные исходники на integration `e85240c53a5059e0e19212ced2f841fea58441fc`, но не переносил production в свой worktree и не выдаёт прежний RED за новый локальный GREEN. Это свидетельство координатора; общий `npm run check`, CI и выпуск ещё не подтверждены.
+
+Контракт также записывает прежние 79 targeted UI/security/delivery PASS и 10 bridge compatibility PASS до последних QA-исправлений. Они относятся к своим срезам, не подменяют итоговые проверки объединённой ревизии. Существующие tests дополнительно описывают требования gates: `Both pinned scanners scan tracked runtime and tests with isolated offline environments`, `Findings fail with only typed locations and no secret match snippets or raw output`, `Receipts reject changed head configuration pins missing evidence and tampered bytes`, `Direct delivery rejects missing forged or stale enabled gate receipts before publishing`. Этот worker их отдельный полный прогон не заявляет.
+
+## Реальные квитанции run9fc
+
+Источник — актуальный `integration-contract.md` каталога запуска run9fc; пути ниже указаны от приватного scratch координатора, вне Git. Документационный worker не выполнял GUI/API-проверки и не переносил сырые traces.
+
+| Проверка | Подтверждённый результат и границы |
+| --- | --- |
+| Browser Harness, Chrome DevTools MCP, Agent Desktop, Browser Use | Успешные реальные cases в `live-all-ui/ui-smoke-e960aca82d6a.json`, HEAD `edc657d`. Первый общий batch не прошёл: Vibetest выявил настоящий empty-name дефект fixture. |
+| Исправленная fixture и Vibetest | required+trim в `0605cec`, сохранено в integration `1ad830e`; успешный Vibetest в `live-vibetest-fixed/ui-smoke-014391624527.json` на `1ad830e`. |
+| Jev Ultrafast | Отдельный реальный recheck `live-jev-diagnostic.json`: два действия, daemon очищен. Точный HEAD этого диагностического файла в контракте не указан; не приписывается общий batch PASS. |
+| Независимая видимая UI QA | `visible-ui-qa/receipt.json`: реальные формы Browser Harness/Agent Desktop прошли, собственные процессы/endpoint закрыты. Удаление тестового Chrome-профиля было заблокировано автоматической проверкой разрешений; профиль оставлен приватно, полное удаление не заявляется. |
+| Реальные scanner gates | На `b3f1cf7866792e5682d1d63e896938e8dbbe1833` Semgrep 1.183.0 просканировал 53 поддерживаемых файла, Gitleaks 8.30.1 получил scope 120; оба прошли. Ранее независимая QA воспроизвела Semgrep RPC failure при длинном Windows TEMP; короткий собственный temp устранил сбой без изменения global TEMP/WSL. |
+
+Все шесть UI-драйверов имеют отдельные реальные успешные свидетельства. Это не общий PASS первого batch, не fresh gate текущего объединённого HEAD и не проверка всех поддерживаемых ОС. Два собственных видимых QA-чата завершены, результаты проверены координатором и чаты архивированы штатным механизмом; постоянный диспетчер сохранён. CLI-native sessions не объявляются видимыми чатами.
+
+Урок fixture: exploratory QA оценивает и само тестовое приложение. Подтверждённую ошибку сохраняют, исправляют required/trim и повторяют сценарий; результат QA нельзя отбрасывать для зелёного summary. [ADR-0002](decisions/0002-ui-security-and-progress.md), [pins и публичный JSON](UI-TOOLS.md).
+
+Для новой интеграции **общий check/CI, PR/merge, опубликованный пакет, installed smoke выпуска и deployment пока не заявлены**. Исторический выпуск 0.2.1 ниже относится к прежней функциональности и не является доказательством поставки этих adapters.
 
 ## Реальная приёмка пайплайна
 
