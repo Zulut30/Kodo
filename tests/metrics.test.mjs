@@ -114,3 +114,21 @@ test('Aggregation preserves partial and absent evidence instead of fabricating z
   assert.equal(empty.toolSteps, null);
   assert.equal(empty.usage.totalTokens, null);
 });
+
+test('Local prompt and context bytes aggregate independently while legacy and malformed measurements stay unknown', () => {
+  const nativeOnly = sessionMetrics('codex', [], { usage: { input_tokens: 4, output_tokens: 2 } });
+  for (const key of ['promptBytes', 'contextOriginalBytes', 'contextSentBytes']) assert.equal(nativeOnly[key], null, 'native token usage does not establish local payload bytes');
+  const measured = { promptBytes: 52, contextOriginalBytes: 80, contextSentBytes: 20, usage: normalizeUsage('codex', { input_tokens: 4, output_tokens: 2 }) };
+  const result = aggregateMetrics([measured, { ...measured, promptBytes: 18, contextOriginalBytes: 5, contextSentBytes: 12 }]);
+  assert.equal(result.promptBytes, 70);
+  assert.equal(result.contextOriginalBytes, 85);
+  assert.equal(result.contextSentBytes, 32, 'tiny contexts may grow; no fictional savings');
+  assert.equal(result.usage.totalTokens, 12);
+  for (const missing of [{}, { promptBytes: -1 }, { promptBytes: '52' }, { promptBytes: 1.5 }]) {
+    const partial = aggregateMetrics([measured, missing]);
+    assert.equal(partial.promptBytes, null);
+    assert.deepEqual(partial.completeness.promptBytes, { known: 1, total: 2, complete: false });
+    assert.equal(partial.contextSentBytes, null);
+  }
+  assert.equal(aggregateMetrics([]).promptBytes, null);
+});
