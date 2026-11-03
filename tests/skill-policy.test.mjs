@@ -116,7 +116,7 @@ test('Default provenance verifies original resources and retained license declar
 });
 
 test('Default policy rejects altered pinned source and invalid provenance before building a prompt', async t => {
-  const directory = await temporary(t), copiedRoot = path.join(directory, 'bundle'), project = path.join(directory, 'project');
+  const directory = await temporary(t), copiedRoot = path.join(directory, 'bundle with spaces'), project = path.join(directory, 'project');
   await mkdir(copiedRoot); await mkdir(project);
   await cp(path.join(root, 'skills'), path.join(copiedRoot, 'skills'), { recursive: true });
   const lock = JSON.parse(await text(path.join(root, 'third-party-skills.lock.json')));
@@ -176,4 +176,40 @@ test('Default policy resolves bundled resources outside a generic target project
   }
   const before = JSON.parse(await text(path.join(root, 'third-party-skills.lock.json'))).components[0].files[1];
   assert.equal(digest(await readFile(path.join(root, before.path))), before.sha256, 'context link resolution must not rewrite pinned source bytes');
+});
+
+test('Compact policy keeps complete adapters and provenance with on-demand upstream references instead of excerpts', async t => {
+  const project = await temporary(t);
+  const result = await loadDefaultPolicy({ project, stage: 'review', task: 'Review a React monorepo' });
+  assert.match(result.context, /^Kodo default skill policy v1, stage review/);
+  assert.equal(result.skills.filter(row => row.applies).length, 12);
+  assert.doesNotMatch(result.context, /Pinned upstream reference excerpt|# Security-focused code review|# Systematic Debugging/);
+  for (const skill of result.skills) {
+    assert.ok(result.context.includes(skill.id));
+    assert.ok(result.context.includes(skill.revision), `${skill.id} provenance`);
+    assert.ok(result.context.includes(skill.source), `${skill.id} source`);
+    if (!skill.applies) continue;
+    const adapter = (await text(path.join(root, skill.id, 'SKILL.md'))).replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, '');
+    const prose = adapter.replace(/\]\([^)]+\)/g, ']');
+    assert.ok(result.context.replace(/\]\([^)]+\)/g, ']').includes(prose), `${skill.id}: full adapter prose`);
+  }
+});
+
+test('Repeated compact policy loads recheck even non-applicable pinned resources', async t => {
+  const directory = await temporary(t), copiedRoot = path.join(directory, 'bundle with spaces'), project = path.join(directory, 'project');
+  await mkdir(copiedRoot); await mkdir(project);
+  await cp(path.join(root, 'skills'), path.join(copiedRoot, 'skills'), { recursive: true });
+  const lock = JSON.parse(await text(path.join(root, 'third-party-skills.lock.json')));
+  await writeFile(path.join(copiedRoot, 'third-party-skills.lock.json'), JSON.stringify(lock));
+  const adapterPath = path.join(copiedRoot, 'skills/ce-compound/SKILL.md');
+  await writeFile(adapterPath, (await text(adapterPath)) + '\n' + 'Complete adapter obligation. '.repeat(100) + '\nADAPTER_TAIL_MUST_SURVIVE\n');
+  const first = await loadDefaultPolicy({ root: copiedRoot, project, stage: 'complete' });
+  assert.match(first.context, /ADAPTER_TAIL_MUST_SURVIVE/);
+  const links = [...first.context.matchAll(/\]\(<([^>]+)>\)/g)].map(match => match[1]);
+  assert.ok(links.length > 0);
+  for (const filename of links) await access(filename);
+  assert.equal(first.skills.find(row => row.id === 'skills/react-best-practices').applies, false);
+  const unused = lock.components.find(row => row.id === 'skills/react-best-practices').files.at(-1).path;
+  await writeFile(path.join(copiedRoot, unused), 'changed unused upstream rule');
+  await assert.rejects(loadDefaultPolicy({ root: copiedRoot, project, stage: 'complete' }), error => error.code === 'skill_integrity' && /hash mismatch/.test(error.message));
 });
