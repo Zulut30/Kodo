@@ -198,7 +198,11 @@ export function redact(value, secrets = {}) {
   let text = value;
   for (const secret of Object.values(secrets)) if (typeof secret === 'string' && secret.length > 5) text = text.split(secret).join('[REDACTED]');
   text = text.replace(/AIza[\w-]{25,}/g, '[REDACTED]').replace(/(?:apikey_|get-x-api-|reddit-api-|sk-(?:proj-)?)[A-Za-z0-9_-]{16,}/g, '[REDACTED]');
-  text = text.replace(/(Bearer\s+)[^\s"'<>]+/gi, '$1[REDACTED]').replace(/([?&](?:token|key|api_key)=)[^&\s"']+/gi, '$1[REDACTED]');
+  // Literal template references are source, not credential values. Only accept
+  // a complete identifier/property reference; mixed tokens still fail closed.
+  // Known values and provider-shaped secrets have already been removed above.
+  const credential = (match, prefix, token) => /^\$\{[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\}$/.test(token) ? match : `${prefix}[REDACTED]`;
+  text = text.replace(/(Bearer\s+)([^\s"'<>]+)/gi, credential).replace(/([?&](?:token|key|api_key)=)([^&\s"']+)/gi, credential);
   return text;
 }
 export function workerEnvironment(base = process.env) {

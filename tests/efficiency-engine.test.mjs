@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {Engine} from '../runtime/engine.mjs';
 import { Store } from '../runtime/store.mjs';
 import { execute } from '../runtime/command.mjs';
-import { mkdtemp, mkdir, writeFile, readFile, rm, stat, chmod } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, rm, stat, chmod, rename, readdir } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
@@ -40,6 +40,61 @@ async function readEvidence(filename, expectedHead) {
   }
   return document;
 }
+
+test('Engine prepares one private evidence directory per worker batch and rechecks protection for the next batch', async t => {
+  const fx = await fixture(t), prepare = fx.engine.privateDirectory.bind(fx.engine), prepared = [];
+  fx.engine.privateDirectory = async directory => { prepared.push(directory); return prepare(directory); };
+  fx.run.plan = plan();
+  fx.run.plan.tasks[0].acceptance.push('Preserve Bearer ${process.env.API_KEY}', 'Redact fixture-sensitive-value');
+  await fx.engine.performNode(fx.run, fx.run.plan.tasks[0]);
+  const directory = path.join(fx.run.artifacts, 'evidence');
+  assert.deepEqual(prepared, [directory], 'contract, analysis and research share one protected batch before the worker starts');
+  const attempt = fx.run.sessionAttempts[0]; assert.equal(attempt.evidence.length, 3);
+  for (const reference of attempt.evidence) {
+    const document = await readEvidence(reference.path, fx.baseSha);
+    assert.doesNotMatch(JSON.stringify(document), /fixture-sensitive-value/);
+    await fx.engine.assertEvidence(reference);
+  }
+  const contract = JSON.parse(await readFile(attempt.evidence.find(ref => path.basename(ref.path).startsWith('node-contract-')).path, 'utf8'));
+  assert.ok(contract.value.task.acceptance.includes('Preserve Bearer ${process.env.API_KEY}'));
+  assert.match(fx.requests[0].prompt, /Bearer \$\{process\.env\.API_KEY\}/);
+  if (process.platform === 'win32') {
+    await execute('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', '[Console]::InputEncoding=[Text.UTF8Encoding]::new($false); $p=[Console]::In.ReadToEnd(); $a=[IO.Directory]::GetAccessControl($p); $a.SetAccessRuleProtection($false,$true); [IO.Directory]::SetAccessControl($p,$a)'], { input: directory });
+  } else await chmod(directory, 0o755);
+  const next = await fx.engine.planningEvidence(fx.run);
+  assert.deepEqual(prepared, [directory, directory], 'no successful protection receipt is cached across batches or sessions');
+  for (const reference of next.references) await readEvidence(reference.path, fx.baseSha);
+});
+
+test('Engine evidence batches reject expired writers and replaced or missing directories before producing another artifact', async t => {
+  const fx = await fixture(t), directory = path.join(fx.run.artifacts, 'evidence');
+  let retained;
+  await fx.engine.withEvidenceBatch(fx.run, async persist => { retained = persist; await persist('test', { result: 'original' }); });
+  const originalFiles = await readdir(directory);
+  await assert.rejects(retained('test', { result: 'expired' }), { code: 'evidence_integrity' });
+  assert.deepEqual(await readdir(directory), originalFiles);
+  await assert.rejects(fx.engine.withEvidenceBatch(fx.run, async persist => {
+    await rename(directory, `${directory}-original`); await mkdir(directory);
+    await persist('test', { result: 'replacement' });
+  }), { code: 'evidence_integrity' });
+  assert.deepEqual(await readdir(directory), [], 'a replacement directory receives no temporary or final evidence');
+  await assert.rejects(fx.engine.withEvidenceBatch(fx.run, async persist => {
+    await rename(directory, `${directory}-empty`);
+    await persist('test', { result: 'missing' });
+  }), { code: 'evidence_integrity' });
+});
+
+test('Engine redacts the previous worker error before its inline limit while retaining the full redacted contract error', async t => {
+  const fx = await fixture(t), prefix = 'x'.repeat(1190), suffix = ' FULL_ERROR_TAIL';
+  fx.run.plan = plan();
+  fx.run.nodes.feature = { id: 'feature', status: 'pending', attempt: 0, error: prefix + 'fixture-sensitive-value' + suffix };
+  await fx.engine.performNode(fx.run, fx.run.plan.tasks[0]);
+  const label = 'Previous error (brief; full value in node contract): ', prompt = fx.requests[0].prompt;
+  assert.equal(prompt.split('\n').find(line => line.startsWith(label)), label + prefix + '[REDACTED]');
+  assert.doesNotMatch(prompt, /fixture-se/, 'neither the known credential nor its truncated prefix may reach the worker');
+  const contract = fx.run.sessionAttempts[0].evidence.find(reference => path.basename(reference.path).startsWith('node-contract-'));
+  assert.equal((await readEvidence(contract.path, fx.baseSha)).value.previousError, prefix + '[REDACTED]' + suffix);
+});
 
 test('Engine planner sends compact redacted evidence with readable private immutable head-bound originals', async t => {
   const fx = await fixture(t); fx.run.analysis.secret = 'fixture-sensitive-value';

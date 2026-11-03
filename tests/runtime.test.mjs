@@ -39,6 +39,18 @@ test('Redaction preserves JSON structure while removing secrets containing quote
   const value = { nested: [{ text: `before ${secret} after` }], literal: 'ordinary "quoted" text' };
   assert.deepEqual(redact(value, { KEY: secret }), { nested: [{ text: 'before [REDACTED] after' }], literal: value.literal });
 });
+test('Redaction preserves literal variable references but removes real credentials and mixed interpolation tokens', () => {
+  const examples = ['Bearer ${token}', 'bearer ${process.env.API_KEY}', 'https://example.invalid/?key=${process.env.API_KEY}&token=${token}'];
+  for (const example of examples) assert.equal(redact(example), example);
+  for (const token of ['actual-private-token', '${token}-private-suffix', 'private-prefix${token}', '${getToken()}', '${token']) {
+    assert.equal(redact(`Bearer ${token}`), 'Bearer [REDACTED]');
+    assert.equal(redact(`https://example.invalid/?token=${token}`), 'https://example.invalid/?token=[REDACTED]');
+  }
+  const secret = 'fixture_private_credential';
+  assert.equal(redact('Bearer ${fixture_private_credential}', { KEY: secret }), 'Bearer [REDACTED]', 'known credentials take precedence over placeholder syntax');
+  const shaped = 'sk-proj-' + 'a'.repeat(24);
+  assert.doesNotMatch(redact(`Bearer \${${shaped}}`), new RegExp(shaped));
+});
 test('Plan contracts reject malformed graphs and forbidden scopes while overlap stays conservative', () => {
   const plan = { summary: 'feature', tasks: [{ id: 'one', role: 'developer', description: 'feature', dependsOn: [], writePaths: ['src/**'], acceptance: ['works'], parallel: true }] };
   assert.equal(validatePlan(plan), plan); assert.equal(ownsPath(['src/**'], 'src/feature.mjs'), true); assert.equal(ownsPath(['src/**'], 'test/feature.mjs'), false);

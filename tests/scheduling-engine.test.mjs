@@ -12,6 +12,10 @@ const deferred = () => Promise.withResolvers();
 const turn = () => new Promise(resolve => setImmediate(resolve));
 const read = file => readFile(file, 'utf8');
 const node = (id, dependsOn = []) => ({ id, role: 'developer', description: `write ${id}`, writePaths: [`${id}.txt`], dependsOn, parallel: true, acceptance: [`${id} exists`] });
+// This guard covers real Git, per-session pin checks and Windows ACL processes
+// under the parallel suite. Admission ordering is proved by the handshake, not
+// a wall-clock performance threshold (24 concurrent fixtures exceeded 20s).
+const integrationTimeoutMs = 60000;
 function git(cwd, ...args) {
   const result = spawnSync('git', args, { cwd, encoding: 'utf8', windowsHide: true });
   assert.equal(result.status, 0, `${args.join(' ')}\n${result.stderr}`);
@@ -21,7 +25,10 @@ async function fixture(t, tasks, worker) {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'kodo-scheduler-test-'));
   const project = path.join(directory, 'project'); await mkdir(project);
   let store;
+  const cleanup = new AbortController(), active = new Set();
   t.after(async () => {
+    cleanup.abort();
+    await Promise.allSettled([...active]);
     store?.close();
     const resolved = path.resolve(directory);
     assert.equal(path.dirname(resolved), path.resolve(os.tmpdir()));
@@ -54,6 +61,13 @@ async function fixture(t, tasks, worker) {
   };
   store = new Store(path.join(directory, 'state'));
   const engine = new Engine({ store, provider, tools: { resolveTool: async () => ({ id: 'ripgrep', ready: false }) } });
+  const executeTasks = engine.executeTasks.bind(engine);
+  engine.executeTasks = (run, signal) => {
+    const running = executeTasks(run, AbortSignal.any([t.signal, cleanup.signal, signal].filter(Boolean)));
+    active.add(running);
+    running.then(() => active.delete(running), () => active.delete(running));
+    return running;
+  };
   const run = await engine.create('Continuously schedule scoped tasks', { project });
   await makeWorktree(project, run.cwd, run.branch, base);
   run.executionMode = { selected: 'standard' };
@@ -69,9 +83,9 @@ async function fixture(t, tasks, worker) {
   return { directory, project, base, store, engine, run, decisions, sessions, concurrency, assertUserUnchanged };
 }
 
-test('Engine admits downstream before slow sibling finishes using distinct exact Git worktrees', { timeout: 20000 }, async t => {
+test('Engine admits downstream before slow sibling finishes using distinct exact Git worktrees', { timeout: integrationTimeoutMs }, async t => {
   const slowStarted = deferred(), downstreamStarted = deferred(), releaseSlow = deferred();
-  t.signal.addEventListener('abort', () => releaseSlow.resolve(), { once: true });
+  t.signal.addEventListener('abort', () => { slowStarted.resolve(); downstreamStarted.resolve(); releaseSlow.resolve(); }, { once: true });
   const tasks = [node('A'), node('B'), node('C', ['A'])];
   let slowFinished = false;
   const fx = await fixture(t, tasks, async (id, request) => {
@@ -286,9 +300,9 @@ test('Engine honors both plan and Jev serial decisions until prior integration i
   await fx.assertUserUnchanged();
 });
 
-test('Engine retains the global subscription capacity across two continuously scheduled runs', { timeout: 20000 }, async t => {
+test('Engine retains the global subscription capacity across two continuously scheduled runs', { timeout: integrationTimeoutMs }, async t => {
   const twoStarted = deferred(), release = deferred(); let started = 0;
-  t.signal.addEventListener('abort', () => release.resolve(), { once: true });
+  t.signal.addEventListener('abort', () => { twoStarted.resolve(); release.resolve(); }, { once: true });
   const fx = await fixture(t, [node('A'), node('B')], async (id, request) => {
     assert.ok(fx.concurrency.active <= 2, 'shared subscription leases must cap both runs together');
     if (++started === 2) twoStarted.resolve();

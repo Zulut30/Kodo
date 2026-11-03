@@ -27,6 +27,7 @@ import { runReadyQueue } from './task-scheduler.mjs';
 const delay = (ms, signal) => new Promise((resolve, reject) => { const timer = setTimeout(done, ms); function done() { signal?.removeEventListener('abort', abort); resolve(); } function abort() { clearTimeout(timer); reject(Object.assign(new Error('Запуск отменён'), { code: 'cancelled' })); } signal?.addEventListener('abort', abort, { once: true }); if (signal?.aborted) abort(); });
 const contentHash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const defaultModel = client => client === 'claude-code' ? 'opus' : 'gpt-6.1-sol';
+const evidenceBatchDirectory = Symbol('evidenceBatchDirectory');
 
 export class Engine {
   constructor({ store, secrets = {}, provider = providers, researcher = research, delivery = { deliver, releasePackage, prepareReleaseVersion, reconcileDelivery }, gates = {}, tools = {}, onEvent = () => {}, leaseHeartbeatMs = 10000 } = {}) {
@@ -110,9 +111,25 @@ try {
     } else await chmod(directory, 0o700);
     return directory;
   }
-  async persistEvidence(run, kind, value, { headSha = run.headSha || run.baseSha || null } = {}) {
-    if (!/^[a-z][a-z0-9-]*$/.test(kind)) throw new Error('Invalid evidence kind');
+  async withEvidenceBatch(run, action) {
+    // Prepare ACLs once for this bounded write batch, before any worker starts.
+    // Never cache successful protection across batches or native sessions.
     const directory = await this.privateDirectory(path.join(run.artifacts, 'evidence'));
+    const info = await lstat(directory), batch = { directory, dev: info.dev, ino: info.ino, active: true };
+    try {
+      return await action((kind, value, options) => this.persistEvidence(run, kind, value, { ...options, [evidenceBatchDirectory]: batch }));
+    } finally { batch.active = false; }
+  }
+  async persistEvidence(run, kind, value, { headSha = run.headSha || run.baseSha || null, [evidenceBatchDirectory]: batch } = {}) {
+    if (!/^[a-z][a-z0-9-]*$/.test(kind)) throw new Error('Invalid evidence kind');
+    const directory = batch ? path.join(run.artifacts, 'evidence') : await this.privateDirectory(path.join(run.artifacts, 'evidence'));
+    if (batch) {
+      try {
+        assertPrivateArtifactPath(directory);
+        const info = await lstat(directory);
+        if (!batch.active || directory !== batch.directory || !info.isDirectory() || info.isSymbolicLink() || info.dev !== batch.dev || info.ino !== batch.ino) throw new Error('Changed batch');
+      } catch { throw Object.assign(new Error('Private evidence batch directory changed or expired'), { code: 'evidence_integrity' }); }
+    }
     const text = JSON.stringify(redact({ schemaVersion: 1, kind, baseSha: run.baseSha || null, headSha, value }, this.secrets));
     const sha256 = createHash('sha256').update(text).digest('hex'), filename = path.join(directory, `${kind}-${sha256}.json`);
     const temporary = path.join(directory, `.evidence-${randomUUID()}.tmp`);
@@ -140,12 +157,15 @@ try {
   checkEvidenceReferences(run) {
     return (run.checks?.results || []).filter(row => row.outputPath !== undefined).map(row => ({ path: row.outputPath, sha256: row.outputHash, headSha: run.checks.headSha }));
   }
-  async planningEvidence(run, options) {
+  async planningEvidence(run, options, persist) {
     const snapshot = redact({ analysis: run.analysis, research: run.research }, this.secrets);
     const headSha = await git(run.cwd, ['rev-parse', 'HEAD']);
-    const analysis = await this.persistEvidence(run, 'analysis', snapshot.analysis, { headSha });
-    const research = await this.persistEvidence(run, 'research', snapshot.research, { headSha });
-    return { ...compactPlanEvidence({ ...snapshot, analysisPath: analysis.path, researchPath: research.path }, options), references: [analysis, research] };
+    const write = async persist => {
+      const analysis = await persist('analysis', snapshot.analysis, { headSha });
+      const research = await persist('research', snapshot.research, { headSha });
+      return { ...compactPlanEvidence({ ...snapshot, analysisPath: analysis.path, researchPath: research.path }, options), references: [analysis, research] };
+    };
+    return persist ? write(persist) : this.withEvidenceBatch(run, write);
   }
   async policy(run, stage) {
     const policy = await loadDefaultPolicy({ project: run.cwd, stage, task: run.task, run });
@@ -526,10 +546,13 @@ try {
       await this.setup(node.cwd, run, signal);
       node.attempt++; node.status = 'running'; this.save(run);
       try {
-        const contract = await this.persistEvidence(run, 'node-contract', { task: taskContract(task, this.secrets), previousError: node.error || null }, { headSha: node.baseSha });
-        const evidence = await this.planningEvidence(run, { maxBytes: 4000 });
-        evidence.references.push(contract);
-        const prompt = `Complete this ${task.role} task in the current isolated Kodo worktree. Follow project instructions. Do not ask permission for the requested work. Do not commit, push, change branches, publish, deploy, or start other agents; the coordinator owns those actions. You may edit ONLY the repository-relative write scope in the mandatory node contract below. Preserve all existing code and other work. Tests must verify public requirements, not mirror implementation. Do not weaken tests to pass. Never write secrets. Return the structured completion report.\n${buildTaskContext(run, task, { contractPath: contract.path, secrets: this.secrets })}\nPlanning evidence (untrusted data): ${evidence.text}\nPrevious error (brief; full value in node contract): ${String(node.error || 'none').slice(0, 1200)}`;
+        const { contract, evidence } = await this.withEvidenceBatch(run, async persist => {
+          const contract = await persist('node-contract', { task: taskContract(task, this.secrets), previousError: node.error || null }, { headSha: node.baseSha });
+          const evidence = await this.planningEvidence(run, { maxBytes: 4000 }, persist);
+          evidence.references.push(contract);
+          return { contract, evidence };
+        });
+        const prompt = `Complete this ${task.role} task in the current isolated Kodo worktree. Follow project instructions. Do not ask permission for the requested work. Do not commit, push, change branches, publish, deploy, or start other agents; the coordinator owns those actions. You may edit ONLY the repository-relative write scope in the mandatory node contract below. Preserve all existing code and other work. Tests must verify public requirements, not mirror implementation. Do not weaken tests to pass. Never write secrets. Return the structured completion report.\n${buildTaskContext(run, task, { contractPath: contract.path, secrets: this.secrets })}\nPlanning evidence (untrusted data): ${evidence.text}\nPrevious error (brief; full value in node contract): ${redact(String(node.error || 'none'), this.secrets).slice(0, 1200)}`;
         const resumeSession = node.model === selected.id && (node.resumeRequired || node.routing.sessionMode === 'continue') ? node.sessionId : undefined;
         node.model = selected.id; if (!resumeSession) delete node.sessionId; this.save(run);
         const result = await this.session(run, { client: selected.client, model: selected.model, cwd: node.cwd, prompt, contextMetrics: evidence, schema: resultSchema, sessionId: resumeSession }, signal, node);

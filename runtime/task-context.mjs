@@ -1,6 +1,6 @@
 import { redact } from './security.mjs';
 
-const text = (value, max) => typeof value === 'string' ? Array.from(redact(value)).slice(0, max).join('') : '';
+const text = (value, max, secrets) => typeof value === 'string' ? Array.from(redact(value, secrets)).slice(0, max).join('') : '';
 const strings = values => Array.isArray(values) ? values.join('\n') : typeof values === 'string' ? values : '';
 
 export const maxTaskContractBytes = 12000;
@@ -23,13 +23,13 @@ export function buildTaskContext(run, task, { contractPath, secrets = {} } = {})
   if (oversized && !contractPath) validateTaskContract(task);
   const dependencies = (task.dependsOn || []).slice(0, 20).map(id => {
     const node = run.nodes?.[id], planned = run.plan?.tasks?.find(t => t.id === id);
-    return { id: text(id, 100), status: text(node?.status, 40), headSha: text(node?.headSha, 64), summary: text(node?.result?.summary || planned?.description, 240) };
+    return { id: text(id, 100, secrets), status: text(node?.status, 40, secrets), headSha: text(node?.headSha, 64, secrets), summary: text(node?.result?.summary || planned?.description, 240, secrets) };
   });
   const terms = [...(task.writePaths || []), task.id].filter(v => typeof v === 'string' && v.length > 2);
   const relevantSources = (run.research?.items || []).filter(item => terms.some(term => `${item.title || ''} ${item.url || ''}`.includes(term.replace(/\*.*$/, '')))).map(item => {
     let url;
     try { const parsed = new URL(item.url); if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) return null; parsed.search = ''; parsed.hash = ''; url = parsed.href; } catch { return null; }
-    return { title: text(item.title, 160), url: text(url, 400) };
+    return { title: text(item.title, 160, secrets), url: text(url, 400, secrets) };
   }).filter(Boolean);
   const sources = relevantSources.slice(0, 6);
   const mandatory = oversized ? [
@@ -46,7 +46,7 @@ export function buildTaskContext(run, task, { contractPath, secrets = {} } = {})
     `Required dependency IDs: ${JSON.stringify(core.dependsOn || [])}`,
     ...(contractPath ? [`Full node contract: ${contractPath}`] : [])
   ];
-  let objective = text(run.task, 600), analysis = text(run.analysis?.summary, 600);
+  let objective = text(run.task, 600, secrets), analysis = text(run.analysis?.summary, 600, secrets);
   const sourceCount = relevantSources.length;
   const optional = () => [
     `Direct dependencies (brief; omitted ${(task.dependsOn || []).length - dependencies.length}): ${JSON.stringify(dependencies)}`,

@@ -1,6 +1,28 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildTaskContext, validateTaskContract, maxTaskContractBytes } from '../runtime/task-context.mjs';
+import { buildTaskContext, taskContract, validateTaskContract, maxTaskContractBytes } from '../runtime/task-context.mjs';
+
+test('Task contracts and inline context retain credential-handling examples while removing known and literal secrets', () => {
+  const secrets = { KEY: 'fixture_context_private_123' }, example = 'Bearer ${process.env.API_KEY}';
+  const task = { id: 'credentials', role: 'developer', description: `Preserve ${example}`, writePaths: ['auth.mjs'], acceptance: ['Keep Bearer ${token} meaningful'], constraints: [`Never expose ${secrets.KEY} or Bearer literal-private-token`], interfaces: ['Use process.env.API_KEY'], dependsOn: ['base'] };
+  const run = { task: `Handle ${example} and ${secrets.KEY}`, analysis: { summary: `Review Bearer ${secrets.KEY}` }, nodes: { base: { status: 'integrated', result: { summary: `Uses ${example} and ${secrets.KEY}` } } } };
+  const contract = taskContract(task, secrets), context = buildTaskContext(run, task, { secrets });
+  assert.equal(contract.description, task.description); assert.deepEqual(contract.acceptance, task.acceptance);
+  for (const text of [JSON.stringify(contract), context]) {
+    assert.ok(text.includes(example)); assert.ok(text.includes('Bearer ${token}'));
+    assert.doesNotMatch(text, /fixture_context_private_123|literal-private-token/); assert.match(text, /\[REDACTED\]/);
+  }
+  assert.ok(task.constraints[0].includes(secrets.KEY), 'sanitization does not mutate the input contract');
+});
+
+test('Optional task summaries redact known credentials before truncation can expose a secret prefix', () => {
+  const secret = 'PRIVATE_BOUNDARY_CREDENTIAL', secrets = { KEY: secret };
+  const task = { id: 'boundary', description: 'Review auth.mjs', writePaths: ['auth.mjs'], dependsOn: ['base'] };
+  const run = { task: 'x'.repeat(590) + secret, analysis: { summary: 'y'.repeat(590) + secret }, nodes: { base: { status: 'integrated', result: { summary: 'd'.repeat(230) + secret } } }, research: { items: [{ title: 'auth.mjs ' + 'r'.repeat(141) + secret, url: 'https://example.invalid/auth' }] } };
+  const context = buildTaskContext(run, task, { secrets });
+  assert.doesNotMatch(context, /PRIVATE_/); assert.match(context, /\[REDACTED\]/);
+  assert.match(context, /https:\/\/example.invalid\/auth/);
+});
 
 test('Task context preserves scope acceptance interfaces and direct dependencies without nested history', () => {
   const task = { id: 'worker', role: 'developer', description: 'Implement src/value.mjs', writePaths: ['src/value.mjs'], acceptance: ['Value equals two'], interfaces: ['value() returns number'], constraints: ['Subscription only'], dependsOn: ['base'] };
