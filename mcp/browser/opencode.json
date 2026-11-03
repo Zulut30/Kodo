@@ -5,6 +5,12 @@
       "type": "local",
       "command": ["npx", "-y", "@playwright/mcp@latest", "--isolated"],
       "enabled": false
+    },
+    "kodo_chrome_devtools": {
+      "type": "local",
+      "command": ["npx", "-y", "chrome-devtools-mcp@1.12.0", "--isolated", "--no-usage-statistics", "--no-performance-crux"],
+      "environment": {"NO_UPDATE_CHECKS": "1", "CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS": "1"},
+      "enabled": false
     }
   }
 }

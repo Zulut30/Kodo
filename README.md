@@ -44,6 +44,22 @@ kodo cancel <runId>
 
 `doctor` проверяет локальные предпосылки. `doctor --live` выполняет отдельные реальные проверки провайдеров; такие обращения могут расходовать квоты подписок и API. Обычные тесты Kodo не обращаются к платным сервисам.
 
+## Необязательные инструменты и проверки
+
+Текущее дерево добавляет управляемые pins девяти инструментов: Agent Desktop, Browser Use, Browser Harness, Vibetest, Jev Ultrafast, Chrome DevTools MCP, Semgrep, Gitleaks и ripgrep. Шесть UI-адаптеров выполняют реальные действия в собственном приложении/браузере и проверяют результат через независимый DOM/accessibility readback. Security gates запускают локальные сканеры. Установка хранится вне Git и не меняет глобальные инструменты.
+
+```powershell
+node cli/index.mjs tools list --json
+node cli/index.mjs tools install browser-harness --json
+node cli/index.mjs tools doctor --json
+node cli/index.mjs ui verify --project "D:\Projects\my-app" --json
+node cli/index.mjs security verify --project "D:\Projects\my-app" --json
+```
+
+У старых проектов UI/security по умолчанию выключены; в конфигурации самого Kodo включены Semgrep/Gitleaks, UI выключен как неприменимый к CLI. `disabled` сохраняется как `passed:null`. Включённые проверки выполняет координатор после build/test и до review/delivery, с привязкой к head/config/pins и приватным evidence. `tools doctor --live` проверяет только локальные версии/import metadata, без модели или UI. [Pins, лицензии, setup, JSON и границы](docs/UI-TOOLS.md), [реальные квитанции и проверки](docs/VALIDATION.md#интеграция-ui-security-и-контекста). Наличие реализации в checkout не подтверждает её публикацию в выпуске 0.2.1.
+
+Для работы в desktop host сохраняй постоянный чат `Kodo · Диспетчер задач`. Координатор поручает реальную работу понятно названным видимым чатам через доступные app tools и после проверки архивирует только собственные завершённые worker-чаты. Диспетчер остаётся активным. CLI-native сессии сохраняются отдельно и автоматически видимыми чатами не становятся; универсальный desktop backend в CLI не заявляется. [Контракт чат-входа](skills/kodo-build-feature/SKILL.md).
+
 ## Аудит сохранённого запуска
 
 Текущая реализация добавляет `kodo audit RUN_ID [--json]`. Для установленного CLI с поддержкой команды:
@@ -88,7 +104,7 @@ kodo init --preset nextjs --client all --target "D:\Projects\my-app" --dry-run
 | `skills/` | Проверка кода, UI, SEO, диагностика и вход в исполняемый процесс Kodo |
 | `pipelines/` | Последовательности работы и ожидаемые результаты |
 | `agents/` | Архитектор, разработчик, дизайнер, QA и документирование |
-| `mcp/` | Шаблоны GitHub, Playwright и Supabase для клиентов |
+| `mcp/` | Шаблоны GitHub, Playwright, опционального Chrome DevTools MCP и Supabase для клиентов |
 | `presets/` | Комплекты инструкций Next.js, .NET и WordPress |
 | `adapters/` | Пути и форматы компонентов для каждого клиента |
 | `runtime/` | Состояние, провайдеры, рабочие сессии и доставка |
@@ -115,6 +131,7 @@ npm test
 
 - [Рабочий процесс, настройка и восстановление](docs/RUNTIME.md)
 - [Совместимость и официальные источники](docs/COMPATIBILITY.md)
+- [UI-инструменты, управляемая установка и конфигурация](docs/UI-TOOLS.md)
 - [Добавление компонентов](docs/COMPONENTS.md)
 - [Проверки и границы доказательств](docs/VALIDATION.md)
 
