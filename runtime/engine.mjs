@@ -456,23 +456,6 @@ export class Engine {
       }
     }
   }
-  async failureFingerprint(cwd) {
-    const tracked = (await execute('git', ['diff', '--binary', 'HEAD'], { cwd })).stdout;
-    const names = (await git(cwd, ['ls-files', '--others', '--exclude-standard', '-z'])).split('\0').filter(Boolean);
-    const untracked = []; let remaining = 8 * 1024 * 1024;
-    for (const name of names.slice(0, 256)) {
-      if (secretFile(name)) continue;
-      const filename = path.join(cwd, name), info = await lstat(filename).catch(() => null);
-      if (!info) { untracked.push({ name, missing: true }); continue; }
-      const row = { name, size: info.size, modified: info.mtimeMs, regular: info.isFile() && !info.isSymbolicLink() };
-      if (row.regular && info.size <= Math.min(2 * 1024 * 1024, remaining)) {
-        row.hash = createHash('sha256').update(await readFile(filename)).digest('hex'); remaining -= info.size;
-      }
-      untracked.push(row);
-    }
-    // Only hashes/metadata are retained, never source or secret-bearing diff.
-    return { head: await git(cwd, ['rev-parse', 'HEAD']), tracked: contentHash(tracked), untracked, untrackedCount: names.length };
-  }
   async moreResearch(run, reason, signal) {
     if (run.config.researchBudget <= 0) return;
     return this.withLease(run, `research:${run.id}`, 1, async signal => {

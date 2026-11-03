@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, readFile, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, writeFile, rm, utimes } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
@@ -125,4 +125,16 @@ test('Engine counts changing contents of a new untracked file as progress within
   assert.equal(blocked.state, 'blocked'); assert.equal(fx.requests.length, 3);
   assert.equal(blocked.nodes.feature.stopped, 'repair_budget_exhausted');
   assert.equal(await readFile(path.join(blocked.nodes.feature.cwd, 'src/new.mjs'), 'utf8'), 'export const value = 3;\n');
+});
+
+test('Engine progress fingerprint ignores timestamp-only rewrites but detects changed untracked bytes', async t => {
+  const fx = await nodeBudgetFixture(t, 3, { untracked: true });
+  const file = path.join(fx.project, 'src/new.mjs');
+  await writeFile(file, 'export const value = 1;\n');
+  const first = await fx.engine.failureFingerprint(fx.project);
+  await utimes(file, new Date(0), new Date(1000));
+  assert.deepEqual(await fx.engine.failureFingerprint(fx.project), first);
+  await writeFile(file, 'export const value = 2;\n');
+  await utimes(file, new Date(0), new Date(1000));
+  assert.notDeepEqual(await fx.engine.failureFingerprint(fx.project), first);
 });
