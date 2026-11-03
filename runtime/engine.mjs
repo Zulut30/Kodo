@@ -441,7 +441,7 @@ export class Engine {
         node.headSha = await commitChanges(node.cwd, `Kodo ${task.id}: ${run.task.slice(0,100)}`);
         node.status = 'completed'; delete node.error; delete node.resumeRequired; this.save(run); return;
       } catch (error) {
-        if (signal?.aborted || this.store.getRun(run.id).cancelRequested || ['quota', 'auth', 'cancelled', 'lease_lost'].includes(error.code)) { node.attempt--; node.resumeRequired = true; node.status = error.code === 'quota' ? 'waiting_limits' : 'pending'; this.save(run); if (signal?.aborted || this.store.getRun(run.id).cancelRequested) throw Object.assign(new Error('Запуск отменён'), { code: 'cancelled' }); throw error; }
+        if (signal?.aborted || this.store.getRun(run.id).cancelRequested || ['quota', 'auth', 'cancelled', 'lease_lost', 'unavailable'].includes(error.code)) { node.attempt--; node.resumeRequired = true; node.status = error.code === 'quota' ? 'waiting_limits' : 'pending'; this.save(run); if (signal?.aborted || this.store.getRun(run.id).cancelRequested) throw Object.assign(new Error('Запуск отменён'), { code: 'cancelled' }); throw error; }
         const signature = contentHash({ error: error.message, workspace: await this.failureFingerprint(node.cwd) });
         node.error = redact(error.message, this.secrets); node.status = 'retrying'; this.log(run, 'node_failed', { node: task.id, attempt: node.attempt, error: node.error });
         const repeated = node.lastFailure === signature; node.lastFailure = signature; this.save(run);

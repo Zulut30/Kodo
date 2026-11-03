@@ -210,6 +210,80 @@ test('Production benchmark executes actual Engine worktrees review and checks us
   await assert.rejects(access(process.env.KODO_WORKTREE_HOME), { code: 'ENOENT' });
 });
 
+test('Unavailable plain and real Engine developer sessions remain pending and resume without repeating completed trials', async t => {
+  for (const condition of ['plain', 'kodo']) await t.test(condition, async t => {
+    const root = await temp(t), output = path.join(root, 'out'), deps = services(root), sessions = [];
+    delete deps.Engine; // Exercise production Engine.create/run, including persisted node budgets.
+    deps.provider.assessTask = async () => ({ fallback: true, code: 'auth', requests: 0 });
+    deps.provider.analyzeGemini = async () => { throw new Error('Quick must not invoke Gemini'); };
+    deps.researcher = async () => { throw new Error('Quick must not invoke research'); };
+    let subjects = 0;
+    deps.provider.runSession = async request => {
+      const stage = request.schema?.properties.tasks ? 'plan' : request.schema?.properties.passed ? 'review' : request.schema ? 'developer' : 'plain';
+      sessions.push({ stage, cwd: request.cwd, sessionId: request.sessionId });
+      if (stage === 'plan') {
+        const implementation = request.prompt.includes('src/button.css') ? 'src/button.css' : 'src/extension.cjs';
+        return { sessionId: 'offline-plan', metrics: metric, output: { summary: 'Fix the assigned behavior', tasks: [{ id: 'fix', role: 'developer', description: 'Fix behavior', dependsOn: [], writePaths: [implementation], acceptance: ['public checks pass'], parallel: false }] } };
+      }
+      if (stage === 'review') return { sessionId: 'offline-review', metrics: metric, output: { passed: true, findings: [] } };
+      await fix(request.cwd);
+      if (stage === (condition === 'kodo' ? 'developer' : 'plain') && ++subjects === 2) {
+        request.onEvent?.({ sessionId: 'interrupted-developer' });
+        throw Object.assign(new Error('PRIVATE unavailable payload'), { code: 'unavailable', metrics: metric });
+      }
+      return { sessionId: 'offline-worker', model: request.model, metrics: metric, output: { summary: 'Changed implementation', checks: [], complete: true } };
+    };
+    const first = await runBenchmark(options(output), deps);
+    assert.equal(first.complete, false);
+    assert.deepEqual(first.pause, { code: 'unavailable' });
+    const paused = first.trials.find(cell => cell.attempts.at(-1)?.error?.code === 'unavailable');
+    assert.equal(paused.condition, condition); assert.equal(paused.status, 'pending');
+    assert.equal(paused.passed, null); assert.equal(paused.execution, null);
+    assert.equal(first.summaries.find(row => row.condition === condition).failed, 0);
+    const completed = first.trials.filter(cell => cell.status === 'completed');
+    assert.ok(completed.length > 0, 'resume must have completed trials to preserve');
+    const manifest = JSON.parse(await readFile(path.join(output, 'benchmark.json'), 'utf8'));
+    const savedCell = manifest.trials.find(cell => cell.trialId === paused.trialId);
+    const readRun = () => {
+      const store = new Store(path.join(output, savedCell.workspace, 'state'));
+      try { return store.getRun(savedCell.engineRunId); } finally { store.close(); }
+    };
+    let pendingRun;
+    if (condition === 'kodo') {
+      pendingRun = readRun();
+      assert.equal(pendingRun.error.code, 'unavailable');
+      assert.equal(pendingRun.config.repairRounds, 1);
+      assert.equal(pendingRun.nodes.fix.attempt, 0);
+      assert.equal(pendingRun.nodes.fix.status, 'pending');
+      assert.equal(pendingRun.nodes.fix.stopped, undefined);
+      assert.equal(pendingRun.nodes.fix.resumeRequired, true);
+      assert.equal(pendingRun.controllerAssessment, undefined);
+      assert.equal(pendingRun.sessionAttempts.at(-1).errorCode, 'unavailable');
+    }
+    const beforeResume = sessions.length;
+    const resumed = await resumeBenchmark(output, deps);
+    assert.equal(resumed.complete, true); assert.equal(resumed.pause, null);
+    assert.equal(resumed.benchmarkId, first.benchmarkId);
+    assert.ok(resumed.trials.every(cell => cell.passed && cell.correctness.passed && cell.scope.passed));
+    for (const cell of completed) assert.deepEqual(resumed.trials.find(row => row.trialId === cell.trialId), cell);
+    const recovered = resumed.trials.find(cell => cell.trialId === paused.trialId);
+    assert.deepEqual(recovered.attempts.map(row => row.status), ['pending', 'completed']);
+    if (condition === 'kodo') {
+      const finalRun = readRun();
+      assert.equal(finalRun.id, pendingRun.id); assert.equal(finalRun.nodes.fix.cwd, pendingRun.nodes.fix.cwd);
+      assert.equal(finalRun.nodes.fix.attempt, 1); assert.equal(finalRun.nodes.fix.stopped, undefined);
+      assert.deepEqual(sessions.slice(beforeResume, beforeResume + 2), [
+        { stage: 'developer', cwd: pendingRun.nodes.fix.cwd, sessionId: 'interrupted-developer' },
+        { stage: 'review', cwd: pendingRun.cwd, sessionId: undefined }
+      ]);
+    }
+    assert.equal(JSON.stringify(resumed).includes('PRIVATE unavailable payload'), false);
+    const calls = sessions.length;
+    assert.equal((await resumeBenchmark(output, deps)).complete, true);
+    assert.equal(sessions.length, calls, 'completed resume cannot invoke any subject again');
+  });
+});
+
 test('Abort while account lease is busy saves pending data without invoking a native session', async t => {
   const root = await temp(t), deps = services(root), controller = new AbortController();
   const token = deps.accountStore.acquireLease('subscription:codex', 'existing-coordinator', { limit: 1 });
