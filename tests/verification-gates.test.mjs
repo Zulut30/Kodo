@@ -8,6 +8,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { deliver } from '../runtime/delivery.mjs';
 import { runUIVerification } from '../runtime/ui-verification.mjs';
+import { Engine } from '../runtime/engine.mjs';
+import { Store } from '../runtime/store.mjs';
+import { readConfig } from '../runtime/config.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const cli = path.join(root, 'cli/index.mjs');
@@ -98,4 +101,52 @@ test('Direct delivery rechecks real fixture evidence bytes and configuration rat
   await assert.rejects(deliver({ ...options, config: { ...options.config, uiVerification: { ...config, maxSteps: 13 } } }), { code: 'stale_ui_verification' });
   writeFileSync(uiVerification.cases[0].evidence[0].path, 'tampered');
   await assert.rejects(deliver(options), { code: 'stale_ui_verification' });
+});
+
+test('Engine failed UI readback after real local checks blocks independent review and retains actionable safe evidence', async t => {
+  const fx = fixture(t), uiVerification = { enabled: true, autoInstall: false, cases: [{ id: 'save', tool: 'browser-harness',
+    url: 'http://127.0.0.1:1/', assertions: [{ selector: '#result', text: 'Saved' }] }] };
+  writeFileSync(path.join(fx.project, 'value.mjs'), 'export const value = 2;\n');
+  writeFileSync(path.join(fx.project, 'kodo.config.json'), JSON.stringify({ repairRounds: 1, researchBudget: 0, uiVerification,
+    commands: { test: [{ command: process.execPath, args: ['--input-type=module', '-e', "import assert from 'node:assert/strict'; import {value} from './value.mjs'; assert.equal(value, 2); console.log('VALUE_CHECK_PASSED');"] }] } }));
+  const git = (...args) => {
+    const result = spawnSync('git', args, { cwd: fx.project, encoding: 'utf8', windowsHide: true });
+    assert.equal(result.status, 0, result.stderr); return result.stdout.trim();
+  };
+  git('init', '-b', 'main'); git('config', 'user.name', 'Gate Fixture'); git('config', 'user.email', 'gate@example.invalid');
+  git('config', 'commit.gpgSign', 'false'); git('add', '.'); git('commit', '-m', 'Gate baseline');
+  const baseSha = git('rev-parse', 'HEAD'), config = await readConfig(fx.project), store = new Store(fx.env.KODO_HOME);
+  try {
+    const task = { id: 'feature', role: 'developer', description: 'Expose value two', dependsOn: [], writePaths: ['value.mjs'], acceptance: ['value equals two'], parallel: false };
+    const run = store.createRun({ project: fx.project, task: 'Require verified UI', config, baseSha, client: 'codex', providers: 'current',
+      completed: { analysis: true, implementation: true }, plan: { summary: 'Value feature', tasks: [task] }, nodes: { feature: { id: 'feature', status: 'integrated', headSha: baseSha } } });
+    const worktreeRoot = path.join(fx.home, 'worktrees');
+    Object.assign(run, { worktreeRoot, cwd: path.join(worktreeRoot, 'integration'), branch: `kodo/${run.id}`, artifacts: path.join(store.home, 'runs', run.id) });
+    store.updateRun(run.id, run);
+    let gateCalls = 0, providerCalls = 0;
+    const engine = new Engine({ store, provider: {
+      discoverProviders: async () => [{ id: 'subscription-fixture', client: 'codex', model: 'gpt-6.1-sol', available: true }],
+      runSession: async () => { providerCalls++; return { output: { passed: true, findings: [] } }; }
+    }, tools: { resolveTool: async id => ({ id, ready: false }) }, gates: {
+      runUIVerification: async options => {
+        gateCalls++;
+        const saved = store.getRun(run.id);
+        assert.equal(saved.checks.headSha, options.headSha); assert.equal(saved.checks.results[0].exitCode, 0);
+        assert.match(saved.checks.results[0].output, /VALUE_CHECK_PASSED/);
+        return runUIVerification({ ...options, caseRunner: async () => ({ schemaVersion: 1, status: 'completed',
+          observations: [{ exists: true, count: 1, text: 'Not saved', value: null }], history: 'RAW_UI_HISTORY_SENTINEL' }) });
+      }
+    } });
+    const blocked = await engine.run(run.id);
+    assert.equal(blocked.state, 'blocked'); assert.equal(blocked.error.code, 'blocked');
+    assert.equal(gateCalls, 1); assert.equal(providerCalls, 0, 'neither independent review nor repair may run after an exhausted failed gate');
+    assert.equal(blocked.review, null); assert.equal(blocked.uiVerification.passed, false);
+    assert.equal(blocked.uiVerification.cases[0].status, 'failed');
+    assert.deepEqual(blocked.uiVerification.cases[0].assertions, [{ index: 0, passed: false, kind: 'dom' }]);
+    assert.equal(blocked.controllerAssessment.reason, 'repair_budget_exhausted');
+    assert.match(blocked.controllerAssessment.summary, /save/); assert.match(blocked.controllerAssessment.summary, /failedAssertions/);
+    assert.doesNotMatch(blocked.controllerAssessment.summary, /RAW_UI_HISTORY_SENTINEL|Not saved/);
+    assert.equal(existsSync(blocked.uiVerification.cases[0].evidence[0].path), true);
+    assert.equal(git('rev-parse', 'HEAD'), baseSha); assert.equal(git('status', '--porcelain'), '');
+  } finally { store.close(); }
 });
