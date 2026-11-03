@@ -14,7 +14,7 @@
   "security": { "enabled": true, "autoInstall": true, "tools": ["semgrep", "gitleaks"] },
   "researchBudget": 40,
   "commands": {
-    "test": [{ "command": "npm", "args": ["run", "check"] }],
+    "test": [{ "command": "npm", "args": ["run", "check"], "timeoutMs": 1200000 }],
     "build": [],
     "deploy": [],
     "smoke": []

@@ -13,6 +13,32 @@ node scripts/package-smoke.mjs
 
 Обычные тесты используют фикстуры, локальные Git/npm-пакеты и контролируемые ответы провайдеров. Платных API-запросов и подписочных модельных вызовов в CI нет. Платформенные проверки DPAPI и Unix permissions запускаются на соответствующей ОС.
 
+## Release lifecycle
+
+Run `8f2d5e16-041c-4df8-ae00-77eed70cc25e`, исходный HEAD `c7b771fc6c5f12e9e3bbcb306054f0528dd7da39`. Изменение остаётся в существующей delivery boundary. RED выполнен с исходным `delivery.mjs`: **8 failed / 0 passed**, exit 1; рабочий файл после воспроизведения восстановлен. Квитанции находятся вне Git в `runs/<runId>/artifacts/release-lifecycle/`: `red.tap`, `lifecycle-green.tap` и итоговый `targeted.tap`.
+
+GREEN: **18/18**, затем итоговый scoped suite — **72/72, 0 failed, 0 skipped**, exit 0; Windows x64, Node.js `v24.19.0` (ABI 137). `git diff --check` прошёл. `receipt.json` связывает команды, TAP и SHA-256 пяти изменённых файлов; это локальное свидетельство dirty worktree, непригодное для reuse clean-head delivery checks.
+
+```powershell
+node --test --test-reporter=tap --test-name-pattern='Delivery lifecycle awaits owned|Delivery lifecycle preserves complete|Release lifecycle forwards explicit|Release lifecycle retains primary.*EBUSY' tests/delivery.test.mjs
+node --test --test-reporter=tap tests/delivery.test.mjs tests/utf8-process.test.mjs tests/runtime.test.mjs tests/release-finalization.test.mjs
+```
+
+| Требование | Точная регрессия |
+| --- | --- |
+| Собственное parent/child/grandchild дерево завершено до settlement; отдельный canary жив | `Delivery lifecycle awaits owned parent and grandchild shutdown on timeout`; `Delivery lifecycle awaits owned parent and grandchild shutdown on abort`; `Delivery lifecycle awaits owned parent and grandchild shutdown on output-limit` |
+| Реальный release subprocess закрывается до вызова worktree cleanup | `Release lifecycle awaits real owned tree before source cleanup on timeout`; `Release lifecycle awaits real owned tree before source cleanup on abort` |
+| Начало длинного stdout и stderr доступны, секреты скрыты, объём ограничен | `Delivery lifecycle preserves complete bounded stdout and stderr diagnostics safely`; `Release lifecycle records complete redacted command diagnostics before cleanup` |
+| cwd/env/stdin EOF, allowFailure, предварительный abort | `Delivery lifecycle preserves cwd environment stdin EOF and allowFailure`; `Delivery lifecycle pre-aborted execution never starts a command` |
+| Explicit timeout выше fallback, self test и release test/build — 1200000 мс | `Release lifecycle forwards explicit and default test and build deadlines` |
+| Каждый первичный тип сохраняется при отказе unsafe-link cleanup | `Release lifecycle retains primary timeout when owned cleanup refuses a replaced link`; `Release lifecycle retains primary command_failed when owned cleanup refuses a replaced link`; `Release lifecycle retains primary cancelled when owned cleanup refuses a replaced link` |
+| EBUSY не подменяет primary после четырёх попыток | `Release lifecycle retains primary timeout after bounded EBUSY cleanup retries`; `Release lifecycle retains primary command_failed after bounded EBUSY cleanup retries`; `Release lifecycle retains primary cancelled after bounded EBUSY cleanup retries` |
+| Transient lock проходит, подтверждённый receipt сохраняется при persistent lock | `Release lifecycle retries transient locks and keeps a confirmed published receipt on persistent cleanup failure` |
+
+Фикстуры используют readiness-файлы/IPC, реальные собственные процессы, локальные Git/npm-пакеты и fake GitHub. Recovery адресуется только к PID фикстуры; произвольные Node/Codex/app-процессы не останавливаются. EBUSY инъецируется на filesystem boundary для одного owned path, остальные операции настоящие. Для RED исходный код действительно оставляет живых потомков, теряет stdout, передаёт 600000 мс и подменяет primary ошибкой EBUSY. Windows-результат не доказывает POSIX-выполнение: Linux-ветка требует отдельного CI. Общий `npm run check`, security gates и независимое review выполняет координатор после интеграции. UI выключен (нейтральное свидетельство). Реальные подписочные модели и benchmark matrix остаются PAUSED; этот scoped run не публикует и не развёртывает Kodo, версия v0.2.5 остаётся неопубликованной.
+
+## Основные регрессии
+
 | Требование | Регрессионная проверка |
 | --- | --- |
 | Все навыки включены по умолчанию для трёх клиентов | `CLI init installs all default skills and the chat entry for Codex Claude Code and OpenCode` |
