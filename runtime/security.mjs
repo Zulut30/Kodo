@@ -201,8 +201,16 @@ export function redact(value, secrets = {}) {
   // Literal template references are source, not credential values. Only accept
   // a complete identifier/property reference; mixed tokens still fail closed.
   // Known values and provider-shaped secrets have already been removed above.
-  const credential = (match, prefix, token) => /^\$\{[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\}$/.test(token) ? match : `${prefix}[REDACTED]`;
-  text = text.replace(/(Bearer\s+)([^\s"'<>]+)/gi, credential).replace(/([?&](?:token|key|api_key)=)([^&\s"']+)/gi, credential);
+  const credential = (match, prefix, token, offset, source) => {
+    // Raw source may escape its closing quote. Keep exactly that syntax byte;
+    // any other suffix (including another backslash) remains credential data.
+    const escape = token.endsWith('\\') && /["'\x60]/.test(source[offset + match.length] || '') ? '\\' : '';
+    const reference = escape ? token.slice(0, -1) : token;
+    return /^\$\{[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\}$/.test(reference) ? match : `${prefix}[REDACTED]${escape}`;
+  };
+  // Backticks delimit source strings and Markdown code, just like quotes. They
+  // are never part of a credential, nor of the complete placeholder test.
+  text = text.replace(/(Bearer\s+)([^\s"'<>`]+)/gi, credential).replace(/([?&](?:token|key|api_key)=)([^&\s"'`]+)/gi, credential);
   return text;
 }
 export function workerEnvironment(base = process.env) {

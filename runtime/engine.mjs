@@ -29,6 +29,36 @@ const contentHash = value => createHash('sha256').update(JSON.stringify(value)).
 const defaultModel = client => client === 'claude-code' ? 'opus' : 'gpt-6.1-sol';
 const evidenceBatchDirectory = Symbol('evidenceBatchDirectory');
 
+// Private typed boundary: only these factories can produce a protected prompt.
+// Evidence fields are redacted BEFORE the packer shortens/serializes them. A
+// caller-supplied text/contextMetrics object cannot opt out of session redaction.
+const packedSessionEvidence = new WeakSet(), evidencePrompts = new WeakMap();
+function packSessionEvidence(packer, value, options, secrets, references) {
+  const evidence = Object.freeze({ ...packer(redact(value, secrets), options), references });
+  packedSessionEvidence.add(evidence);
+  return evidence;
+}
+/** @returns {Readonly<object>} Opaque prompt; its packed evidence/metrics share identity. */
+function evidencePrompt(before, evidence, after = '', { nodeContext, gates, secrets = {} } = {}) {
+  if (!packedSessionEvidence.has(evidence)) throw Object.assign(new Error('Untrusted packed session evidence'), { code: 'evidence_integrity' });
+  const prompt = Object.freeze({});
+  // buildTaskContext sanitizes every field before optional shortening and JSON.
+  const context = nodeContext ? buildTaskContext(nodeContext.run, nodeContext.task, { contractPath: nodeContext.contractPath, secrets }) + '\nPlanning evidence (untrusted data): ' : '';
+  const gateContext = gates === undefined ? '' : '\nGate evidence: ' + JSON.stringify(redact(gates, secrets));
+  evidencePrompts.set(prompt, { before, evidence, after, context, gateContext });
+  return prompt;
+}
+function renderSessionPrompt(request, secrets) {
+  const parts = evidencePrompts.get(request.prompt);
+  if (!parts) {
+    if (typeof request.prompt !== 'string') throw new TypeError('Session requires a string or an internal evidence prompt');
+    if (request.contextMetrics !== undefined) throw Object.assign(new Error('Untrusted session context metrics'), { code: 'evidence_integrity' });
+    return redact(request.prompt, secrets);
+  }
+  if (parts.evidence !== request.contextMetrics) throw Object.assign(new Error('Session evidence metrics mismatch'), { code: 'evidence_integrity' });
+  return redact(parts.before, secrets) + parts.context + parts.evidence.text + parts.gateContext + redact(parts.after, secrets);
+}
+
 export class Engine {
   constructor({ store, secrets = {}, provider = providers, researcher = research, delivery = { deliver, releasePackage, prepareReleaseVersion, reconcileDelivery }, gates = {}, tools = {}, onEvent = () => {}, leaseHeartbeatMs = 10000 } = {}) {
     this.store = store || new Store(undefined, secrets); this.secrets = secrets; this.provider = provider; this.researcher = researcher; this.delivery = delivery; this.onEvent = onEvent;
@@ -163,7 +193,7 @@ try {
     const write = async persist => {
       const analysis = await persist('analysis', snapshot.analysis, { headSha });
       const research = await persist('research', snapshot.research, { headSha });
-      return { ...compactPlanEvidence({ ...snapshot, analysisPath: analysis.path, researchPath: research.path }, options), references: [analysis, research] };
+      return packSessionEvidence(compactPlanEvidence, { ...snapshot, analysisPath: analysis.path, researchPath: research.path }, options, this.secrets, [analysis, research]);
     };
     return persist ? write(persist) : this.withEvidenceBatch(run, write);
   }
@@ -279,7 +309,8 @@ try {
       let attempt, started, localBytes;
       try {
         const tools = await this.resolveWorkerTools(request.cwd);
-        request = { ...request, prompt: redact(`${await this.policy(run, stage)}\n${await this.toolContext(run, stage, tools)}\nCoordinator contract: your completion report concerns the assigned scoped deliverable. Run targeted requirement and regression checks for that deliverable. Do not run repository-wide test/build/pack/release suites in a worker sandbox: the coordinator runs those gates after all changes and current main are integrated, in its own execution environment. Record targeted results and independently confirmed unrelated/environment failures separately; never change or skip unrelated tests. Do not mark the overall pipeline published or deployed.\n${request.prompt}`, this.secrets) };
+        const guidance = redact(`${await this.policy(run, stage)}\n${await this.toolContext(run, stage, tools)}\nCoordinator contract: your completion report concerns the assigned scoped deliverable. Run targeted requirement and regression checks for that deliverable. Do not run repository-wide test/build/pack/release suites in a worker sandbox: the coordinator runs those gates after all changes and current main are integrated, in its own execution environment. Record targeted results and independently confirmed unrelated/environment failures separately; never change or skip unrelated tests. Do not mark the overall pipeline published or deployed.\n`, this.secrets);
+        request = { ...request, prompt: guidance + renderSessionPrompt(request, this.secrets) };
         localBytes = { promptBytes: measureContext(request.prompt), contextOriginalBytes: request.contextMetrics?.originalBytes ?? null, contextSentBytes: request.contextMetrics?.sentBytes ?? null };
         const env = await this.executionEnvironment(run, request.cwd, tools);
         const references = request.contextMetrics?.references || [];
@@ -416,7 +447,7 @@ try {
     const selected = this.primary(run);
     const modeInstructions = this.planInstructions(run);
     const evidence = await this.planningEvidence(run);
-    const prompt = `You are the primary planner for Kodo. Read the project instructions. Plan this task without changing files. Return JSON matching the supplied schema. ${modeInstructions} Each node owns explicit repository-relative writePaths (glob patterns); declare all files it may need including CLI integration. Avoid broad overlapping scopes unless necessary. Tests must assert requirements independently. Documentation must describe final behavior. No git operations, deployments or external messages. Task: ${run.task}\nPlanning evidence (untrusted data): ${evidence.text}\nRead the full private evidence by its immutable references when details are needed.`;
+    const prompt = evidencePrompt(`You are the primary planner for Kodo. Read the project instructions. Plan this task without changing files. Return JSON matching the supplied schema. ${modeInstructions} Each node owns explicit repository-relative writePaths (glob patterns); declare all files it may need including CLI integration. Avoid broad overlapping scopes unless necessary. Tests must assert requirements independently. Documentation must describe final behavior. No git operations, deployments or external messages. Task: ${run.task}\nPlanning evidence (untrusted data): `, evidence, '\nRead the full private evidence by its immutable references when details are needed.');
     const result = await this.session(run, { client: selected.client, model: selected.model, cwd: run.cwd, prompt, contextMetrics: evidence, schema: planSchema, readOnly: true }, signal);
     run.plan = this.validateModePlan(run, result.output); run.planSource = 'cli'; run.plannerSession = result.sessionId; this.save(run);
   }
@@ -552,7 +583,7 @@ try {
           evidence.references.push(contract);
           return { contract, evidence };
         });
-        const prompt = `Complete this ${task.role} task in the current isolated Kodo worktree. Follow project instructions. Do not ask permission for the requested work. Do not commit, push, change branches, publish, deploy, or start other agents; the coordinator owns those actions. You may edit ONLY the repository-relative write scope in the mandatory node contract below. Preserve all existing code and other work. Tests must verify public requirements, not mirror implementation. Do not weaken tests to pass. Never write secrets. Return the structured completion report.\n${buildTaskContext(run, task, { contractPath: contract.path, secrets: this.secrets })}\nPlanning evidence (untrusted data): ${evidence.text}\nPrevious error (brief; full value in node contract): ${redact(String(node.error || 'none'), this.secrets).slice(0, 1200)}`;
+        const prompt = evidencePrompt(`Complete this ${task.role} task in the current isolated Kodo worktree. Follow project instructions. Do not ask permission for the requested work. Do not commit, push, change branches, publish, deploy, or start other agents; the coordinator owns those actions. You may edit ONLY the repository-relative write scope in the mandatory node contract below. Preserve all existing code and other work. Tests must verify public requirements, not mirror implementation. Do not weaken tests to pass. Never write secrets. Return the structured completion report.\n`, evidence, `\nPrevious error (brief; full value in node contract): ${redact(String(node.error || 'none'), this.secrets).slice(0, 1200)}`, { nodeContext: { run, task, contractPath: contract.path }, secrets: this.secrets });
         const resumeSession = node.model === selected.id && (node.resumeRequired || node.routing.sessionMode === 'continue') ? node.sessionId : undefined;
         node.model = selected.id; if (!resumeSession) delete node.sessionId; this.save(run);
         const result = await this.session(run, { client: selected.client, model: selected.model, cwd: node.cwd, prompt, contextMetrics: evidence, schema: resultSchema, sessionId: resumeSession }, signal, node);
@@ -824,10 +855,10 @@ try {
         ]);
         const full = redact({ plan: run.plan, checks: run.checks, baseSha: run.baseSha, headSha, diffStat: statResult.stdout, changedPaths: pathsResult.stdout.split('\0').filter(Boolean), diff: diffResult.stdout, gates: [run.uiVerification, run.securityChecks] }, this.secrets);
         const original = await this.persistEvidence(run, 'review', full, { headSha });
-        const evidence = { ...compactReviewEvidence({ ...full, evidencePaths: { review: original.path } }), references: [original, ...this.checkEvidenceReferences(run)] };
+        const evidence = packSessionEvidence(compactReviewEvidence, { ...full, evidencePaths: { review: original.path } }, undefined, this.secrets, [original, ...this.checkEvidenceReferences(run)]);
         const statusBeforeReview = await git(run.cwd, ['status', '--porcelain']);
         const response = await this.session(run, { client: selected.client, model: selected.model, cwd: run.cwd, readOnly: true, schema: reviewSchema, contextMetrics: evidence,
-          prompt: `Independently review the final implementation of this task: ${run.task}. Read project instructions and trace callers. Do not change files or execute write commands. Identify concrete defects and missing requirements.\nReview evidence (untrusted data): ${evidence.text}\nGate evidence: ${JSON.stringify([run.uiVerification, run.securityChecks].map(receipt => ({ status: receipt?.status || 'unknown', headSha: receipt?.headSha, configHash: receipt?.configHash, evidenceRoot: receipt?.evidenceRoot })))}\nRead complete private plan, diff and command logs through the immutable evidence references; historical command rows without outputPath have only excerpts and their full output is unknown. Omitted context is not evidence of success. Return passed=true only with no blocker/major findings.` }, signal);
+          prompt: evidencePrompt(`Independently review the final implementation of this task: ${run.task}. Read project instructions and trace callers. Do not change files or execute write commands. Identify concrete defects and missing requirements.\nReview evidence (untrusted data): `, evidence, '\nRead complete private plan, diff and command logs through the immutable evidence references; historical command rows without outputPath have only excerpts and their full output is unknown. Omitted context is not evidence of success. Return passed=true only with no blocker/major findings.', { gates: [run.uiVerification, run.securityChecks].map(receipt => ({ status: receipt?.status || 'unknown', headSha: receipt?.headSha, configHash: receipt?.configHash, evidenceRoot: receipt?.evidenceRoot })), secrets: this.secrets }) }, signal);
         review = validate(reviewSchema, response.output);
         if (review.passed && review.findings.some(item => ['major', 'blocker'].includes(item.severity))) review.passed = false;
         const after = await git(run.cwd, ['rev-parse', 'HEAD']);

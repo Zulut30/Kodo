@@ -2,6 +2,34 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { buildTaskContext, taskContract, validateTaskContract, maxTaskContractBytes } from '../runtime/task-context.mjs';
 
+test('Task contracts preserve code templates and optional JSON syntax while redacting credentials before shortening', () => {
+  const example = 'const header = `Bearer ${token}`;', quoted = 'Preserve the exact header "Bearer ${token}" and all criteria';
+  const secret = 'fixture_context_private_123', shaped = 'sk-proj-' + 'c'.repeat(24), secrets = { KEY: secret };
+  const task = { id: 'headers', role: 'developer', description: example, writePaths: ['auth.mjs'], acceptance: [quoted, example], constraints: ['Bearer ${token}-private-suffix', 'Bearer ' + secret, 'Bearer ' + shaped], interfaces: ['Use `?token=${token}`;'], dependsOn: ['base'] };
+  const run = { nodes: { base: { status: 'integrated', result: { summary: quoted } } }, task: 'x'.repeat(590) + secret, analysis: { summary: 'x'.repeat(590) + shaped } };
+  const contract = taskContract(task, secrets), context = buildTaskContext(run, task, { secrets });
+  assert.equal(contract.description, example); assert.deepEqual(contract.acceptance, [quoted, example]);
+  assert.deepEqual(contract.constraints, ['Bearer [REDACTED]', 'Bearer [REDACTED]', 'Bearer [REDACTED]']);
+  assert.ok(context.includes(example)); assert.ok(context.includes(quoted)); assert.ok(context.includes(task.interfaces[0]));
+  const dependencies = JSON.parse(context.split('\n').find(line => line.startsWith('Direct dependencies ')).split(': ').slice(1).join(': '));
+  assert.equal(dependencies[0].summary, quoted);
+  assert.doesNotMatch(context, /fixture_context_|sk-proj-|private-suffix/);
+});
+
+test('Task contracts preserve raw escaped source quotes and remove mixed credential values', () => {
+  const example = 'Preserve source: const header = "\\\"Bearer ${token}\\\"";';
+  const secret = 'fixture_private_credential', shaped = 'sk-proj-' + 'f'.repeat(24), secrets = { KEY: secret };
+  const task = { id: 'escaped-source', role: 'developer', description: example, writePaths: ['auth.mjs'], acceptance: [example], dependsOn: ['base'], constraints: [secret, shaped, '${token}-private-suffix'].map(value => example.replace('${token}', value)) };
+  const run = { nodes: { base: { status: 'integrated', result: { summary: example } } }, analysis: { summary: example } };
+  const contract = taskContract(task, secrets), context = buildTaskContext(run, task, { secrets });
+  assert.equal(contract.description, example); assert.deepEqual(contract.acceptance, [example]);
+  assert.deepEqual(contract.constraints, Array(3).fill('Preserve source: const header = "\\\"Bearer [REDACTED]\\\"";'));
+  assert.ok(context.includes(example));
+  const line = context.split('\n').find(line => line.startsWith('Direct dependencies '));
+  assert.equal(JSON.parse(line.slice(line.indexOf(': ') + 2))[0].summary, example);
+  assert.doesNotMatch(context, /fixture_private_credential|sk-proj-|private-suffix/);
+});
+
 test('Task contracts and inline context retain credential-handling examples while removing known and literal secrets', () => {
   const secrets = { KEY: 'fixture_context_private_123' }, example = 'Bearer ${process.env.API_KEY}';
   const task = { id: 'credentials', role: 'developer', description: `Preserve ${example}`, writePaths: ['auth.mjs'], acceptance: ['Keep Bearer ${token} meaningful'], constraints: [`Never expose ${secrets.KEY} or Bearer literal-private-token`], interfaces: ['Use process.env.API_KEY'], dependsOn: ['base'] };

@@ -41,6 +41,124 @@ async function readEvidence(filename, expectedHead) {
   return document;
 }
 
+for (const stage of ['plan', 'review', 'node']) test(`Engine ${stage} envelope preserves structured evidence bytes and safe templates at the provider boundary`, async t => {
+  const fx = await fixture(t), quoted = 'Preserve the exact header "Bearer ${token}" and all criteria', code = 'const header = `Bearer ${token}`;';
+  const shaped = 'sk-proj-' + 'd'.repeat(24), known = 'fixture-sensitive-value';
+  fx.run.task = quoted + ' ' + code + ' ' + known + ' Bearer ${token}-private-suffix';
+  fx.run.analysis.summary = quoted + '\n' + code;
+  fx.run.analysis.risks = ['x'.repeat(5000) + known, 'Bearer ' + shaped, 'Bearer ${token}-private-suffix'];
+  fx.run.analysis.literalSecret = known;
+  const quotedSecret = 'fixture-"quoted"-\\credential'; fx.engine.secrets.QUOTED_FIXTURE = quotedSecret;
+  fx.run.analysis.quotedSecret = quotedSecret; fx.run.analysis.files = [quotedSecret];
+  fx.run.research.items[0].title = quoted + ' ' + code;
+  // Exercise known credentials even inside a syntactically valid placeholder.
+  fx.run.analysis.limitations = ['Bearer ${fixture-sensitive-value}', 'Bearer ${' + shaped + '}'];
+  let packed;
+  const session = fx.engine.session.bind(fx.engine);
+  fx.engine.session = (run, request, ...rest) => { packed = request.contextMetrics; return session(run, request, ...rest); };
+  if (stage === 'review') {
+    const gates = fx.engine.verificationGates.bind(fx.engine);
+    fx.engine.verificationGates = async (...args) => {
+      await gates(...args);
+      // Synthetic disabled-receipt metadata exercises the second JSON envelope;
+      // this makes no claim about a live UI/security gate or filesystem path.
+      fx.run.uiVerification.evidenceRoot = quoted + ' ' + known;
+      fx.run.securityChecks.evidenceRoot = code + ' ' + shaped;
+    };
+  }
+  if (stage === 'plan') await fx.engine.plan(fx.run);
+  else {
+    fx.run.plan = plan(); fx.run.plan.summary = quoted;
+    const task = fx.run.plan.tasks[0]; task.description = code; task.acceptance.push(quoted, code);
+    task.constraints = ['Never expose ' + known, 'Bearer ' + shaped, 'Bearer ${token}-private-suffix'];
+    if (stage === 'node') {
+      task.dependsOn = ['base']; fx.run.nodes.base = { status: 'integrated', result: { summary: quoted } };
+      await fx.engine.performNode(fx.run, task);
+    } else await fx.engine.verify(fx.run);
+  }
+  const request = fx.requests[0], label = stage === 'review' ? 'Review evidence (untrusted data): ' : 'Planning evidence (untrusted data): ';
+  const sent = request.prompt.split('\n').find(line => line.startsWith(label)).slice(label.length);
+  const document = JSON.parse(sent), attempt = fx.run.sessionAttempts[0];
+  assert.equal(sent, packed.text, 'the provider receives the packed JSON bytes unchanged');
+  assert.equal(Object.isFrozen(packed), true, 'serialized evidence and its measured bytes cannot change after packing');
+  assert.equal(document.kind, stage === 'review' ? 'review-evidence' : 'plan-evidence');
+  assert.equal(stage === 'review' ? document.plan.summary : document.analysis.summary, stage === 'review' ? quoted : quoted + '\n' + code);
+  assert.equal(attempt.metrics.contextSentBytes, Buffer.byteLength(sent, 'utf8'));
+  assert.equal(attempt.metrics.promptBytes, Buffer.byteLength(request.prompt, 'utf8'));
+  assert.ok(request.prompt.includes(quoted)); assert.ok(request.prompt.includes(code));
+  assert.doesNotMatch(request.prompt, /fixture-sensitive-value|sk-proj-|private-suffix/);
+  assert.ok(!request.prompt.includes(quotedSecret)); assert.ok(!sent.includes(JSON.stringify(quotedSecret).slice(1, -1)));
+  if (stage === 'review') {
+    const gates = jsonLine(request.prompt, 'Gate evidence: ');
+    assert.deepEqual(gates.map(row => row.status), ['disabled', 'disabled']);
+    assert.deepEqual(gates.map(row => row.evidenceRoot), [quoted + ' [REDACTED]', code + ' [REDACTED]']);
+  }
+  for (const reference of attempt.evidence) {
+    const full = await readEvidence(reference.path, fx.baseSha);
+    assert.doesNotMatch(JSON.stringify(full), /fixture-sensitive-value|sk-proj-|private-suffix/);
+    await fx.engine.assertEvidence(reference);
+    if (full.kind === 'analysis') assert.equal(full.value.summary, quoted + '\n' + code);
+    if (full.kind === 'review') assert.equal(full.value.plan.summary, quoted);
+  }
+  if (stage === 'node') {
+    const reference = attempt.evidence.find(ref => path.basename(ref.path).startsWith('node-contract-'));
+    const full = (await readEvidence(reference.path, fx.baseSha)).value.task;
+    assert.equal(full.description, code); assert.deepEqual(full.acceptance, ['PUBLIC_ACCEPTANCE_SENTINEL', quoted, code]);
+    assert.deepEqual(full.constraints, ['Never expose [REDACTED]', 'Bearer [REDACTED]', 'Bearer [REDACTED]']);
+    const dependencies = request.prompt.split('\n').find(line => line.startsWith('Direct dependencies '));
+    assert.equal(JSON.parse(dependencies.slice(dependencies.indexOf(': ') + 2))[0].summary, quoted);
+  }
+});
+
+test('Engine node envelope preserves raw escaped source quotes in the full contract and transmitted JSON', async t => {
+  const fx = await fixture(t), example = 'Preserve source: const header = "\\\"Bearer ${token}\\\"";';
+  const known = 'fixture_private_credential', shaped = 'sk-proj-' + 'g'.repeat(24);
+  fx.engine.secrets.SOURCE_FIXTURE = known;
+  fx.run.plan = plan(); const task = fx.run.plan.tasks[0];
+  task.description = example; task.acceptance.push(example); task.dependsOn = ['base'];
+  task.constraints = [known, shaped, '${token}-private-suffix', '${token}\\private-suffix'].map(value => example.replace('${token}', value));
+  fx.run.analysis.summary = example;
+  fx.run.nodes.base = { status: 'integrated', result: { summary: example } };
+  let packed;
+  const session = fx.engine.session.bind(fx.engine);
+  fx.engine.session = (run, request, ...rest) => { packed = request.contextMetrics; return session(run, request, ...rest); };
+  await fx.engine.performNode(fx.run, task);
+  const request = fx.requests[0], attempt = fx.run.sessionAttempts[0], label = 'Planning evidence (untrusted data): ';
+  const sent = request.prompt.split('\n').find(line => line.startsWith(label)).slice(label.length);
+  assert.equal(JSON.parse(sent).analysis.summary, example); assert.equal(sent, packed.text);
+  assert.equal(attempt.metrics.contextSentBytes, Buffer.byteLength(sent, 'utf8'));
+  assert.equal(attempt.metrics.promptBytes, Buffer.byteLength(request.prompt, 'utf8'));
+  assert.ok(request.prompt.includes('Your task: ' + example)); assert.ok(request.prompt.includes('Acceptance:\nPUBLIC_ACCEPTANCE_SENTINEL\n' + example));
+  const dependencies = request.prompt.split('\n').find(line => line.startsWith('Direct dependencies '));
+  assert.equal(JSON.parse(dependencies.slice(dependencies.indexOf(': ') + 2))[0].summary, example);
+  for (const reference of attempt.evidence) {
+    const full = await readEvidence(reference.path, fx.baseSha); await fx.engine.assertEvidence(reference);
+    assert.doesNotMatch(JSON.stringify(full), /fixture_private_credential|sk-proj-|private-suffix/);
+    if (full.kind === 'node-contract') {
+      assert.equal(full.value.task.description, example);
+      assert.deepEqual(full.value.task.acceptance, ['PUBLIC_ACCEPTANCE_SENTINEL', example]);
+      assert.deepEqual(full.value.task.constraints, Array(4).fill('Preserve source: const header = "\\\"Bearer [REDACTED]\\\"";'));
+    }
+  }
+  assert.doesNotMatch(request.prompt, /fixture_private_credential|sk-proj-|private-suffix/);
+});
+
+test('Engine session rejects forged protected prompts and copied metrics while ordinary text still redacts', async t => {
+  const fx = await fixture(t), session = fx.engine.session.bind(fx.engine);
+  let captured;
+  fx.engine.session = (run, request, ...rest) => { captured = request; return session(run, { ...request, contextMetrics: { ...request.contextMetrics } }, ...rest); };
+  await assert.rejects(fx.engine.plan(fx.run), { code: 'evidence_integrity' });
+  assert.equal(fx.requests.length, 0);
+  assert.throws(() => { captured.contextMetrics.text = '{"forged":"fixture-sensitive-value"}'; }, TypeError);
+  await assert.rejects(session(fx.run, { ...captured, prompt: { ...captured.prompt } }), TypeError);
+  await assert.rejects(session(fx.run, { ...captured, prompt: 'fixture-sensitive-value', contextMetrics: { text: 'fixture-sensitive-value', originalBytes: 1, sentBytes: 1 } }), { code: 'evidence_integrity' });
+  assert.equal(fx.requests.length, 0);
+  await session(fx.run, { client: 'codex', model: 'gpt-6.1-sol', cwd: fx.project, prompt: 'const header = `Bearer ${token}`; fixture-sensitive-value Bearer ${token}-private-suffix', readOnly: true });
+  assert.match(fx.requests[0].prompt, /const header = `Bearer \$\{token\}`;/);
+  assert.doesNotMatch(fx.requests[0].prompt, /fixture-sensitive-value|private-suffix/);
+  assert.equal(fx.run.sessionAttempts[0].metrics.contextSentBytes, null);
+});
+
 test('Engine prepares one private evidence directory per worker batch and rechecks protection for the next batch', async t => {
   const fx = await fixture(t), prepare = fx.engine.privateDirectory.bind(fx.engine), prepared = [];
   fx.engine.privateDirectory = async directory => { prepared.push(directory); return prepare(directory); };

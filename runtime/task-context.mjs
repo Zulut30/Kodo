@@ -19,6 +19,7 @@ export function validateTaskContract(task) {
  * previous request. The pinned policy and optional tool guidance are separate. */
 export function buildTaskContext(run, task, { contractPath, secrets = {} } = {}) {
   const core = taskContract(task, secrets);
+  if (contractPath) contractPath = redact(contractPath, secrets);
   const oversized = Buffer.byteLength(JSON.stringify(core), 'utf8') > maxTaskContractBytes;
   if (oversized && !contractPath) validateTaskContract(task);
   const dependencies = (task.dependsOn || []).slice(0, 20).map(id => {
@@ -56,11 +57,13 @@ export function buildTaskContext(run, task, { contractPath, secrets = {} } = {})
   ].join('\n');
   // Reserve the inline contract in full. Discard whole optional entries first,
   // preserving valid structured data and Unicode rather than slicing JSON.
-  while (Buffer.byteLength(redact(optional(), secrets), 'utf8') > 3000) {
+  while (Buffer.byteLength(optional(), 'utf8') > 3000) {
     if (sources.length) sources.pop();
     else if (dependencies.length) dependencies.pop();
     else if (objective.length > analysis.length) objective = Array.from(objective).slice(0, Math.floor(Array.from(objective).length / 2)).join('');
     else analysis = Array.from(analysis).slice(0, Math.floor(Array.from(analysis).length / 2)).join('');
   }
-  return redact([...mandatory, optional()].join('\n'), secrets);
+  // Every variable field above is sanitized before shortening/JSON.stringify.
+  // Re-redacting serialized dependency/source JSON would consume its escapes.
+  return [...mandatory, optional()].join('\n');
 }

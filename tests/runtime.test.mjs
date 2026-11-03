@@ -51,6 +51,47 @@ test('Redaction preserves literal variable references but removes real credentia
   const shaped = 'sk-proj-' + 'a'.repeat(24);
   assert.doesNotMatch(redact(`Bearer \${${shaped}}`), new RegExp(shaped));
 });
+test('Redaction retains source and Markdown delimiters around complete credential templates', () => {
+  const examples = [
+    'const header = `Bearer ${token}`;',
+    'const header = `Bearer ${process.env.API_KEY}`;',
+    'Preserve `Bearer ${token}` and all criteria.',
+    'const url = `https://example.invalid/?key=${process.env.API_KEY}&token=${token}`;'
+  ];
+  for (const example of examples) assert.equal(redact(example), example);
+  for (const token of ['literal-private-token', '${token}-private-suffix', 'private-prefix${token}', '${token}private', '${getToken()}', '${token']) {
+    assert.equal(redact('const header = `Bearer ' + token + '`;'), 'const header = `Bearer [REDACTED]`;');
+    assert.equal(redact('const url = `https://example.invalid/?token=' + token + '`;'), 'const url = `https://example.invalid/?token=[REDACTED]`;');
+  }
+  const secret = 'fixture_private_credential', shaped = 'sk-proj-' + 'b'.repeat(24);
+  for (const token of ['${' + secret + '}', '${' + shaped + '}', '${token}-' + shaped]) {
+    assert.equal(redact('const header = `Bearer ' + token + '`;', { KEY: secret }), 'const header = `Bearer [REDACTED]`;');
+  }
+});
+test('Redaction preserves escaped source quote boundaries without allowing credential suffixes', () => {
+  const example = 'Preserve source: const header = "\\\"Bearer ${token}\\\"";';
+  const escapedQuote = String.fromCharCode(92, 34);
+  assert.ok(example.includes(escapedQuote + 'Bearer ${token}' + escapedQuote), 'exercise raw source escapes, before any JSON serialization');
+  assert.equal(redact(example), example);
+  const secret = 'fixture_private_credential', shaped = 'sk-proj-' + 'e'.repeat(24);
+  for (const candidate of ['literal-private-token', '${token}-private-suffix', 'private-prefix${token}', '${token}private', '${token}\\private-suffix', '${token}\\', '${getToken()}', '${' + secret + '}', '${' + shaped + '}']) {
+    const source = example.replace('${token}', candidate);
+    assert.equal(redact(source, { KEY: secret }), 'Preserve source: const header = "\\\"Bearer [REDACTED]\\\"";');
+  }
+  for (const delimiter of ['"', "'", String.fromCharCode(96)]) {
+    const boundary = '\\' + delimiter;
+    for (const placeholder of ['${token}', '${process.env.API_KEY}']) {
+      const reference = boundary + 'Bearer ' + placeholder + boundary;
+      assert.equal(redact(reference), reference);
+      assert.equal(redact(boundary + 'Bearer ${token}-private-suffix' + boundary), boundary + 'Bearer [REDACTED]' + boundary);
+      const query = boundary + 'https://example.invalid/?token=' + placeholder + boundary;
+      assert.equal(redact(query), query);
+      assert.equal(redact(boundary + 'https://example.invalid/?token=${token}-private-suffix' + boundary), boundary + 'https://example.invalid/?token=[REDACTED]' + boundary);
+    }
+    assert.equal(redact(boundary + 'Bearer ${token}\\' + boundary), boundary + 'Bearer [REDACTED]' + boundary, 'another backslash is still a credential suffix');
+  }
+  assert.equal(redact('Bearer ${token}\\'), 'Bearer [REDACTED]', 'a trailing backslash without a quote is a mixed token');
+});
 test('Plan contracts reject malformed graphs and forbidden scopes while overlap stays conservative', () => {
   const plan = { summary: 'feature', tasks: [{ id: 'one', role: 'developer', description: 'feature', dependsOn: [], writePaths: ['src/**'], acceptance: ['works'], parallel: true }] };
   assert.equal(validatePlan(plan), plan); assert.equal(ownsPath(['src/**'], 'src/feature.mjs'), true); assert.equal(ownsPath(['src/**'], 'test/feature.mjs'), false);
