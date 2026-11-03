@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtemp, mkdir, readFile, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, writeFile, rm, stat, utimes } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { Engine } from '../runtime/engine.mjs';
@@ -252,4 +252,159 @@ test('Node no-progress detection distinguishes changed tracked and untracked con
     assert.equal(result.state, 'succeeded', `${untracked ? 'untracked' : 'tracked'} content: ${result.error?.message}`); assert.equal(attempts, 3);
     assert.equal(result.nodes.fix.attempt, 3); assert.equal(result.nodes.fix.stopped, undefined);
   }
+});
+
+test('Rewriting identical untracked bytes with a new timestamp stops at no progress before the repair cap', async t => {
+  const fx = await fixture(t, {
+    config: { executionMode: 'deep', repairRounds: 4, researchBudget: 0 },
+    plan: () => ({ summary: 'One scoped deliverable', tasks: [{ ...task('fix'), writePaths: ['value.mjs', 'notes.txt'] }] })
+  });
+  const original = fx.provider.runSession;
+  let attempts = 0, previousTimestamp;
+  fx.provider.runSession = async request => {
+    if (request.schema.properties.tasks || request.schema.properties.passed) return original(request);
+    attempts++;
+    const file = path.join(request.cwd, 'notes.txt');
+    await writeFile(file, 'Same unfinished work\n');
+    await utimes(file, 1700000000 + attempts, 1700000000 + attempts);
+    const timestamp = (await stat(file)).mtimeMs;
+    if (previousTimestamp !== undefined) assert.notEqual(timestamp, previousTimestamp, 'the witness changes metadata but preserves bytes');
+    previousTimestamp = timestamp;
+    return { metrics: metrics(), output: { complete: false, summary: 'Still missing the same requirement', checks: [] } };
+  };
+  const run = await fx.engine.create('Set value to one', { project: fx.project });
+  const blocked = await fx.engine.run(run.id);
+  assert.equal(blocked.state, 'blocked');
+  assert.equal(blocked.nodes.fix.stopped, 'no_progress');
+  assert.equal(blocked.nodes.fix.attempt, 2);
+  assert.equal(blocked.controllerAssessment.reason, 'no_progress');
+  assert.equal(attempts, 2);
+  assert.equal(fx.calls.includes('research'), false);
+  assert.equal((await fx.engine.run(run.id)).state, 'blocked');
+  assert.equal(attempts, 2, 'ordinary resume cannot reset a stopped cycle');
+});
+
+test('Review quota recovery reuses successful checks only while their exact head is unchanged', async t => {
+  const cases = [
+    { name: 'unchanged head reuses checks' },
+    { name: 'changed head reruns checks', changedHead: true },
+    { name: 'changed test command reruns checks', changedCommand: 'test' },
+    { name: 'changed build command reruns checks', changedCommand: 'build' }
+  ];
+  for (const { name, changedHead = false, changedCommand } of cases) await t.test(name, async subtest => {
+    const fx = await fixture(subtest, { config: {
+      uiVerification: { enabled: true, autoInstall: false, cases: [{ id: 'ready', tool: 'browser-harness', url: 'http://127.0.0.1:1', assertions: [{ selector: 'body', text: 'Ready' }] }] }
+    } });
+    let uiCalls = 0, securityCalls = 0;
+    fx.engine.gates.runUIVerification = request => runUIVerification({ ...request, caseRunner: async () => {
+      uiCalls++;
+      return { schemaVersion: 1, status: 'completed', observations: [{ exists: true, count: 1, text: 'Ready', value: null }] };
+    } });
+    fx.engine.gates.runSecurityChecks = request => { securityCalls++; return runSecurityChecks(request); };
+    const log = path.join(fx.root, 'check-executions.txt');
+    for (const [file, label] of [['verify.mjs', 'test'], ['build.mjs', 'build']]) {
+      const source = await readFile(path.join(fx.project, file), 'utf8');
+      await writeFile(path.join(fx.project, file), source + `import { appendFileSync } from 'node:fs'; appendFileSync(${JSON.stringify(log)}, ${JSON.stringify(label + '\n')});\n`);
+    }
+    git(fx.project, 'add', '.'); git(fx.project, 'commit', '-m', 'Observe actual check command executions');
+    const original = fx.provider.runSession;
+    let quota = true;
+    fx.provider.runSession = async request => {
+      const response = await original(request);
+      if (request.schema.properties.passed && quota) {
+        quota = false;
+        throw Object.assign(new Error('Review quota fixture'), { code: 'quota', metrics: metrics() });
+      }
+      return response;
+    };
+    const created = await fx.engine.create('Set value to one', { project: fx.project, mode: 'quick', model: 'gpt-6.1-sol' });
+    const waiting = await fx.engine.run(created.id);
+    assert.equal(waiting.state, 'waiting_limits');
+    assert.deepEqual(waiting.checks.results.map(row => [row.kind, row.exitCode]), [['test', 0], ['build', 0]]);
+    assert.equal(waiting.uiVerification.passed, true);
+    assert.equal(uiCalls, 1); assert.equal(securityCalls, 1);
+    const checkedHead = waiting.checks.headSha;
+    if (changedHead) {
+      await writeFile(path.join(waiting.cwd, 'value.mjs'), 'export const value = 1; // new scoped head\n');
+      git(waiting.cwd, 'add', 'value.mjs'); git(waiting.cwd, 'commit', '-m', 'Change the checked implementation head');
+    }
+    if (changedCommand) {
+      const saved = fx.store.getRun(created.id);
+      saved.config.commands[changedCommand][0].args.unshift(`--conditions=kodo-${changedCommand}-config-change`);
+      fx.store.updateRun(created.id, { config: saved.config });
+    }
+    const resumed = await fx.engine.run(created.id);
+    assert.equal(resumed.state, 'succeeded', resumed.error?.message);
+    assert.equal(resumed.executionMode.selected, 'quick');
+    assert.equal(resumed.metrics.sessions, 4, 'the failed native review remains in metrics');
+    assert.equal(fx.calls.filter(call => call === 'assessment').length, 1);
+    assert.equal(fx.calls.filter(call => call === 'plan').length, 1);
+    assert.equal(fx.calls.filter(call => call === 'worker').length, 1);
+    assert.equal(fx.calls.filter(call => call === 'review').length, 2);
+    assert.ok(fx.sessions.every(request => request.model === 'gpt-6.1-sol'));
+    assert.equal(uiCalls, 2, 'enabled UI observations must be fresh even when local checks are reused');
+    assert.equal(securityCalls, 2, 'security gate invocation remains separate from local check reuse');
+    for (const receipt of [resumed.checks, resumed.review, resumed.uiVerification, resumed.securityChecks]) assert.equal(receipt.headSha, resumed.headSha);
+    if (changedHead) assert.notEqual(resumed.headSha, checkedHead);
+    else assert.equal(resumed.headSha, checkedHead);
+    if (changedCommand) assert.deepEqual(resumed.checks.results.find(row => row.kind === changedCommand).command.args, [`--conditions=kodo-${changedCommand}-config-change`, changedCommand === 'test' ? 'verify.mjs' : 'build.mjs']);
+    assert.deepEqual((await readFile(log, 'utf8')).trim().split('\n'), changedHead || changedCommand ? ['test', 'build', 'test', 'build'] : ['test', 'build'], 'unchanged successful checks must be reused, while a new head or check configuration requires actual commands');
+  });
+});
+
+test('Review quota recovery cannot reuse a previous enabled UI pass after observations fail', async t => {
+  const fx = await fixture(t, { config: {
+    uiVerification: { enabled: true, autoInstall: false, cases: [{ id: 'ready', tool: 'browser-harness', url: 'http://127.0.0.1:1', assertions: [{ selector: 'body', text: 'Ready' }] }] }
+  } });
+  let observations = 0, quota = true;
+  fx.engine.gates.runUIVerification = request => runUIVerification({ ...request, caseRunner: async () => {
+    observations++;
+    return { schemaVersion: 1, status: 'completed', observations: [{ exists: true, count: 1, text: observations === 1 ? 'Ready' : 'Broken', value: null }] };
+  } });
+  const original = fx.provider.runSession;
+  fx.provider.runSession = async request => {
+    const response = await original(request);
+    if (request.schema.properties.passed && quota) {
+      quota = false;
+      throw Object.assign(new Error('Review quota fixture'), { code: 'quota', metrics: metrics() });
+    }
+    return response;
+  };
+  const created = await fx.engine.create('Set value to one', { project: fx.project, mode: 'quick' });
+  const waiting = await fx.engine.run(created.id);
+  assert.equal(waiting.state, 'waiting_limits'); assert.equal(waiting.uiVerification.passed, true);
+  const checkedHead = waiting.checks.headSha;
+  const resumed = await fx.engine.run(created.id);
+  assert.equal(resumed.state, 'blocked');
+  assert.equal(resumed.checks.headSha, checkedHead);
+  assert.equal(resumed.uiVerification.headSha, checkedHead);
+  assert.equal(observations, 2);
+  assert.equal(resumed.uiVerification.passed, false);
+  assert.equal(resumed.uiVerification.cases[0].assertions[0].passed, false);
+  assert.equal(resumed.review, null);
+  assert.equal(fx.calls.filter(call => call === 'review').length, 1, 'newly failed UI evidence must prevent another review success');
+});
+
+test('Quick rejects contradictory passing review receipts with blocker or major findings', async t => {
+  for (const severity of ['blocker', 'major']) await t.test(severity, async subtest => {
+    const fx = await fixture(subtest);
+    const original = fx.provider.runSession;
+    fx.provider.runSession = async request => {
+      const response = await original(request);
+      if (request.schema.properties.passed) response.output = {
+        passed: true,
+        findings: [{ file: 'value.mjs', severity, problem: 'A confirmed acceptance condition is missing', fix: 'Implement the missing condition' }]
+      };
+      return response;
+    };
+    const run = await fx.engine.create('Set value to one', { project: fx.project, mode: 'quick' });
+    const result = await fx.engine.run(run.id);
+    assert.equal(result.state, 'blocked');
+    assert.deepEqual(result.checks.results.map(row => row.exitCode), [0, 0]);
+    assert.equal(result.review.passed, false, 'severity overrides the reviewer success boolean');
+    assert.equal(result.review.findings[0].severity, severity);
+    assert.equal(result.review.headSha, result.headSha);
+    assert.equal(result.controllerAssessment.attempts, 1);
+    assert.deepEqual(fx.calls, ['assessment', 'discovery', 'plan', 'worker', 'review']);
+  });
 });

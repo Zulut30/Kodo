@@ -1,9 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { mkdtemp, readFile, writeFile, mkdir, rm, access } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { runBenchmark, resumeBenchmark, reportBenchmark, isolatedBenchmarkInvocation } from '../runtime/benchmark.mjs';
+import { runBenchmark, resumeBenchmark, reportBenchmark, isolatedBenchmarkInvocation, buildBenchmarkReport } from '../runtime/benchmark.mjs';
 import { defaultFixtures, materializeFixture, evaluateFixture } from '../runtime/benchmark-fixtures.mjs';
 import { Store } from '../runtime/store.mjs';
 
@@ -261,4 +262,94 @@ test('Missing native usage and tools remain unknown and capability probe overhea
     assert.equal(cell.metrics.sessions, 1); assert.equal(cell.metrics.usage.totalTokens, null);
     assert.equal(cell.metrics.toolSteps, null); assert.equal(cell.metrics.nativeRequestCount, null);
   }
+});
+
+test('Held-out oracle rejects smoke-passing filename and CSS regressions within the allowed write scope', async t => {
+  const root = await temp(t);
+  const [css, js] = defaultFixtures;
+  const cssSource = css.files[css.implementation].replace('#2563eb', '#7c3aed');
+  const filename = "const name = filename.replaceAll('\\\\', '/').split('/').at(-1); const dot = name.lastIndexOf('.'); ";
+  const suffix = "return dot > 0 && dot < name.length - 1 ? name.slice(dot + 1).toLowerCase() : '';";
+  const regressions = [
+    { name: 'directory dots', fixture: js, source: 'const name = filename; const dot = name.lastIndexOf(\'.\'); ' + suffix },
+    { name: 'backslash directories', fixture: js, source: "const name = filename.split('/').at(-1); const dot = name.lastIndexOf('.'); " + suffix },
+    { name: 'leading hidden dot', fixture: js, source: filename + suffix.replace('dot > 0', 'dot >= 0') },
+    { name: 'hidden name with later dot', fixture: js, source: filename + "if (name.startsWith('.')) return ''; " + suffix },
+    { name: 'extensionless name', fixture: js, source: filename + suffix.replace(": '';", ': name.toLowerCase();') },
+    { name: 'trailing dot', fixture: js, source: filename + "if (name.endsWith('.')) return '.'; " + suffix },
+    { name: 'focus outline', fixture: css, source: cssSource.replace('outline-offset: 2px', 'outline-offset: 0px') },
+    { name: 'disabled behavior', fixture: css, source: cssSource.replace('cursor: not-allowed', 'cursor: pointer') },
+    { name: 'unrelated declaration', fixture: css, source: cssSource.replace('border-radius: 4px', 'border-radius: 0px') }
+  ];
+  for (const [index, regression] of regressions.entries()) await t.test(regression.name, async () => {
+    const fx = await materializeFixture({ directory: path.join(root, `oracle-${index}`), fixture: regression.fixture, client: 'codex', model: 'test-model' });
+    const source = regression.fixture === js ? `function extension(filename) { ${regression.source} }\nmodule.exports = { extension };\n` : regression.source;
+    await writeFile(path.join(fx.directory, regression.fixture.implementation), source);
+    const smoke = spawnSync(process.execPath, ['verify.cjs'], { cwd: fx.directory, encoding: 'utf8', windowsHide: true });
+    assert.equal(smoke.status, 0, 'the public smoke must pass so only the held-out requirement distinguishes the subject');
+    const result = await evaluateFixture({ fixture: regression.fixture, cwd: fx.directory, baseline: fx.baseline });
+    assert.deepEqual(result.scope, { passed: true, violations: 0 });
+    assert.deepEqual(result.correctness, { passed: false, code: 'heldout_failed' });
+  });
+});
+
+test('Capability quota resumes only the pending model probe before scheduling either paired condition', async t => {
+  const root = await temp(t), deps = services(root), output = path.join(root, 'out'), probes = [];
+  let quota = true;
+  deps.provider.discoverProviders = async ({ client }, { config }) => {
+    const model = config.models[client][0]; probes.push(model);
+    if (model === 'retry-model' && quota) { quota = false; return [{ client, model, available: false, code: 'quota' }]; }
+    return [{ client, model, available: true, verified: true }];
+  };
+  const first = await runBenchmark({ ...options(output), models: ['test-model', 'retry-model'] }, deps);
+  assert.equal(first.complete, false); assert.equal(first.pause.code, 'quota');
+  assert.deepEqual(first.trials, []); assert.equal(deps.calls.length, 0);
+  assert.deepEqual(probes, ['test-model', 'retry-model']);
+  const second = await resumeBenchmark(output, deps);
+  assert.equal(second.complete, true); assert.equal(second.pause, null);
+  assert.equal(second.identityHash, first.identityHash); assert.equal(second.benchmarkId, first.benchmarkId);
+  assert.deepEqual(probes, ['test-model', 'retry-model', 'retry-model']);
+  assert.equal(second.trials.length, 8); assert.equal(deps.calls.length, 8);
+  assert.ok(second.trials.every(cell => cell.passed && cell.attempts.length === 1));
+  const before = await readFile(path.join(output, 'benchmark.json'), 'utf8');
+  await assert.rejects(resumeBenchmark(output, { ...deps, clientVersion: async () => 'different-client-2' }), /identity changed/i);
+  assert.equal(await readFile(path.join(output, 'benchmark.json'), 'utf8'), before);
+  assert.equal(deps.calls.length, 8, 'identity rejection cannot invoke subjects');
+  assert.equal((await resumeBenchmark(output, deps)).complete, true);
+  assert.equal(deps.calls.length, 8, 'completed cells remain idempotent on resume');
+});
+
+test('Paired reports separate native duration from wall time and keep failed and unknown cells in their denominators', () => {
+  const session = (durationMs, toolSteps, totalTokens) => ({ ...metric, durationMs, toolSteps, usage: { ...metric.usage, inputTokens: totalTokens - 2, totalTokens } });
+  const cell = (pairKey, condition, wallMs, sessions, passed) => ({
+    trialId: `${pairKey}-${condition}`, pairKey, fixture: 'filename-extension', fixtureHash: 'fixture-hash', model: 'test-model', repeat: pairKey === 'known' ? 1 : 2, condition,
+    status: 'completed', wallMs, wallIncomplete: wallMs === null, sessions, reportedModels: [],
+    attempts: [{ number: 1, status: 'completed', durationMs: wallMs }],
+    execution: { succeeded: true, error: null }, correctness: { passed, code: passed ? 'passed' : 'heldout_failed' }, scope: { passed: true, violations: 0 }, passed
+  });
+  const report = buildBenchmarkReport({
+    id: 'offline-report', identityHash: 'offline-identity', complete: true, capabilities: { 'test-model': { available: true } }, probeMetrics: [],
+    identity: { options: { client: 'codex', models: ['test-model'], mode: 'quick', repeats: 2, seed: 17 }, engine: {}, clientVersion: 'offline-1' },
+    // Pairing must use identity rather than array adjacency. A completed
+    // failure remains measured, and a lost receipt stays unknown.
+    trials: [
+      cell('known', 'kodo', 170, [session(20.25, 2, 12), session(40.5, 3, 20)], false),
+      cell('unknown', 'plain', 50, [session(30, 1, 10)], true),
+      cell('known', 'plain', 100, [session(40, 2, 12)], true),
+      cell('unknown', 'kodo', null, [{ durationMs: null, toolSteps: null }], true)
+    ]
+  });
+  const kodo = report.trials.find(row => row.trialId === 'known-kodo');
+  assert.equal(kodo.wallMs, 170); assert.equal(kodo.metrics.durationMs, 60.75);
+  assert.equal(kodo.metrics.sessions, 2); assert.equal(kodo.metrics.nativeRequestCount, null);
+  const known = report.pairedDeltas.find(row => row.pairKey === 'known');
+  assert.equal(known.complete, true); assert.equal(known.plainPassed, true); assert.equal(known.kodoPassed, false);
+  assert.equal(known.kodoMinusPlainWallMs, 70); assert.equal(known.kodoMinusPlainToolSteps, 3); assert.equal(known.kodoMinusPlainTotalTokens, 20);
+  const unknown = report.pairedDeltas.find(row => row.pairKey === 'unknown');
+  assert.equal(unknown.complete, true);
+  assert.equal(unknown.kodoMinusPlainWallMs, null); assert.equal(unknown.kodoMinusPlainToolSteps, null); assert.equal(unknown.kodoMinusPlainTotalTokens, null);
+  assert.deepEqual(report.summaries.map(({ condition, total, completed, passed, failed, pending, passRate, knownWallCount, medianWallMs, medianPassingWallMs }) => ({ condition, total, completed, passed, failed, pending, passRate, knownWallCount, medianWallMs, medianPassingWallMs })), [
+    { condition: 'plain', total: 2, completed: 2, passed: 2, failed: 0, pending: 0, passRate: 1, knownWallCount: 2, medianWallMs: 75, medianPassingWallMs: 75 },
+    { condition: 'kodo', total: 2, completed: 2, passed: 1, failed: 1, pending: 0, passRate: .5, knownWallCount: 1, medianWallMs: 170, medianPassingWallMs: null }
+  ]);
 });
