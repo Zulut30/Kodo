@@ -721,7 +721,8 @@ export class Engine {
         node.attempt = 0; node.status = 'pending'; delete node.routing; delete node.sessionId; delete node.lastFailure; delete node.stopped;
       }
       const previous = run.verification;
-      if (previous) run.verification = { attempt: 0, cycle: (previous.cycle || 1) + 1, previousCycles: [...(previous.previousCycles || []), { attempt: previous.attempt, cycle: previous.cycle, stopped: previous.stopped }].slice(-20) };
+      // A reserved repair must finish in its existing cycle, even on explicit retry.
+      if (previous && !previous.pendingRepair) run.verification = { attempt: 0, cycle: (previous.cycle || 1) + 1, previousCycles: [...(previous.previousCycles || []), { attempt: previous.attempt, cycle: previous.cycle, stopped: previous.stopped }].slice(-20) };
       delete run.controllerAssessment;
       this.save(run); this.log(run, 'retry_requested');
     }
