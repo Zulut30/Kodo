@@ -255,6 +255,9 @@ async function trial(cell, manifest, context) {
       }
       cwd = store.getRun(cell.engineRunId).cwd || project;
       result = await engine.run(cell.engineRunId, { signal, resumeCancelled: true });
+      if (result.metrics?.coordinatorLogicalCalls && typeof result.metrics.coordinatorLogicalCalls === 'object') {
+        cell.engineLogicalCalls = Object.fromEntries(['assessment','analysis','research','routing','discovery'].map(key => [key, count(result.metrics.coordinatorLogicalCalls[key])]));
+      }
       cwd = result.cwd || project;
       const resolved = path.resolve(cwd), expectedRoot = path.resolve(home);
       // The real Engine uses <state>-worktrees. Never evaluate a caller's repo.
@@ -345,7 +348,7 @@ export function buildBenchmarkReport(manifest) {
     correctness: cell.correctness ? { passed: typeof cell.correctness.passed === 'boolean' ? cell.correctness.passed : null, code: ['passed', 'heldout_failed', 'unsafe_workspace', 'invalid_implementation', 'execution_failed'].includes(cell.correctness.code) ? cell.correctness.code : 'unknown' } : null,
     scope: cell.scope ? { passed: typeof cell.scope.passed === 'boolean' ? cell.scope.passed : null, violations: count(cell.scope.violations) } : null,
     passed: cell.status === 'completed' ? cell.passed === true : null,
-    metrics: { ...aggregateMetrics(cell.sessions), coordinatorLogicalCalls: cell.condition === 'kodo' ? cell.logicalCalls : null, researchRequests: cell.condition === 'kodo' ? cell.researchRequests ?? null : null }
+    metrics: { ...aggregateMetrics(cell.sessions), coordinatorLogicalCalls: cell.condition === 'kodo' ? Object.fromEntries(['assessment','analysis','research','routing','discovery'].map(key => [key, count(cell.engineLogicalCalls?.[key] ?? cell.logicalCalls?.[key])])) : null, researchRequests: cell.condition === 'kodo' ? cell.researchRequests ?? null : null }
   }));
   const summaries = [];
   for (const model of options.models) for (const condition of ['plain', 'kodo']) {
