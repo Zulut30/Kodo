@@ -182,7 +182,7 @@ test('Engine exposes only managed ready ripgrep on worker PATH while provider cr
   const run = await engine.create('Scoped code search', { project: fx.project });
   const environment = await engine.executionEnvironment(run, fx.project);
   const pathKey = Object.keys(environment).find(key => key.toLowerCase() === 'path');
-  assert.equal(environment[pathKey].split(path.delimiter)[0], path.dirname(command));
+  assert.deepEqual(environment[pathKey].split(path.delimiter).slice(0, 2), [path.dirname(process.execPath), path.dirname(command)]);
   assert.equal(environment.GEMINI_API_KEY, undefined); assert.equal(environment.TYPESAFE_API_KEY, undefined); assert.equal(environment.OPENAI_API_KEY, undefined);
 });
 
