@@ -21,6 +21,10 @@ import { git } from './workspace.mjs';
 import { writeProgress, assertPrivateArtifactPath } from './progress.mjs';
 
 export async function runtimeCli(command, args) {
+  if (command === 'benchmark') {
+    const { benchmarkCli } = await import('./benchmark-cli.mjs');
+    const result = await benchmarkCli(args); console.log(result.output); process.exitCode = result.exitCode; return;
+  }
   // Audit only reads saved state. Keep it before credentials, project config,
   // provider checks and engine startup (including lease/worktree handling).
   if (command === 'audit') {
@@ -41,7 +45,7 @@ export async function runtimeCli(command, args) {
   }
   const options = { positional: [] };
   const flags = new Set(['--json', '--live', '--prepare', '--retry-failed']);
-  const values = new Set(['--project', '--client', '--model', '--providers', '--plan', '--delivery', '--target']);
+  const values = new Set(['--project', '--client', '--model', '--mode', '--providers', '--plan', '--delivery', '--target']);
   for (let index = 0; index < args.length; index++) {
     const arg = args[index];
     if (flags.has(arg)) { if (options[arg.slice(2)] !== undefined) throw new Error(`Повторный параметр ${arg}`); options[arg.slice(2)] = true; }
@@ -50,12 +54,13 @@ export async function runtimeCli(command, args) {
     else options.positional.push(arg);
   }
   const allowed = {
-    init: ['json','project','target','client'], doctor: ['json','live','project','client'], run: ['json','prepare','project','client','model','providers','plan','delivery'],
+    init: ['json','project','target','client'], doctor: ['json','live','project','client'], run: ['json','prepare','project','client','model','mode','providers','plan','delivery'],
     resume: ['json','plan','retry-failed'], status: ['json'], logs: ['json'], cancel: ['json'], migrate: ['json','target'],
     tools: ['json','project','live'], ui: ['json','project'], security: ['json','project']
   }[command];
   if (!allowed) throw new Error(`Неизвестная команда ${command}`);
   for (const key of Object.keys(options)) if (key !== 'positional' && !allowed?.includes(key)) throw new Error(`Параметр ${key} неприменим к ${command}`);
+  if (options.mode !== undefined) { const { normalizeMode } = await import('./modes.mjs'); normalizeMode(options.mode); }
   const print = value => console.log(JSON.stringify(value, null, options.json ? 0 : 2));
   const project = path.resolve(options.project || options.target || process.cwd());
   // Metadata and tool setup never open the provider credential store or engine.
