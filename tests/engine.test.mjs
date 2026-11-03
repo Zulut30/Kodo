@@ -315,6 +315,70 @@ test('Engine keeps partial pending verification repair out of HEAD until the exa
   assert.equal(git(result.cwd, 'status', '--porcelain'), ''); assert.equal(git(fx.project, 'rev-parse', 'HEAD'), fx.base);
 });
 
+test('Engine retry-failed preserves pending verification repair before resetting its cycle', async t => {
+  for (const complete of [false, true]) await t.test(complete ? 'completed-before-commit' : 'quota-with-partial-writes', async subtest => {
+    const fx = await fixture(subtest, { config: { repairRounds: 2, researchBudget: 0 },
+      testScript: "import assert from 'node:assert/strict'; import {value} from './src/value.mjs'; assert.equal(value, 3);\n" });
+    const services = fakeServices({ plan: { summary: 'value three', tasks: [node('feature', 'developer', ['src/value.mjs'])] } });
+    const original = services.provider.runSession, controller = new AbortController(), repairSnapshots = [];
+    let store = fx.openStore();
+    services.provider.runSession = async request => {
+      if (!/Repair confirmed failures/.test(request.prompt)) return original(request);
+      repairSnapshots.push({ sessionId: request.sessionId, headSha: git(request.cwd, 'rev-parse', 'HEAD'),
+        committed: git(request.cwd, 'show', 'HEAD:src/value.mjs'), working: await read(path.join(request.cwd, 'src/value.mjs')) });
+      request.onEvent({ sessionId: 'retry-pending-verification-session' });
+      if (!complete && repairSnapshots.length <= 2) {
+        await writeFile(path.join(request.cwd, 'src/value.mjs'), 'export const value = 99;\n');
+        throw Object.assign(new Error('fixture quota after partial repair write'), { code: 'quota' });
+      }
+      await writeFile(path.join(request.cwd, 'src/value.mjs'), 'export const value = 3;\n');
+      if (complete) controller.abort();
+      return { sessionId: 'retry-pending-verification-session', output: { complete: true, summary: 'repair completed', checks: [] } };
+    };
+    let engine = new Engine({ store, ...services });
+    const run = await engine.create('Retry the reserved verification repair', { project: fx.project });
+    const history = [{ attempt: 2, cycle: 1, stopped: 'repair_budget_exhausted' }];
+    run.verification = { attempt: 0, cycle: 2, previousCycles: history }; engine.save(run);
+    let reserved;
+    for (let interruption = 1; interruption <= (complete ? 1 : 2); interruption++) {
+      const paused = await engine.run(run.id, { signal: controller.signal, retryFailed: interruption > 1 });
+      reserved ||= structuredClone(paused.verification);
+      assert.equal(git(paused.cwd, 'rev-parse', 'HEAD'), reserved.pendingRepair.headSha, 'retry-failed must leave unfinished writes out of HEAD');
+      assert.equal(git(paused.cwd, 'show', 'HEAD:src/value.mjs'), 'export const value = 2;');
+      assert.equal(paused.state, complete ? 'cancelled' : 'waiting_limits', paused.error?.message);
+      assert.equal(paused.error.code, complete ? 'cancelled' : 'quota');
+      assert.deepEqual(paused.verification, reserved, 'retry-failed must retain the entire reserved round and its history');
+      assert.equal(paused.verification.attempt, 1); assert.equal(paused.verification.cycle, 2);
+      assert.deepEqual(paused.verification.previousCycles, history);
+      assert.equal(paused.verification.pendingRepair.sessionId, 'retry-pending-verification-session');
+      assert.equal(paused.verification.pendingRepair.complete === true, complete);
+      assert.equal(await read(path.join(paused.cwd, 'src/value.mjs')), complete ? 'export const value = 3;\n' : 'export const value = 99;\n');
+      assert.equal(services.calls.review.length, 0);
+      fx.closeStore(store); store = fx.openStore(); engine = new Engine({ store, ...services });
+    }
+    const result = await engine.run(run.id, { retryFailed: true, resumeCancelled: complete });
+    assert.equal(result.state, 'succeeded', result.error?.message);
+    assert.equal(repairSnapshots.length, complete ? 1 : 3, 'completed output must not reopen the session; unfinished output must resume it');
+    assert.deepEqual(repairSnapshots.map(snapshot => snapshot.sessionId), complete ? [undefined] : [undefined, 'retry-pending-verification-session', 'retry-pending-verification-session']);
+    for (const snapshot of repairSnapshots) {
+      assert.equal(snapshot.headSha, reserved.pendingRepair.headSha); assert.equal(snapshot.committed, 'export const value = 2;');
+    }
+    assert.deepEqual(repairSnapshots.map(snapshot => snapshot.working), complete ? ['export const value = 2;\n'] : ['export const value = 2;\n', 'export const value = 99;\n', 'export const value = 99;\n']);
+    assert.equal(result.verification.pendingRepair, undefined); assert.equal(result.verification.attempt, 1); assert.equal(result.verification.cycle, 2);
+    assert.deepEqual(result.verification.previousCycles, history); assert.equal(result.verification.lastFailure, reserved.lastFailure);
+    assert.equal(git(result.cwd, 'show', 'HEAD:src/value.mjs'), 'export const value = 3;');
+    assert.equal(git(result.cwd, 'rev-list', '--count', `${reserved.pendingRepair.headSha}..HEAD`), '1');
+    assert.equal(git(result.cwd, 'log', '-1', '--format=%s'), 'Kodo repair checks 1');
+    assert.equal(store.events(run.id).filter(event => event.type === 'repair_recovered').length, 0);
+    assert.equal(store.events(run.id).filter(event => event.type === 'check_started').length, 2);
+    assert.equal(store.events(run.id).filter(event => event.type === 'retry_requested').length, complete ? 1 : 2);
+    assert.equal(services.calls.worker.length, 1); assert.equal(services.calls.review.length, 1);
+    assert.equal(result.checks.headSha, result.headSha); assert.equal(result.review.headSha, result.headSha);
+    assert.equal(result.uiVerification.headSha, result.headSha); assert.equal(result.securityChecks.headSha, result.headSha);
+    assert.equal(git(result.cwd, 'status', '--porcelain'), ''); assert.equal(git(fx.project, 'rev-parse', 'HEAD'), fx.base);
+  });
+});
+
 test('Engine detects no progress only after a resumed verification repair completes', async t => {
   const fx = await fixture(t, { config: { repairRounds: 3, researchBudget: 0 }, testScript: 'process.exit(0);\n' });
   const services = fakeServices({ plan: { summary: 'one feature', tasks: [node('feature', 'developer', ['src/value.mjs'])] },
