@@ -110,6 +110,7 @@ test('Both pinned scanners scan tracked runtime and tests with isolated offline 
     if (tool === 'semgrep') {
       assert.ok(args.includes('--metrics=off') && args.includes('--disable-version-check') && args.includes('--strict'));
       assert.ok(args.includes('--no-git-ignore') && args.includes('--x-ignore-semgrepignore-files'));
+      assert.ok(!args.includes('--no-exclude-minified-files'), 'unsupported by pinned Python scan backend');
       assert.equal(options.env.TEMP, options.env.TMP); assert.equal(options.env.TMP, options.env.TMPDIR);
       assert.ok(!options.env.TMPDIR.startsWith(fx.artifacts));
       if (process.platform === 'win32') assert.ok(options.env.TMPDIR.length <= 70);

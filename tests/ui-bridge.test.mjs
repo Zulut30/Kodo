@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { runDesktopCase, runChromeCase, uiEnvironment } from '../runtime/ui-browser.mjs';
+import { runDesktopCase, runChromeCase, uiEnvironment, browserEnvironment } from '../runtime/ui-browser.mjs';
 import { assessObservations } from '../runtime/ui-schema.mjs';
 
 test('bridge compatibility and failure checks run without installed tools, network or UI', t => {
@@ -19,6 +19,13 @@ test('UI process environment drops provider keys, user profiles and browser/clou
   for (const key of ['GEMINI_API_KEY', 'TYPESAFE_API_KEY', 'OPENAI_API_KEY', 'BU_CDP_URL', 'BU_NAME', 'NODE_OPTIONS', 'TEXT_MODEL_BASE_URL']) assert.equal(env[key], undefined);
 });
 const desktop = { case: { id: 'desktop', tool: 'agent-desktop', app: 'OwnedFixture', windowId: 'w-123', steps: [{ action: 'set-value', name: 'Name', value: 'Kodo' }, { action: 'click', name: 'Verify', role: 'button' }], assertions: [{ text: 'Verified Kodo' }] }, config: { timeoutMs: 2000 }, tool: { command: 'managed-desktop', args: [] }, evidenceDir: process.cwd() };
+test('Windows owned Chrome omits fabricated account folders without inheriting personal state or keys', () => {
+  const base = { PATH: 'safe', USERPROFILE: 'personal', APPDATA: 'personal', LOCALAPPDATA: 'personal', HOME: 'personal', OPENAI_API_KEY: 'secret', BU_CDP_URL: 'personal' };
+  const env = browserEnvironment('/owned', base, 'win32');
+  for (const key of ['HOME','USERPROFILE','APPDATA','LOCALAPPDATA','OPENAI_API_KEY','BU_CDP_URL']) assert.equal(env[key], undefined);
+  assert.equal(env.TEMP, '/owned'); assert.equal(env.PATH, 'safe');
+  assert.equal(browserEnvironment('/owned', base, 'linux').HOME, '/owned');
+});
 function desktopPort({ ambiguous = false, uncertain = false, uncertainChangedState = true, truncated = false } = {}) {
   const calls = []; let stage = 0;
   return { calls, runner: async (command, args, options) => {

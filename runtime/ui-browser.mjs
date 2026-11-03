@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, realpath } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -16,6 +16,14 @@ export function uiEnvironment(home, base = process.env) {
     XDG_CONFIG_HOME: home, XDG_CACHE_HOME: home, PYTHONNOUSERSITE: '1', PYTHONDONTWRITEBYTECODE: '1', PYTHONIOENCODING: 'utf-8',
     PYTHON_DOTENV_DISABLED: '1', ANONYMIZED_TELEMETRY: 'false', BROWSER_USE_LOGGING_LEVEL: 'critical', BROWSER_USE_DISABLE_UPDATE_CHECK: 'true',
     NO_UPDATE_CHECKS: '1', DO_NOT_TRACK: '1', BH_RECORD: '0', BH_TAB_MARKER: '0', BH_OPEN_LIVE_URL: '0', BH_DOMAIN_SKILLS: '0' };
+}
+export function browserEnvironment(home, base = process.env, platform = process.platform) {
+  const env = uiEnvironment(home, base);
+  // Windows Chrome resolves system known folders before honoring its explicit
+  // user-data-dir. Fabricated account folders break that resolution. Omit the
+  // account overrides rather than inherit personal folder values or API keys.
+  if (platform === 'win32') for (const name of ['HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA']) delete env[name];
+  return env;
 }
 export function ownedProcess(command, args, { cwd, env, signal } = {}) {
   const resolved = resolveCommand(command, args);
@@ -70,9 +78,11 @@ function chromeExecutable(config) {
 export async function launchOwnedBrowser({ config, signal }) {
   const executablePath = chromeExecutable(config);
   // Short unique OS-temp paths also avoid Windows IPC/path limits.
-  const directory = await mkdtemp(path.join(os.tmpdir(), 'kui-'));
+  // External Chrome must see the physical directory, including MSIX redirected
+  // Windows temp roots; a logical path can otherwise name a different profile.
+  const directory = await realpath(await mkdtemp(path.join(os.tmpdir(), 'kui-')));
   const profile = path.join(directory, 'profile'); await mkdir(profile, { mode: 0o700 });
-  const process = ownedProcess(executablePath, [`--user-data-dir=${profile}`, '--remote-debugging-address=127.0.0.1', '--remote-debugging-port=0', '--headless=new', '--no-first-run', '--no-default-browser-check', '--disable-background-networking', '--disable-sync', '--disable-extensions', '--disable-component-update', 'about:blank'], { cwd: directory, env: uiEnvironment(directory), signal });
+  const process = ownedProcess(executablePath, [`--user-data-dir=${profile}`, '--remote-debugging-address=127.0.0.1', '--remote-debugging-port=0', '--headless=new', '--no-first-run', '--no-default-browser-check', '--disable-background-networking', '--disable-sync', '--disable-extensions', '--disable-component-update', 'about:blank'], { cwd: directory, env: browserEnvironment(directory), signal });
   const close = async () => { try { await process.stop(); } finally { await rm(directory, { recursive: true, force: true, maxRetries: 3 }).catch(() => {}); } };
   try {
     const cdpUrl = await waitUntil(async () => {

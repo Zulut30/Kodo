@@ -234,7 +234,7 @@ async function runScanner({ tool, config, source, target, scratch, cwd, headSha,
     const temp = await shortTemp(runner, env, signal);
     try {
       common.env = environment(path.join(scratch, 'home'), temp.alias, tool.env);
-      const result = await call(runner, tool.command, [...tool.args, 'scan', '--config', path.join(scratch, 'rules.yml'), '--json', '--error', '--strict', '--quiet', '--metrics=off', '--disable-version-check', '--oss-only', '--no-git-ignore', '--x-ignore-semgrepignore-files', '--disable-nosem', '--no-rewrite-rule-ids', '--no-exclude-minified-files', '--max-target-bytes=0', '--timeout=30', '.'], common);
+      const result = await call(runner, tool.command, [...tool.args, 'scan', '--config', path.join(scratch, 'rules.yml'), '--json', '--error', '--strict', '--quiet', '--metrics=off', '--disable-version-check', '--oss-only', '--no-git-ignore', '--x-ignore-semgrepignore-files', '--disable-nosem', '--no-rewrite-rule-ids', '--max-target-bytes=0', '--timeout=30', '.'], common);
       return semgrepResult(result, target, source, secrets, Boolean(config.semgrepConfig));
     } finally { await removeOwned(temp.directory, temp.parent, 'ks-'); }
   }
