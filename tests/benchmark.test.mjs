@@ -45,6 +45,21 @@ function services(root, overrides = {}) {
 }
 const options = output => ({ output, client: 'codex', models: ['test-model'], repeats: 1, seed: 17 });
 
+test('Benchmark reports authoritative Engine assessment counters without doubling wrapped operations', async t => {
+  const root = await temp(t), deps = services(root);
+  class MeasuredEngine extends deps.Engine {
+    async run(id) {
+      const run = await super.run(id);
+      return { ...run, metrics: { coordinatorLogicalCalls: { assessment: 1, analysis: 0, research: 0, routing: 0, discovery: 1 } } };
+    }
+  }
+  const report = await runBenchmark(options(path.join(root, 'out')), { ...deps, Engine: MeasuredEngine });
+  for (const trial of report.trials) {
+    if (trial.condition === 'plain') assert.equal(trial.metrics.coordinatorLogicalCalls, null);
+    else assert.deepEqual(trial.metrics.coordinatorLogicalCalls, { assessment: 1, analysis: 0, research: 0, routing: 0, discovery: 1 });
+  }
+});
+
 test('Native invocation disables shared memory without changing subscription auth tools or credential homes', () => {
   const invocation = { command: 'codex', args: ['--no-daemon', 'exec', '--json', '--model', 'test-model'], env: { CODEX_HOME: '/signed-in-home' }, input: 'task' };
   const value = isolatedBenchmarkInvocation('codex', invocation);
