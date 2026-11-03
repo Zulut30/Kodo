@@ -366,8 +366,11 @@ def run_jev(r):
 
 def cleanup_harness(r):
     configure_harness(r)
-    from browser_harness.admin import restart_daemon
-    with no_provider_environment(): restart_daemon(os.environ['BU_NAME'], require_clean=True)
+    from browser_harness.admin import restart_daemon, daemon_alive
+    name = os.environ['BU_NAME']
+    with no_provider_environment():
+        if daemon_alive(name): restart_daemon(name, require_clean=True)
+        if daemon_alive(name): raise RuntimeError('cleanup_failed')
 
 
 async def dispatch(r):

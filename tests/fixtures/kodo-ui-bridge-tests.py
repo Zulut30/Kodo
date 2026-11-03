@@ -14,6 +14,26 @@ bridge = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(bridge)
 
 class BridgeTests(unittest.TestCase):
+    def test_owned_harness_cleanup_is_idempotent_and_verifies_shutdown(self):
+        alive = [True]
+        calls = []
+        admin = types.ModuleType('browser_harness.admin')
+        admin.daemon_alive = lambda name: alive[0]
+        def stop(name, require_clean=False):
+            self.assertTrue(require_clean)
+            self.assertTrue(name.startswith('kodo-'))
+            calls.append(name)
+            alive[0] = False
+        admin.restart_daemon = stop
+        with patch.dict(sys.modules, {'browser_harness.admin': admin}), patch.dict(os.environ, {}, clear=True):
+            bridge.cleanup_harness(self.req)
+            bridge.cleanup_harness(self.req)
+        self.assertEqual(len(calls), 1)
+        alive[0] = True
+        admin.restart_daemon = lambda *a, **kw: None
+        with patch.dict(sys.modules, {'browser_harness.admin': admin}), patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(RuntimeError): bridge.cleanup_harness(self.req)
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix='kodo-ui-python-')
         self.addCleanup(self.tmp.cleanup)
