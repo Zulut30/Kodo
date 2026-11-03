@@ -74,6 +74,30 @@ test('previous success is not reused and malformed/ambiguous observations fail',
   const r = await runUIVerification({ ...base, previous: { status: 'passed' }, caseRunner: port });
   assert.equal(calls, 1); assert.equal(r.passed, false);
 });
+test('UI rejects bridge results above the configured step budget despite passing independent observations', async t => {
+  const base = await fixture(t), boundedConfig = { ...config, maxSteps: 2 };
+  const result = steps => ({ schemaVersion: 1, status: 'completed', steps, observations: [{ exists: true, count: 1, text: 'Saved', value: null }] });
+  const within = await runUIVerification({ ...base, config: boundedConfig, caseRunner: async () => result(2) });
+  assert.equal(within.passed, true); assert.equal(isCurrentUIReceipt(within, { headSha, config: boundedConfig }), true);
+  const over = await runUIVerification({ ...base, config: boundedConfig, caseRunner: async () => result(3) });
+  assert.deepEqual({ passed: over.passed, current: isCurrentUIReceipt(over, { headSha, config: boundedConfig }) },
+    { passed: false, current: false }, 'a successful DOM readback cannot authorize exceeding maxSteps');
+});
+
+test('UI requires all configured cases and never promotes mixed passed and failed readbacks to success', async t => {
+  const base = await fixture(t), calls = [];
+  const both = { ...config, cases: [config.cases[0], { ...config.cases[0], id: 'second' }] };
+  const receipt = await runUIVerification({ ...base, config: both, caseRunner: async ({ case: c }) => {
+    calls.push(c.id);
+    return { schemaVersion: 1, status: 'completed', observations: [{ exists: true, count: 1, text: c.id === 'save' ? 'Saved' : 'Not saved', value: null }] };
+  } });
+  assert.deepEqual(calls, ['save', 'second']);
+  assert.deepEqual(receipt.cases.map(c => [c.id, c.status, c.assertions[0].passed]), [['save', 'passed', true], ['second', 'failed', false]]);
+  assert.equal(receipt.status, 'failed'); assert.equal(receipt.passed, false);
+  assert.equal(isCurrentUIReceipt(receipt, { headSha, config: both }), false);
+  const partial = { ...receipt, status: 'passed', passed: true, cases: [receipt.cases[0]] };
+  assert.equal(isCurrentUIReceipt(partial, { headSha, config: both }), false);
+});
 test('Vibetest requires both independently observed QA states and preserves exploratory evidence privately', async t => {
   const base = await fixture(t);
   const vconfig = { ...config, cases: [{ ...config.cases[0], tool: 'vibetest', goal: 'Save' }] };
