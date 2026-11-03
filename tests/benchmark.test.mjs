@@ -4,7 +4,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdtemp, readFile, writeFile, mkdir, rm, access } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { runBenchmark, resumeBenchmark, reportBenchmark, isolatedBenchmarkInvocation, buildBenchmarkReport } from '../runtime/benchmark.mjs';
+import { runBenchmark, resumeBenchmark, reportBenchmark, isolatedBenchmarkInvocation, buildBenchmarkReport, normalizeBenchmarkOptions } from '../runtime/benchmark.mjs';
 import { defaultFixtures, materializeFixture, evaluateFixture } from '../runtime/benchmark-fixtures.mjs';
 import { Store } from '../runtime/store.mjs';
 
@@ -45,6 +45,12 @@ function services(root, overrides = {}) {
   return { provider, Engine: overrides.Engine || ControlledEngine, accountStore, clientVersion: async () => 'test-client-1', calls, creates, secrets: {} };
 }
 const options = output => ({ output, client: 'codex', models: ['test-model'], repeats: 1, seed: 17 });
+
+test('Windows benchmark rejects oversized execution roots before any native subscription probe', () => {
+  const long = path.join(os.tmpdir(), 'x'.repeat(90));
+  assert.throws(() => normalizeBenchmarkOptions(options(long), { platform: 'win32' }), /short execution root/i);
+  assert.equal(normalizeBenchmarkOptions(options(long), { platform: 'linux' }).mode, 'quick');
+});
 
 test('Benchmark reports authoritative Engine assessment counters without doubling wrapped operations', async t => {
   const root = await temp(t), deps = services(root);

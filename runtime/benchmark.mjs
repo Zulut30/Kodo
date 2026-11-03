@@ -42,7 +42,7 @@ function failure(error, signal) {
   return { code, ...(Number.isFinite(retry) ? { retryAt: new Date(retry).toISOString() } : {}) };
 }
 
-export function normalizeBenchmarkOptions(options = {}) {
+export function normalizeBenchmarkOptions(options = {}, { platform = process.platform } = {}) {
   const client = options.client ?? 'codex', mode = normalizeMode(options.mode) ?? 'quick';
   const models = typeof options.models === 'string' ? options.models.split(',') : options.models;
   if (!['codex', 'claude-code'].includes(client)) throw new TypeError('Benchmark client must be codex or claude-code');
@@ -51,12 +51,13 @@ export function normalizeBenchmarkOptions(options = {}) {
   if (!Number.isSafeInteger(repeats) || repeats < 1 || repeats > 100) throw new TypeError('Benchmark repeats must be an integer from 1 to 100');
   if (!Number.isSafeInteger(seed) || seed < -2147483648 || seed > 2147483647) throw new TypeError('Benchmark seed must be a signed 32-bit integer');
   if (options.output !== undefined && (typeof options.output !== 'string' || !path.isAbsolute(options.output))) throw new TypeError('Benchmark output must be an absolute directory');
+  if (platform === 'win32' && options.output && path.resolve(options.output).length > 80) throw new TypeError('Windows benchmark requires a short execution root (at most 80 characters), such as D:/KodoBench/pilot. Deep process working directories are not supported by the Windows runtime.');
   return { client, models: [...models], mode, repeats, seed };
 }
 
 async function metadata() {
   const pkg = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8'));
-  const sources = ['runtime/benchmark.mjs', 'runtime/benchmark-cli.mjs', 'runtime/benchmark-fixtures.mjs', 'runtime/engine.mjs', 'runtime/modes.mjs', 'runtime/providers.mjs', 'runtime/metrics.mjs', 'third-party-skills.lock.json'];
+  const sources = ['runtime/benchmark.mjs', 'runtime/benchmark-cli.mjs', 'runtime/benchmark-fixtures.mjs', 'runtime/engine.mjs', 'runtime/modes.mjs', 'runtime/providers.mjs', 'runtime/metrics.mjs', 'runtime/command.mjs', 'runtime/config.mjs', 'runtime/workspace.mjs', 'runtime/task-context.mjs', 'third-party-skills.lock.json'];
   const hashes = {};
   for (const file of sources) hashes[file] = hash(await readFile(path.join(root, file), 'utf8'));
   const commit = await lstat(path.join(root, '.git')).then(() => git(root, ['rev-parse', 'HEAD'])).catch(() => null);
@@ -318,7 +319,8 @@ async function executeBenchmark(directory, manifest, dependencies, signal) {
 
 export async function runBenchmark(options = {}, dependencies = {}) {
   const normalized = normalizeBenchmarkOptions(options);
-  const directory = options.output || path.join(os.tmpdir(), `kodo-benchmark-${randomUUID()}`);
+  const directory = options.output || path.join(os.homedir(), '.kodo', 'bench', randomUUID().replaceAll('-', '').slice(0, 12));
+  if (process.platform === 'win32' && path.resolve(directory).length > 80) throw new TypeError('Choose a shorter Windows benchmark execution root with --output');
   await mkdir(directory, { recursive: true, mode: 0o700 });
   const descriptor = await identity(normalized, dependencies);
   const manifest = { schemaVersion: 1, id: randomUUID(), identity: descriptor, identityHash: hash(descriptor), capabilities: {}, probeMetrics: [], scheduled: false, trials: [], complete: false };
