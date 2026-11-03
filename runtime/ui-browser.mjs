@@ -120,7 +120,7 @@ export async function runDesktopCase({ case: c, config, tool, evidenceDir, signa
     return found.matches[0].ref_id;
   };
   let uncertain = false;
-  for (const step of c.steps) {
+  for (const [index, step] of c.steps.entries()) {
     const ref = await find(step);
     const result = await call([step.action, ref, ...(step.action === 'set-value' ? [step.value] : [])], true);
     const fresh = await snapshot();
@@ -129,7 +129,9 @@ export async function runDesktopCase({ case: c, config, tool, evidenceDir, signa
       const read = await call(['get', newRef, '--property', 'value']);
       if (read.value !== step.value) throw fail('action_readback_failed');
     }
-    if (result.uncertain) { uncertain = true; break; } // Never repeat uncertain delivery or continue dependent mutations.
+    // Fresh independent assertions may verify the final uncertain action. Never
+    // repeat it or execute later mutations while delivery remains uncertain.
+    if (result.uncertain) { uncertain = index < c.steps.length - 1; break; }
     if (!fresh.complete) throw fail('incomplete_observation');
   }
   const final = await snapshot(), texts = [];

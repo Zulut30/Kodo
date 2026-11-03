@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { runDesktopCase, runChromeCase, uiEnvironment } from '../runtime/ui-browser.mjs';
+import { assessObservations } from '../runtime/ui-schema.mjs';
 
 test('bridge compatibility and failure checks run without installed tools, network or UI', t => {
   const candidates = [process.env.KODO_UI_TEST_PYTHON, 'python3', 'python'].filter(Boolean);
@@ -18,7 +19,7 @@ test('UI process environment drops provider keys, user profiles and browser/clou
   for (const key of ['GEMINI_API_KEY', 'TYPESAFE_API_KEY', 'OPENAI_API_KEY', 'BU_CDP_URL', 'BU_NAME', 'NODE_OPTIONS', 'TEXT_MODEL_BASE_URL']) assert.equal(env[key], undefined);
 });
 const desktop = { case: { id: 'desktop', tool: 'agent-desktop', app: 'OwnedFixture', windowId: 'w-123', steps: [{ action: 'set-value', name: 'Name', value: 'Kodo' }, { action: 'click', name: 'Verify', role: 'button' }], assertions: [{ text: 'Verified Kodo' }] }, config: { timeoutMs: 2000 }, tool: { command: 'managed-desktop', args: [] }, evidenceDir: process.cwd() };
-function desktopPort({ ambiguous = false, uncertain = false, truncated = false } = {}) {
+function desktopPort({ ambiguous = false, uncertain = false, uncertainChangedState = true, truncated = false } = {}) {
   const calls = []; let stage = 0;
   return { calls, runner: async (command, args, options) => {
     calls.push(args); assert.equal(command, 'managed-desktop'); assert.equal(options.env.GEMINI_API_KEY, undefined);
@@ -27,7 +28,7 @@ function desktopPort({ ambiguous = false, uncertain = false, truncated = false }
     if (args[0] === 'skills') data = { content: 'version matched docs' };
     else if (args[0] === 'find') { assert.ok(args.includes('OwnedFixture') && args.includes('w-123')); data = { matches: [{ ref_id: `@s${stage}:e1` }, ...(ambiguous ? [{ ref_id: '@s0:e2' }] : [])] }; }
     else if (args[0] === 'set-value') { assert.equal(args[1], '@s0:e1'); assert.equal(args[2], 'Kodo'); stage++; data = {}; }
-    else if (args[0] === 'click') { assert.equal(args[1], '@s1:e1'); stage++; if (uncertain) return { code: 1, stdout: JSON.stringify({ version: '2.5', command: 'click', ok: false, error: { disposition: { delivery: 'uncertain', retry: 'unsafe' } } }) }; data = {}; }
+    else if (args[0] === 'click') { assert.equal(args[1], '@s1:e1'); if (!uncertain || uncertainChangedState) stage++; if (uncertain) return { code: 1, stdout: JSON.stringify({ version: '2.5', command: 'click', ok: false, error: { disposition: { delivery: 'uncertain', retry: 'unsafe' } } }) }; data = {}; }
     else if (args[0] === 'get') data = { value: 'Kodo' };
     else if (args[0] === 'snapshot') data = { complete: !truncated, window: { id: 'w-123' }, tree: { role: 'window', children: [{ name: 'Verification result', value: stage === 2 ? 'Verified Kodo' : 'Not verified' }] } };
     else throw Error('unexpected command');
@@ -39,11 +40,23 @@ test('desktop uses scoped qualified refs, fresh readback and no physical input',
   assert.equal(r.status, 'completed'); assert.ok(r.observations[0].texts.includes('Verified Kodo'));
   assert.equal(port.calls.filter(a => a[0] === 'click').length, 1);
 });
-test('desktop blocks ambiguity/incomplete observations and never repeats uncertain input', async () => {
+test('desktop blocks ambiguity and incomplete observations', async () => {
   for (const options of [{ ambiguous: true }, { truncated: true }]) await assert.rejects(runDesktopCase({ ...desktop, ...desktopPort(options) }));
+});
+test('desktop observes uncertain final delivery once and requires independent state assertions', async () => {
   const port = desktopPort({ uncertain: true }); const r = await runDesktopCase({ ...desktop, ...port });
-  assert.equal(r.status, 'failed'); assert.equal(port.calls.filter(a => a[0] === 'click').length, 1);
+  assert.equal(r.status, 'completed'); assert.equal(assessObservations(desktop.case, r.observations)[0].passed, true);
+  assert.equal(port.calls.filter(a => a[0] === 'click').length, 1);
   assert.ok(port.calls.at(-1).includes('snapshot'));
+  const failed = desktopPort({ uncertain: true, uncertainChangedState: false });
+  const other = await runDesktopCase({ ...desktop, ...failed });
+  assert.equal(assessObservations(desktop.case, other.observations)[0].passed, false);
+  assert.equal(failed.calls.filter(a => a[0] === 'click').length, 1);
+});
+test('desktop does not continue mutations after uncertain intermediate delivery', async () => {
+  const port = desktopPort({ uncertain: true });
+  const r = await runDesktopCase({ ...desktop, case: { ...desktop.case, steps: [...desktop.case.steps, { action: 'click', name: 'Other' }] }, ...port });
+  assert.equal(r.status, 'failed'); assert.equal(port.calls.filter(a => a[0] === 'click').length, 1);
 });
 test('desktop does not silently select the focused window when the configured app has multiple windows', async () => {
   const c = { ...desktop.case, windowId: undefined, steps: [] };

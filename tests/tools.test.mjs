@@ -195,7 +195,11 @@ function pythonRunner({ malformed = false, wrongCommit = false, missingAsset = f
 
 test('Chrome MCP accepts the pinned package relative bin spelling and rejects traversal', async t => {
   const fx = await fixture(t), good = npmRunner({ binPrefix: './' });
-  assert.equal((await installTools(['chrome-devtools-mcp'], { ...fx, runner: good.runner }))[0].ready, true);
+  const installed = (await installTools(['chrome-devtools-mcp'], { ...fx, runner: good.runner }))[0];
+  assert.equal(installed.ready, true);
+  assert.equal(installed.env.CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS, '1');
+  const probe = good.calls.find(c => c.command === process.execPath);
+  assert.equal(probe.options.env.CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS, '1');
   const other = await fixture(t), bad = npmRunner({ binPrefix: '../' });
   assert.equal((await installTools(['chrome-devtools-mcp'], { ...other, runner: bad.runner }))[0].ready, false);
 });

@@ -89,7 +89,7 @@ function invocation(tool, directory, platform, arch) {
   };
   if (tool.kind === 'native') return { command: path.join(directory, 'native', tool.assets[`${platform}-${arch}`].executable), args: [], env: {} };
   const root = path.join(directory, 'npm', 'node_modules', tool.id);
-  if (tool.id === 'chrome-devtools-mcp') return { command: process.execPath, args: [path.join(root, tool.entry), '--no-usage-statistics', '--no-performance-crux'], env: { NO_UPDATE_CHECKS: '1' } };
+  if (tool.id === 'chrome-devtools-mcp') return { command: process.execPath, args: [path.join(root, tool.entry), '--no-usage-statistics', '--no-performance-crux'], env: { NO_UPDATE_CHECKS: '1', CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS: '1' } };
   const helper = desktopHelper(platform, arch);
   return { command: path.join(root, 'bin', desktopName(platform, arch)), args: [], env: helper ? {
     [platform === 'darwin' ? 'AGENT_DESKTOP_MACOS_HELPER_PATH' : 'AGENT_DESKTOP_LINUX_CLIPBOARD_OWNER_PATH']: path.join(root, 'bin', helper)
