@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, writeFile, readFile, readdir, rm, symlink, link, chmod } from 'node:fs/promises';
+import { mkdtemp, writeFile, readFile, readdir, rm, symlink, link, chmod, realpath } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
@@ -11,7 +11,8 @@ import { cacheFingerprint, readCheckCache, writeCheckCache } from '../runtime/ci
 const hash = value => createHash('sha256').update(value).digest('hex');
 const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8', windowsHide: true }).trim();
 async function fixture(t) {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'kodo-cache-')), project = path.join(root, 'project'), home = path.join(root, 'private');
+  // Cache reuse requires a canonical project, even when TEMP is an 8.3 alias.
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'kodo-cache-'))), project = path.join(root, 'project'), home = path.join(root, 'private');
   const { mkdir } = await import('node:fs/promises'); await mkdir(project);
   t.after(() => rm(root, { recursive: true, force: true }));
   git(project, 'init', '-q'); git(project, 'config', 'user.email', 'fixture@example.invalid'); git(project, 'config', 'user.name', 'Fixture');
@@ -32,6 +33,27 @@ test('Command cache first run misses and exact successful complete private recei
   assert.equal(await writeCheckCache(fx), true);
   const result = await readCheckCache(fx); assert.equal(result.exitCode, 0); assert.equal(result.headSha, fx.headSha);
   assert.equal(result.trust, 'private-local'); assert.equal(result.complete, true);
+});
+
+test('Command cache keeps real Windows aliases as misses while canonical receipts remain reusable', { skip: process.platform !== 'win32' }, async t => {
+  const fx = await fixture(t);
+  assert.equal(fx.project, await realpath(fx.project));
+  assert.equal(await writeCheckCache(fx), true);
+  assert.equal((await readCheckCache(fx)).exitCode, 0);
+  const aliases = new Set([path.join(fx.root, 'PROJECT'), path.join(os.tmpdir(), path.basename(fx.root), 'project')]);
+  aliases.delete(fx.project);
+  for (const alias of aliases) {
+    assert.notEqual(alias, fx.project); assert.equal(await realpath(alias), fx.project);
+    t.diagnostic(JSON.stringify({ alias, physical: fx.project }));
+    // Even a valid stored canonical receipt must miss with an alias caller.
+    assert.equal(await readCheckCache({ ...fx, project: alias }), null);
+    const input = { ...fx.input, project: alias }, fingerprint = cacheFingerprint(input);
+    assert.notEqual(fingerprint, fx.fingerprint);
+    const aliased = { ...fx, project: alias, input, fingerprint };
+    assert.equal(await writeCheckCache(aliased), false);
+    assert.equal(await readCheckCache(aliased), null);
+  }
+  assert.equal((await readCheckCache(fx)).exitCode, 0);
 });
 
 test('Command cache requires freshly supplied complete context on every read', async t => {

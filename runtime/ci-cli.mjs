@@ -143,12 +143,34 @@ async function security(options, dependencies) {
   return receipt;
 }
 
+function redactDiagnosticOutput(text, secrets) {
+  // Sweep original ranges before replacing: sequential replacement can destroy
+  // crossing/prefix matches and expose a suffix. Keep one pending match per
+  // known value, including overlapping occurrences of the same value.
+  const pending = [...new Set(Object.values(secrets))]
+    .filter(value => typeof value === 'string' && value.length > 5 && value.length <= text.length)
+    .map(value => ({ value, index: text.indexOf(value) })).filter(match => match.index >= 0);
+  const parts = []; let cursor = 0, start = -1, end = 0;
+  const flush = () => { if (start >= 0) { parts.push(text.slice(cursor, start), '[REDACTED]'); cursor = end; } };
+  while (pending.length) {
+    let next = 0;
+    for (let index = 1; index < pending.length; index++) if (pending[index].index < pending[next].index) next = index;
+    const match = pending[next];
+    if (start < 0 || match.index > end) { flush(); start = match.index; end = match.index + match.value.length; }
+    else end = Math.max(end, match.index + match.value.length);
+    match.index = text.indexOf(match.value, match.index + 1);
+    if (match.index < 0) pending.splice(next, 1);
+  }
+  flush();
+  return redact(parts.length ? parts.join('') + text.slice(cursor) : text);
+}
+
 function failureDiagnostic(result, secrets) {
   const diagnostic = {};
   for (const stream of ['stdout', 'stderr']) {
     // Redact the entire capture before cutting: a credential may cross the
     // tail boundary. Advance past UTF-8 continuation bytes to retain valid text.
-    const bytes = Buffer.from(redact(typeof result[stream] === 'string' ? result[stream] : '', secrets));
+    const bytes = Buffer.from(redactDiagnosticOutput(typeof result[stream] === 'string' ? result[stream] : '', secrets));
     let start = Math.max(0, bytes.length - 4096);
     while (start < bytes.length && (bytes[start] & 0xc0) === 0x80) start++;
     diagnostic[`${stream}Tail`] = bytes.subarray(start).toString('utf8');

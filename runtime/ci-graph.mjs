@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { realpath } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { isBuiltin } from 'node:module';
 import { parse } from 'acorn';
@@ -140,7 +141,9 @@ function buildGraph(tree, reasons) {
 /** Plan from immutable Git objects. Any uncertain edge forces the caller's full test runner. */
 export async function planAffected({ project, baseSha, headSha, changedPaths = [] }) {
   project = path.resolve(project); await noLinks(project);
-  if (path.resolve((await git(project, ['rev-parse', '--show-toplevel'])).trim()) !== project) throw new Error('Affected project must be the repository root');
+  // Reject links before resolving legitimate Windows case and 8.3 aliases.
+  project = await realpath(project);
+  if (await realpath(path.resolve((await git(project, ['rev-parse', '--show-toplevel'])).trim())) !== project) throw new Error('Affected project must be the repository root');
   if (!Array.isArray(changedPaths)) throw new Error('Invalid changed paths');
   changedPaths.forEach(relative);
   headSha = await revision(project, headSha || (await git(project, ['rev-parse', 'HEAD'])).trim());

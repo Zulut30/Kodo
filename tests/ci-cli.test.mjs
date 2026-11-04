@@ -268,6 +268,75 @@ test('CI failure diagnostics mask known secrets before byte tails and exclude en
   } finally { if (previous === undefined) delete process.env[name]; else process.env[name] = previous; }
 });
 
+test('CI public failure diagnostics merge original secret ranges through real profiler and injected execute', async t => {
+  const secrets = {
+    KODO_CI_FIRST_TOKEN: 'alpha-overlap', KODO_CI_SECOND_TOKEN: 'overlap-omega',
+    KODO_CI_A_PREFIX_TOKEN: 'prefix-value', KODO_CI_Z_LONG_TOKEN: 'prefix-value-extended'
+  };
+  const previous = Object.fromEntries(Object.keys(secrets).map(name => [name, process.env[name]]));
+  Object.assign(process.env, secrets);
+  t.after(() => {
+    for (const [name, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[name]; else process.env[name] = value;
+    }
+  });
+  for (const route of ['real profiler', 'injected execute']) {
+    for (const kind of ['crossing', 'prefix']) {
+      for (const boundary of [false, true]) await t.test(`${route}: ${kind}${boundary ? ' at tail boundary' : ' repeated'}`, async t => {
+        const value = kind === 'crossing' ? 'alpha-overlap-omega' : 'prefix-value-extended';
+        const output = Object.fromEntries(['stdout', 'stderr'].map(stream => [stream, boundary
+          ? 'private-prefix-' + 'p'.repeat(6000) + value + 'z'.repeat(4090)
+          : `${stream}: ${value} / ${value}`]));
+        const scratch = await mkdtemp(path.join(os.tmpdir(), 'kodo-ci-overlap-'));
+        t.after(async () => { assert.equal(path.dirname(scratch), path.resolve(os.tmpdir())); await rm(scratch, { recursive: true, force: true }); });
+        const project = path.join(scratch, 'project'); await mkdir(project);
+        const git = args => execute('git', args, { cwd: project });
+        await git(['init', '-q']); await git(['config', 'user.name', 'CI Fixture']); await git(['config', 'user.email', 'ci@example.invalid']);
+        await writeFile(path.join(project, 'package.json'), JSON.stringify({ private: true, scripts: { check: 'node emit.mjs' } }));
+        await writeFile(path.join(project, '.npmrc'), 'loglevel=silent\n');
+        await writeFile(path.join(project, 'emit.mjs'), `
+          import assert from 'node:assert/strict';
+          for (const name of ${JSON.stringify(Object.keys(secrets))}) assert.equal(process.env[name], undefined);
+          process.stdout.write(${JSON.stringify(output.stdout)});
+          process.stderr.write(${JSON.stringify(output.stderr)});
+          process.exitCode = 8;
+        `);
+        await git(['add', '.']); await git(['commit', '-qm', 'fixture']);
+        let executions = 0;
+        const dependencies = route === 'real profiler'
+          ? { security: async () => ({ status: 'passed', passed: true }) }
+          : ports({ execute: async (_command, _args, options) => {
+            executions++;
+            for (const name of Object.keys(secrets)) assert.equal(options.env[name], undefined);
+            return { code: 8, ...output, env: { unexpected: 'environment-snapshot' }, args: ['argv-snapshot'] };
+          } }).dependencies;
+        const result = await ciCli(['run', '--tier', 'L2', '--project', project, '--json'], dependencies);
+        const report = JSON.parse(result.output), receipt = report.receipts.find(row => row.phase === 'fullcheck');
+        assert.equal(result.exitCode, 1); assert.equal(report.status, 'failed'); assert.equal(report.complete, false);
+        assert.equal(receipt.status, 'failed'); assert.equal(receipt.exitCode, 8);
+        if (route === 'real profiler') {
+          assert.ok(receipt.profilePath);
+          for (const stream of ['stdout', 'stderr']) {
+            const raw = await readFile(path.join(path.dirname(receipt.profilePath), `${stream}.log`), 'utf8');
+            assert.ok(raw.includes(output[stream]), 'private full captures remain available through the real profiler');
+          }
+        } else assert.equal(executions, 1);
+        const diagnostic = receipt.diagnostic;
+        assert.ok(diagnostic);
+        assert.deepEqual(Object.keys(diagnostic).sort(), ['stderrTail', 'stderrTruncated', 'stdoutTail', 'stdoutTruncated']);
+        for (const stream of ['stdout', 'stderr']) {
+          const expected = boundary ? 'ACTED]' + 'z'.repeat(4090) : `${stream}: [REDACTED] / [REDACTED]`;
+          assert.equal(diagnostic[`${stream}Tail`], expected);
+          assert.equal(diagnostic[`${stream}Truncated`], boundary);
+          assert.ok(Buffer.byteLength(diagnostic[`${stream}Tail`]) <= 4096);
+        }
+        for (const hidden of [...Object.keys(secrets), ...Object.values(secrets), '-omega', '-extended', 'private-prefix-', 'environment-snapshot', 'argv-snapshot']) assert.ok(!result.output.includes(hidden));
+        assert.equal(receipt.env, undefined); assert.equal(receipt.stdout, undefined); assert.equal(receipt.stderr, undefined);
+      });
+    }
+  }
+});
+
 test('CI failure diagnostics preserve Unicode and finite per-stream byte boundaries', async () => {
   for (const length of [4095, 4096, 4097]) {
     const p = ports({ execute: async () => ({ code: 1, stdout: 'a'.repeat(length), stderr: 'b'.repeat(length) }) });

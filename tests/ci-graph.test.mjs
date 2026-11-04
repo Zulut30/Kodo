@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, rm, rename } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, rm, rename, realpath, symlink } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
@@ -158,6 +158,71 @@ test('Affected graph requires the repository root and ignores relative diff conf
   git(fx.project, 'config', 'diff.relative', 'true');
   const plan = await planAffected({ ...fx, headSha }); assert.deepEqual(plan.testFiles, ['tests/value.test.mjs']);
   await assert.rejects(() => planAffected({ ...fx, project: path.join(fx.project, 'src'), headSha }), /root/i);
+});
+
+test('Affected graph accepts a real Windows case alias for the repository root', { skip: process.platform !== 'win32' }, async t => {
+  const fx = await fixture(t); await put(fx.project, 'src/value.mjs', 'export const value = 2;'); const headSha = fx.commit();
+  const physical = await realpath(fx.project), alias = path.join(path.dirname(physical), path.basename(physical).toUpperCase());
+  assert.notEqual(alias, physical); assert.equal(await realpath(alias), physical);
+  const gitRoot = path.resolve(git(alias, 'rev-parse', '--show-toplevel'));
+  assert.notEqual(gitRoot, alias, 'real Git must expose the lexical root mismatch');
+  assert.equal(await realpath(gitRoot), physical);
+  t.diagnostic(JSON.stringify({ alias, physical, gitRoot }));
+  const plan = await planAffected({ ...fx, project: alias, headSha });
+  assert.equal(plan.fallback, false); assert.deepEqual(plan.reasons, []);
+  assert.deepEqual(plan.testFiles, ['tests/value.test.mjs']);
+  assert.deepEqual(plan.affectedFiles, ['src/bridge.mjs', 'src/value.mjs', 'tests/value.test.mjs']);
+  assert.deepEqual(plan, await planAffected({ ...fx, project: physical, headSha }));
+});
+
+test('Affected graph accepts an available real Windows short path for the repository root', { skip: process.platform !== 'win32' }, async t => {
+  const fx = await fixture(t); await put(fx.project, 'src/value.mjs', 'export const value = 2;'); const headSha = fx.commit();
+  // Ask Windows for an existing 8.3 name; do not invent an alias or mock Git.
+  const alias = execFileSync('cmd.exe', ['/d', '/c', 'for %I in ("%KODO_GRAPH_ALIAS_ROOT%") do @echo %~sI'], {
+    encoding: 'utf8', windowsHide: true, windowsVerbatimArguments: true, env: { ...process.env, KODO_GRAPH_ALIAS_ROOT: fx.project }
+  }).trim();
+  const physical = await realpath(fx.project);
+  if (!alias.includes('~') || alias === physical) { t.skip('Filesystem did not supply an 8.3 alias'); return; }
+  assert.equal(await realpath(alias), physical);
+  const gitRoot = path.resolve(git(alias, 'rev-parse', '--show-toplevel'));
+  assert.notEqual(gitRoot, alias, 'real Git must expand the short path');
+  assert.equal(await realpath(gitRoot), physical);
+  t.diagnostic(JSON.stringify({ alias, physical, gitRoot }));
+  const plan = await planAffected({ ...fx, project: alias, headSha });
+  assert.equal(plan.fallback, false); assert.deepEqual(plan.reasons, []);
+  assert.deepEqual(plan.testFiles, ['tests/value.test.mjs']);
+  assert.deepEqual(plan.affectedFiles, ['src/bridge.mjs', 'src/value.mjs', 'tests/value.test.mjs']);
+  assert.deepEqual(plan, await planAffected({ ...fx, project: physical, headSha }));
+});
+
+test('Affected graph rejects a linked root and linked ancestor before resolving physical paths', async t => {
+  const fx = await fixture(t), wrapper = await mkdtemp(path.join(os.tmpdir(), 'kodo-graph-links-'));
+  t.after(() => rm(wrapper, { recursive: true, force: true }));
+  const link = path.join(wrapper, 'repository');
+  await symlink(fx.project, link, process.platform === 'win32' ? 'junction' : 'dir');
+  assert.equal(await realpath(link), await realpath(fx.project));
+  await assert.rejects(() => planAffected({ ...fx, project: link }), /Unsafe symlink installation path/);
+  await assert.rejects(() => planAffected({ ...fx, project: path.join(link, 'src') }), /Unsafe symlink installation path/);
+});
+
+test('Affected graph rejects an outside directory without a repository', async t => {
+  const fx = await fixture(t), outside = await mkdtemp(path.join(os.tmpdir(), 'kodo-graph-outside-'));
+  t.after(() => rm(outside, { recursive: true, force: true }));
+  await assert.rejects(() => planAffected({ ...fx, project: outside }), /not a git repository/i);
+});
+
+test('Affected graph retains immutable object snapshots and current head and dirty guards', async t => {
+  const fx = await fixture(t), base = await planAffected(fx);
+  await put(fx.project, 'src/value.mjs', 'export const value = 2;'); const headSha = fx.commit();
+  const stale = await planAffected({ ...fx, headSha: fx.baseSha });
+  assert.equal(stale.fallback, true); assert.deepEqual(stale.reasons, ['head-mismatch']);
+  assert.equal(stale.sourceHash, base.sourceHash); assert.equal(stale.dependencyHash, base.dependencyHash);
+  const clean = await planAffected({ ...fx, headSha });
+  await put(fx.project, 'src/value.mjs', 'export const broken = ;');
+  const dirty = await planAffected({ ...fx, headSha });
+  assert.equal(dirty.fallback, true); assert.deepEqual(dirty.reasons, ['dirty-worktree']);
+  assert.equal(dirty.sourceHash, clean.sourceHash); assert.equal(dirty.dependencyHash, clean.dependencyHash);
+  assert.deepEqual(dirty.testFiles, ['tests/other.test.mjs', 'tests/value.test.mjs']);
 });
 
 test('Affected graph cannot narrow tests in a project with unsupported source languages', async t => {
