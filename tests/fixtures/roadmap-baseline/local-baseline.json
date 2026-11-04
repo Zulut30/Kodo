@@ -1,0 +1,110 @@
+{
+  "schemaVersion": 1,
+  "kind": "roadmap-local-baseline-public",
+  "sourceReceipt": "baseline-receipt.json",
+  "sourceReceiptSha256": "8b3057a681b40a65dcd85fbf5fdf57f054f7cbf53b5f484bc49c0f4b54977191",
+  "head": "d2654f12b1da21dfa3523fa9b1aea72b51a050ba",
+  "platform": "win32",
+  "arch": "x64",
+  "node": "v24.19.0",
+  "abi": "137",
+  "startedAt": "2026-11-04T11:04:10.628Z",
+  "endedAt": "2026-11-04T11:14:01.152Z",
+  "parserNote": "Final counts parsed from unchanged full log; Node 24 emitted spec summary with ℹ prefix. Exit codes, output hash and measured command durations unchanged.",
+  "status": "passed",
+  "passed": true,
+  "wallMs": 590524,
+  "results": [
+    {
+      "name": "install",
+      "args": [
+        "ci",
+        "--ignore-scripts",
+        "--no-audit",
+        "--no-fund"
+      ],
+      "exitCode": 0,
+      "durationMs": 3454.1351999999997,
+      "sha256": "b5f9366bb62b10c6b293eafaf1c39aef6975b45c59efc5566937eab5f0edea44",
+      "command": "npm",
+      "counts": {}
+    },
+    {
+      "name": "check",
+      "args": [
+        "run",
+        "check"
+      ],
+      "exitCode": 0,
+      "durationMs": 579186.6849000001,
+      "sha256": "2034c4b77c37058347d5717431a5f78a5bb56c8ca8a8ff2e1cb101e4028f0d05",
+      "command": "npm",
+      "counts": {
+        "tests": 731,
+        "pass": 729,
+        "fail": 0,
+        "cancelled": 0,
+        "skipped": 2,
+        "duration_ms": 577586.0121
+      }
+    },
+    {
+      "name": "package-smoke",
+      "args": [
+        "scripts/package-smoke.mjs"
+      ],
+      "exitCode": 0,
+      "durationMs": 7878.847499999916,
+      "sha256": "dfe4a65f47dd42ac60dcf5d009fab9e5010029b68234749590eb93ff414d3a5c",
+      "command": "node",
+      "commandNormalization": "Absolute Node executable is represented by its command name; private path omitted.",
+      "counts": {}
+    }
+  ],
+  "installed": {
+    "package": "@zulut30/kodo",
+    "version": "0.2.6",
+    "archive": "zulut30-kodo-0.2.6.tgz",
+    "sha256": "4b53673c308d73413bb3c4e82541ec0128dcbe6f576486579efd2cceca725650",
+    "components": 33,
+    "defaultSkills": 13,
+    "upstreamFiles": 183,
+    "checks": [
+      "npm pack",
+      "isolated install --ignore-scripts",
+      "installed package bin and launcher",
+      "installed CLI help",
+      "installed CLI validate --json",
+      "installed CLI list --json",
+      "installed default skill pins"
+    ],
+    "passed": true
+  },
+  "nativeCliAuth": {
+    "source": "coordinator non-live doctor report on 2026-11-04",
+    "live": false,
+    "codex": "subscription auth status OK",
+    "claudeCode": "subscription auth status OK",
+    "externalKeysConfigured": 5
+  },
+  "nativeCliInference": "NOT RUN",
+  "desktopWorker": "Real scoped subscription worker in a visible Codex desktop chat; not native CLI inference evidence",
+  "uiVerification": {
+    "status": "disabled",
+    "passed": null
+  },
+  "securityGates": "Separate coordinator gates; no fresh scanner PASS claimed by this fixture",
+  "deployment": "NOT CONFIGURED",
+  "benchmark": {
+    "status": "PAUSED",
+    "historicalCompletedTrials": 9,
+    "historicalPlannedTrials": 24,
+    "newTrials": 0
+  },
+  "limitations": [
+    "Local baseline on original source HEAD; final documentation commit requires separate integrated gates, review and exact-head CI.",
+    "Worker verified source receipt and all three command log SHA-256 values but did not duplicate full checks.",
+    "Source receipt and complete command logs remain private outside Git. Public fixture omits raw logs, prompts, credentials and personal paths.",
+    "Published 0.2.6 remote asset was downloaded and installed by coordinator before this task; this package smoke installs a locally packed baseline."
+  ]
+}
