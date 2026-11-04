@@ -2,8 +2,124 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { chmod, readFile, realpath } from 'node:fs/promises';
 import path from 'node:path';
-import { fixture, put, projects, pins, fakeTools, toolRunner, windowsShortPath } from './fixtures/quality/helpers.mjs';
+import { fixture, put, projects, pins, fakeTools, toolRunner, windowsShortPath, vendoredGo } from './fixtures/quality/helpers.mjs';
 const api = () => import('../runtime/quality-runner.mjs');
+
+test('Quality Go seals workspace and persistent environment for build and vet', async t => {
+  const { runQuality } = await api();
+  for (const [label, files, mod] of [['standalone', projects.go, 'readonly'], ['vendor', vendoredGo, 'vendor']]) {
+    const fx = await fixture(t, files), fake = toolRunner();
+    const nativeResolve = async id => ({ command: id, args: [], env: { GOENV: '/outside/env', GOWORK: '/outside/go.work', GOFLAGS: '-overlay=/outside/overlay.json', GOPROXY: 'https://outside.invalid', goenv: '/outside/env', gowork: '/outside/go.work', goflags: '-modfile=/outside/go.mod' } });
+    const result = await runQuality({ ...fx, nativeResolve, runner: fake.runner, capabilities: ['lint', 'typecheck'] });
+    assert.equal(result.status, 'passed', label);
+    for (const { options } of fake.calls) {
+      assert.equal(options.env.GOWORK, 'off'); assert.equal(options.env.GOENV, 'off');
+      assert.equal(options.env.GOFLAGS, `-mod=${mod}`); assert.equal(options.env.GOPROXY, 'off');
+      assert.equal(options.env.GOTOOLCHAIN, 'local');
+      assert.equal(options.env.goenv, undefined); assert.equal(options.env.gowork, undefined); assert.equal(options.env.goflags, undefined);
+      assert.ok(options.env.GOMODCACHE.startsWith(result.evidenceRoot));
+    }
+    assert.ok(fake.calls.some(c => c.args[0] === 'vet')); assert.ok(fake.calls.some(c => c.args[0] === 'build'));
+  }
+});
+
+test('Quality Go vendor mutations invalidate receipts and activate owning quick checks', async t => {
+  const { runQuality, isCurrentQualityReceipt } = await api();
+  const fx = await fixture(t, vendoredGo), fake = toolRunner();
+  const options = { ...fx, runner: fake.runner, capabilities: ['typecheck'] };
+  const first = await runQuality(options);
+  assert.equal(first.passed, true); assert.equal(await isCurrentQualityReceipt(first, options), true);
+  await put(fx.project, 'vendor/example.test/dependency/value.go', 'package dependency\nvar Value int = "bad"\n');
+  assert.equal(await isCurrentQualityReceipt(first, options), false);
+  const quick = await runQuality({ ...options, changedPaths: ['vendor/example.test/dependency/value.go'], mode: 'quick' });
+  assert.equal(quick.receipts[0].status, 'passed');
+  assert.match(quick.receipts[0].scopeReason, /vendor/);
+  assert.ok(fake.calls.filter(c => c.args[0] === 'build').length >= 2, 'quick executes the compiler again');
+  assert.deepEqual(quick.receipts[0].files, ['main.go']);
+  const hashes = new Map(first.plan.files.map(f => [f.path, f.sha256]));
+  assert.ok(hashes.has('vendor/modules.txt')); assert.ok(hashes.has('vendor/example.test/dependency/value.go'));
+});
+
+test('Quality Go exact version and shared deadline remain fail closed', async t => {
+  const { runQuality } = await api();
+  const fx = await fixture(t, projects.go);
+  const mismatch = toolRunner({ go: () => ({ code: 0, stdout: 'go version go1.24.1 windows/amd64', stderr: '' }) });
+  const wrong = await runQuality({ ...fx, runner: mismatch.runner, capabilities: ['typecheck'] });
+  assert.equal(wrong.status, 'blocked'); assert.equal(wrong.receipts[0].reason, 'version_mismatch');
+  assert.equal(mismatch.calls.some(call => call.args[0] === 'build'), false);
+  const expired = toolRunner({ go: async ({ args }) => {
+    assert.equal(args[0], 'version', 'expired version budget must prevent build');
+    await new Promise(resolve => setTimeout(resolve, 1100));
+    return { code: 0, stdout: 'go version go1.24.0 windows/amd64', stderr: '' };
+  } });
+  const deadline = await runQuality({ ...fx, runner: expired.runner, capabilities: ['typecheck'], timeoutMs: 1000 });
+  assert.equal(deadline.status, 'blocked'); assert.equal(deadline.receipts[0].reason, 'timeout');
+  assert.equal(expired.calls.length, 1);
+});
+
+test('Quality native Go ignores parent workspace and never certifies sibling dependency bytes', { skip: !process.env.KODO_QUALITY_GO_BINARY }, async t => {
+  const { runQuality, isCurrentQualityReceipt } = await api();
+  const binary = process.env.KODO_QUALITY_GO_BINARY;
+  const nativeResolve = async () => ({ command: binary, args: [], env: {} });
+  await t.test('sibling dependency is not a standalone PASS', async t => {
+    const fx = await fixture(t, { ...projects.go, 'main.go': 'package main\nimport "example.test/sibling"\nvar value int = sibling.Value\nfunc main() {}\n' });
+    await put(fx.base, 'go.work', 'go 1.24.0\nuse (\n ./project\n ./sibling\n)\n');
+    await put(fx.base, 'sibling/go.mod', 'module example.test/sibling\n\ngo 1.24.0\n');
+    await put(fx.base, 'sibling/value.go', 'package sibling\nconst Value = 42\n');
+    const options = { ...fx, nativeResolve, capabilities: ['typecheck'] };
+    const first = await runQuality(options);
+    await put(fx.base, 'sibling/value.go', 'package sibling\nconst Value = "bad"\n');
+    const current = await isCurrentQualityReceipt(first, options);
+    await captureGoProbe('parent-workspace-sibling', first, { currentAfterSiblingMutation: current });
+    assert.equal(first.passed, false, 'untracked workspace dependency must never receive PASS');
+    assert.equal(current, false, 'a successful receipt cannot survive a dependency mutation');
+  });
+  await t.test('valid stdlib module ignores unrelated parent workspace', async t => {
+    const fx = await fixture(t, { ...projects.go, 'main.go': 'package main\nimport "fmt"\nfunc main() { fmt.Println("ok") }\n' });
+    await put(fx.base, 'go.work', 'go 1.24.0\nuse ./sibling\n');
+    await put(fx.base, 'sibling/go.mod', 'module example.test/sibling\n\ngo 1.24.0\n');
+    await put(fx.base, 'sibling/value.go', 'package sibling\nconst Value = 42\n');
+    const result = await runQuality({ ...fx, nativeResolve, capabilities: ['typecheck'] });
+    await captureGoProbe('parent-workspace-stdlib', result);
+    assert.equal(result.passed, true, JSON.stringify(result.receipts));
+  });
+});
+
+test('Quality native Go prepared vendor works offline and tracks dependency errors and quick scope', { skip: !process.env.KODO_QUALITY_GO_BINARY }, async t => {
+  const { runQuality, isCurrentQualityReceipt } = await api();
+  const fx = await fixture(t, vendoredGo);
+  const nativeResolve = async () => ({ command: process.env.KODO_QUALITY_GO_BINARY, args: [], env: {} });
+  const options = { ...fx, nativeResolve, capabilities: ['typecheck'] };
+  const { execute } = await import('../runtime/delivery.mjs');
+  const command = process.env.KODO_QUALITY_GO_BINARY, args = ['build', '-o', path.join(fx.base, 'ordinary-build.exe'), './...'];
+  const env = { PATH: process.env.PATH, SystemRoot: process.env.SystemRoot, HOME: fx.base, USERPROFILE: fx.base, TEMP: fx.base, TMP: fx.base,
+    GOENV: 'off', GOWORK: 'off', GOTOOLCHAIN: 'local', GOPROXY: 'off', GOSUMDB: 'off', GOFLAGS: '', GOCACHE: path.join(fx.base, 'ordinary-cache'), GOMODCACHE: path.join(fx.base, 'empty-mod-cache') };
+  const ordinary = await execute(command, args, { cwd: fx.project, env, timeoutMs: 120000, allowFailure: true });
+  assert.equal(ordinary.code, 0, 'prepared fixture also builds with ordinary offline Go defaults');
+  const good = await runQuality(options);
+  await captureGoProbe('vendor-valid', good, { ordinaryOfflineBuild: { command, args, env, ...ordinary } });
+  assert.equal(good.passed, true, JSON.stringify(good.receipts));
+  assert.equal(await isCurrentQualityReceipt(good, options), true);
+  await put(fx.project, 'vendor/example.test/dependency/value.go', 'package dependency\nvar Value int = "bad"\n');
+  assert.equal(await isCurrentQualityReceipt(good, options), false);
+  const bad = await runQuality(options);
+  await captureGoProbe('vendor-bad-type', bad);
+  assert.equal(bad.status, 'failed', JSON.stringify(bad.receipts));
+  const quick = await runQuality({ ...options, mode: 'quick', changedPaths: ['vendor/example.test/dependency/value.go'] });
+  await captureGoProbe('vendor-quick-bad-type', quick);
+  assert.equal(quick.status, 'failed', JSON.stringify(quick.receipts));
+  assert.deepEqual(quick.receipts[0].files, ['main.go']);
+});
+
+async function captureGoProbe(name, report, observations = {}) {
+  if (!process.env.KODO_QUALITY_GO_PROBE_EVIDENCE) return;
+  const { cp, mkdir } = await import('node:fs/promises');
+  const target = path.join(process.env.KODO_QUALITY_GO_PROBE_EVIDENCE, name);
+  await mkdir(target, { recursive: true });
+  await put(target, 'report.json', { ...report, observations });
+  await mkdir(path.join(target, 'raw'), { recursive: true });
+  for (const receipt of report.receipts) for (const item of receipt.evidence) await cp(item.path, path.join(target, 'raw', path.basename(item.path)));
+}
 
 test('Quality TypeScript checks every receipt root despite files exclude and noCheck', async t => {
   const { runQuality } = await api();

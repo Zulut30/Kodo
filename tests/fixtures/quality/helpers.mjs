@@ -49,6 +49,13 @@ export const projects = {
   sql: { 'schema.sql': 'SELECT 1;\n' }
 };
 export const pins = { rustfmt: { version: '1.8.0' }, cargo: { version: '1.85.0' }, clippy: { version: '0.1.85' }, php: { version: '8.4.1' } };
+// Prepared vendor layout, without a proxy, installer or external module cache.
+export const vendoredGo = {
+  'go.mod': 'module example.test/fixture\n\ngo 1.24.0\n\nrequire example.test/dependency v1.0.0\n',
+  'main.go': 'package main\nimport "example.test/dependency"\nvar value int = dependency.Value\nfunc main() {}\n',
+  'vendor/modules.txt': '# example.test/dependency v1.0.0\n## explicit; go 1.24.0\nexample.test/dependency\n',
+  'vendor/example.test/dependency/value.go': 'package dependency\nconst Value = 42\n'
+};
 export function fakeTools(overrides = {}) {
   return async id => ({ id, version: ({ oxlint: '1.91.0', oxfmt: '0.76.0', typescript: '7.0.2', stylelint: '18.0.0', 'html-validate': '11.18.0', sqlfluff: '4.5.0' })[id], ready: true, status: 'ready', command: id, args: [], env: {}, ...overrides });
 }

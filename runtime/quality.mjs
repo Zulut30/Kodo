@@ -86,19 +86,26 @@ export async function qualityInventory(project) {
   const root = await realpath(requested);
   await noLinks(root);
   const files = []; let bytes = 0;
-  async function visit(directory, prefix = '') {
-    for (const entry of (await readdir(directory, { withFileTypes: true })).sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0)) {
-      if (ignored.has(entry.name) || privateSource(prefix + entry.name)) {
+  async function visit(directory, prefix = '', dependency = null) {
+    const entries = (await readdir(directory, { withFileTypes: true })).sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+    const goModule = !dependency && entries.some(entry => entry.name === 'go.mod' && entry.isFile());
+    for (const entry of entries) {
+      const goVendor = goModule && entry.name === 'vendor';
+      // Go reads dependency source, embed data and metadata from vendor. Hash
+      // every byte, including normally excluded names; never discover projects
+      // or frameworks inside that dependency tree.
+      if (!dependency && !goVendor && (ignored.has(entry.name) || privateSource(prefix + entry.name))) {
         if (entry.isSymbolicLink() && entry.name !== '.git') throw qualityError('unsafe_path', 'symlink in excluded project directory');
         continue;
       }
       const name = qualityPath(prefix + entry.name), absolute = path.join(directory, entry.name), info = await lstat(absolute);
       if (info.isSymbolicLink()) throw qualityError('unsafe_path', 'symlink in quality source scope');
-      if (info.isDirectory()) { await visit(absolute, name + '/'); continue; }
+      if (goVendor && !info.isDirectory()) throw qualityError('unsafe_path', 'Go vendor must be a real directory');
+      if (info.isDirectory()) { await visit(absolute, name + '/', goVendor ? { language: 'go', root: prefix.slice(0, -1) } : dependency); continue; }
       if (!info.isFile() || info.nlink > 1) throw qualityError('unsafe_path', 'non-regular or hardlinked quality source');
       bytes += info.size;
       if (files.length >= 20000 || bytes > 256 * 1024 * 1024 || info.size > 32 * 1024 * 1024) throw qualityError('scope_limit', 'quality source inventory exceeds limit');
-      files.push({ path: name, sha256: sha256(await readFile(absolute)) });
+      files.push({ path: name, sha256: sha256(await readFile(absolute)), ...(dependency ? { dependency } : {}) });
     }
   }
   await visit(root); return files;
@@ -165,7 +172,6 @@ async function validateManifestScope(root, files, documents) {
       };
       await visit(documents.get(name));
     }
-    if (base === 'go.mod') for (const match of documents.get(name).matchAll(/=>\s+(\.{1,2}\/[^\s]+)/g)) await checkedPath(name, match[1]);
     if (/\.csproj$/.test(base) || /^Directory\.Build\.(?:props|targets)$/.test(base)) {
       const text = await readFile(path.join(root, name), 'utf8');
       if (/<!DOCTYPE|<!ENTITY/i.test(text) || !/<(?:Project|project)(?:\s|>)/.test(text) || !/<\/(?:Project|project)>/.test(text)) throw qualityError('configuration', 'invalid .NET project manifest');
@@ -226,7 +232,15 @@ function metadataKind(name) {
 }
 function metadataScope(report, scope, affected) {
   const widened = new Map(), unknown = [];
+  const dependencies = new Map(report.files.filter(file => file.dependency).map(file => [file.path, file.dependency]));
   for (const name of scope) {
+    const dependency = dependencies.get(name);
+    if (dependency?.language === 'go') {
+      const owner = report.profiles.find(profile => profile.language === 'go' && profile.root === dependency.root);
+      if (owner) widened.set(owner.id, [...(widened.get(owner.id) ?? []), name]);
+      else unknown.push(name);
+      continue;
+    }
     const kind = metadataKind(name);
     if (!kind) continue;
     if (kind === 'unknown') { unknown.push(name); continue; }
@@ -272,7 +286,7 @@ export class QualityProfileRegistry {
   constructor() { this.languages = qualityLanguages; }
   async _discover(project) {
     const requested = path.resolve(project); await noLinks(requested);
-    const root = await realpath(requested), files = await qualityInventory(root), names = new Set(files.map(f => f.path));
+    const root = await realpath(requested), files = await qualityInventory(root), projectFiles = files.filter(file => !file.dependency), names = new Set(projectFiles.map(f => f.path));
     const documents = new Map(), frameworks = new Set(), frameworkEvidence = [];
     const markFramework = (framework, name) => { frameworks.add(framework); frameworkEvidence.push({ framework, root: dir(name) }); };
     for (const name of names) {
@@ -299,11 +313,11 @@ export class QualityProfileRegistry {
       if (!pkg || ![1, 2, 3].includes(doc.lockfileVersion)) throw qualityError('configuration', 'mismatched package lock manifest');
       if (doc.lockfileVersion >= 2 && (!object(locked) || ['dependencies', 'devDependencies', 'optionalDependencies'].some(key => JSON.stringify(Object.entries(pkg[key] ?? {}).sort()) !== JSON.stringify(Object.entries(locked[key] ?? {}).sort())))) throw qualityError('configuration', 'package lock dependencies differ from manifest');
     }
-    await validateManifestScope(root, files, documents);
+    await validateManifestScope(root, projectFiles, documents);
     const config = normalizeQualityConfig(documents.get('kodo.config.json')?.quality);
-    const languageFiles = files.filter(f => languageOf(f.path)); const profiles = [];
+    const languageFiles = projectFiles.filter(f => languageOf(f.path)); const profiles = [];
     for (const language of qualityLanguages) {
-      const roots = [...new Set(files.filter(f => ({ csharp: /\.csproj$/, rust: /(?:^|\/)Cargo\.toml$/, go: /(?:^|\/)go\.mod$/, php: /(?:^|\/)composer\.json$/, typescript: /(?:^|\/)package\.json$/, javascript: /(?:^|\/)package\.json$/, css: /(?:^|\/)package\.json$/, html: /(?:^|\/)package\.json$/, sql: /(?:^|\/)package\.json$/ })[language].test(f.path)).map(f => dir(f.path)))].sort((a, b) => b.length - a.length || a.localeCompare(b));
+      const roots = [...new Set(projectFiles.filter(f => ({ csharp: /\.csproj$/, rust: /(?:^|\/)Cargo\.toml$/, go: /(?:^|\/)go\.mod$/, php: /(?:^|\/)composer\.json$/, typescript: /(?:^|\/)package\.json$/, javascript: /(?:^|\/)package\.json$/, css: /(?:^|\/)package\.json$/, html: /(?:^|\/)package\.json$/, sql: /(?:^|\/)package\.json$/ })[language].test(f.path)).map(f => dir(f.path)))].sort((a, b) => b.length - a.length || a.localeCompare(b));
       const grouped = new Map();
       for (const file of languageFiles.filter(f => languageOf(f.path) === language)) {
         const owner = roots.find(r => beneath(r, file.path)) ?? '';
@@ -311,7 +325,7 @@ export class QualityProfileRegistry {
       }
       for (const [owner, sources] of [...grouped].sort()) {
         // Include real same-directory manifests/configs/locks, not directory names.
-        const metadata = files.filter(f => dir(f.path) === owner && /(?:\.csproj$|\.slnx?$|(?:^|\/)(?:package(?:-lock)?\.json|tsconfig[^/]*\.json|Cargo\.(?:toml|lock)|rust-toolchain\.toml|go\.(?:mod|sum)|composer\.(?:json|lock)|global\.json|next\.config\.[^/]+|astro\.config\.[^/]+|\.stylelintrc[^/]*|stylelint\.config\.[^/]+|\.htmlvalidate[^/]*|\.sqlfluff|\.editorconfig))/.test(f.path)).map(f => f.path);
+        const metadata = projectFiles.filter(f => dir(f.path) === owner && /(?:\.csproj$|\.slnx?$|(?:^|\/)(?:package(?:-lock)?\.json|tsconfig[^/]*\.json|Cargo\.(?:toml|lock)|rust-toolchain\.toml|go\.(?:mod|sum)|composer\.(?:json|lock)|global\.json|next\.config\.[^/]+|astro\.config\.[^/]+|\.stylelintrc[^/]*|stylelint\.config\.[^/]+|\.htmlvalidate[^/]*|\.sqlfluff|\.editorconfig))/.test(f.path)).map(f => f.path);
         const ownFrameworks = [...new Set(frameworkEvidence.filter(e => e.root === owner || beneath(owner, at(e.root, '_')) && sources.some(name => beneath(e.root, name))).map(e => e.framework))].sort();
         profiles.push({ id: `${language}:${owner || '.'}`, language, root: owner, files: sources.sort(), manifests: metadata, frameworks: ownFrameworks });
       }
@@ -374,6 +388,17 @@ export class QualityProfileRegistry {
                 if (!check.clippyVersion) check = { ...check, status: 'missing', reason: 'exact_clippy_pin_required' };
               }
             }
+          }
+          if (check.tool === 'go') {
+            check.manifest = at(profile.root, 'go.mod');
+            const manifest = documents.get(check.manifest);
+            check.goModuleMode = names.has(at(profile.root, 'vendor/modules.txt')) ? 'vendor' : 'readonly';
+            if (typeof manifest !== 'string') check = { ...check, status: 'blocked', reason: 'go_module_required' };
+            // MVP supports standalone modules and their prepared vendor only.
+            // Reject all replacement syntax conservatively, including quoted,
+            // absolute and block forms, instead of implementing a Go parser.
+            else if (manifest.includes('=>')) check = { ...check, status: 'unsupported', reason: 'go_replacements_unsupported' };
+            else if (check.goModuleMode !== 'vendor' && report.files.some(file => file.dependency?.language === 'go' && file.dependency.root === profile.root)) check = { ...check, status: 'unsupported', reason: 'go_prepared_vendor_required' };
           }
           if (check.tool === 'typescript') {
             check.manifest = at(profile.root, 'tsconfig.json');
