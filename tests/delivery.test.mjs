@@ -698,7 +698,7 @@ test('Output boundary redaction handles every split small caps long secrets and 
     // Freeze capture at the first exceeded chunk, even when a partial Unicode
     // character left room. No later stream/chunk may fill that gap.
     chunks = [['stdout', Buffer.from('ok😀')], ['stderr', Buffer.from('late')]];
-    const unicodeError = await execute('fixture-stream', [], { maxOutputBytes: 5 }).catch(error => error);
+    const unicodeError = await execute('fixture-stream', [], { maxOutputBytes: 5, env: {} }).catch(error => error);
     assert.equal(unicodeError.code, 'invalid_output'); assert.equal(unicodeError.stdout, 'ok'); assert.equal(unicodeError.stderr, '');
     chunks = [['stdout', Buffer.from('ok�overflow')]];
     const replacementError = await execute('fixture-stream', [], { maxOutputBytes: 5 }).catch(error => error);
