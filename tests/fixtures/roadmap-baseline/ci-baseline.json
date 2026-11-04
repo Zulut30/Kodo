@@ -1,0 +1,308 @@
+{
+  "schemaVersion": 1,
+  "kind": "roadmap-ci-baseline-public",
+  "sourceReceipt": "ci-baseline.json",
+  "sourceReceiptSha256": "2ea878662670ca4ceab6559ce2d5bb705de15745d387bafc82e2d85ab2c6b930",
+  "observedAt": "2026-11-04T11:07:29.912Z",
+  "runId": 41813816870,
+  "headSha": "c19157b05ff8080f830cff70b81def32842d67ac",
+  "conclusion": "success",
+  "wallSeconds": 673,
+  "sourceHeadSha": "d2654f12b1da21dfa3523fa9b1aea72b51a050ba",
+  "treeSha": "6839577d42a792b2fda83a87007b29be67b4e306",
+  "exactSourceHeadCi": false,
+  "jobs": [
+    {
+      "platform": "linux",
+      "jobId": 126519395877,
+      "url": "https://github.com/Zulut30/Kodo/actions/runs/41813816870/job/126519395877",
+      "conclusion": "success",
+      "wallSeconds": 119,
+      "queueSeconds": 3,
+      "logSha256": "c782954138678bf9929e419aafdfca310819a51b3fba1efa13d6b3261a2a70c7",
+      "steps": [
+        {
+          "name": "Set up job",
+          "status": "success",
+          "durationSeconds": 1
+        },
+        {
+          "name": "Run actions/checkout@v4",
+          "status": "success",
+          "durationSeconds": 3
+        },
+        {
+          "name": "Run actions/setup-node@v4",
+          "status": "success",
+          "durationSeconds": 4
+        },
+        {
+          "name": "Run npm ci --ignore-scripts",
+          "status": "success",
+          "durationSeconds": 7
+        },
+        {
+          "name": "Run npm run check",
+          "status": "success",
+          "durationSeconds": 97
+        },
+        {
+          "name": "Verify installed CLI package",
+          "status": "success",
+          "durationSeconds": 3
+        },
+        {
+          "name": "Post Run actions/setup-node@v4",
+          "status": "success",
+          "durationSeconds": 0
+        },
+        {
+          "name": "Post Run actions/checkout@v4",
+          "status": "success",
+          "durationSeconds": 1
+        },
+        {
+          "name": "Complete job",
+          "status": "success",
+          "durationSeconds": 0
+        }
+      ],
+      "counts": {
+        "tests": 733,
+        "pass": 731,
+        "fail": 0,
+        "cancelled": 0,
+        "skipped": 2,
+        "duration_ms": 95912.926445
+      },
+      "installed": {
+        "package": "@zulut30/kodo",
+        "version": "0.2.6",
+        "archive": "zulut30-kodo-0.2.6.tgz",
+        "sha256": "4b53673c308d73413bb3c4e82541ec0128dcbe6f576486579efd2cceca725650",
+        "components": 33,
+        "defaultSkills": 13,
+        "upstreamFiles": 183,
+        "checks": [
+          "npm pack",
+          "isolated install --ignore-scripts",
+          "installed package bin and launcher",
+          "installed CLI help",
+          "installed CLI validate --json",
+          "installed CLI list --json",
+          "installed default skill pins"
+        ],
+        "passed": true
+      },
+      "slowTests": [
+        {
+          "name": "Engine durably resumes pending verification repair after subscription interruption",
+          "durationMs": 7871.738639
+        },
+        {
+          "name": "Review quota recovery reuses successful checks only while their exact head is unchanged",
+          "durationMs": 7518.464175
+        },
+        {
+          "name": "Unavailable plain and real Engine developer sessions remain pending and resume without repeating completed trials",
+          "durationMs": 6317.68977
+        },
+        {
+          "name": "Engine five verification rounds stop with persisted controller assessment until explicit retry",
+          "durationMs": 5684.492927
+        },
+        {
+          "name": "Explicit model stays fixed for planner worker reviewer and retries despite uncertain strongest routing",
+          "durationMs": 4957.419653
+        },
+        {
+          "name": "Engine retry-failed preserves pending verification repair before resetting its cycle",
+          "durationMs": 4776.309623
+        },
+        {
+          "name": "Node no-progress detection distinguishes changed tracked and untracked contents with identical porcelain",
+          "durationMs": 4689.476305
+        },
+        {
+          "name": "Credential redaction covers real release command errors on timeout",
+          "durationMs": 4534.615139
+        },
+        {
+          "name": "Release lifecycle awaits real owned tree before source cleanup on timeout",
+          "durationMs": 4400.168125
+        },
+        {
+          "name": "Engine resolves target branch conflicts then invalidates checks and review before redelivery",
+          "durationMs": 4332.049206
+        },
+        {
+          "name": "Delivery lifecycle awaits owned parent and grandchild shutdown on timeout",
+          "durationMs": 4300.843755
+        },
+        {
+          "name": "Output boundary redaction protects unfinished real streams on timeout",
+          "durationMs": 4278.308591
+        }
+      ]
+    },
+    {
+      "platform": "windows",
+      "jobId": 126519396652,
+      "url": "https://github.com/Zulut30/Kodo/actions/runs/41813816870/job/126519396652",
+      "conclusion": "success",
+      "wallSeconds": 669,
+      "queueSeconds": 3,
+      "logSha256": "a33ecf8b378c9694f0715e7bd395ddf84a9415cefa5efdd57203bac2741214cf",
+      "steps": [
+        {
+          "name": "Set up job",
+          "status": "success",
+          "durationSeconds": 1
+        },
+        {
+          "name": "Run actions/checkout@v4",
+          "status": "success",
+          "durationSeconds": 5
+        },
+        {
+          "name": "Run actions/setup-node@v4",
+          "status": "success",
+          "durationSeconds": 5
+        },
+        {
+          "name": "Run npm ci --ignore-scripts",
+          "status": "success",
+          "durationSeconds": 7
+        },
+        {
+          "name": "Run npm run check",
+          "status": "success",
+          "durationSeconds": 612
+        },
+        {
+          "name": "Verify installed CLI package",
+          "status": "success",
+          "durationSeconds": 34
+        },
+        {
+          "name": "Post Run actions/setup-node@v4",
+          "status": "success",
+          "durationSeconds": 1
+        },
+        {
+          "name": "Post Run actions/checkout@v4",
+          "status": "success",
+          "durationSeconds": 2
+        },
+        {
+          "name": "Complete job",
+          "status": "success",
+          "durationSeconds": 0
+        }
+      ],
+      "counts": {
+        "tests": 731,
+        "pass": 729,
+        "fail": 0,
+        "cancelled": 0,
+        "skipped": 2,
+        "duration_ms": 610609.9227
+      },
+      "installed": {
+        "package": "@zulut30/kodo",
+        "version": "0.2.6",
+        "archive": "zulut30-kodo-0.2.6.tgz",
+        "sha256": "4b53673c308d73413bb3c4e82541ec0128dcbe6f576486579efd2cceca725650",
+        "components": 33,
+        "defaultSkills": 13,
+        "upstreamFiles": 183,
+        "checks": [
+          "npm pack",
+          "isolated install --ignore-scripts",
+          "installed package bin and launcher",
+          "installed CLI help",
+          "installed CLI validate --json",
+          "installed CLI list --json",
+          "installed default skill pins"
+        ],
+        "passed": true
+      },
+      "slowTests": [
+        {
+          "name": "Review quota recovery reuses successful checks only while their exact head is unchanged",
+          "durationMs": 53013.641
+        },
+        {
+          "name": "Engine durably resumes pending verification repair after subscription interruption",
+          "durationMs": 51347.0161
+        },
+        {
+          "name": "Engine five verification rounds stop with persisted controller assessment until explicit retry",
+          "durationMs": 45126.5024
+        },
+        {
+          "name": "Unavailable plain and real Engine developer sessions remain pending and resume without repeating completed trials",
+          "durationMs": 43482.1945
+        },
+        {
+          "name": "Explicit model stays fixed for planner worker reviewer and retries despite uncertain strongest routing",
+          "durationMs": 36369.3463
+        },
+        {
+          "name": "Engine retry-failed preserves pending verification repair before resetting its cycle",
+          "durationMs": 25667.9264
+        },
+        {
+          "name": "Engine configured gates block review and repairs receive only safe findings",
+          "durationMs": 24935.7701
+        },
+        {
+          "name": "Node no-progress detection distinguishes changed tracked and untracked contents with identical porcelain",
+          "durationMs": 23556.8766
+        },
+        {
+          "name": "Engine distinguishes incomplete verification output from a completed repair interrupted before commit",
+          "durationMs": 23167.5204
+        },
+        {
+          "name": "plain",
+          "durationMs": 22706.9919
+        },
+        {
+          "name": "Engine reruns checks and independent review after repairing a confirmed review finding",
+          "durationMs": 21987.7624
+        },
+        {
+          "name": "Production benchmark executes actual Engine worktrees review and checks using offline provider boundaries",
+          "durationMs": 21884.1273
+        }
+      ]
+    }
+  ],
+  "protection": {
+    "strict": true,
+    "enforceAdmins": true,
+    "contexts": [
+      "check (ubuntu-latest, 24)",
+      "check (windows-latest, 24)",
+      "kodo/review"
+    ],
+    "conversationResolution": true
+  },
+  "release": {
+    "isDraft": false,
+    "tagName": "v0.2.6",
+    "targetCommitish": "d2654f12b1da21dfa3523fa9b1aea72b51a050ba",
+    "url": "https://github.com/Zulut30/Kodo/releases/tag/v0.2.6"
+  },
+  "pullRequest9": {
+    "state": "OPEN",
+    "source": "coordinator read-back after HTTP 504; not a merged receipt"
+  },
+  "limitations": [
+    "CI ran on c19157b; public main d2654f1 has identical Git tree, but no main workflow was created after the partial GitHub merge response. Not relabelled as exact-main CI.",
+    "Slow test records are test cases, not independently timed files. Queue time includes GitHub timestamp resolution.",
+    "Historical evidence is not fresh native-provider or deployment evidence."
+  ],
+  "evidenceBoundary": "Public allowlisted metadata only; no raw logs, provider output, project prompts, credentials or personal paths. CI on c19157b is tree-identical, not exact-main CI. No new release or deployment."
+}
