@@ -50,7 +50,9 @@ async function privateDirectory(artifacts, cwd, signal) {
   if (inside(await realpath(cwd), await realpath(artifacts))) throw failure('evidence_integrity');
   const directory = await mkdtemp(path.join(artifacts, 'architecture-gate-'));
   if (process.platform === 'win32') await acl("$p=[Console]::In.ReadToEnd()|ConvertFrom-Json; $user=[Security.Principal.WindowsIdentity]::GetCurrent().User; $acl=[Security.AccessControl.DirectorySecurity]::new(); $acl.SetOwner($user); $acl.SetAccessRuleProtection($true,$false); foreach($sid in @($user,[Security.Principal.SecurityIdentifier]::new('S-1-5-18'))) {$acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow'))}; [IO.Directory]::SetAccessControl($p[0],$acl)", [directory], signal);
-  return directory;
+  // The checker canonicalizes nested evidence paths. Use the same root spelling
+  // so Windows 8.3 aliases cannot make valid evidence fail containment checks.
+  return await realpath(directory);
 }
 async function readEvidence(entry, root) {
   if (!entry || !path.isAbsolute(entry.path) || !inside(root, entry.path) || entry.path === root || !Number.isSafeInteger(entry.bytes) || entry.bytes < 1 || entry.bytes > 40 * 1024 ** 2 || !/^[a-f0-9]{64}$/.test(entry.sha256)) throw failure('evidence_integrity');

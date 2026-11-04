@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
-import { mkdir, writeFile, readFile, chmod, cp } from 'node:fs/promises';
+import { mkdir, writeFile, readFile, chmod, cp, realpath } from 'node:fs/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createHash } from 'node:crypto';
 import { Engine } from '../runtime/engine.mjs';
@@ -9,6 +9,7 @@ import { execute, deliver } from '../runtime/delivery.mjs';
 import { diffHash } from '../runtime/workspace.mjs';
 import { readConfig } from '../runtime/config.mjs';
 import { normalizeArchitectureConfig, runArchitectureChecks, isCurrentArchitectureReceipt } from '../runtime/architecture-gate.mjs';
+import { architectureCli } from '../runtime/architecture-cli.mjs';
 import { fixture, fakeServices, node, git } from './helpers/engine-fixture.mjs';
 
 const enabled = { enabled: true };
@@ -127,6 +128,33 @@ test('Architecture freshness rejects stale identity config runtime pins source a
   const evidence = receipt.report.receipts[0].evidence[0].path;
   await chmod(evidence, 0o600); await writeFile(evidence, 'tampered');
   assert.equal(await isCurrentArchitectureReceipt(receipt, fx.options()), false);
+});
+
+test('Windows architecture freshness accepts real short-path aliases with canonical private evidence', { skip: process.platform !== 'win32' }, async t => {
+  const fx = await setup(t);
+  // Query only our fixture's existing directory; no links or filesystem changes.
+  const short = (await windowsAcl("[Console]::Out.Write((New-Object -ComObject Scripting.FileSystemObject).GetFolder($env:ACL_TEST_FILE).ShortPath)", fx.run.artifacts)).stdout.trim();
+  const canonicalArtifacts = await realpath(fx.run.artifacts);
+  if (short.toLowerCase() === canonicalArtifacts.toLowerCase()) return t.skip('Fixture volume has no distinct 8.3 alias');
+  assert.equal(await realpath(short), canonicalArtifacts);
+  const options = { ...fx.options(), cwd: fx.run.cwd.toUpperCase(), artifacts: short };
+  assert.equal(await realpath(options.cwd), await realpath(fx.run.cwd));
+  const receipt = await runArchitectureChecks(options);
+  assert.equal(receipt.passed, true);
+  const planned = await architectureCli(['plan', '--project', receipt.cwd, '--base', fx.run.baseSha, '--json']);
+  assert.equal(planned.report.status, 'planned');
+  const stable = report => Object.fromEntries(Object.entries(report).filter(([key]) => !['status', 'passed', 'receipts'].includes(key)));
+  assert.deepEqual(stable(receipt.report), stable(planned.report), 'path aliases must not change the static architecture record');
+  const canonicalRoot = await realpath(receipt.evidenceRoot);
+  const nestedInsideRoot = receipt.report.receipts.every(row => row.evidence.every(entry => {
+    const relative = path.relative(receipt.evidenceRoot, entry.path);
+    return relative && !path.isAbsolute(relative) && !relative.startsWith('..' + path.sep);
+  }));
+  t.diagnostic(JSON.stringify({ control: 'windows-path-alias', staticReportsEqual: true, evidenceRootCanonical: receipt.evidenceRoot === canonicalRoot, nestedInsideRoot }));
+  assert.equal(await isCurrentArchitectureReceipt(receipt, options), true);
+  assert.equal(receipt.evidenceRoot, canonicalRoot);
+  assert.equal(nestedInsideRoot, true);
+  assert.equal(await isCurrentArchitectureReceipt(receipt, { ...fx.options(), cwd: receipt.cwd }), true);
 });
 
 test('Engine awaits asynchronous freshness and rejects evidence tampered during approved review', async t => {
