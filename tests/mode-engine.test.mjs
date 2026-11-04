@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { mkdtemp, mkdir, readFile, writeFile, rm, stat, utimes } from 'node:fs/promises';
 import os from 'node:os';
@@ -20,6 +21,117 @@ const high = () => ({ ...low(), risk: choice(['low','medium','high'], 'high') })
 const task = id => ({ id, role: 'developer', description: 'Set exported value to one with its checks', writePaths: ['value.mjs'], dependsOn: [], acceptance: ['Export equals one; test and build pass'], parallel: false });
 const onePlan = () => ({ summary: 'One localized deliverable including verification', tasks: [task('fix')] });
 const metrics = () => ({ durationMs: 2, toolSteps: 1, nativeRequestCount: null, usage: { inputTokens: 10, cachedInputTokens: 4, outputTokens: 2, cacheReadTokens: null, cacheWriteTokens: null, totalTokens: 12, semantics: 'input-includes-cached', source: 'codex.usage' } });
+
+test('Engine strict source fence rejects hidden bytes at check reuse commands gates and review', async t => {
+  for (const flag of ['--assume-unchanged', '--skip-worktree']) await t.test(flag, async t => {
+    const fx = await fixture(t), log = path.join(fx.root, 'actual-commands.jsonl');
+    const markers = Object.fromEntries(['test', 'build'].map(kind => [kind, path.join(fx.root, `${kind}-mutation`)]));
+    for (const [file, kind] of [['verify.mjs', 'test'], ['build.mjs', 'build']]) {
+      const source = await readFile(path.join(fx.project, file), 'utf8');
+      await writeFile(path.join(fx.project, file), source + `
+import { appendFileSync, existsSync } from 'node:fs';
+process.on('exit', exitCode => appendFileSync(${JSON.stringify(log)}, JSON.stringify({kind:${JSON.stringify(kind)},exitCode}) + '\\n'));
+if (existsSync(${JSON.stringify(markers[kind])})) appendFileSync(new URL('./value.mjs', import.meta.url), '// hidden command mutation\\n');
+`);
+    }
+    git(fx.project, 'add', '.'); git(fx.project, 'commit', '-m', 'Observe source fence command exits');
+    const created = await fx.engine.create('Set value to one', { project: fx.project, mode: 'quick' });
+    const result = await fx.engine.run(created.id);
+    assert.equal(result.state, 'succeeded', result.error?.message);
+    const baseline = fx.store.getRun(created.id), headSha = git(baseline.cwd, 'rev-parse', 'HEAD');
+    assert.equal(baseline.checks.complete, true); assert.equal(baseline.checks.headSha, headSha);
+    const commands = async () => (await readFile(log, 'utf8')).trim().split('\n').filter(Boolean).map(JSON.parse);
+    assert.deepEqual(await commands(), [{kind:'test',exitCode:0},{kind:'build',exitCode:0}]);
+    for (const row of baseline.checks.results) {
+      const bytes = await readFile(row.outputPath), evidence = JSON.parse(bytes);
+      assert.equal(evidence.headSha, headSha); assert.equal(evidence.kind, 'check');
+      assert.equal(evidence.value.kind, row.kind); assert.equal(evidence.value.exitCode, 0);
+      assert.equal(createHash('sha256').update(bytes).digest('hex'), row.outputHash);
+    }
+    const file = path.join(baseline.cwd, 'value.mjs'), original = await readFile(file, 'utf8');
+    const hash = bytes => createHash('sha256').update(bytes).digest('hex');
+    git(baseline.cwd, 'update-index', flag, '--', 'value.mjs');
+    const originalGates = { ...fx.engine.gates }, originalProvider = fx.provider.runSession;
+    const originalPersist = fx.engine.persistEvidence.bind(fx.engine);
+    const scenarios = ['receipt reuse', 'test mutation', 'build mutation', 'gate before', 'ui gate mutation', 'security gate mutation', 'review before', 'review mutation', 'clean control'];
+    for (const scenario of scenarios) await t.test(scenario, async t => {
+      await writeFile(file, original); await writeFile(log, '');
+      for (const marker of Object.values(markers)) await rm(marker, { force: true });
+      const run = structuredClone(baseline);
+      fx.engine.gates = { ...originalGates }; fx.provider.runSession = originalProvider; fx.engine.persistEvidence = originalPersist;
+      let uiCalls = 0, securityCalls = 0, reviewCalls = 0;
+      const mutate = () => writeFile(file, original + `// hidden ${scenario}\n`);
+      if (scenario === 'receipt reuse' || scenario === 'gate before') await mutate();
+      if (scenario === 'test mutation' || scenario === 'build mutation') {
+        run.checks = null;
+        await writeFile(markers[scenario.split(' ')[0]], 'mutate');
+      }
+      if (scenario.includes('gate')) {
+        run.config.uiVerification.enabled = true; run.config.security.enabled = true;
+        fx.engine.gates.runUIVerification = async ({ headSha }) => {
+          uiCalls++; if (scenario === 'ui gate mutation') await mutate();
+          return { headSha, status: 'passed', passed: true };
+        };
+        fx.engine.gates.runSecurityChecks = async ({ headSha }) => {
+          securityCalls++; if (scenario === 'security gate mutation') await mutate();
+          return { headSha, status: 'passed', passed: true };
+        };
+        for (const name of ['isCurrentUIReceipt', 'isCurrentSecurityReceipt']) fx.engine.gates[name] = (receipt, { headSha }) => receipt?.headSha === headSha && receipt.status === 'passed' && receipt.passed === true;
+      }
+      if (scenario === 'review before') fx.engine.persistEvidence = async (...args) => {
+        const receipt = await originalPersist(...args);
+        if (args[1] === 'review') await mutate();
+        return receipt;
+      };
+      fx.provider.runSession = async request => {
+        const response = await originalProvider(request);
+        if (request.schema.properties.passed) {
+          reviewCalls++; if (scenario === 'review mutation') await mutate();
+        }
+        return response;
+      };
+      fx.engine.save(run);
+      const porcelain = () => {
+        const r = spawnSync('git', ['status', '--porcelain=v1', '--untracked-files=all'], { cwd: run.cwd, encoding: 'utf8', windowsHide: true });
+        assert.equal(r.status, 0, r.stderr); return r.stdout;
+      };
+      const statusBefore = porcelain(); assert.equal(statusBefore, '');
+      const beforeEvents = fx.store.events(run.id).at(-1).seq;
+      let error;
+      try {
+        if (scenario.includes('gate')) await fx.engine.verificationGates(run);
+        else if (scenario.startsWith('review') || scenario === 'clean control') await fx.engine.verify(run);
+        else await fx.engine.checks(run);
+      } catch (caught) { error = caught; }
+      const saved = fx.store.getRun(run.id), observed = await readFile(file), actualCommands = await commands();
+      const statusAfter = porcelain(), actualHead = git(run.cwd, 'rev-parse', 'HEAD');
+      const reused = fx.store.events(run.id, beforeEvents).filter(row => row.type === 'checks_reused').length;
+      t.diagnostic(JSON.stringify({flag,scenario,statusBefore,statusAfter,headSha,actualHead,committedHash:hash(original),observedHash:hash(observed),actualCommands,reused,uiCalls,securityCalls,reviewCalls,errorCode:error?.code??null,errorMessage:error?.message??null,persistedChecksComplete:saved.checks?.complete,persistedCheckResults:saved.checks?.results.map(row=>({kind:row.kind,exitCode:row.exitCode,outputHash:row.outputHash})),persistedReviewPassed:saved.review?.passed??null,persistedUI:saved.uiVerification?.status??null,persistedSecurity:saved.securityChecks?.status??null}));
+      assert.equal(statusAfter, ''); assert.equal(actualHead, headSha);
+      assert.equal(hash(observed) === hash(original), scenario === 'clean control');
+      assert.deepEqual(actualCommands, scenario === 'test mutation' ? [{kind:'test',exitCode:0}] : scenario === 'build mutation' ? [{kind:'test',exitCode:0},{kind:'build',exitCode:0}] : []);
+      if (scenario === 'clean control') {
+        assert.equal(error, undefined); assert.equal(reused, 1); assert.equal(reviewCalls, 1);
+        assert.equal(saved.checks.complete, true); assert.equal(saved.review.passed, true);
+      } else {
+        assert.ok(error, 'hidden bytes must not be accepted by the actual Engine boundary');
+        if (!scenario.startsWith('review')) assert.equal(error.code, 'dirty_worktree');
+        if (scenario === 'receipt reuse') { assert.equal(reused, 0); assert.deepEqual(saved.checks, baseline.checks); }
+        if (scenario.endsWith('mutation') && ['test', 'build'].includes(scenario.split(' ')[0])) {
+          assert.equal(saved.checks.complete, false);
+          assert.equal(saved.checks.results.length, scenario === 'test mutation' ? 0 : 1);
+        }
+        if (scenario.includes('gate') || scenario.startsWith('review')) {
+          assert.equal(saved.uiVerification, null); assert.equal(saved.securityChecks, null); assert.equal(saved.review, null);
+        }
+        if (scenario === 'gate before') { assert.equal(uiCalls, 0); assert.equal(securityCalls, 0); }
+        if (scenario === 'ui gate mutation') { assert.equal(uiCalls, 1); assert.equal(securityCalls, 0); }
+        if (scenario === 'security gate mutation') { assert.equal(uiCalls, 1); assert.equal(securityCalls, 1); }
+        if (scenario.startsWith('review')) assert.equal(reviewCalls, scenario === 'review before' ? 0 : 1);
+      }
+    });
+  });
+});
 
 async function fixture(t, { config = {}, assessment = low, plan = onePlan, failedCheck = false, failedReview = false, failedWorker = false } = {}) {
   const root = await mkdtemp(path.join(os.tmpdir(), 'kodo-mode-engine-')), project = path.join(root, 'project');

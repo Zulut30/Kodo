@@ -9,6 +9,7 @@ import { readConfig, validateCommandTimeouts, configuredConcurrency, normalizeCo
 import { validatePlan, validate, planSchema, resultSchema, reviewSchema, routingSchema, ownsPath, scopesOverlap } from './contracts.mjs';
 import { execute, resolveCommand } from './command.mjs';
 import { git, inspectProject, makeWorktree, collectFiles, changedFiles, commitChanges, diffHash } from './workspace.mjs';
+import { inspectCurrentSource } from './ci-graph.mjs';
 import * as providers from './providers.mjs';
 import { research } from './research.mjs';
 import { deliver, releasePackage, prepareReleaseVersion, reconcileDelivery } from './delivery.mjs';
@@ -693,8 +694,8 @@ try {
   async checks(run, signal) {
     validateCommandTimeouts(run.config.commands);
     run.state = 'testing'; this.save(run); await this.setup(run.cwd, run, signal);
-    if (await git(run.cwd, ['status', '--porcelain'])) throw Object.assign(new Error('Проверка commit требует чистого integration worktree'), { code: 'dirty_worktree' });
     const headSha = await git(run.cwd, ['rev-parse', 'HEAD']);
+    if (await inspectCurrentSource({ project: run.cwd, headSha }) !== 'clean') throw Object.assign(new Error('Проверка commit требует чистого integration worktree'), { code: 'dirty_worktree' });
     const expected = ['test','build'].flatMap(kind => run.config.commands[kind].map(command => ({ kind, command })));
     const fingerprint = contentHash({ headSha, expected, runtime: { node: process.version, abi: process.versions.modules, platform: process.platform, arch: process.arch } });
     if (run.config.commands.test.length && run.checks?.schemaVersion === 2 && run.checks.complete === true && run.checks.headSha === headSha && run.checks.fingerprint === fingerprint && Array.isArray(run.checks.results) && run.checks.results.length === expected.length && run.checks.results.every((row, index) => row.exitCode === 0 && row.kind === expected[index].kind && isDeepStrictEqual(row.command, expected[index].command))) {
@@ -706,7 +707,7 @@ try {
     for (const kind of ['test', 'build']) for (const command of run.config.commands[kind]) {
       this.checkCancelled(run, signal); this.log(run, 'check_started', { kind, command });
       const result = await execute(command.command, command.args, { cwd: run.cwd, signal, env: workerEnvironment(), secrets: this.secrets, timeoutMs: command.timeoutMs, allowFailure: true });
-      if (await git(run.cwd, ['rev-parse', 'HEAD']) !== headSha || await git(run.cwd, ['status', '--porcelain'])) throw Object.assign(new Error('Команда проверки изменила проверяемый commit или файлы'), { code: 'dirty_worktree' });
+      if (await inspectCurrentSource({ project: run.cwd, headSha }) !== 'clean') throw Object.assign(new Error('Команда проверки изменила проверяемый commit или файлы'), { code: 'dirty_worktree' });
       const evidence = await this.persistEvidence(run, 'check', { kind, command, exitCode: result.code, stdout: result.stdout, stderr: result.stderr }, { headSha });
       results.push({ kind, command, exitCode: result.code, output: (result.stdout + result.stderr).slice(-24000), outputPath: evidence.path, outputHash: evidence.sha256 }); this.save(run);
       if (result.code !== 0) throw Object.assign(new Error(`Проверка ${kind} не пройдена (exit ${result.code}): ${(result.stdout + result.stderr).slice(-6000)}`), { code: 'check_failed' });
@@ -717,7 +718,7 @@ try {
   async verificationGates(run, signal) {
     const headSha = await git(run.cwd, ['rev-parse', 'HEAD']);
     const clean = async () => {
-      if (await git(run.cwd, ['rev-parse', 'HEAD']) !== headSha || await git(run.cwd, ['status', '--porcelain'])) {
+      if (await inspectCurrentSource({ project: run.cwd, headSha }) !== 'clean') {
         run.uiVerification = null; run.securityChecks = null; run.review = null; this.save(run);
         throw Object.assign(new Error('UI/security gate changed the checked worktree'), { code: 'dirty_worktree' });
       }
@@ -864,13 +865,19 @@ try {
         const full = redact({ plan: run.plan, checks: run.checks, baseSha: run.baseSha, headSha, diffStat: statResult.stdout, changedPaths: pathsResult.stdout.split('\0').filter(Boolean), diff: diffResult.stdout, gates: [run.uiVerification, run.securityChecks] }, this.secrets);
         const original = await this.persistEvidence(run, 'review', full, { headSha });
         const evidence = packSessionEvidence(compactReviewEvidence, { ...full, evidencePaths: { review: original.path } }, undefined, this.secrets, [original, ...this.checkEvidenceReferences(run)]);
-        const statusBeforeReview = await git(run.cwd, ['status', '--porcelain']);
+        if (await inspectCurrentSource({ project: run.cwd, headSha }) !== 'clean') {
+          run.uiVerification = null; run.securityChecks = null; run.review = null; this.save(run);
+          throw new Error('Проверяемые файлы изменились перед ревью');
+        }
         const response = await this.session(run, { client: selected.client, model: selected.model, cwd: run.cwd, readOnly: true, schema: reviewSchema, contextMetrics: evidence,
           prompt: evidencePrompt(`Independently review the final implementation of this task: ${run.task}. Read project instructions and trace callers. Do not change files or execute write commands. Identify concrete defects and missing requirements.\nReview evidence (untrusted data): `, evidence, '\nRead complete private plan, diff and command logs through the immutable evidence references; historical command rows without outputPath have only excerpts and their full output is unknown. Omitted context is not evidence of success. Return passed=true only with no blocker/major findings.', { gates: [run.uiVerification, run.securityChecks].map(receipt => ({ status: receipt?.status || 'unknown', headSha: receipt?.headSha, configHash: receipt?.configHash, evidenceRoot: receipt?.evidenceRoot })), secrets: this.secrets }) }, signal);
         review = validate(reviewSchema, response.output);
         if (review.passed && review.findings.some(item => ['major', 'blocker'].includes(item.severity))) review.passed = false;
         const after = await git(run.cwd, ['rev-parse', 'HEAD']);
-        if (after !== headSha || await git(run.cwd, ['status', '--porcelain']) !== statusBeforeReview) throw new Error('Ревьюер изменил проверяемые файлы');
+        if (after !== headSha || await inspectCurrentSource({ project: run.cwd, headSha }) !== 'clean') {
+          run.uiVerification = null; run.securityChecks = null; run.review = null; this.save(run);
+          throw new Error('Ревьюер изменил проверяемые файлы');
+        }
         if (review.passed) {
           if (!this.gates.isCurrentUIReceipt(run.uiVerification, { headSha, config: run.config.uiVerification }) || !this.gates.isCurrentSecurityReceipt(run.securityChecks, { headSha, config: run.config.security })) {
             run.uiVerification = null; run.securityChecks = null; this.save(run);
