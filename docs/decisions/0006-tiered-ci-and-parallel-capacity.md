@@ -1,6 +1,6 @@
 # ADR-0006: ступени CI и явная ёмкость пяти сессий
 
-Статус: локальный draft phase03; приёмка phase02 и общие проверки ещё не завершены.
+Статус: локальный draft phase03, pending full/review/CI. Phase02 принят: PR #11, merge `dabecb7bec7514116e3b2870c04270bb4f83ee77`; его evidence не заменяет общие проверки phase03.
 
 ## Контекст
 
@@ -9,6 +9,8 @@
 ## Решение
 
 CI получает четыре ступени: L0 проверяет применимые format/lint для изменения; L1 добавляет syntax/lint/typecheck и доказанно затронутые тесты; L2 выполняет полный `npm run check` и свежий обязательный security gate на Windows/Linux Node24; L3 сохраняет smoke установленного пакета. Оба существующих required `check` contexts и branch protections сохраняются. Только устаревшие PR heads отменяются; main/release runs не отменяются этой политикой.
+
+Новый optional Actions job `fast` является opt-in: job-level `if: ${{ vars.KODO_FAST_CI_ENABLED == 'true' }}`. При отсутствующей переменной job skipped/neutral, не PASS. Воспроизведённый blocked broad feedback требует сначала подготовить и проверить source/vendor ownership; скрытых exclusions нет. Затем координатор может включить repository variable `KODO_FAST_CI_ENABLED=true`. Required Windows/Linux `check` не получает этого условия и сохраняет полный L2, security и installed smoke. Локальный feedback на подготовленной области работает независимо; одиночные 4.29s не являются Actions benchmark. Worker не меняет repository variables или branch protection.
 
 Для bounded parallelism split test files `scripts.test` явно задаёт `node --test --test-concurrency=4`. Node24 не принимает `--test-concurrency` в `NODE_OPTIONS`; поэтому значение передаётся непосредственно test runner. `scripts.check` остаётся ровно `npm run validate && npm test`, L2 вызывает `npm run check`, required matrix job names и все тесты сохраняются. Lock-файл не дублирует scripts и ради этой настройки не меняется. Это ограничение конкуренции процессов файлов, отдельное от ёмкости пяти Kodo workers.
 

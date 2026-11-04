@@ -15,6 +15,7 @@ permissions:
 
 jobs:
   fast:
+    if: ${{ vars.KODO_FAST_CI_ENABLED == 'true' }}
     runs-on: ubuntu-latest
     env:
       KODO_TOOL_HOME: ${{ runner.temp }}/kodo-fast-tools

@@ -2,7 +2,7 @@
 
 Phase 03 draft. Этот модуль не меняет обязательные `npm run check`, UI/security,
 Windows/Linux CI, package smoke или release gates. Интеграция разрешена только
-после приёмки phase 02. Локальные тесты не доказывают native/provider, CI,
+после приёмки phase 02 (принят, PR #11 / `dabecb7`). Локальные тесты не доказывают native/provider, CI,
 опубликованный artifact или deployment.
 
 ## Граф
