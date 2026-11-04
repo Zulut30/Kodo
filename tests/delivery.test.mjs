@@ -337,15 +337,25 @@ async function ownedTree(t, { inheritedPipes = true } = {}) {
   return { directory, filename, ready, disarm: () => { pids = []; } };
 }
 
-async function assertStopped(pids) {
+async function assertStopped(pids, { platform = process.platform, probe = pid => process.kill(pid, 0), readStat = pid => readFile(`/proc/${pid}/stat`, 'utf8') } = {}) {
   for (const pid of pids) {
-    try { process.kill(pid, 0); }
+    try { probe(pid); }
     catch (error) { if (error.code === 'ESRCH') continue; throw error; }
     // Linux can retain an already-dead orphan as a zombie until PID 1 reaps it.
-    if (process.platform === 'linux' && /\) Z /.test(await readFile(`/proc/${pid}/stat`, 'utf8'))) continue;
+    if (platform === 'linux') {
+      try { if (/\) Z /.test(await readStat(pid))) continue; }
+      catch (error) { if (['ENOENT', 'ESRCH'].includes(error.code)) continue; throw error; }
+    }
     assert.fail(`Owned fixture process ${pid} is still running after execute settled`);
   }
 }
+
+test('Owned process assertion handles reaping between liveness and proc observation', async () => {
+  for (const code of ['ESRCH', 'ENOENT']) await assertStopped([123], { platform: 'linux', probe() {}, readStat: async () => { throw Object.assign(new Error('Owned process was reaped'), { code }); } });
+  await assertStopped([123], { platform: 'linux', probe() {}, readStat: async () => '123 (owned node) Z 1' });
+  await assert.rejects(() => assertStopped([123], { platform: 'linux', probe() {}, readStat: async () => '123 (owned node) R 1' }), /still running/);
+  await assert.rejects(() => assertStopped([123], { platform: 'linux', probe() {}, readStat: async () => { throw Object.assign(new Error('Access denied'), { code: 'EACCES' }); } }), error => error.code === 'EACCES');
+});
 
 for (const scenario of [
   { name: 'exit at handle boundary', boundary: 'handle', exit: true },
