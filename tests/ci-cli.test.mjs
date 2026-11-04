@@ -217,6 +217,100 @@ test('CI L2 always runs full check and fresh security with platform scope', asyn
   assert.deepEqual(r.requiredPlatforms, ['linux', 'win32']); assert.equal(r.crossPlatformVerified, false);
 });
 
+test('CI L2 public diagnostic exposes a real failing npm assertion and retains private full output', async t => {
+  const scratch = await mkdtemp(path.join(os.tmpdir(), 'kodo-ci-diagnostic-'));
+  t.after(async () => { assert.equal(path.dirname(scratch), path.resolve(os.tmpdir())); await rm(scratch, { recursive: true, force: true }); });
+  const project = path.join(scratch, 'project'); await mkdir(project);
+  const git = args => execute('git', args, { cwd: project });
+  await git(['init', '-q']); await git(['config', 'user.name', 'CI Fixture']); await git(['config', 'user.email', 'ci@example.invalid']);
+  await writeFile(path.join(project, 'package.json'), JSON.stringify({ private: true, scripts: { check: 'node --test broken.test.mjs' } }));
+  await writeFile(path.join(project, 'broken.test.mjs'), "import test from 'node:test'; import assert from 'node:assert/strict'; console.log('private-prefix-' + 'x'.repeat(9000)); test('diagnostic fixture assertion', () => assert.equal(1, 2));\n");
+  await git(['add', '.']); await git(['commit', '-qm', 'fixture']);
+  // A nested Node runner must not inherit the outer test worker context.
+  const env = { ...process.env }; delete env.NODE_TEST_CONTEXT;
+  const invocation = await execute(process.execPath, ['--input-type=module', '-e',
+    `import { ciCli } from ${JSON.stringify(pathToFileURL(path.join(root, 'runtime/ci-cli.mjs')).href)}; const r = await ciCli(['run', '--tier', 'L2', '--project', ${JSON.stringify(project)}, '--json'], { security: async () => ({ status: 'passed', passed: true }) }); console.log(r.output); process.exitCode = r.exitCode;`],
+  { cwd: project, env, allowFailure: true, timeoutMs: 20000 });
+  const r = { exitCode: invocation.code, output: invocation.stdout, report: JSON.parse(invocation.stdout) };
+  assert.equal(r.exitCode, 1); assert.equal(r.report.status, 'failed'); assert.equal(r.report.complete, false);
+  const receipt = r.report.receipts.find(row => row.phase === 'fullcheck');
+  assert.equal(receipt.status, 'failed'); assert.equal(receipt.exitCode, 1);
+  assert.equal(JSON.parse(r.output).receipts[0].profilePath, receipt.profilePath);
+  const raw = await readFile(path.join(path.dirname(receipt.profilePath), 'stdout.log'), 'utf8');
+  assert.match(raw, /private-prefix-/); assert.match(raw, /diagnostic fixture assertion/); assert.match(raw, /AssertionError/);
+  assert.ok(receipt.diagnostic, 'public command receipt must expose the failure');
+  assert.match(receipt.diagnostic.stdoutTail, /diagnostic fixture assertion/);
+  assert.match(receipt.diagnostic.stdoutTail, /AssertionError/);
+  assert.doesNotMatch(r.output, /private-prefix-/);
+  assert.ok(Buffer.byteLength(receipt.diagnostic.stdoutTail) <= 4096);
+  assert.equal(receipt.diagnostic.stdoutTruncated, true);
+  assert.equal(receipt.diagnostic.stderrTruncated, false);
+});
+
+test('CI failure diagnostics mask known secrets before byte tails and exclude environment and argv snapshots', async () => {
+  const name = 'KODO_CI_DIAGNOSTIC_SECRET', previous = process.env[name];
+  const secret = ['private', 'diagnostic', 'secret', 'value'].join('-');
+  process.env[name] = secret;
+  try {
+    const result = { code: 8, stdout: `failure ${secret}`, stderr: 'p'.repeat(6000) + secret + 'z'.repeat(4090),
+      env: { unexpected: 'environment-snapshot' }, args: ['argv-snapshot'] };
+    for (const profile of [false, true]) {
+      const p = ports({ execute: async () => result, runProfiledCommand: async () => ({ ...result, exitCode: result.code, profilePath: '/private/profile.json' }) });
+      const r = await ciCli([profile ? 'profile' : 'run', '--tier', 'L2', '--json'], p.dependencies);
+      assert.equal(r.exitCode, 1); assert.equal(r.report.complete, false);
+      const diagnostic = r.report.receipts[0].diagnostic;
+      assert.ok(diagnostic); assert.equal(diagnostic.stdoutTail, 'failure [REDACTED]');
+      assert.doesNotMatch(diagnostic.stderrTail, /value/);
+      assert.equal(diagnostic.stderrTruncated, true); assert.ok(Buffer.byteLength(diagnostic.stderrTail) <= 4096);
+      assert.deepEqual(Object.keys(diagnostic).sort(), ['stderrTail', 'stderrTruncated', 'stdoutTail', 'stdoutTruncated']);
+      for (const value of [secret, name, 'environment-snapshot', 'argv-snapshot']) assert.ok(!r.output.includes(value));
+    }
+  } finally { if (previous === undefined) delete process.env[name]; else process.env[name] = previous; }
+});
+
+test('CI failure diagnostics preserve Unicode and finite per-stream byte boundaries', async () => {
+  for (const length of [4095, 4096, 4097]) {
+    const p = ports({ execute: async () => ({ code: 1, stdout: 'a'.repeat(length), stderr: 'b'.repeat(length) }) });
+    const r = await runCi({ project: root, tier: 'L2' }, p.dependencies);
+    const diagnostic = r.receipts[0].diagnostic;
+    assert.ok(diagnostic);
+    for (const stream of ['stdout', 'stderr']) {
+      assert.equal(Buffer.byteLength(diagnostic[`${stream}Tail`]), Math.min(length, 4096));
+      assert.equal(diagnostic[`${stream}Truncated`], length > 4096);
+    }
+  }
+  const p = ports({ execute: async () => ({ code: 1, stdout: '🙂'.repeat(1500) + 'END', stderr: '界'.repeat(2000) + 'END' }) });
+  const diagnostic = (await runCi({ project: root, tier: 'L2' }, p.dependencies)).receipts[0].diagnostic;
+  for (const stream of ['stdout', 'stderr']) {
+    const tail = diagnostic[`${stream}Tail`];
+    assert.ok(Buffer.byteLength(tail) <= 4096); assert.ok(tail.endsWith('END'));
+    assert.ok(tail.isWellFormed()); assert.ok(!tail.includes('\uFFFD'));
+    assert.equal(diagnostic[`${stream}Truncated`], true);
+  }
+});
+
+test('CI passing and incomplete processes omit diagnostics and preserve typed infrastructure failures', async () => {
+  for (const profile of [false, true]) {
+    for (const code of [0, null, -1, NaN]) {
+      const p = ports({ execute: async () => ({ code, stdout: 'unpublished output', stderr: 'unpublished error' }),
+        runProfiledCommand: async () => ({ exitCode: code, stdout: 'unpublished output', stderr: 'unpublished error', profilePath: '/private/profile.json' }) });
+      const r = await ciCli([profile ? 'profile' : 'run', '--tier', 'L2', '--json'], p.dependencies);
+      assert.equal(r.report.receipts[0].status, code === 0 ? 'passed' : 'blocked');
+      assert.equal(r.report.receipts[0].diagnostic, undefined);
+      assert.doesNotMatch(r.output, /unpublished/);
+    }
+    for (const code of ['timeout', 'cancelled', 'ENOENT']) {
+      const throws = async () => { throw Object.assign(new Error('private infrastructure error'), { code, stderr: 'invented process stderr', profilePath: '/private/profile.json' }); };
+      const p = ports({ execute: throws, runProfiledCommand: throws });
+      const r = await ciCli([profile ? 'profile' : 'run', '--tier', 'L2', '--json'], p.dependencies);
+      assert.equal(r.exitCode, 1); assert.equal(r.report.status, 'blocked'); assert.equal(r.report.complete, false);
+      assert.equal(r.report.receipts[0].reason, code === 'ENOENT' ? 'command_error' : code);
+      assert.equal(r.report.receipts[0].profilePath, '/private/profile.json');
+      assert.equal(r.report.receipts[0].diagnostic, undefined); assert.doesNotMatch(r.output, /invented process stderr|private infrastructure error/);
+    }
+  }
+});
+
 test('CI profile L2 keeps one npm check without cascading reporter options', async () => {
   const previous = process.env.NODE_OPTIONS;
   delete process.env.NODE_OPTIONS;
@@ -259,10 +353,12 @@ test('CI preaborted run launches no checks and returns cancelled', async () => {
 
 test('CI profile uses profiler port and retains failed command receipt', async () => {
   const observed = [];
-  const p = ports({ runProfiledCommand: async options => { observed.push(options); return { exitCode: 3, durationMs: 12, stdout: 'private output', stderr: '', profilePath: '/private/profile.json' }; } });
+  const p = ports({ runProfiledCommand: async options => { observed.push(options); return { exitCode: 3, durationMs: 12, stdout: 'private output\n' + 'x'.repeat(5000) + '\nfailure detail', stderr: '', profilePath: '/private/profile.json' }; } });
   const r = await ciCli(['profile', '--tier', 'L3', '--project', root, '--json'], p.dependencies);
   assert.equal(r.exitCode, 1); assert.equal(observed[0].phase, 'package');
   assert.equal(r.report.receipts[0].profilePath, '/private/profile.json'); assert.doesNotMatch(r.output, /private output/);
+  assert.match(r.report.receipts[0].diagnostic.stdoutTail, /failure detail/);
+  assert.equal(r.report.receipts[0].diagnostic.stdoutTruncated, true);
 });
 
 test('CI profile supplies file URL and matching destinations to two real Node reporters', async t => {
