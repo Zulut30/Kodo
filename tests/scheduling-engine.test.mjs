@@ -186,7 +186,7 @@ test('Engine refuses to overwrite an unresolved base merge receipt when delivery
   await fx.assertUserUnchanged();
 });
 
-test('Engine drains workers after real Git merge interruption and recovers the owning conflict before other integrations', { timeout: 25000 }, async t => {
+test('Engine drains workers after real Git merge interruption and recovers the owning conflict before other integrations', { timeout: integrationTimeoutMs }, async t => {
   const slowStarted = deferred(), conflictReached = deferred(), releaseSlow = deferred();
   t.signal.addEventListener('abort', () => releaseSlow.resolve(), { once: true });
   const original = Object.assign(new Error('quota in merge resolver'), { code: 'quota' });
