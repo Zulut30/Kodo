@@ -1,8 +1,64 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
-import { fixture, put, projects, pins, fakeTools, toolRunner } from './fixtures/quality/helpers.mjs';
+import { readFile, realpath } from 'node:fs/promises';
+import path from 'node:path';
+import { fixture, put, projects, pins, fakeTools, toolRunner, windowsShortPath } from './fixtures/quality/helpers.mjs';
 const api = () => import('../runtime/quality-runner.mjs');
+
+test('Quality Windows aliases keep evidence outside the canonical project', { skip: process.platform !== 'win32' }, async t => {
+  const { runQuality } = await api(), fx = await fixture(t, projects.javascript);
+  const alias = await windowsShortPath(fx.project);
+  for (const project of [fx.project, alias]) {
+    await assert.rejects(() => runQuality({ ...fx, project, evidenceDir: path.join(project, 'private-evidence'), resolve: fakeTools(), runner: toolRunner().runner, capabilities: ['lint'] }), /outside the project/);
+  }
+});
+
+test('Quality Windows aliases map absolute diagnostics only inside the inventoried root', { skip: process.platform !== 'win32' }, async t => {
+  const { runQuality } = await api(), fx = await fixture(t, projects.html);
+  const alias = await windowsShortPath(fx.project);
+  const reported = path.join(alias, 'index.html');
+  const fake = toolRunner({ 'html-validate': ({ args }) => args.includes('--version')
+    ? { code: 0, stdout: '11.18.0', stderr: '' }
+    : { code: 1, stdout: JSON.stringify([{ filePath: reported, messages: [{ ruleId: 'wcag/h37', severity: 2, line: 1, message: 'Image requires alt' }], errorCount: 1, warningCount: 0 }]), stderr: '' } });
+  const result = await runQuality({ ...fx, runner: fake.runner, resolve: fakeTools(), capabilities: ['lint'] });
+  assert.equal(result.status, 'failed'); assert.equal(result.receipts[0].findings[0].file, 'index.html');
+  const { parseQualityOutput } = await api();
+  const check = { tool: 'html-validate', files: ['index.html'], root: '' };
+  const response = filePath => ({ code: 0, stdout: JSON.stringify([{ filePath, messages: [], errorCount: 0, warningCount: 0 }]), stderr: '' });
+  assert.throws(() => parseQualityOutput(check, response(path.join(fx.evidenceDir, 'outside.html')), result.plan.project), /malformed/);
+  const { symlink } = await import('node:fs/promises');
+  const linked = path.join(fx.evidenceDir, 'linked-project');
+  await symlink(fx.project, linked, 'junction');
+  assert.throws(() => parseQualityOutput(check, response(path.join(linked, 'index.html')), result.plan.project), /malformed/);
+});
+
+test('Quality Windows receipt containment rejects relocated evidence through aliases', { skip: process.platform !== 'win32' }, async t => {
+  const { runQuality, isCurrentQualityReceipt } = await api(), fx = await fixture(t, projects.javascript);
+  const resolve = fakeTools(), runner = toolRunner().runner;
+  const result = await runQuality({ ...fx, resolve, runner, capabilities: ['lint'] });
+  assert.equal(await isCurrentQualityReceipt(result, { resolve, runner }), true);
+  const { cp } = await import('node:fs/promises');
+  const target = path.join(fx.project, '.kodo', 'relocated-evidence');
+  await cp(result.evidenceRoot, target, { recursive: true });
+  const alias = await windowsShortPath(target), relocated = structuredClone(result);
+  relocated.evidenceRoot = alias;
+  for (const row of relocated.receipts) for (const item of row.evidence) item.path = path.join(alias, path.basename(item.path));
+  assert.equal(await isCurrentQualityReceipt(relocated, { resolve, runner }), false);
+});
+
+test('Quality quick config changes cannot hide failing TypeScript behind passing JavaScript', async t => {
+  const { runQuality } = await api();
+  const fx = await fixture(t, { ...projects.typescript, 'src/main.ts': 'export const value: number = "bad";', 'src/main.js': 'export const ok = 1;' });
+  const fake = toolRunner({ typescript: ({ args }) => args.includes('--version')
+    ? { code: 0, stdout: 'Version 7.0.2', stderr: '' }
+    : { code: 2, stdout: 'src/main.ts(1,14): error TS2322: Type string is not assignable to type number.', stderr: '' } });
+  const result = await runQuality({ ...fx, project: await realpath(fx.project), runner: fake.runner, resolve: fakeTools(), mode: 'quick', changedPaths: ['tsconfig.json', 'src/main.js'], capabilities: ['lint', 'typecheck'] });
+  assert.equal(result.status, 'failed');
+  assert.equal(result.receipts.find(c => c.id === 'typescript:.:typecheck').status, 'failed');
+  assert.equal(result.receipts.find(c => c.id === 'javascript:.:lint').status, 'passed');
+  assert.ok(fake.calls.some(c => c.id === 'typescript' && c.args.includes('--project')));
+  assert.match(result.receipts.find(c => c.id === 'typescript:.:typecheck').scopeReason, /config|metadata/);
+});
 
 test('Quality runner gives nine languages independent verified capability receipts', async t => {
   const { runQuality } = await api();

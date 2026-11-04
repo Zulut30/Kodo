@@ -79,8 +79,12 @@ export function normalizeQualityConfig(input = {}) {
 }
 
 export async function qualityInventory(project) {
-  const root = path.resolve(project); await noLinks(root);
-  if (!(await lstat(root)).isDirectory() || await realpath(root) !== root) throw qualityError('unsafe_path', 'project must be a real directory');
+  const requested = path.resolve(project); await noLinks(requested);
+  if (!(await lstat(requested)).isDirectory()) throw qualityError('unsafe_path', 'project must be a real directory');
+  // Windows drive casing, 8.3 names and redirected paths may have different
+  // spellings for the same directory. Reject links before canonicalizing.
+  const root = await realpath(requested);
+  await noLinks(root);
   const files = []; let bytes = 0;
   async function visit(directory, prefix = '') {
     for (const entry of (await readdir(directory, { withFileTypes: true })).sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0)) {
@@ -170,6 +174,30 @@ async function validateManifestScope(root, files, documents) {
 function dir(name) { const value = path.posix.dirname(name); return value === '.' ? '' : value; }
 function beneath(root, name) { return !root || name.startsWith(root + '/'); }
 const at = (root, name) => root ? root + '/' + name : name;
+function metadataKind(name) {
+  const base = path.posix.basename(name);
+  if (/^(?:package(?:-lock)?\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?|tsconfig[^/]*\.json|Cargo\.(?:toml|lock)|rust-toolchain(?:\.toml)?|go\.(?:mod|sum|work|work\.sum)|composer\.(?:json|lock)|global\.json|Directory\.(?:Build\.(?:props|targets)|Packages\.props)|NuGet\.Config|kodo\.config\.json|(?:next|astro|stylelint|oxlint|oxfmt)\.config\.[^/]+|\.?(?:stylelintrc|htmlvalidate|oxlintrc|oxfmtrc)[^/]*|\.sqlfluff|\.editorconfig|phpstan[^/]*\.(?:neon|json)|phpcs\.xml(?:\.dist)?|\.phpcs\.xml(?:\.dist)?)$/i.test(base) || /\.(?:csproj|slnx?)$/i.test(base)) return 'known';
+  if (/\.(?:jsonc?|ya?ml|toml|ini|xml|neon|lock|props|targets)$/i.test(base) || /(?:^|[.-])config(?:[.-]|$)/i.test(base) || base.startsWith('.')) return 'unknown';
+  return null;
+}
+function metadataScope(report, scope, affected) {
+  const widened = new Map(), unknown = [];
+  for (const name of scope) {
+    const kind = metadataKind(name);
+    if (!kind) continue;
+    if (kind === 'unknown') { unknown.push(name); continue; }
+    const directory = dir(name);
+    // Ancestor configs may be inherited; nested configs belong to the deepest
+    // discovered project. A sibling project's metadata never selects its peers.
+    const containing = report.profiles.filter(p => p.root === directory || beneath(p.root, name));
+    const owner = containing.sort((a, b) => b.root.length - a.root.length)[0]?.root;
+    const profiles = report.profiles.filter(p => p.root === directory || beneath(directory, at(p.root, '_')) || owner !== undefined && p.root === owner);
+    for (const profile of profiles) widened.set(profile.id, [...(widened.get(profile.id) ?? []), name]);
+    if (!profiles.length) unknown.push(name);
+  }
+  if (unknown.length && !affected.some(name => report.profiles.some(p => p.files.includes(name)))) return { widened, blocked: unknown };
+  return { widened, blocked: [] };
+}
 function nativePin(profile, id, config, documents) {
   const configured = config.tools[id === 'gofmt' ? 'go' : id]?.version;
   let manifest;
@@ -199,7 +227,8 @@ function nativePin(profile, id, config, documents) {
 export class QualityProfileRegistry {
   constructor() { this.languages = qualityLanguages; }
   async _discover(project) {
-    const root = path.resolve(project), files = await qualityInventory(root), names = new Set(files.map(f => f.path));
+    const requested = path.resolve(project); await noLinks(requested);
+    const root = await realpath(requested), files = await qualityInventory(root), names = new Set(files.map(f => f.path));
     const documents = new Map(), frameworks = new Set(), frameworkEvidence = [];
     const markFramework = (framework, name) => { frameworks.add(framework); frameworkEvidence.push({ framework, root: dir(name) }); };
     for (const name of names) {
@@ -263,12 +292,15 @@ export class QualityProfileRegistry {
     const selected = options.capabilities ?? qualityCapabilities;
     if (!Array.isArray(selected) || !selected.length || selected.some(c => !qualityCapabilities.includes(c)) || new Set(selected).size !== selected.length) throw qualityError('configuration', 'invalid quality capabilities');
     const changedPaths = changed === null ? null : [...new Set(changed)].sort(), scope = changedPaths === null ? null : new Set([...changedPaths, ...affected]);
+    const metadata = mode === 'quick' && scope ? metadataScope(report, scope, affected) : { widened: new Map(), blocked: [] };
     const checks = [];
     for (const profile of report.profiles) for (const capability of selected) {
-      const files = mode === 'quick' && scope ? profile.files.filter(f => scope.has(f)) : profile.files;
-      let check = { id: `${profile.id}:${capability}`, profile: profile.id, language: profile.language, root: profile.root, capability, files, frameworks: profile.frameworks, status: 'applicable', tool: null, version: null, scopeReason: mode === 'quick' && scope === null ? 'unknown changed paths; inspect all discovered source files' : null };
+      const triggers = metadata.widened.get(profile.id);
+      const files = mode === 'quick' && scope && !triggers ? profile.files.filter(f => scope.has(f)) : profile.files;
+      let check = { id: `${profile.id}:${capability}`, profile: profile.id, language: profile.language, root: profile.root, capability, files, frameworks: profile.frameworks, status: 'applicable', tool: null, version: null, scopeReason: triggers ? `changed manifest/config/lock metadata requires its owning project: ${triggers.join(', ')}` : mode === 'quick' && scope === null ? 'unknown changed paths; inspect all discovered source files' : null };
       if (!config.enabled) check = { ...check, status: 'disabled', reason: 'quality_disabled' };
       else if (!config.capabilities[capability]) check = { ...check, status: 'disabled', reason: 'capability_disabled' };
+      else if (metadata.blocked.length) check = { ...check, status: 'blocked', reason: 'explicit_affected_scope_required', scopeReason: 'unknown metadata ownership; supply explicit affected source paths: ' + metadata.blocked.join(', ') };
       else if (!files.length) check = { ...check, status: 'skipped', reason: 'no_changed_or_affected_source' };
       else if (['test', 'security', 'architecture', 'release'].includes(capability)) check = { ...check, status: 'skipped', reason: 'explicit_configured_check_required' };
       else {
@@ -305,7 +337,7 @@ export class QualityProfileRegistry {
           }
           if (['typescript', 'cargo'].includes(check.tool) || check.tool === 'dotnet' && capability !== 'format' || check.tool === 'go' && capability !== 'format') {
             check.files = profile.files;
-            check.scopeReason = 'compiler/analyzer dependency graph is project-wide; selected source requires its owning project';
+            check.scopeReason = [check.scopeReason, 'compiler/analyzer dependency graph is project-wide; selected source requires its owning project'].filter(Boolean).join('; ');
           }
           if (check.tool === 'stylelint' && !profile.manifests.some(f => /stylelint/.test(f))) check = { ...check, status: 'blocked', reason: 'stylelint_project_config_required' };
           if (check.tool === 'html-validate' && !profile.manifests.some(f => /htmlvalidate/.test(f))) check = { ...check, status: 'blocked', reason: 'htmlvalidate_project_config_required' };
@@ -322,9 +354,11 @@ export class QualityProfileRegistry {
     for (const entry of config.checks.filter(c => selected.includes(c.capability))) {
       const candidates = entry.files.filter(f => names.has(f));
       if (candidates.length !== entry.files.length) throw qualityError('unsafe_path', 'configured quality check source is missing');
-      const relevant = scope === null || entry.files.some(f => scope.has(f));
-      if (mode === 'quick' && relevant && scope && entry.files.some(f => !scope.has(f)) && !entry.scopeReason) throw qualityError('configuration', 'configured quality check widening requires explicit dependency scopeReason');
-      const check = { id: `configured:${entry.id}`, language: entry.language ?? null, root: '', capability: entry.capability, tool: entry.command, version: entry.version, files: entry.files, status: !config.enabled || !config.capabilities[entry.capability] ? 'disabled' : !relevant && mode === 'quick' ? 'skipped' : 'applicable', scopeReason: entry.scopeReason ?? (scope === null ? 'unknown changed paths; explicitly configured check' : null), configured: entry };
+      const triggers = [...new Set(report.profiles.filter(p => metadata.widened.has(p.id) && p.files.some(f => entry.files.includes(f))).flatMap(p => metadata.widened.get(p.id)))];
+      const relevant = scope === null || entry.files.some(f => scope.has(f)) || triggers.length > 0;
+      if (mode === 'quick' && relevant && scope && !triggers.length && entry.files.some(f => !scope.has(f)) && !entry.scopeReason) throw qualityError('configuration', 'configured quality check widening requires explicit dependency scopeReason');
+      const check = { id: `configured:${entry.id}`, language: entry.language ?? null, root: '', capability: entry.capability, tool: entry.command, version: entry.version, files: entry.files, status: !config.enabled || !config.capabilities[entry.capability] ? 'disabled' : metadata.blocked.length ? 'blocked' : !relevant && mode === 'quick' ? 'skipped' : 'applicable', scopeReason: triggers.length ? `changed manifest/config/lock metadata activates configured owning-project check: ${triggers.join(', ')}` : entry.scopeReason ?? (scope === null ? 'unknown changed paths; explicitly configured check' : null), configured: entry };
+      if (check.status === 'blocked' && metadata.blocked.length) { check.reason = 'explicit_affected_scope_required'; check.scopeReason = 'unknown metadata ownership; supply explicit affected source paths: ' + metadata.blocked.join(', '); }
       checks.push(check);
       // A configured receipt replaces the neutral placeholder, never a built-in check.
       for (let i = checks.length - 2; i >= 0; i--) if (checks[i].capability === entry.capability && checks[i].reason === 'explicit_configured_check_required' && (!entry.language || checks[i].language === entry.language)) checks.splice(i, 1);

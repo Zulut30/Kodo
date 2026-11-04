@@ -4,6 +4,31 @@
 
 Публичный контракт: [QUALITY](../QUALITY.md), [ADR-0005](../decisions/0005-language-quality-profiles.md). Девять языков, offline detect/plan/run, отдельные capability receipts, strict pins/debt/scope. Используются существующие installer/managed `resolveTool` и owned-process `delivery.execute`; credential/provider startup не нужен. Архитектурный движок, CI/cache и автоматическая доставка не добавлены.
 
+## Ремонт Windows-путей и Quick metadata scope
+
+Следующий проверенный base — `4042edd9cb74cb4b7f798549d0997d229d68a6bc`: coordinator local и Linux CI PASS, Windows CI [41836243161](https://github.com/Zulut30/Kodo/actions/runs/41836243161) FAIL на строковом `realpath(root) !== root`. Независимый managed TSC/Oxlint probe также обнаружил ложный Quick PASS при изменённых `tsconfig.json` + JS и ошибке в TS. Эти исторические результаты не являются приёмкой ремонта.
+
+Worker исправляет только разрешённый scoped diff поверх `4042edd9`, без commit/доставки: directory/noLinks проверяются до канонизации; канонический root используется для inventory, diagnostic mapping и evidence containment, включая повторную проверку квитанций. Windows drive case, 8.3 и перенаправленные пути допускаются; внешние пути и symlink diagnostics отвергаются. Известные manifest/config/lock активируют owning checks с причиной, неизвестные metadata требуют явного affected scope. CSS/JS source-only fast path и границы siblings сохранены. Configured checks также активируются изменением metadata своего проекта.
+
+| Requirement | Evidence |
+| --- | --- |
+| Windows aliases | `Quality Windows drive case and short aliases preserve safe discovery and planning` |
+| directory/noLinks | `Quality canonical discovery still rejects linked and non-directory roots` |
+| Scope всех девяти языков | `Quality quick manifest and config changes select all nine language profiles` |
+| Owning project, siblings, CSS/JS, unknown scope | `Quality quick metadata changes widen owning checks and preserve sibling and source scopes` |
+| Configured checks | `Quality quick metadata changes activate configured checks without crossing sibling projects` |
+| Ложный смешанный JS/TS PASS | `Quality quick config changes cannot hide failing TypeScript behind passing JavaScript` |
+| Evidence containment | `Quality Windows aliases keep evidence outside the canonical project`; `Quality Windows receipt containment rejects relocated evidence through aliases` |
+| Diagnostic paths | `Quality Windows aliases map absolute diagnostics only inside the inventoried root`; неизменённый `QACC-21 HTML validator source text is not a diagnostic file path` |
+
+Private raw evidence: `%TEMP%/kodo-roadmap-20261104/repair01/`. `red.tap`: все три первоначальные регрессии RED (unsafe_path, skipped typecheck, ложный passed). После канонизации дополнительный `alias-scoped.tap`: 93 PASS / 1 FAIL, frozen QACC-21 подтвердил несовпадение diagnostic namespace; `red-alias-diagnostics.tap` и `red-receipt-alias.tap` сохраняют отдельные RED. Последний targeted `green-final-regressions.tap`: 9/9 PASS. Итоговый scoped GREEN: **98/98 PASS, 0 fail/cancelled/skip** в обычном окружении (`final-normal-green.tap`, 43287.963 ms) и **98/98 PASS, 0 fail/cancelled/skip** с реальным 8.3 TEMP/TMP (`final-alias-green.tap`, 43916.322 ms). Полные scoped команды, хеши файлов/логов и точный alias фиксируются в `receipt.json`; full integrated check, fresh scanners/review и новый exact-head Linux/Windows CI **PENDING**.
+
+```powershell
+node --test --test-reporter=tap tests/quality-profiles.test.mjs tests/quality-runner.test.mjs tests/quality-cli.test.mjs tests/quality-acceptance.test.mjs
+```
+
+Эта команда повторяется с дочерними `TEMP/TMP`, указывающими на owned 8.3 scratch; `alias-tmp.txt` хранит точный путь. Frozen acceptance SHA-256 остаётся `7101c8462ca38870282720b5f759ec55a50ecaeae0705bc682fc6606a139db73`. Уроки: строковая идентичность пути не доказывает filesystem identity; source-only пересечение теряет изменения конфигурации; после смены namespace все проверки containment и diagnostics должны использовать тот же канонический корень. Наличие Windows scoped GREEN не заменяет Windows CI и fresh review.
+
 ## Независимые проверки
 
 Тесты: [quality-acceptance.test.mjs](../../tests/quality-acceptance.test.mjs). Все имена фиксированы; source/output не попадают в имена. Fixture-инструменты — искусственные offline процессы/порты; fake npm полностью заменяет package manager, сети/реальных установок нет. Временные Git-проекты и evidence изолированы вне checkout. Assertions проверяют публичный результат, файлы и квитанции; внутренние функции реализации не вызываются.

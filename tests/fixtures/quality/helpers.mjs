@@ -1,8 +1,20 @@
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import os from 'node:os';
-import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, rm, realpath } from 'node:fs/promises';
 import { execute } from '../../../runtime/delivery.mjs';
+import { execute as command } from '../../../runtime/command.mjs';
+import { workerEnvironment } from '../../../runtime/security.mjs';
+
+export async function windowsShortPath(project) {
+  const script = "$ErrorActionPreference='Stop'; $p=[Console]::In.ReadToEnd(); $f=New-Object -ComObject Scripting.FileSystemObject; [Console]::Out.Write($f.GetFolder($p).ShortPath)";
+  const result = await command(path.join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
+    ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
+    { input: project, env: workerEnvironment(), timeoutMs: 10000 });
+  const short = result.stdout.trim();
+  assert.equal(await realpath(short), await realpath(project));
+  return short;
+}
 
 export async function put(root, name, value) {
   const filename = path.join(root, name);

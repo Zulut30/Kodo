@@ -5,6 +5,7 @@
 import path from 'node:path';
 import os from 'node:os';
 import { performance } from 'node:perf_hooks';
+import { lstatSync, realpathSync } from 'node:fs';
 import { access, lstat, mkdir, mkdtemp, readFile, realpath, writeFile } from 'node:fs/promises';
 import { execute } from './delivery.mjs';
 import { resolveTool, toolCatalog } from './tools.mjs';
@@ -37,8 +38,20 @@ async function nativeTool(id) {
   throw qualityError('missing', 'native quality runtime is not installed');
 }
 async function privateDirectory(target, project) {
-  const absolute = path.resolve(target); await noLinks(absolute);
-  if (inside(project, absolute) || inside(absolute, project) || absolute === path.parse(absolute).root || absolute === path.resolve(os.homedir())) throw qualityError('unsafe_evidence', 'quality evidence must be in a dedicated private directory outside the project');
+  const requested = path.resolve(target); await noLinks(requested);
+  // The project is canonical; compare evidence in that same namespace even
+  // when its not-yet-created leaf is supplied through a Windows alias.
+  let current = requested; const missing = [];
+  let absolute;
+  for (;;) {
+    try { absolute = path.join(await realpath(current), ...missing); break; }
+    catch (error) {
+      if (error.code !== 'ENOENT' || current === path.dirname(current)) throw error;
+      missing.unshift(path.basename(current)); current = path.dirname(current);
+    }
+  }
+  await noLinks(absolute);
+  if (inside(project, absolute) || inside(absolute, project) || absolute === path.parse(absolute).root || absolute === await realpath(os.homedir())) throw qualityError('unsafe_evidence', 'quality evidence must be in a dedicated private directory outside the project');
   for (let current = absolute; ; current = path.dirname(current)) {
     try { await lstat(path.join(current, '.git')); throw qualityError('unsafe_evidence', 'quality evidence must be outside Git'); }
     catch (error) { if (error.code !== 'ENOENT' && error.code !== 'ENOTDIR') throw error; }
@@ -73,8 +86,21 @@ function fileInOutput(value, check, project) {
   const filename = value.replaceAll('\\', '/');
   let name;
   if (path.isAbsolute(value) || /^[A-Za-z]:\//.test(filename)) {
-    if (!inside(project, path.resolve(value))) return malformed();
-    name = path.relative(project, value).replaceAll('\\', '/');
+    let absolute = path.resolve(value);
+    if (!inside(project, absolute) && process.platform === 'win32') {
+      // A compiler can report the original DOS/redirected spelling although
+      // planning uses the canonical root. Accept only a real, link-free alias.
+      try {
+        let current = path.parse(absolute).root;
+        for (const part of absolute.slice(current.length).split(path.sep).filter(Boolean)) {
+          current = path.join(current, part);
+          if (lstatSync(current).isSymbolicLink()) return malformed();
+        }
+        absolute = realpathSync.native(absolute);
+      } catch { return malformed(); }
+    }
+    if (!inside(project, absolute)) return malformed();
+    name = path.relative(project, absolute).replaceAll('\\', '/');
   } else name = (check.root ? check.root + '/' : '') + filename.replace(/^\.\//, '');
   qualityPath(name);
   if (!check.files.includes(name)) return malformed(); return name;
@@ -398,13 +424,15 @@ export async function isCurrentQualityReceipt(report, { project, runner = execut
     const head = await runner('git', ['rev-parse', '--verify', 'HEAD'], { cwd: plan.project, timeoutMs: 10000, maxOutputBytes: 1024 });
     if (head.code !== 0 || head.stdout.trim() !== report.headSha || plan.checks.length !== report.receipts.length) return false;
     await noLinks(report.evidenceRoot);
-    if (inside(plan.project, report.evidenceRoot)) return false;
+    const evidenceRoot = await realpath(report.evidenceRoot);
+    if (inside(plan.project, evidenceRoot) || inside(evidenceRoot, plan.project)) return false;
     for (const [index, row] of report.receipts.entries()) {
       const check = plan.checks[index];
       if (row.id !== check.id || row.tool !== check.tool || row.version !== check.version || row.pinsHash !== pinsHash(check, plan) || JSON.stringify(row.files) !== JSON.stringify(check.files)) return false;
       if (!resultStates.has(row.status) || ['blocked', 'failed', 'missing', 'unsupported'].includes(row.status) || row.evidence.length !== 1) return false;
-      const item = row.evidence[0]; if (!inside(report.evidenceRoot, path.resolve(item.path))) return false; await noLinks(item.path);
-      const content = await readFile(item.path); if (sha256(content) !== item.sha256 || content.length !== item.bytes) return false;
+      const item = row.evidence[0]; await noLinks(item.path);
+      const evidencePath = await realpath(item.path); if (!inside(evidenceRoot, evidencePath)) return false;
+      const content = await readFile(evidencePath); if (sha256(content) !== item.sha256 || content.length !== item.bytes) return false;
       const stored = JSON.parse(content);
       const { logs, ...storedReceipt } = stored, { evidence, ...suppliedReceipt } = row;
       if (JSON.stringify(storedReceipt) !== JSON.stringify(suppliedReceipt) || stored.headSha !== report.headSha || stored.sourceHash !== report.sourceHash || stored.configHash !== report.configHash) return false;
