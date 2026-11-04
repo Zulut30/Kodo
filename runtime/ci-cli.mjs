@@ -7,7 +7,7 @@ import { randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { access } from 'node:fs/promises';
 import { execute } from './command.mjs';
-import { workerEnvironment } from './security.mjs';
+import { redact, workerEnvironment } from './security.mjs';
 
 export const ciHelp = 'kodo ci plan|run|profile [--tier L0|L1|L2|L3] [--base SHA] [--project PATH] [--json]\nkodo ci feedback --base SHA [--tier L1] [--project PATH] [--json]';
 const shaOK = value => typeof value === 'string' && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(value);
@@ -143,10 +143,25 @@ async function security(options, dependencies) {
   return receipt;
 }
 
+function failureDiagnostic(result, secrets) {
+  const diagnostic = {};
+  for (const stream of ['stdout', 'stderr']) {
+    // Redact the entire capture before cutting: a credential may cross the
+    // tail boundary. Advance past UTF-8 continuation bytes to retain valid text.
+    const bytes = Buffer.from(redact(typeof result[stream] === 'string' ? result[stream] : '', secrets));
+    let start = Math.max(0, bytes.length - 4096);
+    while (start < bytes.length && (bytes[start] & 0xc0) === 0x80) start++;
+    diagnostic[`${stream}Tail`] = bytes.subarray(start).toString('utf8');
+    diagnostic[`${stream}Truncated`] = start > 0;
+  }
+  return diagnostic;
+}
+
 export async function runCi(options, dependencies = {}) {
   const plan = await planCi(options, dependencies), receipts = [], began = performance.now();
   const evidenceDir = options.evidenceDir ?? path.join(os.tmpdir(), 'kodo-ci-evidence', randomUUID());
   const common = { cwd: plan.project, env: workerEnvironment(), signal: options.signal, timeoutMs: 1200000 };
+  const secrets = Object.fromEntries(Object.entries(process.env).filter(([name]) => !(name in common.env)));
   if (options.signal?.aborted) return { ...plan, status: 'blocked', complete: false, durationMs: performance.now() - began, receipts: [{ phase: 'run', status: 'blocked', reason: 'cancelled' }] };
   const requiresCleanSource = !options.feedback && ['L1', 'L2', 'L3'].includes(plan.tier);
   if (requiresCleanSource) {
@@ -183,11 +198,12 @@ export async function runCi(options, dependencies = {}) {
         result = await profile({ ...command, args, ...common, phase, evidenceDir, tier: plan.tier });
       } else {
         const observation = await (dependencies.execute ?? execute)(command.command, command.args, { ...common, allowFailure: true });
-        result = { exitCode: observation.code, durationMs: performance.now() - start };
+        result = { exitCode: observation.code, durationMs: performance.now() - start, stdout: observation.stdout, stderr: observation.stderr };
       }
       const valid = Number.isInteger(result.exitCode) && result.exitCode >= 0;
       receipts.push({ ...command, status: valid ? result.exitCode === 0 ? 'passed' : 'failed' : 'blocked', exitCode: result.exitCode,
-        durationMs: result.durationMs, ...(result.profilePath ? { profilePath: result.profilePath } : {}) });
+        durationMs: result.durationMs, ...(result.profilePath ? { profilePath: result.profilePath } : {}),
+        ...(valid && result.exitCode !== 0 ? { diagnostic: failureDiagnostic(result, secrets) } : {}) });
     } catch (error) {
       receipts.push({ ...command, status: 'blocked', reason: ['timeout', 'cancelled', 'profiler_contract'].includes(error.code) ? error.code : 'command_error', durationMs: performance.now() - start,
         ...(error.profilePath ? { profilePath: error.profilePath } : {}) });
