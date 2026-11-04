@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import os from 'node:os';
+import { createHash } from 'node:crypto';
 import { mkdtemp, mkdir, writeFile, rm, readFile, access } from 'node:fs/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { execute } from '../runtime/command.mjs';
@@ -9,6 +10,75 @@ import { ciCli, planCi, runCi } from '../runtime/ci-cli.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const sha = 'a'.repeat(40);
+
+test('CI strict source fence checks hidden tracked bytes before and after real L1 and L3 commands', async t => {
+  for (const flag of ['--assume-unchanged', '--skip-worktree']) {
+    for (const tier of ['L1', 'L3']) {
+      for (const scenario of ['dirty before', 'mutation during', 'clean source']) await t.test(`${flag} ${tier} ${scenario}`, async t => {
+        const scratch = await mkdtemp(path.join(os.tmpdir(), 'kodo-ci-hidden-'));
+        t.after(async () => { assert.equal(path.dirname(scratch), path.resolve(os.tmpdir())); await rm(scratch, { recursive: true, force: true }); });
+        const project = path.join(scratch, 'project'); await mkdir(project);
+        const git = args => execute('git', args, { cwd: project, rawOutput: true });
+        await git(['init', '-q']); await git(['config', 'user.name', 'CI Fixture']); await git(['config', 'user.email', 'ci@example.invalid']);
+        await git(['config', 'core.autocrlf', 'false']);
+        const source = path.join(project, 'source.mjs'), marker = path.join(scratch, 'checker-runs');
+        const original = 'export const value = 2;\n', changed = 'export const value = 3;\n';
+        const hash = bytes => createHash('sha256').update(bytes).digest('hex');
+        await writeFile(source, 'export const value = 1;\n');
+        const checker = `import assert from 'node:assert/strict';
+import { writeFile } from 'node:fs/promises';
+import { value } from '../source.mjs';
+assert.ok(value > 0);
+await writeFile(${JSON.stringify(marker)}, 'ran\\n', { flag: 'a' });
+${scenario === 'mutation during' ? `await writeFile(${JSON.stringify(source)}, ${JSON.stringify(changed)});` : ''}
+`;
+        await mkdir(path.join(project, tier === 'L1' ? 'tests' : 'scripts'));
+        await writeFile(path.join(project, tier === 'L1' ? 'tests/source.test.mjs' : 'scripts/package-smoke.mjs'), checker);
+        await git(['add', '.']); await git(['commit', '-qm', 'base']);
+        const baseSha = (await git(['rev-parse', 'HEAD'])).stdout.trim();
+        await writeFile(source, original); await git(['add', 'source.mjs']); await git(['commit', '-qm', 'changed source']);
+        const headSha = (await git(['rev-parse', 'HEAD'])).stdout.trim();
+        await git(['update-index', flag, '--', 'source.mjs']);
+        if (scenario === 'dirty before') await writeFile(source, changed);
+        const statusBefore = (await git(['status', '--porcelain=v1', '--untracked-files=all'])).stdout;
+        assert.equal(statusBefore, '', 'real Git porcelain hides the index-flagged bytes');
+        assert.equal(await readFile(source, 'utf8'), scenario === 'dirty before' ? changed : original);
+        const commands = []; let qualityChecks = 0;
+        const result = await runCi({ project, tier, baseSha }, {
+          qualityRegistry: {
+            detect: async () => ({ files: [{ path: 'source.mjs' }] }),
+            plan: async () => ({ status: 'applicable', checks: [{ id: 'offline:lint', status: 'applicable' }] })
+          },
+          runQuality: async () => { qualityChecks++; return { status: 'passed', receipts: [{ id: 'offline:lint', status: 'passed' }] }; },
+          execute: async (command, args, options) => {
+            if (command === process.execPath) commands.push(args);
+            const env = { ...options.env }; delete env.NODE_TEST_CONTEXT;
+            return execute(command, args, { ...options, env });
+          }
+        });
+        const statusAfter = (await git(['status', '--porcelain=v1', '--untracked-files=all'])).stdout;
+        const actualHead = (await git(['rev-parse', 'HEAD'])).stdout.trim();
+        const bytes = await readFile(source);
+        let checkerRuns = 0;
+        try { checkerRuns = (await readFile(marker, 'utf8')).trim().split('\n').length; } catch (error) { if (error.code !== 'ENOENT') throw error; }
+        t.diagnostic(JSON.stringify({ tier, flag, scenario, statusBefore, statusAfter, headSha, actualHead,
+          committedHash: hash(original), observedHash: hash(bytes), commands, checkerRuns, qualityChecks, status: result.status, complete: result.complete }));
+        assert.equal(actualHead, headSha);
+        assert.equal(statusAfter, '', 'real Git porcelain remains empty after the successful command');
+        assert.equal(hash(bytes), hash(scenario === 'clean source' ? original : changed));
+        if (scenario !== 'clean source') assert.notEqual(hash(bytes), hash(original), 'tracked working bytes differ from HEAD');
+        assert.equal(result.headSha, headSha);
+        assert.equal(result.status, scenario === 'clean source' ? 'passed' : 'blocked');
+        assert.equal(result.complete, scenario === 'clean source');
+        assert.equal(checkerRuns, scenario === 'dirty before' ? 0 : 1);
+        assert.equal(qualityChecks, tier === 'L1' && scenario !== 'dirty before' ? 1 : 0);
+        assert.equal(commands.length, scenario === 'dirty before' ? 0 : tier === 'L1' ? 2 : 1);
+        if (scenario !== 'clean source') assert.ok(result.receipts.some(row => row.phase === 'source' && row.reason === 'dirty_worktree'));
+        if (scenario === 'mutation during') assert.ok(result.receipts.some(row => row.phase === (tier === 'L1' ? 'tests' : 'package-smoke') && row.status === 'passed' && row.exitCode === 0));
+      });
+    }
+  }
+});
 
 test('CI acceptance blocks dirty source before execution and mutation under an unchanged HEAD', async t => {
   for (const scenario of ['dirty before', 'mutation during', 'clean source']) await t.test(scenario, async t => {
@@ -47,6 +117,37 @@ function ports(overrides = {}) {
     ...overrides
   } };
 }
+
+test('CI explicit sourceState port keeps its project contract and unknown fails closed before and after commands', async () => {
+  for (const tier of ['L1', 'L3']) {
+    for (const after of [false, true]) {
+      for (const unavailable of ['unknown', undefined, true, { state: 'clean' }]) {
+        let inspections = 0;
+        const p = ports({ sourceState: async (...args) => {
+          assert.deepEqual(args, [root]);
+          inspections++;
+          return after && inspections === 1 ? 'clean' : unavailable;
+        } });
+        const result = await runCi({ project: root, tier, baseSha: sha }, p.dependencies);
+        assert.equal(result.status, 'blocked'); assert.equal(result.complete, false);
+        assert.equal(inspections, after ? 2 : 1);
+        assert.equal(p.calls.length > 0, after);
+        assert.ok(result.receipts.some(row => row.phase === 'source' && row.reason === 'source_unavailable'));
+      }
+    }
+  }
+});
+
+test('CI L0 and partial feedback avoid strict source inspection cost', async () => {
+  for (const options of [{ tier: 'L0' }, { tier: 'L1', feedback: true }]) {
+    let inspections = 0;
+    const p = ports({ sourceState: async () => { inspections++; return 'unknown'; } });
+    const result = await runCi({ project: root, baseSha: sha, ...options }, p.dependencies);
+    assert.equal(inspections, 0);
+    assert.equal(result.status, options.feedback ? 'feedback_ready' : 'passed');
+    if (options.feedback) { assert.equal(result.complete, false); assert.equal(result.requiresFullCheck, true); }
+  }
+});
 
 test('CI strict arguments reject invalid duplicate and positional flags as JSON', async () => {
   for (const args of [['other'], ['plan', '--tier', 'L4'], ['plan', '--base', 'HEAD'], ['plan', '--tier', 'L1', '--tier', 'L0'], ['run', '--fix'], ['run', 'extra'], ['run', '--project'], ['plan', '--json', '--json']]) {

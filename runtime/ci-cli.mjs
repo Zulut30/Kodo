@@ -52,16 +52,12 @@ async function currentHead(project, dependencies) {
   const value = dependencies.head ? await dependencies.head(project) : (await execute('git', ['rev-parse', '--verify', 'HEAD'], { cwd: project, timeoutMs: 10000 })).stdout.trim();
   if (!shaOK(value)) throw fail('invalid_head'); return value;
 }
-async function sourceState(project, dependencies) {
+async function sourceState(project, headSha, dependencies) {
   try {
-    if (dependencies.sourceState) {
-      const value = await dependencies.sourceState(project);
-      return ['clean', 'dirty'].includes(value) ? value : 'unknown';
-    }
-    const result = await (dependencies.execute ?? execute)('git', ['status', '--porcelain=v1', '--untracked-files=all'],
-      { cwd: project, env: workerEnvironment(), timeoutMs: 10000, rawOutput: true });
-    if (result.code !== 0 || typeof result.stdout !== 'string') return 'unknown';
-    return result.stdout.trim() ? 'dirty' : 'clean';
+    const value = dependencies.sourceState
+      ? await dependencies.sourceState(project)
+      : await (await import('./ci-graph.mjs')).inspectCurrentSource({ project, headSha });
+    return ['clean', 'dirty'].includes(value) ? value : 'unknown';
   } catch { return 'unknown'; }
 }
 async function affected(options, dependencies) {
@@ -187,7 +183,7 @@ export async function runCi(options, dependencies = {}) {
   if (options.signal?.aborted) return { ...plan, status: 'blocked', complete: false, durationMs: performance.now() - began, receipts: [{ phase: 'run', status: 'blocked', reason: 'cancelled' }] };
   const requiresCleanSource = !options.feedback && ['L1', 'L2', 'L3'].includes(plan.tier);
   if (requiresCleanSource) {
-    const state = await sourceState(plan.project, dependencies);
+    const state = await sourceState(plan.project, plan.headSha, dependencies);
     if (state !== 'clean') return { ...plan, status: 'blocked', complete: false, durationMs: performance.now() - began,
       receipts: [{ phase: 'source', status: 'blocked', reason: state === 'dirty' ? 'dirty_worktree' : 'source_unavailable' }] };
   }
@@ -241,7 +237,7 @@ export async function runCi(options, dependencies = {}) {
   const unchanged = await currentHead(plan.project, dependencies) === plan.headSha;
   if (!unchanged || options.signal?.aborted) receipts.push({ phase: 'head', status: 'blocked', reason: unchanged ? 'cancelled' : 'changed_head' });
   if (requiresCleanSource) {
-    const state = await sourceState(plan.project, dependencies);
+    const state = await sourceState(plan.project, plan.headSha, dependencies);
     if (state !== 'clean') receipts.push({ phase: 'source', status: 'blocked', reason: state === 'dirty' ? 'dirty_worktree' : 'source_unavailable' });
   }
   const status = receipts.some(row => row.status === 'failed') ? 'failed' : receipts.some(row => row.status === 'blocked') ? 'blocked' : receipts.some(row => row.status === 'passed') ? 'passed' : 'not_applicable';

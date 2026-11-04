@@ -1,10 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, rm, rename, realpath, symlink } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, rm, rename, realpath, symlink, link, open } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { planAffected } from '../runtime/ci-graph.mjs';
+import { inspectCurrentSource, planAffected } from '../runtime/ci-graph.mjs';
 import { runCi } from '../runtime/ci-cli.mjs';
 import { execute } from '../runtime/command.mjs';
 
@@ -230,4 +230,132 @@ test('Affected graph cannot narrow tests in a project with unsupported source la
   await put(fx.project, 'src/value.mjs', 'export const value = 2;');
   const plan = await planAffected({ ...fx, headSha: fx.commit() });
   assert.equal(plan.fallback, true); assert.ok(plan.reasons.includes('unsupported-syntax:bridge.py')); assert.ok(plan.testFiles.includes('tests/other.test.mjs'));
+});
+
+for (const flag of ['--assume-unchanged', '--skip-worktree']) test(`Affected graph detects tracked bytes hidden by ${flag}`, async t => {
+  const fx = await fixture(t), clean = await planAffected(fx);
+  const file = 'src/value.mjs', before = await readFile(path.join(fx.project, file));
+  git(fx.project, 'update-index', flag, file);
+  await put(fx.project, file, 'export const value = 9;');
+  assert.equal(git(fx.project, 'status', '--porcelain=v1', '--untracked-files=all'), '', 'real Git hides the modification');
+  assert.notDeepEqual(await readFile(path.join(fx.project, file)), before, 'actual bytes changed');
+  assert.equal(git(fx.project, 'rev-parse', 'HEAD'), fx.baseSha);
+  assert.equal(await inspectCurrentSource({ project: fx.project, headSha: fx.baseSha }), 'dirty');
+  const plan = await planAffected(fx);
+  assert.equal(plan.sourceHash, clean.sourceHash); assert.equal(plan.dependencyHash, clean.dependencyHash);
+  assert.equal(plan.fallback, true, 'hidden tracked edits cannot permit narrow selection');
+  assert.ok(plan.reasons.includes('dirty-worktree'));
+  assert.deepEqual(plan.testFiles, ['tests/other.test.mjs', 'tests/value.test.mjs']);
+});
+
+test('Current source checks clean bytes CRLF checkout and binary bytes without project filters', async t => {
+  const fx = await fixture(t, { 'crlf.txt': 'first line\nsecond line\n', 'binary.dat': Buffer.from([0, 255, 13, 10, 254]) });
+  const input = { project: fx.project, headSha: fx.baseSha };
+  assert.equal(await inspectCurrentSource(input), 'clean');
+  const sourceHash = (await planAffected(input)).sourceHash;
+  git(fx.project, 'update-index', '--skip-worktree', 'crlf.txt', 'binary.dat');
+  await put(fx.project, 'crlf.txt', 'first line\r\nsecond line\r\n');
+  assert.equal(git(fx.project, 'status', '--porcelain=v1', '--untracked-files=all'), '');
+  assert.equal(await inspectCurrentSource(input), 'clean', 'ordinary lossless UTF8 CRLF checkout remains compatible');
+  assert.equal((await planAffected(input)).sourceHash, sourceHash);
+  await put(fx.project, 'binary.dat', Buffer.from([0, 255, 10, 254]));
+  assert.equal(await inspectCurrentSource(input), 'dirty', 'invalid UTF8 cannot use text normalization');
+  await put(fx.project, 'binary.dat', Buffer.from([0, 255, 13, 10, 254]));
+  await put(fx.project, '.gitattributes', 'crlf.txt filter=tripwire\n'); fx.commit();
+  const headSha = git(fx.project, 'rev-parse', 'HEAD');
+  // A project filter would create this marker and fail if ever executed.
+  git(fx.project, 'config', 'filter.tripwire.clean', 'echo called > filter-ran.txt; exit 1');
+  git(fx.project, 'config', 'filter.tripwire.required', 'true');
+  await put(fx.project, 'crlf.txt', 'different actual bytes\n');
+  assert.equal(git(fx.project, 'status', '--porcelain=v1', '--untracked-files=all'), '');
+  assert.equal(await inspectCurrentSource({ project: fx.project, headSha }), 'dirty');
+  await assert.rejects(() => readFile(path.join(fx.project, 'filter-ran.txt')), { code: 'ENOENT' });
+});
+
+test('Current source status inspection never executes configured project clean filters', async t => {
+  const fx = await fixture(t, { '.gitattributes': 'src/value.mjs filter=tripwire\n' });
+  git(fx.project, 'config', 'filter.tripwire.clean', 'echo called > filter-ran.txt; exit 1');
+  git(fx.project, 'config', 'filter.tripwire.required', 'true');
+  await put(fx.project, 'src/value.mjs', 'export const value = 9;');
+  const state = await inspectCurrentSource({ project: fx.project, headSha: fx.baseSha });
+  await assert.rejects(() => readFile(path.join(fx.project, 'filter-ran.txt')), { code: 'ENOENT' });
+  assert.equal(state, 'dirty');
+  const plan = await planAffected({ project: fx.project, headSha: fx.baseSha });
+  assert.equal(plan.fallback, true); assert.ok(plan.reasons.includes('dirty-worktree'));
+  await assert.rejects(() => readFile(path.join(fx.project, 'filter-ran.txt')), { code: 'ENOENT' });
+});
+
+test('Current source fails closed for invalid inputs stale HEAD non-root and linked paths', async t => {
+  const fx = await fixture(t), input = { project: fx.project, headSha: fx.baseSha };
+  for (const invalid of [undefined, null, {}, { project: fx.project, headSha: 'HEAD' }, { project: fx.project, headSha: 'a'.repeat(40) }, { ...input, project: path.join(fx.project, 'src') }]) {
+    const state = await inspectCurrentSource(invalid);
+    assert.equal(state, invalid?.headSha === 'a'.repeat(40) ? 'dirty' : 'unknown');
+  }
+  await put(fx.project, 'src/value.mjs', 'export const value = 2;'); fx.commit();
+  assert.equal(await inspectCurrentSource(input), 'dirty');
+  const wrapper = await mkdtemp(path.join(os.tmpdir(), 'kodo-source-links-'));
+  t.after(() => rm(wrapper, { recursive: true, force: true }));
+  const alias = path.join(wrapper, 'alias'); await symlink(fx.project, alias, process.platform === 'win32' ? 'junction' : 'dir');
+  assert.equal(await inspectCurrentSource({ ...input, project: alias }), 'unknown');
+  assert.equal(await inspectCurrentSource({ ...input, project: path.join(alias, 'src') }), 'unknown');
+  const current = { ...input, headSha: git(fx.project, 'rev-parse', 'HEAD') };
+  await put(fx.project, 'untracked.txt', 'untracked');
+  assert.equal(await inspectCurrentSource(current), 'dirty');
+});
+
+test('Current source uncertainty forces broad graph for missing nonregular linked and oversized tracked files', async t => {
+  const fx = await fixture(t), input = { project: fx.project, headSha: fx.baseSha }, file = path.join(fx.project, 'src/value.mjs');
+  git(fx.project, 'update-index', '--skip-worktree', 'src/value.mjs');
+  const unknown = async () => {
+    assert.equal(git(fx.project, 'status', '--porcelain=v1', '--untracked-files=all'), '');
+    assert.equal(await inspectCurrentSource(input), 'unknown');
+    const plan = await planAffected(input);
+    assert.equal(plan.fallback, true); assert.ok(plan.reasons.includes('unknown-source'));
+    assert.deepEqual(plan.testFiles, ['tests/other.test.mjs', 'tests/value.test.mjs']);
+  };
+  await rm(file); await unknown();
+  await mkdir(file); await unknown(); await rm(file, { recursive: true });
+  const external = path.join(await realpath(os.tmpdir()), `kodo-source-${path.basename(fx.project)}.mjs`);
+  t.after(() => rm(external, { force: true })); await writeFile(external, 'export const value = 1;');
+  await symlink(external, file, process.platform === 'win32' ? 'junction' : 'file');
+  await unknown(); await rm(file);
+  await link(external, file); await unknown(); await rm(file);
+  const handle = await open(file, 'w'); await handle.truncate(16 * 1024 ** 2 + 1); await handle.close();
+  await unknown();
+});
+
+test('Current source enforces total byte budget with individually bounded matching blobs', async t => {
+  const extras = Object.fromEntries(Array.from({ length: 9 }, (_, i) => [`data-${i}.dat`, 'x']));
+  const fx = await fixture(t, extras), input = { project: fx.project, headSha: fx.baseSha };
+  // Matching objects keep the earlier byte checks clean; the ninth file alone
+  // exceeds the total budget. No huge fixture is committed or checked out.
+  const zero = Buffer.alloc(16 * 1024 ** 2);
+  const oid = execFileSync('git', ['hash-object', '-w', '--stdin', '--no-filters'], { cwd: fx.project, input: zero, encoding: 'utf8', windowsHide: true }).trim();
+  for (const [index, file] of Object.keys(extras).entries()) {
+    const handle = await open(path.join(fx.project, file), 'w'); await handle.truncate(16 * 1024 ** 2); await handle.close();
+    git(fx.project, 'update-index', '--cacheinfo', `100644,${oid},${file}`);
+    git(fx.project, 'update-index', '--skip-worktree', file);
+    if (index === 0) {
+      git(fx.project, 'commit', '-qm', 'one bounded blob'); input.headSha = git(fx.project, 'rev-parse', 'HEAD');
+      assert.equal(await inspectCurrentSource(input), 'clean', 'an exactly 16 MiB matching file is accepted');
+    }
+  }
+  git(fx.project, 'commit', '-qm', 'bounded blobs'); input.headSha = git(fx.project, 'rev-parse', 'HEAD');
+  assert.equal(git(fx.project, 'status', '--porcelain=v1', '--untracked-files=all'), '');
+  assert.equal(await inspectCurrentSource(input), 'unknown');
+});
+
+test('Current source rejects unsupported immutable symlink and submodule modes', async t => {
+  for (const mode of ['120000', '160000']) {
+    const fx = await fixture(t), input = { project: fx.project, headSha: fx.baseSha };
+    const file = 'src/value.mjs', target = mode === '160000' ? input.headSha : git(fx.project, 'rev-parse', `${input.headSha}:${file}`);
+    git(fx.project, 'update-index', '--cacheinfo', `${mode},${target},${file}`);
+    git(fx.project, 'update-index', '--skip-worktree', file);
+    git(fx.project, 'commit', '-qm', 'unsupported mode'); input.headSha = git(fx.project, 'rev-parse', 'HEAD');
+    assert.equal(git(fx.project, 'status', '--porcelain=v1', '--untracked-files=all'), '');
+    assert.equal(await inspectCurrentSource(input), 'unknown');
+    const plan = await planAffected(input);
+    assert.equal(plan.fallback, true); assert.ok(plan.reasons.includes('unknown-source'));
+    assert.ok(plan.reasons.includes('unsupported-tree-entry:src/value.mjs'));
+  }
 });

@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { realpath } from 'node:fs/promises';
+import { lstat, open, realpath } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { isBuiltin } from 'node:module';
 import { parse } from 'acorn';
@@ -20,7 +20,22 @@ function relative(file) {
   return file;
 }
 async function git(project, args, input) {
-  return (await execute('git', args, { cwd: project, input, env: workerEnvironment(), rawOutput: true, timeoutMs: 30000 })).stdout;
+  const options = { cwd: project, input, env: workerEnvironment(), rawOutput: true, timeoutMs: 30000 };
+  if (args[0] === 'status') {
+    // Status itself can run clean/process filters when an equal-size tracked
+    // file needs rehashing. Inspect names only; suppress drivers for this child,
+    // without reading their commands, editing config or trusting their output.
+    const config = await execute('git', ['config', '--null', '--name-only', '--get-regexp', '^filter\\..*\\.(clean|smudge|process|required)$'], { ...options, allowFailure: true });
+    const keys = config.stdout.split('\0').filter(Boolean);
+    if (![0, 1].includes(config.code) || config.stdout.length > 65536 || keys.length > 256) throw new Error('Unknown Git filter configuration');
+    const drivers = sorted(keys.map(key => {
+      const match = /^(filter\.[^\x00-\x20=\x7f]+)\.(?:clean|smudge|process|required)$/i.exec(key);
+      if (!match) throw new Error('Unknown Git filter configuration');
+      return match[1];
+    }));
+    args = [...drivers.flatMap(driver => ['clean', 'smudge', 'process', 'required'].flatMap(key => ['-c', `${driver}.${key}=${key === 'required' ? 'false' : ''}`])), ...args];
+  }
+  return (await execute('git', args, options)).stdout;
 }
 async function revision(project, value) {
   if (typeof value !== 'string' || !/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(value)) throw new Error('Affected graph requires a full commit SHA');
@@ -44,6 +59,65 @@ async function snapshot(project, sha) {
     sources.set(entry.file, bytes.subarray(end + 1, end + 1 + size).toString('utf8')); offset = end + size + 2;
   }
   return { entries, sources };
+}
+
+/** Point-in-time tracked-byte check. Unknown scope/I/O is never proof of clean source. */
+export async function inspectCurrentSource(input = {}) {
+  try {
+    let { project, headSha } = input;
+    if (typeof project !== 'string' || !project || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(headSha || '')) return 'unknown';
+    project = path.resolve(project); await noLinks(project);
+    project = await realpath(project);
+    const root = path.resolve((await git(project, ['rev-parse', '--show-toplevel'])).trim());
+    await noLinks(root);
+    if (await realpath(root) !== project) return 'unknown';
+    const state = async () => (await git(project, ['rev-parse', '--verify', 'HEAD'])).trim() !== headSha ||
+      Boolean(await git(project, ['status', '--porcelain=v1', '-z', '--untracked-files=all']));
+    if (await state()) return 'dirty';
+    const entries = (await git(project, ['ls-tree', '-rz', '--full-tree', headSha])).split('\0').filter(Boolean);
+    if (!entries.length || entries.length > 50000) return 'unknown';
+    let total = 0;
+    for (const entry of entries) {
+      const match = /^(100644|100755) blob ([a-f0-9]+)\t([\s\S]+)$/.exec(entry);
+      if (!match || match[2].length !== headSha.length) return 'unknown';
+      const [, mode, oid, name] = match;
+      relative(name);
+      // Reject OS aliases/streams and ambiguous names before touching source.
+      if (name.length > 2048 || /[:\x00-\x1f\x7f]/.test(name) || name.split('/').some(part => /[. ]$/.test(part) || /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(part))) return 'unknown';
+      const file = path.join(project, name); await noLinks(file);
+      const info = await lstat(file);
+      if (!info.isFile() || info.nlink !== 1) return 'unknown';
+      total += info.size;
+      if (info.size > 16 * 1024 ** 2 || total > 128 * 1024 ** 2) return 'unknown';
+      if (process.platform !== 'win32' && Boolean(info.mode & 0o111) !== (mode === '100755')) return 'dirty';
+      // Read at most the observed size plus one byte. A growing/replaced file
+      // cannot turn a bounded verification into an unbounded readFile().
+      const handle = await open(file, 'r');
+      let bytes;
+      try {
+        const opened = await handle.stat();
+        const same = actual => actual.isFile() && actual.nlink === 1 && ['dev', 'ino', 'size', 'mode', 'mtimeMs', 'ctimeMs'].every(key => actual[key] === info[key]);
+        if (!same(opened)) return 'unknown';
+        const buffer = Buffer.alloc(info.size + 1); let offset = 0;
+        while (offset < buffer.length) {
+          const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset);
+          if (!bytesRead) break;
+          offset += bytesRead;
+        }
+        await noLinks(file);
+        if (offset !== info.size || !same(await handle.stat()) || !same(await lstat(file))) return 'unknown';
+        bytes = buffer.subarray(0, offset);
+      } finally { await handle.close(); }
+      const gitHash = data => createHash(headSha.length === 40 ? 'sha1' : 'sha256').update(`blob ${data.length}\0`).update(data).digest('hex');
+      if (gitHash(bytes) !== oid) {
+        // Match security-gates' normal CRLF checkout compatibility without
+        // invoking any project-defined clean/smudge filter or logging bytes.
+        const text = bytes.toString('utf8');
+        if (!Buffer.from(text).equals(bytes) || gitHash(Buffer.from(text.replaceAll('\r\n', '\n'))) !== oid) return 'dirty';
+      }
+    }
+    return await state() ? 'dirty' : 'clean';
+  } catch { return 'unknown'; }
 }
 function staticDependencies(source, file, reasons) {
   let ast;
@@ -152,6 +226,9 @@ export async function planAffected({ project, baseSha, headSha, changedPaths = [
   const currentHead = (await git(project, ['rev-parse', 'HEAD'])).trim();
   if (currentHead !== headSha) reasons.add('head-mismatch');
   if ((await git(project, ['status', '--porcelain=v1', '--untracked-files=all'])).trim()) reasons.add('dirty-worktree');
+  const sourceState = await inspectCurrentSource({ project, headSha });
+  if (sourceState === 'dirty' && currentHead === headSha) reasons.add('dirty-worktree');
+  if (sourceState === 'unknown') reasons.add('unknown-source');
   const tokens = (await git(project, ['diff', '--no-relative', '--name-status', '-z', '--find-renames', baseSha, headSha, '--'])).split('\0').filter(Boolean), changed = new Set(changedPaths);
   for (let index = 0; index < tokens.length;) {
     const status = tokens[index++], count = /^[RC]/.test(status) ? 2 : 1;

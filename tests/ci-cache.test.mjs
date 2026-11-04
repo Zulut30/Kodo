@@ -10,6 +10,27 @@ import { cacheFingerprint, readCheckCache, writeCheckCache } from '../runtime/ci
 
 const hash = value => createHash('sha256').update(value).digest('hex');
 const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8', windowsHide: true }).trim();
+function windowsCacheAccess(file, parent) {
+  // Failure diagnostics contain only bounded classifications, never identity,
+  // paths, environment, command arguments or security descriptor text.
+  const script = `$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'
+try {
+  $r=[Console]::In.ReadToEnd() | ConvertFrom-Json
+  $user=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+  $file=[IO.File]::GetAccessControl($r.file)
+  $parent=[IO.Directory]::GetAccessControl($r.parent)
+  $owner=$file.GetOwner([Security.Principal.SecurityIdentifier]).Value
+  $kind=if($owner -eq $user){'current-user'}elseif($owner -eq 'S-1-5-18'){'system'}elseif($owner -eq 'S-1-5-32-544'){'administrators'}else{'other'}
+  $others=@($file.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]) | Where-Object {$_.AccessControlType -eq 'Allow' -and $_.IdentityReference.Value -notin @($user,'S-1-5-18')}).Count -gt 0
+  @{owner=$kind;protected=$file.AreAccessRulesProtected;otherAllows=$others;parentSddl=$parent.Sddl;fileSddl=$file.Sddl} | ConvertTo-Json -Compress
+} catch { [Console]::Out.Write('{"state":"unavailable"}') }`;
+  const result = JSON.parse(execFileSync(path.join(process.env.SystemRoot || 'C:\\Windows', 'System32/WindowsPowerShell/v1.0/powershell.exe'),
+    ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
+    { input: JSON.stringify({ file, parent }), encoding: 'utf8', windowsHide: true }));
+  if (result.parentSddl) { result.parentHash = hash(result.parentSddl); delete result.parentSddl; }
+  if (result.fileSddl) { result.fileHash = hash(result.fileSddl); delete result.fileSddl; }
+  return result;
+}
 async function fixture(t) {
   // Cache reuse requires a canonical project, even when TEMP is an 8.3 alias.
   const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'kodo-cache-'))), project = path.join(root, 'project'), home = path.join(root, 'private');
@@ -31,7 +52,9 @@ async function fixture(t) {
 test('Command cache first run misses and exact successful complete private receipt can be reused', async t => {
   const fx = await fixture(t); assert.equal(await readCheckCache(fx), null);
   assert.equal(await writeCheckCache(fx), true);
-  const result = await readCheckCache(fx); assert.equal(result.exitCode, 0); assert.equal(result.headSha, fx.headSha);
+  const result = await readCheckCache(fx);
+  assert.ok(result, process.platform === 'win32' ? JSON.stringify(windowsCacheAccess(path.join(fx.home, 'ci-check-cache-v1', fx.fingerprint + '.json'), fx.home)) : 'canonical receipt must remain reusable');
+  assert.equal(result.exitCode, 0); assert.equal(result.headSha, fx.headSha);
   assert.equal(result.trust, 'private-local'); assert.equal(result.complete, true);
 });
 
@@ -130,4 +153,74 @@ test('Command cache refuses receipt permissions widened after a successful write
   if (process.platform === 'win32') execFileSync('icacls.exe', [file, '/grant', '*S-1-1-0:R'], { windowsHide: true, stdio: 'pipe' });
   else await chmod(file, 0o644);
   assert.equal(await readCheckCache(fx), null);
+});
+
+for (const flag of ['--assume-unchanged', '--skip-worktree']) test(`Command cache misses tracked bytes hidden by ${flag}`, async t => {
+  const fx = await fixture(t); assert.equal(await writeCheckCache(fx), true);
+  assert.equal((await readCheckCache(fx)).exitCode, 0, 'clean canonical positive control');
+  const before = await readFile(path.join(fx.project, 'value.mjs'));
+  git(fx.project, 'update-index', flag, 'value.mjs');
+  await writeFile(path.join(fx.project, 'value.mjs'), 'export const value = 9;');
+  assert.equal(git(fx.project, 'status', '--porcelain=v1', '--untracked-files=all'), '', 'real Git hides the modification');
+  assert.notDeepEqual(await readFile(path.join(fx.project, 'value.mjs')), before);
+  assert.equal(git(fx.project, 'rev-parse', 'HEAD'), fx.headSha);
+  const plan = await planAffected({ project: fx.project, headSha: fx.headSha });
+  assert.equal(plan.sourceHash, fx.input.sourceHash); assert.equal(plan.dependencyHash, fx.input.dependencyHash);
+  const previous = await readCheckCache(fx), written = await writeCheckCache(fx);
+  assert.equal(previous, null, 'hidden edits invalidate a previously reusable PASS');
+  assert.equal(written, false, 'hidden edits cannot publish a new PASS');
+});
+
+test('Command cache refuses opaque runtime dependencies even when Git hides ignored input changes', async t => {
+  const fx = await fixture(t);
+  await writeFile(path.join(fx.project, '.gitignore'), 'ignored-input.txt\n');
+  await writeFile(path.join(fx.project, 'value.mjs'), "import {readFileSync} from 'node:fs'; process.stdout.write(readFileSync('ignored-input.txt', 'utf8'));\n");
+  git(fx.project, 'add', '-A'); git(fx.project, 'commit', '-qm', 'opaque dependency');
+  const headSha = git(fx.project, 'rev-parse', 'HEAD'), plan = await planAffected({ project: fx.project, headSha });
+  assert.equal(plan.fallback, true); assert.ok(plan.reasons.includes('runtime-dependency:value.mjs:fs'));
+  const input = { ...fx.input, headSha, sourceHash: plan.sourceHash, dependencyHash: plan.dependencyHash, args: ['value.mjs'] };
+  const candidate = { ...fx, headSha, input, fingerprint: cacheFingerprint(input), receipt: { ...fx.receipt, headSha, args: input.args } };
+  await writeFile(path.join(fx.project, 'ignored-input.txt'), 'first input\n');
+  const run = () => execFileSync(process.execPath, input.args, { cwd: fx.project, encoding: 'utf8', windowsHide: true });
+  const before = run(); assert.equal(before, 'first input\n');
+  await writeFile(fx.receipt.evidence[0].path, before);
+  candidate.receipt.evidence = [{ path: fx.receipt.evidence[0].path, bytes: Buffer.byteLength(before), sha256: hash(before) }];
+  const written = await writeCheckCache(candidate);
+  await writeFile(path.join(fx.project, 'ignored-input.txt'), 'second input\n');
+  assert.equal(run(), 'second input\n', 'real execution depends on ignored bytes');
+  assert.equal(git(fx.project, 'status', '--porcelain=v1', '--untracked-files=all'), '');
+  const after = await planAffected({ project: fx.project, headSha });
+  assert.equal(after.sourceHash, plan.sourceHash); assert.equal(after.dependencyHash, plan.dependencyHash);
+  const reused = await readCheckCache(candidate);
+  assert.equal(written, false, 'an uncertain graph cannot store reusable PASS');
+  assert.equal(reused, null, 'an uncertain graph cannot reuse stale PASS');
+});
+
+test('Command cache misses unknown tracked source scope after a previously reusable PASS', async t => {
+  const fx = await fixture(t); assert.equal(await writeCheckCache(fx), true);
+  assert.equal((await readCheckCache(fx)).exitCode, 0);
+  git(fx.project, 'update-index', '--skip-worktree', 'value.mjs');
+  await link(path.join(fx.project, 'value.mjs'), path.join(fx.root, 'source-hardlink'));
+  assert.equal(git(fx.project, 'status', '--porcelain=v1', '--untracked-files=all'), '');
+  const plan = await planAffected({ project: fx.project, headSha: fx.headSha });
+  assert.ok(plan.reasons.includes('unknown-source'));
+  assert.equal(await readCheckCache(fx), null); assert.equal(await writeCheckCache(fx), false);
+});
+
+test('Command cache explicitly owns and protects new Windows receipts without repairing widened reads', { skip: process.platform !== 'win32' }, async t => {
+  const fx = await fixture(t), existing = windowsCacheAccess(fx.receipt.evidence[0].path, fx.root);
+  assert.equal(await writeCheckCache(fx), true);
+  assert.deepEqual(windowsCacheAccess(fx.receipt.evidence[0].path, fx.root), existing, 'write must preserve the existing parent and evidence ACLs');
+  const file = path.join(fx.home, 'ci-check-cache-v1', fx.fingerprint + '.json');
+  const before = windowsCacheAccess(file, fx.home);
+  t.diagnostic(JSON.stringify({ stage: 'after-write', ...before }));
+  assert.equal(before.owner, 'current-user'); assert.equal(before.otherAllows, false);
+  assert.equal(before.protected, true, 'new cache-owned files must receive explicit protected ACLs');
+  assert.equal((await readCheckCache(fx)).exitCode, 0);
+  execFileSync('icacls.exe', [file, '/grant', '*S-1-1-0:R'], { windowsHide: true, stdio: 'pipe' });
+  const widened = windowsCacheAccess(file, fx.home); assert.equal(widened.otherAllows, true);
+  assert.equal(await readCheckCache(fx), null);
+  const after = windowsCacheAccess(file, fx.home);
+  assert.deepEqual(after, widened, 'read must not repair the receipt or its parent');
+  assert.equal(after.parentHash, before.parentHash);
 });

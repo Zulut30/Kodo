@@ -5,7 +5,7 @@ import { execute } from './command.mjs';
 import { noLinks } from './toolchains.mjs';
 import { assertPrivateArtifactPath } from './progress.mjs';
 import { workerEnvironment } from './security.mjs';
-import { planAffected } from './ci-graph.mjs';
+import { inspectCurrentSource, planAffected } from './ci-graph.mjs';
 
 const kinds = new Set(['test', 'build', 'lint', 'typecheck']);
 const digest = value => createHash('sha256').update(value).digest('hex');
@@ -45,17 +45,17 @@ async function current(context, project, headSha) {
     !['node', 'v8', 'modules'].every(key => context.runtimeVersions[key] === process.versions[key])) return false;
   await noLinks(project);
   if ((await realpath(project)) !== path.resolve(project)) return false;
-  if ((await git(project, ['rev-parse', 'HEAD'])).trim() !== headSha || (await git(project, ['status', '--porcelain=v1', '--untracked-files=all'])).trim()) return false;
+  if (await inspectCurrentSource({ project, headSha }) !== 'clean') return false;
   const plan = await planAffected({ project, baseSha: headSha, headSha });
   const locks = (await git(project, ['ls-tree', '-rz', '--full-tree', headSha])).split('\0').filter(Boolean).flatMap(row => {
     const match = /^\d+ \w+ ([a-f0-9]+)\t([\s\S]+)$/.exec(row);
     return match && /(?:^|\/)(?:package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb?)$/.test(match[2]) ? [[match[2], match[1]]] : [];
   }).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
-  return !plan.reasons.includes('dirty-worktree') && !plan.reasons.includes('head-mismatch') && plan.sourceHash === context.sourceHash && plan.dependencyHash === context.dependencyHash && digest(JSON.stringify(locks)) === context.lockHash;
+  return !plan.fallback && plan.sourceHash === context.sourceHash && plan.dependencyHash === context.dependencyHash && digest(JSON.stringify(locks)) === context.lockHash;
 }
 
 // Fixed script: user paths travel over stdin, never shell interpolation. Only
-// the cache-owned directory is protected; read verifies without repairing ACLs.
+// the cache-owned directory/new temporary file are protected. Read never repairs.
 const aclScript = `$ErrorActionPreference='Stop'
 [Console]::InputEncoding=[Text.UTF8Encoding]::new($false)
 try {
@@ -69,6 +69,12 @@ try {
     foreach($sid in @($user,$system)) { $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid,[Security.AccessControl.FileSystemRights]::FullControl,$inherit,[Security.AccessControl.PropagationFlags]::None,[Security.AccessControl.AccessControlType]::Allow)) }
     [IO.Directory]::SetAccessControl($r.target,$acl)
   }
+  if ($r.protectFile) {
+    $acl=[Security.AccessControl.FileSecurity]::new()
+    $acl.SetOwner($user); $acl.SetAccessRuleProtection($true,$false)
+    foreach($sid in @($user,$system)) { $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid,[Security.AccessControl.FileSystemRights]::FullControl,[Security.AccessControl.AccessControlType]::Allow)) }
+    [IO.File]::SetAccessControl($r.file,$acl)
+  }
   $actual=[IO.Directory]::GetAccessControl($r.target)
   if (-not $actual.AreAccessRulesProtected) { exit 1 }
   $entries=@($actual)
@@ -80,14 +86,14 @@ try {
     }
   }
 } catch { exit 1 }`;
-async function privateDirectory(directory, create, file) {
+async function privateDirectory(directory, create, file, protectFile = false) {
   assertPrivateArtifactPath(directory); await noLinks(directory);
   if (create) await mkdir(directory, { recursive: true, mode: 0o700 });
   const info = await lstat(directory);
   if (!info.isDirectory()) throw new Error('Invalid private cache directory');
   if (process.platform === 'win32') await execute(path.join(process.env.SystemRoot || 'C:\\Windows', 'System32/WindowsPowerShell/v1.0/powershell.exe'),
     ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(aclScript, 'utf16le').toString('base64')],
-    { input: JSON.stringify({ target: directory, protect: create, file }), env: workerEnvironment(), timeoutMs: 30000 });
+    { input: JSON.stringify({ target: directory, protect: create, file, protectFile }), env: workerEnvironment(), timeoutMs: 30000 });
   else {
     if (create) await chmod(directory, 0o700);
     const actual = await lstat(directory);
@@ -151,6 +157,8 @@ export async function writeCheckCache({ home, fingerprint, receipt, project, hea
     const envelope = { schemaVersion: 1, trust: 'private-local', fingerprint, context, receipt: saved, integrityHash: digest(encode({ context, receipt: saved })) };
     temporary = path.join(directory, `.${randomUUID()}.tmp`);
     await writeFile(temporary, encode(envelope) + '\n', { flag: 'wx', mode: 0o600 });
+    await regularPrivateFile(temporary, 256 * 1024);
+    if (process.platform === 'win32') await privateDirectory(directory, false, temporary, true);
     await noLinks(directory); await rename(temporary, file); temporary = undefined;
     return true;
   } catch { return false; }
