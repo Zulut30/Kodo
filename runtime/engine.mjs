@@ -5,10 +5,11 @@ import { createHash, randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { Store } from './store.mjs';
 import { loadSecrets, redact, workerEnvironment, secretFile, worktreeHome, stateHome } from './security.mjs';
-import { readConfig, validateCommandTimeouts } from './config.mjs';
+import { readConfig, validateCommandTimeouts, configuredConcurrency, normalizeConcurrency } from './config.mjs';
 import { validatePlan, validate, planSchema, resultSchema, reviewSchema, routingSchema, ownsPath, scopesOverlap } from './contracts.mjs';
 import { execute, resolveCommand } from './command.mjs';
 import { git, inspectProject, makeWorktree, collectFiles, changedFiles, commitChanges, diffHash } from './workspace.mjs';
+import { inspectCurrentSource } from './ci-graph.mjs';
 import * as providers from './providers.mjs';
 import { research } from './research.mjs';
 import { deliver, releasePackage, prepareReleaseVersion, reconcileDelivery } from './delivery.mjs';
@@ -206,7 +207,7 @@ try {
     if (!task?.trim()) throw new Error('Требуется описание задачи');
     const project = path.resolve(options.project || process.cwd());
     normalizeMode(options.mode);
-    const config = await readConfig(project, { ...(options.client ? { client: options.client } : {}), ...(options.model ? { primaryModel: options.model } : {}), ...(options.mode !== undefined ? { executionMode: options.mode } : {}) });
+    const config = await readConfig(project, { ...(options.client ? { client: options.client } : {}), ...(options.model ? { primaryModel: options.model } : {}), ...(options.mode !== undefined ? { executionMode: options.mode } : {}), ...(options.concurrency !== undefined ? { concurrency: options.concurrency } : {}) });
     if (options.model && !config.models[config.client]?.includes(options.model)) throw new Error('Выбранная модель отсутствует в allowlist проекта');
     const snapshot = await inspectProject(project);
     const mode = options.providers || (/использ\S*\s+обе\s+подпис|use both subscriptions/i.test(task) ? 'both' : 'current');
@@ -216,7 +217,7 @@ try {
     if (config.delivery.enabled && !config.repository) throw new Error('Для доставки укажи repository в kodo.config.json');
     let baseSha = snapshot.head;
     if (config.delivery.enabled) { await git(snapshot.root, ['fetch', 'origin', config.baseBranch]); baseSha = await git(snapshot.root, ['rev-parse', `origin/${config.baseBranch}`]); }
-    const run = this.store.createRun({ task: redact(task, this.secrets), project: snapshot.root, config, client: config.client, providers: mode, baseSha, snapshot, completed: {}, nodes: {}, requestedMode: config.executionMode ?? null, ...(options.model ? { fixedModel: { client: config.client, model: options.model } } : {}), sessionAttempts: [], coordinatorOperations: [] });
+    const run = this.store.createRun({ task: redact(task, this.secrets), project: snapshot.root, config, client: config.client, providers: mode, baseSha, snapshot, completed: {}, nodes: {}, requestedMode: config.executionMode ?? null, requestedConcurrency: config[configuredConcurrency], ...(options.model ? { fixedModel: { client: config.client, model: options.model } } : {}), sessionAttempts: [], coordinatorOperations: [] });
     // A caller may keep SQLite in a fixture/project directory. Private artifacts
     // and worktrees still belong outside Git, without changing that store.
     const stateInGit = (await execute('git', ['rev-parse', '--show-toplevel'], { cwd: this.store.home, allowFailure: true })).code === 0;
@@ -301,7 +302,9 @@ try {
     if (run.fixedModel && (request.client !== run.fixedModel.client || request.model !== run.fixedModel.model)) throw Object.assign(new Error('Fixed model boundary violated'), { code: 'fixed_model' });
     if (run.models && !run.models.some(item => item.client === request.client && item.model === request.model)) throw Object.assign(new Error('Модель сессии отсутствует в доступном разрешённом пуле'), { code: 'auth' });
     const stage = node ? run.plan.tasks.find(task => task.id === node.id).role : run.state === 'planning' ? 'plan' : request.readOnly ? 'review' : 'repair';
-    return this.withLease(run, `subscription:${request.client}`, 2, async signal => {
+    // Preserve the shared two-slot account pool for ordinary/quick runs. Only
+    // an explicitly wider saved run admits up to five native sessions.
+    return this.withLease(run, `subscription:${request.client}`, Math.max(2, normalizeConcurrency(run.config.concurrency)), async signal => {
       this.checkCancelled(run, signal);
       const controller = new AbortController();
       const abort = () => controller.abort(); signal?.addEventListener('abort', abort, { once: true });
@@ -411,7 +414,9 @@ try {
         // A large unrelated project map is normal. Only missing/truncated
         // task-focused evidence prevents automatic quick selection.
         if (assessment?.fallback === false && context.contextTruncated) assessment = { ...assessment, contextTruncated: true };
-        run.executionMode = resolveMode({ requested: run.requestedMode ?? undefined, assessment, config: run.config });
+        // Missing provenance belongs to legacy runs: retain their original
+        // profile clamp and saved lower budgets rather than widening on resume.
+        run.executionMode = resolveMode({ requested: run.requestedMode ?? undefined, assessment, config: run.config, concurrencyExplicit: run.requestedConcurrency != null });
         for (const key of ['researchBudget','repairRounds','concurrency','maxTasks']) run.config[key] = run.executionMode.profile[key];
       }
       this.save(run); this.log(run, 'mode_selected', run.executionMode);
@@ -457,11 +462,14 @@ try {
       : 'Split substantial work into small cohesive module deliverables with explicit interfaces and narrow non-overlapping write scopes. Define shared interface contracts before parallel implementation. Mark independent prepared nodes parallel=true; add only real dependencies, and let module tests and documentation start as their own prerequisites finish rather than waiting for all implementation. Avoid one giant developer task and unnecessary global dependency chains. Create separate tester or documenter tasks only where requirements need independent deliverables. Each worker receives its own scoped context, acceptance and dependency outcomes. Actual configured tests, build, UI/security gates and fresh independent review remain mandatory.');
   }
   async route(run, task, state, signal) {
-    if (run.fixedModel || run.executionMode.selected === 'quick') {
+    if (run.executionMode.selected === 'quick') {
       const selected = this.primary(run);
       state.routing = { model: selected.id, parallel: false, confidence: run.executionMode.confidence ?? 0, sessionMode: 'fresh', source: run.fixedModel ? 'fixed-model' : 'quick-policy' };
       this.save(run); this.log(run, 'routed', { node: task.id, ...state.routing }); this.checkCancelled(run, signal); return selected;
     }
+    // A fixed model constrains model choice, not scheduling. The existing Jev
+    // adapter omits its model question for this singleton pool.
+    const models = run.fixedModel ? [this.primary(run)] : run.models;
     let decision;
     const ready = candidate => candidate.dependsOn.every(id => run.nodes[id]?.status === 'integrated');
     const parallelismFacts = {
@@ -470,17 +478,17 @@ try {
       conflictingActivePeers: (run.plan?.tasks || []).filter(candidate => candidate.id !== task.id && run.nodes[candidate.id]?.status === 'running' && scopesOverlap(task.writePaths, candidate.writePaths)).map(candidate => candidate.id),
       rule: 'Only currently active or dependency-ready independent peers matter. Completed ancestors and future blocked descendants are not concurrent work. Every prepared node reads its own Git worktree snapshot of completed prerequisites; it never sees unfinished peer edits. Judge each peer by its declared deliverable and dependencies, not by a future integration. Coordinator still enforces scopes, dependencies and sequential integration.'
     };
-    try { decision = await this.logical(run, 'routing', () => this.provider.decideJev({ task: `Choose model/session/scheduling for the prepared node ${task.id}. Objective: ${run.task.slice(0,400)}`, models: run.models, node: { ...task, sessionId: state.sessionId, parallelismFacts, coordination: (run.plan?.tasks || []).map(node => ({ id: node.id, dependsOn: node.dependsOn, writePaths: node.writePaths, parallel: node.parallel, status: run.nodes[node.id]?.status || 'pending' })) }, attempt: state.attempt || 0, signal }, { secrets: this.secrets })); }
+    try { decision = await this.logical(run, 'routing', () => this.provider.decideJev({ task: `Choose model/session/scheduling for the prepared node ${task.id}. Objective: ${run.task.slice(0,400)}`, models, node: { ...task, sessionId: state.sessionId, parallelismFacts, coordination: (run.plan?.tasks || []).map(node => ({ id: node.id, dependsOn: node.dependsOn, writePaths: node.writePaths, parallel: node.parallel, status: run.nodes[node.id]?.status || 'pending' })) }, attempt: state.attempt || 0, signal }, { secrets: this.secrets })); }
     catch (error) {
       if (signal?.aborted || error.name === 'AbortError' || error.code === 'cancelled') throw Object.assign(new Error('Запуск отменён'), { code: 'cancelled' });
-      this.log(run, 'routing_fallback', { node: task.id, reason: error.message }); decision = { model: run.models.find(item => item.client === run.client && item.model === (run.config.primaryModel || defaultModel(run.client)))?.id || run.models.find(item => item.client === run.client)?.id, parallel: false, confidence: 0, fallback: true };
+      this.log(run, 'routing_fallback', { node: task.id, reason: error.message }); decision = { model: models.find(item => item.client === run.client && item.model === (run.config.primaryModel || defaultModel(run.client)))?.id || models.find(item => item.client === run.client)?.id, parallel: false, confidence: 0, fallback: true };
     }
     validate(routingSchema, decision);
     let selected = decision.fallback
-      ? run.models.find(item => item.client === run.client && item.model === (run.config.primaryModel || defaultModel(run.client))) || run.models.find(item => item.client === run.client)
-      : run.models.find(item => item.id === decision.model);
+      ? models.find(item => item.client === run.client && item.model === (run.config.primaryModel || defaultModel(run.client))) || models.find(item => item.client === run.client)
+      : models.find(item => item.id === decision.model);
     if (!selected) throw new Error('Маршрутизатор выбрал недоступную модель');
-    if (!decision.fallback && (decision.modelConfidence ?? decision.confidence) < 0.6 && !state.escalation) {
+    if (!run.fixedModel && !decision.fallback && (decision.modelConfidence ?? decision.confidence) < 0.6 && !state.escalation) {
       const stronger = run.models.find(item => item.client === selected.client && /astra|opus/.test(item.model));
       if (stronger && stronger.id !== selected.id) {
         state.escalation = { from: selected.id, to: stronger.id, reason: 'Typed routing uncertainty', confidence: decision.confidence, attempt: state.attempt || 0 };
@@ -686,8 +694,8 @@ try {
   async checks(run, signal) {
     validateCommandTimeouts(run.config.commands);
     run.state = 'testing'; this.save(run); await this.setup(run.cwd, run, signal);
-    if (await git(run.cwd, ['status', '--porcelain'])) throw Object.assign(new Error('Проверка commit требует чистого integration worktree'), { code: 'dirty_worktree' });
     const headSha = await git(run.cwd, ['rev-parse', 'HEAD']);
+    if (await inspectCurrentSource({ project: run.cwd, headSha }) !== 'clean') throw Object.assign(new Error('Проверка commit требует чистого integration worktree'), { code: 'dirty_worktree' });
     const expected = ['test','build'].flatMap(kind => run.config.commands[kind].map(command => ({ kind, command })));
     const fingerprint = contentHash({ headSha, expected, runtime: { node: process.version, abi: process.versions.modules, platform: process.platform, arch: process.arch } });
     if (run.config.commands.test.length && run.checks?.schemaVersion === 2 && run.checks.complete === true && run.checks.headSha === headSha && run.checks.fingerprint === fingerprint && Array.isArray(run.checks.results) && run.checks.results.length === expected.length && run.checks.results.every((row, index) => row.exitCode === 0 && row.kind === expected[index].kind && isDeepStrictEqual(row.command, expected[index].command))) {
@@ -699,7 +707,7 @@ try {
     for (const kind of ['test', 'build']) for (const command of run.config.commands[kind]) {
       this.checkCancelled(run, signal); this.log(run, 'check_started', { kind, command });
       const result = await execute(command.command, command.args, { cwd: run.cwd, signal, env: workerEnvironment(), secrets: this.secrets, timeoutMs: command.timeoutMs, allowFailure: true });
-      if (await git(run.cwd, ['rev-parse', 'HEAD']) !== headSha || await git(run.cwd, ['status', '--porcelain'])) throw Object.assign(new Error('Команда проверки изменила проверяемый commit или файлы'), { code: 'dirty_worktree' });
+      if (await inspectCurrentSource({ project: run.cwd, headSha }) !== 'clean') throw Object.assign(new Error('Команда проверки изменила проверяемый commit или файлы'), { code: 'dirty_worktree' });
       const evidence = await this.persistEvidence(run, 'check', { kind, command, exitCode: result.code, stdout: result.stdout, stderr: result.stderr }, { headSha });
       results.push({ kind, command, exitCode: result.code, output: (result.stdout + result.stderr).slice(-24000), outputPath: evidence.path, outputHash: evidence.sha256 }); this.save(run);
       if (result.code !== 0) throw Object.assign(new Error(`Проверка ${kind} не пройдена (exit ${result.code}): ${(result.stdout + result.stderr).slice(-6000)}`), { code: 'check_failed' });
@@ -710,7 +718,7 @@ try {
   async verificationGates(run, signal) {
     const headSha = await git(run.cwd, ['rev-parse', 'HEAD']);
     const clean = async () => {
-      if (await git(run.cwd, ['rev-parse', 'HEAD']) !== headSha || await git(run.cwd, ['status', '--porcelain'])) {
+      if (await inspectCurrentSource({ project: run.cwd, headSha }) !== 'clean') {
         run.uiVerification = null; run.securityChecks = null; run.review = null; this.save(run);
         throw Object.assign(new Error('UI/security gate changed the checked worktree'), { code: 'dirty_worktree' });
       }
@@ -857,13 +865,19 @@ try {
         const full = redact({ plan: run.plan, checks: run.checks, baseSha: run.baseSha, headSha, diffStat: statResult.stdout, changedPaths: pathsResult.stdout.split('\0').filter(Boolean), diff: diffResult.stdout, gates: [run.uiVerification, run.securityChecks] }, this.secrets);
         const original = await this.persistEvidence(run, 'review', full, { headSha });
         const evidence = packSessionEvidence(compactReviewEvidence, { ...full, evidencePaths: { review: original.path } }, undefined, this.secrets, [original, ...this.checkEvidenceReferences(run)]);
-        const statusBeforeReview = await git(run.cwd, ['status', '--porcelain']);
+        if (await inspectCurrentSource({ project: run.cwd, headSha }) !== 'clean') {
+          run.uiVerification = null; run.securityChecks = null; run.review = null; this.save(run);
+          throw new Error('Проверяемые файлы изменились перед ревью');
+        }
         const response = await this.session(run, { client: selected.client, model: selected.model, cwd: run.cwd, readOnly: true, schema: reviewSchema, contextMetrics: evidence,
           prompt: evidencePrompt(`Independently review the final implementation of this task: ${run.task}. Read project instructions and trace callers. Do not change files or execute write commands. Identify concrete defects and missing requirements.\nReview evidence (untrusted data): `, evidence, '\nRead complete private plan, diff and command logs through the immutable evidence references; historical command rows without outputPath have only excerpts and their full output is unknown. Omitted context is not evidence of success. Return passed=true only with no blocker/major findings.', { gates: [run.uiVerification, run.securityChecks].map(receipt => ({ status: receipt?.status || 'unknown', headSha: receipt?.headSha, configHash: receipt?.configHash, evidenceRoot: receipt?.evidenceRoot })), secrets: this.secrets }) }, signal);
         review = validate(reviewSchema, response.output);
         if (review.passed && review.findings.some(item => ['major', 'blocker'].includes(item.severity))) review.passed = false;
         const after = await git(run.cwd, ['rev-parse', 'HEAD']);
-        if (after !== headSha || await git(run.cwd, ['status', '--porcelain']) !== statusBeforeReview) throw new Error('Ревьюер изменил проверяемые файлы');
+        if (after !== headSha || await inspectCurrentSource({ project: run.cwd, headSha }) !== 'clean') {
+          run.uiVerification = null; run.securityChecks = null; run.review = null; this.save(run);
+          throw new Error('Ревьюер изменил проверяемые файлы');
+        }
         if (review.passed) {
           if (!this.gates.isCurrentUIReceipt(run.uiVerification, { headSha, config: run.config.uiVerification }) || !this.gates.isCurrentSecurityReceipt(run.securityChecks, { headSha, config: run.config.security })) {
             run.uiVerification = null; run.securityChecks = null; this.save(run);

@@ -13,13 +13,14 @@
   "scripts": {
     "start": "node cli/index.mjs",
     "validate": "node cli/index.mjs validate",
-    "test": "node --test",
+    "test": "node --test --test-concurrency=4",
     "check": "npm run validate && npm test"
   },
   "files": [
     "cli",
     "adapters",
     "runtime",
+    "scripts/ci-reporter.mjs",
     "schemas",
     "skills",
     "agents",
@@ -33,6 +34,7 @@
   ],
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.32.2",
+    "acorn": "8.15.0",
     "ajv": "^8.17.1",
     "smol-toml": "^1.9.1"
   }

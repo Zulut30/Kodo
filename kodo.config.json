@@ -8,7 +8,7 @@
     "codex": ["gpt-6.1-sol", "gpt-6-astra", "gpt-6.1-terra"],
     "claude-code": ["opus", "sonnet"]
   },
-  "concurrency": 2,
+  "concurrency": 5,
   "repairRounds": 5,
   "uiVerification": { "enabled": false },
   "security": { "enabled": true, "autoInstall": true, "tools": ["semgrep", "gitleaks"] },

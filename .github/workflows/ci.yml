@@ -5,7 +5,60 @@ on:
     branches: [main]
   pull_request:
 
+# Only superseded PR heads are cancelled. Main/release runs get unique groups.
+concurrency:
+  group: quality-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
 jobs:
+  fast:
+    if: ${{ vars.KODO_FAST_CI_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: package-lock.json
+      # setup-node caches npm tarballs, never node_modules or successful checks.
+      # npm ci verifies package-lock integrity on every restored tarball.
+      - run: npm ci --ignore-scripts
+      - name: Install pinned fast quality tools
+        env:
+          KODO_TOOL_HOME: ${{ runner.temp }}/kodo-fast-tools
+        run: |
+          node cli/index.mjs tools install oxlint --json
+          node cli/index.mjs tools install typescript --json
+      - name: Resolve immutable comparison base
+        shell: bash
+        env:
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BASE: ${{ github.event.before }}
+        run: |
+          base="$PR_BASE"
+          if [ -z "$base" ]; then base="$PUSH_BASE"; fi
+          if ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            echo "CI_UNKNOWN_BASE=1" >> "$GITHUB_ENV"
+          else
+            echo "CI_BASE=$base" >> "$GITHUB_ENV"
+          fi
+      - name: Partial feedback with exact-head L2 still required
+        shell: bash
+        env:
+          KODO_TOOL_HOME: ${{ runner.temp }}/kodo-fast-tools
+        run: |
+          if [ "${CI_UNKNOWN_BASE:-0}" = 1 ]; then
+            node scripts/ci.mjs feedback --json
+          else
+            node scripts/ci.mjs feedback --base "$CI_BASE" --json
+          fi
+
   check:
     strategy:
       fail-fast: false
@@ -18,7 +71,35 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: package-lock.json
       - run: npm ci --ignore-scripts
-      - run: npm run check
+      # The runtime installer requires existing Python 3.12 and uv; CI owns setup.
+      - name: Set up Python 3.12 for Semgrep
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Record resolved Python patch version
+        run: python --version
+      - name: Set up pinned uv for Semgrep
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: '0.12.3'
+          enable-cache: false
+      # Separate steps keep a failed install fatal under both bash and PowerShell.
+      - name: Install pinned Semgrep
+        env:
+          KODO_TOOL_HOME: ${{ runner.temp }}/kodo-security-tools
+        run: node cli/index.mjs tools install semgrep --json
+      - name: Install pinned Gitleaks
+        env:
+          KODO_TOOL_HOME: ${{ runner.temp }}/kodo-security-tools
+        run: node cli/index.mjs tools install gitleaks --json
+      - name: L2 npm run check and fresh mandatory security
+        env:
+          KODO_TOOL_HOME: ${{ runner.temp }}/kodo-security-tools
+        run: node scripts/ci.mjs run --tier L2 --json
       - name: Verify installed CLI package
+        env:
+          KODO_TOOL_HOME: ${{ runner.temp }}/kodo-security-tools
         run: node scripts/package-smoke.mjs

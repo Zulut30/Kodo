@@ -3,6 +3,13 @@ import path from 'node:path';
 import { normalizeUIConfig } from './ui-verification.mjs';
 import { normalizeSecurityConfig } from './security-gates.mjs';
 import { normalizeMode } from './modes.mjs';
+// Read-time provenance only: Engine persists the explicit choice on a new run.
+// The default 2 must not become an explicit override of quick's default 1.
+export const configuredConcurrency = Symbol('configuredConcurrency');
+export function normalizeConcurrency(value) {
+  if (!Number.isSafeInteger(value) || value < 1 || value > 5) throw new TypeError('Некорректная конфигурация Kodo: invalid concurrency, expected an integer from 1 to 5');
+  return value;
+}
 export const defaults = {
   schemaVersion: 1, repository: null, baseBranch: 'main', client: 'codex', primaryModel: null,
   models: { codex: ['gpt-6.1-sol', 'gpt-6-astra', 'gpt-6.1-terra'], 'claude-code': ['opus', 'sonnet'] },
@@ -25,7 +32,9 @@ export async function readConfig(project, overrides = {}) {
   try { file = JSON.parse(await readFile(path.join(project, 'kodo.config.json'), 'utf8')); } catch (error) { if (error.code !== 'ENOENT') throw error; }
   const config = { ...defaults, ...file, ...overrides, models: { ...defaults.models, ...file.models }, commands: { ...defaults.commands, ...file.commands }, delivery: { ...defaults.delivery, ...file.delivery } };
   if (overrides.client && overrides.client !== (file.client || defaults.client) && !Object.hasOwn(overrides, 'primaryModel')) config.primaryModel = file.primaryModels?.[overrides.client] || null;
-  if (config.schemaVersion !== 1 || !['codex', 'claude-code'].includes(config.client) || !Number.isInteger(config.concurrency) || config.concurrency < 1 || config.concurrency > 2 || !Number.isInteger(config.repairRounds) || config.repairRounds < 1 || config.repairRounds > 5 || !Number.isInteger(config.researchBudget) || config.researchBudget < 0 || config.researchBudget > 40 || !Array.isArray(config.checks)) throw new Error('Некорректная конфигурация Kodo');
+  normalizeConcurrency(config.concurrency);
+  Object.defineProperty(config, configuredConcurrency, { value: Object.hasOwn(overrides, 'concurrency') || Object.hasOwn(file, 'concurrency') ? config.concurrency : null });
+  if (config.schemaVersion !== 1 || !['codex', 'claude-code'].includes(config.client) || !Number.isInteger(config.repairRounds) || config.repairRounds < 1 || config.repairRounds > 5 || !Number.isInteger(config.researchBudget) || config.researchBudget < 0 || config.researchBudget > 40 || !Array.isArray(config.checks)) throw new Error('Некорректная конфигурация Kodo');
   normalizeMode(config.executionMode);
   if (config.maxTasks !== undefined && (!Number.isSafeInteger(config.maxTasks) || config.maxTasks < 1 || config.maxTasks > 24)) throw new Error('Некорректный лимит maxTasks');
   config.uiVerification = normalizeUIConfig(config.uiVerification); config.security = normalizeSecurityConfig(config.security);
