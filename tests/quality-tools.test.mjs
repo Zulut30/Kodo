@@ -167,6 +167,19 @@ test('SQLFluff uses a separate hash constrained Python environment and module ve
   const reports = await doctorTools({ ...fx, live: false, runner: fake.runner }); assert.equal(reports.find(r => r.id === 'sqlfluff').ready, true);
 });
 
+test('SQLFluff module banner requires the exact pinned version', async t => {
+  for (const [cliVersion, expectedReady] of [
+    ['python -m sqlfluff, version 4.5.0', true],
+    ['python -m sqlfluff, version 4.4.0', false],
+    ['python -m sqlfluff, version 4.5.0 extra', false]
+  ]) {
+    const fx = await fixture(t), fake = pythonFixture({ cliVersion });
+    const [report] = await installTools(['sqlfluff'], { ...fx, runner: fake.runner });
+    assert.equal(report.ready, expectedReady);
+    assert.equal((await resolveTool('sqlfluff', fx)).ready, expectedReady);
+  }
+});
+
 test('SQLFluff rejects hash metadata module and CLI version failures', async t => {
   for (const failure of [{ badHashes: true }, { wrongVersion: true }, { missingModule: true }, { cliVersion: 'sqlfluff, version 4.4.0' }, { cliVersion: 'sqlfluff, version 4.5.0 expected 4.4.0' }, { probeError: true }]) {
     const fx = await fixture(t), fake = pythonFixture(failure), [report] = await installTools(['sqlfluff'], { ...fx, runner: fake.runner });
