@@ -37,6 +37,26 @@ node --test --test-reporter=tap tests/delivery.test.mjs tests/utf8-process.test.
 
 Фикстуры используют readiness-файлы/IPC, реальные собственные процессы, локальные Git/npm-пакеты и fake GitHub. Recovery адресуется только к PID фикстуры; произвольные Node/Codex/app-процессы не останавливаются. EBUSY инъецируется на filesystem boundary для одного owned path, остальные операции настоящие. Для RED исходный код действительно оставляет живых потомков, теряет stdout, передаёт 600000 мс и подменяет primary ошибкой EBUSY. Windows-результат не доказывает POSIX-выполнение: Linux-ветка требует отдельного CI. Общий `npm run check`, security gates и независимое review выполняет координатор после интеграции. UI выключен (нейтральное свидетельство). Реальные подписочные модели и benchmark matrix остаются PAUSED; этот scoped run не публикует и не развёртывает Kodo, версия v0.2.5 остаётся неопубликованной.
 
+## Credential redaction repair
+
+4 ноября 2026 года, run `8f2d5e16-041c-4df8-ae00-77eed70cc25e`, исходный HEAD `cfc8a5874aeae476a8bc72a54af01c69bc125a44`. Подтверждённый дефект PR9: после очистки env команда могла прочитать то же значение из собственного config, а выбрасываемая ошибка сохраняла credential, хотя диагностическое событие его скрывало.
+
+До исправления runtime: **RED 7 failed / 0 passed**, exit 1; все семь случаев обнаружили env-only значение. Дополнительный RED на уже вычисленном Node 24 `stack` и frozen-ошибке: **4 failed / 1 passed**, exit 1. После исправления: **GREEN 9/9**, итоговый delivery suite — **62/62**, 0 failed/skipped, exit 0; `git diff --check` прошёл. Windows x64, Node.js `v24.19.0`, ABI 137. TAP и `receipt.json` сохраняются вне Git в `runs/<runId>/artifacts/credential-redaction-repair/`; квитанция связывает команды, исходную ревизию и хеши файлов dirty worktree. Это не reuse clean-head checks.
+
+```powershell
+node --test --test-reporter=tap --test-name-pattern='Credential redaction' tests/delivery.test.mjs
+node --test --test-reporter=tap --test-name-pattern='Credential redaction covers fallback' tests/delivery.test.mjs
+node --test --test-reporter=tap tests/delivery.test.mjs
+```
+
+| Требование | Точная регрессия |
+| --- | --- |
+| Объединение env-only и explicit значений при одинаковом имени, реальный direct runner | `Credential redaction covers direct runner overlapping environment and options names` |
+| Реальный release subprocess читает фиктивный config; env очищен, безопасное значение и cwd сохранены, полные потоки/exitCode доступны, cleanup/leases завершены без публикации | `Credential redaction covers real release command errors on exit`; `Credential redaction covers real release command errors on timeout`; `Credential redaction covers real release command errors on cancelled` |
+| Fallback result, типизированный rethrow, cached stack/cause и вложенный result очищены; обычная ошибка сохраняет identity, frozen — тип | `Credential redaction covers fallback runner errors on result`; `Credential redaction covers fallback runner errors on command_failed`; `Credential redaction covers fallback runner errors on timeout`; `Credential redaction covers fallback runner errors on cancelled`; `Credential redaction covers fallback runner errors on frozen` |
+
+Все значения вымышлены, config создаётся только в temp fixture; реальное credential store не читается. Git/npm и subprocess локальные, GitHub подменён fixture. Полный `npm run check`, security gates, свежее независимое review и CI выполняет координатор. UI выключен (нейтральное свидетельство); native subscription clients, опубликованный Kodo и deployment этой проверкой не подтверждаются. Рабочий агент не выполняет commit/push/release, не меняет версии, план или registry.
+
 ## Основные регрессии
 
 | Требование | Регрессионная проверка |

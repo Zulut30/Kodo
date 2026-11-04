@@ -91,8 +91,42 @@ async function stopOwnedTree(child) {
   }
 }
 
+function commandRedactions(baseEnv, environment, secrets = {}) {
+  // Separate namespaces retain both values when options.secrets and the stripped
+  // environment use the same name. The map never becomes part of diagnostics.
+  return Object.fromEntries([
+    ...Object.entries(baseEnv).filter(([name]) => !(name in environment)).map(([name, value]) => [`env:${name}`, value]),
+    ...Object.entries(secrets ?? {}).map(([name, value]) => [`secret:${name}`, value])
+  ]);
+}
+
+function redactCommandError(value, secrets, seen = new WeakMap()) {
+  if (typeof value === 'string') return redact(value, secrets);
+  if (!value || typeof value !== 'object') return value;
+  if (seen.has(value)) return seen.get(value);
+  // Keep mutable errors (including their type/identity), non-enumerable stack
+  // and cause, and nested diagnostics. Frozen runner errors need a typed copy.
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  // V8's cached stack is still an accessor in Node 24. Materialize it before
+  // changing message, then redact the original diagnostic instead of dropping it.
+  if (value instanceof Error && descriptors.stack?.get) descriptors.stack = {
+    value: value.stack, writable: descriptors.stack.configurable,
+    enumerable: descriptors.stack.enumerable, configurable: descriptors.stack.configurable
+  };
+  const immutable = Reflect.ownKeys(descriptors).some(key => 'value' in descriptors[key] && !descriptors[key].writable && !descriptors[key].configurable);
+  const clean = !immutable ? value : Array.isArray(value) ? [] : value instanceof Error
+    ? Object.setPrototypeOf(new Error(), Object.getPrototypeOf(value)) : Object.create(Object.getPrototypeOf(value));
+  seen.set(value, clean);
+  for (const key of Reflect.ownKeys(descriptors)) {
+    const descriptor = descriptors[key];
+    if ('value' in descriptor) Object.defineProperty(clean, key, { ...descriptor, value: redactCommandError(descriptor.value, secrets, seen) });
+    else if (clean !== value) Object.defineProperty(clean, key, descriptor);
+  }
+  return clean;
+}
+
 function commandFailure(command, code, result, extra = {}, secrets = {}) {
-  const clean = { ...result, stdout: redact(result.stdout ?? '', secrets), stderr: redact(result.stderr ?? '', secrets) };
+  const clean = redact({ ...result, stdout: result.stdout ?? '', stderr: result.stderr ?? '' }, secrets);
   const diagnostics = ['stdout', 'stderr'].map(name => clean[name] ? `${name}:\n${clean[name].length > 12000 ? `${clean[name].slice(0, 6000)}\n[full bounded output retained in result]\n${clean[name].slice(-6000)}` : clean[name]}` : '').filter(Boolean).join('\n');
   return fail(code, `${command} ${code === 'command_failed' ? `failed (${result.code})` : code}${diagnostics ? `:\n${diagnostics}` : ''}`, { ...extra, exitCode: result.code, stdout: clean.stdout, stderr: clean.stderr, result: clean });
 }
@@ -102,7 +136,7 @@ export async function execute(command, args, { cwd, signal, timeoutMs = 120000, 
   if (!Number.isInteger(timeoutMs) || timeoutMs < 0 || timeoutMs > 2147483647 || !Number.isInteger(maxOutputBytes) || maxOutputBytes < 1) throw fail('configuration', 'Command deadline and output limit must be bounded integers');
   const baseEnv = env ?? process.env;
   let environment = workerEnvironment(baseEnv);
-  const redactions = { ...Object.fromEntries(Object.entries(baseEnv).filter(([name]) => !(name in environment))), ...secrets };
+  const redactions = commandRedactions(baseEnv, environment, secrets);
   let executable = command, argv = args;
   // Coordinator Git processes retain credentials, so repository-authored hooks
   // must never run inside that boundary, including pre-push and reference hooks.
@@ -162,21 +196,22 @@ function context(options) {
     if (!settings.reconcile && !finishingIrreversible) checkpoint();
     const baseEnv = settings.env ?? process.env;
     const unprivileged = workerEnvironment(baseEnv);
+    const redactions = commandRedactions(baseEnv, unprivileged, options.secrets);
     const environment = /(?:^|[\\/])git(?:\.exe)?$/i.test(name) ? gitBoundary(args, baseEnv).env
       : /(?:^|[\\/])gh(?:\.exe)?$/i.test(name) ? gitBoundary(['ls-remote'], baseEnv).env : unprivileged;
     try {
-      const result = await runner(name, args, { cwd, ...settings, secrets: options.secrets, env: environment, signal: settings.ignoreAbort || finishingIrreversible ? undefined : signal });
-      if (result.code && !settings.allowFailure) throw commandFailure(name, 'command_failed', result, {}, options.secrets);
+      const result = await runner(name, args, { cwd, ...settings, secrets: redactions, env: environment, signal: settings.ignoreAbort || finishingIrreversible ? undefined : signal });
+      if (result.code && !settings.allowFailure) throw commandFailure(name, 'command_failed', result, {}, redactions);
       return result.stdout?.trimEnd() ?? '';
     } catch (error) {
+      const clean = redactCommandError(error, redactions);
       // Engine's summary stores only message. Keep the full bounded diagnostics
       // separately before cleanup, without argv or environment/credentials.
-      if (error.stdout || error.stderr) {
-        const hidden = { ...Object.fromEntries(Object.entries(baseEnv).filter(([key]) => !(key in unprivileged))), ...options.secrets };
-        try { await event('delivery.command_failed', redact({ command: name, code: error.code, exitCode: error.exitCode, stdout: error.stdout, stderr: error.stderr, outputTruncated: error.result?.outputTruncated === true }, hidden)); }
+      if (clean?.stdout || clean?.stderr) {
+        try { await event('delivery.command_failed', redact({ command: name, code: clean.code, exitCode: clean.exitCode, stdout: clean.stdout, stderr: clean.stderr, outputTruncated: clean.result?.outputTruncated === true }, redactions)); }
         catch { /* Diagnostic persistence failure must not replace the command. */ }
       }
-      throw error;
+      throw clean;
     }
   };
   const event = async (type, data) => { await store?.event?.(run.id, type, data); await options.onEvent?.({ type, ...data }); };

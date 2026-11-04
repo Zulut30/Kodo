@@ -426,6 +426,133 @@ test('Release lifecycle records complete redacted command diagnostics before cle
   assert.equal(ctx.leases.size, 0); assert.equal(ctx.state.releaseCreates, 0);
 });
 
+async function credentialRedactionFixture(t) {
+  const ctx = await fixture(t);
+  await ctx.git('push', 'origin', `${ctx.run.headSha}:main`);
+  const environmentOnly = 'fictional-env-only-credential', explicit = 'fictional-explicit-credential';
+  const previous = process.env.NPM_TOKEN, previousValue = process.env.FIXTURE_RELEASE_VALUE;
+  process.env.NPM_TOKEN = environmentOnly;
+  process.env.FIXTURE_RELEASE_VALUE = 'kept';
+  t.after(() => {
+    if (previous === undefined) delete process.env.NPM_TOKEN; else process.env.NPM_TOKEN = previous;
+    if (previousValue === undefined) delete process.env.FIXTURE_RELEASE_VALUE; else process.env.FIXTURE_RELEASE_VALUE = previousValue;
+  });
+  // The same key must retain both values in the redaction set. Only the explicit
+  // value is in options.secrets; the child reads the env-only value from fake config.
+  ctx.secrets = { NPM_TOKEN: explicit };
+  const configFile = path.join(ctx.root, 'fixture-tool-config.json');
+  await writeFile(configFile, JSON.stringify({ environmentOnly, explicit }));
+  return { ctx, environmentOnly, explicit, configFile };
+}
+
+function assertCredentialFailure(error, { environmentOnly, explicit }, code, exitCode) {
+  assert.ok(error instanceof Error);
+  assert.equal(error.code, code); assert.equal(error.exitCode, exitCode);
+  assert.equal(error.result.code, exitCode);
+  for (const representation of [error.message, error.stack, JSON.stringify(error), JSON.stringify(Object.getOwnPropertyDescriptors(error))]) {
+    assert.equal(representation.includes(environmentOnly), false, 'env-only credential escaped in an error representation');
+    assert.equal(representation.includes(explicit), false, 'explicit credential escaped in an error representation');
+  }
+  assert.equal(error.stdout, 'first assertion [REDACTED]\n' + 'detail\n'.repeat(9000) + 'tail [REDACTED]\n');
+  assert.equal(error.stderr, 'last failure [REDACTED] / [REDACTED]\n');
+  assert.match(error.message, /first assertion/); assert.match(error.message, /last failure/);
+  assert.ok(error.message.length < 25000);
+  assert.equal(error.result.stdout, error.stdout); assert.equal(error.result.stderr, error.stderr);
+}
+
+test('Credential redaction covers direct runner overlapping environment and options names', async t => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'kodo-delivery-test-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const environmentOnly = 'fictional-env-only-credential', explicit = 'fictional-explicit-credential';
+  const configFile = path.join(directory, 'fixture-tool-config.json');
+  await writeFile(configFile, JSON.stringify({ environmentOnly, explicit }));
+  const script = `
+    const {environmentOnly,explicit}=JSON.parse(require('node:fs').readFileSync(process.argv[1],'utf8'));
+    if(process.env.NPM_TOKEN!==undefined)throw new Error('credential was forwarded');
+    process.stdout.write('first assertion '+environmentOnly+'\\n'+'detail\\n'.repeat(9000)+'tail '+explicit+'\\n');
+    process.stderr.write('last failure '+environmentOnly+' / '+explicit+'\\n');process.exitCode=6;
+  `;
+  await assert.rejects(execute(process.execPath, ['-e', script, configFile], { cwd: directory,
+    env: { ...process.env, NPM_TOKEN: environmentOnly }, secrets: { NPM_TOKEN: explicit }
+  }), error => { assertCredentialFailure(error, { environmentOnly, explicit }, 'command_failed', 6); return true; });
+});
+
+for (const mode of ['exit', 'timeout', 'cancelled']) {
+  test(`Credential redaction covers real release command errors on ${mode}`, { timeout: 40000 }, async t => {
+    const data = await credentialRedactionFixture(t), { ctx, configFile } = data;
+    const controller = new AbortController(), runner = ctx.exec;
+    const readyPath = path.join(ctx.root, 'credential-ready.json');
+    const ready = mode === 'exit' ? undefined : readyFile(ctx.root, path.basename(readyPath));
+    const script = `
+      const fs=require('node:fs'),{environmentOnly,explicit}=JSON.parse(fs.readFileSync(process.argv[1],'utf8'));
+      if(process.env.NPM_TOKEN!==undefined)throw new Error('credential was forwarded');
+      if(process.env.FIXTURE_RELEASE_VALUE!=='kept')throw new Error('safe environment was lost');
+      process.stdout.write('first assertion '+environmentOnly+'\\n'+'detail\\n'.repeat(9000)+'tail '+explicit+'\\n');
+      process.stderr.write('last failure '+environmentOnly+' / '+explicit+'\\n');
+      if(process.argv[2]==='exit')process.exitCode=6;
+      else {setInterval(()=>{},1000);fs.writeFileSync(process.argv[3],JSON.stringify({ready:true}));}
+    `;
+    ctx.config.commands.test = [{ command: process.execPath, args: ['-e', script, configFile, mode, readyPath], timeoutMs: mode === 'timeout' ? 4000 : 15000 }];
+    let source, redactions, environment;
+    ctx.exec = async (command, args, options) => {
+      if (command === process.execPath && args[2] === configFile) { source = options.cwd; redactions = options.secrets; environment = options.env; }
+      return runner(command, args, options);
+    };
+    const outcome = releasePackage({ ...ctx, mergeCommit: ctx.run.headSha, signal: controller.signal }).catch(error => error);
+    if (ready) { assert.deepEqual(await ready, { ready: true }); if (mode === 'cancelled') controller.abort(); }
+    const error = await outcome;
+    assertCredentialFailure(error, data, mode === 'exit' ? 'command_failed' : mode, mode === 'exit' ? 6 : process.platform === 'win32' ? 1 : null);
+    assert.ok(Object.values(redactions).includes(data.environmentOnly)); assert.ok(Object.values(redactions).includes(data.explicit));
+    assert.equal(environment.NPM_TOKEN, undefined); assert.equal(environment.FIXTURE_RELEASE_VALUE, 'kept');
+    const diagnostic = ctx.events.find(event => event.type === 'delivery.command_failed').data;
+    assert.equal(diagnostic.stdout, error.stdout); assert.equal(diagnostic.stderr, error.stderr);
+    assert.equal(diagnostic.code, error.code); assert.equal(diagnostic.exitCode, error.exitCode); assert.equal(diagnostic.outputTruncated, false);
+    assert.equal(error.cleanupErrors, undefined); assert.equal(error.teardownError, undefined);
+    await assert.rejects(readFile(path.join(source, 'package.json')), { code: 'ENOENT' });
+    assert.equal(ctx.leases.size, 0); assert.equal(ctx.state.releaseCreates, 0); assert.equal(ctx.run.delivery?.release, undefined);
+  });
+}
+
+for (const mode of ['result', 'command_failed', 'timeout', 'cancelled', 'frozen']) {
+  test(`Credential redaction covers fallback runner errors on ${mode}`, async t => {
+    const data = await credentialRedactionFixture(t), { ctx, environmentOnly, explicit } = data;
+    const runner = ctx.exec;
+    ctx.config.commands.test = [{ command: 'fixture-redaction' }];
+    const stdout = `first assertion ${environmentOnly}\n` + 'detail\n'.repeat(9000) + `tail ${explicit}\n`;
+    const stderr = `last failure ${environmentOnly} / ${explicit}\n`;
+    const result = { stdout, stderr, code: 7, outputTruncated: true, diagnostics: { detail: `config ${environmentOnly} / ${explicit}` } };
+    const code = mode === 'result' || mode === 'frozen' ? 'command_failed' : mode;
+    const primary = Object.assign(new TypeError(`fixture failure ${environmentOnly} / ${explicit}: first assertion; last failure`, { cause: new Error(`config ${environmentOnly}`) }), { code, exitCode: 7, stdout, stderr, result });
+    // Node 24 exposes stack through an accessor even after it has been cached.
+    void primary.stack; void primary.cause.stack;
+    if (mode === 'frozen') { Object.freeze(primary); Object.freeze(result); }
+    let source, redactions;
+    ctx.exec = async (command, args, options) => {
+      if (command !== 'fixture-redaction') return runner(command, args, options);
+      source = options.cwd; redactions = options.secrets;
+      assert.equal(options.env.NPM_TOKEN, undefined);
+      if (mode === 'result') return result;
+      throw primary;
+    };
+    const error = await releasePackage({ ...ctx, mergeCommit: ctx.run.headSha }).catch(error => error);
+    assertCredentialFailure(error, data, code, 7);
+    assert.equal(error.result.diagnostics.detail, 'config [REDACTED] / [REDACTED]');
+    assert.equal(error.result.outputTruncated, true);
+    if (mode !== 'result') {
+      if (mode === 'frozen') assert.notEqual(error, primary); else assert.equal(error, primary);
+      assert.ok(error instanceof TypeError); assert.equal(error.cause.message, 'config [REDACTED]');
+      assert.equal(error.cause.stack.includes(environmentOnly), false);
+    }
+    assert.ok(Object.values(redactions).includes(environmentOnly)); assert.ok(Object.values(redactions).includes(explicit));
+    const diagnostic = ctx.events.find(event => event.type === 'delivery.command_failed').data;
+    assert.equal(diagnostic.stdout, error.stdout); assert.equal(diagnostic.stderr, error.stderr);
+    assert.equal(diagnostic.exitCode, 7); assert.equal(diagnostic.outputTruncated, true);
+    assert.equal(JSON.stringify(ctx.events).includes(environmentOnly), false); assert.equal(JSON.stringify(ctx.events).includes(explicit), false);
+    await assert.rejects(readFile(path.join(source, 'package.json')), { code: 'ENOENT' });
+    assert.equal(ctx.leases.size, 0); assert.equal(ctx.state.releaseCreates, 0); assert.equal(ctx.run.delivery?.release, undefined);
+  });
+}
+
 test('Delivery lifecycle preserves cwd environment stdin EOF and allowFailure', async t => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'kodo-delivery-test-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
