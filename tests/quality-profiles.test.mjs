@@ -5,6 +5,29 @@ import { realpath } from 'node:fs/promises';
 import { fixture, put, projects, pins, windowsShortPath } from './fixtures/quality/helpers.mjs';
 const api = () => import('../runtime/quality.mjs');
 
+test('Quality TypeScript reference graphs and untracked config inheritance fail closed', async t => {
+  const { QualityProfileRegistry } = await api(), registry = new QualityProfileRegistry();
+  for (const config of [
+    { references: [{ path: './lib' }] },
+    { extends: './config/base.json' },
+    { extends: '@vendor/tsconfig/base.json' },
+    { extends: './missing.json' },
+    { extends: './tsconfig.json' },
+    { compilerOptions: { tsBuildInfoFile: './cache.tsbuildinfo' } },
+  ]) {
+    const fx = await fixture(t, { ...projects.typescript, 'tsconfig.json': config, 'config/base.json': { references: [{ path: '../lib' }] }, 'lib/tsconfig.json': {}, 'lib/index.ts': 'export const value = 1;' });
+    const plan = await registry.plan(fx.project, { capabilities: ['typecheck'], changedPaths: ['src/main.ts'] });
+    assert.equal(plan.status, 'blocked'); assert.equal(plan.checks[0].status, 'blocked');
+    assert.match(plan.checks[0].reason, /typescript_.*unsupported/);
+  }
+  for (const config of [{ references: {} }, { references: [null] }, { compilerOptions: [] }, { extends: [] }]) {
+    const fx = await fixture(t, { ...projects.typescript, 'tsconfig.json': config });
+    await assert.rejects(() => registry.plan(fx.project, { capabilities: ['typecheck'] }), error => error.code === 'configuration');
+  }
+  const unsafe = await fixture(t, { ...projects.typescript, 'tsconfig.json': { extends: './config/base.json' }, 'config/base.json': { include: ['../../outside/**/*.ts'] } });
+  await assert.rejects(() => registry.plan(unsafe.project, { capabilities: ['typecheck'] }), error => error.code === 'unsafe_path');
+});
+
 test('Quality TypeScript reference directives stay inside the inventoried project', async t => {
   const { QualityProfileRegistry } = await api(), registry = new QualityProfileRegistry();
   const fx = await fixture(t, { ...projects.typescript, 'src/main.ts': '/// <reference path="../../outside.ts" />\nexport const value = externalValue;\n' });

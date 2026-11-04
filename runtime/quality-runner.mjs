@@ -225,7 +225,7 @@ function argumentsFor(check, home, plan) {
   switch (check.tool) {
     case 'oxlint': return ['--format', 'json', '--deny-warnings', '--no-ignore', ...(check.frameworks?.includes('react') ? ['--react-plugin', '--jsx-a11y-plugin'] : []), ...(check.frameworks?.includes('next') ? ['--nextjs-plugin'] : []), ...files];
     case 'oxfmt': return ['--check', ...files];
-    case 'typescript': return ['--noEmit', '--incremental', 'false', '--pretty', 'false', ...(plan.config.strictness === 'strict' ? ['--strict'] : []), '--project', manifest];
+    case 'typescript': return ['--noEmit', '--incremental', 'false', '--pretty', 'false', ...(plan.config.strictness === 'strict' ? ['--strict'] : []), '--project', check.typecheckConfig.path];
     case 'stylelint': return ['--formatter', 'json', ...files];
     case 'html-validate': return ['--formatter', 'json', '--max-warnings', '0', ...files];
     case 'sqlfluff': return ['lint', '--format', 'json', '--dialect', check.dialect, '--disable-progress-bar', ...files];
@@ -257,6 +257,22 @@ async function safeProjectEntrypoint(project, entry) {
   const info = await lstat(filename);
   if (!info.isFile() || info.nlink > 1 || info.size > 32 * 1024 * 1024) throw qualityError('unsafe_path', 'unsafe quality project executable');
   return sha256(await readFile(filename));
+}
+function typeScriptConfigContent(check, plan) {
+  return JSON.stringify({
+    extends: path.join(plan.project, check.manifest),
+    files: check.files.map(file => path.join(plan.project, file)), include: [], exclude: [],
+    compilerOptions: { noEmit: true, noCheck: false, skipLibCheck: false, skipDefaultLibCheck: false,
+      incremental: false, composite: false, declaration: false, declarationMap: false, emitDeclarationOnly: false }
+  }) + '\n';
+}
+async function intactTypeScriptConfig(item, check, plan, evidenceRoot) {
+  if (!item || path.dirname(item.path) !== evidenceRoot) return false;
+  await noLinks(item.path);
+  const info = await lstat(item.path);
+  if (!info.isFile() || info.nlink > 1 || info.size > 4 * 1024 * 1024) return false;
+  const content = await readFile(item.path), expected = typeScriptConfigContent(check, plan);
+  return content.length === item.bytes && sha256(content) === item.sha256 && content.toString('utf8') === expected;
 }
 export async function runQuality(options = {}) {
   const { project = process.cwd(), runner = execute, resolve = resolveTool, nativeResolve = nativeTool, signal } = options;
@@ -379,7 +395,15 @@ export async function runQuality(options = {}) {
         if (version.code !== 0 || version.stderr.trim() || (check.configured ? version.stdout.trim() !== check.configured.versionOutput : !validVersion(check.tool, version.stdout, check.version))) throw qualityError('version_mismatch', 'exact quality tool version mismatch');
       }
       receipt.actualVersion = check.version;
-      const groups = check.tool === 'php' && !check.configured ? check.files.map(file => ({ ...check, files: [file] })) : [check];
+      let executionCheck = check;
+      if (check.tool === 'typescript' && !check.configured) {
+        const content = typeScriptConfigContent(check, plan), filename = path.join(evidenceRoot, `typescript-${sha256(check.id).slice(0, 12)}.json`);
+        await writeFile(filename, content, { flag: 'wx', mode: 0o400 });
+        receipt.typecheckConfig = { path: filename, sha256: sha256(content), bytes: Buffer.byteLength(content) };
+        executionCheck = { ...check, typecheckConfig: receipt.typecheckConfig };
+        if (!await intactTypeScriptConfig(receipt.typecheckConfig, check, plan, evidenceRoot)) throw qualityError('typecheck_config_integrity', 'private TypeScript config changed');
+      }
+      const groups = check.tool === 'php' && !check.configured ? check.files.map(file => ({ ...check, files: [file] })) : [executionCheck];
       let successful = true;
       for (const group of groups) {
         const output = await call(tool.command, [...prefix, ...argumentsFor(group, evidenceRoot, plan)], { env: toolEnv });
@@ -400,7 +424,8 @@ export async function runQuality(options = {}) {
     } finally {
       if (check.status === 'applicable') {
         try {
-          if (sha256(JSON.stringify(await qualityInventory(plan.project))) !== plan.sourceHash) { receipt.status = 'blocked'; receipt.reason = 'source_mutation'; }
+          if (receipt.typecheckConfig && !await intactTypeScriptConfig(receipt.typecheckConfig, check, plan, evidenceRoot)) { receipt.status = 'blocked'; receipt.reason = 'typecheck_config_integrity'; }
+          else if (sha256(JSON.stringify(await qualityInventory(plan.project))) !== plan.sourceHash) { receipt.status = 'blocked'; receipt.reason = 'source_mutation'; }
           else if (!headError && await head() !== headSha) { receipt.status = 'blocked'; receipt.reason = 'head_mutation'; }
         } catch (error) { receipt.status = 'blocked'; receipt.reason = signal?.aborted ? 'cancelled' : error.code ?? 'source_mutation'; }
       }
@@ -438,6 +463,7 @@ export async function isCurrentQualityReceipt(report, { project, runner = execut
       const { logs, ...storedReceipt } = stored, { evidence, ...suppliedReceipt } = row;
       if (JSON.stringify(storedReceipt) !== JSON.stringify(suppliedReceipt) || stored.headSha !== report.headSha || stored.sourceHash !== report.sourceHash || stored.configHash !== report.configHash) return false;
       if (row.status === 'passed') {
+        if (check.tool === 'typescript' && !check.configured && !await intactTypeScriptConfig(row.typecheckConfig, check, plan, evidenceRoot)) return false;
         const tool = managed.has(check.tool) ? await resolve(check.tool, { project: plan.project, home: toolHome }) : await nativeResolve(['phpcs', 'phpstan'].includes(check.tool) ? 'php' : check.tool);
         if (managed.has(check.tool) && (!tool.ready || tool.status !== 'ready') || await toolIdentity(tool) !== row.toolIdentity) return false;
         if (row.compilerIdentity && await toolIdentity(await nativeResolve('rustc')) !== row.compilerIdentity) return false;

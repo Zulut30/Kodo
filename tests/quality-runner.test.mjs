@@ -1,9 +1,75 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile, realpath } from 'node:fs/promises';
+import { chmod, readFile, realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { fixture, put, projects, pins, fakeTools, toolRunner, windowsShortPath } from './fixtures/quality/helpers.mjs';
 const api = () => import('../runtime/quality-runner.mjs');
+
+test('Quality TypeScript checks every receipt root despite files exclude and noCheck', async t => {
+  const { runQuality } = await api();
+  for (const scope of [{ files: ['src/main.ts'] }, { exclude: ['src/bad.ts'] }, { compilerOptions: { noCheck: true } }]) {
+    const fx = await fixture(t, { ...projects.typescript, 'tsconfig.json': scope, 'src/bad.ts': 'export const bad: number = "wrong";' });
+    const fake = toolRunner({ typescript: async ({ args, options }) => {
+      if (args.includes('--version')) return { code: 0, stdout: 'Version 7.0.2', stderr: '' };
+      const config = JSON.parse(await readFile(path.resolve(options.cwd, args[args.indexOf('--project') + 1]), 'utf8'));
+      const roots = (config.files ?? ['src/main.ts', 'src/bad.ts']).map(file => path.resolve(options.cwd, file));
+      const covered = roots.includes(path.join(await realpath(fx.project), 'src/bad.ts')) && !config.exclude?.includes('src/bad.ts') && !config.compilerOptions?.noCheck;
+      return { code: covered ? 2 : 0, stdout: covered ? 'src/bad.ts(1,14): error TS2322: Type string is not assignable to number.' : '', stderr: '' };
+    } });
+    const result = await runQuality({ ...fx, resolve: fakeTools(), runner: fake.runner, mode: 'quick', changedPaths: ['src/bad.ts'], capabilities: ['typecheck'] });
+    assert.equal(result.status, 'failed', JSON.stringify(scope));
+    assert.deepEqual(result.receipts[0].files, ['src/bad.ts', 'src/main.ts']);
+    assert.equal(fake.calls.filter(call => !call.args.includes('--version')).length, 1, 'one compiler check, no extra probe');
+  }
+});
+
+test('Quality TypeScript private config binds exact roots options and tamper-sensitive receipts', async t => {
+  const { runQuality, isCurrentQualityReceipt } = await api();
+  const fx = await fixture(t, { ...projects.typescript, 'tsconfig.json': { extends: './config/base.json', files: ['src/main.ts'] }, 'config/base.json': { compilerOptions: { target: 'es2022', module: 'esnext', paths: { '@/*': ['../src/*'] }, jsx: 'preserve', noCheck: true } }, 'src/other.ts': 'export const other = 1;' });
+  const fake = toolRunner(), resolve = fakeTools();
+  const result = await runQuality({ ...fx, resolve, runner: fake.runner, capabilities: ['typecheck'] });
+  assert.equal(result.status, 'passed');
+  const checkCall = fake.calls.find(call => call.args.includes('--project'));
+  const configPath = checkCall.args[checkCall.args.indexOf('--project') + 1];
+  assert.equal(path.dirname(configPath), result.evidenceRoot);
+  const config = JSON.parse(await readFile(configPath, 'utf8'));
+  assert.equal(config.extends, path.join(await realpath(fx.project), 'tsconfig.json'));
+  assert.deepEqual(config.files, result.receipts[0].files.map(file => path.join(result.plan.project, file)));
+  assert.deepEqual(config.include, []); assert.deepEqual(config.exclude, []);
+  assert.equal(config.compilerOptions.noEmit, true); assert.equal(config.compilerOptions.noCheck, false);
+  assert.equal(config.compilerOptions.skipLibCheck, false); assert.equal(config.compilerOptions.skipDefaultLibCheck, false);
+  assert.equal(config.compilerOptions.incremental, false); assert.equal(config.compilerOptions.composite, false);
+  assert.equal(await isCurrentQualityReceipt(result, { resolve, runner: fake.runner }), true);
+  const original = await readFile(configPath, 'utf8');
+  await chmod(configPath, 0o600);
+  await put(path.dirname(configPath), path.basename(configPath), { ...config, files: [] });
+  assert.equal(await isCurrentQualityReceipt(result, { resolve, runner: fake.runner }), false);
+  await put(path.dirname(configPath), path.basename(configPath), original);
+  await put(fx.project, 'config/base.json', { compilerOptions: { target: 'es5' } });
+  assert.equal(await isCurrentQualityReceipt(result, { resolve, runner: fake.runner }), false);
+});
+
+test('Quality TypeScript generated config mutation during compiler execution blocks PASS', async t => {
+  const { runQuality } = await api(), fx = await fixture(t, projects.typescript);
+  const fake = toolRunner({ typescript: async ({ args, options }) => {
+    if (args.includes('--version')) return { code: 0, stdout: 'Version 7.0.2', stderr: '' };
+    const filename = path.resolve(options.cwd, args[args.indexOf('--project') + 1]);
+    if (path.dirname(filename) !== await realpath(fx.project)) { await chmod(filename, 0o600); await put(path.dirname(filename), path.basename(filename), {}); }
+    return { code: 0, stdout: '', stderr: '' };
+  } });
+  const result = await runQuality({ ...fx, resolve: fakeTools(), runner: fake.runner, capabilities: ['typecheck'] });
+  assert.equal(result.status, 'blocked'); assert.equal(result.receipts[0].reason, 'typecheck_config_integrity');
+});
+
+test('Quality TypeScript unsupported project references never execute or receive PASS', async t => {
+  const { runQuality } = await api();
+  const fx = await fixture(t, { ...projects.typescript, 'tsconfig.json': { files: ['src/main.ts'], references: [{ path: './lib' }] }, 'lib/tsconfig.json': { compilerOptions: { composite: true } }, 'lib/bad.ts': 'export const bad: number = "wrong";' });
+  const fake = toolRunner();
+  const result = await runQuality({ ...fx, resolve: async () => assert.fail('unsupported graph must not resolve a tool'), runner: fake.runner, changedPaths: ['lib/bad.ts'], capabilities: ['typecheck'] });
+  assert.equal(result.passed, false); assert.equal(result.receipts[0].status, 'blocked');
+  assert.equal(result.receipts[0].reason, 'typescript_project_references_unsupported');
+  assert.ok(result.receipts[0].files.includes('lib/bad.ts')); assert.equal(fake.calls.length, 0);
+});
 
 test('Quality Windows short names inside the root map only to inventoried diagnostic files', { skip: process.platform !== 'win32' }, async t => {
   const { parseQualityOutput } = await api();

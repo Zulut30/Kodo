@@ -130,19 +130,29 @@ async function validateManifestScope(root, files, documents) {
     if (!inside(root, target)) throw qualityError('unsafe_path', 'compiler manifest scope escapes project');
     await noLinks(target);
   };
-  for (const file of files) {
+  const names = new Set(files.map(f => f.path));
+  const configNames = new Set(files.filter(f => /^tsconfig[^/]*\.json$/.test(path.posix.basename(f.path))).map(f => f.path));
+  const queue = [...files];
+  for (const file of queue) {
     const name = file.path, base = path.posix.basename(name);
-    if (/^tsconfig[^/]*\.json$/.test(base)) {
+    if (configNames.has(name)) {
       const config = jsonc(await readFile(path.join(root, name), 'utf8')); documents.set(name, config);
+      if (config.compilerOptions !== undefined && !object(config.compilerOptions)) throw qualityError('configuration', 'invalid TypeScript compiler options');
+      if (config.references !== undefined && (!Array.isArray(config.references) || config.references.some(ref => !object(ref) || typeof ref.path !== 'string'))) throw qualityError('configuration', 'invalid TypeScript project references');
       for (const key of ['files', 'include', 'exclude']) if (config[key] !== undefined) {
         if (!Array.isArray(config[key])) throw qualityError('configuration', 'invalid TypeScript file scope');
         for (const value of config[key]) await checkedPath(name, value, true);
       }
       if (config.extends !== undefined) for (const value of Array.isArray(config.extends) ? config.extends : [config.extends]) {
-        if (typeof value !== 'string') throw qualityError('configuration', 'invalid TypeScript extends scope');
-        if (value.startsWith('.') || path.isAbsolute(value)) await checkedPath(name, value);
+        if (typeof value !== 'string' || !value.trim()) throw qualityError('configuration', 'invalid TypeScript extends scope');
+        if (value.startsWith('.') || path.isAbsolute(value)) {
+          await checkedPath(name, value);
+          const dependency = localTypeScriptConfig(name, value, names);
+          if (dependency && !configNames.has(dependency)) { configNames.add(dependency); queue.push({ path: dependency }); }
+        }
         else if (!/^@?[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)*$/.test(value)) throw qualityError('unsafe_path', 'unsafe TypeScript dependency config');
       }
+      if (Array.isArray(config.extends) && !config.extends.length) throw qualityError('configuration', 'invalid TypeScript extends scope');
       for (const ref of config.references ?? []) await checkedPath(name, ref.path);
       for (const value of config.compilerOptions?.typeRoots ?? []) await checkedPath(name, value);
       for (const values of Object.values(config.compilerOptions?.paths ?? {})) for (const value of values) await checkedPath(name, value, true);
@@ -175,6 +185,29 @@ async function validateManifestScope(root, files, documents) {
       }
     }
   }
+}
+function localTypeScriptConfig(from, value, names) {
+  if (!value.startsWith('.')) return null;
+  const name = path.posix.normalize(path.posix.join(dir(from), value));
+  return [name, name + '.json'].find(candidate => names.has(candidate)) ?? null;
+}
+function typeScriptScopeSupport(manifest, names, documents, visiting = new Set()) {
+  // Extends preserves relative compiler options, but every contributing config
+  // must be inventoried. Project references are not inherited and need a future
+  // graph-aware read-only adapter rather than silently dropping those projects.
+  if (visiting.has(manifest)) return 'typescript_config_cycle_unsupported';
+  const config = documents.get(manifest);
+  if (!config) return 'typescript_config_inheritance_unsupported';
+  if (config.references?.length) return 'typescript_project_references_unsupported';
+  if (config.compilerOptions?.tsBuildInfoFile !== undefined) return 'typescript_build_info_unsupported';
+  visiting.add(manifest);
+  for (const value of config.extends === undefined ? [] : Array.isArray(config.extends) ? config.extends : [config.extends]) {
+    const dependency = localTypeScriptConfig(manifest, value, names);
+    const reason = dependency ? typeScriptScopeSupport(dependency, names, documents, visiting) : 'typescript_config_inheritance_unsupported';
+    if (reason) return reason;
+  }
+  visiting.delete(manifest);
+  return null;
 }
 function dir(name) { const value = path.posix.dirname(name); return value === '.' ? '' : value; }
 function beneath(root, name) { return !root || name.startsWith(root + '/'); }
@@ -339,6 +372,10 @@ export class QualityProfileRegistry {
           if (check.tool === 'typescript') {
             check.manifest = at(profile.root, 'tsconfig.json');
             if (!names.has(check.manifest)) check = { ...check, status: 'blocked', reason: 'tsconfig_required' };
+            else {
+              const reason = typeScriptScopeSupport(check.manifest, names, documents);
+              if (reason) check = { ...check, status: 'blocked', reason };
+            }
           }
           if (['typescript', 'cargo'].includes(check.tool) || check.tool === 'dotnet' && capability !== 'format' || check.tool === 'go' && capability !== 'format') {
             check.files = profile.files;
