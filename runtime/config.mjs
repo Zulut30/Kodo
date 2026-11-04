@@ -12,6 +12,14 @@ export const defaults = {
   checks: ['check (ubuntu-latest, 24)', 'check (windows-latest, 24)'],
   delivery: { enabled: false, release: false, firstVersion: '0.2.0' }
 };
+export function validateCommandTimeouts(commands) {
+  for (const kind of ['test', 'build', 'deploy', 'smoke']) for (const [index, command] of (commands[kind] || []).entries()) {
+    const timeout = command.timeoutMs;
+    if (timeout !== undefined && (!Number.isInteger(timeout) || timeout < 0 || timeout > 2147483647)) {
+      throw Object.assign(new Error(`Некорректный commands.${kind}[${index}].timeoutMs: требуется целое число от 0 до 2147483647 мс`), { code: 'configuration' });
+    }
+  }
+}
 export async function readConfig(project, overrides = {}) {
   let file = {};
   try { file = JSON.parse(await readFile(path.join(project, 'kodo.config.json'), 'utf8')); } catch (error) { if (error.code !== 'ENOENT') throw error; }
@@ -22,6 +30,7 @@ export async function readConfig(project, overrides = {}) {
   if (config.maxTasks !== undefined && (!Number.isSafeInteger(config.maxTasks) || config.maxTasks < 1 || config.maxTasks > 24)) throw new Error('Некорректный лимит maxTasks');
   config.uiVerification = normalizeUIConfig(config.uiVerification); config.security = normalizeSecurityConfig(config.security);
   for (const kind of ['test', 'build', 'deploy', 'smoke']) if (!Array.isArray(config.commands[kind]) || config.commands[kind].some(item => typeof item.command !== 'string' || !Array.isArray(item.args) || item.args.some(arg => typeof arg !== 'string'))) throw new Error(`Некорректные команды ${kind}`);
+  validateCommandTimeouts(config.commands);
   return config;
 }
 export async function initConfig(project, overrides = {}) {
