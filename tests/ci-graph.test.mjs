@@ -28,6 +28,20 @@ test('Affected graph follows transitive re-exports and excludes independent test
   assert.deepEqual(await planAffected(input), plan); assert.match(plan.sourceHash, /^[a-f0-9]{64}$/); assert.match(plan.dependencyHash, /^[a-f0-9]{64}$/);
 });
 
+test('Shared inspector extraction preserves exact CI fallback reasons for loader aliases and export uncertainty', async t => {
+  for (const source of ['const load = require; load(name);', "import { createRequire as load } from 'node:module';", 'eval(source);', 'new Function(source);', 'require.resolve(name);']) {
+    const fx = await fixture(t); await put(fx.project, 'src/value.mjs', source);
+    const result = await planAffected({ ...fx, headSha: fx.commit() });
+    assert.ok(result.reasons.includes('dynamic-dependency:src/value.mjs'));
+    assert.ok(result.fallback); assert.ok(result.testFiles.includes('tests/other.test.mjs'));
+  }
+  const fx = await fixture(t, { 'src/bridge.mjs': "export * from './value.mjs';", 'old.cjs': 'module.exports = 1;' });
+  await put(fx.project, 'src/value.mjs', 'export const value = 2;');
+  const result = await planAffected({ ...fx, headSha: fx.commit() });
+  assert.equal(result.fallback, false); assert.deepEqual(result.reasons, []);
+  assert.deepEqual(result.testFiles, ['tests/value.test.mjs']);
+});
+
 test('Affected graph includes exact test basenames discovered by default Node runner', async t => {
   for (const extension of ['js', 'mjs', 'cjs']) await t.test(`test.${extension}`, async t => {
     const file = `test.${extension}`;
