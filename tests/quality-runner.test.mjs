@@ -1,0 +1,252 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import { fixture, put, projects, pins, fakeTools, toolRunner } from './fixtures/quality/helpers.mjs';
+const api = () => import('../runtime/quality-runner.mjs');
+
+test('Quality runner gives nine languages independent verified capability receipts', async t => {
+  const { runQuality } = await api();
+  for (const [language, files] of Object.entries(projects)) {
+    const fx = await fixture(t, files, { tools: pins, dialect: 'postgres' });
+    const { runner } = toolRunner();
+    const result = await runQuality({ ...fx, runner, resolve: fakeTools(), capabilities: [language === 'php' ? 'lint' : 'format'] });
+    assert.equal(result.status, 'passed', `${language}: ${JSON.stringify(result.receipts)}`);
+    const receipt = result.receipts.find(r => r.language === language && r.status === 'passed');
+    assert.ok(receipt, language); assert.ok(receipt.durationMs >= 0); assert.match(receipt.headSha, /^[a-f0-9]{40,64}$/);
+    assert.match(receipt.configHash, /^[a-f0-9]{64}$/); assert.match(receipt.sourceHash, /^[a-f0-9]{64}$/); assert.match(receipt.pinsHash, /^[a-f0-9]{64}$/);
+    assert.equal(receipt.evidence.length, 1); assert.match(receipt.evidence[0].sha256, /^[a-f0-9]{64}$/);
+    assert.equal(JSON.parse(await readFile(receipt.evidence[0].path, 'utf8')).status, 'passed');
+  }
+});
+test('Quality runner never passes missing unsupported or mismatched tools', async t => {
+  const { runQuality } = await api(); const fx = await fixture(t, projects.javascript);
+  for (const status of ['missing', 'unsupported', 'error']) {
+    const result = await runQuality({ ...fx, resolve: fakeTools({ ready: false, status }), runner: toolRunner().runner, capabilities: ['lint'] });
+    assert.notEqual(result.status, 'passed'); assert.equal(result.receipts[0].status, status === 'error' ? 'blocked' : status);
+  }
+  const { runner } = toolRunner({ oxlint: () => ({ code: 0, stdout: '1.90.0', stderr: '' }) });
+  const result = await runQuality({ ...fx, resolve: fakeTools(), runner, capabilities: ['lint'] });
+  assert.equal(result.receipts[0].reason, 'version_mismatch'); assert.equal(result.status, 'blocked');
+});
+test('Quality runner blocks malformed partial nonzero and gofmt exit zero filenames', async t => {
+  const { runQuality } = await api(); const fx = await fixture(t, projects.javascript);
+  for (const output of [{ code: 0, stdout: '{}', stderr: '' }, { code: 0, stdout: '{"diagnostics":[]}', stderr: '' }, { code: 0, stdout: '{', stderr: '' }, { code: 2, stdout: '{"diagnostics":[],"number_of_files":1}', stderr: '' }]) {
+    const { runner } = toolRunner({ oxlint: ({ args }) => args.includes('--version') ? { code: 0, stdout: '1.91.0', stderr: '' } : output });
+    const result = await runQuality({ ...fx, runner, resolve: fakeTools(), capabilities: ['lint'] });
+    assert.notEqual(result.status, 'passed');
+  }
+  const go = await fixture(t, projects.go);
+  const result = await runQuality({ ...go, resolve: fakeTools(), runner: toolRunner({ gofmt: () => ({ code: 0, stdout: 'main.go\n', stderr: '' }) }).runner, capabilities: ['format'] });
+  assert.equal(result.receipts[0].status, 'failed');
+});
+test('Quality debt accepts only matching old observations and blocks changed or worsened code', async t => {
+  const { runQuality } = await api(); const fx = await fixture(t, { ...projects.javascript, 'src/new.js': 'export const n = 1;' }, { strictness: 'adopt' });
+  const output = { code: 1, stdout: '{"diagnostics":[{"code":"no-unused-vars","severity":"warning","message":"old","labels":[{"span":{"offset":0,"length":1}}],"filename":"src/main.js"}],"number_of_files":2}', stderr: '' };
+  const runner = toolRunner({ oxlint: ({ args }) => args.includes('--version') ? { code: 0, stdout: '1.91.0', stderr: '' } : output }).runner;
+  const before = await runQuality({ ...fx, runner, resolve: fakeTools(), capabilities: ['lint'], mode: 'standard', changedPaths: ['src/new.js'] });
+  assert.equal(before.status, 'failed'); const finding = before.receipts[0].findings[0];
+  const baseline = [{ ...finding, language: 'javascript', capability: 'lint', tool: 'oxlint', sourceHash: before.plan.files.find(f => f.path === finding.file).sha256 }];
+  await put(fx.project, 'kodo.config.json', { quality: { strictness: 'adopt', baseline } });
+  const old = await runQuality({ ...fx, runner, resolve: fakeTools(), capabilities: ['lint'], mode: 'standard', changedPaths: ['src/new.js'] });
+  assert.equal(old.status, 'passed'); assert.equal(old.receipts[0].debtCount, 1);
+  const changed = await runQuality({ ...fx, runner, resolve: fakeTools(), capabilities: ['lint'], mode: 'standard', changedPaths: ['src/main.js'] });
+  assert.equal(changed.status, 'failed');
+  await put(fx.project, 'src/main.js', 'export const changed = 2;');
+  const worsened = await runQuality({ ...fx, runner, resolve: fakeTools(), capabilities: ['lint'], mode: 'standard', changedPaths: ['src/new.js'] });
+  assert.equal(worsened.status, 'failed');
+});
+test('Quality runner detects source mutation and records redacted bounded private evidence', async t => {
+  const { runQuality } = await api(); const fx = await fixture(t, projects.javascript);
+  const secret = (await import('node:crypto')).randomBytes(20).toString('hex');
+  const runner = toolRunner({ oxlint: async ({ args }) => {
+    if (args.includes('--version')) return { code: 0, stdout: '1.91.0', stderr: '' };
+    await put(fx.project, 'src/main.js', 'mutated');
+    return { code: 1, stdout: '', stderr: `Bearer ${secret}` };
+  } }).runner;
+  const result = await runQuality({ ...fx, runner, resolve: fakeTools(), capabilities: ['lint'] });
+  assert.equal(result.receipts[0].reason, 'source_mutation');
+  const text = await readFile(result.receipts[0].evidence[0].path, 'utf8');
+  assert.ok(!text.includes(secret)); assert.match(text, /REDACTED/);
+});
+
+test('Quality nine language failures missing tools and unsupported platforms cannot pass', async t => {
+  const { runQuality } = await api();
+  for (const [language, files] of Object.entries(projects)) {
+    const fx = await fixture(t, files, { tools: pins, dialect: 'postgres' });
+    const capability = language === 'php' ? 'lint' : 'format';
+    const bad = toolRunner();
+    const badRunner = async (command, args, options) => args.includes('--version') || args[0] === 'version' ? bad.runner(command, args, options) : { code: 1, stdout: 'invalid source', stderr: 'diagnostic' };
+    assert.notEqual((await runQuality({ ...fx, resolve: fakeTools(), runner: badRunner, capabilities: [capability] })).status, 'passed', language);
+    for (const status of ['missing', 'unsupported']) {
+      const nativeResolve = async () => { throw Object.assign(new Error('unavailable fixture runtime'), { code: status }); };
+      const report = await runQuality({ ...fx, resolve: fakeTools({ ready: false, status }), nativeResolve, runner: toolRunner().runner, capabilities: [capability] });
+      assert.equal(report.status, 'blocked', language); assert.equal(report.receipts[0].status, status, language);
+    }
+  }
+});
+
+test('Quality lint and compiler commands are useful read-only checks with explicit dependency scope', async t => {
+  const { runQuality } = await api();
+  for (const [language, files] of Object.entries(projects)) {
+    const fx = await fixture(t, files, { tools: pins, dialect: 'postgres' }), fake = toolRunner();
+    const result = await runQuality({ ...fx, resolve: fakeTools(), runner: fake.runner, capabilities: ['lint'] });
+    assert.equal(result.status, 'passed', `${language} ${JSON.stringify(result.receipts)}`);
+    assert.ok(fake.calls.some(call => !call.args.includes('--version') && call.args[0] !== 'version'));
+    assert.ok(fake.calls.every(call => !call.args.some(arg => ['--write', '--fix', 'install', 'update', 'restore'].includes(arg))));
+  }
+  for (const language of ['csharp', 'rust', 'go', 'typescript']) {
+    const fx = await fixture(t, projects[language], { tools: pins }), fake = toolRunner();
+    const result = await runQuality({ ...fx, resolve: fakeTools(), runner: fake.runner, capabilities: ['typecheck'] });
+    assert.equal(result.status, 'passed', language); assert.match(result.receipts[0].scopeReason, /dependency/);
+  }
+});
+
+async function scriptFixture(t, source, extra = {}) {
+  return fixture(t, { ...projects.javascript, 'scripts/check.mjs': source }, {
+    checks: [{ id: 'fixture-check', capability: 'test', command: 'node', args: ['scripts/check.mjs'], version: process.versions.node, versionOutput: `v${process.versions.node}`, readOnly: true, files: ['src/main.js'], ...extra }]
+  });
+}
+test('Quality configured checks require complete coverage and never execute shipping commands', async t => {
+  const { runQuality } = await api();
+  const good = await scriptFixture(t, 'console.log(JSON.stringify({schemaVersion:1,complete:true,status:"passed",findings:[],scannedFiles:["src/main.js"]}));');
+  const result = await runQuality({ ...good, nativeResolve: undefined, capabilities: ['test'] });
+  assert.equal(result.status, 'passed'); assert.equal(result.receipts.length, 1); assert.equal(result.receipts[0].capability, 'test');
+  const partial = await scriptFixture(t, 'console.log(JSON.stringify({schemaVersion:1,complete:true,status:"passed",findings:[],scannedFiles:[]}));');
+  assert.equal((await runQuality({ ...partial, nativeResolve: undefined, capabilities: ['test'] })).receipts[0].reason, 'invalid_output');
+  const shipping = await scriptFixture(t, 'throw new Error("must not start")', { args: ['publish'] });
+  await assert.rejects(() => runQuality({ ...shipping, capabilities: ['test'] }), /unsafe.*arguments/);
+});
+
+test('Quality process port bounds output and kills the owned tree on deadline', async t => {
+  const { runQuality } = await api();
+  const overflow = await scriptFixture(t, 'process.stdout.write("x".repeat(20000)); setInterval(()=>{},1000);');
+  const large = await runQuality({ ...overflow, nativeResolve: undefined, capabilities: ['test'], timeoutMs: 3000, maxOutputBytes: 1024 });
+  assert.equal(large.status, 'blocked'); assert.equal(large.receipts[0].reason, 'output_limit');
+  const tree = await scriptFixture(t, 'import {spawn} from "node:child_process"; const child=spawn(process.execPath,["-e","setInterval(()=>{},1000)"],{stdio:"ignore"}); console.log("owned-pid:"+child.pid); setInterval(()=>{},1000);');
+  const deadline = await runQuality({ ...tree, nativeResolve: undefined, capabilities: ['test'], timeoutMs: 1000 });
+  assert.equal(deadline.receipts[0].reason, 'timeout');
+  const text = await readFile(deadline.receipts[0].evidence[0].path, 'utf8');
+  const pid = Number(/owned-pid:(\d+)/.exec(text)?.[1]); assert.ok(pid > 0);
+  assert.throws(() => process.kill(pid, 0), error => error.code === 'ESRCH');
+});
+
+test('Quality cancellation remains blocked and tool environments contain no credentials or startup hooks', async t => {
+  const { runQuality } = await api();
+  const fx = await fixture(t, projects.javascript); const controller = new AbortController(); controller.abort();
+  const cancelled = await runQuality({ ...fx, runner: toolRunner().runner, resolve: fakeTools(), capabilities: ['lint'], signal: controller.signal });
+  assert.equal(cancelled.receipts[0].reason, 'cancelled'); assert.equal(cancelled.status, 'blocked');
+  const { randomBytes } = await import('node:crypto'); const value = randomBytes(20).toString('hex');
+  const previous = process.env.SYNTHETIC_API_KEY; process.env.SYNTHETIC_API_KEY = value;
+  t.after(() => { if (previous === undefined) delete process.env.SYNTHETIC_API_KEY; else process.env.SYNTHETIC_API_KEY = previous; });
+  const fake = toolRunner();
+  const runner = async (command, args, options) => {
+    assert.equal(options.env.SYNTHETIC_API_KEY, undefined); assert.equal(options.env.NODE_OPTIONS, undefined);
+    if (args.includes('--version')) return fake.runner(command, args, options);
+    return { code: 1, stdout: value, stderr: `Bearer ${value}` };
+  };
+  const result = await runQuality({ ...fx, resolve: fakeTools(), runner, capabilities: ['lint'] });
+  const text = await readFile(result.receipts[0].evidence[0].path, 'utf8'); assert.ok(!text.includes(value)); assert.match(text, /REDACTED/);
+});
+
+test('Quality passing receipts become stale on evidence config source head or pin changes', async t => {
+  const { runQuality, isCurrentQualityReceipt } = await api(); const fx = await fixture(t, projects.javascript);
+  const result = await runQuality({ ...fx, resolve: fakeTools(), runner: toolRunner().runner, capabilities: ['lint'] });
+  assert.equal(await isCurrentQualityReceipt(result, { project: fx.project, resolve: fakeTools() }), true);
+  const tampered = structuredClone(result); tampered.receipts[0].pinsHash = '0'.repeat(64);
+  assert.equal(await isCurrentQualityReceipt(tampered, { project: fx.project, resolve: fakeTools() }), false);
+  await put(fx.project, 'src/main.js', 'export const changed = 2;');
+  assert.equal(await isCurrentQualityReceipt(result, { project: fx.project, resolve: fakeTools() }), false);
+});
+
+test('Quality parsers accept observed native JSON channels and reject incomplete formatter coverage', async t => {
+  const { parseQualityOutput: parse } = await api();
+  const project = process.cwd();
+  const check = (tool, file) => ({ tool, files: [file], root: '', capability: 'lint' });
+  const css = { code: 2, stdout: '', stderr: '[{"source":"main.css","warnings":[{"line":1,"rule":"color-no-invalid-hex","severity":"error","text":"Invalid hex color"}],"invalidOptionWarnings":[],"parseErrors":[],"errored":true}]' };
+  assert.equal(parse(check('stylelint', 'main.css'), css, project).findings[0].ruleId, 'color-no-invalid-hex');
+  const oxlint = { code: 1, stdout: '{"diagnostics":[{"message":"Remove debugger","code":"eslint(no-debugger)","severity":"warning","filename":"main.js","labels":[{"span":{"line":1,"offset":0,"length":9}}]}],"number_of_files":1}', stderr: '' };
+  assert.equal(parse(check('oxlint', 'main.js'), oxlint, project).findings[0].ruleId, 'eslint(no-debugger)');
+  assert.equal(parse(check('html-validate', 'main.html'), { code: 0, stdout: '[]', stderr: '' }, project).clean, true);
+  assert.throws(() => parse(check('oxfmt', 'main.js'), { code: 0, stdout: 'All matched files use the correct format.', stderr: '' }, project), /malformed/);
+  assert.throws(() => parse(check('oxfmt', 'main.js'), { code: 0, stdout: 'Checking formatting...\nAll matched files use the correct format.\nFinished in 1ms on 0 files using 1 threads.', stderr: '' }, project), /malformed/);
+  assert.throws(() => parse(check('cargo', 'src/lib.rs'), { code: 0, stdout: '{"reason":"build-finished","success":true}', stderr: 'error: incomplete compiler output' }, project), /malformed/);
+  assert.throws(() => parse(check('html-validate', 'main.html'), { code: 0, stdout: '[{"filePath":"main.html","messages":[],"errorCount":1,"warningCount":-1}]', stderr: '' }, project), /malformed/);
+  assert.throws(() => parse(check('phpstan', 'main.php'), { code: 0, stdout: '{"totals":{"errors":2,"file_errors":0},"files":{},"errors":[]}', stderr: '' }, project), /malformed/);
+});
+
+test('Quality configured command option paths and symlinked Composer entrypoints block before checks', async t => {
+  const { runQuality } = await api();
+  const fx = await scriptFixture(t, 'throw new Error("must not run")', { args: ['scripts/check.mjs', '--output=../../outside.json'] });
+  const result = await runQuality({ ...fx, capabilities: ['test'] });
+  assert.equal(result.receipts[0].reason, 'unsafe_path');
+  const php = await fixture(t, projects.php, { tools: { ...pins, phpcs: { version: '3.13.3' } } });
+  const { mkdir, symlink } = await import('node:fs/promises');
+  await put(php.evidenceDir, 'phpcs', '<?php echo "should not run";');
+  await mkdir(`${php.project}/vendor/squizlabs/php_codesniffer`, { recursive: true });
+  await symlink(php.evidenceDir, `${php.project}/vendor/squizlabs/php_codesniffer/bin`, process.platform === 'win32' ? 'junction' : 'dir');
+  const blocked = await runQuality({ ...php, runner: toolRunner().runner, capabilities: ['format'] });
+  assert.notEqual(blocked.status, 'passed');
+});
+
+test('Quality active cancellation stops a real configured process and retains cancellation evidence', async t => {
+  const { runQuality } = await api(); const { execute } = await import('../runtime/delivery.mjs');
+  const fx = await scriptFixture(t, 'console.log("started"); setInterval(()=>{},1000);');
+  const controller = new AbortController();
+  const runner = async (command, args, options) => {
+    if (args[0] === 'scripts/check.mjs') setTimeout(() => controller.abort(), 200);
+    return execute(command, args, options);
+  };
+  const result = await runQuality({ ...fx, nativeResolve: undefined, runner, signal: controller.signal, capabilities: ['test'] });
+  assert.equal(result.status, 'blocked'); assert.equal(result.receipts[0].reason, 'cancelled');
+  const evidence = await readFile(result.receipts[0].evidence[0].path, 'utf8'); assert.match(evidence, /started/);
+});
+
+test('Quality debt cannot adopt untracked new errors omitted by supplied changed paths', async t => {
+  const { runQuality } = await api(); const fx = await fixture(t, projects.javascript, { strictness: 'adopt' });
+  await put(fx.project, 'src/new.js', 'debugger;');
+  const runner = toolRunner({ oxlint: ({ args }) => args.includes('--version') ? { code: 0, stdout: 'Version: 1.91.0', stderr: '' } : { code: 1, stdout: '{"diagnostics":[{"message":"Remove debugger","code":"eslint(no-debugger)","severity":"warning","filename":"src/new.js","labels":[{"span":{"line":1,"offset":0,"length":9}}]}],"number_of_files":2}', stderr: '' } }).runner;
+  const first = await runQuality({ ...fx, runner, resolve: fakeTools(), mode: 'standard', changedPaths: [], capabilities: ['lint'] });
+  assert.equal(first.status, 'failed');
+  const baseline = [{ ...first.receipts[0].findings[0], language: 'javascript', capability: 'lint', tool: 'oxlint', sourceHash: first.plan.files.find(f => f.path === 'src/new.js').sha256 }];
+  await put(fx.project, 'kodo.config.json', { quality: { strictness: 'adopt', baseline } });
+  const current = await runQuality({ ...fx, runner, resolve: fakeTools(), mode: 'standard', changedPaths: [], capabilities: ['lint'] });
+  assert.equal(current.status, 'failed'); assert.ok(current.plan.actualChangedPaths.includes('src/new.js')); assert.equal(current.receipts[0].debtCount, 0);
+});
+
+test('Quality receipt validation rejects changed evidence config head and resolved installation', async t => {
+  const { runQuality, isCurrentQualityReceipt: current } = await api(); const { execute } = await import('../runtime/delivery.mjs');
+  const fx = await fixture(t, projects.javascript);
+  const result = await runQuality({ ...fx, resolve: fakeTools(), runner: toolRunner().runner, capabilities: ['lint'] });
+  const options = { project: fx.project, resolve: fakeTools() };
+  assert.equal(await current(result, options), true);
+  const evidence = result.receipts[0].evidence[0].path, originalEvidence = await readFile(evidence, 'utf8');
+  const { writeFile } = await import('node:fs/promises');
+  await writeFile(evidence, originalEvidence + ' '); assert.equal(await current(result, options), false); await writeFile(evidence, originalEvidence);
+  const modified = structuredClone(result); modified.receipts[0].durationMs++;
+  assert.equal(await current(modified, options), false);
+  assert.equal(await current(result, { ...options, resolve: fakeTools({ command: 'different-installation' }) }), false);
+  const config = await readFile(`${fx.project}/kodo.config.json`, 'utf8');
+  await put(fx.project, 'kodo.config.json', { quality: { strictness: 'standard' } }); assert.equal(await current(result, options), false);
+  await put(fx.project, 'kodo.config.json', config); assert.equal(await current(result, options), true);
+  await execute('git', ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@localhost', '-c', 'commit.gpgSign=false', 'commit', '--allow-empty', '-qm', 'advance fixture'], { cwd: fx.project });
+  assert.equal(await current(result, options), false);
+});
+
+test('Quality identical SQL checks share one process with independent capability and debt receipts', async t => {
+  const { runQuality } = await api(); const fx = await fixture(t, projects.sql, { dialect: 'sqlite', strictness: 'adopt' });
+  const fake = toolRunner();
+  const clean = await runQuality({ ...fx, runner: fake.runner, resolve: fakeTools(), capabilities: ['format', 'lint'] });
+  assert.equal(clean.status, 'passed'); assert.equal(clean.receipts.length, 2);
+  assert.equal(fake.calls.filter(call => call.args[0] === 'lint').length, 1);
+  assert.equal(fake.calls.filter(call => call.args.includes('--version')).length, 1);
+  assert.deepEqual(clean.receipts[1].reusedFrom, [clean.receipts[0].id]);
+  const badRunner = () => toolRunner({ sqlfluff: ({ args }) => args.includes('--version') ? { code: 0, stdout: 'python -m sqlfluff, version 4.5.0', stderr: '' } : { code: 1, stdout: '[{"filepath":"schema.sql","violations":[{"code":"LT01","start_line_no":1,"description":"Unexpected whitespace"}]}]', stderr: '' } });
+  const first = await runQuality({ ...fx, runner: badRunner().runner, resolve: fakeTools(), mode: 'standard', changedPaths: [], capabilities: ['format', 'lint'] });
+  assert.equal(first.status, 'failed');
+  const baseline = [{ ...first.receipts[1].findings[0], language: 'sql', capability: 'lint', tool: 'sqlfluff', sourceHash: first.plan.files.find(f => f.path === 'schema.sql').sha256 }];
+  await put(fx.project, 'kodo.config.json', { quality: { dialect: 'sqlite', strictness: 'adopt', baseline } });
+  const bad = badRunner();
+  const result = await runQuality({ ...fx, runner: bad.runner, resolve: fakeTools(), mode: 'standard', changedPaths: [], capabilities: ['format', 'lint'] });
+  assert.equal(result.receipts[0].status, 'failed'); assert.equal(result.receipts[1].status, 'passed'); assert.equal(result.receipts[1].debtCount, 1);
+  assert.equal(bad.calls.filter(call => call.args[0] === 'lint').length, 1);
+});
