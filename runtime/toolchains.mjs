@@ -21,6 +21,32 @@ export function relativeFile(name) {
   if (parts.some(p => !p || p === '.' || p === '..' || /[. ]$/.test(p) || /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(p))) throw new Error('Unsafe relative installation path');
   return parts.join('/');
 }
+/** The pinned bin and package metadata must describe the same local script.
+ * Node executes this script directly: npm's generated shims are never trusted. */
+export function npmEntrypoint(tool, pkg) {
+  const entry = relativeFile(tool.entry);
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(tool.binName ?? '') || entry.startsWith('-')) throw new Error('Invalid pinned npm entrypoint');
+  const bin = typeof pkg.bin === 'string' && tool.binName === tool.id ? pkg.bin : typeof pkg.bin === 'object' && pkg.bin !== null && Object.hasOwn(pkg.bin, tool.binName) ? pkg.bin[tool.binName] : undefined;
+  if (typeof bin !== 'string' || relativeFile(bin.startsWith('./') ? bin.slice(2) : bin) !== entry) throw new Error('Unexpected npm bin entrypoint');
+  return entry;
+}
+export function pythonEntrypoint(entry) {
+  if (typeof entry !== 'string' || entry.length > 200 || !/^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$/.test(entry)) throw new Error('Invalid Python entry module');
+  return entry;
+}
+// Only the deliberately small grammar used by pinned engines is supported.
+// Unknown ranges and prerelease runtimes fail closed rather than guessing.
+export function supportsNodeEngine(range, version = process.versions.node) {
+  if (typeof range !== 'string' || typeof version !== 'string' || !/^\d+\.\d+\.\d+$/.test(version)) return false;
+  const clauses = range.split('||').map(part => /^(\^|>=)\s*(\d+)\.(\d+)\.(\d+)$/.exec(part.trim()));
+  if (!clauses.length || clauses.some(part => !part)) return false;
+  const actual = version.split('.').map(Number);
+  return clauses.some(([, operator, ...parts]) => {
+    const minimum = parts.map(Number);
+    const comparison = actual[0] - minimum[0] || actual[1] - minimum[1] || actual[2] - minimum[2];
+    return comparison >= 0 && (operator === '>=' || (actual[0] === minimum[0] && (minimum[0] !== 0 || (actual[1] === minimum[1] && (minimum[1] !== 0 || actual[2] === minimum[2])))));
+  });
+}
 export async function noLinks(target) {
   const absolute = path.resolve(target), parsed = path.parse(absolute);
   let current = parsed.root;
@@ -186,6 +212,9 @@ for pin in request:
  if d.version!=pin['version']: raise RuntimeError('Wrong package version')
  files=d.files or []
  if not any(str(f).replace('\\\\','/').startswith(pin['module']+'/') and d.locate_file(f).is_file() for f in files): raise RuntimeError('Missing module')
+ if pin.get('entryModule'):
+  entry=pin['entryModule'].replace('.', '/')
+  if not any(str(f).replace('\\\\','/') in (entry+'.py',entry+'/__main__.py') and d.locate_file(f).is_file() for f in files): raise RuntimeError('Missing module entrypoint')
  if pin.get('git'):
   direct=json.loads(d.read_text('direct_url.json') or '{}'); commit=direct.get('vcs_info',{}).get('commit_id')
   if commit!=pin['revision']: raise RuntimeError('Wrong source revision')

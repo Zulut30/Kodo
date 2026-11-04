@@ -46,10 +46,11 @@ test('Worker PATH keeps the current Node runtime first and only ready managed ri
 
 test('Tools CLI metadata is offline and validates subcommands arity and flags before side effects', t => {
   const fx = fixture(t), result = fx.run(['tools', 'list', '--json']);
-  assert.equal(result.status, 0, result.stderr); assert.equal(JSON.parse(result.stdout).length, 10);
+  assert.equal(result.status, 0, result.stderr); assert.equal(JSON.parse(result.stdout).length, 16);
+  assert.deepEqual(JSON.parse(result.stdout).slice(10).map(tool => tool.id), ['oxlint', 'oxfmt', 'typescript', 'stylelint', 'html-validate', 'sqlfluff']);
   assert.equal(existsSync(fx.env.KODO_HOME), false); assert.equal(existsSync(fx.env.KODO_TOOL_HOME), false); assert.equal(existsSync(fx.env.KODO_CREDENTIAL_HOME), false);
   const doctor = fx.run(['tools', 'doctor', '--live', '--json']);
-  assert.equal(doctor.status, 2, doctor.stderr); assert.equal(JSON.parse(doctor.stdout).length, 10);
+  assert.equal(doctor.status, 2, doctor.stderr); assert.equal(JSON.parse(doctor.stdout).length, 16);
   assert.equal(existsSync(fx.env.KODO_TOOL_HOME), false);
   for (const args of [['tools'], ['tools', 'list', 'extra'], ['tools', 'install'], ['tools', 'install', 'unknown'], ['tools', 'doctor', 'extra'], ['tools', 'list', '--live'], ['tools', 'list', '--json', '--json'], ['ui', 'verify', '--live'], ['security', 'verify', 'extra']]) {
     const invalid = fx.run(args); assert.notEqual(invalid.status, 0, args.join(' '));
