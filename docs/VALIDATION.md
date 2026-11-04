@@ -13,6 +13,104 @@ node scripts/package-smoke.mjs
 
 Обычные тесты используют фикстуры, локальные Git/npm-пакеты и контролируемые ответы провайдеров. Платных API-запросов и подписочных модельных вызовов в CI нет. Платформенные проверки DPAPI и Unix permissions запускаются на соответствующей ОС.
 
+## Release lifecycle
+
+Run `8f2d5e16-041c-4df8-ae00-77eed70cc25e`, исходный HEAD `c7b771fc6c5f12e9e3bbcb306054f0528dd7da39`. Изменение остаётся в существующей delivery boundary. RED выполнен с исходным `delivery.mjs`: **8 failed / 0 passed**, exit 1; рабочий файл после воспроизведения восстановлен. Квитанции находятся вне Git в `runs/<runId>/artifacts/release-lifecycle/`: `red.tap`, `lifecycle-green.tap` и итоговый `targeted.tap`.
+
+GREEN: **18/18**, затем итоговый scoped suite — **72/72, 0 failed, 0 skipped**, exit 0; Windows x64, Node.js `v24.19.0` (ABI 137). `git diff --check` прошёл. `receipt.json` связывает команды, TAP и SHA-256 пяти изменённых файлов; это локальное свидетельство dirty worktree, непригодное для reuse clean-head delivery checks.
+
+```powershell
+node --test --test-reporter=tap --test-name-pattern='Delivery lifecycle awaits owned|Delivery lifecycle preserves complete|Release lifecycle forwards explicit|Release lifecycle retains primary.*EBUSY' tests/delivery.test.mjs
+node --test --test-reporter=tap tests/delivery.test.mjs tests/utf8-process.test.mjs tests/runtime.test.mjs tests/release-finalization.test.mjs
+```
+
+| Требование | Точная регрессия |
+| --- | --- |
+| Собственное parent/child/grandchild дерево завершено до settlement; отдельный canary жив | `Delivery lifecycle awaits owned parent and grandchild shutdown on timeout`; `Delivery lifecycle awaits owned parent and grandchild shutdown on abort`; `Delivery lifecycle awaits owned parent and grandchild shutdown on output-limit` |
+| Реальный release subprocess закрывается до вызова worktree cleanup | `Release lifecycle awaits real owned tree before source cleanup on timeout`; `Release lifecycle awaits real owned tree before source cleanup on abort` |
+| Начало длинного stdout и stderr доступны, секреты скрыты, объём ограничен | `Delivery lifecycle preserves complete bounded stdout and stderr diagnostics safely`; `Release lifecycle records complete redacted command diagnostics before cleanup` |
+| cwd/env/stdin EOF, allowFailure, предварительный abort | `Delivery lifecycle preserves cwd environment stdin EOF and allowFailure`; `Delivery lifecycle pre-aborted execution never starts a command` |
+| Explicit timeout выше fallback, self test и release test/build — 1200000 мс | `Release lifecycle forwards explicit and default test and build deadlines` |
+| Каждый первичный тип сохраняется при отказе unsafe-link cleanup | `Release lifecycle retains primary timeout when owned cleanup refuses a replaced link`; `Release lifecycle retains primary command_failed when owned cleanup refuses a replaced link`; `Release lifecycle retains primary cancelled when owned cleanup refuses a replaced link` |
+| EBUSY не подменяет primary после четырёх попыток | `Release lifecycle retains primary timeout after bounded EBUSY cleanup retries`; `Release lifecycle retains primary command_failed after bounded EBUSY cleanup retries`; `Release lifecycle retains primary cancelled after bounded EBUSY cleanup retries` |
+| Transient lock проходит, подтверждённый receipt сохраняется при persistent lock | `Release lifecycle retries transient locks and keeps a confirmed published receipt on persistent cleanup failure` |
+
+Фикстуры используют readiness-файлы/IPC, реальные собственные процессы, локальные Git/npm-пакеты и fake GitHub. Recovery адресуется только к PID фикстуры; произвольные Node/Codex/app-процессы не останавливаются. EBUSY инъецируется на filesystem boundary для одного owned path, остальные операции настоящие. Для RED исходный код действительно оставляет живых потомков, теряет stdout, передаёт 600000 мс и подменяет primary ошибкой EBUSY. Windows-результат не доказывает POSIX-выполнение: Linux-ветка требует отдельного CI. Общий `npm run check`, security gates и независимое review выполняет координатор после интеграции. UI выключен (нейтральное свидетельство). Реальные подписочные модели и benchmark matrix остаются PAUSED; этот scoped run не публикует и не развёртывает Kodo, версия v0.2.5 остаётся неопубликованной.
+
+## Credential redaction repair
+
+4 ноября 2026 года, run `8f2d5e16-041c-4df8-ae00-77eed70cc25e`, исходный HEAD `cfc8a5874aeae476a8bc72a54af01c69bc125a44`. Подтверждённый дефект PR9: после очистки env команда могла прочитать то же значение из собственного config, а выбрасываемая ошибка сохраняла credential, хотя диагностическое событие его скрывало.
+
+До исправления runtime: **RED 7 failed / 0 passed**, exit 1; все семь случаев обнаружили env-only значение. Дополнительный RED на уже вычисленном Node 24 `stack` и frozen-ошибке: **4 failed / 1 passed**, exit 1. После исправления: **GREEN 9/9**, итоговый delivery suite — **62/62**, 0 failed/skipped, exit 0; `git diff --check` прошёл. Windows x64, Node.js `v24.19.0`, ABI 137. TAP и `receipt.json` сохраняются вне Git в `runs/<runId>/artifacts/credential-redaction-repair/`; квитанция связывает команды, исходную ревизию и хеши файлов dirty worktree. Это не reuse clean-head checks.
+
+```powershell
+node --test --test-reporter=tap --test-name-pattern='Credential redaction' tests/delivery.test.mjs
+node --test --test-reporter=tap --test-name-pattern='Credential redaction covers fallback' tests/delivery.test.mjs
+node --test --test-reporter=tap tests/delivery.test.mjs
+```
+
+| Требование | Точная регрессия |
+| --- | --- |
+| Объединение env-only и explicit значений при одинаковом имени, реальный direct runner | `Credential redaction covers direct runner overlapping environment and options names` |
+| Реальный release subprocess читает фиктивный config; env очищен, безопасное значение и cwd сохранены, полные потоки/exitCode доступны, cleanup/leases завершены без публикации | `Credential redaction covers real release command errors on exit`; `Credential redaction covers real release command errors on timeout`; `Credential redaction covers real release command errors on cancelled` |
+| Fallback result, типизированный rethrow, cached stack/cause и вложенный result очищены; обычная ошибка сохраняет identity, frozen — тип | `Credential redaction covers fallback runner errors on result`; `Credential redaction covers fallback runner errors on command_failed`; `Credential redaction covers fallback runner errors on timeout`; `Credential redaction covers fallback runner errors on cancelled`; `Credential redaction covers fallback runner errors on frozen` |
+
+Все значения вымышлены, config создаётся только в temp fixture; реальное credential store не читается. Git/npm и subprocess локальные, GitHub подменён fixture. Полный `npm run check`, security gates, свежее независимое review и CI выполняет координатор. UI выключен (нейтральное свидетельство); native subscription clients, опубликованный Kodo и deployment этой проверкой не подтверждаются. Рабочий агент не выполняет commit/push/release, не меняет версии, план или registry.
+
+## Output boundary redaction repair
+
+4 ноября 2026 года, run `8f2d5e16-041c-4df8-ae00-77eed70cc25e`, исходный HEAD `f33111acea9f91c5efc07c09422acd81a2fc3061`. Второе ревью подтвердило: если env-only `NPM_TOKEN` пересекает штатный raw cap 20 MiB, сохранённые 35/36 символов обходят замену полного значения и попадают в `message`, `stack`, поток, вложенный `result` и `delivery.command_failed`.
+
+RED на настоящих subprocess: **4 failed / 0 passed**, отдельно direct execute и release/context, stdout и stderr. Затем **7 failed / 0 passed**, включая незавершённый ключ при timeout/cancel и принудительные split boundaries. Повторный RED с ключом ровно 36 символов — **7/7 failed** на исходном модуле через внешний Node load hook: рабочий runtime не заменялся. Диагностика RED перечисляет утёкшие representations, включая event; значения только фиктивные. Дополнительный **RED 1/1 → GREEN 1/1** подтвердил, что короткое explicit-значение не должно скрывать начало длинного env-only совпадения при одинаковом имени. Исправление находит незавершённое совпадение в raw capture и сохраняет безопасный общий redacted префикс, учитывая пересекающиеся полные замены; после превышения общего лимита capture прекращается. Prefix matcher использует память, ограниченную длиной сохранённого потока; дочитывания/сохранения неограниченного вывода нет. Корректный U+FFFD сохраняется, неполный UTF-8 code point на cap отбрасывается.
+
+Первый целевой GREEN — **18/18**; после окончательной правки — **41/41, 0 failed/skipped**, exit 0, Windows x64, Node.js `v24.19.0` (ABI 137). Сохранены `red-default.tap`, `red-boundaries.tap`, `red-exact-replay.tap`, `red-overlapping-values.tap`, `green-boundaries.tap`, `green-overlapping-values.tap`, `targeted-green.tap`, `final-targeted-green.tap`, отдельные квитанции, `repair.diff` и итоговый `receipt.json` в приватном `runs/<runId>/artifacts/output-boundary-repair/` вне Git. Квитанции содержат команды, исходный HEAD и SHA-256 файлов/TAP/diff. Это свидетельство dirty worktree, не reuse clean-head checks. `git diff --check` прошёл.
+
+```powershell
+node --test --test-reporter=tap --test-name-pattern='Output boundary redaction' tests/delivery.test.mjs
+node --test --test-reporter=tap --test-name-pattern='Output boundary redaction|Credential redaction|Delivery lifecycle|Release lifecycle|Native command execution|Release subprocess environment|Coordinator Git|Cancellation during irreversible|Cancellation during release creation|Cancellation before irreversible|UTF-8' tests/delivery.test.mjs tests/utf8-process.test.mjs
+```
+
+| Требование | Точная регрессия |
+| --- | --- |
+| Реальные stdout/stderr пересекают default cap; ошибка и вложенный result безопасны | `Output boundary redaction protects direct default cap on stdout`; `Output boundary redaction protects direct default cap on stderr` |
+| Release/context не сохраняет префикс в stack/message/event; source cleanup и leases завершены без публикации | `Output boundary redaction protects release default cap and event on stdout`; `Output boundary redaction protects release default cap and event on stderr` |
+| Каждый byte split, caps 1–37, ключ длиннее 128 KiB, перекрывающиеся префиксы и полные замены, одноимённые env/options значения с общим началом, Unicode, поздние chunks после общего лимита и raw success | `Output boundary redaction handles every split small caps long secrets and UTF8 without retaining later chunks` |
+| Незавершённые значения в обоих реальных потоках на границе остановки; первичный тип и exit сохранены | `Output boundary redaction protects unfinished real streams on timeout`; `Output boundary redaction protects unfinished real streams on cancelled` |
+| Одноимённые env/options значения, frozen error, cached stack/cause и fallback | `Credential redaction covers direct runner overlapping environment and options names`; `Credential redaction covers fallback runner errors on frozen` и остальные `Credential redaction` |
+| Teardown, EBUSY/primary, cwd/env, UTF-8, Git/gh credentials/hooks, irreversible confirmation | Соседние `Delivery lifecycle`, `Release lifecycle`, `Release subprocess environment excludes inherited credentials from npm tests builds and installed smoke`, `Coordinator Git disables credential-reading repository hooks for push and fetch`, `Cancellation during irreversible merge confirms and persists its successful receipt`, `Cancellation during release creation verifies publication and saves its receipt` |
+
+Контролируемые потоки дополняют реальные процессы и принудительно задают разбиения, которые ОС может объединить. Все config/key fixtures локальные и фиктивные; credential stores и реальные API не используются. Память процесса не профилировалась: ограниченность matcher подтверждена алгоритмом и тестом ключа длиннее cap. Полный `npm run check`, CI/Linux, security gates и свежее независимое review остаются координатору. UI выключен (нейтральное свидетельство); native subscription clients, опубликованный артефакт и deployment не проверялись. Версии/config/registry/plan не менялись; commit/push/release не выполнялись.
+
+Проверенный урок: redaction полного значения после raw truncation недостаточна. Проверяй границу каждого потока до формирования любых representations ошибки и отдельно убеждайся, что поздние chunks не дописываются в оставшийся после UTF-8 truncation зазор.
+
+Gitleaks обнаружил `generic-api-key` в статическом фиктивном `boundarySecret` теста. Фикстура теперь собирает то же значение из двух частей во время выполнения: проверены идентичность и 36 байт, затем реальный default-cap stdout regression прошёл. Правила, exclusions и обязательность сканера не менялись; новый явный цикл проверки сохраняет прежние режим и лимиты, а предыдущая остановка остаётся в истории запуска.
+
+Сценарий контролируемого capture без секретов передаёт `env: {}`: CI-переменные GitHub тоже могут попасть в набор удаляемых значений. Это сохраняет независимость ожидаемых байтов `ok` от окружения runner; проверки настоящих credential boundaries сохраняют собственные явные значения.
+
+## Full overlap redaction repair
+
+4 ноября 2026 года, run `8f2d5e16-041c-4df8-ae00-77eed70cc25e`, исходный HEAD `1941c9019fc43bab15dd36a2ee5643adf76bf691`. Исправлен только finding1: полные известные значения могли пересекаться, и последовательная замена короткого значения оставляла хвост длинного. Delivery теперь находит совпадения в исходной строке, включая самопересечения, закрывает объединение диапазонов и затем применяет общие credential regex. Одноимённые env/options значения сохраняются в отдельных пространствах имён. Matcher хранит одно ожидающее совпадение на значение и части ограниченного вывода, без списка всех совпадений; профилирование памяти не выполнялось.
+
+Meaningful RED на исходном runtime: **7 failed / 0 passed**, exit 1, включая реальный `execute` с видимым хвостом. Финальные тесты повторно дали тот же RED через Node `registerHooks`: точные исходные байты загружались по исходному URL модуля, рабочие файлы не подменялись. Отдельная мутация longest-first дала **1 failed / 0 passed**, exit 1: пересечение без вложенности оставило `-ending`. Поэтому сортировка по длине не заменяет контракт объединения.
+
+GREEN и соседние проверки: **40/40, 0 failed/skipped**, exit 0, Windows x64, Node.js `v24.19.0`, ABI 137. Полный delivery suite и `npm run check` worker не запускал. Команда:
+
+```powershell
+node --test --test-reporter=tap --test-name-pattern='Full overlap redaction|Output boundary redaction|Credential redaction|Delivery lifecycle preserves|Delivery lifecycle pre-aborted|Delivery lifecycle awaits owned|Release lifecycle retains primary|Release lifecycle retries transient|Release subprocess environment|Coordinator Git disables|Cancellation during irreversible|Cancellation before irreversible' tests/delivery.test.mjs
+```
+
+| Требование | Точная регрессия |
+| --- | --- |
+| Полные prefix/substring, пересечения без вложенности, самопересечения, оба порядка env/options, known до общих regex, UTF-8/NUL и безопасный текст | `Full overlap redaction unions original matches for real execute regardless of value order` |
+| Реальный subprocess через context, result fallback, тип/identity ошибки, полный bounded result, cached stack/cause, frozen-копия и `delivery.command_failed` | `Full overlap redaction protects context events and error representations on execute`, `on result`, `on command_failed`, `on timeout`, `on cancelled`, `on frozen` |
+| Прежние partial/default-cap/chunk/stop, raw success, длинные значения, credentials, teardown и cleanup | Прошедшие соседние `Output boundary redaction`, `Credential redaction`, `Delivery lifecycle`, `Release lifecycle`, `Release subprocess environment`, `Coordinator Git disables`, `Cancellation` в указанном scoped-прогоне |
+
+TAP, исходный runtime, hooks воспроизведения, `receipt.json`, SHA-256 и итоговый diff находятся вне Git в `runs/<runId>/artifacts/full-overlap-repair/`. Это локальная проверка dirty worktree. Engine propagation и checks deadlines поручены другому исполнителю и этим отчётом не подтверждаются; `docs/RUNTIME.md` не менялся. Общий check, свежие security gates, независимое review и CI остаются координатору. UI выключен (нейтральное свидетельство); native subscription clients, опубликованный артефакт и deployment не проверялись. Commit/push/release не выполнялись.
+
+Проверенный урок: искать каждый известный секрет в уже отредактированном тексте небезопасно, даже при longest-first. Регрессия должна отдельно проверять полные вложенные и пересекающиеся значения, error representations и фактически сохраняемое событие.
+
+## Основные регрессии
+
 | Требование | Регрессионная проверка |
 | --- | --- |
 | Все навыки включены по умолчанию для трёх клиентов | `CLI init installs all default skills and the chat entry for Codex Claude Code and OpenCode` |

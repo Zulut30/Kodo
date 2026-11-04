@@ -1,9 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtemp, mkdir, readFile, writeFile, copyFile, readdir, rm, chmod } from 'node:fs/promises';
-import { constants } from 'node:fs';
-import { spawnSync } from 'node:child_process';
+import { mkdtemp, mkdir, readFile, writeFile, copyFile, readdir, rm, chmod, rename, symlink } from 'node:fs/promises';
+import { constants, watch } from 'node:fs';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+import childProcess, { spawn, spawnSync } from 'node:child_process';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
 import os from 'node:os';
 import path from 'node:path';
 import Ajv from 'ajv';
@@ -281,6 +285,668 @@ test('Native command execution reports nonzero exit and timeout without a shell'
   const result = await execute(process.execPath, ['-e', 'process.stdout.write("expected"); process.exit(5)'], { allowFailure: true });
   assert.equal(result.code, 5); assert.equal(result.stdout, 'expected');
   await assert.rejects(execute(process.execPath, ['-e', 'setTimeout(()=>{},10000)'], { timeoutMs: 30 }), { code: 'timeout' });
+});
+
+async function readyFile(directory, name) {
+  const filename = path.join(directory, name);
+  return new Promise((resolve, reject) => {
+    const watcher = watch(directory, check);
+    const watchdog = setTimeout(() => finish(new Error('Fixture readiness watchdog expired')), 20000);
+    function finish(error, value) { clearTimeout(watchdog); watcher.close(); error ? reject(error) : resolve(value); }
+    async function check() {
+      try { const value = JSON.parse(await readFile(filename, 'utf8')); finish(null, value); }
+      catch (error) { if (!['ENOENT', undefined].includes(error.code) && !(error instanceof SyntaxError)) finish(error); }
+    }
+    check();
+  });
+}
+
+async function ownedTree(t, { inheritedPipes = true } = {}) {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'kodo-delivery-test-'));
+  let pids = [];
+  t.after(async () => {
+    // Failure recovery targets only PIDs obtained from this fixture's handshake.
+    for (const pid of pids.slice().reverse()) {
+      if (process.platform === 'win32') spawnSync('taskkill.exe', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+      else { try { process.kill(pid, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; } }
+    }
+    assert.equal(path.dirname(directory), path.resolve(os.tmpdir()));
+    assert.ok(path.basename(directory).startsWith('kodo-delivery-test-'));
+    await rm(directory, { recursive: true, force: true });
+  });
+  const script = `
+    const {spawn}=require('node:child_process'),fs=require('node:fs');
+    const level=Number(process.argv[2]),dir=process.argv[3];
+    process.on('SIGTERM',()=>{});
+    fs.openSync(require('node:path').join(process.cwd(),'held-'+level),'w');
+    const ready=pids=>{
+      if(level===0){fs.watch(dir,(_,name)=>{if(name==='flood')process.stdout.write('x'.repeat(8192));});
+        console.log('owned tree ready');console.error('owned tree stderr ready');fs.writeFileSync(require('node:path').join(dir,'ready.json'),JSON.stringify(pids));}
+      else process.send(pids);
+    };
+    if(level===2)ready([process.pid]);
+    else {const child=spawn(process.execPath,[__filename,String(level+1),dir],{
+      cwd:process.cwd(),windowsHide:true,stdio:['ignore',${JSON.stringify(inheritedPipes ? 'inherit' : 'ignore')},${JSON.stringify(inheritedPipes ? 'inherit' : 'ignore')},'ipc']});
+      child.on('message',pids=>ready([process.pid,...pids]));}
+    setInterval(()=>{},1000);
+  `;
+  // The recursive script is passed as data, with no shell or global processes.
+  const filename = path.join(directory, 'tree.cjs');
+  await writeFile(filename, script);
+  const ready = readyFile(directory, 'ready.json').then(value => { pids = value; return value; });
+  return { directory, filename, ready, disarm: () => { pids = []; } };
+}
+
+async function assertStopped(pids) {
+  for (const pid of pids) {
+    try { process.kill(pid, 0); }
+    catch (error) { if (error.code === 'ESRCH') continue; throw error; }
+    // Linux can retain an already-dead orphan as a zombie until PID 1 reaps it.
+    if (process.platform === 'linux' && /\) Z /.test(await readFile(`/proc/${pid}/stat`, 'utf8'))) continue;
+    assert.fail(`Owned fixture process ${pid} is still running after execute settled`);
+  }
+}
+
+for (const mode of ['timeout', 'abort', 'output-limit']) {
+  test(`Delivery lifecycle awaits owned parent and grandchild shutdown on ${mode}`, { timeout: 40000 }, async t => {
+    const tree = await ownedTree(t, { inheritedPipes: mode !== 'abort' });
+    const canary = spawn(process.execPath, ['-e', "process.on('message',()=>process.exit(0));process.send('ready')"], { windowsHide: true, stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });
+    const canaryClosed = new Promise(resolve => canary.once('close', resolve));
+    t.after(async () => { if (canary.connected) canary.send('exit'); await canaryClosed; });
+    await new Promise((resolve, reject) => { canary.once('message', resolve); canary.once('error', reject); });
+    const controller = new AbortController();
+    const outcome = execute(process.execPath, [tree.filename, '0', tree.directory], {
+      cwd: tree.directory, signal: controller.signal, timeoutMs: mode === 'timeout' ? 4000 : 10000, maxOutputBytes: 1024
+    }).then(value => ({ value }), error => ({ error }));
+    const pids = await tree.ready;
+    assert.equal(pids.length, 3);
+    if (mode === 'abort') controller.abort();
+    if (mode === 'output-limit') await writeFile(path.join(tree.directory, 'flood'), 'go');
+    const { error } = await outcome;
+    assert.equal(error?.code, { timeout: 'timeout', abort: 'cancelled', 'output-limit': 'invalid_output' }[mode]);
+    await assertStopped(pids);
+    tree.disarm();
+    assert.equal(canary.exitCode, null); assert.equal(canary.signalCode, null); assert.equal(process.kill(canary.pid, 0), true);
+    assert.match(error.stdout, /owned tree ready/);
+    assert.equal(error.teardownError, undefined);
+    assert.ok(Buffer.byteLength(error.stdout) + Buffer.byteLength(error.stderr) <= 1024);
+    // Removal happens immediately after settlement, without a retry or sleep.
+    await rm(tree.directory, { recursive: true });
+  });
+}
+
+test('Delivery lifecycle preserves complete bounded stdout and stderr diagnostics safely', async () => {
+  const text = 'failing assertion near the beginning\n' + 'detail\n'.repeat(9000);
+  const secret = 'fixture-private-value';
+  await assert.rejects(execute(process.execPath, ['-e', `process.stdout.write('failing assertion near the beginning\\n'+'detail\\n'.repeat(9000));process.stderr.write('specific failure Bearer ${secret}');process.exitCode=9`]), error => {
+    assert.equal(error.code, 'command_failed'); assert.equal(error.exitCode, 9);
+    assert.equal(error.stdout, text); assert.match(error.stderr, /specific failure Bearer \[REDACTED\]/);
+    assert.match(error.message, /stdout/); assert.match(error.message, /specific failure/);
+    assert.match(error.message, /failing assertion near the beginning/);
+    assert.equal(JSON.stringify(error).includes(secret), false); return true;
+  });
+});
+
+for (const mode of ['timeout', 'abort']) {
+  test(`Release lifecycle awaits real owned tree before source cleanup on ${mode}`, { timeout: 40000 }, async t => {
+    const ctx = await fixture(t), runner = ctx.exec, tree = await ownedTree(t), controller = new AbortController();
+    await ctx.git('push', 'origin', `${ctx.run.headSha}:main`);
+    ctx.config.commands.test = [{ command: process.execPath, args: [tree.filename, '0', tree.directory], timeoutMs: mode === 'timeout' ? 4000 : 15000 }];
+    let source, pids, cleanupObserved = false;
+    ctx.exec = async (command, args, options) => {
+      if (command === process.execPath && args[0] === tree.filename) source = options.cwd;
+      if (command === 'git' && args[0] === 'worktree' && args[1] === 'remove') {
+        await assertStopped(pids); cleanupObserved = true;
+      }
+      return runner(command, args, options);
+    };
+    const outcome = releasePackage({ ...ctx, mergeCommit: ctx.run.headSha, signal: controller.signal }).catch(error => error);
+    pids = await tree.ready;
+    if (mode === 'abort') controller.abort();
+    const error = await outcome;
+    assert.equal(error.code, mode === 'timeout' ? 'timeout' : 'cancelled');
+    assert.match(error.stdout, /owned tree ready/); assert.match(error.stderr, /owned tree stderr ready/);
+    assert.equal(error.cleanupErrors, undefined); assert.equal(error.teardownError, undefined);
+    assert.equal(cleanupObserved, true); await assertStopped(pids);
+    tree.disarm();
+    await assert.rejects(readFile(path.join(source, 'package.json')), { code: 'ENOENT' });
+    assert.equal(ctx.leases.size, 0); assert.equal(ctx.state.releaseCreates, 0); assert.equal(ctx.run.delivery?.release, undefined);
+  });
+}
+
+test('Release lifecycle records complete redacted command diagnostics before cleanup', async t => {
+  const ctx = await fixture(t);
+  await ctx.git('push', 'origin', `${ctx.run.headSha}:main`);
+  ctx.config.commands.test = [{ command: process.execPath, args: ['-e', "process.stdout.write('first assertion\\n'+'detail\\n'.repeat(9000));process.stderr.write('last failure Bearer fixture-private-value');process.exitCode=6"] }];
+  await assert.rejects(releasePackage({ ...ctx, mergeCommit: ctx.run.headSha }), error => {
+    assert.equal(error.code, 'command_failed'); assert.equal(error.exitCode, 6); assert.match(error.message, /first assertion/); return true;
+  });
+  const diagnostic = ctx.events.find(event => event.type === 'delivery.command_failed').data;
+  assert.equal(diagnostic.stdout, 'first assertion\n' + 'detail\n'.repeat(9000));
+  assert.equal(diagnostic.stderr, 'last failure Bearer [REDACTED]');
+  assert.equal(diagnostic.outputTruncated, false); assert.equal(JSON.stringify(diagnostic).includes('fixture-private-value'), false);
+  assert.equal(ctx.leases.size, 0); assert.equal(ctx.state.releaseCreates, 0);
+});
+
+async function credentialRedactionFixture(t) {
+  const ctx = await fixture(t);
+  await ctx.git('push', 'origin', `${ctx.run.headSha}:main`);
+  const environmentOnly = 'fictional-env-only-credential', explicit = 'fictional-explicit-credential';
+  const previous = process.env.NPM_TOKEN, previousValue = process.env.FIXTURE_RELEASE_VALUE;
+  process.env.NPM_TOKEN = environmentOnly;
+  process.env.FIXTURE_RELEASE_VALUE = 'kept';
+  t.after(() => {
+    if (previous === undefined) delete process.env.NPM_TOKEN; else process.env.NPM_TOKEN = previous;
+    if (previousValue === undefined) delete process.env.FIXTURE_RELEASE_VALUE; else process.env.FIXTURE_RELEASE_VALUE = previousValue;
+  });
+  // The same key must retain both values in the redaction set. Only the explicit
+  // value is in options.secrets; the child reads the env-only value from fake config.
+  ctx.secrets = { NPM_TOKEN: explicit };
+  const configFile = path.join(ctx.root, 'fixture-tool-config.json');
+  await writeFile(configFile, JSON.stringify({ environmentOnly, explicit }));
+  return { ctx, environmentOnly, explicit, configFile };
+}
+
+function assertCredentialFailure(error, { environmentOnly, explicit }, code, exitCode) {
+  assert.ok(error instanceof Error);
+  assert.equal(error.code, code); assert.equal(error.exitCode, exitCode);
+  assert.equal(error.result.code, exitCode);
+  for (const representation of [error.message, error.stack, JSON.stringify(error), JSON.stringify(Object.getOwnPropertyDescriptors(error))]) {
+    assert.equal(representation.includes(environmentOnly), false, 'env-only credential escaped in an error representation');
+    assert.equal(representation.includes(explicit), false, 'explicit credential escaped in an error representation');
+  }
+  assert.equal(error.stdout, 'first assertion [REDACTED]\n' + 'detail\n'.repeat(9000) + 'tail [REDACTED]\n');
+  assert.equal(error.stderr, 'last failure [REDACTED] / [REDACTED]\n');
+  assert.match(error.message, /first assertion/); assert.match(error.message, /last failure/);
+  assert.ok(error.message.length < 25000);
+  assert.equal(error.result.stdout, error.stdout); assert.equal(error.result.stderr, error.stderr);
+}
+
+test('Credential redaction covers direct runner overlapping environment and options names', async t => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'kodo-delivery-test-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const environmentOnly = 'fictional-env-only-credential', explicit = 'fictional-explicit-credential';
+  const configFile = path.join(directory, 'fixture-tool-config.json');
+  await writeFile(configFile, JSON.stringify({ environmentOnly, explicit }));
+  const script = `
+    const {environmentOnly,explicit}=JSON.parse(require('node:fs').readFileSync(process.argv[1],'utf8'));
+    if(process.env.NPM_TOKEN!==undefined)throw new Error('credential was forwarded');
+    process.stdout.write('first assertion '+environmentOnly+'\\n'+'detail\\n'.repeat(9000)+'tail '+explicit+'\\n');
+    process.stderr.write('last failure '+environmentOnly+' / '+explicit+'\\n');process.exitCode=6;
+  `;
+  await assert.rejects(execute(process.execPath, ['-e', script, configFile], { cwd: directory,
+    env: { ...process.env, NPM_TOKEN: environmentOnly }, secrets: { NPM_TOKEN: explicit }
+  }), error => { assertCredentialFailure(error, { environmentOnly, explicit }, 'command_failed', 6); return true; });
+});
+
+function fullOverlapCases() {
+  const short = ['fixture', 'shared'].join('-');
+  const tail = ['private', 'suffix'].join('-');
+  const left = ['fixture', 'middle'].join('-'), right = ['middle', 'ending'].join('-');
+  const providerHead = ['sk', 'x'.repeat(20)].join('-');
+  return [
+    { name: 'prefix', values: [short, `${short}-${tail}`], text: `${short}-${tail}` },
+    { name: 'substring', values: [short, `outer-${short}-${tail}`], text: `outer-${short}-${tail}` },
+    { name: 'crossing', values: [left, right], text: ['fixture', 'middle', 'ending'].join('-') },
+    { name: 'generic prefix', values: [providerHead, `${providerHead}::${tail}`], text: `${providerHead}::${tail}` },
+    { name: 'self overlap', values: ['ab'.repeat(4)], text: 'ab'.repeat(7) }
+  ];
+}
+
+function assertFullOverlapFailure(error, stdout, stderr, code = 'command_failed') {
+  assert.ok(error instanceof Error); assert.equal(error.code, code); assert.equal(error.exitCode, 7);
+  assert.equal(error.stdout, stdout); assert.equal(error.stderr, stderr);
+  assert.equal(error.result.stdout, stdout); assert.equal(error.result.stderr, stderr); assert.equal(error.result.code, 7);
+  for (const representation of [error.message, error.stack, JSON.stringify(error), JSON.stringify(Object.getOwnPropertyDescriptors(error))]) {
+    assert.equal(/fixture-|shared|private-suffix|outer-|middle-|-ending|abab/.test(representation), false, 'overlapping credential bytes escaped in an error representation');
+  }
+}
+
+test('Full overlap redaction unions original matches for real execute regardless of value order', async t => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'kodo-delivery-test-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const configFile = path.join(directory, 'overlap.json');
+  const script = `
+    const {text}=JSON.parse(require('node:fs').readFileSync(process.argv[1],'utf8'));
+    if(process.env.NPM_TOKEN!==undefined)throw new Error('credential was forwarded');
+    process.stdout.write('assertion Привет 😀\\0 '+text+' / Bearer '+text+' / Bearer unknown-value\\n');
+    process.stderr.write('diagnostic '+text+' / ?token='+text+'&safe=1 / ?key=unknown-value&safe=2\\n');process.exitCode=7;
+  `;
+  for (const sample of fullOverlapCases()) {
+    await writeFile(configFile, JSON.stringify(sample));
+    for (const reverse of [false, true]) {
+      const values = reverse ? [...sample.values].reverse() : sample.values;
+      const error = await execute(process.execPath, ['-e', script, configFile], { cwd: directory,
+        env: { ...process.env, NPM_TOKEN: values[0] }, secrets: { NPM_TOKEN: values[1] ?? values[0] }
+      }).catch(error => error);
+      assertFullOverlapFailure(error, 'assertion Привет 😀\0 [REDACTED] / Bearer [REDACTED] / Bearer [REDACTED]\n', 'diagnostic [REDACTED] / ?token=[REDACTED]&safe=1 / ?key=[REDACTED]&safe=2\n');
+      assert.equal(error.teardownError, undefined);
+    }
+  }
+});
+
+for (const mode of ['execute', 'result', 'command_failed', 'timeout', 'cancelled', 'frozen']) {
+  test(`Full overlap redaction protects context events and error representations on ${mode}`, async t => {
+    const cases = fullOverlapCases(), outputs = cases.map(sample => sample.text);
+    const ctx = await fixture(t);
+    const previous = process.env.NPM_TOKEN; process.env.NPM_TOKEN = cases[0].values[0];
+    t.after(() => { if (previous === undefined) delete process.env.NPM_TOKEN; else process.env.NPM_TOKEN = previous; });
+    // The same option name must retain the longer value alongside the env prefix.
+    ctx.secrets = { NPM_TOKEN: cases[0].values[1], ...Object.fromEntries(cases.flatMap((sample, index) => sample.values.map((value, part) => [`overlap${index}_${part}`, value]))) };
+    ctx.run.delivery = { pr: { number: 7 } };
+    const stdout = outputs.map(text => `assertion ${text}\n`).join('') + 'detail\n'.repeat(9000) + `tail ${outputs[0]}\n`;
+    const stderr = outputs.map(text => `diagnostic ${text}\n`).join('');
+    const cleanStdout = 'assertion [REDACTED]\n'.repeat(cases.length) + 'detail\n'.repeat(9000) + 'tail [REDACTED]\n';
+    const cleanStderr = 'diagnostic [REDACTED]\n'.repeat(cases.length);
+    const result = { stdout, stderr, code: 7, diagnostics: { detail: outputs.join(' / ') } };
+    const code = ['execute', 'result', 'frozen'].includes(mode) ? 'command_failed' : mode;
+    const primary = Object.assign(new TypeError(outputs.join(' / '), { cause: new Error(outputs.join(' / ')) }), { code, exitCode: 7, stdout, stderr, result });
+    void primary.stack; void primary.cause.stack;
+    if (mode === 'frozen') { Object.freeze(primary.cause); Object.freeze(result.diagnostics); Object.freeze(result); Object.freeze(primary); }
+    const configFile = path.join(ctx.root, 'overlap.json');
+    await writeFile(configFile, JSON.stringify({ stdout, stderr }));
+    ctx.exec = async (command, args, options) => {
+      assert.equal(command, 'gh'); assert.equal(options.env.NPM_TOKEN, undefined);
+      assert.ok(Object.values(options.secrets).includes(cases[0].values[0]));
+      assert.ok(Object.values(options.secrets).includes(cases[0].values[1]));
+      if (mode === 'execute') return execute(process.execPath, ['-e', "const data=JSON.parse(require('node:fs').readFileSync(process.argv[1],'utf8'));process.stdout.write(data.stdout);process.stderr.write(data.stderr);process.exitCode=7", configFile], options);
+      if (mode === 'result') return result;
+      throw primary;
+    };
+    const error = await reconcileDelivery(ctx).catch(error => error);
+    assertFullOverlapFailure(error, cleanStdout, cleanStderr, code);
+    assert.match(error.message, mode === 'execute' || mode === 'result' ? /assertion/ : /\[REDACTED\]/);
+    if (mode !== 'execute') assert.equal(error.result.diagnostics.detail, Array(cases.length).fill('[REDACTED]').join(' / '));
+    if (!['execute', 'result'].includes(mode)) {
+      assert.ok(error instanceof TypeError);
+      if (mode === 'frozen') assert.notEqual(error, primary); else assert.equal(error, primary);
+      assert.equal(error.cause.message, Array(cases.length).fill('[REDACTED]').join(' / '));
+      assert.equal(/fixture-|shared|private-suffix|outer-|middle-|-ending|abab/.test(error.cause.stack), false);
+    }
+    const diagnostic = ctx.events.find(event => event.type === 'delivery.command_failed').data;
+    assert.deepEqual(diagnostic, { command: 'gh', code, exitCode: 7, stdout: cleanStdout, stderr: cleanStderr, outputTruncated: false });
+    assert.equal(ctx.leases.size, 0); assert.equal(ctx.state.releaseCreates, 0);
+  });
+}
+
+const defaultOutputCap = 20 * 1024 * 1024;
+const boundarySecret = ['fixture-env-boundary', '0123456789abcde'].join('-');
+const boundaryMarker = 'actionable assertion before boundary\n';
+async function outputBoundaryScript(directory, stream, cap = defaultOutputCap) {
+  const configFile = path.join(directory, 'output-boundary.json');
+  await writeFile(configFile, JSON.stringify({ secret: boundarySecret, stream, cap }));
+  const script = `
+    const fs=require('node:fs'),{secret,stream,cap}=JSON.parse(fs.readFileSync(process.argv[1],'utf8'));
+    if(process.env.NPM_TOKEN!==undefined)throw new Error('credential was forwarded');
+    const output=process[stream],write=text=>new Promise(resolve=>output.write(text,resolve));
+    (async()=>{
+      await write(${JSON.stringify(boundaryMarker)});
+      let remaining=cap-(secret.length-1)-${Buffer.byteLength(boundaryMarker)};
+      while(remaining>0){const size=Math.min(remaining,65536);await write('.'.repeat(size));remaining-=size;}
+      await write(secret.slice(0,11));await new Promise(resolve=>setImmediate(resolve));
+      await write(secret.slice(11));setInterval(()=>{},1000);
+    })();
+  `;
+  return ['-e', script, configFile];
+}
+
+function assertBoundaryFailure(error, stream, cap = defaultOutputCap, diagnostic) {
+  assert.ok(error instanceof Error); assert.equal(error.code, 'invalid_output');
+  assert.equal(error.result.outputTruncated, true); assert.equal(error.exitCode, error.result.code);
+  assert.equal(error.exitCode, process.platform === 'win32' ? 1 : null);
+  const representations = { message: error.message, stack: error.stack, stdout: error.stdout, stderr: error.stderr,
+    'result.stdout': error.result.stdout, 'result.stderr': error.result.stderr, ...(diagnostic ? { event: JSON.stringify(diagnostic) } : {}) };
+  const leaked = Object.entries(representations).filter(([, value]) => value.includes(boundarySecret.slice(0, -1))).map(([name]) => name);
+  assert.deepEqual(leaked, [], 'credential prefix escaped at capture boundary');
+  assert.ok(error[stream].startsWith(boundaryMarker));
+  assert.ok(error[stream].endsWith('[REDACTED]'));
+  assert.equal(error.result[stream], error[stream]);
+  assert.ok(Buffer.byteLength(error.stdout) + Buffer.byteLength(error.stderr) <= cap);
+  assert.equal(error.teardownError, undefined);
+}
+
+for (const stream of ['stdout', 'stderr']) {
+  test(`Output boundary redaction protects direct default cap on ${stream}`, { timeout: 40000 }, async t => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'kodo-delivery-test-'));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const args = await outputBoundaryScript(directory, stream);
+    const error = await execute(process.execPath, args, { cwd: directory, env: { ...process.env, NPM_TOKEN: boundarySecret } }).catch(error => error);
+    assertBoundaryFailure(error, stream);
+  });
+
+  test(`Output boundary redaction protects release default cap and event on ${stream}`, { timeout: 40000 }, async t => {
+    const ctx = await fixture(t), runner = ctx.exec;
+    await ctx.git('push', 'origin', `${ctx.run.headSha}:main`);
+    const previous = process.env.NPM_TOKEN; process.env.NPM_TOKEN = boundarySecret;
+    t.after(() => { if (previous === undefined) delete process.env.NPM_TOKEN; else process.env.NPM_TOKEN = previous; });
+    ctx.config.commands.test = [{ command: process.execPath, args: await outputBoundaryScript(ctx.root, stream) }];
+    let source;
+    ctx.exec = async (command, args, options) => {
+      if (command === process.execPath) { source = options.cwd; assert.equal(options.env.NPM_TOKEN, undefined); }
+      return runner(command, args, options);
+    };
+    const error = await releasePackage({ ...ctx, mergeCommit: ctx.run.headSha }).catch(error => error);
+    const diagnostic = ctx.events.find(event => event.type === 'delivery.command_failed').data;
+    assertBoundaryFailure(error, stream, defaultOutputCap, diagnostic);
+    assert.equal(diagnostic.stdout, error.stdout); assert.equal(diagnostic.stderr, error.stderr);
+    assert.equal(diagnostic.code, error.code); assert.equal(diagnostic.exitCode, error.exitCode); assert.equal(diagnostic.outputTruncated, true);
+    assert.equal(JSON.stringify(diagnostic).includes(boundarySecret.slice(0, -1)), false);
+    assert.equal(error.cleanupErrors, undefined);
+    await assert.rejects(readFile(path.join(source, 'package.json')), { code: 'ENOENT' });
+    assert.equal(ctx.leases.size, 0); assert.equal(ctx.state.releaseCreates, 0); assert.equal(ctx.run.delivery?.release, undefined);
+  });
+}
+
+test('Output boundary redaction handles every split small caps long secrets and UTF8 without retaining later chunks', async t => {
+  // The real default-cap processes above cover the OS boundary. This controlled
+  // stream fixture additionally forces every byte split, including UTF8 bytes;
+  // an OS is free to coalesce writes and cannot promise those partitions.
+  let chunks = [], code = 7;
+  const mocked = t.mock.method(childProcess, 'spawn', () => {
+    const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough() });
+    queueMicrotask(() => {
+      for (const [stream, chunk] of chunks) child[stream].write(chunk);
+      child.stdout.end(); child.stderr.end(); child.emit('close', code);
+    });
+    return child;
+  });
+  syncBuiltinESMExports();
+  try {
+    for (const stream of ['stdout', 'stderr']) {
+      chunks = [[stream, Buffer.from('assertion\n' + boundarySecret.slice(0, -1))]];
+      const overlapError = await execute('fixture-stream', [], { env: { ...process.env, NPM_TOKEN: boundarySecret },
+        secrets: { NPM_TOKEN: boundarySecret.slice(0, 20) }
+      }).catch(error => error);
+      assert.equal(overlapError[stream], 'assertion\n[REDACTED]', 'a shorter explicit value must not hide the env-only boundary match');
+      const marker = 'assertion\n', raw = Buffer.from(marker + boundarySecret.slice(0, -1));
+      for (let split = 0; split <= raw.length; split++) {
+        chunks = [[stream, raw.subarray(0, split)], [stream, raw.subarray(split)]];
+        const error = await execute('fixture-stream', [], { secrets: { NPM_TOKEN: boundarySecret } }).catch(error => error);
+        assert.equal(error.code, 'command_failed'); assert.equal(error.exitCode, 7);
+        assert.equal(error[stream], marker + '[REDACTED]', `${stream} byte split ${split}`);
+        assert.equal(error.result[stream], error[stream]);
+      }
+      for (let cap = 1; cap <= boundarySecret.length + 1; cap++) {
+        chunks = [[stream, Buffer.from(boundarySecret + '!')]];
+        const error = await execute('fixture-stream', [], { maxOutputBytes: cap, secrets: { NPM_TOKEN: boundarySecret } }).catch(error => error);
+        assert.equal(error.code, cap < boundarySecret.length + 1 ? 'invalid_output' : 'command_failed');
+        assert.equal(error[stream].includes(boundarySecret.slice(0, Math.min(cap, boundarySecret.length))), false);
+        assert.ok(Buffer.byteLength(error.stdout) + Buffer.byteLength(error.stderr) <= cap);
+        assert.equal(error.result.outputTruncated, cap < boundarySecret.length + 1 ? true : undefined);
+      }
+      const longSecret = 'ab'.repeat(65536) + 'Z';
+      chunks = [[stream, Buffer.from(longSecret.slice(0, 4097))]];
+      const longError = await execute('fixture-stream', [], { maxOutputBytes: 4096, secrets: { NPM_TOKEN: longSecret } }).catch(error => error);
+      assert.equal(longError.code, 'invalid_output'); assert.equal(longError[stream], '[REDACTED]');
+      assert.ok(Buffer.byteLength(longError[stream]) <= 4096);
+      // Overlapping proper prefixes need fallback, rather than the last start
+      // character alone; different known values may share the same prefix.
+      chunks = [[stream, Buffer.from('assertion\nabababa')]];
+      const repeatedError = await execute('fixture-stream', [], { secrets: { first: 'abababac', second: 'abababad' } }).catch(error => error);
+      assert.equal(repeatedError[stream], 'assertion\n*******');
+      chunks = [[stream, Buffer.from('assertion\naaaaaaa')]];
+      const completeOverlap = await execute('fixture-stream', [], { secrets: { first: 'aaaaaa' } }).catch(error => error);
+      assert.equal(completeOverlap[stream], 'assertion\n*****', 'a full match overlapping the boundary must not become a visible prefix');
+      const unicodeSecret = 'ключ😀-fictional-value';
+      const unicodeRaw = Buffer.from('assertion\n' + unicodeSecret.slice(0, -1));
+      for (let split = 0; split <= unicodeRaw.length; split++) {
+        chunks = [[stream, unicodeRaw.subarray(0, split)], [stream, unicodeRaw.subarray(split)]];
+        const error = await execute('fixture-stream', [], { secrets: { NPM_TOKEN: unicodeSecret } }).catch(error => error);
+        assert.equal(error[stream], 'assertion\n[REDACTED]', `${stream} Unicode byte split ${split}`);
+      }
+    }
+    // Freeze capture at the first exceeded chunk, even when a partial Unicode
+    // character left room. No later stream/chunk may fill that gap.
+    chunks = [['stdout', Buffer.from('ok😀')], ['stderr', Buffer.from('late')]];
+    const unicodeError = await execute('fixture-stream', [], { maxOutputBytes: 5, env: {} }).catch(error => error);
+    assert.equal(unicodeError.code, 'invalid_output'); assert.equal(unicodeError.stdout, 'ok'); assert.equal(unicodeError.stderr, '');
+    chunks = [['stdout', Buffer.from('ok�overflow')]];
+    const replacementError = await execute('fixture-stream', [], { maxOutputBytes: 5 }).catch(error => error);
+    assert.equal(replacementError.stdout, 'ok�', 'a valid replacement character is ordinary UTF8 data');
+    // Full secrets split into one-byte chunks are still removed on failure.
+    const text = 'assertion Привет 😀\0 ' + boundarySecret + '\n';
+    chunks = [...Buffer.from(text)].map(byte => ['stdout', Buffer.from([byte])]);
+    const fullError = await execute('fixture-stream', [], { secrets: { NPM_TOKEN: boundarySecret } }).catch(error => error);
+    assert.equal(fullError.stdout, 'assertion Привет 😀\0 [REDACTED]\n');
+    // Successful machine output (including a secret-looking prefix) stays raw.
+    code = 0;
+    const raw = text + boundarySecret.slice(0, -1);
+    chunks = [...Buffer.from(raw)].map(byte => ['stdout', Buffer.from([byte])]);
+    assert.equal((await execute('fixture-stream', [], { secrets: { NPM_TOKEN: boundarySecret } })).stdout, raw);
+  } finally { mocked.mock.restore(); syncBuiltinESMExports(); }
+});
+
+for (const mode of ['timeout', 'cancelled']) {
+  test(`Output boundary redaction protects unfinished real streams on ${mode}`, { timeout: 40000 }, async t => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'kodo-delivery-test-'));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const readyPath = path.join(directory, 'ready.json'), ready = readyFile(directory, 'ready.json');
+    const controller = new AbortController();
+    const script = `
+      const fs=require('node:fs'),secret=JSON.parse(fs.readFileSync(process.argv[1],'utf8'));
+      if(process.env.NPM_TOKEN!==undefined)throw new Error('credential was forwarded');
+      process.stdout.write('actionable stdout\\n'+secret.slice(0,17),()=>{
+        process.stderr.write('actionable stderr\\n'+secret.slice(0,29),()=>{
+          setInterval(()=>{},1000);fs.writeFileSync(process.argv[2],JSON.stringify({ready:true}));
+        });
+      });
+    `;
+    const configFile = path.join(directory, 'fictional-key.json'); await writeFile(configFile, JSON.stringify(boundarySecret));
+    const outcome = execute(process.execPath, ['-e', script, configFile, readyPath], { cwd: directory,
+      env: { ...process.env, NPM_TOKEN: boundarySecret }, signal: controller.signal, timeoutMs: mode === 'timeout' ? 4000 : 15000
+    }).catch(error => error);
+    assert.deepEqual(await ready, { ready: true }); if (mode === 'cancelled') controller.abort();
+    const error = await outcome;
+    assert.equal(error.code, mode); assert.equal(error.exitCode, process.platform === 'win32' ? 1 : null);
+    assert.equal(error.stdout, 'actionable stdout\n[REDACTED]'); assert.equal(error.stderr, 'actionable stderr\n[REDACTED]');
+    assert.equal(error.result.stdout, error.stdout); assert.equal(error.result.stderr, error.stderr);
+    assert.equal(error.result.outputTruncated, undefined); assert.equal(error.teardownError, undefined);
+    for (const representation of [error.message, error.stack, JSON.stringify(error)]) {
+      assert.equal(representation.includes(boundarySecret.slice(0, 17)), false);
+    }
+  });
+}
+
+for (const mode of ['exit', 'timeout', 'cancelled']) {
+  test(`Credential redaction covers real release command errors on ${mode}`, { timeout: 40000 }, async t => {
+    const data = await credentialRedactionFixture(t), { ctx, configFile } = data;
+    const controller = new AbortController(), runner = ctx.exec;
+    const readyPath = path.join(ctx.root, 'credential-ready.json');
+    const ready = mode === 'exit' ? undefined : readyFile(ctx.root, path.basename(readyPath));
+    const script = `
+      const fs=require('node:fs'),{environmentOnly,explicit}=JSON.parse(fs.readFileSync(process.argv[1],'utf8'));
+      if(process.env.NPM_TOKEN!==undefined)throw new Error('credential was forwarded');
+      if(process.env.FIXTURE_RELEASE_VALUE!=='kept')throw new Error('safe environment was lost');
+      process.stdout.write('first assertion '+environmentOnly+'\\n'+'detail\\n'.repeat(9000)+'tail '+explicit+'\\n');
+      process.stderr.write('last failure '+environmentOnly+' / '+explicit+'\\n');
+      if(process.argv[2]==='exit')process.exitCode=6;
+      else {setInterval(()=>{},1000);fs.writeFileSync(process.argv[3],JSON.stringify({ready:true}));}
+    `;
+    ctx.config.commands.test = [{ command: process.execPath, args: ['-e', script, configFile, mode, readyPath], timeoutMs: mode === 'timeout' ? 4000 : 15000 }];
+    let source, redactions, environment;
+    ctx.exec = async (command, args, options) => {
+      if (command === process.execPath && args[2] === configFile) { source = options.cwd; redactions = options.secrets; environment = options.env; }
+      return runner(command, args, options);
+    };
+    const outcome = releasePackage({ ...ctx, mergeCommit: ctx.run.headSha, signal: controller.signal }).catch(error => error);
+    if (ready) { assert.deepEqual(await ready, { ready: true }); if (mode === 'cancelled') controller.abort(); }
+    const error = await outcome;
+    assertCredentialFailure(error, data, mode === 'exit' ? 'command_failed' : mode, mode === 'exit' ? 6 : process.platform === 'win32' ? 1 : null);
+    assert.ok(Object.values(redactions).includes(data.environmentOnly)); assert.ok(Object.values(redactions).includes(data.explicit));
+    assert.equal(environment.NPM_TOKEN, undefined); assert.equal(environment.FIXTURE_RELEASE_VALUE, 'kept');
+    const diagnostic = ctx.events.find(event => event.type === 'delivery.command_failed').data;
+    assert.equal(diagnostic.stdout, error.stdout); assert.equal(diagnostic.stderr, error.stderr);
+    assert.equal(diagnostic.code, error.code); assert.equal(diagnostic.exitCode, error.exitCode); assert.equal(diagnostic.outputTruncated, false);
+    assert.equal(error.cleanupErrors, undefined); assert.equal(error.teardownError, undefined);
+    await assert.rejects(readFile(path.join(source, 'package.json')), { code: 'ENOENT' });
+    assert.equal(ctx.leases.size, 0); assert.equal(ctx.state.releaseCreates, 0); assert.equal(ctx.run.delivery?.release, undefined);
+  });
+}
+
+for (const mode of ['result', 'command_failed', 'timeout', 'cancelled', 'frozen']) {
+  test(`Credential redaction covers fallback runner errors on ${mode}`, async t => {
+    const data = await credentialRedactionFixture(t), { ctx, environmentOnly, explicit } = data;
+    const runner = ctx.exec;
+    ctx.config.commands.test = [{ command: 'fixture-redaction' }];
+    const stdout = `first assertion ${environmentOnly}\n` + 'detail\n'.repeat(9000) + `tail ${explicit}\n`;
+    const stderr = `last failure ${environmentOnly} / ${explicit}\n`;
+    const result = { stdout, stderr, code: 7, outputTruncated: true, diagnostics: { detail: `config ${environmentOnly} / ${explicit}` } };
+    const code = mode === 'result' || mode === 'frozen' ? 'command_failed' : mode;
+    const primary = Object.assign(new TypeError(`fixture failure ${environmentOnly} / ${explicit}: first assertion; last failure`, { cause: new Error(`config ${environmentOnly}`) }), { code, exitCode: 7, stdout, stderr, result });
+    // Node 24 exposes stack through an accessor even after it has been cached.
+    void primary.stack; void primary.cause.stack;
+    if (mode === 'frozen') { Object.freeze(primary); Object.freeze(result); }
+    let source, redactions;
+    ctx.exec = async (command, args, options) => {
+      if (command !== 'fixture-redaction') return runner(command, args, options);
+      source = options.cwd; redactions = options.secrets;
+      assert.equal(options.env.NPM_TOKEN, undefined);
+      if (mode === 'result') return result;
+      throw primary;
+    };
+    const error = await releasePackage({ ...ctx, mergeCommit: ctx.run.headSha }).catch(error => error);
+    assertCredentialFailure(error, data, code, 7);
+    assert.equal(error.result.diagnostics.detail, 'config [REDACTED] / [REDACTED]');
+    assert.equal(error.result.outputTruncated, true);
+    if (mode !== 'result') {
+      if (mode === 'frozen') assert.notEqual(error, primary); else assert.equal(error, primary);
+      assert.ok(error instanceof TypeError); assert.equal(error.cause.message, 'config [REDACTED]');
+      assert.equal(error.cause.stack.includes(environmentOnly), false);
+    }
+    assert.ok(Object.values(redactions).includes(environmentOnly)); assert.ok(Object.values(redactions).includes(explicit));
+    const diagnostic = ctx.events.find(event => event.type === 'delivery.command_failed').data;
+    assert.equal(diagnostic.stdout, error.stdout); assert.equal(diagnostic.stderr, error.stderr);
+    assert.equal(diagnostic.exitCode, 7); assert.equal(diagnostic.outputTruncated, true);
+    assert.equal(JSON.stringify(ctx.events).includes(environmentOnly), false); assert.equal(JSON.stringify(ctx.events).includes(explicit), false);
+    await assert.rejects(readFile(path.join(source, 'package.json')), { code: 'ENOENT' });
+    assert.equal(ctx.leases.size, 0); assert.equal(ctx.state.releaseCreates, 0); assert.equal(ctx.run.delivery?.release, undefined);
+  });
+}
+
+test('Delivery lifecycle preserves cwd environment stdin EOF and allowFailure', async t => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'kodo-delivery-test-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const result = await execute(process.execPath, ['-e', "let input='';process.stdin.on('data',x=>input+=x);process.stdin.on('end',()=>{console.log(JSON.stringify({cwd:process.cwd(),value:process.env.FIXTURE_VALUE,secret:process.env.NPM_TOKEN,input}));process.exit(7)});process.stdin.resume()"], {
+    cwd: directory, env: { ...process.env, FIXTURE_VALUE: 'kept', NPM_TOKEN: 'fixture-never-forward' }, allowFailure: true
+  });
+  assert.equal(result.code, 7);
+  assert.deepEqual(JSON.parse(result.stdout), { cwd: directory, value: 'kept', input: '' });
+});
+
+test('Delivery lifecycle pre-aborted execution never starts a command', async t => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'kodo-delivery-test-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const controller = new AbortController(); controller.abort();
+  await assert.rejects(execute(process.execPath, ['-e', "require('fs').writeFileSync('unexpected','started')"], { cwd: directory, signal: controller.signal }), { code: 'cancelled' });
+  assert.deepEqual(await readdir(directory), []);
+});
+
+test('Release lifecycle forwards explicit and default test and build deadlines', async t => {
+  const ctx = await fixture(t), runner = ctx.exec, observed = [];
+  await ctx.git('push', 'origin', `${ctx.run.headSha}:main`);
+  ctx.config.commands.test = [{ command: 'fixture-check', args: ['explicit'], timeoutMs: 71 }, { command: 'fixture-check', args: ['default-test'] }];
+  ctx.config.commands.build = [{ command: 'fixture-check', args: ['default-build'] }, { command: 'fixture-check', args: ['explicit-build'], timeoutMs: 93 }];
+  ctx.exec = async (command, args, options) => {
+    if (command === 'fixture-check') { observed.push([args[0], options.timeoutMs]); return { stdout: '', code: 0 }; }
+    return runner(command, args, options);
+  };
+  const release = await releasePackage({ ...ctx, mergeCommit: ctx.run.headSha });
+  assert.equal(release.published, true);
+  assert.deepEqual(observed, [['explicit', 71], ['default-test', 1200000], ['default-build', 1200000], ['explicit-build', 93]]);
+  const self = JSON.parse(await readFile(new URL('../kodo.config.json', import.meta.url), 'utf8'));
+  assert.deepEqual(self.commands.test, [{ command: 'npm', args: ['run', 'check'], timeoutMs: 1200000 }]);
+});
+
+for (const code of ['timeout', 'command_failed', 'cancelled']) {
+  test(`Release lifecycle retains primary ${code} when owned cleanup refuses a replaced link`, async t => {
+    const ctx = await fixture(t), runner = ctx.exec;
+    await ctx.git('push', 'origin', `${ctx.run.headSha}:main`);
+    ctx.config.commands.test = [{ command: 'fixture-primary' }];
+    const external = path.join(ctx.root, 'external'); await mkdir(external); await writeFile(path.join(external, 'sentinel'), 'must survive');
+    const primary = Object.assign(new Error('primary diagnostic'), { code, stdout: 'first actionable failure', stderr: 'more detail' });
+    let directory, moved;
+    ctx.exec = async (command, args, options) => {
+      if (command === 'fixture-primary') {
+        directory = path.dirname(options.cwd); moved = `${directory}-displaced`;
+        await rename(directory, moved); await symlink(external, directory, process.platform === 'win32' ? 'junction' : 'dir');
+        throw primary;
+      }
+      return runner(command, args, options);
+    };
+    t.after(async () => {
+      if (directory) await rm(directory, { force: true });
+      if (moved) {
+        assert.equal(path.dirname(moved), path.resolve(os.tmpdir())); assert.ok(path.basename(moved).startsWith('kodo-release-'));
+        await rm(moved, { recursive: true, force: true });
+      }
+    });
+    await assert.rejects(releasePackage({ ...ctx, mergeCommit: ctx.run.headSha }), error => {
+      assert.equal(error, primary); assert.equal(error.stdout, 'first actionable failure');
+      assert.ok(error.cleanupErrors.some(item => item.code === 'unsafe_path')); return true;
+    });
+    assert.equal(await readFile(path.join(external, 'sentinel'), 'utf8'), 'must survive');
+    assert.ok(ctx.events.some(event => event.type === 'delivery.cleanup_failed' && event.data.code === 'unsafe_path'));
+    assert.equal(ctx.leases.size, 0); assert.equal(ctx.state.releaseCreates, 0); assert.equal(ctx.run.delivery?.release, undefined);
+  });
+}
+
+for (const code of ['timeout', 'command_failed', 'cancelled']) {
+  test(`Release lifecycle retains primary ${code} after bounded EBUSY cleanup retries`, async t => {
+    const ctx = await fixture(t), runner = ctx.exec;
+    await ctx.git('push', 'origin', `${ctx.run.headSha}:main`);
+    ctx.config.commands.test = [{ command: 'fixture-primary' }];
+    const primary = Object.assign(new Error('primary fixture failure'), { code, stdout: 'original assertion', stderr: 'original stderr' });
+    let directory, attempts = 0;
+    const nativeRemove = fs.promises.rm;
+    const mocked = t.mock.method(fs.promises, 'rm', async (target, options) => {
+      if (target === directory) { attempts++; throw Object.assign(new Error('fixture locked release directory'), { code: 'EBUSY' }); }
+      return nativeRemove(target, options);
+    });
+    syncBuiltinESMExports();
+    ctx.exec = async (command, args, options) => {
+      if (command === 'fixture-primary') { directory = path.dirname(options.cwd); throw primary; }
+      return runner(command, args, options);
+    };
+    try {
+      await assert.rejects(releasePackage({ ...ctx, mergeCommit: ctx.run.headSha }), error => {
+        assert.equal(error, primary); assert.equal(error.stdout, 'original assertion'); assert.equal(error.stderr, 'original stderr');
+        assert.ok(error.cleanupErrors.some(item => item.code === 'EBUSY')); return true;
+      });
+      assert.equal(attempts, 4);
+      assert.equal(ctx.leases.size, 0); assert.equal(ctx.state.releaseCreates, 0);
+      assert.ok(ctx.events.some(event => event.type === 'delivery.cleanup_failed' && event.data.code === 'EBUSY'));
+    } finally {
+      mocked.mock.restore(); syncBuiltinESMExports();
+      if (directory) { assert.equal(path.dirname(directory), path.resolve(os.tmpdir())); assert.ok(path.basename(directory).startsWith('kodo-release-')); await nativeRemove(directory, { recursive: true, force: true }); }
+    }
+  });
+}
+
+test('Release lifecycle retries transient locks and keeps a confirmed published receipt on persistent cleanup failure', async t => {
+  for (const persistent of [false, true]) {
+    const ctx = await fixture(t), runner = ctx.exec;
+    await ctx.git('push', 'origin', `${ctx.run.headSha}:main`);
+    let directory, attempts = 0;
+    const nativeRemove = fs.promises.rm;
+    const mocked = t.mock.method(fs.promises, 'rm', async (target, options) => {
+      if (target === directory && ++attempts <= (persistent ? 4 : 2)) throw Object.assign(new Error('fixture temporary lock'), { code: 'EBUSY' });
+      return nativeRemove(target, options);
+    });
+    syncBuiltinESMExports();
+    ctx.exec = async (command, args, options) => {
+      if (command === 'git' && args[0] === 'worktree' && args[1] === 'add') directory = path.dirname(args[3]);
+      return runner(command, args, options);
+    };
+    try {
+      const receipt = await releasePackage({ ...ctx, mergeCommit: ctx.run.headSha });
+      assert.equal(receipt.published, true); assert.deepEqual(ctx.run.delivery.release, receipt);
+      assert.equal(attempts, persistent ? 4 : 3); assert.equal(ctx.leases.size, 0);
+      assert.equal(ctx.events.some(event => event.type === 'delivery.cleanup_failed'), persistent);
+    } finally {
+      mocked.mock.restore(); syncBuiltinESMExports();
+      if (directory) { assert.equal(path.dirname(directory), path.resolve(os.tmpdir())); assert.ok(path.basename(directory).startsWith('kodo-release-')); await nativeRemove(directory, { recursive: true, force: true }); }
+    }
+  }
 });
 
 test('Lost merge lease stops mutation and heartbeat cleanup releases the token', async t => {

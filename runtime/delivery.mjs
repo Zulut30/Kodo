@@ -1,9 +1,10 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { access, mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { access, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { workerEnvironment } from './security.mjs';
+import { StringDecoder } from 'node:string_decoder';
+import { redact, workerEnvironment } from './security.mjs';
 import { gitBoundary } from './command.mjs';
 import { isCurrentUIReceipt, uiConfigHash } from './ui-verification.mjs';
 import { isCurrentSecurityReceipt, securityConfigHash } from './security-gates.mjs';
@@ -30,9 +31,181 @@ async function npmCommand() {
   throw fail('configuration', 'Cannot find npm-cli.js; install npm beside Node.js');
 }
 
-export async function execute(command, args, { cwd, signal, timeoutMs = 120000, allowFailure = false, env } = {}) {
+// Helpers receive no authenticated Git/gh environment. They operate on the
+// spawned PID/group only, never executable names or the host application's tree.
+async function processHelper(command, args, input) {
+  return new Promise((resolve, reject) => {
+    const helper = spawn(command, args, { env: workerEnvironment(), windowsHide: true, shell: false, stdio: ['pipe', 'pipe', 'pipe'] });
+    let output = '', error;
+    const timer = setTimeout(() => { error = fail('process_teardown', 'Owned process teardown helper timed out'); helper.kill('SIGKILL'); }, 20000);
+    helper.stdout.setEncoding('utf8'); helper.stderr.resume();
+    helper.stdout.on('data', chunk => { if (output.length < 4 * 1024 * 1024) output += chunk; else { error ??= fail('process_teardown', 'Owned process enumeration exceeded limit'); helper.kill('SIGKILL'); } });
+    helper.on('error', cause => { error ??= fail('process_teardown', 'Cannot start owned process teardown helper', { cause }); });
+    helper.on('close', code => { clearTimeout(timer); error ? reject(error) : code !== 0 ? reject(fail('process_teardown', `Owned process teardown helper failed (${code})`)) : resolve(output); });
+    helper.stdin.on('error', () => {}); helper.stdin.end(input);
+  });
+}
+
+async function stopOwnedTree(child) {
+  if (!child.pid) return;
+  if (process.platform === 'win32') {
+    // Keep handles to the observed descendants: taskkill returning, or the root
+    // closing its pipes, alone does not prove children with ignored stdio exited.
+    const script = `
+      $ErrorActionPreference = 'Stop'
+      $root = [int][Console]::In.ReadToEnd()
+      $owned = [Collections.Generic.List[Diagnostics.Process]]::new()
+      $seen = [Collections.Generic.HashSet[int]]::new()
+      function Capture-Owned([int]$ownedId) {
+        if (!$seen.Add($ownedId)) { return }
+        if ($seen.Count -gt 1024) { throw 'Owned process tree exceeds limit' }
+        try { $p = [Diagnostics.Process]::GetProcessById($ownedId); $null = $p.Handle; $owned.Add($p) } catch [ArgumentException] { }
+        foreach ($entry in @(Get-CimInstance Win32_Process -Filter "ParentProcessId = $ownedId")) { Capture-Owned ([int]$entry.ProcessId) }
+      }
+      try {
+        Capture-Owned $root
+        try { & "$env:SystemRoot\\System32\\taskkill.exe" /PID $root /T /F 2>$null | Out-Null } catch { }
+        foreach ($p in $owned) { if (!$p.HasExited) { $p.Kill() } }
+        foreach ($p in $owned) { if (!$p.WaitForExit(5000)) { throw 'Owned process did not exit' } }
+      } finally { foreach ($p in $owned) { $p.Dispose() } }
+    `;
+    const powershell = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32/WindowsPowerShell/v1.0/powershell.exe');
+    await processHelper(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], String(child.pid));
+    return;
+  }
+  const killGroup = signal => { try { process.kill(-child.pid, signal); } catch (error) { if (error.code !== 'ESRCH') throw error; } };
+  killGroup('SIGTERM');
+  await wait(250); // Bounded graceful shutdown, followed by mandatory escalation.
+  killGroup('SIGKILL');
+  const deadline = Date.now() + 5000;
+  for (;;) {
+    // Only the owned detached group is tested. Dead zombies hold no resources;
+    // their final reap belongs to their OS parent, not to this Node process.
+    const states = await processHelper('ps', ['-A', '-o', 'pgid=,stat=']);
+    const running = states.split(/\r?\n/).some(line => {
+      const [group, state] = line.trim().split(/\s+/);
+      return Number(group) === child.pid && state && !/^[ZX]/.test(state);
+    });
+    if (!running) return;
+    if (Date.now() >= deadline) throw fail('process_teardown', 'Owned process group did not exit');
+    await wait(25);
+  }
+}
+
+function commandRedactions(baseEnv, environment, secrets = {}) {
+  // Separate namespaces retain both values when options.secrets and the stripped
+  // environment use the same name. The map never becomes part of diagnostics.
+  return Object.fromEntries([
+    ...Object.entries(baseEnv).filter(([name]) => !(name in environment)).map(([name, value]) => [`env:${name}`, value]),
+    ...Object.entries(secrets ?? {}).map(([name, value]) => [`secret:${name}`, value])
+  ]);
+}
+
+function redactCommandOutput(value, secrets) {
+  if (typeof value !== 'string') {
+    if (Array.isArray(value)) return value.map(item => redactCommandOutput(item, secrets));
+    if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, item]) => [redactCommandOutput(key, secrets), redactCommandOutput(item, secrets)]));
+    return value;
+  }
+  // Sweep matches in the original text, retaining only one pending occurrence
+  // per known value. Sequential replacement (even longest-first) can destroy
+  // a crossing match and expose its tail. Include overlapping self-matches too.
+  const pending = [...new Set(Object.values(secrets ?? {}))]
+    .filter(secret => typeof secret === 'string' && secret.length > 5 && secret.length <= value.length)
+    .map(secret => ({ secret, start: value.indexOf(secret) })).filter(match => match.start >= 0);
+  const parts = [];
+  let cursor = 0, start = -1, end = 0;
+  const flush = () => { if (start >= 0) { parts.push(value.slice(cursor, start), '[REDACTED]'); cursor = end; } };
+  while (pending.length) {
+    let first = 0;
+    for (let index = 1; index < pending.length; index++) if (pending[index].start < pending[first].start) first = index;
+    const match = pending[first];
+    if (start < 0 || match.start > end) { flush(); start = match.start; end = match.start + match.secret.length; }
+    else end = Math.max(end, match.start + match.secret.length);
+    match.start = value.indexOf(match.secret, match.start + 1);
+    if (match.start < 0) pending.splice(first, 1);
+  }
+  flush();
+  // Generic credential rules run only after the known ranges have been hidden.
+  // Memory is bounded by the supplied values and captured/redacted text, never
+  // by a list of every occurrence or the uncaptured process output.
+  return redact(parts.length ? parts.join('') + value.slice(cursor) : value);
+}
+
+function redactCommandError(value, secrets, seen = new WeakMap()) {
+  if (typeof value === 'string') return redactCommandOutput(value, secrets);
+  if (!value || typeof value !== 'object') return value;
+  if (seen.has(value)) return seen.get(value);
+  // Keep mutable errors (including their type/identity), non-enumerable stack
+  // and cause, and nested diagnostics. Frozen runner errors need a typed copy.
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  // V8's cached stack is still an accessor in Node 24. Materialize it before
+  // changing message, then redact the original diagnostic instead of dropping it.
+  if (value instanceof Error && descriptors.stack?.get) descriptors.stack = {
+    value: value.stack, writable: descriptors.stack.configurable,
+    enumerable: descriptors.stack.enumerable, configurable: descriptors.stack.configurable
+  };
+  const immutable = Reflect.ownKeys(descriptors).some(key => 'value' in descriptors[key] && !descriptors[key].writable && !descriptors[key].configurable);
+  const clean = !immutable ? value : Array.isArray(value) ? [] : value instanceof Error
+    ? Object.setPrototypeOf(new Error(), Object.getPrototypeOf(value)) : Object.create(Object.getPrototypeOf(value));
+  seen.set(value, clean);
+  for (const key of Reflect.ownKeys(descriptors)) {
+    const descriptor = descriptors[key];
+    if ('value' in descriptor) Object.defineProperty(clean, key, { ...descriptor, value: redactCommandError(descriptor.value, secrets, seen) });
+    else if (clean !== value) Object.defineProperty(clean, key, descriptor);
+  }
+  return clean;
+}
+
+function redactOutputBoundary(text, clean, secrets) {
+  let hidden = 0;
+  for (const secret of new Set(Object.values(secrets))) {
+    if (typeof secret !== 'string' || secret.length <= 5) continue;
+    // A closed/capped stream may end in any proper prefix of a known value.
+    // Match its longest suffix in linear time, including repetitive/long keys.
+    // The table and scan never exceed captured text, even if a key exceeds cap.
+    const length = Math.min(secret.length - 1, text.length);
+    if (!length || text.indexOf(secret[0], text.length - length) < 0) continue;
+    const prefixes = new Uint32Array(length);
+    for (let index = 1, matched = 0; index < length; index++) {
+      while (matched && secret[index] !== secret[matched]) matched = prefixes[matched - 1];
+      if (secret[index] === secret[matched]) matched++;
+      prefixes[index] = matched;
+    }
+    let matched = 0;
+    for (let index = text.length - length; index < text.length; index++) {
+      while (matched && text[index] !== secret[matched]) matched = prefixes[matched - 1];
+      if (text[index] === secret[matched]) matched++;
+    }
+    hidden = Math.max(hidden, matched);
+  }
+  if (!hidden) return clean;
+  // Detect the boundary on raw text: a shorter known value may otherwise
+  // replace the start of a longer unfinished value before we can recognize it.
+  // A complete match can also overlap this cut. Keep only the common redacted
+  // prefix so cutting the raw stream cannot expose part of that complete match.
+  const prefix = redactCommandOutput(text.slice(0, -hidden), secrets);
+  let end = 0;
+  while (end < prefix.length && end < clean.length && prefix[end] === clean[end]) end++;
+  // Short candidates must not expand a tiny capture budget. Finalize only
+  // diagnostics: successful machine output remains byte-for-byte raw.
+  return clean.slice(0, end) + (hidden < 10 ? '*'.repeat(hidden) : '[REDACTED]');
+}
+
+function commandFailure(command, code, result, extra = {}, secrets = {}) {
+  const clean = redactCommandOutput({ ...result, stdout: result.stdout ?? '', stderr: result.stderr ?? '' }, secrets);
+  clean.stdout = redactOutputBoundary(result.stdout ?? '', clean.stdout, secrets);
+  clean.stderr = redactOutputBoundary(result.stderr ?? '', clean.stderr, secrets);
+  const diagnostics = ['stdout', 'stderr'].map(name => clean[name] ? `${name}:\n${clean[name].length > 12000 ? `${clean[name].slice(0, 6000)}\n[full bounded output retained in result]\n${clean[name].slice(-6000)}` : clean[name]}` : '').filter(Boolean).join('\n');
+  return fail(code, `${command} ${code === 'command_failed' ? `failed (${result.code})` : code}${diagnostics ? `:\n${diagnostics}` : ''}`, { ...extra, exitCode: result.code, stdout: clean.stdout, stderr: clean.stderr, result: clean });
+}
+
+export async function execute(command, args, { cwd, signal, timeoutMs = 120000, allowFailure = false, env, maxOutputBytes = 20 * 1024 * 1024, secrets = {} } = {}) {
+  if (signal?.aborted) throw fail('cancelled', 'Delivery cancelled');
+  if (!Number.isInteger(timeoutMs) || timeoutMs < 0 || timeoutMs > 2147483647 || !Number.isInteger(maxOutputBytes) || maxOutputBytes < 1) throw fail('configuration', 'Command deadline and output limit must be bounded integers');
   const baseEnv = env ?? process.env;
   let environment = workerEnvironment(baseEnv);
+  const redactions = commandRedactions(baseEnv, environment, secrets);
   let executable = command, argv = args;
   // Coordinator Git processes retain credentials, so repository-authored hooks
   // must never run inside that boundary, including pre-push and reference hooks.
@@ -41,21 +214,45 @@ export async function execute(command, args, { cwd, signal, timeoutMs = 120000, 
   if (command === 'npm') {
     const [node, prefix] = await npmCommand(); executable = node; argv = [...prefix, ...args];
   }
+  if (signal?.aborted) throw fail('cancelled', 'Delivery cancelled');
   return new Promise((resolve, reject) => {
-    const child = spawn(executable, argv, { cwd, env: environment, signal, shell: false, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(executable, argv, { cwd, env: environment, detached: process.platform !== 'win32', shell: false, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
     child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
-    let stdout = '', stderr = '', settled = false;
-    const timer = setTimeout(() => { child.kill(); finish(fail('timeout', `${command} timed out`)); }, timeoutMs);
-    const finish = (error, result) => { if (settled) return; settled = true; clearTimeout(timer); error ? reject(error) : resolve(result); };
-    child.stdout.on('data', chunk => { stdout += chunk; if (stdout.length > 20 * 1024 * 1024) { child.kill(); finish(fail('invalid_output', `${command} output exceeded limit`)); } });
-    child.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-32768); });
-    child.on('error', error => finish(signal?.aborted ? fail('cancelled', 'Delivery cancelled') : error));
-    child.on('close', code => {
-      const result = { stdout, stderr, code };
-      if (signal?.aborted) return finish(fail('cancelled', 'Delivery cancelled'));
-      if (code !== 0 && !allowFailure) return finish(fail('command_failed', `${command} failed (${code}): ${stderr.slice(-1500)}`, { exitCode: code, stderr }));
-      finish(null, result);
+    let stdout = '', stderr = '', bytes = 0, terminalError, stopping, teardownError, outputTruncated = false;
+    const stop = error => {
+      if (terminalError) return;
+      terminalError = error;
+      clearTimeout(timer); signal?.removeEventListener('abort', abort);
+      stopping = stopOwnedTree(child).catch(cause => {
+        teardownError = { code: cause.code ?? 'process_teardown', message: redactCommandOutput(cause.message, redactions) };
+        child.kill('SIGKILL'); child.stdout.destroy(); child.stderr.destroy();
+      });
+    };
+    const abort = () => stop(fail('cancelled', 'Delivery cancelled'));
+    const timer = setTimeout(() => stop(fail('timeout', `${command} timed out`)), timeoutMs);
+    const capture = (name, chunk) => {
+      if (outputTruncated) return;
+      const buffer = Buffer.from(chunk), available = Math.max(0, maxOutputBytes - bytes);
+      // Decoder.write omits only an incomplete trailing code point; a literal
+      // U+FFFD is valid output and must survive. Never fill the gap from a later
+      // chunk/stream once this shared capture boundary has been reached.
+      const text = buffer.length <= available ? chunk : new StringDecoder('utf8').write(buffer.subarray(0, available));
+      bytes += Buffer.byteLength(text);
+      if (name === 'stdout') stdout += text; else stderr += text;
+      if (buffer.length > available) { outputTruncated = true; stop(fail('invalid_output', `${command} output exceeded limit`)); }
+    };
+    child.stdout.on('data', chunk => capture('stdout', chunk));
+    child.stderr.on('data', chunk => capture('stderr', chunk));
+    child.on('error', error => { terminalError ??= error; });
+    child.once('close', async code => {
+      clearTimeout(timer); signal?.removeEventListener('abort', abort);
+      await stopping;
+      const result = { stdout, stderr, code, ...(outputTruncated ? { outputTruncated: true } : {}) };
+      if (terminalError) return reject(commandFailure(command, terminalError.code ?? 'command_failed', result, { ...(teardownError ? { teardownError } : {}) }, redactions));
+      if (code !== 0 && !allowFailure) return reject(commandFailure(command, 'command_failed', result, {}, redactions));
+      resolve(result);
     });
+    signal?.addEventListener('abort', abort, { once: true }); if (signal?.aborted) abort();
   });
 }
 
@@ -71,11 +268,24 @@ function context(options) {
   const command = async (name, args, settings = {}) => {
     if (!settings.reconcile && !finishingIrreversible) checkpoint();
     const baseEnv = settings.env ?? process.env;
+    const unprivileged = workerEnvironment(baseEnv);
+    const redactions = commandRedactions(baseEnv, unprivileged, options.secrets);
     const environment = /(?:^|[\\/])git(?:\.exe)?$/i.test(name) ? gitBoundary(args, baseEnv).env
-      : /(?:^|[\\/])gh(?:\.exe)?$/i.test(name) ? gitBoundary(['ls-remote'], baseEnv).env : workerEnvironment(baseEnv);
-    const result = await runner(name, args, { cwd, ...settings, env: environment, signal: settings.ignoreAbort || finishingIrreversible ? undefined : signal });
-    if (result.code && !settings.allowFailure) throw fail('command_failed', `${name} failed (${result.code}): ${(result.stderr ?? '').slice(-1500)}`, { exitCode: result.code, stderr: result.stderr });
-    return result.stdout?.trimEnd() ?? '';
+      : /(?:^|[\\/])gh(?:\.exe)?$/i.test(name) ? gitBoundary(['ls-remote'], baseEnv).env : unprivileged;
+    try {
+      const result = await runner(name, args, { cwd, ...settings, secrets: redactions, env: environment, signal: settings.ignoreAbort || finishingIrreversible ? undefined : signal });
+      if (result.code && !settings.allowFailure) throw commandFailure(name, 'command_failed', result, {}, redactions);
+      return result.stdout?.trimEnd() ?? '';
+    } catch (error) {
+      const clean = redactCommandError(error, redactions);
+      // Engine's summary stores only message. Keep the full bounded diagnostics
+      // separately before cleanup, without argv or environment/credentials.
+      if (clean?.stdout || clean?.stderr) {
+        try { await event('delivery.command_failed', redactCommandOutput({ command: name, code: clean.code, exitCode: clean.exitCode, stdout: clean.stdout, stderr: clean.stderr, outputTruncated: clean.result?.outputTruncated === true }, redactions)); }
+        catch { /* Diagnostic persistence failure must not replace the command. */ }
+      }
+      throw clean;
+    }
   };
   const event = async (type, data) => { await store?.event?.(run.id, type, data); await options.onEvent?.({ type, ...data }); };
   const save = async patch => { Object.assign(run, patch); await store?.updateRun?.(run.id, patch); };
@@ -253,6 +463,8 @@ export async function deliver(options) {
   let pr = matches[0];
   if (!pr) {
     const directory = await mkdtemp(path.join(os.tmpdir(), 'kodo-pr-'));
+    const ownership = await lstat(directory);
+    let primaryError;
     try {
       const filename = path.join(directory, 'body.md');
       await writeFile(filename, `${ctx.run.task}\n\nImplemented and checked by Kodo.\n\n- Run: \`${ctx.run.id}\`\n- Reviewed head: \`${head}\`\n- Diff SHA-256: \`${diffHash}\`\n\n<!-- kodo-run:${ctx.run.id} -->\n`);
@@ -260,7 +472,8 @@ export async function deliver(options) {
       const number = Number(/\/pull\/(\d+)/.exec(url)?.[1]);
       if (!number) throw fail('invalid_output', 'GitHub did not return a PR URL');
       pr = { number, url, state: 'OPEN' };
-    } finally { await safeRemove(directory, 'kodo-pr-'); }
+    } catch (error) { primaryError = error; throw error; }
+    finally { await cleanupDelivery(ctx, primaryError, [() => safeRemove(directory, 'kodo-pr-', ownership)]); }
   }
   if (pr.state === 'CLOSED') throw fail('pr_closed', 'The run PR was closed without merge');
   saved = { ...saved, pr: { number: pr.number, url: pr.url }, reviewedHead: head, diffHash };
@@ -313,10 +526,40 @@ export async function deliver(options) {
   }
 }
 
-async function safeRemove(directory, prefix) {
+async function validateTemporary(directory, prefix, ownership) {
   const resolved = path.resolve(directory);
-  if (path.dirname(resolved) !== path.resolve(os.tmpdir()) || !path.basename(resolved).startsWith(prefix)) throw fail('unsafe_path', 'Refusing to remove unexpected temporary directory');
-  await rm(resolved, { recursive: true, force: true });
+  if (!path.isAbsolute(directory) || directory !== resolved || !['kodo-pr-', 'kodo-release-'].includes(prefix) || path.dirname(resolved) !== path.resolve(os.tmpdir()) || !path.basename(resolved).startsWith(prefix) || path.basename(resolved) === prefix) throw fail('unsafe_path', 'Refusing to remove unexpected temporary directory');
+  let current;
+  try { current = await lstat(resolved); } catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+  if (!ownership || current.isSymbolicLink() || !current.isDirectory() || current.dev !== ownership.dev || current.ino !== ownership.ino || await realpath(resolved) !== path.join(await realpath(os.tmpdir()), path.basename(resolved))) throw fail('unsafe_path', 'Refusing to remove replaced or linked temporary directory');
+  return true;
+}
+
+async function safeRemove(directory, prefix, ownership) {
+  for (let attempt = 0; ; attempt++) {
+    if (!await validateTemporary(directory, prefix, ownership)) return;
+    try { await rm(directory, { recursive: true, force: true }); return; }
+    catch (error) {
+      if (attempt >= 3 || !['EBUSY', 'EPERM', 'EACCES', 'ENOTEMPTY'].includes(error.code)) throw error;
+      await wait(50 * 2 ** attempt);
+    }
+  }
+}
+
+async function cleanupDelivery(ctx, primaryError, actions, confirmed = false) {
+  const errors = [];
+  for (const action of actions) {
+    try { await action(); }
+    catch (error) {
+      const detail = { code: error.code ?? 'cleanup_failed', message: redactCommandOutput(error.message, ctx.secrets).slice(0, 4000) };
+      errors.push(detail);
+      try { await ctx.event('delivery.cleanup_failed', detail); }
+      catch { /* Reporting cleanup must not hide the primary command/receipt. */ }
+    }
+  }
+  if (!errors.length) return;
+  if (primaryError) primaryError.cleanupErrors = [...(primaryError.cleanupErrors ?? []), ...errors];
+  else if (!confirmed) throw fail('cleanup_failed', 'Delivery temporary cleanup failed; see cleanupErrors', { cleanupErrors: errors });
 }
 
 async function pack(ctx, source, destination) {
@@ -510,9 +753,10 @@ export async function releasePackage(options) {
   const candidate = options.mergeCommit;
   if (!/^[a-f0-9]{40,64}$/.test(candidate ?? '')) throw fail('configuration', 'A full merged commit SHA is required for release');
   const lease = await acquire(ctx, `release:${ctx.repository}:${ctx.baseBranch}`);
-  let directory, source;
+  let directory, source, ownership, primaryError;
   try {
     directory = await mkdtemp(path.join(os.tmpdir(), 'kodo-release-'));
+    ownership = await lstat(directory);
     const savedReceipt = ctx.run.delivery?.release;
     if (savedReceipt?.published === true && savedReceipt.commit === candidate) {
       const info = await verifyPublishedArtifact(ctx, savedReceipt, directory);
@@ -559,7 +803,7 @@ export async function releasePackage(options) {
         await ctx.command('npm', [hasLock ? 'ci' : 'install', '--ignore-scripts', '--no-audit', '--no-fund', ...(hasLock ? [] : ['--no-package-lock'])], { cwd: source, timeoutMs: 300000 });
       }
       for (const check of [...(ctx.config.commands?.test ?? []), ...(ctx.config.commands?.build ?? [])]) {
-        await ctx.command(check.command, check.args ?? [], { cwd: source, timeoutMs: check.timeoutMs ?? 600000 });
+        await ctx.command(check.command, check.args ?? [], { cwd: source, timeoutMs: check.timeoutMs ?? 1200000 });
       }
       const artifacts = path.join(directory, 'artifacts'); await mkdir(artifacts);
       const packed = await pack(ctx, source, artifacts);
@@ -607,10 +851,22 @@ export async function releasePackage(options) {
       await ctx.event('delivery.released', receipt);
       return receipt;
     });
-  } finally {
-    try {
-      if (source) await ctx.command('git', ['worktree', 'remove', '--force', source], { allowFailure: true, ignoreAbort: true, reconcile: true }).catch(() => {});
-      if (directory) await safeRemove(directory, 'kodo-release-');
-    } finally { await releaseOwnedLease(ctx, lease); }
+  } catch (error) { primaryError = error; throw error; }
+  finally {
+    await cleanupDelivery(ctx, primaryError, [
+      async () => {
+        if (primaryError?.teardownError) throw fail('process_teardown', `Release worktree cleanup deferred until owned teardown can be confirmed: ${directory}`);
+        if (!source || !await validateTemporary(directory, 'kodo-release-', ownership)) return;
+        try {
+          if ((await lstat(source)).isSymbolicLink() || await realpath(source) !== path.join(await realpath(directory), 'source')) throw fail('unsafe_path', 'Refusing to remove a linked release worktree');
+        } catch (error) { if (error.code === 'ENOENT') return; throw error; }
+        await ctx.command('git', ['worktree', 'remove', '--force', source], { ignoreAbort: true, reconcile: true });
+      },
+      async () => {
+        if (primaryError?.teardownError) return; // Keep the source for safe recovery.
+        if (directory) await safeRemove(directory, 'kodo-release-', ownership);
+      },
+      () => releaseOwnedLease(ctx, lease)
+    ], ctx.run.delivery?.release?.published === true && ctx.run.delivery.release.commit === candidate);
   }
 }
