@@ -175,6 +175,21 @@ Jev выбирает из допустимых моделей и вариант�
 
 Standalone-команды `kodo ui verify [--project PATH] [--json]` и `kodo security verify [--project PATH] [--json]` читают локальную конфигурацию, проверяют Git HEAD до/после и записывают приватные receipts вне Git. Включённая неуспешная проверка возвращает ненулевой код. Установка инструментов допускается по явной `tools install` или `autoInstall:true` включённого gate; model credentials остаются у координатора. [Точный JSON, pins, adapters и prerequisites](UI-TOOLS.md), [локальные scanners](SECURITY.md#локальные-security-gates).
 
+### Architecture Guardian
+
+Offline-команды не запускают Engine или подписочных провайдеров:
+
+```powershell
+kodo architecture plan --project D:\Projects\example --base FULL_COMMIT_SHA --json
+kodo architecture check --project D:\Projects\example --base FULL_COMMIT_SHA --evidence-dir C:\PrivateEvidence\architecture --json
+```
+
+Подставь полный SHA base commit; head берётся из текущего чистого Git-дерева. Plan read-only, без тестов/evidence; check запускает только выбранные registry contract tests реальным Node TAP с общим deadline 120000ms. Fixed policy — architecture.policy.json; --head/--preset отсутствуют. Успех требует актуальных actual bytes, полного TAP без fail/cancel/skip/todo и intact private captures; exit0 без тестов не заменяет test receipt. При поддержанной policy CSS-only static check может пройти без unrelated tests.
+
+[Policy/registry schema, ручные presets, migration/debt и примеры](ARCHITECTURE.md), [ADR-0007](decisions/0007-architecture-guardian.md). MVP анализирует только product ESM .mjs/.js type=module; Rust/C#/Go/PHP/TSX/JSX/CJS не получают native architecture PASS. Language quality и SDK/platform checks остаются отдельными. Отсутствие policy в base/head даёт not_applicable/passed:null; malformed base или удаление enrolled policy блокирует. Первое enrollment может локально пройти producer tests при baseRulesEvaluated:false, но всегда требует full verification и независимого review.
+
+Замороженный config-контракт интеграции G — только `{"architecture":{"enabled":false}}`, default false, без настраиваемого policy path. На docs-checkpoint этапа 04 интеграция G и её окончательные проверки ещё pending; этот JSON описывает целевой контракт, а не завершённое подключение gate к Engine. Disabled нейтрален, не PASS; старые saved runs не включаются задним числом. Enabled gate должен привязывать receipt к source/base/head, normalized policy/registry/config, Node/runtime, checker/parser pins и байтам private evidence, await-ить freshness/expiry перед review/delivery и сбрасывать receipt при source/repair/integration changes. Full checks, свежие security и независимое review сохраняются.
+
 ### Повторное использование локальных checks
 
 При продолжении координатор может повторно использовать только полный успешный список локальных test/build-команд. Квитанция `run.checks` схемы 2 требует `complete:true`, точного HEAD, чистого integration worktree, непустого настроенного списка test и совпадающего fingerprint: упорядоченные test/build-команды с аргументами, версия Node, ABI, платформа и архитектура. Все результаты должны соответствовать полному ожидаемому списку по порядку и иметь `exitCode:0`. При выполнении каждой команды проверяется, что HEAD и чистота дерева сохранились. Запись `checks_reused` показывает факт повторного использования, а не новый прогон.
