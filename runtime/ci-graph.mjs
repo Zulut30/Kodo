@@ -10,7 +10,7 @@ const sorted = values => [...new Set(values)].sort();
 const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const javascript = file => /\.(?:mjs|cjs|js)$/.test(file);
 const unsupported = file => /\.(?:ts|tsx|mts|cts|jsx|vue|svelte|py|pyi|go|rs|cs|vb|fs|fsx|java|kt|rb|php|ps1|sh|bash|c|h|cpp|cc|hpp|swift|scala|ex|exs|clj|lua|dart)$/.test(file);
-const testFile = file => /(?:^|\/)(?:[^/]+[._-](?:test|spec)|test-[^/]+)\.(?:mjs|cjs|js|ts|tsx|mts|cts|jsx)$/.test(file) || /(?:^|\/)(?:test|__tests__)\/.*\.(?:mjs|cjs|js|ts|tsx|mts|cts|jsx)$/.test(file);
+const testFile = file => /(?:^|\/)test\.(?:mjs|cjs|js)$/.test(file) || /(?:^|\/)(?:[^/]+[._-](?:test|spec)|test-[^/]+)\.(?:mjs|cjs|js|ts|tsx|mts|cts|jsx)$/.test(file) || /(?:^|\/)(?:test|__tests__)\/.*\.(?:mjs|cjs|js|ts|tsx|mts|cts|jsx)$/.test(file);
 const lockFile = file => /(?:^|\/)(?:package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb?)$/.test(file);
 const manifestFile = file => /(?:^|\/)package\.json$/.test(file);
 

@@ -17,8 +17,6 @@ jobs:
   fast:
     if: ${{ vars.KODO_FAST_CI_ENABLED == 'true' }}
     runs-on: ubuntu-latest
-    env:
-      KODO_TOOL_HOME: ${{ runner.temp }}/kodo-fast-tools
     steps:
       - uses: actions/checkout@v4
         with:
@@ -32,6 +30,8 @@ jobs:
       # npm ci verifies package-lock integrity on every restored tarball.
       - run: npm ci --ignore-scripts
       - name: Install pinned fast quality tools
+        env:
+          KODO_TOOL_HOME: ${{ runner.temp }}/kodo-fast-tools
         run: |
           node cli/index.mjs tools install oxlint --json
           node cli/index.mjs tools install typescript --json
@@ -50,6 +50,8 @@ jobs:
           fi
       - name: Partial feedback with exact-head L2 still required
         shell: bash
+        env:
+          KODO_TOOL_HOME: ${{ runner.temp }}/kodo-fast-tools
         run: |
           if [ "${CI_UNKNOWN_BASE:-0}" = 1 ]; then
             node scripts/ci.mjs feedback --json
@@ -64,8 +66,6 @@ jobs:
         os: [ubuntu-latest, windows-latest]
         node: [24]
     runs-on: ${{ matrix.os }}
-    env:
-      KODO_TOOL_HOME: ${{ runner.temp }}/kodo-security-tools
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -75,10 +75,16 @@ jobs:
           cache-dependency-path: package-lock.json
       - run: npm ci --ignore-scripts
       - name: Install pinned security tools
+        env:
+          KODO_TOOL_HOME: ${{ runner.temp }}/kodo-security-tools
         run: |
           node cli/index.mjs tools install semgrep --json
           node cli/index.mjs tools install gitleaks --json
       - name: L2 npm run check and fresh mandatory security
+        env:
+          KODO_TOOL_HOME: ${{ runner.temp }}/kodo-security-tools
         run: node scripts/ci.mjs run --tier L2 --json
       - name: Verify installed CLI package
+        env:
+          KODO_TOOL_HOME: ${{ runner.temp }}/kodo-security-tools
         run: node scripts/package-smoke.mjs

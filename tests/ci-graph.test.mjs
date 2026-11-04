@@ -3,8 +3,10 @@ import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile, rm, rename } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { planAffected } from '../runtime/ci-graph.mjs';
+import { runCi } from '../runtime/ci-cli.mjs';
+import { execute } from '../runtime/command.mjs';
 
 const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8', windowsHide: true }).trim();
 async function put(root, file, text) { await mkdir(path.dirname(path.join(root, file)), { recursive: true }); await writeFile(path.join(root, file), text); }
@@ -24,6 +26,65 @@ test('Affected graph follows transitive re-exports and excludes independent test
   assert.equal(plan.fallback, false); assert.deepEqual(plan.testFiles, ['tests/value.test.mjs']);
   assert.deepEqual(plan.affectedFiles, ['src/bridge.mjs', 'src/value.mjs', 'tests/value.test.mjs']);
   assert.deepEqual(await planAffected(input), plan); assert.match(plan.sourceHash, /^[a-f0-9]{64}$/); assert.match(plan.dependencyHash, /^[a-f0-9]{64}$/);
+});
+
+test('Affected graph includes exact test basenames discovered by default Node runner', async t => {
+  for (const extension of ['js', 'mjs', 'cjs']) await t.test(`test.${extension}`, async t => {
+    const file = `test.${extension}`;
+    const source = extension === 'cjs'
+      ? "const {test} = require('node:test'); const assert = require('node:assert/strict'); const {value} = require('./src/value.mjs');"
+      : "import {test} from 'node:test'; import assert from 'node:assert/strict'; import {value} from './src/value.mjs';";
+    const fx = await fixture(t, { [file]: `${source}\ntest('exact basename assertion', () => assert.equal(value, 1));` });
+    // Nested runners must not inherit the parent node:test IPC context.
+    const env = { ...process.env }; delete env.NODE_TEST_CONTEXT;
+    const discover = () => spawnSync(process.execPath, ['--test', '--test-reporter=tap'], { cwd: fx.project, env, encoding: 'utf8', windowsHide: true });
+    const before = discover(); assert.equal(before.status, 0, before.stderr + before.stdout);
+    assert.match(before.stdout, /ok \d+ - exact basename assertion/);
+    await put(fx.project, 'src/value.mjs', 'export const value = 2;'); const headSha = fx.commit();
+    const after = discover(); assert.equal(after.status, 1, after.stderr + after.stdout);
+    assert.match(after.stdout, /not ok \d+ - exact basename assertion/);
+    const plan = await planAffected({ ...fx, headSha });
+    assert.equal(plan.fallback, false); assert.deepEqual(plan.reasons, []);
+    assert.ok(plan.affectedFiles.includes(file));
+    assert.deepEqual(plan.testFiles, [file, 'tests/value.test.mjs']);
+  });
+});
+
+test('L1 runs exact basename affected test and rejects its real failing assertion', async t => {
+  const fx = await fixture(t, { 'test.mjs': "import {test} from 'node:test'; import assert from 'node:assert/strict'; import {value} from './src/value.mjs'; test('L1 exact basename assertion', () => assert.equal(value, 1));" });
+  await put(fx.project, 'src/value.mjs', 'export const value = 2;'); fx.commit();
+  const calls = [];
+  const result = await runCi({ project: fx.project, baseSha: fx.baseSha, tier: 'L1' }, {
+    qualityRegistry: { detect: async () => ({ files: ['src/value.mjs', 'src/bridge.mjs', 'test.mjs', 'tests/value.test.mjs'].map(path => ({ path })) }), plan: async () => ({}) },
+    runQuality: async () => ({ status: 'not_applicable', receipts: [{ status: 'not_applicable' }] }),
+    execute: async (command, args, options) => {
+      const env = { ...options.env }; delete env.NODE_TEST_CONTEXT;
+      const observation = await execute(command, args, { ...options, env });
+      calls.push({ command, args, ...observation }); return observation;
+    }
+  });
+  assert.equal(result.complete, false, 'L1 must not accept a failing default-discovered test');
+  assert.equal(result.status, 'failed'); assert.equal(result.graph.fallback, false);
+  assert.deepEqual(result.graph.testFiles, ['test.mjs', 'tests/value.test.mjs']);
+  const receipt = result.receipts.find(row => row.phase === 'tests');
+  assert.equal(receipt?.status, 'failed'); assert.equal(receipt.exitCode, 1);
+  const testCall = calls.find(row => row.args[0] === '--test');
+  assert.equal(testCall.command, process.execPath);
+  assert.deepEqual(testCall.args, ['--test', 'test.mjs', 'tests/value.test.mjs']);
+  assert.match(testCall.stdout, /L1 exact basename assertion/);
+  assert.match(testCall.stdout, /2 !== 1/);
+});
+
+test('Affected graph preserves test naming conventions paths and fallback inventory', async t => {
+  const names = ['nested space #/test.mjs', 'nested/test.js', 'nested/test.cjs', 'tests/value_test.js', 'tests/value-spec.cjs', 'tests/test-value.mjs', 'test/helper.js', '__tests__/helper.mjs'];
+  const extras = Object.fromEntries([...names, 'nested/tester.mjs', 'nested/contest.js', 'nested/test.json'].map(file => [file, file.endsWith('.json') ? '{}' : file.endsWith('.cjs') ? "require('../src/value.mjs');" : "import '../src/value.mjs';"]));
+  const fx = await fixture(t, extras); await put(fx.project, 'src/value.mjs', 'export const value = 2;');
+  const narrow = await planAffected({ ...fx, headSha: fx.commit() });
+  const expected = [...names, 'tests/value.test.mjs'].sort();
+  assert.equal(narrow.fallback, false); assert.deepEqual(narrow.testFiles, expected);
+  await put(fx.project, 'unknown.config.json', '{}');
+  const broad = await planAffected({ ...fx, headSha: fx.commit() });
+  assert.equal(broad.fallback, true); assert.deepEqual(broad.testFiles, [...expected, 'tests/other.test.mjs'].sort());
 });
 
 test('Affected graph parses literal dynamic imports require and workspace package boundaries', async t => {
