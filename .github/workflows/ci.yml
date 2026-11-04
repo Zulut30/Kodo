@@ -74,12 +74,27 @@ jobs:
           cache: npm
           cache-dependency-path: package-lock.json
       - run: npm ci --ignore-scripts
-      - name: Install pinned security tools
+      # The runtime installer requires existing Python 3.12 and uv; CI owns setup.
+      - name: Set up Python 3.12 for Semgrep
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Record resolved Python patch version
+        run: python --version
+      - name: Set up pinned uv for Semgrep
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: '0.12.3'
+          enable-cache: false
+      # Separate steps keep a failed install fatal under both bash and PowerShell.
+      - name: Install pinned Semgrep
         env:
           KODO_TOOL_HOME: ${{ runner.temp }}/kodo-security-tools
-        run: |
-          node cli/index.mjs tools install semgrep --json
-          node cli/index.mjs tools install gitleaks --json
+        run: node cli/index.mjs tools install semgrep --json
+      - name: Install pinned Gitleaks
+        env:
+          KODO_TOOL_HOME: ${{ runner.temp }}/kodo-security-tools
+        run: node cli/index.mjs tools install gitleaks --json
       - name: L2 npm run check and fresh mandatory security
         env:
           KODO_TOOL_HOME: ${{ runner.temp }}/kodo-security-tools
