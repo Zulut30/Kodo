@@ -2,6 +2,7 @@ import { readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { normalizeUIConfig } from './ui-verification.mjs';
 import { normalizeSecurityConfig } from './security-gates.mjs';
+import { normalizeArchitectureConfig } from './architecture-gate.mjs';
 import { normalizeMode } from './modes.mjs';
 // Read-time provenance only: Engine persists the explicit choice on a new run.
 // The default 2 must not become an explicit override of quick's default 1.
@@ -14,7 +15,7 @@ export const defaults = {
   schemaVersion: 1, repository: null, baseBranch: 'main', client: 'codex', primaryModel: null,
   models: { codex: ['gpt-6.1-sol', 'gpt-6-astra', 'gpt-6.1-terra'], 'claude-code': ['opus', 'sonnet'] },
   concurrency: 2, repairRounds: 5, researchBudget: 40,
-  uiVerification: normalizeUIConfig(), security: normalizeSecurityConfig(),
+  uiVerification: normalizeUIConfig(), security: normalizeSecurityConfig(), architecture: normalizeArchitectureConfig(),
   commands: { test: [{ command: 'npm', args: ['test'] }], build: [], deploy: [], smoke: [] },
   checks: ['check (ubuntu-latest, 24)', 'check (windows-latest, 24)'],
   delivery: { enabled: false, release: false, firstVersion: '0.2.0' }
@@ -38,6 +39,7 @@ export async function readConfig(project, overrides = {}) {
   normalizeMode(config.executionMode);
   if (config.maxTasks !== undefined && (!Number.isSafeInteger(config.maxTasks) || config.maxTasks < 1 || config.maxTasks > 24)) throw new Error('Некорректный лимит maxTasks');
   config.uiVerification = normalizeUIConfig(config.uiVerification); config.security = normalizeSecurityConfig(config.security);
+  config.architecture = normalizeArchitectureConfig(config.architecture);
   for (const kind of ['test', 'build', 'deploy', 'smoke']) if (!Array.isArray(config.commands[kind]) || config.commands[kind].some(item => typeof item.command !== 'string' || !Array.isArray(item.args) || item.args.some(arg => typeof arg !== 'string'))) throw new Error(`Некорректные команды ${kind}`);
   validateCommandTimeouts(config.commands);
   return config;
