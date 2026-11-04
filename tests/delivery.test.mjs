@@ -480,7 +480,7 @@ test('Credential redaction covers direct runner overlapping environment and opti
 });
 
 const defaultOutputCap = 20 * 1024 * 1024;
-const boundarySecret = 'fixture-env-boundary-0123456789abcde';
+const boundarySecret = ['fixture-env-boundary', '0123456789abcde'].join('-');
 const boundaryMarker = 'actionable assertion before boundary\n';
 async function outputBoundaryScript(directory, stream, cap = defaultOutputCap) {
   const configFile = path.join(directory, 'output-boundary.json');
