@@ -13,7 +13,7 @@ import { chmod, lstat, mkdir, mkdtemp, open, readFile, readdir, realpath, rename
 import catalog from './tool-catalog.json' with { type: 'json' };
 import { execute } from './command.mjs';
 import { stateHome, workerEnvironment } from './security.mjs';
-import { createVenvScript, downloadScript, extractNativeArchive, fileHash, inside, inventory, noLinks, pythonProbeScript, relativeFile, sha256 } from './toolchains.mjs';
+import { createVenvScript, downloadScript, extractNativeArchive, fileHash, inside, inventory, noLinks, npmEntrypoint, pythonEntrypoint, pythonProbeScript, relativeFile, sha256, supportsNodeEngine } from './toolchains.mjs';
 import { formatRtkContext, isManagedRtkReady } from './rtk.mjs';
 
 function freeze(value) {
@@ -33,7 +33,9 @@ function groupKey(tool, platform, arch) {
   const pins = members(tool);
   return `${tool.kind === 'python' ? `python-${tool.group}` : tool.id}-${sha256(JSON.stringify({ schema: SCHEMA, platform, arch, pins })).slice(0, 24)}`;
 }
-function supported(tool, platform, arch) { return tool.assets ? Boolean(tool.assets[`${platform}-${arch}`]) : tool.platforms.includes(`${platform}-${arch}`); }
+function supported(tool, platform, arch) {
+  return (!tool.engines || supportsNodeEngine(tool.engines.node)) && (tool.assets ? Boolean(tool.assets[`${platform}-${arch}`]) : tool.platforms.includes(`${platform}-${arch}`));
+}
 function result(tool, status, reason, extra = {}) {
   return { id: tool.id, version: tool.version, command: null, args: [], ready: status === 'ready', status, ...(reason ? { reason } : {}), ...extra };
 }
@@ -85,12 +87,13 @@ function desktopHelper(platform, arch) {
 }
 function invocation(tool, directory, platform, arch) {
   if (tool.kind === 'python') return {
-    command: pythonPath(directory, platform), args: tool.id === 'semgrep' ? ['-I', '-B', '-c', 'from semgrep.console_scripts.entrypoint import main; main()'] : ['-I', '-B'],
+    command: pythonPath(directory, platform), args: tool.id === 'semgrep' ? ['-I', '-B', '-c', 'from semgrep.console_scripts.entrypoint import main; main()'] : ['-I', '-B', ...(tool.entryModule ? ['-m', pythonEntrypoint(tool.entryModule)] : [])],
     env: { PYTHONDONTWRITEBYTECODE: '1', PYTHONNOUSERSITE: '1', ANONYMIZED_TELEMETRY: 'false', SEMGREP_SEND_METRICS: 'off', SEMGREP_ENABLE_VERSION_CHECK: '0' }
   };
   if (tool.kind === 'native') return { command: path.join(directory, 'native', tool.assets[`${platform}-${arch}`].executable), args: [], env: tool.id === 'rtk' ? { RTK_RECALL: '0', RTK_TEE: '0', RTK_TELEMETRY_DISABLED: '1' } : {} };
   const root = path.join(directory, 'npm', 'node_modules', tool.id);
   if (tool.id === 'chrome-devtools-mcp') return { command: process.execPath, args: [path.join(root, tool.entry), '--no-usage-statistics', '--no-performance-crux'], env: { NO_UPDATE_CHECKS: '1', CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS: '1' } };
+  if (tool.id !== 'agent-desktop') return { command: process.execPath, args: [path.join(root, relativeFile(tool.entry))], env: { NO_UPDATE_CHECKS: '1' } };
   const helper = desktopHelper(platform, arch);
   return { command: path.join(root, 'bin', desktopName(platform, arch)), args: [], env: helper ? {
     [platform === 'darwin' ? 'AGENT_DESKTOP_MACOS_HELPER_PATH' : 'AGENT_DESKTOP_LINUX_CLIPBOARD_OWNER_PATH']: path.join(root, 'bin', helper)
@@ -113,12 +116,12 @@ async function verifyNpm(tool, directory, platform, arch, installed = true) {
       const expected = (await readFile(binary + '.sha256', 'utf8')).trim();
       if (!/^[a-f0-9]{64}$/i.test(expected) || await fileHash(binary) !== expected.toLowerCase()) throw new Error('Desktop binary checksum mismatch');
     }
-  } else if (![tool.entry, './' + tool.entry].includes(pkg.bin?.['chrome-devtools-mcp'])) throw new Error('Unexpected Chrome MCP entrypoint');
+  } else npmEntrypoint(tool.id === 'chrome-devtools-mcp' ? { ...tool, binName: tool.id } : tool, pkg);
 }
 async function validateInstallation(tool, directory, platform, arch) {
   const call = invocation(tool, directory, platform, arch);
   // Node itself lives outside this install; validate the actual script too.
-  const target = tool.id === 'chrome-devtools-mcp' ? call.args[0] : call.command;
+  const target = tool.kind === 'npm' && tool.id !== 'agent-desktop' ? call.args[0] : call.command;
   await noLinks(target);
   if (!(await lstat(target)).isFile()) throw new Error('Missing executable');
   if (tool.kind === 'native' && tool.licenseFile) {
@@ -134,7 +137,7 @@ async function validateInstallation(tool, directory, platform, arch) {
   return call;
 }
 async function resolved(tool, home, platform, arch) {
-  if (!supported(tool, platform, arch)) return result(tool, 'unsupported', 'No pinned package for this platform/architecture');
+  if (!supported(tool, platform, arch)) return result(tool, 'unsupported', 'No pinned package for this platform/architecture or Node runtime');
   const key = groupKey(tool, platform, arch), base = path.join(home, key), receiptPath = path.join(base, 'receipt.json');
   try {
     await noLinks(base);
@@ -187,14 +190,14 @@ async function workingDirectory(directory) {
   await mkdir(path.join(directory, 'work'), { recursive: true, mode: 0o700 });
   for (const name of ['empty.npmrc', 'global.npmrc', 'empty.gitconfig']) await writeFile(path.join(directory, 'work', name), '', { mode: 0o600 });
 }
-function pythonPins(tool) { return members(tool).map(t => ({ id: t.id, version: t.version, module: t.module, revision: t.revision, git: t.spec.includes('git+') })); }
+function pythonPins(tool) { return members(tool).map(t => ({ id: t.id, version: t.version, module: t.module, revision: t.revision, git: t.spec.includes('git+'), ...(t.entryModule ? { entryModule: pythonEntrypoint(t.entryModule) } : {}) })); }
 async function probe(tool, directory, platform, arch, runner, signal, cwd = directory) {
   const call = invocation(tool, directory, platform, arch);
   if (tool.kind === 'python') {
     const output = await run(runner, call.command, ['-I', '-B', '-c', pythonProbeScript, JSON.stringify(pythonPins(tool))], cwd, signal, call.env, 30000);
     let parsed; try { parsed = JSON.parse(output); } catch { throw new Error('Invalid Python metadata result'); }
     if (parsed.python !== '3.12' || parsed.assets !== true || !members(tool).every(t => parsed.versions?.[t.id] === t.version && (!t.spec.includes('git+') || parsed.revisions?.[t.id] === t.revision))) throw new Error('Python metadata mismatch');
-    if (tool.id !== 'semgrep') return;
+    if (tool.id !== 'semgrep' && !tool.entryModule) return;
   }
   const flag = tool.id === 'gitleaks' ? 'version' : '--version';
   const probeEnv = tool.id === 'rtk' ? { ...call.env, RTK_DB_PATH: path.join(cwd, 'work', 'tracking.db') } : call.env;
@@ -205,7 +208,7 @@ async function probe(tool, directory, platform, arch, runner, signal, cwd = dire
   const pattern = tool.id === 'ripgrep' ? new RegExp(`^ripgrep ${escaped}(?: \\(rev [a-f0-9]+\\))?$`)
     : tool.id === 'agent-desktop' ? new RegExp(`^agent-desktop ${escaped}$`)
       : tool.id === 'gitleaks' ? new RegExp(`^(?:gitleaks(?: version)? )?${escaped}$`)
-        : tool.id === 'rtk' ? new RegExp(`^rtk ${escaped}$`) : new RegExp(`^${escaped}$`);
+        : tool.id === 'rtk' ? new RegExp(`^rtk ${escaped}$`) : tool.versionPrefixes ? new RegExp(`^(?:${tool.versionPrefixes.map(prefix => prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})${escaped}$`) : new RegExp(`^${escaped}$`);
   if (output.length > 4096 || !pattern.test(tool.id === 'ripgrep' ? text.split(/\r?\n/)[0] : text)) throw new Error('Tool version mismatch');
 }
 async function installNpm(tool, directory, platform, arch, runner, signal) {
@@ -214,7 +217,7 @@ async function installNpm(tool, directory, platform, arch, runner, signal) {
   // A lock-only resolution cannot execute upstream scripts. Check its root
   // integrity against the research pin before npm ci downloads/extracts it.
   await workingDirectory(npm);
-  const flags = ['--ignore-scripts', '--no-audit', '--no-fund', '--no-bin-links', '--registry=https://registry.npmjs.org/'];
+  const flags = ['--ignore-scripts', '--no-audit', '--no-fund', '--no-bin-links', '--registry=https://registry.npmjs.org/', ...(tool.engines ? ['--engine-strict'] : [])];
   await run(runner, 'npm', ['install', '--package-lock-only', ...flags], npm, signal);
   await verifyNpm(tool, directory, platform, arch, false);
   await run(runner, 'npm', ['ci', ...flags], npm, signal);
@@ -232,7 +235,20 @@ async function installPython(tool, directory, platform, runner, signal) {
   const found = (await run(runner, 'uv', ['python', 'find', '--no-project', '--no-config', '--no-python-downloads', '3.12'], directory, signal, { UV_PYTHON_INSTALL_DIR: existingPythonHome }, 30000)).trim();
   if (!path.isAbsolute(found) || /[\r\n\0]/.test(found)) throw new Error('Python 3.12 interpreter unavailable');
   await run(runner, found, ['-I', '-B', '-c', createVenvScript, path.join(directory, 'venv')], directory, signal);
-  await run(runner, 'uv', ['pip', 'install', '--no-config', '--no-python-downloads', '--keyring-provider', 'disabled', '--link-mode', 'copy', '--python', pythonPath(directory, platform), '--default-index', 'https://pypi.org/simple', ...members(tool).map(t => t.spec)], directory, signal, {}, 900000);
+  const pins = members(tool);
+  let requirements = pins.map(t => t.spec);
+  if (pins.some(t => t.files)) {
+    // uv verifies supplied hashes while resolving transitive dependencies.
+    // Pin the primary artifacts before package code can be imported/probed.
+    const lines = pins.map(t => {
+      if (t.spec !== `${t.id}==${t.version}` || !Array.isArray(t.files) || !t.files.length || t.files.some(f => !/^[a-f0-9]{64}$/.test(f.sha256))) throw new Error('Invalid Python artifact pins');
+      return `${t.spec} ${t.files.map(f => `--hash=sha256:${f.sha256}`).join(' ')}`;
+    });
+    const filename = path.join(directory, 'requirements.txt');
+    await writeFile(filename, lines.join('\n') + '\n', { flag: 'wx', mode: 0o600 });
+    requirements = ['--requirement', filename];
+  }
+  await run(runner, 'uv', ['pip', 'install', '--no-config', '--no-python-downloads', '--keyring-provider', 'disabled', '--link-mode', 'copy', '--python', pythonPath(directory, platform), '--default-index', 'https://pypi.org/simple', ...requirements], directory, signal, {}, 900000);
 }
 async function installNative(tool, directory, platform, arch, runner, signal) {
   const asset = tool.assets[`${platform}-${arch}`], archive = path.join(directory, 'download');

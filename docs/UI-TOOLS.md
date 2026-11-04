@@ -1,6 +1,6 @@
 # Инструменты UI и локальной проверки
 
-Kodo управляет десятью необязательными инструментами через `runtime/tools.mjs`. Каталог `runtime/tool-catalog.json` закрепляет версии, Git-ревизии, npm integrity и SHA-256 нативных архивов. Это отдельный механизм: в registry остаются 33 компонента, в политике — 13 стандартных навыков. Базовый CLI, чтение конфигурации и обычные тесты не устанавливают инструменты и не обращаются к моделям.
+Kodo управляет шестнадцатью необязательными инструментами через `runtime/tools.mjs`. Каталог `runtime/tool-catalog.json` закрепляет версии, Git-ревизии, npm integrity и SHA-256 нативных архивов. Это отдельный механизм: в registry остаются 33 компонента, в политике — 13 стандартных навыков. Базовый CLI, чтение конфигурации и обычные тесты не устанавливают инструменты и не обращаются к моделям.
 
 ## Роли, версии и лицензии
 
@@ -16,8 +16,14 @@ Kodo управляет десятью необязательными инстр
 | `gitleaks` | native `8.30.1` | MIT | Поиск секретов в текущем tracked source; ограниченная история по явной настройке |
 | `ripgrep` | native `15.2.0` | MIT OR Unlicense | Поиск кода по явным путям/glob с ограниченным выводом |
 | `rtk` | OSS native `1.1.0`, `753a3b0e939f2e4490fc24e3a1984010f40a103c` | Apache-2.0 | Необязательная явная фильтрация поддерживаемого человекочитаемого shell-вывода |
+| `oxlint` | npm `1.91.0` | MIT | Проверка JS/TS lint без исправления файлов |
+| `oxfmt` | npm `0.76.0` | MIT | Проверка форматирования поддерживаемых исходников |
+| `typescript` | npm `7.0.2`, `2bd066d87f5bafd315be9f40889d0a60b9e58e0b` | Apache-2.0 | `tsc` для проверки типов без emit |
+| `stylelint` | npm `18.0.0`, `7c49e1828311b9d413826cb47703ef1c6ccae4ef` | MIT | CSS lint с конфигурацией проекта |
+| `html-validate` | npm `11.18.0`, `eb0f0df1a6062e783bc5505d899cdaf5c2fdcac7` | MIT | HTML validation с конфигурацией проекта |
+| `sqlfluff` | Python `4.5.0` | MIT | SQL lint с явно указанным dialect |
 
-Исходники: [Agent Desktop](https://github.com/vercel-labs/agent-desktop), [Browser Use](https://github.com/browser-use/browser-use), [Browser Harness](https://github.com/browser-use/browser-harness), [Vibetest](https://github.com/browser-use/vibetest-use), [Jev Ultrafast](https://github.com/browser-use/jev-ultrafast), [Chrome DevTools MCP](https://github.com/ChromeDevTools/chrome-devtools-mcp), [Semgrep](https://github.com/semgrep/semgrep), [Gitleaks](https://github.com/gitleaks/gitleaks), [ripgrep](https://github.com/BurntSushi/ripgrep), [RTK pinned source](https://github.com/rtk-ai/rtk/tree/753a3b0e939f2e4490fc24e3a1984010f40a103c). Pin и лицензия относятся к конкретному инструменту, а не ко всему Kodo. Полные digest и платформенные assets находятся в каталоге, а не подбираются по `latest` во время установки.
+Исходники: [Agent Desktop](https://github.com/vercel-labs/agent-desktop), [Browser Use](https://github.com/browser-use/browser-use), [Browser Harness](https://github.com/browser-use/browser-harness), [Vibetest](https://github.com/browser-use/vibetest-use), [Jev Ultrafast](https://github.com/browser-use/jev-ultrafast), [Chrome DevTools MCP](https://github.com/ChromeDevTools/chrome-devtools-mcp), [Semgrep](https://github.com/semgrep/semgrep), [Gitleaks](https://github.com/gitleaks/gitleaks), [ripgrep](https://github.com/BurntSushi/ripgrep), [RTK pinned source](https://github.com/rtk-ai/rtk/tree/753a3b0e939f2e4490fc24e3a1984010f40a103c). [Oxlint/Oxfmt](https://github.com/oxc-project/oxc), [TypeScript](https://github.com/microsoft/TypeScript), [Stylelint](https://github.com/stylelint/stylelint), [HTML-Validate](https://gitlab.com/html-validate/html-validate), [SQLFluff](https://github.com/sqlfluff/sqlfluff). Pin и лицензия относятся к конкретному инструменту, а не ко всему Kodo. Полные digest и платформенные assets находятся в каталоге, а не подбираются по `latest` во время установки.
 
 ## Управляемая установка и doctor
 
@@ -28,6 +34,8 @@ kodo tools list --json
 kodo tools doctor --json
 kodo tools doctor --live --json
 kodo tools install browser-harness --json
+kodo tools install typescript --json
+kodo tools install sqlfluff --json
 kodo tools install all --json
 kodo ui verify --project "D:\Projects\my-app" --json
 kodo security verify --project "D:\Projects\my-app" --json
@@ -35,9 +43,9 @@ kodo security verify --project "D:\Projects\my-app" --json
 
 `list` возвращает метаданные. `doctor`, включая `--live`, проверяет управляемые файлы и версии/import metadata; он не подключается к личному браузеру, не открывает UI и не вызывает модель. Это отличается от общего `kodo doctor --live`, проверяющего провайдеров. Отсутствующие, неподдерживаемые или повреждённые установки имеют явный статус и `ready: false`; doctor/install возвращают ненулевой код, если запрошенные инструменты не готовы. Неизвестные ID, лишние аргументы и неподходящие флаги отклоняются.
 
-Нужны Node.js 24/npm; Python-инструментам также нужны уже доступные `uv`, Python 3.12 и Git для двух Git pins. Kodo не устанавливает uv и не обновляет системный Python. Четыре браузерных Python-пакета ставятся в общий закрытый venv, Semgrep — в отдельный. Проверяются версии, Git pins и необходимые browser assets, включая Jev `snapshot.js`. Наличие зависимостей сторонних провайдеров в venv не разрешает API fallback.
+Нужны Node.js 24/npm; для всех новых npm pins подходит Node.js 24.15.0+ (точные engines сохранены в каталоге, установка проверяет их через `--engine-strict`); Python-инструментам также нужны уже доступные `uv`, Python 3.12 и Git для двух Git pins. Kodo не устанавливает uv и не обновляет системный Python. Четыре браузерных Python-пакета ставятся в общий закрытый venv, Semgrep и SQLFluff — в отдельные venv. SQLFluff получает requirements-файл с SHA-256 wheel/sdist из закреплённой PyPI metadata; uv проверяет эти hashes, затем inventory фиксирует все файлы зависимостей. Наличие hash у основного пакета не означает заранее закреплённые версии всех его transitive dependencies. Проверяются версии, Git pins и необходимые browser assets, включая Jev `snapshot.js`. Наличие зависимостей сторонних провайдеров в venv не разрешает API fallback.
 
-Инструменты находятся вне Git: `KODO_TOOL_HOME` либо соседний с каталогом состояния `Kodo-Tools`. Принимается только отдельный безопасный каталог, без ссылок и пересечения с проектом. Установки сериализуются, повторно используются только точные pins с проверенной квитанцией и хешами файлов. npm lifecycle scripts отключены; Agent Desktop использует комплектный бинарник с соседним `.sha256`. Нативные архивы проверяются до безопасной распаковки. Глобальные инструменты и исследовательские окружения не изменяются. Установка происходит по явной `tools install` либо по `autoInstall: true` у включённого gate; doctor никогда не устанавливает.
+Инструменты находятся вне Git: `KODO_TOOL_HOME` либо соседний с каталогом состояния `Kodo-Tools`. Принимается только отдельный безопасный каталог, без ссылок и пересечения с проектом. Установки сериализуются, повторно используются только точные pins с проверенной квитанцией и хешами файлов. npm lifecycle scripts отключены; общие npm entrypoints запускаются через текущий Node только после совпадения pinned `binName`/`entry` с package metadata, проверки безопасного относительного пути, отсутствия symlinks и полного inventory. Python `entryModule` — проверенное имя модуля, запускаемое через `-I -B -m`, с проверкой наличия entrypoint и точной CLI-версии; Agent Desktop использует комплектный бинарник с соседним `.sha256`. Нативные архивы проверяются до безопасной распаковки. Глобальные инструменты и исследовательские окружения не изменяются. Установка происходит по явной `tools install` либо по `autoInstall: true` у включённого gate; doctor никогда не устанавливает.
 
 Для UI нужен установленный Chrome/Chromium, при необходимости абсолютный `uiVerification.executablePath`, либо доступное собственное desktop-приложение. Матрица пакетов охватывает Windows/Linux/macOS x64/arm64, но зависит от инструмента: Semgrep pin объявлен для Windows x64, Linux x64/arm64 и macOS arm64; RTK — только Windows x64/Linux x64. Доступность пакета на платформе не доказывает работу её accessibility API или UI-сценария.
 
