@@ -1,6 +1,6 @@
 # Этап 02 — Language Quality Engine
 
-2026-11-04. **Независимый RED → coordinator scoped GREEN; весь этап ещё не принят.** Исходный integration HEAD `977f9767ee9b56c8789b1b67b5e9a482d57a8887` остаётся RED; исправления координатора отдельно прошли scoped-проверки с неизменённым acceptance oracle. Node `v24.19.0`, Windows x64. [Фаза 01](phase-01.md) принята через PR #10 / merge `ef38109e` / CI `41822569460`. Фазы 03–13 не начаты. PR фазы 02: **PENDING**; exact-head Linux/Windows CI: **PENDING**; нового release нет.
+2026-11-04. **Второй repair scoped GREEN на `1574a3c`; весь этап ещё не принят, full check/CI нового head PENDING.** Исходный integration HEAD `977f9767ee9b56c8789b1b67b5e9a482d57a8887` остаётся RED; исправления координатора отдельно прошли scoped-проверки с неизменённым acceptance oracle. Node `v24.19.0`, Windows x64. [Фаза 01](phase-01.md) принята через PR #10 / merge `ef38109e` / CI `41822569460`. Фазы 03–13 не начаты. PR фазы 02: **PENDING**; exact-head Linux/Windows CI: **PENDING**; нового release нет.
 
 Публичный контракт: [QUALITY](../QUALITY.md), [ADR-0005](../decisions/0005-language-quality-profiles.md). Девять языков, offline detect/plan/run, отдельные capability receipts, strict pins/debt/scope. Используются существующие installer/managed `resolveTool` и owned-process `delivery.execute`; credential/provider startup не нужен. Архитектурный движок, CI/cache и автоматическая доставка не добавлены.
 
@@ -28,6 +28,23 @@ node --test --test-reporter=tap tests/quality-profiles.test.mjs tests/quality-ru
 ```
 
 Эта команда повторяется с дочерними `TEMP/TMP`, указывающими на owned 8.3 scratch; `alias-tmp.txt` хранит точный путь. Frozen acceptance SHA-256 остаётся `7101c8462ca38870282720b5f759ec55a50ecaeae0705bc682fc6606a139db73`. Уроки: строковая идентичность пути не доказывает filesystem identity; source-only пересечение теряет изменения конфигурации; после смены namespace все проверки containment и diagnostics должны использовать тот же канонический корень. Наличие Windows scoped GREEN не заменяет Windows CI и fresh review.
+
+## Второй repair: TypeScript references и внутренние Windows 8.3 diagnostics
+
+2026-11-04. Проверен только diff `dfc69bf679a3330359f53ee3702bc7773d5b1512..1574a3c1b022e9e746326ca297cf89f0bf0d43a6`: два runtime-файла и две регрессии; все четыре SHA-256 совпали с `coordinator-scope-repair-adoption.json`, original plan неизменён. Runtime/test source worker не менял. TypeScript reference проходит containment/noLinks и проверку inventory до компилятора; внешняя и исключённая зависимости отклоняются, внутренняя разрешена. Windows diagnostic alias внутри канонического root теперь проходит link-free canonicalization при несовпадении с inventory; внешняя диагностика по-прежнему отклоняется.
+
+Сохранённый actual TSC probe на `dfc69bf` подтверждает причину major finding: первая проверка PASS, после внешней мутации прежний receipt всё ещё current, повторный TSC FAIL. `scope-repair-red.tap`: **0 PASS / 2 FAIL** (`Missing expected rejection`, `invalid_output`). `scope-repair-green.tap`: **102 PASS**, но до финального excluded-reference guard; этот результат не удостоверяет точный финальный source. `scope-repair-final-targeted.tap`: **2 PASS** на финальном source.
+
+Независимый worker повторил на `1574a3c`:
+
+```powershell
+node --test --test-reporter=tap --test-name-pattern '^Quality (TypeScript reference directives|Windows short names inside)' tests/quality-profiles.test.mjs tests/quality-runner.test.mjs
+node --test --test-reporter=tap --test-name-pattern '^QACC-(12|13|14|21) ' tests/quality-acceptance.test.mjs
+```
+
+Точные регрессии: `Quality TypeScript reference directives stay inside the inventoried project` — external/excluded отказ и valid internal ref; `Quality Windows short names inside the root map only to inventoried diagnostic files` — реальный вложенный 8.3 alias внутри root и outside отказ. Первый запуск **2 PASS**, 913.9677 ms; второй **4 PASS**, 5447.3893 ms; оба exit 0, без fail/cancelled/skip. Frozen acceptance SHA-256 `7101c8462ca38870282720b5f759ec55a50ecaeae0705bc682fc6606a139db73` неизменён. Private scoped receipt и raw TAP: `%TEMP%/kodo-roadmap-20261104/repair02-validation/`.
+
+Full `npm run check`, fresh security gates/review и Linux/Windows CI для нового head **PENDING**, их выполняет координатор. Исторические coordinator local `dfc69bf` **842 tests / 840 PASS / 2 SKIP** и обе ОС CI `41841801700` PASS не являются PASS нового head. UI disabled/not-applicable; новые native provider checks не запускались, published artifact/deployment evidence отсутствует. Урок: неучтённый compiler input делает receipt ненадёжным; строковое containment ещё не сопоставляет DOS alias с inventoried файлом. Фазы 03–13 не начаты.
 
 ## Независимые проверки
 
