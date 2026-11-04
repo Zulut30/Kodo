@@ -5,7 +5,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { Store } from './store.mjs';
 import { loadSecrets, redact, workerEnvironment, secretFile, worktreeHome, stateHome } from './security.mjs';
-import { readConfig } from './config.mjs';
+import { readConfig, validateCommandTimeouts } from './config.mjs';
 import { validatePlan, validate, planSchema, resultSchema, reviewSchema, routingSchema, ownsPath, scopesOverlap } from './contracts.mjs';
 import { execute, resolveCommand } from './command.mjs';
 import { git, inspectProject, makeWorktree, collectFiles, changedFiles, commitChanges, diffHash } from './workspace.mjs';
@@ -684,6 +684,7 @@ try {
     });
   }
   async checks(run, signal) {
+    validateCommandTimeouts(run.config.commands);
     run.state = 'testing'; this.save(run); await this.setup(run.cwd, run, signal);
     if (await git(run.cwd, ['status', '--porcelain'])) throw Object.assign(new Error('Проверка commit требует чистого integration worktree'), { code: 'dirty_worktree' });
     const headSha = await git(run.cwd, ['rev-parse', 'HEAD']);
@@ -697,7 +698,7 @@ try {
     run.checks = { schemaVersion: 2, headSha, fingerprint, complete: false, results }; this.save(run);
     for (const kind of ['test', 'build']) for (const command of run.config.commands[kind]) {
       this.checkCancelled(run, signal); this.log(run, 'check_started', { kind, command });
-      const result = await execute(command.command, command.args, { cwd: run.cwd, signal, env: workerEnvironment(), secrets: this.secrets, allowFailure: true });
+      const result = await execute(command.command, command.args, { cwd: run.cwd, signal, env: workerEnvironment(), secrets: this.secrets, timeoutMs: command.timeoutMs, allowFailure: true });
       if (await git(run.cwd, ['rev-parse', 'HEAD']) !== headSha || await git(run.cwd, ['status', '--porcelain'])) throw Object.assign(new Error('Команда проверки изменила проверяемый commit или файлы'), { code: 'dirty_worktree' });
       const evidence = await this.persistEvidence(run, 'check', { kind, command, exitCode: result.code, stdout: result.stdout, stderr: result.stderr }, { headSha });
       results.push({ kind, command, exitCode: result.code, output: (result.stdout + result.stderr).slice(-24000), outputPath: evidence.path, outputHash: evidence.sha256 }); this.save(run);
@@ -910,13 +911,16 @@ try {
     signal = controller.signal;
     const cancellation = setInterval(() => { if (this.store.getRun(id).cancelRequested) cancel(); }, 500); cancellation.unref();
     try {
+      // Saved runs bypass readConfig; reject invalid timer values before any
+      // preparation, check reuse or coordinator delivery command can start.
+      validateCommandTimeouts(run.config.commands);
       this.checkCancelled(run, signal); await this.prepare(run, signal);
       if (prepare && !run.plan) { run.state = 'awaiting_plan'; run.planningContext = `${await this.policy(run, 'plan')}\n${this.planInstructions(run)}`; await writeFile(path.join(run.artifacts, 'plan-context.md'), run.planningContext); await writeFile(path.join(run.artifacts, 'plan.schema.json'), JSON.stringify({ ...planSchema, properties: { ...planSchema.properties, tasks: { ...planSchema.properties.tasks, maxItems: run.executionMode.profile.maxTasks } } }, null, 2)); this.save(run); return run; }
       if (run.verification?.stopped) throw Object.assign(new Error('Verification repair cycle stopped; use --retry-failed for a new cycle'), { code: 'blocked' });
       // Recover a completed external merge before requiring native clients.
       // A lost delivery receipt must not rediscover models or replay analysis.
       if (run.delivery?.pr && this.delivery.reconcileDelivery) {
-        const recovered = await this.delivery.reconcileDelivery({ run, config: run.config, store: this.store, cwd: run.cwd, signal });
+        const recovered = await this.delivery.reconcileDelivery({ run, config: run.config, store: this.store, cwd: run.cwd, secrets: this.secrets, signal });
         if (recovered) { run.delivery = recovered; this.save(run); }
       }
       if (!run.delivery?.mergeCommit) {
@@ -934,7 +938,7 @@ try {
         await this.recoverIntegrationEdits(run, signal);
         if (run.config.delivery.enabled) await this.synchronizeBase(run, signal);
         if (run.config.delivery.release) {
-          if (this.delivery.prepareReleaseVersion) await this.delivery.prepareReleaseVersion({ run, config: run.config, store: this.store, cwd: run.cwd, signal });
+          if (this.delivery.prepareReleaseVersion) await this.delivery.prepareReleaseVersion({ run, config: run.config, store: this.store, cwd: run.cwd, secrets: this.secrets, signal });
           await commitChanges(run.cwd, 'Kodo assign release version', ['package.json', 'package-lock.json', 'registry.json']);
         }
         await this.verify(run, signal);
@@ -943,16 +947,16 @@ try {
       if (run.config.delivery.enabled) {
         run.state = 'delivering'; this.save(run);
         for (let attempt = 0; ; attempt++) {
-          try { run.delivery = await this.delivery.deliver({ run, config: run.config, store: this.store, cwd: run.cwd, review: run.review, signal, onEvent: event => this.log(run, 'delivery', event) }); break; }
+          try { run.delivery = await this.delivery.deliver({ run, config: run.config, store: this.store, cwd: run.cwd, review: run.review, secrets: this.secrets, signal, onEvent: event => this.log(run, 'delivery', event) }); break; }
           catch (error) {
             if (error.code !== 'stale_base' || attempt >= 3) throw error;
             if (run.delivery?.pr && this.delivery.reconcileDelivery) {
-              const recovered = await this.delivery.reconcileDelivery({ run, config: run.config, store: this.store, cwd: run.cwd, signal });
+              const recovered = await this.delivery.reconcileDelivery({ run, config: run.config, store: this.store, cwd: run.cwd, secrets: this.secrets, signal });
               if (recovered) { run.delivery = recovered; break; }
             }
             await this.synchronizeBase(run, signal);
             if (run.config.delivery.release && this.delivery.prepareReleaseVersion) {
-              await this.delivery.prepareReleaseVersion({ run, config: run.config, store: this.store, cwd: run.cwd, signal });
+              await this.delivery.prepareReleaseVersion({ run, config: run.config, store: this.store, cwd: run.cwd, secrets: this.secrets, signal });
               await commitChanges(run.cwd, 'Kodo refresh release version', ['package.json', 'package-lock.json', 'registry.json']);
             }
             await this.verify(run, signal);
@@ -962,7 +966,7 @@ try {
         this.checkCancelled(run, signal);
         if (run.config.delivery.release) {
           run.state = 'releasing'; this.save(run);
-          run.release = await this.delivery.releasePackage({ run, config: run.config, store: this.store, cwd: run.cwd, mergeCommit: run.delivery.mergeCommit, signal, onEvent: event => this.log(run, 'release', event) });
+          run.release = await this.delivery.releasePackage({ run, config: run.config, store: this.store, cwd: run.cwd, mergeCommit: run.delivery.mergeCommit, secrets: this.secrets, signal, onEvent: event => this.log(run, 'release', event) });
         }
       }
       if (!run.release?.published) this.checkCancelled(run, signal);
