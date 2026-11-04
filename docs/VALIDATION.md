@@ -85,6 +85,28 @@ node --test --test-reporter=tap --test-name-pattern='Output boundary redaction|C
 
 Gitleaks обнаружил `generic-api-key` в статическом фиктивном `boundarySecret` теста. Фикстура теперь собирает то же значение из двух частей во время выполнения: проверены идентичность и 36 байт, затем реальный default-cap stdout regression прошёл. Правила, exclusions и обязательность сканера не менялись; новый явный цикл проверки сохраняет прежние режим и лимиты, а предыдущая остановка остаётся в истории запуска.
 
+## Full overlap redaction repair
+
+4 ноября 2026 года, run `8f2d5e16-041c-4df8-ae00-77eed70cc25e`, исходный HEAD `1941c9019fc43bab15dd36a2ee5643adf76bf691`. Исправлен только finding1: полные известные значения могли пересекаться, и последовательная замена короткого значения оставляла хвост длинного. Delivery теперь находит совпадения в исходной строке, включая самопересечения, закрывает объединение диапазонов и затем применяет общие credential regex. Одноимённые env/options значения сохраняются в отдельных пространствах имён. Matcher хранит одно ожидающее совпадение на значение и части ограниченного вывода, без списка всех совпадений; профилирование памяти не выполнялось.
+
+Meaningful RED на исходном runtime: **7 failed / 0 passed**, exit 1, включая реальный `execute` с видимым хвостом. Финальные тесты повторно дали тот же RED через Node `registerHooks`: точные исходные байты загружались по исходному URL модуля, рабочие файлы не подменялись. Отдельная мутация longest-first дала **1 failed / 0 passed**, exit 1: пересечение без вложенности оставило `-ending`. Поэтому сортировка по длине не заменяет контракт объединения.
+
+GREEN и соседние проверки: **40/40, 0 failed/skipped**, exit 0, Windows x64, Node.js `v24.19.0`, ABI 137. Полный delivery suite и `npm run check` worker не запускал. Команда:
+
+```powershell
+node --test --test-reporter=tap --test-name-pattern='Full overlap redaction|Output boundary redaction|Credential redaction|Delivery lifecycle preserves|Delivery lifecycle pre-aborted|Delivery lifecycle awaits owned|Release lifecycle retains primary|Release lifecycle retries transient|Release subprocess environment|Coordinator Git disables|Cancellation during irreversible|Cancellation before irreversible' tests/delivery.test.mjs
+```
+
+| Требование | Точная регрессия |
+| --- | --- |
+| Полные prefix/substring, пересечения без вложенности, самопересечения, оба порядка env/options, known до общих regex, UTF-8/NUL и безопасный текст | `Full overlap redaction unions original matches for real execute regardless of value order` |
+| Реальный subprocess через context, result fallback, тип/identity ошибки, полный bounded result, cached stack/cause, frozen-копия и `delivery.command_failed` | `Full overlap redaction protects context events and error representations on execute`, `on result`, `on command_failed`, `on timeout`, `on cancelled`, `on frozen` |
+| Прежние partial/default-cap/chunk/stop, raw success, длинные значения, credentials, teardown и cleanup | Прошедшие соседние `Output boundary redaction`, `Credential redaction`, `Delivery lifecycle`, `Release lifecycle`, `Release subprocess environment`, `Coordinator Git disables`, `Cancellation` в указанном scoped-прогоне |
+
+TAP, исходный runtime, hooks воспроизведения, `receipt.json`, SHA-256 и итоговый diff находятся вне Git в `runs/<runId>/artifacts/full-overlap-repair/`. Это локальная проверка dirty worktree. Engine propagation и checks deadlines поручены другому исполнителю и этим отчётом не подтверждаются; `docs/RUNTIME.md` не менялся. Общий check, свежие security gates, независимое review и CI остаются координатору. UI выключен (нейтральное свидетельство); native subscription clients, опубликованный артефакт и deployment не проверялись. Commit/push/release не выполнялись.
+
+Проверенный урок: искать каждый известный секрет в уже отредактированном тексте небезопасно, даже при longest-first. Регрессия должна отдельно проверять полные вложенные и пересекающиеся значения, error representations и фактически сохраняемое событие.
+
 ## Основные регрессии
 
 | Требование | Регрессионная проверка |

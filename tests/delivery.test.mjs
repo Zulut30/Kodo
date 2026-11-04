@@ -479,6 +479,96 @@ test('Credential redaction covers direct runner overlapping environment and opti
   }), error => { assertCredentialFailure(error, { environmentOnly, explicit }, 'command_failed', 6); return true; });
 });
 
+function fullOverlapCases() {
+  const short = ['fixture', 'shared'].join('-');
+  const tail = ['private', 'suffix'].join('-');
+  const left = ['fixture', 'middle'].join('-'), right = ['middle', 'ending'].join('-');
+  const providerHead = ['sk', 'x'.repeat(20)].join('-');
+  return [
+    { name: 'prefix', values: [short, `${short}-${tail}`], text: `${short}-${tail}` },
+    { name: 'substring', values: [short, `outer-${short}-${tail}`], text: `outer-${short}-${tail}` },
+    { name: 'crossing', values: [left, right], text: ['fixture', 'middle', 'ending'].join('-') },
+    { name: 'generic prefix', values: [providerHead, `${providerHead}::${tail}`], text: `${providerHead}::${tail}` },
+    { name: 'self overlap', values: ['ab'.repeat(4)], text: 'ab'.repeat(7) }
+  ];
+}
+
+function assertFullOverlapFailure(error, stdout, stderr, code = 'command_failed') {
+  assert.ok(error instanceof Error); assert.equal(error.code, code); assert.equal(error.exitCode, 7);
+  assert.equal(error.stdout, stdout); assert.equal(error.stderr, stderr);
+  assert.equal(error.result.stdout, stdout); assert.equal(error.result.stderr, stderr); assert.equal(error.result.code, 7);
+  for (const representation of [error.message, error.stack, JSON.stringify(error), JSON.stringify(Object.getOwnPropertyDescriptors(error))]) {
+    assert.equal(/fixture-|shared|private-suffix|outer-|middle-|-ending|abab/.test(representation), false, 'overlapping credential bytes escaped in an error representation');
+  }
+}
+
+test('Full overlap redaction unions original matches for real execute regardless of value order', async t => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'kodo-delivery-test-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const configFile = path.join(directory, 'overlap.json');
+  const script = `
+    const {text}=JSON.parse(require('node:fs').readFileSync(process.argv[1],'utf8'));
+    if(process.env.NPM_TOKEN!==undefined)throw new Error('credential was forwarded');
+    process.stdout.write('assertion Привет 😀\\0 '+text+' / Bearer '+text+' / Bearer unknown-value\\n');
+    process.stderr.write('diagnostic '+text+' / ?token='+text+'&safe=1 / ?key=unknown-value&safe=2\\n');process.exitCode=7;
+  `;
+  for (const sample of fullOverlapCases()) {
+    await writeFile(configFile, JSON.stringify(sample));
+    for (const reverse of [false, true]) {
+      const values = reverse ? [...sample.values].reverse() : sample.values;
+      const error = await execute(process.execPath, ['-e', script, configFile], { cwd: directory,
+        env: { ...process.env, NPM_TOKEN: values[0] }, secrets: { NPM_TOKEN: values[1] ?? values[0] }
+      }).catch(error => error);
+      assertFullOverlapFailure(error, 'assertion Привет 😀\0 [REDACTED] / Bearer [REDACTED] / Bearer [REDACTED]\n', 'diagnostic [REDACTED] / ?token=[REDACTED]&safe=1 / ?key=[REDACTED]&safe=2\n');
+      assert.equal(error.teardownError, undefined);
+    }
+  }
+});
+
+for (const mode of ['execute', 'result', 'command_failed', 'timeout', 'cancelled', 'frozen']) {
+  test(`Full overlap redaction protects context events and error representations on ${mode}`, async t => {
+    const cases = fullOverlapCases(), outputs = cases.map(sample => sample.text);
+    const ctx = await fixture(t);
+    const previous = process.env.NPM_TOKEN; process.env.NPM_TOKEN = cases[0].values[0];
+    t.after(() => { if (previous === undefined) delete process.env.NPM_TOKEN; else process.env.NPM_TOKEN = previous; });
+    // The same option name must retain the longer value alongside the env prefix.
+    ctx.secrets = { NPM_TOKEN: cases[0].values[1], ...Object.fromEntries(cases.flatMap((sample, index) => sample.values.map((value, part) => [`overlap${index}_${part}`, value]))) };
+    ctx.run.delivery = { pr: { number: 7 } };
+    const stdout = outputs.map(text => `assertion ${text}\n`).join('') + 'detail\n'.repeat(9000) + `tail ${outputs[0]}\n`;
+    const stderr = outputs.map(text => `diagnostic ${text}\n`).join('');
+    const cleanStdout = 'assertion [REDACTED]\n'.repeat(cases.length) + 'detail\n'.repeat(9000) + 'tail [REDACTED]\n';
+    const cleanStderr = 'diagnostic [REDACTED]\n'.repeat(cases.length);
+    const result = { stdout, stderr, code: 7, diagnostics: { detail: outputs.join(' / ') } };
+    const code = ['execute', 'result', 'frozen'].includes(mode) ? 'command_failed' : mode;
+    const primary = Object.assign(new TypeError(outputs.join(' / '), { cause: new Error(outputs.join(' / ')) }), { code, exitCode: 7, stdout, stderr, result });
+    void primary.stack; void primary.cause.stack;
+    if (mode === 'frozen') { Object.freeze(primary.cause); Object.freeze(result.diagnostics); Object.freeze(result); Object.freeze(primary); }
+    const configFile = path.join(ctx.root, 'overlap.json');
+    await writeFile(configFile, JSON.stringify({ stdout, stderr }));
+    ctx.exec = async (command, args, options) => {
+      assert.equal(command, 'gh'); assert.equal(options.env.NPM_TOKEN, undefined);
+      assert.ok(Object.values(options.secrets).includes(cases[0].values[0]));
+      assert.ok(Object.values(options.secrets).includes(cases[0].values[1]));
+      if (mode === 'execute') return execute(process.execPath, ['-e', "const data=JSON.parse(require('node:fs').readFileSync(process.argv[1],'utf8'));process.stdout.write(data.stdout);process.stderr.write(data.stderr);process.exitCode=7", configFile], options);
+      if (mode === 'result') return result;
+      throw primary;
+    };
+    const error = await reconcileDelivery(ctx).catch(error => error);
+    assertFullOverlapFailure(error, cleanStdout, cleanStderr, code);
+    assert.match(error.message, mode === 'execute' || mode === 'result' ? /assertion/ : /\[REDACTED\]/);
+    if (mode !== 'execute') assert.equal(error.result.diagnostics.detail, Array(cases.length).fill('[REDACTED]').join(' / '));
+    if (!['execute', 'result'].includes(mode)) {
+      assert.ok(error instanceof TypeError);
+      if (mode === 'frozen') assert.notEqual(error, primary); else assert.equal(error, primary);
+      assert.equal(error.cause.message, Array(cases.length).fill('[REDACTED]').join(' / '));
+      assert.equal(/fixture-|shared|private-suffix|outer-|middle-|-ending|abab/.test(error.cause.stack), false);
+    }
+    const diagnostic = ctx.events.find(event => event.type === 'delivery.command_failed').data;
+    assert.deepEqual(diagnostic, { command: 'gh', code, exitCode: 7, stdout: cleanStdout, stderr: cleanStderr, outputTruncated: false });
+    assert.equal(ctx.leases.size, 0); assert.equal(ctx.state.releaseCreates, 0);
+  });
+}
+
 const defaultOutputCap = 20 * 1024 * 1024;
 const boundarySecret = ['fixture-env-boundary', '0123456789abcde'].join('-');
 const boundaryMarker = 'actionable assertion before boundary\n';

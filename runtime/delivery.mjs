@@ -101,8 +101,39 @@ function commandRedactions(baseEnv, environment, secrets = {}) {
   ]);
 }
 
+function redactCommandOutput(value, secrets) {
+  if (typeof value !== 'string') {
+    if (Array.isArray(value)) return value.map(item => redactCommandOutput(item, secrets));
+    if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, item]) => [redactCommandOutput(key, secrets), redactCommandOutput(item, secrets)]));
+    return value;
+  }
+  // Sweep matches in the original text, retaining only one pending occurrence
+  // per known value. Sequential replacement (even longest-first) can destroy
+  // a crossing match and expose its tail. Include overlapping self-matches too.
+  const pending = [...new Set(Object.values(secrets ?? {}))]
+    .filter(secret => typeof secret === 'string' && secret.length > 5 && secret.length <= value.length)
+    .map(secret => ({ secret, start: value.indexOf(secret) })).filter(match => match.start >= 0);
+  const parts = [];
+  let cursor = 0, start = -1, end = 0;
+  const flush = () => { if (start >= 0) { parts.push(value.slice(cursor, start), '[REDACTED]'); cursor = end; } };
+  while (pending.length) {
+    let first = 0;
+    for (let index = 1; index < pending.length; index++) if (pending[index].start < pending[first].start) first = index;
+    const match = pending[first];
+    if (start < 0 || match.start > end) { flush(); start = match.start; end = match.start + match.secret.length; }
+    else end = Math.max(end, match.start + match.secret.length);
+    match.start = value.indexOf(match.secret, match.start + 1);
+    if (match.start < 0) pending.splice(first, 1);
+  }
+  flush();
+  // Generic credential rules run only after the known ranges have been hidden.
+  // Memory is bounded by the supplied values and captured/redacted text, never
+  // by a list of every occurrence or the uncaptured process output.
+  return redact(parts.length ? parts.join('') + value.slice(cursor) : value);
+}
+
 function redactCommandError(value, secrets, seen = new WeakMap()) {
-  if (typeof value === 'string') return redact(value, secrets);
+  if (typeof value === 'string') return redactCommandOutput(value, secrets);
   if (!value || typeof value !== 'object') return value;
   if (seen.has(value)) return seen.get(value);
   // Keep mutable errors (including their type/identity), non-enumerable stack
@@ -153,7 +184,7 @@ function redactOutputBoundary(text, clean, secrets) {
   // replace the start of a longer unfinished value before we can recognize it.
   // A complete match can also overlap this cut. Keep only the common redacted
   // prefix so cutting the raw stream cannot expose part of that complete match.
-  const prefix = redact(text.slice(0, -hidden), secrets);
+  const prefix = redactCommandOutput(text.slice(0, -hidden), secrets);
   let end = 0;
   while (end < prefix.length && end < clean.length && prefix[end] === clean[end]) end++;
   // Short candidates must not expand a tiny capture budget. Finalize only
@@ -162,7 +193,7 @@ function redactOutputBoundary(text, clean, secrets) {
 }
 
 function commandFailure(command, code, result, extra = {}, secrets = {}) {
-  const clean = redact({ ...result, stdout: result.stdout ?? '', stderr: result.stderr ?? '' }, secrets);
+  const clean = redactCommandOutput({ ...result, stdout: result.stdout ?? '', stderr: result.stderr ?? '' }, secrets);
   clean.stdout = redactOutputBoundary(result.stdout ?? '', clean.stdout, secrets);
   clean.stderr = redactOutputBoundary(result.stderr ?? '', clean.stderr, secrets);
   const diagnostics = ['stdout', 'stderr'].map(name => clean[name] ? `${name}:\n${clean[name].length > 12000 ? `${clean[name].slice(0, 6000)}\n[full bounded output retained in result]\n${clean[name].slice(-6000)}` : clean[name]}` : '').filter(Boolean).join('\n');
@@ -193,7 +224,7 @@ export async function execute(command, args, { cwd, signal, timeoutMs = 120000, 
       terminalError = error;
       clearTimeout(timer); signal?.removeEventListener('abort', abort);
       stopping = stopOwnedTree(child).catch(cause => {
-        teardownError = { code: cause.code ?? 'process_teardown', message: redact(cause.message, redactions) };
+        teardownError = { code: cause.code ?? 'process_teardown', message: redactCommandOutput(cause.message, redactions) };
         child.kill('SIGKILL'); child.stdout.destroy(); child.stderr.destroy();
       });
     };
@@ -250,7 +281,7 @@ function context(options) {
       // Engine's summary stores only message. Keep the full bounded diagnostics
       // separately before cleanup, without argv or environment/credentials.
       if (clean?.stdout || clean?.stderr) {
-        try { await event('delivery.command_failed', redact({ command: name, code: clean.code, exitCode: clean.exitCode, stdout: clean.stdout, stderr: clean.stderr, outputTruncated: clean.result?.outputTruncated === true }, redactions)); }
+        try { await event('delivery.command_failed', redactCommandOutput({ command: name, code: clean.code, exitCode: clean.exitCode, stdout: clean.stdout, stderr: clean.stderr, outputTruncated: clean.result?.outputTruncated === true }, redactions)); }
         catch { /* Diagnostic persistence failure must not replace the command. */ }
       }
       throw clean;
@@ -520,7 +551,7 @@ async function cleanupDelivery(ctx, primaryError, actions, confirmed = false) {
   for (const action of actions) {
     try { await action(); }
     catch (error) {
-      const detail = { code: error.code ?? 'cleanup_failed', message: redact(error.message, ctx.secrets).slice(0, 4000) };
+      const detail = { code: error.code ?? 'cleanup_failed', message: redactCommandOutput(error.message, ctx.secrets).slice(0, 4000) };
       errors.push(detail);
       try { await ctx.event('delivery.cleanup_failed', detail); }
       catch { /* Reporting cleanup must not hide the primary command/receipt. */ }
