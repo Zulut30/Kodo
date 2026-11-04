@@ -36,7 +36,7 @@ async function fixture(t, { config = {}, assessment = low, plan = onePlan, faile
     assessTask: async request => { calls.push('assessment'); assert.ok(request.files.length <= 32); return assessment(request); },
     analyzeGemini: async () => { calls.push('analysis'); return { summary: 'Fixture analysis', model: 'offline-gemini', files: [], limitations: [] }; },
     discoverProviders: async () => { calls.push('discovery'); return [ { id: 'sol', client: 'codex', model: 'gpt-6.1-sol', available: true }, { id: 'astra', client: 'codex', model: 'gpt-6-astra', available: true } ]; },
-    decideJev: async () => { calls.push('routing'); return { model: 'astra', confidence: .1, parallel: true }; },
+    decideJev: async request => { calls.push('routing'); return { model: request.models.find(model => model.id === 'astra')?.id || request.models[0].id, confidence: .1, parallel: true }; },
     runSession: async request => {
       sessions.push(request);
       const stage = request.schema.properties.tasks ? 'plan' : request.schema.properties.passed ? 'review' : 'worker'; calls.push(stage);
@@ -239,6 +239,11 @@ test('Explicit model stays fixed for planner worker reviewer and retries despite
   for (const mode of ['quick','standard','deep']) {
     const fx = await fixture(t, { config: { primaryModel: 'gpt-6-astra' } }); let rejected = false;
     const original = fx.provider.runSession;
+    fx.provider.decideJev = async request => {
+      fx.calls.push('routing');
+      assert.deepEqual(request.models.map(({ client, model }) => ({ client, model })), [{ client: 'codex', model: 'gpt-6.1-sol' }]);
+      return { model: request.models[0].id, confidence: .1, modelConfidence: .1, parallelConfidence: .95, parallel: true };
+    };
     fx.provider.runSession = async request => {
       const result = await original(request);
       if (mode !== 'quick' && request.schema.properties.passed && !rejected) { rejected = true; result.output = { passed: false, findings: [{ file: 'value.mjs', severity: 'major', problem: 'Confirmed missing condition', fix: 'Check the required condition' }] }; }
@@ -249,7 +254,8 @@ test('Explicit model stays fixed for planner worker reviewer and retries despite
     // different saved default so every later stage must honor fixedModel.
     run.config.primaryModel = 'gpt-6-astra'; fx.engine.save(run);
     const result = await fx.engine.run(run.id); assert.equal(result.state, 'succeeded', result.error?.message);
-    assert.ok(fx.sessions.every(r => r.model === 'gpt-6.1-sol')); assert.equal(fx.calls.includes('routing'), false);
+    assert.ok(fx.sessions.every(r => r.model === 'gpt-6.1-sol')); assert.equal(fx.calls.includes('routing'), mode !== 'quick');
+    assert.equal(fx.store.events(run.id).filter(event => event.type === 'model_escalated').length, 0);
     if (mode !== 'quick') assert.equal(fx.calls.filter(c => c === 'review').length, 2, 'confirmed review failure triggers a fixed-model repair and fresh review');
   }
 });

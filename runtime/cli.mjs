@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, realpath, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
-import { readConfig, initConfig } from './config.mjs';
+import { readConfig, initConfig, normalizeConcurrency } from './config.mjs';
 import { loadSecrets, redact, stateHome } from './security.mjs';
 import { Store } from './store.mjs';
 import { buildAuditReport, formatAuditReport } from './audit.mjs';
@@ -45,7 +45,7 @@ export async function runtimeCli(command, args) {
   }
   const options = { positional: [] };
   const flags = new Set(['--json', '--live', '--prepare', '--retry-failed']);
-  const values = new Set(['--project', '--client', '--model', '--mode', '--providers', '--plan', '--delivery', '--target']);
+  const values = new Set(['--project', '--client', '--model', '--mode', '--concurrency', '--providers', '--plan', '--delivery', '--target']);
   for (let index = 0; index < args.length; index++) {
     const arg = args[index];
     if (flags.has(arg)) { if (options[arg.slice(2)] !== undefined) throw new Error(`Повторный параметр ${arg}`); options[arg.slice(2)] = true; }
@@ -54,13 +54,17 @@ export async function runtimeCli(command, args) {
     else options.positional.push(arg);
   }
   const allowed = {
-    init: ['json','project','target','client'], doctor: ['json','live','project','client'], run: ['json','prepare','project','client','model','mode','providers','plan','delivery'],
+    init: ['json','project','target','client'], doctor: ['json','live','project','client'], run: ['json','prepare','project','client','model','mode','concurrency','providers','plan','delivery'],
     resume: ['json','plan','retry-failed'], status: ['json'], logs: ['json'], cancel: ['json'], migrate: ['json','target'],
     tools: ['json','project','live'], ui: ['json','project'], security: ['json','project']
   }[command];
   if (!allowed) throw new Error(`Неизвестная команда ${command}`);
   for (const key of Object.keys(options)) if (key !== 'positional' && !allowed?.includes(key)) throw new Error(`Параметр ${key} неприменим к ${command}`);
   if (options.mode !== undefined) { const { normalizeMode } = await import('./modes.mjs'); normalizeMode(options.mode); }
+  if (options.concurrency !== undefined) {
+    if (!/^[1-5]$/.test(options.concurrency)) throw new TypeError('Invalid concurrency: expected an integer from 1 to 5');
+    options.concurrency = normalizeConcurrency(Number(options.concurrency));
+  }
   const print = value => console.log(JSON.stringify(value, null, options.json ? 0 : 2));
   const project = path.resolve(options.project || options.target || process.cwd());
   // Metadata and tool setup never open the provider credential store or engine.

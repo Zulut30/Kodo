@@ -85,7 +85,7 @@ function assessmentReceipt(assessment) {
   } catch { return fallback('invalid_output', assessment?.requests === 1 ? 1 : 0); }
 }
 
-export function resolveMode({ requested, assessment, config = {} } = {}) {
+export function resolveMode({ requested, assessment, config = {}, concurrencyExplicit = true } = {}) {
   const explicit = normalizeMode(requested === undefined ? config.executionMode : requested);
   const receipt = assessmentReceipt(assessment);
   let selected = 'standard', source = 'fallback', reason = receipt.reason;
@@ -103,7 +103,8 @@ export function resolveMode({ requested, assessment, config = {} } = {}) {
   for (const key of ['researchBudget', 'repairRounds', 'concurrency', 'maxTasks']) {
     if (config[key] === undefined) continue;
     if (!Number.isSafeInteger(config[key]) || config[key] < (['concurrency', 'maxTasks'].includes(key) ? 1 : 0)) throw new TypeError(`Invalid execution budget: ${key}`);
-    profile[key] = Math.min(profile[key], config[key]);
+    if (key === 'concurrency' && config[key] > 5) throw new TypeError('Invalid execution budget: concurrency');
+    profile[key] = key === 'concurrency' && concurrencyExplicit ? config[key] : Math.min(profile[key], config[key]);
   }
   // An assessment cannot overwrite the authoritative selection or its reason.
   const { reason: fallbackReason, ...data } = receipt;

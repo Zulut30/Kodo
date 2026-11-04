@@ -1,14 +1,14 @@
 # Прогресс Kodo roadmap
 
-Снимок: 2026-11-04. Авторитетные run state и receipts хранятся вне Git в SQLite Kodo. Этот документ отражает состояние до итоговых gates текущего commit.
+Снимок: 2026-11-04. Авторитетные run state и receipts хранятся вне Git в SQLite Kodo. Этот документ отражает состояние до итоговых gates текущего commit. Пользователь выбрал [рабочий MVP всех13этапов](MVP-SCOPE.md), расширенные проверки и benchmark после него; целевой бюджет10часов от15:36UTC.
 
 Пользователь отдельно потребовал пять одновременных задач. Разработка независимых worktree выполняется параллельно; приёмка и merge этапов сохраняют порядок. Пять drafts ускорения получили реальные scoped результаты: pool53+3, Windows61, profiler14, graph17, CI18. Совместимость компонентов проверяется отдельно; это не общий PASS этапа03.
 
 | Фаза | Статус | Следующий проверяемый шаг |
 | --- | --- | --- |
 | 01 Baseline/plan | ACCEPTED; PR #10 MERGED `ef38109e`; обе ОС CI PASS | Исторический baseline сохранён |
-| 02 Language quality | Full/review/обе ОС CI на4bb PASS; GitHub остановил merge на двух реальных Go-дефектах. Native Go ремонт принят координатором:118PASS/2SKIP | Свежие full/gates/review/current-head CI и подтверждённое устранение conversations; [PR #11](https://github.com/Zulut30/Kodo/pull/11) ещё не merged |
-| 03 CI/cache/concurrency | Пять изолированных drafts завершены; cross-port проверка продолжается. Test layout принят как maintenance02 | После02acceptance интегрировать остальные изменения; проверить full/CI и фактическое время |
+| 02 Language quality | f72: full870/864PASS/6SKIP, security и независимое review PASS. Go findings устранены и conversations resolved; один старый fixture guard приведён к общему integrationTimeoutMs | Exact-head CI41877990343 ожидает GitHub runners; [PR #11](https://github.com/Zulut30/Kodo/pull/11) ещё не merged |
+| 03 CI/cache/concurrency | Пять drafts собраны; scoped85/85PASS наb69 и CI clean-source regression33/33PASS. Real Kodo small-JS feedback4.29s, completefalse/L2required; свежий Go repair включён | После02acceptance: integrated full check/review/requiredCI; broad quality покаblocked |
 | 04 Architecture | NOT STARTED | После03: forbidden imports/contracts |
 | 05 Research knowledge | NOT STARTED | После04: claims/provenance/invalidation |
 | 06 Project Director | NOT STARTED | После05: versioned DB/legacy compatibility |

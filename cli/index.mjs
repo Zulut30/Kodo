@@ -25,6 +25,7 @@ kodo audit RUN_ID [--json]
 kodo tools list|doctor [--live] [--json]
 kodo tools install <id|all> [--json]
 kodo quality detect|plan|run [--project PATH] [--json]
+kodo ci plan|run|profile [--tier L0|L1|L2|L3] [--base SHA] [--project PATH] [--json]
 kodo quality run [--mode quick|standard|deep] [--changed PATH] [--affected PATH] [--capability NAME] [--evidence-dir PATH]
 kodo ui verify [--project PATH] [--json]
 kodo security verify [--project PATH] [--json]
@@ -68,6 +69,14 @@ async function main() {
   if (!command || ['help', '--help', '-h'].includes(command)) return console.log(help);
   // Offline reports and argument errors must not initialize the runtime's
   // SQLite store or credential/provider startup path.
+  if (command === 'ci') {
+    const { ciCli } = await import('../runtime/ci-cli.mjs');
+    const controller = new AbortController(), abort = () => controller.abort();
+    process.once('SIGINT', abort); process.once('SIGTERM', abort);
+    try { const result = await ciCli(argv, { signal: controller.signal }); console.log(result.output); process.exitCode = result.exitCode; }
+    finally { process.removeListener('SIGINT', abort); process.removeListener('SIGTERM', abort); }
+    return;
+  }
   if (command === 'quality') {
     const { qualityCli } = await import('../runtime/quality-cli.mjs');
     const result = await qualityCli(argv); console.log(result.output); process.exitCode = result.exitCode; return;

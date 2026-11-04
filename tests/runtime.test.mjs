@@ -119,6 +119,6 @@ test('Config initialization never overwrites a project and rejects unsafe execut
   await writeFile(path.join(root, 'kodo.config.json'), JSON.stringify({ schemaVersion: 1, client: 'codex', primaryModel: 'gpt-6.1-sol' }));
   assert.equal((await readConfig(root, { client: 'claude-code' })).primaryModel, null);
   assert.equal((await readConfig(root, { client: 'claude-code', primaryModel: 'opus' })).primaryModel, 'opus');
-  await writeFile(path.join(root, 'kodo.config.json'), JSON.stringify({ schemaVersion: 1, concurrency: 3 })); await assert.rejects(readConfig(root), /конфигурация/);
+  await writeFile(path.join(root, 'kodo.config.json'), JSON.stringify({ schemaVersion: 1, concurrency: 6 })); await assert.rejects(readConfig(root), /конфигурация/);
   await writeFile(path.join(root, 'kodo.config.json'), JSON.stringify({ schemaVersion: 1, commands: { test: [{ command: 'npm', args: [17] }] } })); await assert.rejects(readConfig(root), /команды/);
 });

@@ -5,7 +5,57 @@ on:
     branches: [main]
   pull_request:
 
+# Only superseded PR heads are cancelled. Main/release runs get unique groups.
+concurrency:
+  group: quality-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
 jobs:
+  fast:
+    runs-on: ubuntu-latest
+    env:
+      KODO_TOOL_HOME: ${{ runner.temp }}/kodo-fast-tools
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: package-lock.json
+      # setup-node caches npm tarballs, never node_modules or successful checks.
+      # npm ci verifies package-lock integrity on every restored tarball.
+      - run: npm ci --ignore-scripts
+      - name: Install pinned fast quality tools
+        run: |
+          node cli/index.mjs tools install oxlint --json
+          node cli/index.mjs tools install typescript --json
+      - name: Resolve immutable comparison base
+        shell: bash
+        env:
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BASE: ${{ github.event.before }}
+        run: |
+          base="$PR_BASE"
+          if [ -z "$base" ]; then base="$PUSH_BASE"; fi
+          if ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            echo "CI_UNKNOWN_BASE=1" >> "$GITHUB_ENV"
+          else
+            echo "CI_BASE=$base" >> "$GITHUB_ENV"
+          fi
+      - name: Partial feedback with exact-head L2 still required
+        shell: bash
+        run: |
+          if [ "${CI_UNKNOWN_BASE:-0}" = 1 ]; then
+            node scripts/ci.mjs feedback --json
+          else
+            node scripts/ci.mjs feedback --base "$CI_BASE" --json
+          fi
+
   check:
     strategy:
       fail-fast: false
@@ -13,12 +63,21 @@ jobs:
         os: [ubuntu-latest, windows-latest]
         node: [24]
     runs-on: ${{ matrix.os }}
+    env:
+      KODO_TOOL_HOME: ${{ runner.temp }}/kodo-security-tools
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: package-lock.json
       - run: npm ci --ignore-scripts
-      - run: npm run check
+      - name: Install pinned security tools
+        run: |
+          node cli/index.mjs tools install semgrep --json
+          node cli/index.mjs tools install gitleaks --json
+      - name: L2 npm run check and fresh mandatory security
+        run: node scripts/ci.mjs run --tier L2 --json
       - name: Verify installed CLI package
         run: node scripts/package-smoke.mjs
