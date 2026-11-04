@@ -3,6 +3,7 @@ import { spawn } from 'node:child_process';
 import { access, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { StringDecoder } from 'node:string_decoder';
 import { redact, workerEnvironment } from './security.mjs';
 import { gitBoundary } from './command.mjs';
 import { isCurrentUIReceipt, uiConfigHash } from './ui-verification.mjs';
@@ -125,8 +126,45 @@ function redactCommandError(value, secrets, seen = new WeakMap()) {
   return clean;
 }
 
+function redactOutputBoundary(text, clean, secrets) {
+  let hidden = 0;
+  for (const secret of new Set(Object.values(secrets))) {
+    if (typeof secret !== 'string' || secret.length <= 5) continue;
+    // A closed/capped stream may end in any proper prefix of a known value.
+    // Match its longest suffix in linear time, including repetitive/long keys.
+    // The table and scan never exceed captured text, even if a key exceeds cap.
+    const length = Math.min(secret.length - 1, text.length);
+    if (!length || text.indexOf(secret[0], text.length - length) < 0) continue;
+    const prefixes = new Uint32Array(length);
+    for (let index = 1, matched = 0; index < length; index++) {
+      while (matched && secret[index] !== secret[matched]) matched = prefixes[matched - 1];
+      if (secret[index] === secret[matched]) matched++;
+      prefixes[index] = matched;
+    }
+    let matched = 0;
+    for (let index = text.length - length; index < text.length; index++) {
+      while (matched && text[index] !== secret[matched]) matched = prefixes[matched - 1];
+      if (text[index] === secret[matched]) matched++;
+    }
+    hidden = Math.max(hidden, matched);
+  }
+  if (!hidden) return clean;
+  // Detect the boundary on raw text: a shorter known value may otherwise
+  // replace the start of a longer unfinished value before we can recognize it.
+  // A complete match can also overlap this cut. Keep only the common redacted
+  // prefix so cutting the raw stream cannot expose part of that complete match.
+  const prefix = redact(text.slice(0, -hidden), secrets);
+  let end = 0;
+  while (end < prefix.length && end < clean.length && prefix[end] === clean[end]) end++;
+  // Short candidates must not expand a tiny capture budget. Finalize only
+  // diagnostics: successful machine output remains byte-for-byte raw.
+  return clean.slice(0, end) + (hidden < 10 ? '*'.repeat(hidden) : '[REDACTED]');
+}
+
 function commandFailure(command, code, result, extra = {}, secrets = {}) {
   const clean = redact({ ...result, stdout: result.stdout ?? '', stderr: result.stderr ?? '' }, secrets);
+  clean.stdout = redactOutputBoundary(result.stdout ?? '', clean.stdout, secrets);
+  clean.stderr = redactOutputBoundary(result.stderr ?? '', clean.stderr, secrets);
   const diagnostics = ['stdout', 'stderr'].map(name => clean[name] ? `${name}:\n${clean[name].length > 12000 ? `${clean[name].slice(0, 6000)}\n[full bounded output retained in result]\n${clean[name].slice(-6000)}` : clean[name]}` : '').filter(Boolean).join('\n');
   return fail(code, `${command} ${code === 'command_failed' ? `failed (${result.code})` : code}${diagnostics ? `:\n${diagnostics}` : ''}`, { ...extra, exitCode: result.code, stdout: clean.stdout, stderr: clean.stderr, result: clean });
 }
@@ -162,8 +200,12 @@ export async function execute(command, args, { cwd, signal, timeoutMs = 120000, 
     const abort = () => stop(fail('cancelled', 'Delivery cancelled'));
     const timer = setTimeout(() => stop(fail('timeout', `${command} timed out`)), timeoutMs);
     const capture = (name, chunk) => {
+      if (outputTruncated) return;
       const buffer = Buffer.from(chunk), available = Math.max(0, maxOutputBytes - bytes);
-      const text = buffer.length <= available ? chunk : buffer.subarray(0, available).toString('utf8').replace(/\uFFFD$/, '');
+      // Decoder.write omits only an incomplete trailing code point; a literal
+      // U+FFFD is valid output and must survive. Never fill the gap from a later
+      // chunk/stream once this shared capture boundary has been reached.
+      const text = buffer.length <= available ? chunk : new StringDecoder('utf8').write(buffer.subarray(0, available));
       bytes += Buffer.byteLength(text);
       if (name === 'stdout') stdout += text; else stderr += text;
       if (buffer.length > available) { outputTruncated = true; stop(fail('invalid_output', `${command} output exceeded limit`)); }

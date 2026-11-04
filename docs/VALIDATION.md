@@ -57,6 +57,32 @@ node --test --test-reporter=tap tests/delivery.test.mjs
 
 Все значения вымышлены, config создаётся только в temp fixture; реальное credential store не читается. Git/npm и subprocess локальные, GitHub подменён fixture. Полный `npm run check`, security gates, свежее независимое review и CI выполняет координатор. UI выключен (нейтральное свидетельство); native subscription clients, опубликованный Kodo и deployment этой проверкой не подтверждаются. Рабочий агент не выполняет commit/push/release, не меняет версии, план или registry.
 
+## Output boundary redaction repair
+
+4 ноября 2026 года, run `8f2d5e16-041c-4df8-ae00-77eed70cc25e`, исходный HEAD `f33111acea9f91c5efc07c09422acd81a2fc3061`. Второе ревью подтвердило: если env-only `NPM_TOKEN` пересекает штатный raw cap 20 MiB, сохранённые 35/36 символов обходят замену полного значения и попадают в `message`, `stack`, поток, вложенный `result` и `delivery.command_failed`.
+
+RED на настоящих subprocess: **4 failed / 0 passed**, отдельно direct execute и release/context, stdout и stderr. Затем **7 failed / 0 passed**, включая незавершённый ключ при timeout/cancel и принудительные split boundaries. Повторный RED с ключом ровно 36 символов — **7/7 failed** на исходном модуле через внешний Node load hook: рабочий runtime не заменялся. Диагностика RED перечисляет утёкшие representations, включая event; значения только фиктивные. Дополнительный **RED 1/1 → GREEN 1/1** подтвердил, что короткое explicit-значение не должно скрывать начало длинного env-only совпадения при одинаковом имени. Исправление находит незавершённое совпадение в raw capture и сохраняет безопасный общий redacted префикс, учитывая пересекающиеся полные замены; после превышения общего лимита capture прекращается. Prefix matcher использует память, ограниченную длиной сохранённого потока; дочитывания/сохранения неограниченного вывода нет. Корректный U+FFFD сохраняется, неполный UTF-8 code point на cap отбрасывается.
+
+Первый целевой GREEN — **18/18**; после окончательной правки — **41/41, 0 failed/skipped**, exit 0, Windows x64, Node.js `v24.19.0` (ABI 137). Сохранены `red-default.tap`, `red-boundaries.tap`, `red-exact-replay.tap`, `red-overlapping-values.tap`, `green-boundaries.tap`, `green-overlapping-values.tap`, `targeted-green.tap`, `final-targeted-green.tap`, отдельные квитанции, `repair.diff` и итоговый `receipt.json` в приватном `runs/<runId>/artifacts/output-boundary-repair/` вне Git. Квитанции содержат команды, исходный HEAD и SHA-256 файлов/TAP/diff. Это свидетельство dirty worktree, не reuse clean-head checks. `git diff --check` прошёл.
+
+```powershell
+node --test --test-reporter=tap --test-name-pattern='Output boundary redaction' tests/delivery.test.mjs
+node --test --test-reporter=tap --test-name-pattern='Output boundary redaction|Credential redaction|Delivery lifecycle|Release lifecycle|Native command execution|Release subprocess environment|Coordinator Git|Cancellation during irreversible|Cancellation during release creation|Cancellation before irreversible|UTF-8' tests/delivery.test.mjs tests/utf8-process.test.mjs
+```
+
+| Требование | Точная регрессия |
+| --- | --- |
+| Реальные stdout/stderr пересекают default cap; ошибка и вложенный result безопасны | `Output boundary redaction protects direct default cap on stdout`; `Output boundary redaction protects direct default cap on stderr` |
+| Release/context не сохраняет префикс в stack/message/event; source cleanup и leases завершены без публикации | `Output boundary redaction protects release default cap and event on stdout`; `Output boundary redaction protects release default cap and event on stderr` |
+| Каждый byte split, caps 1–37, ключ длиннее 128 KiB, перекрывающиеся префиксы и полные замены, одноимённые env/options значения с общим началом, Unicode, поздние chunks после общего лимита и raw success | `Output boundary redaction handles every split small caps long secrets and UTF8 without retaining later chunks` |
+| Незавершённые значения в обоих реальных потоках на границе остановки; первичный тип и exit сохранены | `Output boundary redaction protects unfinished real streams on timeout`; `Output boundary redaction protects unfinished real streams on cancelled` |
+| Одноимённые env/options значения, frozen error, cached stack/cause и fallback | `Credential redaction covers direct runner overlapping environment and options names`; `Credential redaction covers fallback runner errors on frozen` и остальные `Credential redaction` |
+| Teardown, EBUSY/primary, cwd/env, UTF-8, Git/gh credentials/hooks, irreversible confirmation | Соседние `Delivery lifecycle`, `Release lifecycle`, `Release subprocess environment excludes inherited credentials from npm tests builds and installed smoke`, `Coordinator Git disables credential-reading repository hooks for push and fetch`, `Cancellation during irreversible merge confirms and persists its successful receipt`, `Cancellation during release creation verifies publication and saves its receipt` |
+
+Контролируемые потоки дополняют реальные процессы и принудительно задают разбиения, которые ОС может объединить. Все config/key fixtures локальные и фиктивные; credential stores и реальные API не используются. Память процесса не профилировалась: ограниченность matcher подтверждена алгоритмом и тестом ключа длиннее cap. Полный `npm run check`, CI/Linux, security gates и свежее независимое review остаются координатору. UI выключен (нейтральное свидетельство); native subscription clients, опубликованный артефакт и deployment не проверялись. Версии/config/registry/plan не менялись; commit/push/release не выполнялись.
+
+Проверенный урок: redaction полного значения после raw truncation недостаточна. Проверяй границу каждого потока до формирования любых representations ошибки и отдельно убеждайся, что поздние chunks не дописываются в оставшийся после UTF-8 truncation зазор.
+
 ## Основные регрессии
 
 | Требование | Регрессионная проверка |

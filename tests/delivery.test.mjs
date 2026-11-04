@@ -5,7 +5,9 @@ import { mkdtemp, mkdir, readFile, writeFile, copyFile, readdir, rm, chmod, rena
 import { constants, watch } from 'node:fs';
 import fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
-import { spawn, spawnSync } from 'node:child_process';
+import childProcess, { spawn, spawnSync } from 'node:child_process';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
 import os from 'node:os';
 import path from 'node:path';
 import Ajv from 'ajv';
@@ -476,6 +478,184 @@ test('Credential redaction covers direct runner overlapping environment and opti
     env: { ...process.env, NPM_TOKEN: environmentOnly }, secrets: { NPM_TOKEN: explicit }
   }), error => { assertCredentialFailure(error, { environmentOnly, explicit }, 'command_failed', 6); return true; });
 });
+
+const defaultOutputCap = 20 * 1024 * 1024;
+const boundarySecret = 'fixture-env-boundary-0123456789abcde';
+const boundaryMarker = 'actionable assertion before boundary\n';
+async function outputBoundaryScript(directory, stream, cap = defaultOutputCap) {
+  const configFile = path.join(directory, 'output-boundary.json');
+  await writeFile(configFile, JSON.stringify({ secret: boundarySecret, stream, cap }));
+  const script = `
+    const fs=require('node:fs'),{secret,stream,cap}=JSON.parse(fs.readFileSync(process.argv[1],'utf8'));
+    if(process.env.NPM_TOKEN!==undefined)throw new Error('credential was forwarded');
+    const output=process[stream],write=text=>new Promise(resolve=>output.write(text,resolve));
+    (async()=>{
+      await write(${JSON.stringify(boundaryMarker)});
+      let remaining=cap-(secret.length-1)-${Buffer.byteLength(boundaryMarker)};
+      while(remaining>0){const size=Math.min(remaining,65536);await write('.'.repeat(size));remaining-=size;}
+      await write(secret.slice(0,11));await new Promise(resolve=>setImmediate(resolve));
+      await write(secret.slice(11));setInterval(()=>{},1000);
+    })();
+  `;
+  return ['-e', script, configFile];
+}
+
+function assertBoundaryFailure(error, stream, cap = defaultOutputCap, diagnostic) {
+  assert.ok(error instanceof Error); assert.equal(error.code, 'invalid_output');
+  assert.equal(error.result.outputTruncated, true); assert.equal(error.exitCode, error.result.code);
+  assert.equal(error.exitCode, process.platform === 'win32' ? 1 : null);
+  const representations = { message: error.message, stack: error.stack, stdout: error.stdout, stderr: error.stderr,
+    'result.stdout': error.result.stdout, 'result.stderr': error.result.stderr, ...(diagnostic ? { event: JSON.stringify(diagnostic) } : {}) };
+  const leaked = Object.entries(representations).filter(([, value]) => value.includes(boundarySecret.slice(0, -1))).map(([name]) => name);
+  assert.deepEqual(leaked, [], 'credential prefix escaped at capture boundary');
+  assert.ok(error[stream].startsWith(boundaryMarker));
+  assert.ok(error[stream].endsWith('[REDACTED]'));
+  assert.equal(error.result[stream], error[stream]);
+  assert.ok(Buffer.byteLength(error.stdout) + Buffer.byteLength(error.stderr) <= cap);
+  assert.equal(error.teardownError, undefined);
+}
+
+for (const stream of ['stdout', 'stderr']) {
+  test(`Output boundary redaction protects direct default cap on ${stream}`, { timeout: 40000 }, async t => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'kodo-delivery-test-'));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const args = await outputBoundaryScript(directory, stream);
+    const error = await execute(process.execPath, args, { cwd: directory, env: { ...process.env, NPM_TOKEN: boundarySecret } }).catch(error => error);
+    assertBoundaryFailure(error, stream);
+  });
+
+  test(`Output boundary redaction protects release default cap and event on ${stream}`, { timeout: 40000 }, async t => {
+    const ctx = await fixture(t), runner = ctx.exec;
+    await ctx.git('push', 'origin', `${ctx.run.headSha}:main`);
+    const previous = process.env.NPM_TOKEN; process.env.NPM_TOKEN = boundarySecret;
+    t.after(() => { if (previous === undefined) delete process.env.NPM_TOKEN; else process.env.NPM_TOKEN = previous; });
+    ctx.config.commands.test = [{ command: process.execPath, args: await outputBoundaryScript(ctx.root, stream) }];
+    let source;
+    ctx.exec = async (command, args, options) => {
+      if (command === process.execPath) { source = options.cwd; assert.equal(options.env.NPM_TOKEN, undefined); }
+      return runner(command, args, options);
+    };
+    const error = await releasePackage({ ...ctx, mergeCommit: ctx.run.headSha }).catch(error => error);
+    const diagnostic = ctx.events.find(event => event.type === 'delivery.command_failed').data;
+    assertBoundaryFailure(error, stream, defaultOutputCap, diagnostic);
+    assert.equal(diagnostic.stdout, error.stdout); assert.equal(diagnostic.stderr, error.stderr);
+    assert.equal(diagnostic.code, error.code); assert.equal(diagnostic.exitCode, error.exitCode); assert.equal(diagnostic.outputTruncated, true);
+    assert.equal(JSON.stringify(diagnostic).includes(boundarySecret.slice(0, -1)), false);
+    assert.equal(error.cleanupErrors, undefined);
+    await assert.rejects(readFile(path.join(source, 'package.json')), { code: 'ENOENT' });
+    assert.equal(ctx.leases.size, 0); assert.equal(ctx.state.releaseCreates, 0); assert.equal(ctx.run.delivery?.release, undefined);
+  });
+}
+
+test('Output boundary redaction handles every split small caps long secrets and UTF8 without retaining later chunks', async t => {
+  // The real default-cap processes above cover the OS boundary. This controlled
+  // stream fixture additionally forces every byte split, including UTF8 bytes;
+  // an OS is free to coalesce writes and cannot promise those partitions.
+  let chunks = [], code = 7;
+  const mocked = t.mock.method(childProcess, 'spawn', () => {
+    const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough() });
+    queueMicrotask(() => {
+      for (const [stream, chunk] of chunks) child[stream].write(chunk);
+      child.stdout.end(); child.stderr.end(); child.emit('close', code);
+    });
+    return child;
+  });
+  syncBuiltinESMExports();
+  try {
+    for (const stream of ['stdout', 'stderr']) {
+      chunks = [[stream, Buffer.from('assertion\n' + boundarySecret.slice(0, -1))]];
+      const overlapError = await execute('fixture-stream', [], { env: { ...process.env, NPM_TOKEN: boundarySecret },
+        secrets: { NPM_TOKEN: boundarySecret.slice(0, 20) }
+      }).catch(error => error);
+      assert.equal(overlapError[stream], 'assertion\n[REDACTED]', 'a shorter explicit value must not hide the env-only boundary match');
+      const marker = 'assertion\n', raw = Buffer.from(marker + boundarySecret.slice(0, -1));
+      for (let split = 0; split <= raw.length; split++) {
+        chunks = [[stream, raw.subarray(0, split)], [stream, raw.subarray(split)]];
+        const error = await execute('fixture-stream', [], { secrets: { NPM_TOKEN: boundarySecret } }).catch(error => error);
+        assert.equal(error.code, 'command_failed'); assert.equal(error.exitCode, 7);
+        assert.equal(error[stream], marker + '[REDACTED]', `${stream} byte split ${split}`);
+        assert.equal(error.result[stream], error[stream]);
+      }
+      for (let cap = 1; cap <= boundarySecret.length + 1; cap++) {
+        chunks = [[stream, Buffer.from(boundarySecret + '!')]];
+        const error = await execute('fixture-stream', [], { maxOutputBytes: cap, secrets: { NPM_TOKEN: boundarySecret } }).catch(error => error);
+        assert.equal(error.code, cap < boundarySecret.length + 1 ? 'invalid_output' : 'command_failed');
+        assert.equal(error[stream].includes(boundarySecret.slice(0, Math.min(cap, boundarySecret.length))), false);
+        assert.ok(Buffer.byteLength(error.stdout) + Buffer.byteLength(error.stderr) <= cap);
+        assert.equal(error.result.outputTruncated, cap < boundarySecret.length + 1 ? true : undefined);
+      }
+      const longSecret = 'ab'.repeat(65536) + 'Z';
+      chunks = [[stream, Buffer.from(longSecret.slice(0, 4097))]];
+      const longError = await execute('fixture-stream', [], { maxOutputBytes: 4096, secrets: { NPM_TOKEN: longSecret } }).catch(error => error);
+      assert.equal(longError.code, 'invalid_output'); assert.equal(longError[stream], '[REDACTED]');
+      assert.ok(Buffer.byteLength(longError[stream]) <= 4096);
+      // Overlapping proper prefixes need fallback, rather than the last start
+      // character alone; different known values may share the same prefix.
+      chunks = [[stream, Buffer.from('assertion\nabababa')]];
+      const repeatedError = await execute('fixture-stream', [], { secrets: { first: 'abababac', second: 'abababad' } }).catch(error => error);
+      assert.equal(repeatedError[stream], 'assertion\n*******');
+      chunks = [[stream, Buffer.from('assertion\naaaaaaa')]];
+      const completeOverlap = await execute('fixture-stream', [], { secrets: { first: 'aaaaaa' } }).catch(error => error);
+      assert.equal(completeOverlap[stream], 'assertion\n*****', 'a full match overlapping the boundary must not become a visible prefix');
+      const unicodeSecret = 'ключ😀-fictional-value';
+      const unicodeRaw = Buffer.from('assertion\n' + unicodeSecret.slice(0, -1));
+      for (let split = 0; split <= unicodeRaw.length; split++) {
+        chunks = [[stream, unicodeRaw.subarray(0, split)], [stream, unicodeRaw.subarray(split)]];
+        const error = await execute('fixture-stream', [], { secrets: { NPM_TOKEN: unicodeSecret } }).catch(error => error);
+        assert.equal(error[stream], 'assertion\n[REDACTED]', `${stream} Unicode byte split ${split}`);
+      }
+    }
+    // Freeze capture at the first exceeded chunk, even when a partial Unicode
+    // character left room. No later stream/chunk may fill that gap.
+    chunks = [['stdout', Buffer.from('ok😀')], ['stderr', Buffer.from('late')]];
+    const unicodeError = await execute('fixture-stream', [], { maxOutputBytes: 5 }).catch(error => error);
+    assert.equal(unicodeError.code, 'invalid_output'); assert.equal(unicodeError.stdout, 'ok'); assert.equal(unicodeError.stderr, '');
+    chunks = [['stdout', Buffer.from('ok�overflow')]];
+    const replacementError = await execute('fixture-stream', [], { maxOutputBytes: 5 }).catch(error => error);
+    assert.equal(replacementError.stdout, 'ok�', 'a valid replacement character is ordinary UTF8 data');
+    // Full secrets split into one-byte chunks are still removed on failure.
+    const text = 'assertion Привет 😀\0 ' + boundarySecret + '\n';
+    chunks = [...Buffer.from(text)].map(byte => ['stdout', Buffer.from([byte])]);
+    const fullError = await execute('fixture-stream', [], { secrets: { NPM_TOKEN: boundarySecret } }).catch(error => error);
+    assert.equal(fullError.stdout, 'assertion Привет 😀\0 [REDACTED]\n');
+    // Successful machine output (including a secret-looking prefix) stays raw.
+    code = 0;
+    const raw = text + boundarySecret.slice(0, -1);
+    chunks = [...Buffer.from(raw)].map(byte => ['stdout', Buffer.from([byte])]);
+    assert.equal((await execute('fixture-stream', [], { secrets: { NPM_TOKEN: boundarySecret } })).stdout, raw);
+  } finally { mocked.mock.restore(); syncBuiltinESMExports(); }
+});
+
+for (const mode of ['timeout', 'cancelled']) {
+  test(`Output boundary redaction protects unfinished real streams on ${mode}`, { timeout: 40000 }, async t => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'kodo-delivery-test-'));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const readyPath = path.join(directory, 'ready.json'), ready = readyFile(directory, 'ready.json');
+    const controller = new AbortController();
+    const script = `
+      const fs=require('node:fs'),secret=JSON.parse(fs.readFileSync(process.argv[1],'utf8'));
+      if(process.env.NPM_TOKEN!==undefined)throw new Error('credential was forwarded');
+      process.stdout.write('actionable stdout\\n'+secret.slice(0,17),()=>{
+        process.stderr.write('actionable stderr\\n'+secret.slice(0,29),()=>{
+          setInterval(()=>{},1000);fs.writeFileSync(process.argv[2],JSON.stringify({ready:true}));
+        });
+      });
+    `;
+    const configFile = path.join(directory, 'fictional-key.json'); await writeFile(configFile, JSON.stringify(boundarySecret));
+    const outcome = execute(process.execPath, ['-e', script, configFile, readyPath], { cwd: directory,
+      env: { ...process.env, NPM_TOKEN: boundarySecret }, signal: controller.signal, timeoutMs: mode === 'timeout' ? 4000 : 15000
+    }).catch(error => error);
+    assert.deepEqual(await ready, { ready: true }); if (mode === 'cancelled') controller.abort();
+    const error = await outcome;
+    assert.equal(error.code, mode); assert.equal(error.exitCode, process.platform === 'win32' ? 1 : null);
+    assert.equal(error.stdout, 'actionable stdout\n[REDACTED]'); assert.equal(error.stderr, 'actionable stderr\n[REDACTED]');
+    assert.equal(error.result.stdout, error.stdout); assert.equal(error.result.stderr, error.stderr);
+    assert.equal(error.result.outputTruncated, undefined); assert.equal(error.teardownError, undefined);
+    for (const representation of [error.message, error.stack, JSON.stringify(error)]) {
+      assert.equal(representation.includes(boundarySecret.slice(0, 17)), false);
+    }
+  });
+}
 
 for (const mode of ['exit', 'timeout', 'cancelled']) {
   test(`Credential redaction covers real release command errors on ${mode}`, { timeout: 40000 }, async t => {
