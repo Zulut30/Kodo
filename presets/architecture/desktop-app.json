@@ -1,0 +1,64 @@
+{
+  "schemaVersion": 1,
+  "version": 1,
+  "productRoots": [
+    "src"
+  ],
+  "modules": [
+    {
+      "id": "main",
+      "roots": [
+        "src/main"
+      ],
+      "layer": "main",
+      "public": [
+        "src/main/index.mjs"
+      ],
+      "allow": [
+        "shared"
+      ]
+    },
+    {
+      "id": "renderer",
+      "roots": [
+        "src/renderer"
+      ],
+      "layer": "renderer",
+      "public": [
+        "src/renderer/index.mjs"
+      ],
+      "allow": [
+        "shared"
+      ]
+    },
+    {
+      "id": "shared",
+      "roots": [
+        "src/shared"
+      ],
+      "layer": "shared",
+      "public": [
+        "src/shared/index.mjs"
+      ],
+      "allow": []
+    }
+  ],
+  "layers": {
+    "main": [
+      "shared"
+    ],
+    "renderer": [
+      "shared"
+    ],
+    "shared": []
+  },
+  "forbiddenImports": [],
+  "cycles": "forbid",
+  "contracts": "architecture.contracts.json",
+  "baseline": [],
+  "exceptions": [],
+  "protectedPaths": [
+    "architecture.contracts.json",
+    "architecture.policy.json"
+  ]
+}
