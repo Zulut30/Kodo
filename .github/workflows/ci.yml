@@ -95,6 +95,17 @@ jobs:
         env:
           KODO_TOOL_HOME: ${{ runner.temp }}/kodo-security-tools
         run: node cli/index.mjs tools install gitleaks --json
+      - name: Canonicalize Windows temporary paths for L2
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $kodoCanonicalTemp = node -e "process.stdout.write(require('node:fs').realpathSync.native(require('node:os').tmpdir()))"
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve the Windows temporary directory' }
+          if ([string]::IsNullOrWhiteSpace($kodoCanonicalTemp) -or -not (Test-Path -LiteralPath $kodoCanonicalTemp -PathType Container)) {
+            throw 'The canonical Windows temporary directory must exist'
+          }
+          "TEMP=$kodoCanonicalTemp" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "TMP=$kodoCanonicalTemp" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: L2 npm run check and fresh mandatory security
         env:
           KODO_TOOL_HOME: ${{ runner.temp }}/kodo-security-tools
