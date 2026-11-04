@@ -262,7 +262,9 @@ function typeScriptConfigContent(check, plan) {
   return JSON.stringify({
     extends: path.join(plan.project, check.manifest),
     files: check.files.map(file => path.join(plan.project, file)), include: [], exclude: [],
-    compilerOptions: { noEmit: true, noCheck: false, skipLibCheck: false, skipDefaultLibCheck: false,
+    // Roots are already inventoried. Never let imports/references expand the
+    // compiler program beyond the source hashes bound into this receipt.
+    compilerOptions: { noResolve: true, types: [], typeRoots: [], noEmit: true, noCheck: false, skipLibCheck: false, skipDefaultLibCheck: false,
       incremental: false, composite: false, declaration: false, declarationMap: false, emitDeclarationOnly: false }
   }) + '\n';
 }

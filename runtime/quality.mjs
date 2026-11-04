@@ -199,6 +199,12 @@ function typeScriptScopeSupport(manifest, names, documents, visiting = new Set()
   const config = documents.get(manifest);
   if (!config) return 'typescript_config_inheritance_unsupported';
   if (config.references?.length) return 'typescript_project_references_unsupported';
+  // Explicit ambient packages can expand the program even with noResolve.
+  // Inventoried declaration files are already roots; package discovery is not.
+  for (const key of ['types', 'typeRoots']) {
+    const value = config.compilerOptions?.[key];
+    if (value !== undefined && (!Array.isArray(value) || value.length)) return 'typescript_external_types_unsupported';
+  }
   if (config.compilerOptions?.tsBuildInfoFile !== undefined) return 'typescript_build_info_unsupported';
   visiting.add(manifest);
   for (const value of config.extends === undefined ? [] : Array.isArray(config.extends) ? config.extends : [config.extends]) {

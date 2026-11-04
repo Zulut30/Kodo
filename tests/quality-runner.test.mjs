@@ -37,6 +37,8 @@ test('Quality TypeScript private config binds exact roots options and tamper-sen
   assert.deepEqual(config.files, result.receipts[0].files.map(file => path.join(result.plan.project, file)));
   assert.deepEqual(config.include, []); assert.deepEqual(config.exclude, []);
   assert.equal(config.compilerOptions.noEmit, true); assert.equal(config.compilerOptions.noCheck, false);
+  assert.equal(config.compilerOptions.noResolve, true);
+  assert.deepEqual(config.compilerOptions.types, []); assert.deepEqual(config.compilerOptions.typeRoots, []);
   assert.equal(config.compilerOptions.skipLibCheck, false); assert.equal(config.compilerOptions.skipDefaultLibCheck, false);
   assert.equal(config.compilerOptions.incremental, false); assert.equal(config.compilerOptions.composite, false);
   assert.equal(await isCurrentQualityReceipt(result, { resolve, runner: fake.runner }), true);
@@ -387,4 +389,88 @@ test('Quality identical SQL checks share one process with independent capability
   const result = await runQuality({ ...fx, runner: bad.runner, resolve: fakeTools(), mode: 'standard', changedPaths: [], capabilities: ['format', 'lint'] });
   assert.equal(result.receipts[0].status, 'failed'); assert.equal(result.receipts[1].status, 'passed'); assert.equal(result.receipts[1].debtCount, 1);
   assert.equal(bad.calls.filter(call => call.args[0] === 'lint').length, 1);
+});
+
+// Opt-in native conformance: ordinary suites remain independent of installed SDKs.
+test('Quality native TypeScript compiler seals dependency closure', { skip: !process.env.KODO_QUALITY_TSC_TOOL_HOME }, async t => {
+  const { runQuality, isCurrentQualityReceipt } = await api();
+  const { resolveTool } = await import('../runtime/tools.mjs');
+  const { execute } = await import('../runtime/delivery.mjs');
+  const toolHome = process.env.KODO_QUALITY_TSC_TOOL_HOME;
+  const tool = await resolveTool('typescript', { home: toolHome });
+  assert.equal(tool.ready, true); assert.equal(tool.version, '7.0.2');
+  const resolve = async id => { assert.equal(id, 'typescript'); return tool; };
+  const cases = [
+    ['escaped traversal', () => String.raw`import { value } from '\u002e\u002e/\u002e\u002e/outside/value'; export const answer = value;`],
+    ['comment separated import', () => "import { value } from /* scope */ '../../outside/value'; export const answer = value;"],
+    ['template dynamic import', () => 'export const answer = import(`../../outside/value`);'],
+    ['absolute drive import', fx => `import { value } from ${JSON.stringify(path.join(fx.base, 'outside/value').replaceAll('\\', '/'))}; export const answer = value;`],
+    ['UNC import', fx => `import { value } from /* scope */ ${JSON.stringify('//localhost/' + path.join(fx.base, 'outside/value').replaceAll('\\', '/').replace(':', '$'))}; export const answer = value;`],
+    ['package main escape', () => "import { value } from './pkg'; export const answer = value;", { 'src/pkg/package.json': { main: '../../../outside/value.ts' } }],
+    ['excluded internal source', () => "import { value } from /* scope */ '../dist/value'; export const answer = value;", { 'dist/value.ts': 'export const value = 42;' }],
+    ['type reference escape', () => '/// <reference types="../../outside/global" />\nexport const answer = outsideValue;'],
+    ['automatic external types', () => 'export const answer: number = outsideValue;', { 'node_modules/@types/untracked/index.d.ts': 'declare const outsideValue: number;' }],
+    ['explicit external types', () => 'export const answer: number = outsideValue;', { 'node_modules/@types/untracked/index.d.ts': 'declare const outsideValue: number;', 'tsconfig.json': { compilerOptions: { types: ['untracked'], typeRoots: ['./node_modules/@types'] } } }]
+  ];
+  for (const [name, source, extras = {}] of cases) await t.test(name, async t => {
+    const fx = await fixture(t, { ...projects.typescript, ...extras });
+    await put(fx.base, 'outside/value.ts', 'export const value = 42;');
+    await put(fx.base, 'outside/global.d.ts', 'declare const outsideValue: number;');
+    await put(fx.project, 'src/main.ts', source(fx));
+    const options = { ...fx, resolve, runner: execute, capabilities: ['typecheck'] };
+    const first = await runQuality(options);
+    await captureNativeQualityProbe(name, first);
+    // Capture the original false PASS/stale-receipt defect before asserting it.
+    await put(fx.base, 'outside/value.ts', 'export const value = "changed";');
+    const current = await isCurrentQualityReceipt(first, { project: fx.project, resolve });
+    t.diagnostic(JSON.stringify({ status: first.status, currentAfterExternalMutation: current, evidenceRoot: first.evidenceRoot }));
+    assert.equal(first.passed, false, 'uncovered compiler dependency cannot receive PASS');
+    assert.equal(current, false, 'external mutation cannot leave a successful current receipt');
+  });
+});
+
+test('Quality native TypeScript retains local imports extends paths JSX and all roots', { skip: !process.env.KODO_QUALITY_TSC_TOOL_HOME }, async t => {
+  const { runQuality, isCurrentQualityReceipt } = await api();
+  const { resolveTool } = await import('../runtime/tools.mjs');
+  const tool = await resolveTool('typescript', { home: process.env.KODO_QUALITY_TSC_TOOL_HOME });
+  assert.equal(tool.ready, true);
+  const resolve = async () => tool;
+  const fx = await fixture(t, { ...projects.typescript,
+    'tsconfig.json': { extends: './config/base.json', files: ['src/main.ts'], exclude: ['src/other.ts'], compilerOptions: { noResolve: false } },
+    'config/base.json': { compilerOptions: { target: 'es2022', module: 'esnext', moduleResolution: 'bundler', jsx: 'preserve', paths: { '@local/*': ['../src/*'] } } },
+    'src/main.ts': "import { value } from './value'; import { value as alias } from '@local/value'; export const answer: number = value + alias;",
+    'src/value.ts': 'export const value = 42;',
+    'src/other.ts': 'export const other: number = 1;',
+    'src/view.tsx': 'export const view = <div />;',
+    'src/jsx.d.ts': 'declare namespace JSX { interface IntrinsicElements { div: {}; } }'
+  });
+  const options = { ...fx, resolve, capabilities: ['typecheck'] };
+  const clean = await runQuality(options);
+  await captureNativeQualityProbe('valid-local', clean);
+  t.diagnostic(JSON.stringify({ status: clean.status, evidenceRoot: clean.evidenceRoot }));
+  assert.equal(clean.passed, true);
+  assert.equal(await isCurrentQualityReceipt(clean, { project: fx.project, resolve }), true);
+  await put(fx.project, 'src/other.ts', 'export const other: number = "wrong";');
+  assert.equal(await isCurrentQualityReceipt(clean, { project: fx.project, resolve }), false);
+  const bad = await runQuality(options);
+  await captureNativeQualityProbe('invalid-root', bad);
+  assert.equal(bad.status, 'failed', 'excluded root still checked');
+});
+async function captureNativeQualityProbe(name, report) {
+  if (!process.env.KODO_QUALITY_TSC_PROBE_EVIDENCE) return;
+  const { cp, mkdir } = await import('node:fs/promises');
+  const target = path.join(process.env.KODO_QUALITY_TSC_PROBE_EVIDENCE, name.replaceAll(' ', '-'));
+  await mkdir(target, { recursive: true });
+  await put(target, 'report.json', report);
+  await cp(report.evidenceRoot, path.join(target, 'raw'), { recursive: true });
+}
+
+test('Quality TypeScript external ambient package scopes block before tool execution', async t => {
+  const { runQuality } = await api();
+  for (const compilerOptions of [{ types: ['untracked'] }, { typeRoots: ['./node_modules/@types'] }]) {
+    const fx = await fixture(t, { ...projects.typescript, 'tsconfig.json': { extends: './config/base.json' }, 'config/base.json': { compilerOptions } });
+    const result = await runQuality({ ...fx, resolve: async () => assert.fail('unsupported ambient scope must not execute'), capabilities: ['typecheck'] });
+    assert.equal(result.status, 'blocked');
+    assert.equal(result.receipts[0].reason, 'typescript_external_types_unsupported');
+  }
 });
