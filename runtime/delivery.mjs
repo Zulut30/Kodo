@@ -59,13 +59,33 @@ async function stopOwnedTree(child) {
       function Capture-Owned([int]$ownedId) {
         if (!$seen.Add($ownedId)) { return }
         if ($seen.Count -gt 1024) { throw 'Owned process tree exceeds limit' }
-        try { $p = [Diagnostics.Process]::GetProcessById($ownedId); $null = $p.Handle; $owned.Add($p) } catch [ArgumentException] { }
+        $p = $null
+        try { $p = [Diagnostics.Process]::GetProcessById($ownedId) } catch [ArgumentException] { }
+        if ($null -ne $p) {
+          $captured = $false
+          try {
+            $null = $p.Handle
+            $owned.Add($p); $captured = $true
+          } catch [InvalidOperationException] {
+            # Exit between lookup and opening the handle is benign only when
+            # this Process confirms exit. Access/other errors still propagate.
+            if (!$p.HasExited) { throw }
+          } finally { if (!$captured) { $p.Dispose() } }
+        }
         foreach ($entry in @(Get-CimInstance Win32_Process -Filter "ParentProcessId = $ownedId")) { Capture-Owned ([int]$entry.ProcessId) }
       }
       try {
         Capture-Owned $root
-        try { & "$env:SystemRoot\\System32\\taskkill.exe" /PID $root /T /F 2>$null | Out-Null } catch { }
-        foreach ($p in $owned) { if (!$p.HasExited) { $p.Kill() } }
+        # Only invoke the bulk kill for the captured root identity. Retain its
+        # handle until teardown finishes, including if it exits during taskkill.
+        $rootProcess = $owned | Where-Object { $_.Id -eq $root } | Select-Object -First 1
+        if ($null -ne $rootProcess -and !$rootProcess.HasExited) {
+          try { & "$env:SystemRoot\\System32\\taskkill.exe" /PID $root /T /F 2>$null | Out-Null } catch { }
+        }
+        foreach ($p in $owned) {
+          try { if (!$p.HasExited) { $p.Kill() } }
+          catch [InvalidOperationException] { if (!$p.HasExited) { throw } }
+        }
         foreach ($p in $owned) { if (!$p.WaitForExit(5000)) { throw 'Owned process did not exit' } }
       } finally { foreach ($p in $owned) { $p.Dispose() } }
     `;
