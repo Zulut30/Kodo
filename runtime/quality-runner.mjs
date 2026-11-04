@@ -52,7 +52,7 @@ function environment(home) {
   for (const [key, value] of Object.entries(base)) if (/^(?:PATH|PATHEXT|SYSTEMROOT|WINDIR|COMSPEC|LANG|LC_ALL|NUMBER_OF_PROCESSORS|PROCESSOR_ARCHITECTURE|DOTNET_ROOT|DOTNET_ROOT_X64)$/i.test(key)) safe[key] = value;
   return { ...safe, HOME: home, USERPROFILE: home, APPDATA: home, LOCALAPPDATA: home, TEMP: home, TMP: home, TMPDIR: home,
     XDG_CONFIG_HOME: home, XDG_CACHE_HOME: home, NO_COLOR: '1', FORCE_COLOR: '0', CI: '1', DO_NOT_TRACK: '1',
-    DOTNET_CLI_HOME: home, DOTNET_NOLOGO: '1', DOTNET_SKIP_FIRST_TIME_EXPERIENCE: '1', DOTNET_CLI_TELEMETRY_OPTOUT: '1', DOTNET_CLI_WORKLOAD_UPDATE_NOTIFY_DISABLE: '1',
+    DOTNET_CLI_HOME: home, DOTNET_NOLOGO: '1', DOTNET_SKIP_FIRST_TIME_EXPERIENCE: '1', DOTNET_CLI_TELEMETRY_OPTOUT: '1', DOTNET_CLI_WORKLOAD_UPDATE_NOTIFY_DISABLE: '1', DOTNET_CLI_UI_LANGUAGE: 'en-US', VSLANG: '1033',
     RUSTUP_HOME: process.env.RUSTUP_HOME || path.join(os.homedir(), '.rustup'), RUSTUP_AUTO_INSTALL: '0', CARGO_HOME: home, CARGO_TARGET_DIR: path.join(home, 'cargo-target'), CARGO_NET_OFFLINE: 'true',
     GOENV: 'off', GOTOOLCHAIN: 'local', GOPROXY: 'off', GOSUMDB: 'off', GOFLAGS: '-mod=readonly', GOCACHE: path.join(home, 'go-cache'), GOMODCACHE: path.join(home, 'go-mod'),
     PYTHONDONTWRITEBYTECODE: '1', PYTHONNOUSERSITE: '1', PIP_DISABLE_PIP_VERSION_CHECK: '1', NPM_CONFIG_UPDATE_NOTIFIER: 'false' };
@@ -109,7 +109,8 @@ export function parseQualityOutput(check, result, project) {
     if (!Array.isArray(doc) || (id === 'html-validate' ? doc.length > check.files.length : doc.length !== check.files.length)) return malformed();
     const scanned = new Set();
     for (const item of doc) {
-      const file = fileInOutput(item.source ?? item.filePath ?? item.filepath, check, project); if (scanned.has(file)) return malformed(); scanned.add(file);
+      const reportedPath = id === 'stylelint' ? item.source : id === 'html-validate' ? item.filePath : item.filepath;
+      const file = fileInOutput(reportedPath, check, project); if (scanned.has(file)) return malformed(); scanned.add(file);
       let messages;
       if (id === 'stylelint') {
         if (!Array.isArray(item.warnings) || !Array.isArray(item.parseErrors) || !Array.isArray(item.invalidOptionWarnings) || item.parseErrors.length || item.invalidOptionWarnings.length || item.errored && !item.warnings.length) return malformed();
@@ -156,7 +157,9 @@ export function parseQualityOutput(check, result, project) {
     return malformed();
   } else if (id === 'dotnet') {
     if (check.capability === 'typecheck') {
-      if (result.code === 0 && !result.stderr.trim() && /Build succeeded\./.test(out) && /\b0 Error\(s\)/.test(out) && !/\b(?:warning|error) [A-Z]+\d+:/.test(out)) return { findings, clean: true };
+      const summaries = out.split(/\r?\n/).filter(line => /(?:Warning|Error)\(s\)/.test(line));
+      const completeCleanSummary = summaries.length === 2 && summaries.some(line => /^\s*0 Warning\(s\)\s*$/.test(line)) && summaries.some(line => /^\s*0 Error\(s\)\s*$/.test(line));
+      if (result.code === 0 && !result.stderr.trim() && /Build succeeded\./.test(out) && !/Build FAILED/.test(out) && completeCleanSummary && !/\b(?:warning|error) [A-Z]+\d+:/.test(out)) return { findings, clean: true };
       if (result.code !== 0 && /(?:Build FAILED|error [A-Z]+\d+:)/.test(out + result.stderr)) return { findings, clean: false };
       return malformed();
     }
@@ -340,8 +343,9 @@ export async function runQuality(options = {}) {
       if (check.tool === 'gofmt') {
         const go = await nativeResolve('go');
         version = await call(go.command, [...(go.args ?? []), 'version', tool.command], { stage: 'version' });
-        const expected = `go${check.version}`;
-        if (version.code !== 0 || version.stderr.trim() || !version.stdout.trim().endsWith(': ' + expected)) throw qualityError('version_mismatch', 'gofmt binary version mismatch');
+        const expected = `${tool.command}: go${check.version}`;
+        const observed = version.stdout.replace(/\r?\n$/, '');
+        if (version.code !== 0 || version.stderr.trim() || /[\r\n\0]/.test(observed) || observed !== expected) throw qualityError('version_mismatch', 'gofmt binary version mismatch');
       } else {
         const versionArgs = ['phpcs', 'phpstan'].includes(check.tool) ? [check.entry, '--version'] : check.tool === 'go' ? ['version'] : ['--version'];
         version = await call(tool.command, [...prefix, ...versionArgs], { env: toolEnv, stage: 'version' });
