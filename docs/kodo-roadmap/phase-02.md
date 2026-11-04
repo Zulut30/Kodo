@@ -11,6 +11,7 @@
 | Долг и новые нарушения | `QACC-15 old debt cannot hide changed new duplicate or worsened violations` |
 | Config invalidation | `Quality quick config changes cannot hide failing TypeScript behind passing JavaScript` |
 | Source closure / alias | `Quality TypeScript reference directives stay inside the inventoried project`; `Quality Windows short names inside the root map only to inventoried diagnostic files` |
+| Фактическое TSC coverage | `Quality TypeScript checks every receipt root despite files exclude and noCheck`; `Quality TypeScript private config binds exact roots options and tamper-sensitive receipts`; `Quality TypeScript generated config mutation during compiler execution blocks PASS`; `Quality TypeScript unsupported project references never execute or receive PASS` |
 | Реальный Windows teardown | `Windows owned teardown exit at kill boundary`; `Windows owned teardown access denied during handle acquisition`; `Windows owned teardown rejects an owned tree that remains alive after shutdown` |
 
 ## Выполненные проверки
@@ -29,10 +30,14 @@ node --test --test-reporter=tap tests/quality-profiles.test.mjs tests/quality-ru
 
 По новому указанию пользователя пять изолированных задач ускорения выполнены параллельно. Только проверенное test maintenance уже включено в эту фазу: 43 исходных engine-сценария и 10 helpers перенесены побайтно, 446 assert-вхождений сохранены. Четыре файла дали **61/61 PASS**, wall **137420.1356 ms**; сопоставимого полного before нет, коэффициент ускорения неизвестен. [Подробности](../WINDOWS-TEST-SPEED.md). Остальные четыре изменения фазы 03 ожидают отдельной интеграции.
 
+На `c4f1ba7` local full check: **851 / 849 PASS / 2 SKIP / 0 FAIL**, 312828.98 ms: один наблюдаемый прогон примерно на 48% короче `32783ce`, без контролируемого benchmark. Windows CI 41851622322 прошёл с package smoke (689 s job wall), ускорение CI пока не подтверждено. Linux того же HEAD остановился на тестовой гонке `/proc` после завершения процесса. Переносимый RED воспроизвёл ESRCH; исправленная fixture принимает только ENOENT/ESRCH или zombie, живой процесс и EACCES остаются ошибками, **10/10 PASS**.
+
+Независимый review `c4f1ba7` обнаружил ещё один false PASS: `tsconfig.files` исключал ошибочный файл, указанный в receipt. Реальный TSC воспроизвёл проблему. Приватная check-only конфигурация теперь перечисляет все receipt roots, запрещает `noCheck`/пропуск library checks и связывается с evidence по хешу. Inventoried local extends сохраняются; project references явно BLOCKED. Scoped **42/42 PASS**, неизменённый frozen oracle **9/9 PASS**; настоящий TSC: пять ошибочных проектов FAILED, три корректных PASSED, references BLOCKED. После конкретного ремонта запускается официальный новый цикл с прежними лимитами и сохранённой историей трёх неудачных review-попыток.
+
 ## Границы доказательств и следующий gate
 
 Private receipts вне Git: `%TEMP%/kodo-roadmap-20261104/` — `acceptance/`, `repair01/`, `repair02-validation/`, `teardown-race-receipts/`, manifests `coordinator-*-adoption.json`. Они связывают реальные logs, source hashes и попытки; неудачи не перезаписаны.
 
 Native Windows: 6 точных tool-version probes PASS; 14 реальных good/bad source-CLI сценариев для JS/TS/CSS/HTML/SQL/PHP дали ожидаемые результаты. Ошибка config scope подтверждена настоящими TSC/Oxlint. C#/Rust/Go compilation остаётся NOT VERIFIED; .NET/Rust/PHP version observation не заменяет SDK conformance. Codex Desktop worker/review sessions реальны; native subscription CLI end-to-end и Claude/both acceptance относятся к фазе 13.
 
-Локальный прежний installed `.tgz` прошёл новые quality команды; это исторический artifact `4042edd9`, не финальный пакет текущего ремонта. После teardown repair и test split нужны **новый чистый HEAD → full check → fresh security/UI evidence → независимый review → exact-head Windows/Linux CI → merge**. UI disabled нейтрален. Public release не опубликован, deployment не запускался. Авторитетное состояние — SQLite/receipt Kodo; этот документ является снимком до итоговой приёмки.
+Локальный прежний installed `.tgz` прошёл новые quality команды; это исторический artifact `4042edd9`, не финальный пакет текущего ремонта. После последних repairs нужны **новый чистый HEAD → full check → fresh security/UI evidence → независимый review → exact-head Windows/Linux CI → merge**. UI disabled нейтрален. Public release не опубликован, deployment не запускался. Авторитетное состояние — SQLite/receipt Kodo; этот документ является снимком до итоговой приёмки.
