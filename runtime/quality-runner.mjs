@@ -87,7 +87,8 @@ function fileInOutput(value, check, project) {
   let name;
   if (path.isAbsolute(value) || /^[A-Za-z]:\//.test(filename)) {
     let absolute = path.resolve(value);
-    if (!inside(project, absolute) && process.platform === 'win32') {
+    const scopedName = inside(project, absolute) ? path.relative(project, absolute).replaceAll('\\', '/') : null;
+    if (process.platform === 'win32' && !check.files.includes(scopedName)) {
       // A compiler can report the original DOS/redirected spelling although
       // planning uses the canonical root. Accept only a real, link-free alias.
       try {

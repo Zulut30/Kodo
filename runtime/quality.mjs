@@ -168,6 +168,11 @@ async function validateManifestScope(root, files, documents) {
     if (['typescript', 'javascript'].includes(languageOf(name))) {
       const text = await readFile(path.join(root, name), 'utf8');
       for (const match of text.matchAll(/(?:\bfrom\s*|\bimport\s*(?:\(\s*)?|\brequire\s*\(\s*)["'](\.[^"']+|\/[^"']+)["']/g)) await checkedPath(name, match[1]);
+      for (const match of text.matchAll(/^\s*\/\/\/\s*<reference\b[^>\r\n]*\bpath\s*=\s*["']([^"']+)["']/gmi)) {
+        await checkedPath(name, match[1]);
+        const dependency = path.relative(root, path.resolve(root, dir(name), match[1])).replaceAll('\\', '/');
+        if (!files.some(file => file.path === dependency)) throw qualityError('unsupported_scope', 'TypeScript reference must name an inventoried source file');
+      }
     }
   }
 }

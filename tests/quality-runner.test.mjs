@@ -5,6 +5,22 @@ import path from 'node:path';
 import { fixture, put, projects, pins, fakeTools, toolRunner, windowsShortPath } from './fixtures/quality/helpers.mjs';
 const api = () => import('../runtime/quality-runner.mjs');
 
+test('Quality Windows short names inside the root map only to inventoried diagnostic files', { skip: process.platform !== 'win32' }, async t => {
+  const { parseQualityOutput } = await api();
+  const file = 'src/long directory name for diagnostics/index.html';
+  const fx = await fixture(t, { [file]: '<img src="x">' }), project = await realpath(fx.project);
+  const shortRoot = await windowsShortPath(fx.project), shortDirectory = await windowsShortPath(path.dirname(path.join(fx.project, file)));
+  const alias = path.join(project, path.relative(shortRoot, shortDirectory), 'index.html');
+  if (alias === path.join(project, file)) { t.skip('8.3 names unavailable for this owned directory'); return; }
+  const record = { filePath: alias, source: '<img src="x">', errorCount: 1, warningCount: 0, messages: [{ ruleId: 'wcag/h37', line: 1, severity: 2, message: 'Image requires alt' }] };
+  const check = { tool: 'html-validate', root: '', files: [file], capability: 'lint' };
+  const parsed = parseQualityOutput(check, { code: 1, stdout: JSON.stringify([record]), stderr: '' }, project);
+  assert.equal(parsed.clean, false); assert.equal(parsed.findings[0].file, file);
+  record.filePath = path.join(fx.base, 'outside.html');
+  await put(fx.base, 'outside.html', '<img src="x">');
+  assert.throws(() => parseQualityOutput(check, { code: 1, stdout: JSON.stringify([record]), stderr: '' }, project));
+});
+
 test('Quality Windows aliases keep evidence outside the canonical project', { skip: process.platform !== 'win32' }, async t => {
   const { runQuality } = await api(), fx = await fixture(t, projects.javascript);
   const alias = await windowsShortPath(fx.project);

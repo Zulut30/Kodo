@@ -5,6 +5,21 @@ import { realpath } from 'node:fs/promises';
 import { fixture, put, projects, pins, windowsShortPath } from './fixtures/quality/helpers.mjs';
 const api = () => import('../runtime/quality.mjs');
 
+test('Quality TypeScript reference directives stay inside the inventoried project', async t => {
+  const { QualityProfileRegistry } = await api(), registry = new QualityProfileRegistry();
+  const fx = await fixture(t, { ...projects.typescript, 'src/main.ts': '/// <reference path="../../outside.ts" />\nexport const value = externalValue;\n' });
+  await put(fx.base, 'outside.ts', 'declare const externalValue: number;\n');
+  await assert.rejects(() => registry.plan(fx.project, { capabilities: ['typecheck'], changedPaths: ['src/main.ts'] }), error => error.code === 'unsafe_path');
+  await put(fx.project, 'node_modules/hidden.d.ts', 'declare const externalValue: number;\n');
+  await put(fx.project, 'src/main.ts', '/// <reference path="../node_modules/hidden.d.ts" />\nexport const value = externalValue;\n');
+  await assert.rejects(() => registry.plan(fx.project, { capabilities: ['typecheck'], changedPaths: ['src/main.ts'] }), error => error.code === 'unsupported_scope');
+  await put(fx.project, 'src/main.ts', "/// <reference path='./types.d.ts' />\nexport const value = externalValue;\n");
+  await put(fx.project, 'src/types.d.ts', 'declare const externalValue: number;\n');
+  const plan = await registry.plan(fx.project, { capabilities: ['typecheck'], changedPaths: ['src/main.ts'] });
+  assert.equal(plan.checks[0].status, 'applicable');
+  assert.ok(plan.files.some(file => file.path === 'src/types.d.ts'));
+});
+
 test('Quality Windows drive case and short aliases preserve safe discovery and planning', { skip: process.platform !== 'win32' }, async t => {
   const { QualityProfileRegistry } = await api(), registry = new QualityProfileRegistry();
   const fx = await fixture(t, Object.fromEntries(Object.entries(projects.javascript).map(([name, value]) => ['project directory for alias/' + name, value])));
