@@ -407,7 +407,8 @@
       }
     ],
     "versionPrefixes": [
-      "sqlfluff, version "
+      "sqlfluff, version ",
+      "python -m sqlfluff, version "
     ],
     "platforms": [
       "win32-x64",
