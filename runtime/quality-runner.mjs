@@ -67,7 +67,7 @@ function environment(home) {
     XDG_CONFIG_HOME: home, XDG_CACHE_HOME: home, NO_COLOR: '1', FORCE_COLOR: '0', CI: '1', DO_NOT_TRACK: '1',
     DOTNET_CLI_HOME: home, DOTNET_NOLOGO: '1', DOTNET_SKIP_FIRST_TIME_EXPERIENCE: '1', DOTNET_CLI_TELEMETRY_OPTOUT: '1', DOTNET_CLI_WORKLOAD_UPDATE_NOTIFY_DISABLE: '1', DOTNET_CLI_UI_LANGUAGE: 'en-US', VSLANG: '1033',
     RUSTUP_HOME: process.env.RUSTUP_HOME || path.join(os.homedir(), '.rustup'), RUSTUP_AUTO_INSTALL: '0', CARGO_HOME: home, CARGO_TARGET_DIR: path.join(home, 'cargo-target'), CARGO_NET_OFFLINE: 'true',
-    GOENV: 'off', GOTOOLCHAIN: 'local', GOPROXY: 'off', GOSUMDB: 'off', GOFLAGS: '-mod=readonly', GOCACHE: path.join(home, 'go-cache'), GOMODCACHE: path.join(home, 'go-mod'),
+    GOENV: 'off', GOWORK: 'off', GO111MODULE: 'on', GOTOOLCHAIN: 'local', GOPROXY: 'off', GOSUMDB: 'off', GOFLAGS: '-mod=readonly', GOPATH: path.join(home, 'go-path'), GOCACHE: path.join(home, 'go-cache'), GOMODCACHE: path.join(home, 'go-mod'),
     PYTHONDONTWRITEBYTECODE: '1', PYTHONNOUSERSITE: '1', PIP_DISABLE_PIP_VERSION_CHECK: '1', NPM_CONFIG_UPDATE_NOTIFIER: 'false' };
 }
 function validVersion(id, output, version) {
@@ -359,6 +359,15 @@ export async function runQuality(options = {}) {
       receipt.toolIdentity = await toolIdentity(tool);
       if (check.tool === 'go' && check.capability === 'typecheck') await mkdir(path.join(evidenceRoot, 'go-output'), { recursive: true, mode: 0o700 });
       const toolEnv = { ...env, ...(tool.env ?? {}) }, prefix = tool.args ?? [];
+      if (check.tool === 'go' && !check.configured) {
+        // Native resolver additions cannot reopen workspaces, user GOENV,
+        // overlays, downloads or external module caches after sanitization.
+        const fixed = ['GOENV', 'GOWORK', 'GO111MODULE', 'GOTOOLCHAIN', 'GOPROXY', 'GOSUMDB', 'GOPATH', 'GOCACHE', 'GOMODCACHE', 'GOFLAGS'];
+        // Windows environment names are case-insensitive.
+        for (const key of Object.keys(toolEnv)) if (fixed.includes(key.toUpperCase())) delete toolEnv[key];
+        for (const key of fixed) toolEnv[key] = env[key];
+        toolEnv.GOFLAGS = `-mod=${check.goModuleMode}`;
+      }
       if (check.tool === 'cargo') {
         const rustc = await nativeResolve('rustc');
         const compiler = await call(rustc.command, [...(rustc.args ?? []), '--version'], { stage: 'version' });

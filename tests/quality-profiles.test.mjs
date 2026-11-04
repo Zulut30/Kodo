@@ -2,8 +2,83 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import { realpath } from 'node:fs/promises';
-import { fixture, put, projects, pins, windowsShortPath } from './fixtures/quality/helpers.mjs';
+import { fixture, put, projects, pins, windowsShortPath, vendoredGo } from './fixtures/quality/helpers.mjs';
 const api = () => import('../runtime/quality.mjs');
+
+test('Quality Go vendor bytes are dependencies without language profiles or source roots', async t => {
+  const { QualityProfileRegistry } = await api(), registry = new QualityProfileRegistry();
+  const fx = await fixture(t, { ...vendoredGo,
+    'vendor/example.test/dependency/package.json': '{"dependencies":{"next":"15.0.0"}}',
+    'vendor/example.test/dependency/config.json': '{"mode":"one"}',
+    'vendor/example.test/dependency/main.ts': 'invalid TypeScript',
+    'vendor/example.test/dependency/go.mod': 'module example.test/dependency\ngo 1.24.0\n',
+    'vendor/example.test/dependency/bin/payload.txt': 'embed input',
+    'sibling/go.mod': 'module example.test/sibling\ngo 1.24.0\n', 'sibling/main.go': 'package sibling\n',
+    'nested/go.mod': 'module example.test/nested\ngo 1.24.0\n', 'nested/main.go': 'package nested\n'
+  });
+  const before = await registry.detect(fx.project);
+  assert.deepEqual(before.languages, ['go']); assert.deepEqual(before.frameworks, []);
+  assert.deepEqual(before.profiles.map(p => p.id), ['go:.', 'go:nested', 'go:sibling']);
+  assert.deepEqual(before.profiles[0].files, ['main.go']);
+  for (const name of Object.keys(vendoredGo).filter(n => n.startsWith('vendor/')).concat(['vendor/example.test/dependency/config.json', 'vendor/example.test/dependency/bin/payload.txt'])) {
+    assert.ok(before.files.some(f => f.path === name), name);
+  }
+  for (const name of ['vendor/modules.txt', 'vendor/example.test/dependency/config.json', 'vendor/example.test/dependency/value.go']) {
+    const original = await (await import('node:fs/promises')).readFile(path.join(fx.project, name), 'utf8');
+    await put(fx.project, name, original + '\n');
+    assert.notEqual((await registry.detect(fx.project)).sourceHash, before.sourceHash, name);
+    const quick = await registry.plan(fx.project, { mode: 'quick', changedPaths: [name], capabilities: ['typecheck'] });
+    assert.equal(quick.checks.find(c => c.id === 'go:.:typecheck').status, 'applicable', name);
+    assert.ok(quick.checks.filter(c => c.root).every(c => c.status === 'skipped'), name);
+    await put(fx.project, name, original);
+  }
+});
+
+test('Quality Go nested vendor changes activate only their owning module', async t => {
+  const { QualityProfileRegistry } = await api();
+  const fx = await fixture(t, { ...projects.go, ...Object.fromEntries(Object.entries(vendoredGo).map(([name, value]) => ['nested/' + name, value])) });
+  const plan = await new QualityProfileRegistry().plan(fx.project, { mode: 'quick', changedPaths: ['nested/vendor/example.test/dependency/value.go'], capabilities: ['typecheck'] });
+  assert.equal(plan.checks.find(c => c.root === '').status, 'skipped');
+  const nested = plan.checks.find(c => c.root === 'nested');
+  assert.equal(nested.status, 'applicable'); assert.deepEqual(nested.files, ['nested/main.go']);
+});
+
+test('Quality Go incomplete vendor cannot fall back to an untracked module cache', async t => {
+  const { QualityProfileRegistry } = await api();
+  const fx = await fixture(t, { ...projects.go, 'vendor/example.test/dependency/value.go': 'package dependency\nconst Value = 42\n' });
+  const plan = await new QualityProfileRegistry().plan(fx.project, { capabilities: ['typecheck'] });
+  assert.equal(plan.checks[0].status, 'unsupported'); assert.equal(plan.checks[0].reason, 'go_prepared_vendor_required');
+});
+
+test('Quality Go replacement and module-less compiler scopes are explicitly unsupported', async t => {
+  const { QualityProfileRegistry } = await api();
+  for (const replacement of ['../outside', 'C:/outside', '"C:/outside with spaces"', './vendor/local', 'example.test/another v1.0.0']) {
+    const fx = await fixture(t, { ...projects.go, 'go.mod': projects.go['go.mod'] + `replace example.test/dependency => ${replacement}\n` });
+    const plan = await new QualityProfileRegistry().plan(fx.project, { capabilities: ['typecheck'] });
+    assert.equal(plan.checks[0].status, 'unsupported'); assert.equal(plan.checks[0].reason, 'go_replacements_unsupported');
+  }
+  const fx = await fixture(t, { 'main.go': projects.go['main.go'] }, { tools: { go: { version: '1.24.0' } } });
+  const plan = await new QualityProfileRegistry().plan(fx.project, { capabilities: ['typecheck'] });
+  assert.equal(plan.checks[0].status, 'blocked'); assert.equal(plan.checks[0].reason, 'go_module_required');
+});
+
+test('Quality Go rejects linked external or hardlinked vendor inputs', async t => {
+  const { QualityProfileRegistry } = await api();
+  const { mkdir, symlink, link } = await import('node:fs/promises');
+  for (const kind of ['root', 'nested', 'hardlink']) {
+    const fx = await fixture(t, projects.go);
+    await put(fx.base, 'external/value.go', 'package dependency\n');
+    if (kind === 'hardlink') {
+      await mkdir(path.join(fx.project, 'vendor'), { recursive: true });
+      await link(path.join(fx.base, 'external/value.go'), path.join(fx.project, 'vendor/value.go'));
+    } else {
+      const target = kind === 'root' ? 'vendor' : 'vendor/example.test/dependency';
+      await mkdir(path.dirname(path.join(fx.project, target)), { recursive: true });
+      await symlink(path.join(fx.base, 'external'), path.join(fx.project, target), process.platform === 'win32' ? 'junction' : 'dir');
+    }
+    await assert.rejects(() => new QualityProfileRegistry().detect(fx.project), error => error.code === 'unsafe_path', kind);
+  }
+});
 
 test('Quality TypeScript reference graphs and untracked config inheritance fail closed', async t => {
   const { QualityProfileRegistry } = await api(), registry = new QualityProfileRegistry();
