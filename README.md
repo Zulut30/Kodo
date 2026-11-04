@@ -77,7 +77,7 @@ node cli/index.mjs benchmark report "D:\KodoBenchmarks\quick-pilot" --json
 
 ## Необязательные инструменты и проверки
 
-Текущее дерево содержит управляемые pins десяти инструментов: Agent Desktop, Browser Use, Browser Harness, Vibetest, Jev Ultrafast, Chrome DevTools MCP, Semgrep, Gitleaks, ripgrep и RTK OSS 1.1.0. Шесть UI-адаптеров выполняют реальные действия в собственном приложении/браузере и проверяют результат через независимый DOM/accessibility readback. Security gates запускают локальные сканеры. Установка хранится вне Git и не меняет глобальные инструменты.
+Текущее дерево содержит управляемые pins шестнадцати инструментов: Agent Desktop, Browser Use, Browser Harness, Vibetest, Jev Ultrafast, Chrome DevTools MCP, Semgrep, Gitleaks, ripgrep, RTK OSS 1.1.0, Oxlint 1.91.0, Oxfmt 0.76.0, TypeScript (tsc) 7.0.2, Stylelint 18.0.0, HTML-Validate 11.18.0 и SQLFluff 4.5.0. Шесть инструментов качества используют тот же изолированный installer с проверкой pins и версий; SQLFluff требует явного dialect при проверке проекта. Шесть UI-адаптеров выполняют реальные действия в собственном приложении/браузере и проверяют результат через независимый DOM/accessibility readback. Security gates запускают локальные сканеры. Установка хранится вне Git и не меняет глобальные инструменты.
 
 RTK доступен явно для поддерживаемого человекочитаемого вывода в private worker environment; missing/unsupported использует исходные команды. JSON/protocol/porcelain/NUL, Node/TAP, полный check, CI и доставка остаются сырыми. Глобальный RTK 0.50.0 и hooks не меняются. [Правила RTK](docs/UI-TOOLS.md#rtk-и-вывод-shell).
 

@@ -102,7 +102,12 @@ async function offlineInstaller(fx, { corrupt = false, omitLicense = false, wron
 test('RTK pins only verified OSS archives without changing component or skill counts', () => {
   const pin = toolCatalog.find(t => t.id === 'rtk');
   assert.ok(pin);
-  assert.equal(toolCatalog.length, 10); assert.equal(registry.components.length, 33); assert.equal(defaultSkillIds.length, 13);
+  assert.equal(toolCatalog.length, 16); assert.equal(registry.components.length, 33); assert.equal(defaultSkillIds.length, 13);
+  assert.deepEqual(new Set(toolCatalog.map(tool => tool.id)), new Set([
+    'agent-desktop', 'browser-use', 'browser-harness', 'vibetest', 'jev-ultrafast',
+    'chrome-devtools-mcp', 'semgrep', 'gitleaks', 'ripgrep', 'rtk',
+    'oxlint', 'oxfmt', 'typescript', 'stylelint', 'html-validate', 'sqlfluff'
+  ]));
   assert.equal(pin.repository, 'rtk-ai/rtk'); assert.equal(pin.version, '1.1.0');
   assert.equal(pin.revision, '753a3b0e939f2e4490fc24e3a1984010f40a103c'); assert.equal(pin.license, 'Apache-2.0');
   assert.deepEqual(Object.keys(pin.assets).sort(), ['linux-x64', 'win32-x64']);

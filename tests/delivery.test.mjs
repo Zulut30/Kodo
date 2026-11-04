@@ -337,14 +337,94 @@ async function ownedTree(t, { inheritedPipes = true } = {}) {
   return { directory, filename, ready, disarm: () => { pids = []; } };
 }
 
-async function assertStopped(pids) {
+async function assertStopped(pids, { platform = process.platform, probe = pid => process.kill(pid, 0), readStat = pid => readFile(`/proc/${pid}/stat`, 'utf8') } = {}) {
   for (const pid of pids) {
-    try { process.kill(pid, 0); }
+    try { probe(pid); }
     catch (error) { if (error.code === 'ESRCH') continue; throw error; }
     // Linux can retain an already-dead orphan as a zombie until PID 1 reaps it.
-    if (process.platform === 'linux' && /\) Z /.test(await readFile(`/proc/${pid}/stat`, 'utf8'))) continue;
+    if (platform === 'linux') {
+      try { if (/\) Z /.test(await readStat(pid))) continue; }
+      catch (error) { if (['ENOENT', 'ESRCH'].includes(error.code)) continue; throw error; }
+    }
     assert.fail(`Owned fixture process ${pid} is still running after execute settled`);
   }
+}
+
+test('Owned process assertion handles reaping between liveness and proc observation', async () => {
+  for (const code of ['ESRCH', 'ENOENT']) await assertStopped([123], { platform: 'linux', probe() {}, readStat: async () => { throw Object.assign(new Error('Owned process was reaped'), { code }); } });
+  await assertStopped([123], { platform: 'linux', probe() {}, readStat: async () => '123 (owned node) Z 1' });
+  await assert.rejects(() => assertStopped([123], { platform: 'linux', probe() {}, readStat: async () => '123 (owned node) R 1' }), /still running/);
+  await assert.rejects(() => assertStopped([123], { platform: 'linux', probe() {}, readStat: async () => { throw Object.assign(new Error('Access denied'), { code: 'EACCES' }); } }), error => error.code === 'EACCES');
+});
+
+for (const scenario of [
+  { name: 'exit at handle boundary', boundary: 'handle', exit: true },
+  { name: 'confirmed exit during handle acquisition', boundary: 'handle', exit: true, fault: 'InvalidOperationException' },
+  { name: 'exit at kill boundary', boundary: 'kill', exit: true },
+  { name: 'live process error during kill', boundary: 'kill', fault: 'InvalidOperationException' },
+  { name: 'access denied during handle acquisition', boundary: 'handle', fault: 'ComponentModel.Win32Exception' },
+  { name: 'continues descendant enumeration after an observed child disappears', boundary: 'lookup', tree: true },
+  { name: 'rejects an owned tree that remains alive after shutdown', boundary: 'kill', tree: true, survives: true }
+]) {
+  test(`Windows owned teardown ${scenario.name}`, { skip: process.platform !== 'win32', timeout: 40000 }, async t => {
+    const nativeSpawn = childProcess.spawn;
+    let injected = false, helperStderr = '';
+    const mocked = t.mock.method(childProcess, 'spawn', (command, args, options) => {
+      if (!/powershell\.exe$/i.test(command)) return nativeSpawn(command, args, options);
+      const index = args.indexOf('-EncodedCommand') + 1;
+      let script = Buffer.from(args[index], 'base64').toString('utf16le');
+      // Exit a real owned process exactly after discovery / the liveness check.
+      // A separate Process instance avoids opening the captured object's handle.
+      const exit = scenario.exit ? '$terminator = [Diagnostics.Process]::GetProcessById($p.Id); $terminator.Kill(); $terminator.WaitForExit(); $terminator.Dispose();' : '';
+      const fault = scenario.fault ? `throw [${scenario.fault}]::new(${scenario.fault === 'ComponentModel.Win32Exception' ? 5 : "'Fixture process operation failed'"});` : '';
+      if (scenario.boundary === 'lookup') {
+        const lookup = '$p = [Diagnostics.Process]::GetProcessById($ownedId)';
+        assert.ok(script.includes(lookup));
+        // Model GetProcessById finding an exited, already-reaped child. Its
+        // still-live grandchild must still be enumerated and awaited.
+        const vanish = "if ($ownedId -ne $root -and !$script:fixtureExited) { $script:fixtureExited = $true; $gone = [Diagnostics.Process]::GetProcessById($ownedId); $gone.Kill(); $gone.WaitForExit(); $gone.Dispose(); throw [ArgumentException]::new('Fixture child exited') };";
+        script = script.replace(lookup, `${vanish} ${lookup}`);
+      } else if (scenario.boundary === 'handle') {
+        assert.ok(script.includes('$null = $p.Handle'));
+        script = script.replace('$null = $p.Handle', `${exit} ${fault} $null = $p.Handle`);
+      } else {
+        // Suppress the earlier bulk kill so this process reaches the Kill race.
+        script = script.replace(/try \{ & .*taskkill\.exe.*?\} catch \{ \}/, '');
+        assert.ok(!script.includes('taskkill.exe'));
+        assert.ok(script.includes('$p.Kill()'));
+        script = script.replace('$p.Kill()', scenario.survives ? '$null = $p.Id' : `${exit} ${fault} $p.Kill()`);
+        if (scenario.survives) {
+          assert.ok(script.includes("throw 'Owned process did not exit'"));
+          script = script.replace("throw 'Owned process did not exit'", "if (@($owned | Where-Object { $_.Id -ne $root -and !$_.HasExited }).Count -gt 0) { [Console]::Error.WriteLine('Fixture descendant still alive before rejection') }; throw 'Owned process did not exit'");
+        }
+      }
+      injected = true;
+      const argv = [...args]; argv[index] = Buffer.from(script, 'utf16le').toString('base64');
+      const helper = nativeSpawn(command, argv, options);
+      helper.stderr.on('data', chunk => { helperStderr += chunk; });
+      return helper;
+    });
+    syncBuiltinESMExports();
+    try {
+      const tree = scenario.tree ? await ownedTree(t) : undefined;
+      const outcome = execute(process.execPath, tree ? [tree.filename, '0', tree.directory] : ['-e', "process.stdout.write('x'.repeat(2048));setInterval(()=>{},1000)"], { cwd: tree?.directory, maxOutputBytes: 1024 }).catch(error => error);
+      let pids;
+      if (tree) { pids = await tree.ready; await writeFile(path.join(tree.directory, 'flood'), 'go'); }
+      const error = await outcome;
+      assert.equal(injected, true);
+      assert.equal(error.code, 'invalid_output');
+      if ((scenario.fault && !scenario.exit) || scenario.survives) {
+        assert.equal(error.teardownError?.code, 'process_teardown');
+        assert.match(error.teardownError.message, /Owned process teardown helper failed \(1\)/);
+        if (scenario.survives) assert.match(helperStderr, /Owned process did not exit/);
+      } else assert.equal(error.teardownError, undefined, helperStderr);
+      if (tree) {
+        if (scenario.survives) assert.match(helperStderr, /Fixture descendant still alive before rejection/);
+        else { await assertStopped(pids); tree.disarm(); }
+        assert.match(error.stdout, /owned tree ready/);
+      } else assert.equal(error.stdout, 'x'.repeat(1024));
+    } finally { mocked.mock.restore(); syncBuiltinESMExports(); }
+  });
 }
 
 for (const mode of ['timeout', 'abort', 'output-limit']) {

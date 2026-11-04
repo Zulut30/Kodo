@@ -1,21 +1,23 @@
 # Прогресс Kodo roadmap
 
-Снимок: 2026-11-04, baseline HEAD `d2654f12b1da21dfa3523fa9b1aea72b51a050ba`. Это версия плана в Git; авторитетное состояние конкретного execution run по-прежнему хранится в приватном SQLite, а его `progress.md` создаёт runtime. Этот документ не меняет состояние run.
+Снимок: 2026-11-04. Авторитетные run state и receipts хранятся вне Git в SQLite Kodo. Этот документ отражает состояние до итоговых gates текущего commit.
 
-| Фаза | Статус выполнения | Следующий проверяемый шаг |
+Пользователь отдельно потребовал пять одновременных задач. Разработка независимых worktree выполняется параллельно; приёмка и merge этапов сохраняют порядок. Пять drafts ускорения получили реальные scoped результаты: pool53+3, Windows61, profiler14, graph17, CI18. Совместимость компонентов проверяется отдельно; это не общий PASS этапа03.
+
+| Фаза | Статус | Следующий проверяемый шаг |
 | --- | --- | --- |
-| 01 Baseline/plan | BASELINE PASS; SCOPED DOCS PASS; delivery PENDING | Coordinator integrated gates → independent review → PR с exact-head CI, без release |
-| 02 Language quality | NOT STARTED | После 01: detection/status/profile fixtures |
-| 03 CI/cache | NOT STARTED | После 02: timing profiler, затем affected/cache |
-| 04 Architecture | NOT STARTED | После 03: forbidden-import policy fixture |
-| 05 Research knowledge | NOT STARTED | После 04: typed claims/provenance/invalidation |
-| 06 Project Director | NOT STARTED | После 05: versioned DB + legacy compatibility |
-| 07 Swarm | NOT STARTED | После 06: durable job/lease/idempotency |
-| 08 Context/budget | NOT STARTED | После 07: deterministic local fast path |
-| 09 Verification/evolution | NOT STARTED | После 08: risk policy + independent oracles |
-| 10 Progress/maintenance | NOT STARTED | После 09: acceptance-based progress/watchdog |
-| 11 Merge/release | NOT STARTED | После 10: immutable integration queue; deployment requires configured target |
-| 12 Benchmark | NOT STARTED | После 11: сохранить 9/24 PAUSED pilot; новый bounded experiment отдельно |
-| 13 Final acceptance | NOT STARTED | После 12 или явно записанных blockers: сценарии A–F |
+| 01 Baseline/plan | ACCEPTED; PR #10 MERGED `ef38109e`; обе ОС CI PASS | Исторический baseline сохранён |
+| 02 Language quality | Full/review/обе ОС CI на4bb PASS; GitHub остановил merge на двух реальных Go-дефектах. Native Go ремонт принят координатором:118PASS/2SKIP | Свежие full/gates/review/current-head CI и подтверждённое устранение conversations; [PR #11](https://github.com/Zulut30/Kodo/pull/11) ещё не merged |
+| 03 CI/cache/concurrency | Пять изолированных drafts завершены; cross-port проверка продолжается. Test layout принят как maintenance02 | После02acceptance интегрировать остальные изменения; проверить full/CI и фактическое время |
+| 04 Architecture | NOT STARTED | После03: forbidden imports/contracts |
+| 05 Research knowledge | NOT STARTED | После04: claims/provenance/invalidation |
+| 06 Project Director | NOT STARTED | После05: versioned DB/legacy compatibility |
+| 07 Swarm | NOT STARTED | После06: durable jobs/leases/idempotency |
+| 08 Context/budget | NOT STARTED | После07: deterministic fast path |
+| 09 Verification/evolution | NOT STARTED | После08: independent oracles/risk policy |
+| 10 Progress/maintenance | NOT STARTED | После09: watchdog/acceptance progress |
+| 11 Merge/release | NOT STARTED | После10: immutable queue/recovery/smoke |
+| 12 Observability | NOT STARTED; benchmark campaigns отложены пользователем | После11: реальные operational metrics/JSON; неизвестные метрики null |
+| 13 Final acceptance | NOT STARTED | После12: реальные сценарии и проверенный выпуск |
 
-Результаты baseline и ограничения: [BASELINE](BASELINE.md), [phase-01](phase-01.md); публичные [local receipt](../../tests/fixtures/roadmap-baseline/local-baseline.json) и [CI receipt](../../tests/fixtures/roadmap-baseline/ci-baseline.json). CI на `c19157b`, tree-identical `d2654f1`, не exact-main checks. PR9 OPEN — внешний risk; published/installed 0.2.6 не является выпуском roadmap. Фазы 02–13 этим PR не реализуются.
+[Baseline](BASELINE.md), [приёмка01](phase-01.md), [изменения и evidence02](phase-02.md). Исторические [local](../../tests/fixtures/roadmap-baseline/local-baseline.json) и [CI](../../tests/fixtures/roadmap-baseline/ci-baseline.json) receipts не перезаписываются. Published0.2.6 является прежним выпуском; новый release запланирован на фазе13.

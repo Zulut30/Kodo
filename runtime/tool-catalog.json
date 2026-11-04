@@ -249,5 +249,175 @@
         "executable": "rtk"
       }
     }
+  },
+  {
+    "id": "oxlint",
+    "version": "1.91.0",
+    "kind": "npm",
+    "repository": "oxc-project/oxc",
+    "license": "MIT",
+    "source": "https://registry.npmjs.org/oxlint/1.91.0",
+    "integrity": "sha512-vjy/cBZcEFcYh3dbxUoQK+bjc+QaY3ZWo86aJkZ5YAwp/HyiqP7dTdNgbvcIVJafhAH5sZbTqBp4sZcicEZngA==",
+    "entry": "bin/oxlint",
+    "binName": "oxlint",
+    "engines": {
+      "node": "^20.19.0 || >=22.12.0"
+    },
+    "versionPrefixes": [
+      "Version: ",
+      "oxlint "
+    ],
+    "platforms": [
+      "win32-x64",
+      "linux-x64",
+      "darwin-x64",
+      "darwin-arm64",
+      "linux-arm64",
+      "win32-arm64"
+    ],
+    "capability": "Read-only JavaScript/TypeScript lint checks"
+  },
+  {
+    "id": "oxfmt",
+    "version": "0.76.0",
+    "kind": "npm",
+    "repository": "oxc-project/oxc",
+    "license": "MIT",
+    "source": "https://registry.npmjs.org/oxfmt/0.76.0",
+    "integrity": "sha512-Yo9RIn9lRWTm/U8obHbXUWc39lCpEFXlEggFoPx01zS18OCFi7mAwMmL05+p1AunuJgSkONffWyBHJzpMMCRuQ==",
+    "entry": "bin/oxfmt",
+    "binName": "oxfmt",
+    "engines": {
+      "node": "^20.19.0 || >=22.12.0"
+    },
+    "versionPrefixes": [
+      "Version: ",
+      "oxfmt "
+    ],
+    "platforms": [
+      "win32-x64",
+      "linux-x64",
+      "darwin-x64",
+      "darwin-arm64",
+      "linux-arm64",
+      "win32-arm64"
+    ],
+    "capability": "Read-only format verification for supported source files"
+  },
+  {
+    "id": "typescript",
+    "version": "7.0.2",
+    "kind": "npm",
+    "repository": "microsoft/TypeScript",
+    "revision": "2bd066d87f5bafd315be9f40889d0a60b9e58e0b",
+    "license": "Apache-2.0",
+    "source": "https://registry.npmjs.org/typescript/7.0.2",
+    "integrity": "sha512-8FYau96o3NKOhbjKi/qNvG/W5jhzxkbdm5sj9AbZ/5T5sWqn3hJgLfGx27sRKZWTvyzCP8dLRBTf5tBTSRVUNA==",
+    "entry": "bin/tsc",
+    "binName": "tsc",
+    "engines": {
+      "node": ">=16.20.0"
+    },
+    "versionPrefixes": [
+      "Version "
+    ],
+    "platforms": [
+      "win32-x64",
+      "linux-x64",
+      "darwin-x64",
+      "darwin-arm64",
+      "linux-arm64",
+      "win32-arm64"
+    ],
+    "capability": "Pinned tsc type checking without emit"
+  },
+  {
+    "id": "stylelint",
+    "version": "18.0.0",
+    "kind": "npm",
+    "repository": "stylelint/stylelint",
+    "revision": "7c49e1828311b9d413826cb47703ef1c6ccae4ef",
+    "license": "MIT",
+    "source": "https://registry.npmjs.org/stylelint/18.0.0",
+    "integrity": "sha512-kI10GsHXQvsH/AcklVZdQgwDuxtHi+A+h1Ujzd7h9LDf3e5jQiLQkWFlPtpynX3E6oVWHG1wo9v6dL0Mr+nnSA==",
+    "entry": "bin/stylelint.mjs",
+    "binName": "stylelint",
+    "engines": {
+      "node": "^22.22.2 || ^24.15.0 || >=26.0.0"
+    },
+    "versionPrefixes": [
+      ""
+    ],
+    "platforms": [
+      "win32-x64",
+      "linux-x64",
+      "darwin-x64",
+      "darwin-arm64",
+      "linux-arm64",
+      "win32-arm64"
+    ],
+    "capability": "CSS lint checks with project configuration"
+  },
+  {
+    "id": "html-validate",
+    "version": "11.18.0",
+    "kind": "npm",
+    "repository": "https://gitlab.com/html-validate/html-validate",
+    "revision": "eb0f0df1a6062e783bc5505d899cdaf5c2fdcac7",
+    "license": "MIT",
+    "source": "https://registry.npmjs.org/html-validate/11.18.0",
+    "integrity": "sha512-9+cP5LyLG2blk1W8pYACmgTuFnqOuMZS8rt7G0q72wH7xqdduKE0qyV1qhwsKr/tjqmqscq81yyE6mNUuUex3Q==",
+    "entry": "bin/html-validate.mjs",
+    "binName": "html-validate",
+    "engines": {
+      "node": "^22.22.0 || >= 24.8.0"
+    },
+    "versionPrefixes": [
+      "html-validate-"
+    ],
+    "platforms": [
+      "win32-x64",
+      "linux-x64",
+      "darwin-x64",
+      "darwin-arm64",
+      "linux-arm64",
+      "win32-arm64"
+    ],
+    "capability": "HTML validation with project configuration"
+  },
+  {
+    "id": "sqlfluff",
+    "version": "4.5.0",
+    "kind": "python",
+    "repository": "sqlfluff/sqlfluff",
+    "license": "MIT",
+    "source": "https://pypi.org/pypi/sqlfluff/4.5.0/json",
+    "group": "quality",
+    "spec": "sqlfluff==4.5.0",
+    "module": "sqlfluff",
+    "entryModule": "sqlfluff",
+    "files": [
+      {
+        "filename": "sqlfluff-4.5.0-py3-none-any.whl",
+        "sha256": "471a9abcad8061e36b69f711a6d89393241e30f9d1e0869f79965c0ae2c889c7"
+      },
+      {
+        "filename": "sqlfluff-4.5.0.tar.gz",
+        "sha256": "0b0d5b2cca03e7d138b8d899249fed5fa54083e407bbd161449c0b30f901b7b8"
+      }
+    ],
+    "versionPrefixes": [
+      "sqlfluff, version ",
+      "python -m sqlfluff, version "
+    ],
+    "platforms": [
+      "win32-x64",
+      "linux-x64",
+      "darwin-x64",
+      "darwin-arm64",
+      "linux-arm64",
+      "win32-arm64"
+    ],
+    "capability": "SQL lint checks with an explicit project dialect"
   }
 ]
