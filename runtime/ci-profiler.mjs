@@ -162,12 +162,17 @@ function cleanOutput(text, secrets) {
 
 /** Executes through Kodo's owned, shell:false port. Infrastructure errors throw
  * with profilePath/stdout/stderr attached; ordinary nonzero exits are returned. */
-export async function runProfiledCommand({ command, args = [], cwd = process.cwd(), env = process.env, timeoutMs = 120000, evidenceDir = path.join(stateHome(), 'ci-profiles'), phase, tier, signal } = {}) {
+export async function runProfiledCommand({ command, args = [], cwd = process.cwd(), env = process.env, redactions = {}, timeoutMs = 120000, evidenceDir = path.join(stateHome(), 'ci-profiles'), phase, tier, signal } = {}) {
   if (typeof command !== 'string' || !command || !Array.isArray(args) || args.some(arg => typeof arg !== 'string') || !Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 2147483647) throw error('configuration', 'Profile command, arguments and timeout are invalid');
   if (tier !== undefined && !['L0', 'L1', 'L2', 'L3'].includes(tier)) throw error('configuration', 'Unknown CI tier');
   const directory = await privateDirectory(evidenceDir, cwd), profilePath = path.join(directory, 'profile.json');
   const safeEnv = workerEnvironment(env);
-  const secrets = Object.fromEntries(Object.entries(env).filter(([name]) => !(name in safeEnv)));
+  // Callers may already have scrubbed env. Keep their known values as private
+  // metadata, in a separate namespace so neither source can overwrite a value.
+  const secrets = Object.fromEntries([
+    ...Object.entries(env).filter(([name]) => !(name in safeEnv)).map(([name, value]) => [`env:${name}`, value]),
+    ...Object.entries(redactions ?? {}).map(([name, value]) => [`known:${name}`, value])
+  ]);
   const clean = value => cleanOutput(value, secrets);
   const start = performance.now(); let result, failure;
   try { result = await execute(command, args, { cwd, env, timeoutMs, signal, allowFailure: true, maxOutputBytes: 20 * 1024 * 1024, secrets }); }

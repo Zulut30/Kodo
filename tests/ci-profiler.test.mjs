@@ -144,6 +144,79 @@ test('Overlapping known environment secrets cannot expose a tail in successful c
   assert.equal(await readFile(path.join(path.dirname(result.profilePath), 'stdout.log'), 'utf8'), '[REDACTED]\n');
 });
 
+test('Profiler metadata redactions merge with removed env values in passing failing and error captures', async t => {
+  for (const outcome of ['passing', 'failing', 'timeout']) await t.test(outcome, async t => {
+    const f = await fixture(t);
+    const redactions = { SHARED_TOKEN: 'alpha-overlap', SECOND_TOKEN: 'overlap-omega', PREFIX_TOKEN: 'prefix-value', LONG_TOKEN: 'prefix-value-extended' };
+    const env = { ...process.env, SHARED_TOKEN: 'inferred-private-value' };
+    const prefix = 'nonsecret-prefix-' + 'p'.repeat(6000);
+    const text = prefix + 'alpha-overlap-omega / prefix-value-extended / inferred-private-value / alpha-overlap-omega' + 'z'.repeat(4090);
+    const expected = prefix + '[REDACTED] / [REDACTED] / [REDACTED] / [REDACTED]' + 'z'.repeat(4090);
+    const script = path.join(f.cwd, 'emit.cjs');
+    await writeFile(script, `
+      const assert = require('node:assert/strict');
+      for (const name of ${JSON.stringify(Object.keys(redactions))}) assert.equal(process.env[name], undefined);
+      assert.equal(process.env.redactions, undefined);
+      assert.deepEqual(process.argv.slice(2), []);
+      process.stdout.write(${JSON.stringify(text)});
+      process.stderr.write(${JSON.stringify(text)});
+      ${outcome === 'timeout' ? 'setInterval(() => {}, 500);' : `process.exitCode = ${outcome === 'passing' ? 0 : 8};`}
+    `);
+    const invocation = runProfiledCommand({ ...f, redactions, env, command: process.execPath, args: [script], timeoutMs: 2000 });
+    const result = outcome === 'timeout'
+      ? await invocation.then(() => assert.fail('Expected timeout'), error => error)
+      : await invocation;
+    if (outcome === 'timeout') assert.equal(result.code, 'timeout');
+    else assert.equal(result.exitCode, outcome === 'passing' ? 0 : 8);
+    assert.equal(result.stdout, expected); assert.equal(result.stderr, expected);
+    const directory = path.dirname(result.profilePath);
+    for (const stream of ['stdout', 'stderr']) assert.equal(await readFile(path.join(directory, `${stream}.log`), 'utf8'), expected);
+    const files = await readdir(directory);
+    assert.equal(files.includes('error.log'), outcome === 'timeout');
+    for (const file of files) {
+      const capture = await readFile(path.join(directory, file), 'utf8');
+      for (const value of [...Object.values(redactions), env.SHARED_TOKEN, '-omega', '-extended', 'SHARED_TOKEN']) assert.ok(!capture.includes(value));
+    }
+    const report = JSON.parse(await readFile(result.profilePath, 'utf8'));
+    assert.equal(report.buckets.command.failures, outcome === 'passing' ? 0 : 1);
+    for (const name of ['redactions', 'env', 'args', 'secrets']) assert.equal(report[name], undefined);
+  });
+});
+
+test('Profiler metadata redactions mask spawn error stacks without persisting the metadata', async t => {
+  const f = await fixture(t), secret = 'private-spawn-value-9421';
+  const failure = await runProfiledCommand({ ...f, command: path.join(f.cwd, secret), redactions: { CUSTOM_TOKEN: secret } })
+    .then(() => assert.fail('Expected spawn failure'), error => error);
+  assert.equal(failure.code, 'ENOENT');
+  const directory = path.dirname(failure.profilePath);
+  const stack = await readFile(path.join(directory, 'error.log'), 'utf8');
+  assert.match(stack, /ENOENT/); assert.match(stack, /\[REDACTED\]/);
+  for (const file of await readdir(directory)) {
+    const capture = await readFile(path.join(directory, file), 'utf8');
+    assert.ok(!capture.includes(secret)); assert.ok(!capture.includes('CUSTOM_TOKEN'));
+  }
+});
+
+test('Profiler metadata redactions protect known values cut by the shared output limit', async t => {
+  const f = await fixture(t), secret = 'boundary-private-value-8127';
+  const marker = 'nonsecret-prefix-', padding = 20 * 1024 * 1024 - marker.length - 12;
+  const prefix = marker + 'p'.repeat(padding);
+  const script = path.join(f.cwd, 'limit.cjs');
+  await writeFile(script, `process.stdout.write(${JSON.stringify(marker)} + 'p'.repeat(${padding}) + ${JSON.stringify(secret + 'tail')});`);
+  const failure = await runProfiledCommand({ ...f, command: process.execPath, args: [script], redactions: { CUSTOM_TOKEN: secret } })
+    .then(() => assert.fail('Expected output limit'), error => error);
+  assert.equal(failure.code, 'invalid_output'); assert.equal(failure.outputTruncated, true);
+  for (const capture of [failure.stdout, await readFile(path.join(path.dirname(failure.profilePath), 'stdout.log'), 'utf8')]) {
+    assert.ok(capture.startsWith(prefix), 'complete nonsecret prefix is retained');
+    assert.equal(capture.length, prefix.length + '[REDACTED]'.length);
+    assert.equal(capture.slice(prefix.length), '[REDACTED]');
+  }
+  for (const file of await readdir(path.dirname(failure.profilePath))) {
+    const capture = await readFile(path.join(path.dirname(failure.profilePath), file), 'utf8');
+    assert.ok(!capture.includes(secret)); assert.ok(!capture.includes('boundary-pri'));
+  }
+});
+
 test('Timeout cancel output-limit and spawn errors retain a non-passing profile and diagnostics', async t => {
   const f = await fixture(t);
   for (const kind of ['timeout', 'cancelled', 'invalid_output', 'ENOENT']) {
@@ -170,7 +243,7 @@ test('Cancellation after child readiness stops the owned command and retains its
   t.after(() => watcher.close());
   const timer = setTimeout(() => controller.abort(), 10000); t.after(() => clearTimeout(timer));
   const failure = await runProfiledCommand({ ...f, signal: controller.signal, timeoutMs: 20000, command: process.execPath,
-    args: ['-e', "require('fs').writeFileSync('ready','ready'); setInterval(() => {},500)"] }).then(() => assert.fail('Expected cancellation'), error => error);
+    args: ['-e', "const fs = require('fs'); fs.writeFileSync('ready.tmp','ready'); fs.renameSync('ready.tmp','ready'); setInterval(() => {},500)"] }).then(() => assert.fail('Expected cancellation'), error => error);
   assert.equal(await readFile(path.join(f.cwd, 'ready'), 'utf8'), 'ready');
   assert.equal(failure.code, 'cancelled');
   assert.equal(JSON.parse(await readFile(failure.profilePath, 'utf8')).buckets.command.failures, 1);

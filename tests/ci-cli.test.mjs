@@ -318,7 +318,11 @@ test('CI public failure diagnostics merge original secret ranges through real pr
           assert.ok(receipt.profilePath);
           for (const stream of ['stdout', 'stderr']) {
             const raw = await readFile(path.join(path.dirname(receipt.profilePath), `${stream}.log`), 'utf8');
-            assert.ok(raw.includes(output[stream]), 'private full captures remain available through the real profiler');
+            const expected = boundary
+              ? 'private-prefix-' + 'p'.repeat(6000) + '[REDACTED]' + 'z'.repeat(4090)
+              : `${stream}: [REDACTED] / [REDACTED]`;
+            assert.equal(raw, expected, 'private captures retain the complete nonsecret output');
+            for (const hidden of [...Object.values(secrets), '-omega', '-extended']) assert.ok(!raw.includes(hidden));
           }
         } else assert.equal(executions, 1);
         const diagnostic = receipt.diagnostic;

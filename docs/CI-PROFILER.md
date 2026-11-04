@@ -12,6 +12,7 @@ const result = await runProfiledCommand({
   args: ['--test', 'tests/example.test.mjs'],
   cwd: project,
   env: process.env,                 // complete input environment, not an overlay
+  redactions: knownValues,          // optional metadata map when env is already scrubbed
   timeoutMs: 120000,
   evidenceDir: privateEvidenceRoot, // dedicated path outside every Git checkout
   phase: 'unit',
@@ -77,7 +78,7 @@ node scripts/ci-profiler.mjs summary path/to/private/events.jsonl
 
 `summary` принимает report, JSON array или JSONL событий, максимум 16 MiB; заново применяет allowlist при чтении готового отчёта. Неизвестные/повторные flags отклоняются. `run` печатает компактную JSON-квитанцию с exit/duration/profilePath; сырые потоки доступны в приватных файлах, не в публичной сводке.
 
-Каждый запуск создаёт уникальный `profile-*` вне проекта и всех Git ancestors. Symlink/junction paths отвергаются. POSIX: directory 0700, files 0600. Windows: перед записью файлов каталог получает protected inherited ACL текущего пользователя и SYSTEM. `stdout.log`, `stderr.log` и при инфраструктурной ошибке `error.log` сохраняют полную доступную диагностику после redaction; `profile.json` не содержит raw stdout/stderr/команд/args/environment/путей файлов. Используются известные значения удалённых переменных environment и штатные credential patterns. Произвольный неизвестный секрет в обычном тексте не может быть автоматически распознан; сохранять/публиковать приватные логи как публичный artifact нельзя.
+Каждый запуск создаёт уникальный `profile-*` вне проекта и всех Git ancestors. Symlink/junction paths отвергаются. POSIX: directory 0700, files 0600. Windows: перед записью файлов каталог получает protected inherited ACL текущего пользователя и SYSTEM. `stdout.log`, `stderr.log` и при инфраструктурной ошибке `error.log` сохраняют полную доступную диагностику после redaction; `profile.json` не содержит raw stdout/stderr/команд/args/environment/путей файлов. Используются известные значения удалённых переменных environment и штатные credential patterns. Дополнительная карта `redactions` объединяется с удалёнными env values без коллизий имён; CLI передаёт в ней значения, удалённые до вызова профайлера. Эта карта используется только как metadata для очистки captures, включая error и границу обрезанного вывода, и не попадает в child env/argv, prompts, reports или state. Произвольный неизвестный секрет в обычном тексте не может быть автоматически распознан; сохранять/публиковать приватные логи как публичный artifact нельзя.
 
 ## Проверки и урок
 

@@ -217,7 +217,7 @@ export async function runCi(options, dependencies = {}) {
           catch (error) { if (error.code !== 'ENOENT') throw error; }
         }
         const phase = { syntax: 'quality', tests: 'unit', fullcheck: 'integration', 'package-smoke': 'package' }[command.phase];
-        result = await profile({ ...command, args, ...common, phase, evidenceDir, tier: plan.tier });
+        result = await profile({ ...command, args, ...common, redactions: secrets, phase, evidenceDir, tier: plan.tier });
       } else {
         const observation = await (dependencies.execute ?? execute)(command.command, command.args, { ...common, allowFailure: true });
         result = { exitCode: observation.code, durationMs: performance.now() - start, stdout: observation.stdout, stderr: observation.stderr };
