@@ -1,11 +1,11 @@
 # Прогресс Kodo roadmap
 
-Снимок: 2026-11-04, baseline HEAD `d2654f12b1da21dfa3523fa9b1aea72b51a050ba`. Это версия плана в Git; авторитетное состояние конкретного execution run по-прежнему хранится в приватном SQLite, а его `progress.md` создаёт runtime. Этот документ не меняет состояние run.
+Снимок: 2026-11-04. Фаза 01 принята: PR #10, merge `ef38109e4bc8dc0f8528fc2ee0439c8590d9a734`, CI `41822569460` на итоговом PR HEAD с идентичным merge tree. Фаза 02: независимый RED исходного `977f9767ee9b56c8789b1b67b5e9a482d57a8887` сохранён; coordinator repair `f704586c6fe0c5cc6cb163b3a3998d85eb0e511b` прошёл scoped GREEN и интегрирован как `ac225c8b7eb4945ec32a8a5a15a74aeb24d3dd58`. Это версия плана в Git; авторитетное состояние run хранится в приватном SQLite, его `progress.md` создаёт runtime. Этот документ не меняет состояние run.
 
 | Фаза | Статус выполнения | Следующий проверяемый шаг |
 | --- | --- | --- |
-| 01 Baseline/plan | BASELINE PASS; SCOPED DOCS PASS; delivery PENDING | Coordinator integrated gates → independent review → PR с exact-head CI, без release |
-| 02 Language quality | NOT STARTED | После 01: detection/status/profile fixtures |
+| 01 Baseline/plan | ACCEPTED; PR #10 MERGED `ef38109e`; обе ОС CI PASS | Предпосылка 02 выполнена; нового release нет |
+| 02 Language quality | RED 977f сохранён; coordinator repair scoped GREEN 91/91, unchanged acceptance oracle | Full integrated check, fresh gates, independent review, PR и exact-head CI PENDING; этап ещё не принят |
 | 03 CI/cache | NOT STARTED | После 02: timing profiler, затем affected/cache |
 | 04 Architecture | NOT STARTED | После 03: forbidden-import policy fixture |
 | 05 Research knowledge | NOT STARTED | После 04: typed claims/provenance/invalidation |
@@ -18,4 +18,6 @@
 | 12 Benchmark | NOT STARTED | После 11: сохранить 9/24 PAUSED pilot; новый bounded experiment отдельно |
 | 13 Final acceptance | NOT STARTED | После 12 или явно записанных blockers: сценарии A–F |
 
-Результаты baseline и ограничения: [BASELINE](BASELINE.md), [phase-01](phase-01.md); публичные [local receipt](../../tests/fixtures/roadmap-baseline/local-baseline.json) и [CI receipt](../../tests/fixtures/roadmap-baseline/ci-baseline.json). CI на `c19157b`, tree-identical `d2654f1`, не exact-main checks. PR9 OPEN — внешний risk; published/installed 0.2.6 не является выпуском roadmap. Фазы 02–13 этим PR не реализуются.
+Результаты и пределы: [BASELINE](BASELINE.md), [phase-01](phase-01.md), [phase-02](phase-02.md). GREEN 91/91 за 53081.6305 ms подтверждён manifest `coordinator-runner-repair-adoption.json`, неизменным acceptance SHA `7101c8462ca38870282720b5f759ec55a50ecaeae0705bc682fc6606a139db73` и raw `runner-fixes-green.tap` SHA `2b3fcc2f1b34a56fd4698c3b0e60cc5d4021ed53019f211d0939a1fb825d7b79`; private receipts находятся в `%TEMP%/kodo-roadmap-20261104/`. Это отдельная coordinator scoped-проверка исправленного кода, не full integrated check и не CI.
+
+Публичные [local receipt](../../tests/fixtures/roadmap-baseline/local-baseline.json) и [исходный CI receipt](../../tests/fixtures/roadmap-baseline/ci-baseline.json) сохраняют исторический baseline. Итоговый [CI 41822569460](https://github.com/Zulut30/Kodo/actions/runs/41822569460) относится к [PR #10](https://github.com/Zulut30/Kodo/pull/10); фазе 02 эти результаты не приписываются. Published/installed 0.2.6 не является выпуском roadmap. Фазы 03–13 не начаты; следующий release — только после фазы 13.
