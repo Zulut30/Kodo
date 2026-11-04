@@ -7,7 +7,7 @@
 | Фаза | Статус | Следующий проверяемый шаг |
 | --- | --- | --- |
 | 01 Baseline/plan | ACCEPTED; PR #10 MERGED `ef38109e`; обе ОС CI PASS | Исторический baseline сохранён |
-| 02 Language quality | Все профильные дефекты исправлены; независимый review327 PASS, его Windows CI выявил teardown race | Новый общий gate после подтверждённого ремонта и эквивалентного test split; [PR #11](https://github.com/Zulut30/Kodo/pull/11) ещё не merged |
+| 02 Language quality | Full/review/обе ОС CI на4bb PASS; GitHub остановил merge на двух реальных Go-дефектах. Native Go ремонт принят координатором:118PASS/2SKIP | Свежие full/gates/review/current-head CI и подтверждённое устранение conversations; [PR #11](https://github.com/Zulut30/Kodo/pull/11) ещё не merged |
 | 03 CI/cache/concurrency | Пять изолированных drafts завершены; cross-port проверка продолжается. Test layout принят как maintenance02 | После02acceptance интегрировать остальные изменения; проверить full/CI и фактическое время |
 | 04 Architecture | NOT STARTED | После03: forbidden imports/contracts |
 | 05 Research knowledge | NOT STARTED | После04: claims/provenance/invalidation |
@@ -17,7 +17,7 @@
 | 09 Verification/evolution | NOT STARTED | После08: independent oracles/risk policy |
 | 10 Progress/maintenance | NOT STARTED | После09: watchdog/acceptance progress |
 | 11 Merge/release | NOT STARTED | После10: immutable queue/recovery/smoke |
-| 12 Benchmark | NOT STARTED | После11: bounded real comparison; old9/24 pilot preserved |
+| 12 Observability | NOT STARTED; benchmark campaigns отложены пользователем | После11: реальные operational metrics/JSON; неизвестные метрики null |
 | 13 Final acceptance | NOT STARTED | После12: реальные сценарии и проверенный выпуск |
 
 [Baseline](BASELINE.md), [приёмка01](phase-01.md), [изменения и evidence02](phase-02.md). Исторические [local](../../tests/fixtures/roadmap-baseline/local-baseline.json) и [CI](../../tests/fixtures/roadmap-baseline/ci-baseline.json) receipts не перезаписываются. Published0.2.6 является прежним выпуском; новый release запланирован на фазе13.

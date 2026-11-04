@@ -16,6 +16,10 @@
 
 ## Выполненные проверки
 
+На `4bb5071` полный локальный check дал **860 tests / 856 PASS / 4 SKIP / 0 FAIL**, независимое ревью и обе обязательные ОС CI [41868942192](https://github.com/Zulut30/Kodo/actions/runs/41868942192) прошли. Merge корректно остановился на двух нерешённых замечаниях GitHub: внешний родительский `go.work` и игнорирование подготовленного vendor. Эти зелёные проверки относятся к прежнему head, а не к последующему ремонту.
+
+Настоящий Go **1.24.0** воспроизвёл оба дефекта. Новый ремонт отключает внешние workspace/GOENV, использует подготовленный vendor без сети и включает все его байты в sourceHash/receipt, сохраняя владельца quick scope. Replacement scopes для MVP явно unsupported. `Quality native Go ignores parent workspace and never certifies sibling dependency bytes` проверяет внешний sibling и положительный stdlib-проект; `Quality native Go prepared vendor works offline and tracks dependency errors and quick scope` проверяет положительную сборку, ошибку типа зависимости, invalidation и quick FAIL. Финальный scoped набор с настоящим Go: **120 tests / 118 PASS / 2 SKIP / 0 FAIL**, 101622.5906 ms; два skip — отдельные opt-in TSC, ранее проверенные настоящим компилятором. Frozen QACC дополнительно **12 PASS / 0 FAIL / 0 SKIP**, SHA неизменен. Это локальная scoped проверка, не новая CI/merge/release приёмка. После ремонта обязательны свежие full check, gates, независимое review и current-head CI.
+
 Обычные suites используют offline fixtures, fake provider/tool ports и настоящие локальные Git/Node процессы; платных запросов в них нет. Координатор запускает полный `npm run check` на объединённом чистом commit. Scoped команда:
 
 ```powershell
