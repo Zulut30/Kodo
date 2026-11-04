@@ -91,6 +91,9 @@ export async function runArchitectureChecks({ cwd = process.cwd(), headSha, base
   const bytes = Buffer.from(JSON.stringify(snapshot(receipt)));
   const entry = { path: path.join(directory, 'gate.json'), bytes: bytes.length, sha256: digest(bytes) };
   await writeFile(entry.path, bytes, { flag: 'wx', mode: 0o400 }); receipt.evidence = [entry];
+  // File owner is independent of the parent's inherited DACL on elevated
+  // Windows. Protect freshly created bytes; acceptance below remains read-only.
+  if (process.platform === 'win32') await acl("$p=[Console]::In.ReadToEnd()|ConvertFrom-Json; $user=[Security.Principal.WindowsIdentity]::GetCurrent().User; $a=[Security.AccessControl.FileSecurity]::new(); $a.SetOwner($user); $a.SetAccessRuleProtection($true,$false); foreach($sid in @($user,[Security.Principal.SecurityIdentifier]::new('S-1-5-18'))) {$a.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid,'FullControl','Allow'))}; [IO.File]::SetAccessControl($p[0],$a)", [entry.path], signal);
   await privacy(directory, receipt.evidence, signal);
   return receipt;
 }

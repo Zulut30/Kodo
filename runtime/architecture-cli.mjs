@@ -149,7 +149,8 @@ async function privateDirectory(target, project, context) {
   }
   return directory;
 }
-async function capture(directory, index, result, error, secrets) {
+async function capture(directory, index, result, error, context) {
+  const { secrets } = context;
   const record = { stdout: cleanCapture(typeof result?.stdout === 'string' ? result.stdout : '', secrets),
     stderr: cleanCapture(typeof result?.stderr === 'string' ? result.stderr : '', secrets),
     error: error ? { code: reasons.has(error.code) ? error.code : 'configuration', message: cleanCapture(String(error.message ?? ''), secrets),
@@ -160,7 +161,15 @@ async function capture(directory, index, result, error, secrets) {
   try {
     await noLinks(filename); assertPrivateArtifactPath(filename);
     await writeFile(filename, bytes, { flag: 'wx', mode: 0o600 });
-    if (process.platform !== 'win32') await chmod(filename, 0o400);
+    if (process.platform === 'win32') {
+      // DACL inheritance does not determine the owner of new files on elevated
+      // Windows. Assign both only here, at coordinator-owned creation.
+      const script = "$ErrorActionPreference='Stop'; [Console]::InputEncoding=[Text.UTF8Encoding]::new($false); $p=[Console]::In.ReadToEnd()|ConvertFrom-Json; $user=[Security.Principal.WindowsIdentity]::GetCurrent().User; $acl=[Security.AccessControl.FileSecurity]::new(); $acl.SetOwner($user); $acl.SetAccessRuleProtection($true,$false); foreach($sid in @($user,[Security.Principal.SecurityIdentifier]::new('S-1-5-18'))) { $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid,'FullControl','Allow')) }; [IO.File]::SetAccessControl($p[0],$acl)";
+      await command(path.join(process.env.SystemRoot || 'C:\\Windows', 'System32/WindowsPowerShell/v1.0/powershell.exe'),
+        ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
+        { input: JSON.stringify([filename]), env: context.env, signal: context.signal,
+          timeoutMs: Math.min(20000, context.remaining()), secrets });
+    } else await chmod(filename, 0o400);
   } catch { throw fail('evidence_integrity'); }
   return { path: filename, bytes: bytes.length, sha256: digest(bytes) };
 }
@@ -278,7 +287,7 @@ async function compose(options, ports, plan) {
         observation = await (ports.execute ?? execute)(process.execPath, ['--test', '--test-reporter=tap', '--', path.join(project, file)],
           { cwd: project, signal: context.signal, timeoutMs: context.remaining(), env, secrets, allowFailure: true, maxOutputBytes: MAX_OUTPUT });
       } catch (cause) { error = cause; observation = cause.result ?? cause; }
-      const evidence = [await capture(directory, report.receipts.length, observation, error, secrets)];
+      const evidence = [await capture(directory, report.receipts.length, observation, error, context)];
       const counts = tapCounts(observation?.stdout), exitCode = Number.isInteger(observation?.code) && observation.code >= 0 ? observation.code : null;
       const incomplete = error || !counts || typeof observation?.stderr !== 'string' || observation?.outputTruncated || exitCode === null || observation?.signal || Buffer.byteLength(observation?.stdout ?? '') + Buffer.byteLength(observation?.stderr ?? '') > MAX_OUTPUT;
       const status = incomplete || counts && (counts.cancelled || counts.skipped || counts.todo) ? 'blocked' : exitCode !== 0 || counts.fail ? 'failed' : 'passed';

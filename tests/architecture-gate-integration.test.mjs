@@ -12,6 +12,12 @@ import { normalizeArchitectureConfig, runArchitectureChecks, isCurrentArchitectu
 import { fixture, fakeServices, node, git } from './helpers/engine-fixture.mjs';
 
 const enabled = { enabled: true };
+
+async function windowsAcl(script, filename) {
+  return execute(path.join(process.env.SystemRoot, 'System32/WindowsPowerShell/v1.0/powershell.exe'),
+    ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from("$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; " + script, 'utf16le').toString('base64')],
+    { env: { SystemRoot: process.env.SystemRoot, ACL_TEST_FILE: filename } });
+}
 const policy = () => ({ schemaVersion: 1, version: 1, productRoots: ['src'], modules: [
   { id: 'core', roots: ['src/core'], layer: 'core', public: ['src/core/index.mjs'], allow: [] },
   { id: 'app', roots: ['src/app'], layer: 'app', public: [], allow: ['core'] }
@@ -159,6 +165,39 @@ test('Enabled gate cannot accept a repository without policy or fabricated revie
   assert.equal(receipt.status, 'blocked'); assert.equal(receipt.report.status, 'not_applicable');
   assert.equal(await isCurrentArchitectureReceipt(receipt, options), false);
   assert.equal(await isCurrentArchitectureReceipt({ schemaVersion: 1, status: 'passed', passed: true, headSha: fx.base }, options), false);
+});
+
+test('Windows gate creates protected owned files and rejects changed ACLs without repairing acceptance', { skip: process.platform !== 'win32' }, async t => {
+  const fx = await setup(t);
+  const receipt = await runArchitectureChecks(fx.options());
+  assert.equal(receipt.passed, true);
+  const files = [receipt.evidence[0].path, receipt.report.receipts[0].evidence[0].path];
+  for (const file of files) {
+    const observed = await windowsAcl("$a=[IO.File]::GetAccessControl($env:ACL_TEST_FILE); $u=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value; [Console]::Out.Write(($a.AreAccessRulesProtected -and $a.GetOwner([Security.Principal.SecurityIdentifier]).Value -eq $u))", file);
+    assert.equal(observed.stdout.trim(), 'True');
+  }
+  assert.equal(await isCurrentArchitectureReceipt(receipt, fx.options()), true);
+  // Change each descriptor without changing bytes or receipt hashes. Acceptance
+  // must reject it and must leave the altered descriptor unchanged.
+  for (const file of files) {
+    const original = (await windowsAcl("[Console]::Out.Write([IO.File]::GetAccessControl($env:ACL_TEST_FILE).GetSecurityDescriptorSddlForm('All'))", file)).stdout;
+    for (const mutation of [
+      "$a.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new('S-1-1-0'),'Read','Allow'))",
+      "$u=[Security.Principal.WindowsIdentity]::GetCurrent().User; $a.PurgeAccessRules($u); $a.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($u,'Read','Allow'))"
+    ]) {
+      try {
+        await windowsAcl("$a=[IO.File]::GetAccessControl($env:ACL_TEST_FILE); " + mutation + "; [IO.File]::SetAccessControl($env:ACL_TEST_FILE,$a)", file);
+        const changed = (await windowsAcl("[Console]::Out.Write([IO.File]::GetAccessControl($env:ACL_TEST_FILE).GetSecurityDescriptorSddlForm('All'))", file)).stdout;
+        assert.notEqual(createHash('sha256').update(changed).digest('hex'), createHash('sha256').update(original).digest('hex'));
+        assert.equal(await isCurrentArchitectureReceipt(receipt, fx.options()), false);
+        const after = (await windowsAcl("[Console]::Out.Write([IO.File]::GetAccessControl($env:ACL_TEST_FILE).GetSecurityDescriptorSddlForm('All'))", file)).stdout;
+        assert.equal(createHash('sha256').update(after).digest('hex'), createHash('sha256').update(changed).digest('hex'));
+      } finally {
+        await windowsAcl("$a=[Security.AccessControl.FileSecurity]::new(); $a.SetSecurityDescriptorSddlForm([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('" + Buffer.from(original).toString('base64') + "')),[Security.AccessControl.AccessControlSections]::Access); [IO.File]::SetAccessControl($env:ACL_TEST_FILE,$a)", file);
+      }
+      assert.equal(await isCurrentArchitectureReceipt(receipt, fx.options()), true);
+    }
+  }
 });
 
 test('Installed-layout gate works without package lock and rejects changed actual checker or parser bytes', async t => {

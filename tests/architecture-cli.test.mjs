@@ -53,6 +53,23 @@ test('plan is read only and never invokes contract execution', async t => {
   assert.equal(report.requiredTests.length, 1); assert.deepEqual(report.receipts, []); assert.equal(ran, false);
   assert.deepEqual((await readdir(fx.scratch)).sort(), ['empty.gitconfig', 'project']); assert.equal(fx.git(['status', '--porcelain']), '');
 });
+
+test('Windows CLI creates explicitly owned protected file ACLs with only user and SYSTEM full control', { skip: process.platform !== 'win32' }, async t => {
+  const fx = await fixture(t);
+  const report = await checkArchitecture(fx);
+  assert.equal(report.passed, true);
+  const filename = report.receipts[0].evidence[0].path;
+  // Inspect the actual file descriptor, independently of the runtime verifier.
+  // Inherited DACLs alone do not establish the owner on elevated Windows.
+  const script = "$ErrorActionPreference='Stop'; $a=[IO.File]::GetAccessControl($env:ACL_TEST_FILE); $u=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value; $r=@($a.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])); [pscustomobject]@{ owned=($a.GetOwner([Security.Principal.SecurityIdentifier]).Value -eq $u); protected=$a.AreAccessRulesProtected; rules=@($r|ForEach-Object {[pscustomobject]@{allowed=($_.IdentityReference.Value -in @($u,'S-1-5-18')); full=(($_.FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -eq [Security.AccessControl.FileSystemRights]::FullControl); allow=($_.AccessControlType -eq 'Allow'); inherited=$_.IsInherited}})}|ConvertTo-Json -Depth 4 -Compress";
+  const output = execFileSync(path.join(process.env.SystemRoot, 'System32/WindowsPowerShell/v1.0/powershell.exe'),
+    ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
+    { encoding: 'utf8', windowsHide: true, env: { SystemRoot: process.env.SystemRoot, ACL_TEST_FILE: filename } });
+  assert.deepEqual(JSON.parse(output), { owned: true, protected: true, rules: [
+    { allowed: true, full: true, allow: true, inherited: false },
+    { allowed: true, full: true, allow: true, inherited: false }
+  ] });
+});
 test('unenrolled repositories are neutral and removing enrolled policy is blocked', async t => {
   const fx = await fixture(t, false);
   const neutral = await checkArchitecture(fx); assert.equal(neutral.status, 'not_applicable'); assert.equal(neutral.passed, null);
