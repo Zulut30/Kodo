@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises';
+import { writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -104,6 +105,228 @@ test('Director explicit retry creates a new Run and preserves failed attempt his
   assert.equal(f.store.getRun(first.runId).state, 'blocked');
   assert.equal(f.store.db.prepare('SELECT count(*) AS n FROM runs').get().n, 2);
   assert.ok(f.repo.history(f.id, { after: 0, limit: 1000 }).events.some(event => event.entity.id === first.id));
+});
+
+test('Director retry requires current revision risk approval before reserving or dispatching', async t => {
+  const f = await fixture(t, { tasks: [{ ...task('first'), riskApprovalRequired: true }] });
+  await f.director.approveRisk(f.id, 'first'); await f.ready('first');
+  f.engine.run = async id => f.store.updateRun(id, { state: 'blocked' });
+  await f.director.run(f.id);
+  const prior = f.repo.snapshot(f.id).currentAttempts[0];
+  const ref = f.repo.snapshot(f.id).tasks[0].interfaceRefs[0], bytes = await readFile(ref.path);
+  await writeFile(ref.path, '{}');
+  const invalidInterface = await f.director.resume(f.id, { retryFailed: true });
+  assert.equal(invalidInterface.status, 'blocked');
+  assert.ok(invalidInterface.blockers.some(row => row.reasons.includes('interfaces_unverified')));
+  assert.deepEqual(f.repo.snapshot(f.id).currentAttempts[0], prior);
+  await writeFile(ref.path, bytes);
+  await f.director.reprioritize(f.id, 'first', { priority: 60 });
+  const changed = f.repo.snapshot(f.id);
+  assert.equal(changed.riskApprovals.length, 0);
+  assert.notEqual(changed.tasks[0].revision, prior.taskRevision);
+  let starts = 0;
+  f.engine.run = async id => { starts++; return f.store.updateRun(id, { state: 'waiting_limits' }); };
+  const denied = await f.director.resume(f.id, { retryFailed: true });
+  assert.equal(denied.status, 'blocked');
+  assert.ok(denied.blockers.some(row => row.taskId === 'first' && row.reasons.includes('risk_approval_required')));
+  assert.equal(starts, 0);
+  assert.deepEqual(f.repo.snapshot(f.id).currentAttempts[0], prior);
+  assert.equal(f.store.db.prepare('SELECT count(*) AS n FROM runs').get().n, 1);
+  await f.director.approveRisk(f.id, 'first');
+  assert.equal((await f.director.resume(f.id, { retryFailed: true })).status, 'waiting_limits');
+  const next = f.repo.snapshot(f.id).currentAttempts[0];
+  assert.equal(next.number, 2); assert.equal(next.taskRevision, changed.tasks[0].revision);
+  assert.notEqual(next.runId, prior.runId); assert.equal(starts, 1);
+});
+
+test('Director existing reservations recheck immutable interfaces before install and dispatch', async t => {
+  for (const stage of ['reserved', 'installed']) await t.test(stage, async sub => {
+    const f = await fixture(sub); await f.ready('first');
+    const attempt = (await f.apply({ op: 'reserveAttempt', taskId: 'first', retryFailed: false })).attempt;
+    let starts = 0;
+    f.engine.run = async id => { starts++; return f.store.updateRun(id, { state: 'waiting_limits' }); };
+    if (stage === 'installed') await f.director.resume(f.id);
+    starts = 0;
+    const snapshot = f.repo.snapshot(f.id), ref = snapshot.tasks[0].interfaceRefs[0], original = await readFile(ref.path);
+    for (const damage of ['tampered', 'missing']) {
+      if (damage === 'tampered') await writeFile(ref.path, '{}');
+      else await rm(ref.path);
+      const denied = await f.director.resume(f.id);
+      assert.equal(denied.status, 'blocked');
+      assert.ok(denied.blockers.some(row => row.taskId === 'first' && row.reasons.includes('interfaces_unverified')));
+      assert.equal(starts, 0); assert.deepEqual(f.repo.snapshot(f.id).currentAttempts[0], attempt);
+      assert.equal(f.store.db.prepare('SELECT count(*) AS n FROM runs').get().n, stage === 'installed' ? 1 : 0);
+    }
+    await writeFile(ref.path, original);
+    assert.equal((await f.director.resume(f.id)).status, 'waiting_limits');
+    assert.equal(starts, 1); assert.equal(f.repo.snapshot(f.id).currentAttempts[0].runId, attempt.runId);
+  });
+});
+
+test('Director retry rechecks interfaces after predecessor policy lookup before reserving', async t => {
+  const f = await fixture(t); await f.ready('first');
+  f.engine.run = async id => f.store.updateRun(id, { state: 'blocked' });
+  await f.director.run(f.id);
+  const prior = f.repo.snapshot(f.id).currentAttempts[0], ref = f.repo.snapshot(f.id).tasks[0].interfaceRefs[0];
+  const original = f.store.getRun.bind(f.store); let change = true, starts = 0;
+  f.store.getRun = id => {
+    const run = original(id);
+    if (change && id === prior.runId) { change = false; writeFileSync(ref.path, '{}'); }
+    return run;
+  };
+  f.engine.run = async () => { starts++; };
+  assert.equal((await f.director.resume(f.id, { retryFailed: true })).status, 'blocked');
+  assert.equal(change, false); assert.equal(starts, 0);
+  assert.deepEqual(f.repo.snapshot(f.id).currentAttempts[0], prior);
+  assert.equal(f.store.db.prepare('SELECT count(*) AS n FROM runs').get().n, 1);
+});
+
+test('Director rechecks interface eligibility after initialization and after atomic install', async t => {
+  for (const boundary of ['initialize', 'install']) await t.test(boundary, async sub => {
+    const f = await fixture(sub); await f.ready('first');
+    const ref = f.repo.snapshot(f.id).tasks[0].interfaceRefs[0], original = await readFile(ref.path);
+    let starts = 0;
+    f.engine.run = async id => { starts++; return f.store.updateRun(id, { state: 'waiting_limits' }); };
+    if (boundary === 'initialize') {
+      const initialize = f.engine.initializeRun.bind(f.engine);
+      f.engine.initializeRun = async run => { await initialize(run); await writeFile(ref.path, '{}'); };
+      await assert.rejects(() => f.director.run(f.id), { code: 'project_admission_blocked' });
+      f.engine.initializeRun = initialize;
+    } else {
+      const create = f.engine.createReserved.bind(f.engine);
+      f.engine.createReserved = async (...args) => { const run = await create(...args); await writeFile(ref.path, '{}'); return run; };
+      assert.equal((await f.director.run(f.id)).status, 'blocked');
+      f.engine.createReserved = create;
+    }
+    assert.equal(starts, 0);
+    const attempt = f.repo.snapshot(f.id).currentAttempts[0];
+    assert.equal(attempt.number, 1);
+    assert.equal(f.store.db.prepare('SELECT count(*) AS n FROM runs').get().n, boundary === 'initialize' ? 0 : 1);
+    await writeFile(ref.path, original);
+    assert.equal((await f.director.resume(f.id)).status, 'waiting_limits');
+    assert.equal(starts, 1); assert.equal(f.repo.snapshot(f.id).currentAttempts[0].runId, attempt.runId);
+  });
+});
+
+function barrier() {
+  let resolve;
+  const promise = new Promise(done => { resolve = done; });
+  return { promise, resolve };
+}
+
+test('Director pause preserves active work and session then ordinary resume accepts the same completed Run', { timeout: 60000 }, async t => {
+  const f = await fixture(t, { trusted: true, tasks: [task('first'), task('second', ['first'])] });
+  await f.ready('first');
+  const entered = barrier(), finish = barrier(), polled = barrier();
+  const snapshot = f.repo.snapshot.bind(f.repo);
+  let observePause = false, starts = 0, activeSignal;
+  f.repo.snapshot = async (...args) => {
+    const value = snapshot(...args);
+    if (observePause && value.project.paused) { observePause = false; polled.resolve(); }
+    return value;
+  };
+  f.engine.run = async (id, { signal }) => {
+    starts++; activeSignal = signal;
+    f.store.updateRun(id, { state: 'running', sessionAttempts: [{ sessionId: 'owned-active-session' }] });
+    entered.resolve(); await finish.promise;
+    // The real Engine treats this signal as cancellation. Exercise that check
+    // while the provider boundary is replaced by a controlled owned fixture.
+    f.engine.checkCancelled(f.store.getRun(id), signal);
+    return checkedRun(f, id, 'first');
+  };
+  const running = f.director.run(f.id);
+  // Attach immediately so the expected baseline rejection is always observed.
+  const outcome = running.then(value => ({ value }), error => ({ error }));
+  t.after(() => finish.resolve());
+  await entered.promise;
+  const active = snapshot(f.id).currentAttempts[0];
+  await f.director.pause(f.id); observePause = true;
+  await polled.promise; await new Promise(resolve => setImmediate(resolve));
+  const pausedSignal = activeSignal.aborted;
+  await assert.rejects(() => f.director.run(f.id), { code: 'project_control_blocked' });
+  const duringPause = f.store.getRun(active.runId);
+  finish.resolve(); const result = await outcome;
+  assert.equal(pausedSignal, false, 'Observed paused poll must not cancel already admitted work');
+  assert.equal(duringPause.state, 'running'); assert.equal(duringPause.cancelRequested, undefined);
+  assert.deepEqual(duringPause.sessionAttempts, [{ sessionId: 'owned-active-session' }]);
+  assert.equal(result.error?.code, 'project_control_blocked');
+  assert.deepEqual(snapshot(f.id).currentAttempts[0], active);
+  assert.equal(f.store.getRun(active.runId).state, 'succeeded');
+  assert.equal(snapshot(f.id).tasks.find(row => row.id === 'second').status, 'proposed');
+  f.engine.run = async () => assert.fail('Completed work must not be dispatched again');
+  const resumed = await f.director.resume(f.id);
+  assert.equal(resumed.status, 'succeeded'); assert.equal(resumed.runId, active.runId);
+  assert.equal(starts, 1); assert.equal(snapshot(f.id).project.paused, false);
+  assert.equal(snapshot(f.id).currentAttempts[0].id, active.id);
+  assert.equal(snapshot(f.id).tasks.find(row => row.id === 'first').status, 'accepted');
+  assert.equal(snapshot(f.id).currentAttempts.length, 1);
+  assert.deepEqual(f.store.getRun(active.runId).sessionAttempts, duringPause.sessionAttempts);
+});
+
+test('Director unpause resumes unfinished quota work with the saved Run Attempt and session', { timeout: 15000 }, async t => {
+  const f = await fixture(t); await f.ready('first');
+  const entered = barrier(), finish = barrier(), polled = barrier();
+  const original = f.repo.snapshot.bind(f.repo); let observePause = false;
+  f.repo.snapshot = async (...args) => {
+    const snapshot = original(...args);
+    if (observePause && snapshot.project.paused) { observePause = false; polled.resolve(); }
+    return snapshot;
+  };
+  f.engine.run = async (id, { signal }) => {
+    f.store.updateRun(id, { state: 'running', sessionAttempts: [{ sessionId: 'owned-quota-session' }] });
+    entered.resolve(); await finish.promise;
+    f.engine.checkCancelled(f.store.getRun(id), signal);
+    return f.store.updateRun(id, { state: 'waiting_limits' });
+  };
+  const running = f.director.run(f.id).then(value => ({ value }), error => ({ error }));
+  t.after(() => finish.resolve()); await entered.promise;
+  const attempt = original(f.id).currentAttempts[0];
+  await f.director.pause(f.id); observePause = true;
+  await polled.promise; await new Promise(resolve => setImmediate(resolve));
+  finish.resolve(); assert.equal((await running).error.code, 'project_control_blocked');
+  assert.equal(f.store.getRun(attempt.runId).state, 'waiting_limits');
+  f.engine.createReserved = async () => assert.fail('Quota continuation must keep the existing reservation');
+  let resumed = 0;
+  f.engine.run = async id => {
+    resumed++; assert.equal(id, attempt.runId);
+    assert.deepEqual(f.store.getRun(id).sessionAttempts, [{ sessionId: 'owned-quota-session' }]);
+    return f.store.getRun(id);
+  };
+  const restarted = createProjectDirector({ repo: f.repo, engine: f.engine });
+  assert.equal((await restarted.resume(f.id)).status, 'waiting_limits');
+  assert.equal(resumed, 1); assert.deepEqual(original(f.id).currentAttempts[0], attempt);
+  assert.equal(original(f.id).project.paused, false);
+  assert.equal(f.store.db.prepare('SELECT count(*) AS n FROM runs').get().n, 1);
+});
+
+test('Director cancel and lease loss still abort active work and drain before returning', async t => {
+  for (const interruption of ['cancel', 'lease']) await t.test(interruption, async sub => {
+    const f = await fixture(sub); await f.ready('first');
+    const entered = barrier(), aborted = barrier(), drain = barrier();
+    let signal, drained = false, returned = false;
+    f.engine.run = async (id, options) => {
+      signal = options.signal;
+      signal.addEventListener('abort', () => aborted.resolve(), { once: true });
+      entered.resolve(); await aborted.promise; await drain.promise; drained = true;
+      f.store.updateRun(id, { state: 'cancelled' });
+    };
+    f.engine.cancel = async () => {};
+    const running = f.director.run(f.id).then(value => ({ value }), error => ({ error })).finally(() => { returned = true; });
+    sub.after(() => drain.resolve());
+    await entered.promise;
+    if (interruption === 'cancel') await f.director.cancel(f.id);
+    else f.store.renewLease = () => false;
+    await aborted.promise;
+    assert.equal(signal.aborted, true); assert.equal(returned, false); assert.equal(drained, false);
+    drain.resolve(); const result = await running;
+    assert.match(result.error.code, /^project_(control_blocked|lease_lost)$/); assert.equal(drained, true);
+    const snapshot = f.repo.snapshot(f.id), run = f.store.getRun(snapshot.currentAttempts[0].runId);
+    assert.equal(run.state, 'cancelled');
+    if (interruption === 'cancel') {
+      assert.equal(snapshot.project.status, 'cancelled'); assert.equal(snapshot.currentAttempts[0].status, 'cancelled');
+      assert.equal(run.cancelRequested, true);
+    }
+  });
 });
 
 test('Same-task retry after reservation crash keeps the fixed model provider and lower budgets with fresh config', async t => {
