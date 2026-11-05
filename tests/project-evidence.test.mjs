@@ -45,6 +45,43 @@ test('Acceptance awaits both trusted validators and requires verified publicatio
   f.attempt.evidence = f.evidence.filter(ref => !['release', 'delivery'].includes(ref.kind));
   const local = await attemptEvaluation(f);
   assert.ok(local.eligibleStates.includes('accepted')); assert.ok(!local.eligibleStates.includes('released'));
+  assert.deepEqual(local.blockers, []);
+});
+
+test('Accepted proof without future publication has no blockers but explicit release stays blocked', async () => {
+  const f = fixture();
+  f.attempt.evidence = f.evidence.filter(ref => !['release', 'delivery'].includes(ref.kind));
+  delete f.run.release; delete f.run.delivery;
+  const accepted = await attemptEvaluation(f);
+  assert.ok(accepted.eligibleStates.includes('accepted'));
+  assert.ok(!accepted.eligibleStates.includes('released'));
+  assert.deepEqual(accepted.blockers, []);
+  f.command = command(f, 'attempt', A, 'accepted', 'task-done');
+  f.command.action.evidence = f.attempt.evidence;
+  assert.deepEqual((await transitionEvaluation(f)).blockers, []);
+  f.command.action.to = 'released';
+  const released = await transitionEvaluation(f);
+  assert.ok(!released.eligibleStates.includes('released'));
+  assert.ok(released.blockers.includes('publication_proof_missing'));
+});
+
+for (const [name, mutate] of [
+  ['publication prose', f => { f.run.release = { published: true, tag: 'v1.0.0' }; }],
+  ['unpublished release', f => { f.run.release.published = false; }],
+  ['missing release digest', f => { delete f.run.release.sha256; }],
+  ['missing delivery ref', f => { f.attempt.evidence = f.evidence.filter(ref => ref.kind !== 'delivery'); }],
+  ['missing release ref', f => { f.attempt.evidence = f.evidence.filter(ref => ref.kind !== 'release'); }],
+]) test(`Accepted proof cannot become released from ${name}`, async () => {
+  const f = fixture(); mutate(f);
+  const result = await attemptEvaluation(f);
+  assert.ok(result.eligibleStates.includes('accepted'));
+  assert.ok(!result.eligibleStates.includes('released'));
+  assert.deepEqual(result.blockers, []);
+  f.command = command(f, 'attempt', A, 'released', 'task-done');
+  f.command.action.evidence = f.attempt.evidence;
+  const transition = await transitionEvaluation(f);
+  assert.ok(!transition.eligibleStates.includes('released'));
+  assert.ok(transition.blockers.includes('publication_proof_missing'));
 });
 
 for (const [name, mutate] of [
@@ -100,12 +137,53 @@ test('Containers require complete accepted children and their own mapped criteri
 
 test('Project release waits for releaseRequired milestones and cannot use forged command state', async () => {
   const f = fixture(); f.snapshot.project.status = 'accepted'; f.snapshot.tasks[0].status = 'accepted';
-  f.command = command(f, 'project', 'project', 'released', 'project-done');
+  f.command = command(f, 'project', P, 'released', 'project-done');
   assert.ok(!(await transitionEvaluation(f)).eligibleStates.includes('released'));
   f.snapshot.milestones[0].status = 'released';
   assert.ok((await transitionEvaluation(f)).eligibleStates.includes('released'));
   f.command.expectedRevision = 6;
   assert.ok(!(await transitionEvaluation(f)).eligibleStates.includes('released'));
+});
+
+function projectAcceptanceFixture() {
+  const f = fixture();
+  f.snapshot.project.status = 'integrated'; f.snapshot.tasks[0].status = 'accepted';
+  f.evidence = f.evidence.filter(ref => !['release', 'delivery'].includes(ref.kind));
+  f.command = command(f, 'project', P, 'accepted', 'project-done');
+  return f;
+}
+
+test('Project acceptance uses UUID command identity with complete children and own proof', async () => {
+  const f = projectAcceptanceFixture(); let runs = 0, refs = 0;
+  f.ports.validateRun = async () => { await Promise.resolve(); runs++; };
+  f.ports.verifyRef = async () => { await Promise.resolve(); refs++; };
+  const result = await transitionEvaluation(f);
+  assert.notEqual(f.snapshot.project.id, f.command.action.id);
+  assert.ok(result.eligibleStates.includes('accepted'));
+  assert.ok(!result.eligibleStates.includes('released'));
+  assert.deepEqual(result.blockers, []);
+  assert.equal(runs, 1); assert.equal(refs, f.evidence.length);
+});
+
+for (const [name, mutate] of [
+  ['display slug', f => { f.command.action.id = f.snapshot.project.id; }],
+  ['wrong UUID', f => { f.command.action.id = R; }],
+  ['wrong project', f => { f.command.projectId = R; }],
+  ['stale revision', f => { f.command.expectedRevision--; }],
+  ['unaccepted child', f => { f.snapshot.milestones[0].status = 'integrated'; }],
+  ['incomplete children', f => { f.snapshot.completeness.milestones.complete = false; }],
+  ['missing own mapping', f => { f.command.action.mappings = []; }],
+  ['borrowed task criterion', f => { f.command.action.mappings = f.mappings; }],
+  ['missing own proof', f => { f.command.action.evidence = []; }],
+  ['wrong run binding', f => { f.run.directorBinding.projectId = R; }],
+  ['async tampered ref', f => { f.ports.verifyRef = async () => { await Promise.resolve(); throw Error('tamper'); }; }],
+  ['async invalid run', f => { f.ports.validateRun = async () => { await Promise.resolve(); throw Error('invalid'); }; }],
+]) test(`Project UUID acceptance still rejects ${name}`, async () => {
+  const f = projectAcceptanceFixture(); mutate(f);
+  const result = await transitionEvaluation(f);
+  assert.ok(!result.eligibleStates.includes('accepted'));
+  assert.ok(!result.eligibleStates.includes('released'));
+  assert.ok(result.blockers.length);
 });
 
 test('Readiness awaits interface refs and checks current dependencies and risk approval', async () => {

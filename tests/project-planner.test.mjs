@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { planProjectHorizon } from '../runtime/project-planner.mjs';
+import * as contracts from '../runtime/project-contracts.mjs';
 
 const projectId = '10000000-0000-4000-8000-000000000001';
 const now = '2026-11-05T10:00:00.000Z';
@@ -46,6 +47,104 @@ function ports(overrides = {}) {
 }
 const plan = (input, injected = ports()) => planProjectHorizon(input, injected);
 const reasons = (result, id) => result.blocked.find(row => row.taskId === id)?.reasons ?? [];
+const actualPorts = { contracts, knownValues: [] };
+
+test('Actual contracts select 24 of 1000 tasks with no required interfaces and preserve lower limits', () => {
+  const tasks = Array.from({ length: 1000 }, (_, i) => task('task-' + String(i).padStart(4, '0'), { interfaceRefs: [] }));
+  const input = fixture(tasks), before = structuredClone(input);
+  assert.equal(contracts.normalizeDirectorRecord('snapshot', input.snapshot, { knownValues: [] }).tasks.length, 1000);
+  const result = plan(input, actualPorts);
+  assert.deepEqual(result.taskIds, tasks.slice(0, 24).map(t => t.id));
+  assert.equal(result.order.length, 1000);
+  assert.equal(result.blocked.length, 976);
+  assert.ok(result.blocked.every(row => row.reasons.length === 1 && row.reasons[0] === 'horizon_limit'));
+  assert.equal(result.dryRun, true);
+  assert.deepEqual(plan({ ...input, limit: 7 }, actualPorts).taskIds, tasks.slice(0, 7).map(t => t.id));
+  assert.deepEqual(input, before);
+});
+
+test('Actual contracts still require availability and interface verification when required interfaces are empty', () => {
+  const input = fixture([task('one', { interfaceRefs: [] })]);
+  assert.deepEqual(plan(input, actualPorts).taskIds, ['one']);
+  input.availability = [];
+  assert.deepEqual(reasons(plan(input, actualPorts), 'one'), ['availability_missing']);
+  input.availability = [{ taskId: 'one', available: false, interfacesVerified: true, reason: 'quota' }];
+  assert.deepEqual(reasons(plan(input, actualPorts), 'one'), ['availability:quota']);
+  input.availability[0].available = true; input.availability[0].interfacesVerified = false;
+  assert.deepEqual(reasons(plan(input, actualPorts), 'one'), ['interfaces_unverified']);
+  input.snapshot.tasks[0].interfaceRefs = [ref];
+  assert.deepEqual(reasons(plan(input, actualPorts), 'one'), ['interfaces_unverified']);
+  input.availability[0].interfacesVerified = true;
+  assert.deepEqual(plan(input, actualPorts).taskIds, ['one']);
+  input.snapshot.tasks[0].interfaceRefs[0] = { ...ref, sha256: 'invalid-proof' };
+  assert.throws(() => plan(input, actualPorts), { code: 'project_schema' });
+});
+
+test('Actual stale and future revision approvals block the entire horizon without weakening the snapshot contract', () => {
+  const input = fixture([task('risky', { revision: 3, riskApprovalRequired: true }), task('unrelated')]);
+  input.snapshot.revision = input.snapshot.project.revision = 3;
+  const approval = { schemaVersion: 1, projectId, taskId: 'risky', taskRevision: 3, actor: 'owner', reason: 'Reviewed risk', approvedAt: now };
+  let builds = 0;
+  const injected = { knownValues: [], contracts: { ...contracts, buildDirectorTaskInput(value, options) {
+    builds++; return contracts.buildDirectorTaskInput(value, options);
+  } } };
+  for (const taskRevision of [2, 4]) {
+    input.snapshot.riskApprovals = [{ ...approval, taskRevision }]; recount(input.snapshot);
+    const before = structuredClone(input);
+    assert.throws(() => contracts.normalizeDirectorRecord('snapshot', input.snapshot, { knownValues: [] }), { code: 'project_revision' });
+    const result = plan(input, injected);
+    assert.deepEqual(result, { schemaVersion: 1, projectId, revision: 3, taskIds: [],
+      blocked: ['risky', 'unrelated'].map(taskId => ({ taskId, reasons: ['snapshot_invalid:project_revision'] })),
+      order: ['risky', 'unrelated'], dryRun: true });
+    assert.equal(builds, 0);
+    assert.deepEqual(input, before);
+  }
+  input.snapshot.riskApprovals = [approval]; recount(input.snapshot);
+  assert.deepEqual(plan(input, actualPorts).taskIds, ['risky', 'unrelated']);
+  input.snapshot.riskApprovals[0].approvedAt = '2026-11-06T10:00:00.000Z';
+  assert.deepEqual(plan(input, actualPorts).taskIds, ['unrelated']);
+  assert.deepEqual(reasons(plan(input, actualPorts), 'risky'), ['risk_approval_required']);
+});
+
+test('Actual contract safety schema and dependency errors propagate instead of becoming revision blockers', () => {
+  for (const [mutate, code] of [
+    [input => { input.snapshot.tasks[0].extra = true; }, 'project_schema'],
+    [input => { input.snapshot.tasks[0].writePaths = ['../escape']; }, 'project_scope'],
+    [input => { input.snapshot.tasks[0].dependsOn = ['missing']; }, 'project_dag'],
+    [input => { input.snapshot.tasks[0].interfaceRefs = [{ ...ref, path: 'relative/proof.json' }]; }, 'project_path'],
+    [input => { input.snapshot.tasks[0].description = 'Contains owned-test-credential'; }, 'project_unsafe']
+  ]) {
+    const input = fixture([task('one', { riskApprovalRequired: true })]);
+    input.snapshot.riskApprovals = [{ schemaVersion: 1, projectId, taskId: 'one', taskRevision: 2,
+      actor: 'owner', reason: 'Reviewed risk', approvedAt: now }]; recount(input.snapshot);
+    mutate(input);
+    assert.throws(() => plan(input, { contracts, knownValues: ['owned-test-credential'] }), { code });
+  }
+  const input = fixture(); let reads = 0;
+  Object.defineProperty(input.snapshot, 'riskApprovals', { enumerable: true, get() { reads++; return []; } });
+  assert.throws(() => plan(input, actualPorts), { code: 'project_schema' });
+  assert.equal(reads, 0);
+});
+
+test('Actual coherent incomplete task attempt or approval sets are rejected before planning', () => {
+  for (const key of ['tasks', 'currentAttempts', 'riskApprovals']) {
+    const input = fixture();
+    input.snapshot.completeness[key].total++;
+    input.snapshot.completeness[key].complete = false;
+    assert.doesNotThrow(() => contracts.normalizeDirectorRecord('snapshot', input.snapshot, { knownValues: [] }));
+    assert.throws(() => plan(input, actualPorts), { code: 'invalid_project_horizon' });
+  }
+});
+
+test('Revision denial is bounded to 1000 task IDs and passes the output safety boundary', () => {
+  const input = fixture(Array.from({ length: 1000 }, (_, i) => task('task-' + String(i).padStart(4, '0'))));
+  input.snapshot.project.revision = 2;
+  const result = plan(input, actualPorts);
+  assert.deepEqual(result.taskIds, []);
+  assert.deepEqual(result.order, input.snapshot.tasks.map(t => t.id));
+  assert.deepEqual(result.blocked, result.order.map(taskId => ({ taskId, reasons: ['snapshot_invalid:project_revision'] })));
+  assert.throws(() => plan(input, { contracts, knownValues: ['snapshot_invalid:project_revision'] }), { code: 'project_unsafe' });
+});
 
 test('A thousand-task backlog has a stable bounded horizon and preserves every lower limit', () => {
   const tasks = Array.from({ length: 1000 }, (_, i) => task('task-' + String(i).padStart(4, '0')));
@@ -112,7 +211,7 @@ test('Missing availability, quota and stale or missing interfaces fail closed', 
   assert.deepEqual(reasons(plan(input), 'one'), ['availability:quota']);
   input.availability[0].available = true; input.availability[0].interfacesVerified = false;
   assert.ok(reasons(plan(input), 'one').includes('interfaces_unverified'));
-  input.availability[0].interfacesVerified = true; input.snapshot.tasks[0].interfaceRefs = [];
+  input.availability[0].interfacesVerified = true; input.snapshot.tasks[0].interfaceRefs = undefined;
   assert.ok(reasons(plan(input), 'one').includes('interfaces_missing'));
   input.availability.push({ ...input.availability[0] });
   assert.throws(() => plan(input), { code: 'invalid_project_horizon' });
