@@ -4,7 +4,7 @@
 
 `npm test` теперь вызывает `scripts/run-tests.mjs`: официальный Node24
 [`node:test.run`](https://nodejs.org/docs/latest-v24.x/api/test.html#runoptions)
-с `files`, ресурсным default concurrency 4/8, `isolation: 'process'` и встроенным TAP reporter.
+с `files`, консервативным default concurrency 4, `isolation: 'process'` и встроенным TAP reporter.
 Прямой `node --test` сортирует explicit files, поэтому перестановка аргументов
 CLI сама по себе не меняет стартовый порядок. Programmatic API сохраняет
 переданный порядок; это проверено короткими реальными child-процессами.
@@ -64,39 +64,74 @@ Time limits, assertions, frozen oracles и process isolation сохранены.
 запрашивают abort и дренирование. Принудительное OS-завершение процесса не даёт
 выполнить JS cleanup; Windows tree termination остаётся границей координатора.
 
-### Ресурсный default 4/8: 5 ноября 2026
+### Консервативный default 4: 5 ноября 2026
 
-Чистый `chooseTestConcurrency(parallelism, freeMemoryBytes)` выбирает 8 только
-при конечном CPU parallelism ≥16 и конечной свободной памяти ≥4 GiB
-(`4 * 1024 ** 3` bytes); иначе 4, включая неизвестные/нечисловые/Infinity inputs.
-Без явного выбора `runTests` читает `os.availableParallelism()` и `os.freemem()`
-один раз при вызове. Это бюджет одновременно выполняемых тестовых файлов,
-а не динамический регулятор и не лимит native/model сессий. Explicit 1–8 имеет
-приоритет даже при меньших ресурсах; новых env/settings нет. Общий deadline
-20 минут не расширен; discovery, полный набор, порядок, diagnostics, nonzero,
-abort/drain и официальный process-isolated Node runner сохранены.
+Automatic8 отозван: полный локальный check source `e69797cc…` остановился
+по 20-минутному timeout; Director дал 37 PASS/1 CANCELLED (`testTimeoutFailure`
+в неизменённом pause case с deadline60s). Это не feature PASS. `runTests` снова
+всегда использует default4 независимо от CPU/памяти. Selector удалён вместе
+только с новыми obsolete pure-resource tests; исходный default4 barrier
+восстановлен с прежними assertions/deadline. Explicit `--test-concurrency=1..8`
+остаётся opt-in, hard max8, negative cap9 и реальный восьми-PID barrier сохранены.
+Discovery/порядок, process isolation, старые тесты, три frozen oracle,
+failure/cancel/drain, общий deadline, native/model/saved budgets не меняются.
+Новых env/settings нет.
 
-Основание — один контролируемый опыт на неизменённом source
+Историческое основание отозванного эксперимента — один опыт на неизменённом source
 `6dfedcad39d1efed5b31c77a036375a90487219d`, Windows, Node `v24.22.1`, 32 CPU:
 одни и те же 30 cases в восьми Engine/mode-engine файлах прошли 30/30 при 4
 за 180896.4247 ms, затем при 8 за 113540.1556 ms. Это последовательная
 подвыборка одного host, без статистических повторов, не whole-suite speedup,
 не model/provider benchmark и не объяснение причины прежнего timeout.
 
-До source-изменения независимые boundary/default/CLI/barrier проверки дали
+Исторически, до auto8 source-изменения boundary/default/CLI/barrier проверки дали
 3 PASS / 28 FAIL; после — 31 PASS / 0 FAIL/cancel/skip, exit0, Windows,
 Node `v24.19.0`. Barrier удерживает восемь разных child PID до release,
 проверяет верхнюю границу, выполнение всех 11 файлов ровно по одному разу
 и drain. Default wiring проверяется с контролируемыми OS readings, настоящим
 filesystem и Node children, без зависимости от текущей свободной памяти host.
-Старый barrier сохраняет все assertions и timeout с explicit4; старый cap-negative
-изменён только с 5 на 9. Остальные старые тела и frozen oracles сохранены.
+Тогда старый barrier стал explicit4; теперь его исходный default4 восстановлен.
+Cap-negative изменён только с 5 на 9. Остальные старые тела и frozen oracles сохранены.
 Сырые `resource-red.tap`, `resource-green.tap`, команды, exit codes и source hashes
 сохранены приватно вне Git в Run `d44ff299-c1df-4c21-a3c2-74fcd8d768cf`,
 `throughput-evidence`. Полный check, fresh gates, review и CI точного кандидата
 выполняет координатор; [окончательная приёмка06](https://github.com/Zulut30/Kodo/pull/15).
-Урок: проверять CPU и память независимо и наблюдать реальную границу child PID;
-одна удачная подвыборка не заменяет полный check.
+Новая regression с mock32 CPU/8 GiB и настоящими child PID дала RED `8 !== 4`
+на e697 → GREEN после восстановления default4. Low-resource default4 и explicit
+overrides сохранены. Урок: удачная подвыборка не заменяет полный check.
+
+### Dev CLI: Git той же установки
+
+Только CLI-вход `scripts/run-tests.mjs` вызывает `configureGitTestEnvironment()`
+из dev-only `scripts/git-test-environment.mjs`; импорт/programmatic `runTests`
+окружение не меняет. На Windows можно заменить только первый Git в PATH вида
+`.../cmd/git.exe` на sibling `.../mingw64/bin/git.exe` той же установки.
+Реальные обычные файлы без file symlink, native canonical paths в одном root
+и точное совпадение непустых `--version`/`--exec-path` обязательны. Четыре
+абсолютных metadata probes: no shell, windowsHide, timeout≤5s, maxBuffer≤64KiB.
+Их env ограничен OS/path/locale allowlist: PATH, SystemRoot/WINDIR/COMSPEC,
+PATHEXT, TEMP/TMP, HOME/USERPROFILE/HOMEDRIVE/HOMEPATH/SystemDrive,
+GIT_EXEC_PATH, LANG/LC_ALL. Имена и значения сохранены; provider/GitHub/API
+tokens и GIT_CONFIG_VALUE_* не передаются. Родительский env не очищается.
+Custom Git в CWD, ранняя ссылка/другой launcher в PATH, missing/mismatch/error или выход через
+directory symlink оставляют env неизменным. При успехе core directory добавляется
+только в PATH runner/children, с прежними key casing/tail и без Path/PATH дублей.
+User/Machine PATH, HOME/auth/config, runtime.command/gitBoundary и guards прежние.
+Другие ОС — no-op; helper не входит в `package.files`. CLI загружает его динамически
+после argument/recursive validation; отсутствие helper сохраняет окружение и
+работоспособность отдельной копии runner. Regression такой копии с tiny fixture
+сначала дала module-load RED, затем import/CLI GREEN.
+
+Профиль одного неизменённого pause case на e697: 255 Git заняли25722.423ms
+из TAP total31350.598ms; тот же core —255 Git17050.328ms из23071.035ms.
+Оба case PASS, version/exec-path совпали. Это startup hot path observation,
+не whole-suite benchmark и не объяснение полного timeout. Текущие scoped
+scheduler/Git/package tests: 56 PASS, 0 FAIL/cancel, 2 file-symlink SKIP из-за прав Windows;
+directory-junction escape и реальный установленный Git metadata/status прошли.
+Built-in mocks probes изолированы в child, filesystem настоящий. Сырые RED/GREEN,
+команды и exit codes вне Git:
+`C:/Users/zulut/AppData/Local/Kodo/runs/bc5444e9-6e90-4b9c-8a1f-f5a13834e5a6/git-throughput-evidence`.
+Full check, fresh gates, независимое review и CI текущего head остаются у Root.
 
 Поддерживаемый CLI:
 
@@ -108,7 +143,7 @@ npm test -- --test-concurrency=1 tests/test-schedule.test.mjs
 ```
 
 Оба флага принимают `=value` или отдельное значение; повторные name patterns
-передаются Node как массив. Concurrency разрешена от1 до8, default по ресурсам 4/8. Explicit
+передаются Node как массив. Concurrency разрешена от1 до8, default всегда4. Explicit
 paths — только существующие literal-файлы внутри checkout, без ссылок,
 `node_modules`/`.git`; повторения запускаются один раз. Globs, каталоги и остальные
 флаги явно отклоняются с nonzero exit, а не меняют выбор тестов незаметно.

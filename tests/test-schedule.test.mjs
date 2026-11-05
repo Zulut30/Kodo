@@ -169,11 +169,11 @@ test('Scheduler deduplicates priorities and preserves deterministic lexical fall
   assert.deepEqual(orderTests([...files].reverse().map(file => path.resolve(root, file)), root), expected);
 });
 
-test('Scheduler explicit four concurrent isolated workers executes each file once', { timeout: 15000 }, async t => {
+test('Scheduler defaults to four concurrent isolated workers and executes each file once', { timeout: 15000 }, async t => {
   const { temp, put } = await fixture(t);
   const log = path.join(temp, 'events'), release = path.join(temp, 'release');
   for (let id = 0; id < 7; id++) await put(`${id}.test.cjs`, `const {appendFileSync,existsSync}=require('node:fs'); const {setTimeout:delay}=require('node:timers/promises'); const test=require('node:test'); const log=${JSON.stringify(log)}; appendFileSync(log, JSON.stringify({event:'start',id:${id},pid:process.pid})+'\\n'); test('barrier',{timeout:5000},async()=>{ while(!existsSync(${JSON.stringify(release)})) await delay(10); appendFileSync(log,JSON.stringify({event:'end',id:${id}})+'\\n'); });`);
-  const execution = child(t, temp, [...entryArgs, '--test-concurrency=4']);
+  const execution = child(t, temp, entryArgs);
   try {
     await waitFor(async () => (await lines(log)).length >= 4);
     await delay(100);
@@ -242,26 +242,6 @@ test('Scheduler abort drains its owned children and reports cancellation as nonz
   assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' }, 'owned child must be gone after runner closes');
 });
 
-// Independent policy examples: neither expected values nor resource thresholds
-// are read from the implementation or from this machine's current resources.
-for (const [label, cpu, memory, expected] of [
-  ['low CPU with ample memory', 8, 16 * 1024 ** 3, 4],
-  ['high CPU with low memory', 32, 2 * 1024 ** 3, 4],
-  ['exact CPU and memory boundaries', 16, 4 * 1024 ** 3, 8],
-  ['CPU immediately below boundary', 15, 4 * 1024 ** 3, 4],
-  ['memory one byte below boundary', 16, 4 * 1024 ** 3 - 1, 4],
-  ['resources above boundaries', 32, 8 * 1024 ** 3, 8],
-  ...[undefined, null, NaN, Infinity, -Infinity, 0, -1, '32', {}]
-    .flatMap((value, index) => [
-      [`invalid CPU ${index}`, value, 8 * 1024 ** 3, 4],
-      [`invalid memory ${index}`, 32, value, 4],
-    ]),
-]) test(`Scheduler resource selector: ${label}`, async () => {
-  const { chooseTestConcurrency } = await import(scheduleUrl);
-  assert.equal(typeof chooseTestConcurrency, 'function');
-  assert.equal(chooseTestConcurrency(cpu, memory), expected);
-});
-
 async function concurrencyBarrier(t, { expected, resources, explicit }) {
   const { temp, put } = await fixture(t);
   const log = path.join(temp, 'events'), release = path.join(temp, 'release');
@@ -325,7 +305,7 @@ test('Scheduler explicit eight runs eight distinct child PIDs once and drains mo
 for (const [label, resources, expected, explicit] of [
   ['low CPU defaults to four', [8, 8 * 1024 ** 3], 4],
   ['low memory defaults to four', [32, 2 * 1024 ** 3], 4],
-  ['exact resource boundaries default to eight', [16, 4 * 1024 ** 3], 8],
+  ['high resources conservatively default to four', [32, 8 * 1024 ** 3], 4],
   ['explicit one overrides high resources', [32, 8 * 1024 ** 3], 1, 1],
   ['explicit eight overrides low resources', [8, 2 * 1024 ** 3], 8, 8],
 ]) test(`Scheduler default wiring: ${label}`, { timeout: 15000 }, async t => {
