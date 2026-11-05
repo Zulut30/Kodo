@@ -793,7 +793,27 @@ try {
     run.checks = { schemaVersion: 2, headSha, fingerprint, complete: false, results }; this.save(run);
     for (const kind of ['test', 'build']) for (const command of run.config.commands[kind]) {
       this.checkCancelled(run, signal); this.log(run, 'check_started', { kind, command });
-      const result = await execute(command.command, command.args, { cwd: run.cwd, signal, env: workerEnvironment(), secrets: this.secrets, timeoutMs: command.timeoutMs, allowFailure: true });
+      let result;
+      try {
+        result = await execute(command.command, command.args, { cwd: run.cwd, signal, env: workerEnvironment(), secrets: this.secrets, timeoutMs: command.timeoutMs, allowFailure: true });
+      } catch (error) {
+        // Stopped execution is never a passing check, even when the actual
+        // child exit happens to be zero. Persist only the diagnostic contract;
+        // errors, stacks, arguments and environment are not output evidence.
+        const reason = ['cancelled', 'timeout', 'invalid_output', 'command_failed', 'ENOENT', 'EACCES', 'EPERM'].includes(error.code) ? error.code : 'execution_failed';
+        const partial = error.result;
+        const stdout = redact(typeof partial?.stdout === 'string' ? partial.stdout : '', this.secrets).slice(-24000);
+        const stderr = redact(typeof partial?.stderr === 'string' ? partial.stderr : '', this.secrets).slice(-24000);
+        const failed = { kind, command, status: 'failed', reason, exitCode: null, processExitCode: Number.isInteger(partial?.code) ? partial.code : null, stdout, stderr, durationMs: Number.isFinite(partial?.durationMs) && partial.durationMs >= 0 ? partial.durationMs : null, outputTruncated: partial?.outputTruncated === true };
+        const row = redact({ kind, command, status: 'failed', reason, exitCode: null, processExitCode: failed.processExitCode, output: (stdout + stderr).slice(-24000) }, this.secrets);
+        results.push(row);
+        try {
+          const evidence = await this.persistEvidence(run, 'check', failed, { headSha });
+          row.outputPath = evidence.path; row.outputHash = evidence.sha256;
+        } catch { /* Preserve the original execution error if evidence storage fails. */ }
+        try { this.save(run); } catch { /* The previously saved receipt remains incomplete. */ }
+        throw error;
+      }
       if (await inspectCurrentSource({ project: run.cwd, headSha }) !== 'clean') throw Object.assign(new Error('Команда проверки изменила проверяемый commit или файлы'), { code: 'dirty_worktree' });
       const evidence = await this.persistEvidence(run, 'check', { kind, command, exitCode: result.code, stdout: result.stdout, stderr: result.stderr }, { headSha });
       results.push({ kind, command, exitCode: result.code, output: (result.stdout + result.stderr).slice(-24000), outputPath: evidence.path, outputHash: evidence.sha256 }); this.save(run);

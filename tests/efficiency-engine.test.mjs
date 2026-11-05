@@ -305,6 +305,85 @@ test('Engine coordinator checks keep raw Node diagnostics and retain the full fa
   assert.equal(fx.requests.length, 0, 'check failure itself calls no model');
 });
 
+for (const mode of ['timeout', 'cancelled', 'invalid_output']) test(`Engine ${mode} check persists incomplete sanitized evidence across reopen and never runs the next command`, async t => {
+  const fx = await fixture(t), controller = new AbortController(), ready = path.join(fx.root, 'ready'), next = path.join(fx.root, 'next');
+  const once = path.join(fx.root, 'once'), executions = path.join(fx.root, 'executions');
+  const prefix = `const fs=require('node:fs');if(fs.existsSync(${JSON.stringify(once)}))process.exit(0);fs.writeFileSync(${JSON.stringify(once)},'once');process.stdout.write('STOPPED_CHECK_CAUSE fixture-sensitive-value');`;
+  const source = mode === 'invalid_output'
+    ? prefix + "process.stderr.write('x'.repeat(4*1024*1024+1));setInterval(()=>{},1000)"
+    : prefix + `process.stderr.write('STOPPED_STDERR',()=>require('node:fs').writeFileSync(${JSON.stringify(ready)},'ready'));setInterval(()=>{},1000)`;
+  fx.run.config.commands.test = [
+    { command: process.execPath, args: ['-e', `require('node:fs').appendFileSync(${JSON.stringify(executions)},'executed\\n');console.log('PREVIOUS_SUCCESS')`] },
+    { command: process.execPath, args: ['-e', source], timeoutMs: mode === 'timeout' ? 1500 : 10000 },
+    { command: process.execPath, args: ['-e', `require('node:fs').writeFileSync(${JSON.stringify(next)},'unexpected')`] }
+  ];
+  let stopped;
+  const running = assert.rejects(fx.engine.checks(fx.run, controller.signal), error => {
+    stopped = error;
+    assert.equal(error.code, mode);
+    assert.match(error.result.stdout, /STOPPED_CHECK_CAUSE \[REDACTED\]/);
+    return true;
+  });
+  if (mode === 'cancelled') {
+    try {
+      const deadline = Date.now() + 8000;
+      while (await readFile(ready, 'utf8').catch(() => '') !== 'ready') {
+        assert.ok(Date.now() < deadline, 'controlled check must become ready');
+        await new Promise(resolve => setTimeout(resolve, 20));
+      }
+    } finally { controller.abort(); }
+  }
+  await running;
+  const reopened = new Store(fx.store.home);
+  let saved;
+  try { saved = reopened.getRun(fx.run.id); } finally { reopened.close(); }
+  assert.equal(saved.checks.complete, false);
+  assert.equal(saved.checks.results.length, 2);
+  assert.equal(saved.checks.results[0].exitCode, 0);
+  const row = saved.checks.results[1];
+  assert.equal(row.status, 'failed'); assert.equal(row.reason, mode); assert.equal(row.exitCode, null);
+  assert.equal(row.processExitCode, stopped.result.code);
+  assert.doesNotMatch(JSON.stringify(saved.checks), /fixture-sensitive-value/);
+  const evidence = await readEvidence(row.outputPath, fx.baseSha);
+  assert.equal(evidence.value.status, 'failed'); assert.equal(evidence.value.reason, mode); assert.equal(evidence.value.exitCode, null);
+  assert.equal(evidence.value.processExitCode, stopped.result.code);
+  assert.match(evidence.value.stdout, /STOPPED_CHECK_CAUSE \[REDACTED\]/);
+  assert.equal(evidence.value.durationMs, stopped.result.durationMs);
+  assert.equal(evidence.value.outputTruncated, stopped.result.outputTruncated);
+  assert.doesNotMatch(JSON.stringify(evidence), /fixture-sensitive-value/);
+  assert.equal(await stat(next).catch(() => null), null);
+  assert.equal(fx.requests.length, 0);
+  assert.equal(saved.review, undefined);
+  // Keep head, commands and runtime identical: incomplete evidence cannot be reused.
+  assert.equal(await readFile(executions, 'utf8'), 'executed\n');
+  await fx.engine.checks(fx.run);
+  assert.equal(await readFile(executions, 'utf8'), 'executed\nexecuted\n');
+  assert.equal(await readFile(next, 'utf8'), 'unexpected');
+  assert.equal(fx.run.checks.fingerprint, saved.checks.fingerprint);
+  assert.equal(fx.run.checks.results.length, 3);
+  assert.equal(fx.run.checks.complete, true);
+  await fx.engine.assertEvidence({ path: row.outputPath, sha256: row.outputHash, headSha: fx.baseSha });
+});
+
+for (const failure of ['evidence', 'save']) test(`Engine retains the original typed timeout when failed-check ${failure} persistence fails`, async t => {
+  const fx = await fixture(t), save = fx.engine.save.bind(fx.engine);
+  fx.run.config.commands.test = [{ command: process.execPath, args: ['-e', "process.stdout.write('PERSISTENCE_FAILURE_CAUSE');setInterval(()=>{},1000)"], timeoutMs: 1500 }];
+  if (failure === 'evidence') fx.engine.persistEvidence = async () => { throw Object.assign(new Error('Evidence storage failed'), { code: 'evidence_integrity' }); };
+  else fx.engine.save = run => {
+    if (run.checks?.results.some(row => row.status === 'failed')) throw new Error('State storage failed');
+    return save(run);
+  };
+  await assert.rejects(fx.engine.checks(fx.run), error => {
+    assert.equal(error.code, 'timeout');
+    assert.match(error.result.stdout, /PERSISTENCE_FAILURE_CAUSE/);
+    return true;
+  });
+  assert.equal(fx.run.checks.complete, false);
+  assert.equal(fx.run.checks.results[0].status, 'failed');
+  assert.equal(fx.run.checks.results[0].exitCode, null);
+  assert.equal(fx.store.getRun(fx.run.id).checks.complete, false);
+});
+
 test('Engine session uses verified managed RTK only in a private worker environment and rechecks each new session', async t => {
   const root = path.join(path.resolve(os.tmpdir()), 'fixture-managed-rtk'), directory = path.join(root, '1.1.0');
   const rtk = { id: 'rtk', version: '1.1.0', ready: true, status: 'ready', directory, command: path.join(directory, 'native', process.platform === 'win32' ? 'rtk.exe' : 'rtk'), receipt: path.join(root, 'receipt.json') };
