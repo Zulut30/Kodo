@@ -21,6 +21,13 @@ kodo run "TASK" --client codex|claude-code [--model MODEL] [--mode quick|standar
 kodo benchmark run --models MODEL,... [--client codex|claude-code] [--mode quick|standard|deep] [--repeats N] [--seed N] [--output ABSOLUTE_DIR] [--json]
 kodo benchmark resume|report PATH [--json]
 kodo status|logs|resume|cancel RUN_ID [--json]
+kodo project create --file SPEC [--command-id UUID] [--json]
+kodo project status PROJECT_ID [--json]
+kodo project plan PROJECT_ID [--limit 1..24] [--dry-run] [--json]
+kodo project resume PROJECT_ID [--retry-failed] [--command-id UUID] [--json]
+kodo project cancel|pause PROJECT_ID [--command-id UUID] [--json]
+kodo project reprioritize PROJECT_ID TASK_ID --priority 0..100 [--command-id UUID] [--json]
+kodo project approve-risk PROJECT_ID TASK_ID --reason TEXT [--command-id UUID] [--json]
 kodo research status [--project PATH] [--json]
 kodo research refresh --input REL_JSON [--context REL_JSON] [--project PATH] [--json]
 kodo knowledge inspect [--subject TEXT] [--context REL_JSON] [--project PATH] [--json]
@@ -74,6 +81,14 @@ async function main() {
   if (!command || ['help', '--help', '-h'].includes(command)) return console.log(help);
   // Offline reports and argument errors must not initialize the runtime's
   // SQLite store or credential/provider startup path.
+  if (command === 'project') {
+    const { projectCli } = await import('../runtime/project-cli.mjs');
+    const controller = new AbortController(), abort = () => controller.abort();
+    process.once('SIGINT', abort); process.once('SIGTERM', abort);
+    try { const result = await projectCli(argv, { signal: controller.signal }); console.log(result.output); process.exitCode = result.exitCode; }
+    finally { process.removeListener('SIGINT', abort); process.removeListener('SIGTERM', abort); }
+    return;
+  }
   if (['research', 'knowledge'].includes(command)) {
     const { knowledgeCli } = await import('../runtime/knowledge-cli.mjs');
     const result = await knowledgeCli([command, ...argv]); console.log(result.output); process.exitCode = result.exitCode; return;
