@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises';
-import { writeFileSync } from 'node:fs';
+import { chmodSync, lstatSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -18,6 +18,18 @@ const proof = id => ({ id, text: 'The assigned file exists and passes its indepe
 const task = (id, dependsOn = []) => ({ id, epicId: 'epic', title: id, description: `Implement ${id}.`, owner: 'developer',
   dependsOn, writePaths: [`${id}.txt`], acceptance: [proof(`${id}-proof`)], interfaceRefs: [], priority: 50,
   userValue: 1, risk: 1, estimatedEffort: 1, riskApprovalRequired: false });
+function writeOwnedEvidence(f, filename, contents) {
+  const relative = path.relative(f.home, filename);
+  assert.ok(relative && relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+  const info = lstatSync(filename, { throwIfNoEntry: false });
+  if (info) assert.ok(info.isFile() && !info.isSymbolicLink());
+  const mode = info ? info.mode & 0o777 : process.platform === 'win32' ? 0o600 : 0o400;
+  // Only this owned tamper target becomes writable; restore its evidence mode
+  // before the rejection check, including when recreating a removed fixture.
+  if (info) chmodSync(filename, mode | 0o200);
+  try { writeFileSync(filename, contents, { mode: 0o600 }); }
+  finally { chmodSync(filename, mode); }
+}
 async function fixture(t, { tasks = [task('first')], trusted = false, security = false } = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'kodo-project-e-'));
   const root = path.join(directory, 'repo'), home = path.join(directory, 'state'), isolated = path.join(directory, 'empty-home');
@@ -114,12 +126,12 @@ test('Director retry requires current revision risk approval before reserving or
   await f.director.run(f.id);
   const prior = f.repo.snapshot(f.id).currentAttempts[0];
   const ref = f.repo.snapshot(f.id).tasks[0].interfaceRefs[0], bytes = await readFile(ref.path);
-  await writeFile(ref.path, '{}');
+  writeOwnedEvidence(f, ref.path, '{}');
   const invalidInterface = await f.director.resume(f.id, { retryFailed: true });
   assert.equal(invalidInterface.status, 'blocked');
   assert.ok(invalidInterface.blockers.some(row => row.reasons.includes('interfaces_unverified')));
   assert.deepEqual(f.repo.snapshot(f.id).currentAttempts[0], prior);
-  await writeFile(ref.path, bytes);
+  writeOwnedEvidence(f, ref.path, bytes);
   await f.director.reprioritize(f.id, 'first', { priority: 60 });
   const changed = f.repo.snapshot(f.id);
   assert.equal(changed.riskApprovals.length, 0);
@@ -149,7 +161,7 @@ test('Director existing reservations recheck immutable interfaces before install
     starts = 0;
     const snapshot = f.repo.snapshot(f.id), ref = snapshot.tasks[0].interfaceRefs[0], original = await readFile(ref.path);
     for (const damage of ['tampered', 'missing']) {
-      if (damage === 'tampered') await writeFile(ref.path, '{}');
+      if (damage === 'tampered') writeOwnedEvidence(f, ref.path, '{}');
       else await rm(ref.path);
       const denied = await f.director.resume(f.id);
       assert.equal(denied.status, 'blocked');
@@ -157,7 +169,7 @@ test('Director existing reservations recheck immutable interfaces before install
       assert.equal(starts, 0); assert.deepEqual(f.repo.snapshot(f.id).currentAttempts[0], attempt);
       assert.equal(f.store.db.prepare('SELECT count(*) AS n FROM runs').get().n, stage === 'installed' ? 1 : 0);
     }
-    await writeFile(ref.path, original);
+    writeOwnedEvidence(f, ref.path, original);
     assert.equal((await f.director.resume(f.id)).status, 'waiting_limits');
     assert.equal(starts, 1); assert.equal(f.repo.snapshot(f.id).currentAttempts[0].runId, attempt.runId);
   });
@@ -171,7 +183,7 @@ test('Director retry rechecks interfaces after predecessor policy lookup before 
   const original = f.store.getRun.bind(f.store); let change = true, starts = 0;
   f.store.getRun = id => {
     const run = original(id);
-    if (change && id === prior.runId) { change = false; writeFileSync(ref.path, '{}'); }
+    if (change && id === prior.runId) { change = false; writeOwnedEvidence(f, ref.path, '{}'); }
     return run;
   };
   f.engine.run = async () => { starts++; };
@@ -189,12 +201,12 @@ test('Director rechecks interface eligibility after initialization and after ato
     f.engine.run = async id => { starts++; return f.store.updateRun(id, { state: 'waiting_limits' }); };
     if (boundary === 'initialize') {
       const initialize = f.engine.initializeRun.bind(f.engine);
-      f.engine.initializeRun = async run => { await initialize(run); await writeFile(ref.path, '{}'); };
+      f.engine.initializeRun = async run => { await initialize(run); writeOwnedEvidence(f, ref.path, '{}'); };
       await assert.rejects(() => f.director.run(f.id), { code: 'project_admission_blocked' });
       f.engine.initializeRun = initialize;
     } else {
       const create = f.engine.createReserved.bind(f.engine);
-      f.engine.createReserved = async (...args) => { const run = await create(...args); await writeFile(ref.path, '{}'); return run; };
+      f.engine.createReserved = async (...args) => { const run = await create(...args); writeOwnedEvidence(f, ref.path, '{}'); return run; };
       assert.equal((await f.director.run(f.id)).status, 'blocked');
       f.engine.createReserved = create;
     }
@@ -202,7 +214,7 @@ test('Director rechecks interface eligibility after initialization and after ato
     const attempt = f.repo.snapshot(f.id).currentAttempts[0];
     assert.equal(attempt.number, 1);
     assert.equal(f.store.db.prepare('SELECT count(*) AS n FROM runs').get().n, boundary === 'initialize' ? 0 : 1);
-    await writeFile(ref.path, original);
+    writeOwnedEvidence(f, ref.path, original);
     assert.equal((await f.director.resume(f.id)).status, 'waiting_limits');
     assert.equal(starts, 1); assert.equal(f.repo.snapshot(f.id).currentAttempts[0].runId, attempt.runId);
   });
@@ -464,9 +476,9 @@ test('Production authorizer awaits enabled gate freshness and rejects stale logs
   await assert.rejects(() => f.authorizer({ command: c, snapshot }), { code: 'project_transition_blocked' });
   await writeFile(path.join(f.root, 'kodo.config.json'), configText);
   const log = await readFile(stored.checks.results[0].outputPath);
-  await writeFile(stored.checks.results[0].outputPath, '{}');
+  writeOwnedEvidence(f, stored.checks.results[0].outputPath, '{}');
   await assert.rejects(() => f.authorizer({ command: c, snapshot }), { code: 'project_transition_blocked' });
-  await writeFile(stored.checks.results[0].outputPath, log);
+  writeOwnedEvidence(f, stored.checks.results[0].outputPath, log);
   await writeFile(path.join(stored.cwd, 'unreviewed.txt'), 'Unreviewed change\n');
   await git(stored.cwd, ['add', 'unreviewed.txt']); await git(stored.cwd, ['commit', '-m', 'Owned stale-head observation']);
   await assert.rejects(() => f.authorizer({ command: c, snapshot }), { code: 'project_transition_blocked' });
@@ -510,7 +522,7 @@ test('Project plan preserves lower limits and verifies actual immutable interfac
   const first = task('first'); first.interfaceRefs = [{ kind: 'interface', runId: null, headSha: null, path: ref.path, sha256: ref.sha256 }];
   await f.apply({ op: 'amend', kind: 'task', id: 'first', record: first });
   assert.deepEqual((await f.director.plan(f.id, { limit: 24, mode: 'deep' })).taskIds, ['first']);
-  await writeFile(ref.path, '{}');
+  writeOwnedEvidence(f, ref.path, '{}');
   const result = await f.director.plan(f.id);
   assert.equal(result.taskIds.includes('first'), false);
   assert.ok(result.blocked.find(row => row.taskId === 'first').reasons.includes('interfaces_unverified'));
