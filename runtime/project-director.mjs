@@ -177,7 +177,7 @@ export function createProjectDirector({ repo, engine, planner, evaluator, clock 
     return horizonFor(await snapshotFor(id), options);
   }
 
-  async function admission(snapshot, task, options, retry = false) {
+  async function admission(snapshot, task, options, retry = false, recovery = false) {
     // C evaluates the actual snapshot, including current approvals and immutable
     // interfaces. Only the existing reservation's scheduling exclusions are
     // waived: recovery/retry is not selection of another horizon task.
@@ -190,6 +190,7 @@ export function createProjectDirector({ repo, engine, planner, evaluator, clock 
       expected.add('attempt_revision_mismatch');
       if (retryable(task.status)) expected.add(`task_${task.status}`);
     } else if (['running', 'verifying', 'integrated'].includes(task.status)) expected.add(`task_${task.status}`);
+    if (recovery && task.status === 'accepted') expected.add('task_accepted');
     const reasons = blocked?.reasons.filter(reason => !expected.has(reason)) || [];
     return reasons.length ? { status: 'blocked', blockers: [{ taskId: task.id, reasons }] } : null;
   }
@@ -297,7 +298,13 @@ export function createProjectDirector({ repo, engine, planner, evaluator, clock 
     };
     try {
       snapshot = await guard(snapshot.revision);
-      const active = snapshot.currentAttempts.filter(row => !settled(row.status) && !retryable(row.status));
+      const active = snapshot.currentAttempts.filter(row => {
+        const task = snapshot.tasks.find(task => task.id === row.taskId);
+        // A durable Attempt may precede its Task projection across a crash.
+        // Select that same reservation before scheduling any further work.
+        return !settled(row.status) && !retryable(row.status) || settled(row.status)
+          && stages.includes(task?.status) && stages.indexOf(task.status) < stages.indexOf(row.status);
+      });
       requireValue(active.length <= 1, 'multiple_active_attempts');
       let attempt = active[0], task, previous = null;
       if (!attempt && options.retryFailed) {
@@ -334,11 +341,13 @@ export function createProjectDirector({ repo, engine, planner, evaluator, clock 
         snapshot = await guard();
       }
       task = snapshot.tasks.find(row => row.id === attempt.taskId);
-      const denied = await admission(snapshot, task, options);
+      const recovery = settled(attempt.status);
+      const denied = await admission(snapshot, task, options, false, recovery);
       await guard(snapshot.revision, attempt);
       if (denied) return denied;
       const A = await ports(), input = A.contracts.buildDirectorTaskInput({ project: snapshot.project, task }, A);
       let run = storedRun(store, attempt.runId);
+      if (recovery) requireValue(run?.state === 'succeeded', 'recovery_run_invalid');
       if (!run) {
         previous ||= await priorRetryRun(snapshot, attempt);
         const retry = await retrySettings(snapshot, previous);
@@ -360,9 +369,27 @@ export function createProjectDirector({ repo, engine, planner, evaluator, clock 
         });
       }
       requireValue(run.task === input && isDeepStrictEqual(run.directorBinding, bindingFor(attempt)), 'binding_invalid');
-      const dispatchDenied = await admission(snapshot, task, options);
+      const dispatchDenied = await admission(snapshot, task, options, false, recovery);
       await guard(snapshot.revision, attempt);
       if (dispatchDenied) return dispatchDenied;
+      if (recovery) {
+        const D = await evidenceFor(evaluator);
+        // Validate the existing terminal proof before advance can persist any
+        // observations. Attempts store refs, while criterion mappings belong to
+        // Tasks; map only those existing refs against the frozen Task criteria.
+        const mappings = task.acceptance.map(criterion => ({ criterionId: criterion.id,
+          refs: attempt.evidence.filter(ref => criterion.evidenceKinds.includes(ref.kind)).map(ref => ref.sha256),
+          actor: 'project-director', reason: 'Revalidate existing Attempt proof before recovering its Task projection' }));
+        const proof = await D.evaluateProjectAttempt({ snapshot, attempt, run, mappings }, { ...A,
+          verifyRef: ref => verifyRef(engine, ref, run),
+          validateRun: value => validateRun({ store, engine, contracts: A.contracts, snapshot, run: value, publication: attempt.status === 'released' }) });
+        requireValue(proof.blockers.length === 0 && proof.eligibleStates.includes(attempt.status), 'recovery_proof_invalid');
+        // The evaluator preserves terminal history even when publication is no
+        // longer eligible. Require its verified release chain explicitly.
+        if (attempt.status === 'released') requireValue(/^[a-f0-9]{64}$/.test(run.release?.sha256)
+          && ['delivery', 'release'].every(kind => proof.evidence.some(ref => ref.kind === kind)), 'recovery_proof_invalid');
+        await guard(snapshot.revision, attempt);
+      }
       if (!settled(attempt.status) && !['succeeded', 'blocked', 'failed', 'cancelled'].includes(run.state)) {
         // Resume preserves Engine's fixed mode/model, quota, budget and sessions.
         // Project retry reserves a NEW Run; it never resets a saved Engine cycle.

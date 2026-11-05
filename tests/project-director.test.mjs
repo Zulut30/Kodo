@@ -403,6 +403,152 @@ async function checkedRun(f, id, file) {
   run.state = 'succeeded'; f.engine.save(run); return run;
 }
 
+async function interruptProjection(f, kind, to, published = false) {
+  if (published) {
+    await writeFile(path.join(f.root, 'kodo.config.json'), JSON.stringify({ ...f.config, repository: 'owned/fixture', delivery: { enabled: true, release: true } }));
+    await git(f.root, ['add', 'kodo.config.json']); await git(f.root, ['commit', '-m', 'Owned publication control config']);
+    await git(f.root, ['remote', 'add', 'origin', f.root]);
+    // A local trusted reconciliation port, not evidence of remote publication.
+    f.engine.delivery.reconcileDelivery = async ({ run }) => run.delivery;
+  }
+  await f.ready('first');
+  f.engine.run = async id => {
+    const run = await checkedRun(f, id, 'first');
+    run.nodes.implementation.sessionId = 'owned-preserved-session';
+    if (published) {
+      run.release = { published: true, commit: run.headSha, sha256: 'a'.repeat(64) };
+      run.delivery = { mergeCommit: run.headSha, reviewedHead: run.headSha, release: run.release };
+    }
+    f.engine.save(run); return run;
+  };
+  const apply = f.repo.apply.bind(f.repo);
+  let interrupted = false;
+  f.repo.apply = async command => {
+    const result = await apply(command);
+    if (!interrupted && command.action.op === 'transition' && command.action.kind === kind && command.action.to === to) {
+      interrupted = true; throw Error('Owned crash after durable projection');
+    }
+    return result;
+  };
+  await assert.rejects(() => f.director.resume(f.id), /Owned crash after durable projection/);
+  f.repo.apply = apply;
+  return f.repo.snapshot(f.id);
+}
+
+async function reopenProjection(f, published = false) {
+  f.store.close(); f.stores.delete(f.store);
+  f.store = new Store(f.home, {}); f.stores.add(f.store);
+  f.engine = new Engine({ store: f.store, secrets: {} });
+  if (f.config.security.enabled) f.engine.gates.isCurrentSecurityReceipt = async () => true;
+  if (published) f.engine.delivery.reconcileDelivery = async ({ run }) => run.delivery;
+  f.engine.createReserved = async () => assert.fail('Projection recovery must preserve the reserved Run');
+  f.engine.run = async () => assert.fail('Projection recovery must not execute completed work');
+  f.repo = await openProjectStore({ store: f.store, contracts: A,
+    authorizeTransition: createProjectTransitionAuthorizer({ store: f.store, engine: f.engine, contracts: A, evaluator: D }) });
+  return createProjectDirector({ repo: f.repo, engine: f.engine });
+}
+
+test('Director recovery after durable Attempt acceptance completes the same Task after SQLite reopen', async t => {
+  const f = await fixture(t, { trusted: true });
+  const before = await interruptProjection(f, 'attempt', 'accepted'), attempt = before.currentAttempts[0];
+  assert.equal(attempt.status, 'accepted'); assert.equal(before.tasks[0].status, 'ready');
+  const run = f.store.getRun(attempt.runId), director = await reopenProjection(f);
+  const result = await director.resume(f.id), after = f.repo.snapshot(f.id);
+  assert.equal(after.tasks[0].status, 'accepted'); assert.deepEqual(after.currentAttempts[0], attempt);
+  assert.deepEqual(f.store.getRun(attempt.runId), run);
+  assert.equal(f.store.listRuns(f.root).length, 1);
+  assert.equal(result.status, 'blocked'); assert.ok(result.blockers.includes('epic:epic:own_proof_missing'));
+});
+
+test('Director recovery after durable Attempt release completes Task release across a second acceptance interruption', async t => {
+  const f = await fixture(t, { trusted: true });
+  const before = await interruptProjection(f, 'attempt', 'released', true), attempt = before.currentAttempts[0];
+  assert.equal(attempt.status, 'released'); assert.equal(before.tasks[0].status, 'ready');
+  const run = f.store.getRun(attempt.runId), director = await reopenProjection(f, true);
+  const release = attempt.evidence.find(ref => ref.kind === 'release'), contents = await readFile(release.path);
+  await rm(release.path);
+  await assert.rejects(() => director.resume(f.id), { code: 'project_recovery_proof_invalid' });
+  assert.deepEqual(f.repo.snapshot(f.id), before);
+  await assert.rejects(() => readFile(release.path), { code: 'ENOENT' });
+  writeOwnedEvidence(f, release.path, contents);
+  f.engine.delivery.reconcileDelivery = async () => null;
+  await assert.rejects(() => director.resume(f.id), { code: 'project_recovery_proof_invalid' });
+  assert.deepEqual(f.repo.snapshot(f.id), before);
+  f.engine.delivery.reconcileDelivery = async ({ run }) => run.delivery;
+  const apply = f.repo.apply.bind(f.repo);
+  f.repo.apply = async command => {
+    const result = await apply(command);
+    if (command.action.kind === 'task' && command.action.to === 'accepted') throw Error('Owned crash before Task release');
+    return result;
+  };
+  await assert.rejects(() => director.resume(f.id), /Owned crash before Task release/);
+  assert.equal(f.repo.snapshot(f.id).tasks[0].status, 'accepted');
+  const restarted = await reopenProjection(f, true);
+  const result = await restarted.resume(f.id), after = f.repo.snapshot(f.id);
+  assert.equal(after.tasks[0].status, 'released'); assert.deepEqual(after.currentAttempts[0], attempt);
+  assert.deepEqual(f.store.getRun(attempt.runId), run); assert.equal(f.store.listRuns(f.root).length, 1);
+  assert.equal(result.status, 'blocked'); assert.ok(result.blockers.includes('epic:epic:own_proof_missing'));
+});
+
+test('Director recovery after durable Task acceptance retains the container own proof requirement', async t => {
+  const f = await fixture(t, { trusted: true });
+  const before = await interruptProjection(f, 'task', 'accepted'), attempt = before.currentAttempts[0];
+  assert.equal(before.tasks[0].status, 'accepted'); assert.equal(before.epics[0].status, 'proposed');
+  const run = f.store.getRun(attempt.runId), director = await reopenProjection(f);
+  const result = await director.resume(f.id);
+  assert.equal(result.status, 'blocked'); assert.ok(result.blockers.includes('epic:epic:own_proof_missing'));
+  assert.deepEqual(f.repo.snapshot(f.id), before); assert.deepEqual(f.store.getRun(attempt.runId), run);
+  assert.equal(f.store.listRuns(f.root).length, 1);
+});
+
+test('Director recovery revalidates completed Run proof before projecting accepted history', async t => {
+  const f = await fixture(t, { trusted: true, security: true });
+  const before = await interruptProjection(f, 'attempt', 'accepted'), attempt = before.currentAttempts[0];
+  const run = f.store.getRun(attempt.runId), director = await reopenProjection(f);
+  const unchanged = async () => {
+    try { assert.equal((await director.resume(f.id)).status, 'blocked'); }
+    catch (error) { if (error.code?.startsWith('project_') !== true && error.code !== 'evidence_integrity') throw error; }
+    assert.deepEqual(f.repo.snapshot(f.id), before); assert.equal(f.store.listRuns(f.root).length, 1);
+  };
+  await t.test('missing bound Run', async () => {
+    const get = f.store.getRun.bind(f.store);
+    f.store.getRun = id => { if (id === run.id) throw Error(`Запуск не найден: ${id}`); return get(id); };
+    try { await unchanged(); } finally { f.store.getRun = get; }
+  });
+  for (const [label, patch] of [
+    ['binding', { directorBinding: { ...run.directorBinding, contractHash: 'b'.repeat(64) } }],
+    ['checks', { checks: { ...run.checks, fingerprint: 'b'.repeat(64) } }],
+    ['review', { review: { ...run.review, passed: false } }]
+  ]) await t.test(label, async () => {
+    f.store.updateRun(run.id, patch); await unchanged(); f.engine.save(run);
+  });
+  await t.test('enabled gate', async () => {
+    f.engine.gates.isCurrentSecurityReceipt = async () => false; await unchanged();
+    f.engine.gates.isCurrentSecurityReceipt = async () => true;
+  });
+  for (const [label, filename] of [
+    ['missing check log', run.checks.results[0].outputPath],
+    ['missing accepted observation', attempt.evidence.find(ref => ref.kind === 'acceptance').path],
+    ['immutable interface', before.tasks[0].interfaceRefs[0].path]
+  ]) await t.test(label, async () => {
+    const contents = await readFile(filename); await rm(filename); await unchanged();
+    await assert.rejects(() => readFile(filename), { code: 'ENOENT' }); writeOwnedEvidence(f, filename, contents);
+  });
+  await t.test('current config', async () => {
+    const filename = path.join(f.root, 'kodo.config.json'), contents = await readFile(filename);
+    await writeFile(filename, JSON.stringify({ ...f.config, security: { enabled: false } }));
+    await unchanged(); await writeFile(filename, contents);
+  });
+  await t.test('actual HEAD', async () => {
+    await git(run.cwd, ['checkout', '--detach', run.baseSha]); await unchanged();
+    await git(run.cwd, ['checkout', run.branch]);
+  });
+  const restored = f.store.getRun(run.id);
+  assert.deepEqual({ ...restored, updatedAt: run.updatedAt }, run, 'Only owned tamper restoration updates the Run timestamp');
+  await director.resume(f.id);
+  assert.equal(f.repo.snapshot(f.id).tasks[0].status, 'accepted'); assert.deepEqual(f.store.getRun(run.id), restored);
+});
+
 test('Trusted acceptance and owned Git restart preserve the first local task file in the second reserved base', async t => {
   const f = await fixture(t, { tasks: [task('first'), task('second', ['first'])], trusted: true });
   await f.ready('first');
