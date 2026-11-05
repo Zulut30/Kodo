@@ -58,6 +58,42 @@ JSON, Git porcelain, `-z`/NUL, протоколы и любые данные д�
 
 Scoped repair проверяет исходные setup/concurrency-five и затронутые knowledge-тесты; общий check и Windows/Linux CI остаются у координатора. Результаты на разных HEAD не доказывают ускорение полного suite; продолжительность прогона не является pure LLM latency, измерением HTTP, токенов или subscription USD. Проба не подтверждает native provider, опубликованный артефакт или deployment.
 
+## Windows: стоимость source fences и остановленные checks
+
+Corrective Run `7a424d6f-6392-483c-b1f8-6918824f0baf` продолжает работу над
+blocker06; родитель `cf04d9ae-e733-48d6-8d7e-c29220084ef0` остаётся stopped
+на `verification3/cycle1`. На baseline `3c39de0…` один неизменённый Director
+case прошёл за 107157.4236 ms внешней команды: 1238 Git и 13 PowerShell запусков.
+Instrumentation включена во время; exposure sums могут пересекаться. Две полные
+Windows-попытки достигли 20-минутного deadline; причина полного timeout не доказана.
+
+Текущий source `0ee548b…` объединяет before/after HEAD+status в porcelain v2:
+8→6 Git-процессов на успешный `inspectCurrentSource`, включая две обязательные
+свежие filter-config queries. Это scoped source/process-count результат,
+а не measured global speedup. Первоначальные «4 TOTAL» — ошибка учёта Root;
+исправленный критерий 4 CORE + 2 protective = 6 TOTAL. Обе Director source fences,
+tracked-byte/link/stat/size/CRLF guards и подавление project filters сохранены;
+удалены только два внешних дублирующих HEAD-вызова. Success cache не добавлен.
+
+Остановленный `execute` сохраняет первую типизированную причину и очищенный
+`error.result`; `Engine.checks` сохраняет failed/incomplete receipt, предыдущие
+rows и пробрасывает исходную ошибку. `runCi` использует existing profiler captures
+для очищенных 4096-byte UTF-8 tails, оставаясь blocked/incomplete. Отсутствие
+вывода/exit не становится PASS. Пределы capture/deadlines, file concurrency4,
+native capacity5, mode/model и меньшие сохранённые бюджеты не расширены.
+[Точные поля, единицы лимитов, pins и scoped evidence](WINDOWS-TEST-SPEED.md).
+
+По сообщению Root, frozen composite на clean code `0ee548b…` до docs прошёл
+23/23, 0 fail/skip/cancel, 36995.3723 ms, Node24.19/Windows; source/head не изменились.
+Это PRE-DOCS scoped component proof, не полный/current-future-HEAD reuse или общий
+PASS. Точная receipt и TAP hash — в [Windows evidence](WINDOWS-TEST-SPEED.md).
+Сопоставимый AFTER одного cost case ещё ожидается от Root после H/native boundary;
+нового замера ускорения нет. Полный check, Windows/Linux CI,
+fresh enabled security и final independent review остаются pending; UI disabled
+нейтрален. Benchmark, реальные provider/native-client проверки, новый installed
+или published artifact, merge/release/deployment этим исправлением не доказаны.
+Экономия native calls не измеряет LLM latency, HTTP, токены, квоту или USD подписки.
+
 ## Что измерено локально
 
 Квитанция `efficiency-measurements.json` от 3 ноября 2026 года: одинаковые сохранённые входы, одинаковые project/root paths для policy, фактические UTF-8 длины, `modelsCalled:0`. Это отдельные части начального контекста/вывода. Исторический inline baseline plan/review не включает новые метаданные; он не равен `contextOriginalBytes` нового runtime. Приватные источники и границы проверок перечислены в [VALIDATION](VALIDATION.md#контекст-очередь-и-rtk).
