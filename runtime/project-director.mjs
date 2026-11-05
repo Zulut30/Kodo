@@ -497,7 +497,7 @@ export function createProjectDirector({ repo, engine, planner, evaluator, clock 
     if (snapshot.project.status !== 'cancelled') await apply(snapshot, { op: 'transition', kind: 'project', id, to: 'cancelled', evidence: [], mappings: [] }, options);
     snapshot = await snapshotFor(id);
     for (const attempt of snapshot.currentAttempts.filter(row => !settled(row.status))) {
-      if (attempt.status !== 'cancelled') {
+      if (!retryable(attempt.status)) {
         await apply(snapshot, { op: 'transition', kind: 'attempt', id: attempt.id, to: 'cancelled', evidence: [], mappings: [] });
         snapshot = await snapshotFor(id);
       }
