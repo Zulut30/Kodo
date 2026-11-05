@@ -223,8 +223,15 @@ export async function runCi(options, dependencies = {}) {
         durationMs: result.durationMs, ...(result.profilePath ? { profilePath: result.profilePath } : {}),
         ...(valid && result.exitCode !== 0 ? { diagnostic: failureDiagnostic(result, secrets) } : {}) });
     } catch (error) {
-      receipts.push({ ...command, status: 'blocked', reason: ['timeout', 'cancelled', 'profiler_contract'].includes(error.code) ? error.code : 'command_error', durationMs: performance.now() - start,
-        ...(error.profilePath ? { profilePath: error.profilePath } : {}) });
+      // The profiler attaches captures to infrastructure errors too. Publish
+      // only typed metadata and the same redacted byte tails as nonzero exits;
+      // a stopped child remains blocked even if its actual exit code was zero.
+      receipts.push({ ...command, status: 'blocked', reason: ['timeout', 'cancelled', 'invalid_output', 'profiler_contract'].includes(error.code) ? error.code : 'command_error',
+        exitCode: Number.isInteger(error.exitCode) && error.exitCode >= 0 ? error.exitCode : null,
+        durationMs: Number.isFinite(error.durationMs) && error.durationMs >= 0 ? error.durationMs : performance.now() - start,
+        ...(typeof error.outputTruncated === 'boolean' ? { outputTruncated: error.outputTruncated } : {}),
+        ...(typeof error.profilePath === 'string' && error.profilePath.length <= 4096 ? { profilePath: redactDiagnosticOutput(error.profilePath, secrets) } : {}),
+        ...(typeof error.stdout === 'string' || typeof error.stderr === 'string' ? { diagnostic: failureDiagnostic(error, secrets) } : {}) });
     }
     if (options.signal?.aborted) break;
   }
