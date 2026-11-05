@@ -1,6 +1,6 @@
 # Этап 06 — Project Director
 
-2026-11-05. **IN PROGRESS, NOT ACCEPTED**. Предпосылка05 принята: [PR14](https://github.com/Zulut30/Kodo/pull/14), merge `72215c821ea8d2be32123e8212bdc3d22cd526f1`. Code/CLI и admission/pause correction интегрированы в source `3817af81796803fe3311e44e7d3e3b4a79425c4f`. Общие full checks, enabled security, final independent review и required CI06 остаются **pending**.
+2026-11-05. **IN PROGRESS, NOT ACCEPTED**. Предпосылка05 принята: [PR14](https://github.com/Zulut30/Kodo/pull/14), merge `72215c821ea8d2be32123e8212bdc3d22cd526f1`. Code/CLI и admission/pause correction ранее интегрированы в `3817af81796803fe3311e44e7d3e3b4a79425c4f`. Родительский Run `cf04d9ae-e733-48d6-8d7e-c29220084ef0` остановлен на `verification3/cycle1`, без сброса бюджета. Отдельный corrective Run `7a424d6f-6392-483c-b1f8-6918824f0baf` использует clean source `3c39de09eaca16997834c3de07f2e936072915a5`; его A/B/C/D интегрированы в `0ee548b74413fba1c917eab4a49e12f6235869be` до docs. Общие full checks, enabled security, final independent review и required CI06 остаются **pending**. Это blocker06, не этап07.
 
 ## Результат и критерии MVP
 
@@ -31,6 +31,35 @@ Private `C:/Users/zulut/AppData/Local/Temp/kodo-roadmap-20261104/phase06-receipt
 Принятые Task **не принимают автоматически контейнеры**: Epic/Milestone/Project требуют own mapped proof. В CLI нет importer/amend evidence/mappings контейнера, поэтому все Task могут быть accepted при blocked Project (`own_proof_missing` и др.). Шаблоны это ограничение сохраняют; empty refs не выдают себя за frozen interfaces. Ни Rust native behavior, ни Hearthstone patch/source/sample/statistics не проверены и не утверждаются.
 
 ## Оставшаяся приёмка и урок
+
+### Windows corrective evidence
+
+На baseline один неизменённый Director case прошёл: outer wall 107157.4236 ms,
+1238 Git и 13 PowerShell вызовов; две общие Windows-попытки достигли 20 минут.
+Это не доказательство причины full timeout. Source correction сокращает успешный
+`inspectCurrentSource` с 8 до 6 Git-процессов: 4 CORE + 2 обязательных свежих
+filter-config queries. Первоначальный предел 4 TOTAL был ошибкой Root, исправленной
+закреплённым addendum; filters/hidden-byte/link/stat/CRLF guards и обе source fences
+сохранены, удалены только два избыточных внешних HEAD-вызова Director.
+
+Stopped `execute` фиксирует первую причину и очищенный bounded `error.result`;
+Engine сохраняет failed row/evidence с `complete:false` и исходную typed error;
+`runCi` сохраняет очищенные 4096-byte tails с проверенными metadata, оставляя catch
+receipt blocked и общий результат incomplete. Lifecycle, deadlines, file concurrency 4/native capacity 5,
+subscription-only providers и меньшие saved budgets сохранены.
+
+Прямые зависимости сообщили scoped A 54+1 Director, B 32+18, C 75 PASS; группы
+не суммируются в общий результат. D oracle SHA-256
+`ad4033f1f7eb8084ec0201c083d460d69b4607e89a55e751054b3062c3a93bcc`
+заморожен: baseline RED 23/10 PASS/13 FAIL — только preparation, не feature PASS.
+Root сообщил actual frozen composite на clean code `0ee548b…` до docs:
+23/23 PASS, 0 fail/skip/cancel, 36995.3723 ms, Node24.19/Windows;
+source/head до и после неизменны. Это PRE-DOCS scoped component proof,
+не общий check/PASS или reuse для будущего HEAD после H. Performance AFTER
+остаётся PENDING и принадлежит Root после стабилизации H/native boundary.
+Полные контракты, pins,
+provenance и границы — [Windows test speed](../WINDOWS-TEST-SPEED.md).
+Пока нет измеренного глобального ускорения, benchmark или нового release proof.
 
 Координатору нужны интеграция docs/examples в clean candidate head, полный `npm run check`, fresh configured Semgrep/Gitleaks, независимый differential review и required Windows/Linux CI с installed artifact smoke на том же кандидате. UI verification disabled — neutral; selfhost architecture policy/gates оцениваются по фактическому config, disabled не PASS. Published artifact, release/tag/deployment06 и real provider/native-client check здесь не доказаны. Historical05 receipts на06 не переносятся.
 
