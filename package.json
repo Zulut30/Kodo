@@ -21,7 +21,6 @@
     "adapters",
     "runtime",
     "scripts/ci-reporter.mjs",
-    "scripts/run-tests.mjs",
     "schemas",
     "skills",
     "agents",

@@ -44,7 +44,7 @@ paths — только существующие literal-файлы внутри 
 флаги явно отклоняются с nonzero exit, а не меняют выбор тестов незаметно.
 Для более широкого CLI остаётся прямой `node --test`. Поиск существующих scripts
 не выявил npm-вызовов с дополнительными флагами; прямые Node scoped-команды
-остаются самостоятельными. Runner добавлен в точечный `package.files`.
+остаются самостоятельными. Runner нужен только checkout разработчика и не входит в установочный CLI-пакет; shipped script asset остаётся `ci-reporter.mjs`. Существующий пакетный regression test проверяет этот состав.
 
 Локальное доказательство ограничено `tests/test-schedule.test.mjs` с короткими
 фикстурами: default discovery (включая TypeScript/strip-types), exclusions/links,
