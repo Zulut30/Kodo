@@ -4,12 +4,43 @@ import { realpath } from 'node:fs/promises';
 import { loadKnowledgeContext, refreshKnowledge, checkKnowledgeEvidence } from './knowledge-refresh.mjs';
 import { evaluateClaims } from './knowledge-claims.mjs';
 import { projectKnowledge } from './knowledge-context.mjs';
-import { stateHome, workerEnvironment } from './security.mjs';
+import { stateHome, workerEnvironment, loadSecrets, redact } from './security.mjs';
 import { git } from './workspace.mjs';
 
 const fail = code => Object.assign(new Error('Knowledge operation blocked'), { code });
 const identity = value => process.platform === 'win32' ? value.toLowerCase() : value;
 const errorCode = error => /^knowledge_[a-z_]+$/.test(error?.knowledgeCode || error?.code) ? error.knowledgeCode || error.code : error?.code === 'context_budget' ? 'context_budget' : 'knowledge_blocked';
+
+// Reject rather than rewrite data bound to immutable hashes/revisions. Walk raw
+// strings (including keys) before serialization so escaped/short values also fail.
+function assertSafe(value, secrets = {}) {
+  if (typeof value === 'string') {
+    if (Object.values(secrets).some(secret => typeof secret === 'string' && secret && value.includes(secret)) || redact(value, secrets) !== value) throw fail('knowledge_secret');
+  } else if (value && typeof value === 'object') {
+    for (const [key, item] of Object.entries(value)) { assertSafe(key, secrets); assertSafe(item, secrets); }
+  }
+}
+
+async function enabledContext(options, ports) {
+  const load = ports.loadKnowledgeContext || loadKnowledgeContext;
+  if (ports.secrets !== undefined) {
+    const loaded = await load(options, ports);
+    if (loaded.context) assertSafe(loaded, ports.secrets);
+    return { loaded, ports };
+  }
+  // The existing loader reads secrets only after validating the policy and
+  // short-circuiting off, before reading/hashing enabled context metadata. Pause
+  // there to lazily load coordinator credentials, never clients/providers.
+  const needsSecrets = new Error('Coordinator secrets required');
+  try {
+    const loaded = await load(options, { ...ports, get secrets() { throw needsSecrets; } });
+    if (!loaded.context) return { loaded, ports };
+  } catch (error) { if (error !== needsSecrets) throw error; }
+  const scoped = { ...ports, secrets: await (ports.loadSecrets || loadSecrets)() };
+  const loaded = await load(options, scoped);
+  assertSafe(loaded, scoped.secrets);
+  return { loaded, ports: scoped };
+}
 
 // Native callers supply only coordinator-owned cwd choices. An owned path must
 // also belong to the original project's Git repository, never another checkout.
@@ -28,16 +59,18 @@ async function ownedSnapshot(project, snapshotCwd, ownedCwds, repository = true)
 /** Fresh fixed context -> readonly claims -> actual evidence -> evaluation -> projection. */
 export async function knowledgeSnapshot({ project, snapshotCwd = project, contextPath = null, subject, task = '', ownedCwds, now }, ports = {}) {
   if (ownedCwds) await ownedSnapshot(project, snapshotCwd, ownedCwds, false);
-  const load = ports.loadKnowledgeContext || loadKnowledgeContext;
   // C short-circuits off before Git/Store/clock. No saved snapshot is reused.
+  const load = ports.loadKnowledgeContext || loadKnowledgeContext;
   const loaded = await load({ project, snapshotCwd, contextPath }, ports);
   if (!loaded.context) return { status: 'disabled', ...loaded, evaluation: null, projection: null };
+  assertSafe(loaded, ports.secrets);
   await ownedSnapshot(project, snapshotCwd, ownedCwds);
   const home = ports.home || ports.store?.home || stateHome();
   let reader;
   try {
     const store = ports.store || (reader = await (ports.openKnowledgeReader || (await import('./store.mjs')).openKnowledgeReader)(home));
     const claims = await store.listKnowledgeClaims(loaded.context.projectKey, { ...(subject === undefined ? {} : { subject }), limit: loaded.policy.maxClaims });
+    assertSafe(claims, ports.secrets);
     const evidenceChecks = await (ports.checkKnowledgeEvidence || checkKnowledgeEvidence)({ project, snapshotCwd, evidenceRoot: path.join(await realpath(home).catch(error => { if (error.code === 'ENOENT') return path.resolve(home); throw error; }), 'knowledge-evidence'), claims }, ports);
     const evaluatedAt = now ?? ports.now?.() ?? new Date().toISOString();
     const evaluation = evaluateClaims({ claims, ...loaded, now: evaluatedAt, evidenceChecks });
@@ -70,20 +103,23 @@ export async function knowledgeCli(argv, ports = {}) {
   let report, options;
   try {
     options = argumentsFor(argv); // Must precede every Store/metadata/provider port.
+    const prepared = await enabledContext(options, ports);
+    ports = prepared.ports;
     if (options.action === 'refresh') {
-      const loaded = await (ports.loadKnowledgeContext || loadKnowledgeContext)(options, ports);
+      const loaded = prepared.loaded;
       if (!loaded.context) report = { schemaVersion: 1, status: 'disabled', requests: 0, capture: null, errors: [] };
       else {
         let store;
         try {
           store = ports.store || new (await import('./store.mjs')).Store(ports.home || stateHome(), ports.secrets || {});
           report = await refreshKnowledge(options, { ...ports, store });
+          assertSafe(report, ports.secrets);
         } finally { if (!ports.store) store?.close(); }
       }
     }
     else {
       const loaded = options.action === 'status'
-        ? await (ports.loadKnowledgeContext || loadKnowledgeContext)(options, ports)
+        ? prepared.loaded
         : await knowledgeSnapshot(options, ports);
       report = { schemaVersion: 1, status: loaded.status || (loaded.context ? 'ready' : 'disabled'), requests: 0,
         policy: loaded.policy, context: loaded.context, ...(options.action === 'inspect' ? { evaluation: loaded.evaluation, projection: loaded.projection } : {}), errors: [] };
