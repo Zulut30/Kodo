@@ -53,13 +53,22 @@ export async function verifyDefaultSkillPins(root = bundledRoot) {
     if (!rule || byId.has(component.id) || component.repository !== `https://github.com/${rule.repo}` || !/^[a-f0-9]{40}$/.test(component.revision ?? '') || !Array.isArray(component.files) || !component.files.length) throw badPin(`invalid component record: ${component.id}`);
     const prefix = `${component.id}/references/upstream/`;
     const names = new Set();
-    for (const file of component.files) {
-      if (typeof file.path !== 'string' || !file.path.startsWith(prefix) || names.has(file.path) || !/^[a-f0-9]{64}$/.test(file.sha256 ?? '') || !Number.isSafeInteger(file.bytes) || file.bytes < 1 || typeof file.upstreamPath !== 'string') throw badPin(`invalid file record: ${component.id}`);
-      names.add(file.path);
-      let data;
-      try { data = await readLocal(directory, file.path); } catch (error) { throw badPin(`cannot read ${file.path}: ${error.message}`); }
-      if (data.length !== file.bytes || digest(data) !== file.sha256) throw badPin(`hash mismatch: ${file.path}`);
-      resources.set(file.path, data.toString('utf8'));
+    for (let offset = 0; offset < component.files.length; offset += 4) {
+      const batch = component.files.slice(offset, offset + 4);
+      // Capture metadata errors too, so every started read drains before throwing.
+      const results = await Promise.allSettled(batch.map(async file => {
+        if (typeof file.path !== 'string' || !file.path.startsWith(prefix) || names.has(file.path) || !/^[a-f0-9]{64}$/.test(file.sha256 ?? '') || !Number.isSafeInteger(file.bytes) || file.bytes < 1 || typeof file.upstreamPath !== 'string') throw badPin(`invalid file record: ${component.id}`);
+        names.add(file.path);
+        try { return await readLocal(directory, file.path); } catch (error) { throw badPin(`cannot read ${file.path}: ${error.message}`); }
+      }));
+      // Lock order determines both the first error and resource Map insertion.
+      for (let index = 0; index < batch.length; index++) {
+        const result = results[index], file = batch[index];
+        if (result.status === 'rejected') throw result.reason;
+        const data = result.value;
+        if (data.length !== file.bytes || digest(data) !== file.sha256) throw badPin(`hash mismatch: ${file.path}`);
+        resources.set(file.path, data.toString('utf8'));
+      }
     }
     if (!names.has(component.entryPoint) || !names.has(component.license?.localPath) || !['MIT','CC-BY-SA-4.0'].includes(component.license?.spdx)) throw badPin(`missing entry point or license: ${component.id}`);
     byId.set(component.id, component);
