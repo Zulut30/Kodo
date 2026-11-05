@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile, readFile, rm, rename, realpath, symlink, link, open } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { execFileSync, spawnSync } from 'node:child_process';
+import childProcess, { execFileSync, spawnSync } from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
 import { inspectCurrentSource, planAffected } from '../runtime/ci-graph.mjs';
 import { runCi } from '../runtime/ci-cli.mjs';
 import { execute } from '../runtime/command.mjs';
@@ -18,6 +19,17 @@ async function fixture(t, extra = {}) {
   for (const [file, text] of Object.entries(files)) await put(project, file, text);
   const commit = () => { git(project, 'add', '-A'); git(project, 'commit', '-qm', 'fixture'); return git(project, 'rev-parse', 'HEAD'); };
   return { project, commit, baseSha: commit() };
+}
+
+function observeGit(t, observe) {
+  const spawn = childProcess.spawn;
+  t.mock.method(childProcess, 'spawn', (command, args, options) => {
+    const child = spawn(command, args, options);
+    if (/(?:^|[\\/])git(?:\.exe)?$/i.test(command)) observe(child, args);
+    return child;
+  });
+  syncBuiltinESMExports();
+  t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
 }
 
 test('Affected graph follows transitive re-exports and excludes independent tests deterministically', async t => {
@@ -260,6 +272,64 @@ for (const flag of ['--assume-unchanged', '--skip-worktree']) test(`Affected gra
   assert.equal(plan.fallback, true, 'hidden tracked edits cannot permit narrow selection');
   assert.ok(plan.reasons.includes('dirty-worktree'));
   assert.deepEqual(plan.testFiles, ['tests/other.test.mjs', 'tests/value.test.mjs']);
+});
+
+test('Current source clean inspection uses at most four core observations plus two fresh protective Git queries', async t => {
+  const fx = await fixture(t), calls = [];
+  observeGit(t, (_child, args) => calls.push(args));
+  assert.equal(await inspectCurrentSource({ project: fx.project, headSha: fx.baseSha }), 'clean');
+  const queries = calls.map((args, index) => args.includes('config') ? index : -1).filter(index => index !== -1);
+  const statuses = calls.map((args, index) => args.includes('status') ? index : -1).filter(index => index !== -1);
+  assert.ok(calls.length <= 6, `Expected at most six total native Git calls, observed ${calls.length}: ${JSON.stringify(calls)}`);
+  assert.ok(calls.length - queries.length <= 4, 'At most four core observations');
+  assert.equal(queries.length, 2, 'Each status retains its own fresh protective configuration query');
+  assert.equal(statuses.length, 2, 'Both status/HEAD fences are retained');
+  assert.deepEqual(queries, statuses.map(index => index - 1), 'Configuration discovery immediately precedes each status');
+});
+
+test('Current source requires one exact status HEAD before and after tracked-byte inspection', async t => {
+  const fx = await fixture(t), input = { project: fx.project, headSha: fx.baseSha };
+  for (const fence of [1, 2]) for (const [name, output, expected] of [
+    ['missing', '# branch.head fixture\0', 'unknown'],
+    ['duplicate', `# branch.oid ${fx.baseSha}\0# branch.oid ${fx.baseSha}\0`, 'unknown'],
+    ['duplicate malformed', `# branch.oid ${fx.baseSha}\0# branch.oid\0`, 'unknown'],
+    ['ambiguous', `# branch.oid ${fx.baseSha}\0# branch.oid ${'a'.repeat(40)}\0`, 'unknown'],
+    ['unborn', '# branch.oid (initial)\0', 'unknown'],
+    ['malformed', `# branch.oid ${fx.baseSha}extra\0`, 'unknown'],
+    ['unterminated', `# branch.oid ${fx.baseSha}`, 'unknown'],
+    ['wrong HEAD', `# branch.oid ${'a'.repeat(40)}\0`, 'dirty'],
+    ['dirty', `# branch.oid ${fx.baseSha}\0? untracked.txt\0`, 'dirty'],
+    ['optional headers', `# branch.oid ${fx.baseSha}\0# branch.head fixture\0# branch.upstream origin/fixture\0# branch.ab +0 -0\0# future.header optional\0`, 'clean']
+  ]) await t.test(`${name} at fence ${fence}`, async t => {
+    let statuses = 0;
+    observeGit(t, (child, args) => {
+      if (!args.includes('status') || ++statuses !== fence) return;
+      // Keep the actual Git process and substitute only its completed wire
+      // response. No production injection port or implementation parser oracle.
+      const emit = child.stdout.emit;
+      child.stdout.emit = function (event, ...values) {
+        if (event === 'data') return true;
+        if (event === 'end') emit.call(this, 'data', output);
+        return emit.call(this, event, ...values);
+      };
+    });
+    assert.equal(await inspectCurrentSource(input), expected);
+    assert.equal(statuses, fence === 1 && expected !== 'clean' ? 1 : 2);
+  });
+});
+
+test('Current source detects real HEAD and untracked changes between its two status fences', async t => {
+  for (const change of ['HEAD', 'untracked']) await t.test(change, async t => {
+    const fx = await fixture(t);
+    observeGit(t, (child, args) => {
+      if (!args.includes('ls-tree')) return;
+      child.once('close', () => {
+        if (change === 'HEAD') git(fx.project, 'commit', '--allow-empty', '-qm', 'move HEAD during inspection');
+        else execFileSync(process.execPath, ['-e', "require('node:fs').writeFileSync('untracked.txt', 'changed')"], { cwd: fx.project, windowsHide: true });
+      });
+    });
+    assert.equal(await inspectCurrentSource({ project: fx.project, headSha: fx.baseSha }), 'dirty');
+  });
 });
 
 test('Current source checks clean bytes CRLF checkout and binary bytes without project filters', async t => {

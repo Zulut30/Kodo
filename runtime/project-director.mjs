@@ -74,8 +74,7 @@ async function validateRun({ store, engine, contracts, snapshot, run, publicatio
     if (run.fixedModel) requireValue(current.models[run.fixedModel.client]?.includes(run.fixedModel.model), 'model_unavailable');
   }
   requireValue(!run.cancelRequested && !['cancelled', 'blocked', 'failed', 'waiting_limits'].includes(run.state), 'run_blocked');
-  requireValue(await git(run.cwd, ['rev-parse', 'HEAD']) === run.headSha
-    && await inspectCurrentSource({ project: run.cwd, headSha: run.headSha }) === 'clean', 'head_changed');
+  requireValue(await inspectCurrentSource({ project: run.cwd, headSha: run.headSha }) === 'clean', 'head_changed');
   validateCommandTimeouts(run.config.commands);
   const expected = ['test', 'build'].flatMap(kind => run.config.commands[kind].map(command => ({ kind, command })));
   const fingerprint = hash({ headSha: run.headSha, expected, runtime: { node: process.version, abi: process.versions.modules, platform: process.platform, arch: process.arch } });
@@ -112,8 +111,7 @@ async function validateRun({ store, engine, contracts, snapshot, run, publicatio
     requireValue(run.release?.published === true && run.release.commit === reconciled.mergeCommit
       && run.delivery.release && isDeepStrictEqual(run.delivery.release, run.release), 'publication_unverified');
   }
-  requireValue(await git(run.cwd, ['rev-parse', 'HEAD']) === run.headSha
-    && await inspectCurrentSource({ project: run.cwd, headSha: run.headSha }) === 'clean', 'head_changed');
+  requireValue(await inspectCurrentSource({ project: run.cwd, headSha: run.headSha }) === 'clean', 'head_changed');
 }
 
 // Installed only by explicit Project composition. Store remains the CAS owner;
