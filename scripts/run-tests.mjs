@@ -3,6 +3,7 @@ import { tap } from 'node:test/reporters';
 import { pipeline } from 'node:stream/promises';
 import { pathToFileURL } from 'node:url';
 import path from 'node:path';
+import { availableParallelism, freemem } from 'node:os';
 import { readdirSync, lstatSync } from 'node:fs';
 
 // Node 24 internal/test_runner/utils kDefaultPattern. Keep the built-in glob
@@ -86,11 +87,16 @@ export function explicitTests(cwd, names) {
 }
 
 function concurrencyValue(value) {
-  if (!/^[1-4]$/.test(String(value))) throw new Error('Test concurrency must be an integer from 1 to 4');
+  if (!/^[1-8]$/.test(String(value))) throw new Error('Test concurrency must be an integer from 1 to 8');
   return Number(value);
 }
 
-export async function runTests({ cwd = process.cwd(), paths = [], concurrency = 4, testNamePatterns, signal } = {}) {
+export function chooseTestConcurrency(parallelism, freeMemoryBytes) {
+  return Number.isFinite(parallelism) && parallelism >= 16
+    && Number.isFinite(freeMemoryBytes) && freeMemoryBytes >= 4 * 1024 ** 3 ? 8 : 4;
+}
+
+export async function runTests({ cwd = process.cwd(), paths = [], concurrency = chooseTestConcurrency(availableParallelism(), freemem()), testNamePatterns, signal } = {}) {
   // Never accept Node's recursive-run warning as a successful empty suite.
   if (process.env.NODE_TEST_CONTEXT !== undefined) throw new Error('Unsupported recursive test runner invocation');
   const files = paths.length ? explicitTests(cwd, paths) : discoverTests(cwd);

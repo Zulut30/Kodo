@@ -169,11 +169,11 @@ test('Scheduler deduplicates priorities and preserves deterministic lexical fall
   assert.deepEqual(orderTests([...files].reverse().map(file => path.resolve(root, file)), root), expected);
 });
 
-test('Scheduler defaults to four concurrent isolated workers and executes each file once', { timeout: 15000 }, async t => {
+test('Scheduler explicit four concurrent isolated workers executes each file once', { timeout: 15000 }, async t => {
   const { temp, put } = await fixture(t);
   const log = path.join(temp, 'events'), release = path.join(temp, 'release');
   for (let id = 0; id < 7; id++) await put(`${id}.test.cjs`, `const {appendFileSync,existsSync}=require('node:fs'); const {setTimeout:delay}=require('node:timers/promises'); const test=require('node:test'); const log=${JSON.stringify(log)}; appendFileSync(log, JSON.stringify({event:'start',id:${id},pid:process.pid})+'\\n'); test('barrier',{timeout:5000},async()=>{ while(!existsSync(${JSON.stringify(release)})) await delay(10); appendFileSync(log,JSON.stringify({event:'end',id:${id}})+'\\n'); });`);
-  const execution = child(t, temp, entryArgs);
+  const execution = child(t, temp, [...entryArgs, '--test-concurrency=4']);
   try {
     await waitFor(async () => (await lines(log)).length >= 4);
     await delay(100);
@@ -222,7 +222,7 @@ test('Scheduler rejects unsupported flags unsafe paths and empty explicit select
   const { temp, put } = await fixture(t); await put('good.test.cjs');
   await put('node_modules/forbidden.cjs', "throw Error('must not execute');");
   await put('.git/forbidden.cjs', "throw Error('must not execute');");
-  for (const args of [['--watch'], ['--test-force-exit'], ['--test-concurrency=5'], ['--test-concurrency=0'], ['--test-name-pattern'], ['absent.cjs'], ['../escape.cjs'], ['*.test.cjs'], ['node_modules/forbidden.cjs'], ['.git/forbidden.cjs'], ['.']]) {
+  for (const args of [['--watch'], ['--test-force-exit'], ['--test-concurrency=9'], ['--test-concurrency=0'], ['--test-name-pattern'], ['absent.cjs'], ['../escape.cjs'], ['*.test.cjs'], ['node_modules/forbidden.cjs'], ['.git/forbidden.cjs'], ['.']]) {
     const result = await child(t, temp, [runner, ...args]).done;
     assert.notEqual(result.code, 0, JSON.stringify(args));
     assert.match(result.stderr, /unsupported|concurrency|value|not found|outside|literal/i);
@@ -240,4 +240,110 @@ test('Scheduler abort drains its owned children and reports cancellation as nonz
   assert.match(result.stdout + result.stderr, /abort|cancel/i);
   const pid = Number(await readFile(ready, 'utf8'));
   assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' }, 'owned child must be gone after runner closes');
+});
+
+// Independent policy examples: neither expected values nor resource thresholds
+// are read from the implementation or from this machine's current resources.
+for (const [label, cpu, memory, expected] of [
+  ['low CPU with ample memory', 8, 16 * 1024 ** 3, 4],
+  ['high CPU with low memory', 32, 2 * 1024 ** 3, 4],
+  ['exact CPU and memory boundaries', 16, 4 * 1024 ** 3, 8],
+  ['CPU immediately below boundary', 15, 4 * 1024 ** 3, 4],
+  ['memory one byte below boundary', 16, 4 * 1024 ** 3 - 1, 4],
+  ['resources above boundaries', 32, 8 * 1024 ** 3, 8],
+  ...[undefined, null, NaN, Infinity, -Infinity, 0, -1, '32', {}]
+    .flatMap((value, index) => [
+      [`invalid CPU ${index}`, value, 8 * 1024 ** 3, 4],
+      [`invalid memory ${index}`, 32, value, 4],
+    ]),
+]) test(`Scheduler resource selector: ${label}`, async () => {
+  const { chooseTestConcurrency } = await import(scheduleUrl);
+  assert.equal(typeof chooseTestConcurrency, 'function');
+  assert.equal(chooseTestConcurrency(cpu, memory), expected);
+});
+
+async function concurrencyBarrier(t, { expected, resources, explicit }) {
+  const { temp, put } = await fixture(t);
+  const log = path.join(temp, 'events'), release = path.join(temp, 'release');
+  const count = 11;
+  for (let id = 0; id < count; id++) await put(`${id}.test.cjs`, `
+    const {appendFileSync,existsSync}=require('node:fs');
+    const {setTimeout:delay}=require('node:timers/promises');
+    const test=require('node:test');
+    const log=${JSON.stringify(log)};
+    appendFileSync(log,JSON.stringify({event:'start',id:${id},pid:process.pid})+${JSON.stringify('\n')});
+    test('resource barrier',{timeout:5000},async()=>{
+      while(!existsSync(${JSON.stringify(release)})) await delay(10);
+      appendFileSync(log,JSON.stringify({event:'end',id:${id}})+${JSON.stringify('\n')});
+    });
+  `);
+  let args = [...entryArgs];
+  if (resources) {
+    // Only OS readings are controlled. Discovery, filesystem, process isolation,
+    // the package entry point and the official Node scheduler remain real.
+    await put('resources.mjs', `import os from 'node:os'; import {syncBuiltinESMExports} from 'node:module';
+      os.availableParallelism=()=>${resources[0]}; os.freemem=()=>${resources[1]}; syncBuiltinESMExports();`);
+    args = ['--import', pathToFileURL(path.join(temp, 'resources.mjs')).href, ...args];
+  }
+  if (explicit !== undefined) args.push(`--test-concurrency=${explicit}`);
+  const execution = child(t, temp, args);
+  try {
+    await waitFor(async () => (await lines(log)).length >= expected || execution.proc.exitCode !== null);
+    await delay(100);
+    const waiting = (await lines(log)).map(line => JSON.parse(line));
+    assert.equal(waiting.length, expected, 'next file must wait until a slot is released');
+    assert.ok(waiting.every(event => event.event === 'start'));
+    assert.equal(new Set(waiting.map(event => event.pid)).size, expected, 'barrier requires distinct child PIDs');
+  } finally {
+    await writeFile(release, 'go');
+  }
+  const result = await execution.done;
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  assert.match(result.stdout, /# tests 11\b/);
+  const events = (await lines(log)).map(line => JSON.parse(line));
+  const starts = events.filter(event => event.event === 'start');
+  const ends = events.filter(event => event.event === 'end');
+  assert.deepEqual(starts.map(event => event.id).sort((a, b) => a - b), Array.from({ length: count }, (_, id) => id));
+  assert.deepEqual(ends.map(event => event.id).sort((a, b) => a - b), Array.from({ length: count }, (_, id) => id));
+  assert.equal(new Set(starts.map(event => event.pid)).size, count);
+  assert.ok(starts.every(event => event.pid !== execution.proc.pid));
+  let active = 0, peak = 0;
+  for (const event of events) {
+    active += event.event === 'start' ? 1 : -1;
+    assert.ok(active >= 0 && active <= expected, 'active file count remains bounded');
+    peak = Math.max(peak, active);
+  }
+  assert.equal(peak, expected);
+  assert.equal(active, 0, 'all started files drained');
+  for (const { pid } of starts) assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' });
+}
+
+test('Scheduler explicit eight runs eight distinct child PIDs once and drains more than eight files', { timeout: 15000 }, async t => {
+  await concurrencyBarrier(t, { expected: 8, explicit: 8 });
+});
+
+for (const [label, resources, expected, explicit] of [
+  ['low CPU defaults to four', [8, 8 * 1024 ** 3], 4],
+  ['low memory defaults to four', [32, 2 * 1024 ** 3], 4],
+  ['exact resource boundaries default to eight', [16, 4 * 1024 ** 3], 8],
+  ['explicit one overrides high resources', [32, 8 * 1024 ** 3], 1, 1],
+  ['explicit eight overrides low resources', [8, 2 * 1024 ** 3], 8, 8],
+]) test(`Scheduler default wiring: ${label}`, { timeout: 15000 }, async t => {
+  await concurrencyBarrier(t, { resources, expected, explicit });
+});
+
+test('Scheduler accepts every explicit integer one through eight and rejects malformed concurrency', { timeout: 15000 }, async t => {
+  const { temp, put } = await fixture(t);
+  await put('one.test.cjs');
+  for (let value = 1; value <= 8; value++) {
+    const result = await child(t, temp, [...entryArgs, '--test-concurrency', String(value)]).done;
+    assert.equal(result.code, 0, result.stdout + result.stderr);
+    assert.match(result.stdout, /# tests 1\b/);
+  }
+  for (const value of ['0', '9', '1.5', 'Infinity', 'NaN', 'unknown', '-1', '08', '']) {
+    const result = await child(t, temp, [...entryArgs, `--test-concurrency=${value}`]).done;
+    assert.notEqual(result.code, 0, value);
+    assert.match(result.stderr, /concurrency/i);
+    assert.doesNotMatch(result.stdout, /fixture passes/);
+  }
 });
