@@ -1,5 +1,67 @@
 # Тесты и диагностика затрат на Windows
 
+## Планирование полной suite: scoped коррекция06, 5 ноября
+
+`npm test` теперь вызывает `scripts/run-tests.mjs`: официальный Node24
+[`node:test.run`](https://nodejs.org/docs/latest-v24.x/api/test.html#runoptions)
+с `files`, `concurrency: 4`, `isolation: 'process'` и встроенным TAP reporter.
+Прямой `node --test` сортирует explicit files, поэтому перестановка аргументов
+CLI сама по себе не меняет стартовый порядок. Programmatic API сохраняет
+переданный порядок; это проверено короткими реальными child-процессами.
+
+Обнаружение в `scripts/run-tests.mjs` повторяет default pattern из встроенного
+Node `v24.19.0`: `**/{test,test/**/*,test-*,*[._-]test}.{js,mjs,cjs,ts,mts,cts}`.
+При отключённом strip-types остаются `js,mjs,cjs`. Рекурсивный обход не следует
+ссылкам, не выходит из checkout, исключает `node_modules`, `.git` и скрытые
+каталоги, как default glob. Новые подходящие файлы включаются автоматически;
+это не allowlist только для `tests/*.test.mjs`. Сам runner не соответствует
+шаблону и не находится под `test/`.
+
+Эвристический приоритет: `project-director`, `project-director-oracle`,
+`ci-graph`, `ci-cache`, `architecture-gate-integration`, `mode-engine`,
+`mode-engine-2`, `mode-engine-3`, `mode-engine-4`,
+`ci-cli`, `delivery`, затем четыре `engine`-файла
+из `tests/` (полные имена перечислены в модуле). Остальные пути идут лексически;
+дубликаты удаляются. Это прозрачный порядок, без выдуманных весов времени.
+Time limits, assertions, frozen oracles, process isolation и общий потолок4
+сохранены. Cancellation использует AbortSignal штатного runner; CLI SIGINT/SIGTERM
+запрашивают abort и дренирование. Принудительное OS-завершение процесса не даёт
+выполнить JS cleanup; Windows tree termination остаётся границей координатора.
+
+Поддерживаемый CLI:
+
+```powershell
+npm test
+npm test -- tests/test-schedule.test.mjs
+npm test -- --test-name-pattern='Scheduler starts' tests/test-schedule.test.mjs
+npm test -- --test-concurrency=1 tests/test-schedule.test.mjs
+```
+
+Оба флага принимают `=value` или отдельное значение; повторные name patterns
+передаются Node как массив. Concurrency разрешена от1 до4, default4. Explicit
+paths — только существующие literal-файлы внутри checkout, без ссылок,
+`node_modules`/`.git`; повторения запускаются один раз. Globs, каталоги и остальные
+флаги явно отклоняются с nonzero exit, а не меняют выбор тестов незаметно.
+Для более широкого CLI остаётся прямой `node --test`. Поиск существующих scripts
+не выявил npm-вызовов с дополнительными флагами; прямые Node scoped-команды
+остаются самостоятельными. Runner добавлен в точечный `package.files`.
+
+Локальное доказательство ограничено `tests/test-schedule.test.mjs` с короткими
+фикстурами: default discovery (включая TypeScript/strip-types), exclusions/links,
+детерминированный duplicate-free порядок, фактический старт при concurrency1,
+readiness barrier с четырьмя отдельными PID, exit0 и реальные assertion/import/
+cancel failures, abort owned child, explicit paths/name patterns и явный отказ
+для неподдерживаемого CLI. RED сначала показал старый лексический старт.
+Сырые RED/GREEN и receipts находятся вне Git в
+`C:/Users/zulut/AppData/Local/Kodo/runs/ad175403-61c1-49d2-9fd2-f1f8f04656f5/scheduler-evidence`.
+
+Полный `npm run check`, Windows/Linux CI, независимое review и приёмку выполняет
+координатор на интегрированном head. Полный AFTER, ускорение и общий PASS здесь
+не заявлены. UI disabled — neutral; security gates остаются координатору.
+Native provider, installed/published artifact и deployment не проверялись.
+Урок: наблюдать порядок child-start, а не считать порядок CLI-аргументов
+доказательством планирования; локальный barrier не заменяет полный speed test.
+
 ## Коррекция Phase06: текущая граница
 
 Снимок 2026-11-05: corrective Run `7a424d6f-6392-483c-b1f8-6918824f0baf`,
@@ -153,9 +215,9 @@ node --test --test-concurrency=4 tests/engine.test.mjs tests/engine-2.test.mjs t
 ```
 
 Это все четыре части исходного файла, без фильтрации по именам тестов.
-Обычный `npm test` продолжает использовать `node --test` и автоматически обнаруживает
-новые `*.test.mjs`. Число 4 ограничивает только приведённый scoped-прогон;
-изменение общей concurrency CI принадлежит координатору и требует полного gate.
+В историческом прогоне `npm test` использовал `node --test` и автоматически
+обнаруживал новые `*.test.mjs`. Текущий runner и потолок4 описаны в начале
+документа; изменение общей concurrency CI требует полного gate координатора.
 
 ## Проверка сохранности и измерения
 
