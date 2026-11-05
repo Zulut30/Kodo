@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 1,
+  "id": "hearthstone-analytics-example",
+  "root": "C:/Kodo-Owned-Examples/hearthstone-analytics",
+  "title": "Synthetic orchestration template: Hearthstone analytics",
+  "definitionOfDone": [
+    { "id": "project-proof", "text": "Verify provenance, format separation and unknown-data behavior across all accepted deliverables with independent project evidence; no real game statistics are supplied.", "evidenceKinds": ["acceptance", "checks", "review"] }
+  ],
+  "constraints": [
+    "Replace root with an existing owned absolute Git root with an initial commit. This is an orchestration template, not an implemented analytics service.",
+    "Game modes Standard, Wild and Battlegrounds are separate populations. Patch/version, observation window, region, ranks/MMR, sample size and source coverage are unknown; do not infer or merge them.",
+    "Use synthetic offline fixtures only. Source endpoints, licenses, access rights and collection method are unknown until verified; no live scraping, authenticated calls or real player data in this example.",
+    "Execution mode is separate from game format: configure kodo.config.json explicitly. Suggested offline planning: executionMode quick, maxTasks 1, researchBudget 0, repairRounds 1, concurrency 1; Project CLI has no --mode or --model flags.",
+    "Future GPT/Claude work uses signed-in subscription clients only, preserving fixed models and lower saved budgets. No credentials, API fallback, invented win rates, meta rankings or statistically unsupported recommendations.",
+    "Empty interfaceRefs and architectureRefs mean no frozen evidence has been supplied. Resolve and verify needed interfaces before future execution. Accepted tasks do not replace container-specific proof."
+  ],
+  "businessContext": "Illustrative backlog for source-aware Hearthstone reporting. A missing patch, denominator or comparable population must remain unknown. Synthetic fixture values never describe the current game or a real deck.",
+  "architectureRefs": [],
+  "milestones": [
+    { "id": "offline-analysis", "title": "Synthetic offline analysis milestone", "acceptance": [{ "id": "milestone-proof", "text": "Verify provenance and unknowns end to end without claiming real game findings.", "evidenceKinds": ["acceptance", "checks", "review"] }], "releaseRequired": false }
+  ],
+  "epics": [
+    { "id": "source-aware-report", "milestoneId": "offline-analysis", "title": "Source-aware reporting", "acceptance": [{ "id": "epic-proof", "text": "Independent proof covers format isolation, denominators and unknown patch/source rejection.", "evidenceKinds": ["acceptance", "checks", "review"] }] }
+  ],
+  "tasks": [
+    {
+      "id": "data-contract", "epicId": "source-aware-report", "title": "Define provenance and population contract",
+      "description": "Specify required patch/version, format (Standard/Wild/Battlegrounds), source locator/hash, capture time, sample/window and population fields. Mark all real source details unknown. Define missing/incompatible metadata behavior and label every fixture synthetic.",
+      "owner": "developer", "dependsOn": [], "writePaths": ["docs/data-contract.md", "fixtures"],
+      "acceptance": [{ "id": "contract-proof", "text": "Contract distinguishes game formats and missing metadata; fixtures contain no actual player data or unsupported current-game claims.", "evidenceKinds": ["acceptance", "checks", "review"] }],
+      "interfaceRefs": [], "priority": 90, "userValue": 5, "risk": 1, "estimatedEffort": 1, "riskApprovalRequired": false
+    },
+    {
+      "id": "offline-aggregation", "epicId": "source-aware-report", "title": "Implement bounded synthetic aggregation",
+      "description": "After data-contract acceptance and verified immutable interface evidence, implement offline aggregation in the existing project stack. Reject mixed formats/patches and missing denominators; keep unknown distinct from zero. Do not add a framework or fetch live sources.",
+      "owner": "developer", "dependsOn": ["data-contract"], "writePaths": ["src", "tests"],
+      "acceptance": [{ "id": "aggregation-proof", "text": "Public behavior handles missing samples, conflicting versions and mixed formats using synthetic fixtures; no fabricated statistics.", "evidenceKinds": ["acceptance", "checks", "review"] }],
+      "interfaceRefs": [], "priority": 80, "userValue": 5, "risk": 2, "estimatedEffort": 2, "riskApprovalRequired": false
+    },
+    {
+      "id": "report-unknowns", "epicId": "source-aware-report", "title": "Document a source-bound synthetic report",
+      "description": "Describe results and limitations from verified synthetic outputs, separating Standard/Wild/Battlegrounds. Expose unknown patch, source, population/window and sample size without current meta or win-rate claims. Require independent evidence for the report and parent containers.",
+      "owner": "documenter", "dependsOn": ["offline-aggregation"], "writePaths": ["docs/report.md"],
+      "acceptance": [{ "id": "report-proof", "text": "Report clearly labels synthetic input, unknowns and evidence limits; no invented game recommendations, release or deployment.", "evidenceKinds": ["acceptance", "checks", "review"] }],
+      "interfaceRefs": [], "priority": 60, "userValue": 4, "risk": 1, "estimatedEffort": 1, "riskApprovalRequired": false
+    }
+  ]
+}

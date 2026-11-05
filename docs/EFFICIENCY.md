@@ -16,6 +16,10 @@ Kodo сокращает повторяемый начальный контекс
 
 Политика навыков сохраняет заголовок `Kodo default skill policy v1, stage STAGE`, все 13 решений с причиной и provenance, полные применимые адаптеры Kodo и абсолютные ссылки в read-only пакет. Длинные upstream-материалы читаются по необходимости. Проверка всех pinned resources выполняется заново при загрузке политики; React/monorepo-условия и полномочия координатора остаются прежними. [Политика навыков](DEFAULT-SKILLS.md).
 
+В corrective Run `78ee609e-416c-4194-b234-9de84b0ae694` проверка `verifyDefaultSkillPins` читает независимые ресурсы пакетами до четырёх внутри компонента. Все 183 ресурса и 13 компонентов проверяются заново при каждом успешном вызове; `readLocal`, guards путей/ссылок/обычных файлов, bytes/SHA-256, provenance и лицензии сохранены. Кэша нет. Начатые чтения завершаются до выдачи ошибки; первая ошибка и порядок Map определяются порядком lock, а не завершения I/O. Урок: ошибки метаданных также должны дожидаться уже начатых чтений. Scoped-регрессии проверяют перекрытие, предел 4, повторные чтения, порядок и drain.
+
+Исходный диагностический замер координатора на Windows/Node 24.19: 584.3284 / 510.4873 / 501.6942 ms за вызов для всех 183 ресурсов. Это наблюдение hot path, не доказательство единственной причины timeout или ускорения всего запуска. Сопоставимый AFTER, полный `npm run check`, Windows/Linux CI, свежие enabled security gates и независимое review остаются у координатора. UI disabled нейтрален; provider/native-client, опубликованный артефакт и deployment этим scoped изменением не подтверждены.
+
 Engine сначала фиксирует один отредактированный по известным секретам снимок полных данных вне Git, затем строит сводку именно этого снимка:
 
 | Передаваемая часть | Предел и сохраняемые сведения |
@@ -48,15 +52,55 @@ JSON, Git porcelain, `-z`/NUL, протоколы и любые данные д�
 
 ## Потолок параллельных тестовых файлов
 
-`npm test` использует существующий флаг Node.js 24 `--test-concurrency=4`. Условная tooling-проба этапа 05 с потолком 8 консервативно отменена после неуспешного полного прогона интегрированного дерева. Это потолок параллельного выполнения тестовых файлов, а не наблюдённый пик процессов и не гарантия ускорения. `npm run check` по-прежнему выполняет `validate`, затем `npm test`. L1 запускает `node --test` напрямую и не наследует этот npm-script.
+`npm test` вызывает `scripts/run-tests.mjs` и официальный Node24 `test.run` с process isolation. Default всегда4; явный `--test-concurrency=1..8` остаётся opt-in, hard max8. Это бюджет тестовых файлов, отдельный от native workers. `npm run check` по-прежнему выполняет `validate`, затем `npm test`. L1 запускает `node --test` напрямую и не наследует этот npm-script.
 
-Изменение ограничено командой `scripts.test`: зависимости, lockfile, CI workflow, тела тестов, assertions, skips, timeouts и gates сохраняются. Ёмкость native workers 5, ограничения подписок, режимы, фиксированная модель и меньшие бюджеты от этой настройки не меняются.
+Automatic8 отозван после полного локального check source `e69797cc…`: 20-минутный timeout и Director37 PASS/1 CANCELLED (`testTimeoutFailure`, исходный pause deadline60s). Подвыборка тех же30 cases на `6dfedcad…` дала при4 180896ms, при8 113540ms, оба30/30 PASS, но не доказала безопасность default. Восстановлен исходный default4 barrier; удалены только новые obsolete selector tests. Regression с mock high resources и настоящими PID дала RED `8 !== 4` → GREEN; explicit8 PID barrier/диапазон1–8 сохранены. Discovery/порядок, старые assertions/timeouts, frozen oracles, общий deadline, native capacity5, saved mode/model/budgets и gates прежние.
+
+Dev CLI добавляет core Git в PATH runner/children только после same-install native canonical file checks и bounded совпадающих `--version`/`--exec-path` probes. Custom/ранний symlink/неизвестный launcher, ошибки и mismatch дают неизменённый fallback. Global PATH/auth/config и runtime gitBoundary прежние; helper не поставляется в пакете. Один неизменённый pause case: 255 Git заняли25.722s из31.351s; тот же core —255 Git17.050s из23.071s, обаPASS. Это startup hot path observation, не whole-suite/model benchmark; полный текущий check и fresh gates/review/CI выполняет Root. [Контракт и scoped evidence](WINDOWS-TEST-SPEED.md).
+
+Ниже — исторический контекст пробы этапа05, а не текущий результат ресурсной коррекции06. Та проба с безусловным потолком8 была отменена после неуспешного полного прогона; причинность потолка не установлена.
 
 В полном локальном прогоне координатора с потолком 8: 1401 тест, 1393 PASS, 2 FAIL, 6 SKIP, 821334.9533 ms. Неизменённый five-slot scheduler получил первые старты b,a,c,d,e вместо a,b,c,d,e; setup обнаружил отсутствие original project в legacy run при optional KB. Связь порядка стартов с ресурсами или потолком 8 не установлена. Откат не меняет тела тестов, assertions, timeouts, skips или ёмкость native workers 5 и не сериализует независимые workers. Ранее при потолке 4 один Git-вызов достиг старого timeout 10 секунд, а повтор прошёл; причина также не установлена.
 
 Повторный Windows CI run `41955171373`, job `127008243323`, получил тот же order assertion в `concurrency-five:103` уже при потолке 4: a,c,b вместо a,b,c. В fixture пропущен новый optional `nativeKnowledge`: его filesystem I/O выполнялся перед provider-ready, тогда как policy/tool/environment I/O уже нейтрализованы. Scoped correction от `b2622150f1bfad01f77be8eb54f94660d362505d` добавляет только fixture-owned `{text:'',references:[],metrics:{}}` и комментарий. Private preload задерживает первый prototype-вызов до завершения второго и следующего event-loop turn без sleeps: прежний target RED 0/1 → тот же target GREEN 1/1; весь файл без preload GREEN 15/15, exit0. Все test-call blocks/assertions/timeouts/skips byte-identical после LF; actual scheduler/session admission/SQLite leases и active5 остаются под проверкой, реальные KB integration tests не менялись. Потолок 4 и native workers 5 сохранены. Source snapshots/argv/raw outputs/exits/hashes: `C:/Users/zulut/AppData/Local/Temp/kodo-roadmap-20261104/phase05-receipts/concurrency-fixture-isolation`. Это доказательство границы fixture, не причинности потолка или ускорения.
 
 Scoped repair проверяет исходные setup/concurrency-five и затронутые knowledge-тесты; общий check и Windows/Linux CI остаются у координатора. Результаты на разных HEAD не доказывают ускорение полного suite; продолжительность прогона не является pure LLM latency, измерением HTTP, токенов или subscription USD. Проба не подтверждает native provider, опубликованный артефакт или deployment.
+
+## Windows: стоимость source fences и остановленные checks
+
+Corrective Run `7a424d6f-6392-483c-b1f8-6918824f0baf` продолжает работу над
+blocker06; родитель `cf04d9ae-e733-48d6-8d7e-c29220084ef0` остаётся stopped
+на `verification3/cycle1`. На baseline `3c39de0…` один неизменённый Director
+case прошёл за 107157.4236 ms внешней команды: 1238 Git и 13 PowerShell запусков.
+Instrumentation включена во время; exposure sums могут пересекаться. Две полные
+Windows-попытки достигли 20-минутного deadline; причина полного timeout не доказана.
+
+Текущий source `0ee548b…` объединяет before/after HEAD+status в porcelain v2:
+8→6 Git-процессов на успешный `inspectCurrentSource`, включая две обязательные
+свежие filter-config queries. Это scoped source/process-count результат,
+а не measured global speedup. Первоначальные «4 TOTAL» — ошибка учёта Root;
+исправленный критерий 4 CORE + 2 protective = 6 TOTAL. Обе Director source fences,
+tracked-byte/link/stat/size/CRLF guards и подавление project filters сохранены;
+удалены только два внешних дублирующих HEAD-вызова. Success cache не добавлен.
+
+Остановленный `execute` сохраняет первую типизированную причину и очищенный
+`error.result`; `Engine.checks` сохраняет failed/incomplete receipt, предыдущие
+rows и пробрасывает исходную ошибку. `runCi` использует existing profiler captures
+для очищенных 4096-byte UTF-8 tails, оставаясь blocked/incomplete. Отсутствие
+вывода/exit не становится PASS. Пределы capture/deadlines, file concurrency4,
+native capacity5, mode/model и меньшие сохранённые бюджеты не расширены.
+[Точные поля, единицы лимитов, pins и scoped evidence](WINDOWS-TEST-SPEED.md).
+
+По сообщению Root, frozen composite на clean code `0ee548b…` до docs прошёл
+23/23, 0 fail/skip/cancel, 36995.3723 ms, Node24.19/Windows; source/head не изменились.
+Это PRE-DOCS scoped component proof, не полный/current-future-HEAD reuse или общий
+PASS. Точная receipt и TAP hash — в [Windows evidence](WINDOWS-TEST-SPEED.md).
+Сопоставимый AFTER одного cost case ещё ожидается от Root после H/native boundary;
+нового замера ускорения нет. Полный check, Windows/Linux CI,
+fresh enabled security и final independent review остаются pending; UI disabled
+нейтрален. Benchmark, реальные provider/native-client проверки, новый installed
+или published artifact, merge/release/deployment этим исправлением не доказаны.
+Экономия native calls не измеряет LLM latency, HTTP, токены, квоту или USD подписки.
 
 ## Что измерено локально
 

@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import fs from 'node:fs/promises';
+import { syncBuiltinESMExports } from 'node:module';
 import { access, cp, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -212,4 +214,136 @@ test('Repeated compact policy loads recheck even non-applicable pinned resources
   const unused = lock.components.find(row => row.id === 'skills/react-best-practices').files.at(-1).path;
   await writeFile(path.join(copiedRoot, unused), 'changed unused upstream rule');
   await assert.rejects(loadDefaultPolicy({ root: copiedRoot, project, stage: 'complete' }), error => error.code === 'skill_integrity' && /hash mismatch/.test(error.message));
+});
+
+test('Pinned verification overlaps at most four fresh resource operations and preserves all lock entries', async t => {
+  const lock = JSON.parse(await text(path.join(root, 'third-party-skills.lock.json')));
+  const files = lock.components.flatMap(component => component.files);
+  const expected = new Map();
+  for (const file of files) expected.set(file.path, await text(path.join(root, file.path)));
+  assert.equal(expected.size, 183);
+  const targets = new Set(files.map(file => path.join(root, file.path)));
+  const originalLstat = fs.lstat, originalReadFile = fs.readFile;
+  let lockRead = false, active = 0, peak = 0;
+  const reads = new Map();
+  const statSpy = t.mock.method(fs, 'lstat', async (filename, ...args) => {
+    if (filename === root && lockRead) { active++; peak = Math.max(peak, active); }
+    return originalLstat(filename, ...args);
+  });
+  const readSpy = t.mock.method(fs, 'readFile', async (filename, ...args) => {
+    if (!targets.has(filename)) {
+      const data = await originalReadFile(filename, ...args);
+      if (filename === path.join(root, 'third-party-skills.lock.json')) lockRead = true;
+      return data;
+    }
+    reads.set(filename, (reads.get(filename) || 0) + 1);
+    try { return await originalReadFile(filename, ...args); }
+    finally { active--; }
+  });
+  syncBuiltinESMExports();
+  try {
+    for (let call = 1; call <= 2; call++) {
+      lockRead = false;
+      const verified = await verifyDefaultSkillPins(root);
+      assert.deepEqual([...verified.byId.keys()], lock.components.map(component => component.id));
+      assert.deepEqual([...verified.resources], [...expected]);
+      assert.equal(active, 0);
+      assert.equal(reads.size, 183);
+      assert.ok([...reads.values()].every(count => count === call), 'every pinned file must be read again');
+    }
+    assert.ok(peak > 1, `independent resource operations must overlap; observed ${peak}`);
+    assert.ok(peak <= 4, `resource operation bound exceeded: ${peak}`);
+  } finally {
+    statSpy.mock.restore(); readSpy.mock.restore(); syncBuiltinESMExports();
+  }
+});
+
+test('Pinned verification drains started siblings and reports the first lock-ordered read error', async t => {
+  const lock = JSON.parse(await text(path.join(root, 'third-party-skills.lock.json')));
+  const firstFiles = lock.components[0].files.slice(0, 4).map(file => path.join(root, file.path));
+  assert.equal(firstFiles.length, 4);
+  const originalReadFile = fs.readFile;
+  const entered = [], finished = [];
+  const allStarted = Promise.withResolvers(), releaseSibling = Promise.withResolvers();
+  const readSpy = t.mock.method(fs, 'readFile', async (filename, ...args) => {
+    const index = firstFiles.indexOf(filename);
+    if (index < 0) return originalReadFile(filename, ...args);
+    entered.push(filename);
+    if (entered.length === 4) allStarted.resolve();
+    try {
+      if (index === 0) {
+        await allStarted.promise;
+        setImmediate(() => releaseSibling.resolve());
+        throw new Error('first ordered failure');
+      }
+      if (index === 1) throw new Error('earlier completion but later lock entry');
+      if (index === 2) await releaseSibling.promise;
+      return await originalReadFile(filename, ...args);
+    } finally { finished.push(filename); }
+  });
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(verifyDefaultSkillPins(root), error => {
+      assert.equal(error.code, 'skill_integrity');
+      assert.equal(error.message, `Default skill integrity: cannot read ${lock.components[0].files[0].path}: first ordered failure`);
+      assert.equal(entered.length, 4);
+      assert.deepEqual(new Set(finished), new Set(firstFiles), 'all started reads must finish before rejection');
+      return true;
+    });
+  } finally {
+    allStarted.resolve(); releaseSibling.resolve();
+    readSpy.mock.restore(); syncBuiltinESMExports();
+  }
+});
+
+test('Pinned verification preserves hash failure precedence over a later invalid file record', async t => {
+  const directory = await temporary(t);
+  await cp(path.join(root, 'skills'), path.join(directory, 'skills'), { recursive: true });
+  const lock = JSON.parse(await text(path.join(root, 'third-party-skills.lock.json')));
+  const first = lock.components[0].files[0];
+  await writeFile(path.join(directory, first.path), 'corrupt first resource');
+  lock.components[0].files[1].sha256 = 'invalid';
+  await writeFile(path.join(directory, 'third-party-skills.lock.json'), JSON.stringify(lock));
+  await assert.rejects(verifyDefaultSkillPins(directory), error => {
+    assert.equal(error.code, 'skill_integrity');
+    assert.equal(error.message, `Default skill integrity: hash mismatch: ${first.path}`);
+    return true;
+  });
+});
+
+test('Pinned verification drains an earlier read before reporting a later duplicate record', async t => {
+  const directory = await temporary(t);
+  await cp(path.join(root, 'skills'), path.join(directory, 'skills'), { recursive: true });
+  const lock = JSON.parse(await text(path.join(root, 'third-party-skills.lock.json')));
+  const first = lock.components[0].files[0];
+  lock.components[0].files[1] = { ...first };
+  await writeFile(path.join(directory, 'third-party-skills.lock.json'), JSON.stringify(lock));
+  const originalReadFile = fs.readFile;
+  const started = Promise.withResolvers(), release = Promise.withResolvers();
+  let finished = false, settled = false;
+  const readSpy = t.mock.method(fs, 'readFile', async (filename, ...args) => {
+    if (filename !== path.join(directory, first.path)) return originalReadFile(filename, ...args);
+    started.resolve();
+    await release.promise;
+    try { return await originalReadFile(filename, ...args); }
+    finally { finished = true; }
+  });
+  syncBuiltinESMExports();
+  const outcome = verifyDefaultSkillPins(directory).then(
+    value => { settled = true; return { value }; },
+    error => { settled = true; return { error }; }
+  );
+  try {
+    await started.promise;
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(settled, false, 'metadata rejection must wait for the held read');
+    release.resolve();
+    const { error } = await outcome;
+    assert.equal(finished, true);
+    assert.equal(error?.code, 'skill_integrity');
+    assert.equal(error.message, `Default skill integrity: invalid file record: ${lock.components[0].id}`);
+  } finally {
+    release.resolve(); await outcome;
+    readSpy.mock.restore(); syncBuiltinESMExports();
+  }
 });

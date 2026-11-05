@@ -934,7 +934,7 @@ test('Release lifecycle forwards explicit and default test and build deadlines',
   assert.equal(release.published, true);
   assert.deepEqual(observed, [['explicit', 71], ['default-test', 1200000], ['default-build', 1200000], ['explicit-build', 93]]);
   const self = JSON.parse(await readFile(new URL('../kodo.config.json', import.meta.url), 'utf8'));
-  assert.deepEqual(self.commands.test, [{ command: 'npm', args: ['run', 'check'], timeoutMs: 1200000 }]);
+  assert.deepEqual(self.commands.test, [{ command: 'npm', args: ['run', 'check'], timeoutMs: 1800000 }]);
 });
 
 for (const code of ['timeout', 'command_failed', 'cancelled']) {
