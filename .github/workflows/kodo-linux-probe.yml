@@ -1,0 +1,45 @@
+name: Kodo Linux scoped probe
+
+on:
+  push:
+    branches: ['codex/kodo-linux-probe-**']
+
+permissions:
+  contents: read
+
+jobs:
+  scoped-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 11d1d7f9631b09fe84cc90ba793230b948c7ee45
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Verify exact source, Node and frozen oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo 'Expected source HEAD: 11d1d7f9631b09fe84cc90ba793230b948c7ee45'
+          git rev-parse HEAD
+          test "$(git rev-parse HEAD)" = '11d1d7f9631b09fe84cc90ba793230b948c7ee45'
+          node --version
+          echo 'fa0a150b981f9b0ea609e2204bf562a5b04f546f86dc74450ec541bf8635c7c5  tests/project-director-oracle.test.mjs' | sha256sum --check
+          echo '932dfc6aed2b4b28aa4b32054429a9b46a20b5a19db4cc91431839d9f19534ec  tests/project-store.test.mjs' | sha256sum --check
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          echo 'SCOPED ONLY: no full-check, installed-package, release or deployment claim'
+      - name: Install locked dependencies without scripts
+        run: npm ci --ignore-scripts
+      - name: Exact frozen 1000-amendment SQLite coherence scenario
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --test '--test-name-pattern=Director actual SQLite snapshot counts bodies and revision stay coherent during concurrent amendments' tests/project-director-oracle.test.mjs | tee "$RUNNER_TEMP/kodo-linux-coherence.tap"
+      - name: Actual Store and unchanged frozen oracle, concurrency 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --test --test-concurrency=2 tests/project-store.test.mjs tests/project-director-oracle.test.mjs | tee "$RUNNER_TEMP/kodo-linux-store-oracle.tap"
