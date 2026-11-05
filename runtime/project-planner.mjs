@@ -27,7 +27,17 @@ export function planProjectHorizon(input, ports) {
   const options = { knownValues: ports.knownValues };
   synchronous(contracts.assertDirectorSafe(input, options));
   if (!input || !Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > 24 || !timestamp(input.now)) throw invalid();
-  const snapshot = synchronous(contracts.normalizeDirectorRecord('snapshot', input.snapshot, options));
+  let snapshot, snapshotFailure;
+  try {
+    snapshot = synchronous(contracts.normalizeDirectorRecord('snapshot', input.snapshot, options));
+  } catch (error) {
+    if (error?.code !== 'project_revision') throw error;
+    // A validates the full snapshot shape before its semantic revision checks.
+    // Raw safety already passed; retain IDs only for a bounded denial projection.
+    // Never filter approvals, repair revisions or plan from this invalid snapshot.
+    snapshot = input.snapshot;
+    snapshotFailure = 'snapshot_invalid:project_revision';
+  }
   if (!snapshot || snapshot.schemaVersion !== 1 || !snapshot.project || !Number.isSafeInteger(snapshot.revision)
     || snapshot.revision < 1 || sets.some(key => !Array.isArray(snapshot[key])) || snapshot.tasks.length > 1000) throw invalid();
   const { project, tasks } = snapshot;
@@ -51,9 +61,13 @@ export function planProjectHorizon(input, ports) {
     result.blocked = result.order.map(taskId => ({ taskId, reasons: [...new Set(reasons)].sort(compareId) }));
     return finish();
   };
+  if (snapshotFailure) return allBlocked([snapshotFailure]);
   const globalReasons = [];
   for (const key of sets) {
     const count = snapshot.completeness?.[key];
+    // A coherent declaration of truncation is not a complete planning input.
+    if (count?.complete === false && Number.isSafeInteger(count.total) && Number.isSafeInteger(count.returned)
+      && count.returned === snapshot[key].length && count.total > count.returned) throw invalid();
     if (!count || count.complete !== true || !Number.isSafeInteger(count.total) || !Number.isSafeInteger(count.returned)
       || count.total !== count.returned || count.returned !== snapshot[key].length) globalReasons.push('snapshot_incomplete:' + key);
   }
@@ -137,7 +151,8 @@ export function planProjectHorizon(input, ports) {
     const attempt = attempts.get(task.id);
     if (attempt) reasons.push(attempt.taskRevision !== task.revision ? 'attempt_revision_mismatch'
       : ['blocked', 'failed', 'cancelled'].includes(attempt.status) ? 'retry_required' : 'attempt_exists');
-    if (!Array.isArray(task.interfaceRefs) || task.interfaceRefs.length === 0) reasons.push('interfaces_missing');
+    // No required interfaces is valid; availability must still verify that set.
+    if (!Array.isArray(task.interfaceRefs)) reasons.push('interfaces_missing');
     const row = availability.get(task.id);
     if (!row) reasons.push('availability_missing');
     else {
