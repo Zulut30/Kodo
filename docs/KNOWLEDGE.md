@@ -1,6 +1,6 @@
 # Research knowledge: offline MVP
 
-Этап05 добавляет claims для `domain`, `product`, `technical` и `codebase`: происхождение, hash, revisions, TTL, версии, конфликты и ограниченную передачу ссылок в контекст. Это локальная проверка пригодности данных; [общая приёмка05](kodo-roadmap/phase-05.md) ещё pending. Последующий fake-only probe координатора выявил known-credential gap в default CLI refresh/inspect; bounded repair и security acceptance ещё не выполнены. Примеры ниже не доказывают безопасность этой границы.
+Этап05 добавляет claims для `domain`, `product`, `technical` и `codebase`: происхождение, hash, revisions, TTL, версии, конфликты и ограниченную передачу ссылок в контекст. Known-credential gap в default CLI refresh/inspect исправлен локально: credentials лениво загружаются только координатором после проверки аргументов и включённой policy, без передачи workers. Refresh блокирует известное значение до сохранения claims; inspect блокирует сохранённые строки с newly-known значением до evidence/evaluation и вывода, сохраняя историю и hashes без переписывания. Независимое fake-only CLI/SQLite доказательство и его пределы указаны в [статусе05](kodo-roadmap/phase-05.md#оставшаяся-приёмка-и-урок). Общая приёмка05 остаётся pending; H18 ниже относятся только к историческому `19bab3c32d5e496687b2c5db037cff495fc5471c`.
 
 ## Фиксированные файлы и defaults
 
