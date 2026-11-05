@@ -61,7 +61,9 @@ jobs:
 
   check:
     strategy:
-      fail-fast: false
+      # A failed mandatory platform keeps merge blocked and cancels obsolete
+      # sibling work; a passing head still requires both platform checks.
+      fail-fast: true
       matrix:
         os: [ubuntu-latest, windows-latest]
         node: [24]

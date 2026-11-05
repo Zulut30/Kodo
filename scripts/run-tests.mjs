@@ -106,7 +106,17 @@ export async function runTests({ cwd = process.cwd(), paths = [], concurrency = 
   signal?.addEventListener('abort', aborted, { once: true });
   try {
     const stream = run({ files, cwd, concurrency: concurrencyValue(concurrency), isolation: 'process', testNamePatterns, signal });
-    stream.on('test:fail', () => { process.exitCode = 1; });
+    let reportedFailures = 0;
+    stream.on('test:fail', data => {
+      process.exitCode = 1;
+      if (reportedFailures++ >= 16) return;
+      const name = typeof data?.name === 'string' ? data.name : 'unnamed test';
+      // Keep the complete TAP stream. A short stderr summary survives the CI
+      // wrapper's bounded tails when an early failure precedes many passing tests.
+      console.error(JSON.stringify({ kind: 'kodo-test-failure',
+        name: (path.isAbsolute(name) ? path.basename(name) : name).slice(0, 240),
+        failureType: String(data?.details?.error?.failureType || 'unknown').slice(0, 80) }));
+    });
     // The official runner owns spawning, scheduling, cancellation and draining.
     // Do not forceExit, replace timeouts, or filter failure events/diagnostics.
     await pipeline(stream.compose(tap), process.stdout, { end: false });

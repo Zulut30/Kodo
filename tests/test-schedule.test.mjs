@@ -63,6 +63,19 @@ async function waitFor(predicate) {
   }
 }
 
+test('Scheduler retains nonzero TAP results and emits bounded named failure diagnostics', { timeout: 15000 }, async t => {
+  const { temp, put } = await fixture(t);
+  await put('tests/failure.test.cjs', "const test = require('node:test'); for(let i=0;i<25;i++) test('named fixture regression '+i,()=>{throw Error('owned failure')});\n");
+  const result = await child(t, temp, entryArgs).done;
+  assert.notEqual(result.code, 0);
+  assert.match(result.stdout, /not ok.*named fixture regression 0/);
+  const records = result.stderr.split(/\r?\n/).flatMap(line => { try { const row = JSON.parse(line); return row.kind === 'kodo-test-failure' ? [row] : []; } catch { return []; } });
+  assert.equal(records.length, 16);
+  assert.equal(records[0].name, 'named fixture regression 0');
+  assert.ok(records.every(row => typeof row.name === 'string' && row.name.length <= 240 && typeof row.failureType === 'string'));
+  assert.ok(Buffer.byteLength(result.stderr) < 8192);
+});
+
 test('Scheduler orders observed file durations longest first and retains every discovered file once', async t => {
   const { temp, put } = await fixture(t);
   const { orderTests, discoverTests } = await import(scheduleUrl);
