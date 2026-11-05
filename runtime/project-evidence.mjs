@@ -114,7 +114,7 @@ function bindingMatches(snapshot, attempt, run) {
   const binding = run?.directorBinding;
   return task && current && isDeepStrictEqual(current, attempt) && task.revision === attempt.taskRevision && attempt.projectId === snapshot.project.projectId && run?.id === attempt.runId && binding?.projectId === attempt.projectId && binding?.taskId === attempt.taskId && binding?.taskRevision === attempt.taskRevision && binding?.attemptId === attempt.id && binding?.runId === attempt.runId && binding?.contractHash === attempt.contractHash && sha(run.headSha) && (attempt.headSha === null || attempt.headSha === run.headSha);
 }
-async function evaluateAttempt(input, ports, prepared, commandEvidence = [], target) {
+async function evaluateAttempt(input, ports, prepared, commandEvidence = [], target, requestedState) {
   const { snapshot } = prepared;
   prepared.contracts.assertDirectorSafe(input.attempt, prepared.options);
   prepared.contracts.assertDirectorSafe(input.run, prepared.options);
@@ -142,7 +142,7 @@ async function evaluateAttempt(input, ports, prepared, commandEvidence = [], tar
   if (accepted) states.push('accepted');
   else blockers.push('acceptance_proof_missing');
   if (accepted && publication(run, evidence)) states.push('released');
-  else blockers.push('publication_proof_missing');
+  else if (requestedState === 'released') blockers.push('publication_proof_missing');
   return result([...history(target), ...forward(target, states)], blockers, evidence);
 }
 
@@ -162,7 +162,7 @@ export async function evaluateProjectTransition(input, ports = {}) {
     const action = command.action;
     if (command.projectId !== snapshot.project.projectId || command.expectedRevision !== snapshot.revision || action.op !== 'transition') return blocked(null, 'transition_identity_invalid');
     record = action.kind === 'project' ? snapshot.project : action.kind === 'attempt' ? snapshot.currentAttempts.find(row => row.id === action.id) : snapshot[`${action.kind}s`]?.find(row => row.id === action.id);
-    if (!record || record.id !== action.id) return blocked(null, 'transition_entity_missing');
+    if (!record || (action.kind === 'project' ? record.projectId : record.id) !== action.id) return blocked(null, 'transition_entity_missing');
     if (settled.has(record.status) && (record.status === 'released' && action.to !== 'released' || !settled.has(action.to))) return blocked(record, 'history_preserved');
     if (typeof contracts.assertProjectTransition === 'function') contracts.assertProjectTransition({ record, to: action.to, snapshot, evidence: action.evidence, mappings: action.mappings });
     if (controls(snapshot, record, input.run)) return blocked(record, 'project_control_blocked');
@@ -177,7 +177,7 @@ export async function evaluateProjectTransition(input, ports = {}) {
       if (!current) return blocked(record, 'current_attempt_missing');
       // Command evidence is checked as part of this authorization, never saved
       // as a new attempt or mistaken for a different current reservation.
-      return await evaluateAttempt({ ...input, attempt: current, mappings: action.mappings }, ports, prepared, action.evidence, record);
+      return await evaluateAttempt({ ...input, attempt: current, mappings: action.mappings }, ports, prepared, action.evidence, record, action.to);
     }
     const children = action.kind === 'project' ? snapshot.milestones : action.kind === 'milestone' ? snapshot.epics.filter(row => row.milestoneId === record.id) : action.kind === 'epic' ? snapshot.tasks.filter(row => row.epicId === record.id) : null;
     if (!children?.length) return blocked(record, 'container_children_missing');
