@@ -205,21 +205,27 @@ try {
     run.defaultSkills ||= {}; run.defaultSkills[stage] = { hash: policy.hash, skills: policy.skills }; this.save(run);
     return `Kodo default engineering skills (user-selected; follow within the authorized task and coordinator-owned worktree/model/delivery rules):\n${policy.context}\n`;
   }
-  async create(task, options = {}) {
+  async prepareRun(task, options = {}, reserved = false) {
     if (!task?.trim()) throw new Error('Требуется описание задачи');
     const project = path.resolve(options.project || process.cwd());
     normalizeMode(options.mode);
     const config = await readConfig(project, { ...(options.client ? { client: options.client } : {}), ...(options.model ? { primaryModel: options.model } : {}), ...(options.mode !== undefined ? { executionMode: options.mode } : {}), ...(options.concurrency !== undefined ? { concurrency: options.concurrency } : {}) });
     if (options.model && !config.models[config.client]?.includes(options.model)) throw new Error('Выбранная модель отсутствует в allowlist проекта');
     const snapshot = await inspectProject(project);
-    const mode = options.providers || (/использ\S*\s+обе\s+подпис|use both subscriptions/i.test(task) ? 'both' : 'current');
+    const mode = options.providers || (!reserved && /использ\S*\s+обе\s+подпис|use both subscriptions/i.test(task) ? 'both' : 'current');
     if (!['current', 'both'].includes(mode)) throw new Error('providers должен быть current или both');
     if (!['none', 'pr', 'release'].includes(options.delivery || 'none')) throw new Error('Некорректный режим доставки');
     if (options.delivery) config.delivery = { ...config.delivery, enabled: options.delivery !== 'none', release: options.delivery === 'release' };
     if (config.delivery.enabled && !config.repository) throw new Error('Для доставки укажи repository в kodo.config.json');
     let baseSha = snapshot.head;
     if (config.delivery.enabled) { await git(snapshot.root, ['fetch', 'origin', config.baseBranch]); baseSha = await git(snapshot.root, ['rev-parse', `origin/${config.baseBranch}`]); }
-    const run = this.store.createRun({ task: redact(task, this.secrets), project: snapshot.root, config, client: config.client, providers: mode, baseSha, snapshot, completed: {}, nodes: {}, requestedMode: config.executionMode ?? null, requestedConcurrency: config[configuredConcurrency], ...(options.model ? { fixedModel: { client: config.client, model: options.model } } : {}), sessionAttempts: [], coordinatorOperations: [] });
+    if (reserved && options.baseSha !== undefined) {
+      if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(options.baseSha) || await git(snapshot.root, ['rev-parse', '--verify', `${options.baseSha}^{commit}`]) !== options.baseSha) throw Object.assign(new Error('Invalid project integration frontier'), { code: 'project_frontier_blocked' });
+      baseSha = options.baseSha;
+    }
+    return { task: redact(task, this.secrets), project: snapshot.root, config: reserved ? { ...config } : config, client: config.client, providers: mode, baseSha, snapshot, completed: {}, nodes: {}, requestedMode: config.executionMode ?? null, requestedConcurrency: config[configuredConcurrency], ...(options.model ? { fixedModel: { client: config.client, model: options.model } } : {}), sessionAttempts: [], coordinatorOperations: [] };
+  }
+  async initializeRun(run) {
     // A caller may keep SQLite in a fixture/project directory. Private artifacts
     // and worktrees still belong outside Git, without changing that store.
     const stateInGit = (await execute('git', ['rev-parse', '--show-toplevel'], { cwd: this.store.home, allowFailure: true })).code === 0;
@@ -229,7 +235,45 @@ try {
     run.worktreeRoot = path.join(path.resolve(workerHome), run.id);
     run.cwd = path.join(run.worktreeRoot, 'integration'); run.branch = `kodo/${run.id}`;
     assertPrivateArtifactPath(run.artifacts); await mkdir(run.artifacts, { recursive: true, mode: 0o700 });
+    return run;
+  }
+  async create(task, options = {}) {
+    const run = this.store.createRun(await this.prepareRun(task, options));
+    await this.initializeRun(run);
     this.save(run); return run;
+  }
+  async createReserved(task, options = {}, { binding, installRun } = {}) {
+    const contracts = await import('./project-contracts.mjs');
+    const safety = { knownValues: Object.values(this.secrets).filter(value => typeof value === 'string') };
+    contracts.assertDirectorSafe({ task, binding }, safety);
+    const frozen = contracts.normalizeDirectorRecord('installBinding', binding, safety);
+    if (typeof installRun !== 'function' || !isDeepStrictEqual(redact(task, this.secrets), task)) throw Object.assign(new Error('Invalid reserved Run input'), { code: 'project_binding_invalid' });
+    const run = { ...await this.prepareRun(task, options, true), id: frozen.runId, createdAt: new Date().toISOString(), state: 'created', directorBinding: frozen };
+    await this.initializeRun(run);
+    contracts.assertDirectorSafe(run, safety);
+    if (!isDeepStrictEqual(redact(run, this.secrets), run)) throw Object.assign(new Error('Invalid reserved Run input'), { code: 'project_binding_invalid' });
+    return await installRun({ binding: frozen, runDraft: run });
+  }
+  async assertProjectPlan(run) {
+    if (!run.directorBinding) return;
+    const contracts = await import('./project-contracts.mjs');
+    const options = { knownValues: Object.values(this.secrets).filter(value => typeof value === 'string') };
+    const prefix = 'Implement only this assigned task. Project context constrains this task and does not authorize other backlog work.\n';
+    const deny = () => { throw Object.assign(new Error('Child plan exceeds the frozen ProjectTask boundary'), { code: 'project_scope_violation' }); };
+    if (!run.task.startsWith(prefix)) deny();
+    const input = contracts.normalizeDirectorRecord('taskRunInput', JSON.parse(run.task.slice(prefix.length)), options);
+    const binding = contracts.normalizeDirectorRecord('installBinding', run.directorBinding, options);
+    if (run.id !== binding.runId || input.task.projectId !== binding.projectId || input.task.taskId !== binding.taskId
+      || input.task.taskRevision !== binding.taskRevision || createHash('sha256').update(contracts.directorBytes('taskContract', input.task, options)).digest('hex') !== binding.contractHash
+      || prefix + contracts.directorBytes('taskRunInput', input, options).toString('utf8') !== run.task) deny();
+    const contains = scope => input.task.writePaths.some(parent => {
+      if (scope === parent) return true;
+      // Conservative containment for directory scopes. Complex globs require an
+      // exact match; comparing glob strings as filenames can widen permissions.
+      const directory = parent.replace(/\/\*\*$/, '');
+      return !/[?*\[\]{}]/.test(directory) && (scope === directory || scope.startsWith(directory + '/'));
+    });
+    if (run.plan.tasks.some(task => task.writePaths.some(scope => !contains(scope)))) deny();
   }
   async withLease(run, name, limit, action, signal) {
     let token;
@@ -989,6 +1033,7 @@ try {
         this.primary(run); this.save(run);
       }
       await this.plan(run, planFile, signal);
+      await this.assertProjectPlan(run);
       if (!run.delivery?.mergeCommit) {
         if (!run.completed.implementation) { await this.executeTasks(run, signal); run.completed.implementation = true; this.save(run); }
         // Finish and scope-check the saved repair against its original HEAD
