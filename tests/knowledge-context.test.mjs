@@ -59,6 +59,34 @@ test('Projection excludes every ineligible state even when a forged reference is
   assert.deepEqual(result.omitted, []);
 });
 
+for (const synthetic of [false, true]) {
+  test(`Whole-document selector projects ${synthetic ? 'synthetic' : 'local'} JSON within the exact byte budget`, () => {
+    const item = row('a', { synthetic, domain: synthetic ? 'product' : 'codebase', value: { document: ['😀', 7] } });
+    item.claim.source.pointer = '';
+    const before = clone(item);
+    const expected = { schemaVersion: 1, references: [reference(item)], unknownCounts: {}, omitted: [] };
+    assert.deepEqual(project([item], { maxBytes: bytes(expected) }), expected);
+    const smaller = project([item], { maxBytes: bytes(expected) - 1 });
+    assert.deepEqual(smaller.references, []);
+    assert.deepEqual(smaller.unknownCounts, {});
+    assert.deepEqual(smaller.omitted, [{ field: 'references', items: 1 }]);
+    assert.ok(bytes(smaller) <= bytes(expected) - 1);
+    assert.deepEqual(item, before);
+  });
+}
+
+test('Whole-document allowance preserves nonempty locators and malformed selector guards', () => {
+  for (const [field, value] of [
+    ['url', ''], ['path', ''], ['id', ''], ['pointer', ' '],
+    ['pointer', 0], ['pointer', {}], ['pointer', 'x'.repeat(4097)]
+  ]) {
+    const item = row(); item.claim.source.pointer = ''; item.claim.source[field] = value;
+    const result = project([item]);
+    assert.deepEqual(result.references, [], `${field}: ${JSON.stringify(value)}`);
+    assert.deepEqual(result.unknownCounts, { malformed: 1 });
+  }
+});
+
 test('Projection fails closed for malformed envelopes and rows', () => {
   for (const input of [null, {}, { schemaVersion: 2, rows: [] }, { schemaVersion: 1, rows: {} }]) {
     assert.throws(() => projectKnowledge({ evaluation: input, task: '', maxBytes: 4096 }), /evaluation/i);

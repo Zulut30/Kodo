@@ -101,6 +101,41 @@ test('Capture HEAD native session verifies original references at A and new cont
   assert.equal(fx.run.sessionAttempts.at(-1).status, 'failed', 'original capture integrity remains strict after provider');
 });
 
+test('Whole-document capture inspect and native session retain fresh synthetic product data', async t => {
+  const { knowledgeCli } = await import('../runtime/knowledge-cli.mjs');
+  const fx = await fixture(t), value = { document: ['whole', 7] };
+  fx.input.synthetic = true;
+  Object.assign(fx.input.claims[0], { domain: 'product', key: 'whole-document', value });
+  Object.assign(fx.input.claims[0].source, { pointer: '', retrievedAt: fx.now, validAsOf: fx.now });
+  await fx.put('input.json', fx.input); await fx.put('data.json', value);
+  await fx.put('research.context.json', { schemaVersion: 1, versions: { patch: 'A' }, synthetic: true });
+  fx.run.headSha = fx.commit(); fx.engine.save(fx.run);
+  const captured = await fx.capture(), original = captured.capture.claims[0];
+  const originalBytes = await readFile(original.source.evidenceRef.path);
+  assert.equal(original.source.pointer, '');
+  const inspected = await knowledgeCli(['knowledge', 'inspect', '--project', fx.project, '--json'], { store: fx.store, secrets: {} });
+  assert.equal(inspected.exitCode, 0);
+  assert.equal(inspected.report.requests, 0);
+  assert.deepEqual(inspected.report.evaluation.rows.map(row => row.state), ['fresh']);
+  assert.deepEqual(inspected.report.projection.unknownCounts, {});
+  const refs = inspected.report.projection.references;
+  assert.equal(refs.length, 1);
+  assert.equal(refs[0].kind, 'synthetic-reference'); assert.equal(refs[0].domain, 'product');
+  assert.deepEqual(refs[0].value, value); assert.deepEqual(refs[0].evidenceRef, original.source.evidenceRef);
+  fx.during(async request => {
+    assert.ok(request.prompt.includes(label));
+    assert.deepEqual(JSON.parse(request.prompt.split(label)[1]).references, refs);
+  });
+  await fx.session();
+  assert.equal(fx.requests.length, 1); assert.equal(fx.run.sessionAttempts.at(-1).status, 'completed');
+  const evidence = fx.run.sessionAttempts.at(-1).evidence;
+  assert.equal(evidence.length, 2); assert.ok(evidence.some(ref => ref.path === original.source.evidenceRef.path));
+  for (const ref of evidence) await fx.engine.assertEvidence(ref);
+  assert.deepEqual(await readFile(original.source.evidenceRef.path), originalBytes);
+  assert.equal(fx.run.config.researchBudget, 0); assert.equal(fx.run.config.repairRounds, 1);
+  assert.equal(fx.run.executionMode.selected, 'quick'); assert.equal(fx.requests[0].model, fx.run.fixedModel.model);
+});
+
 test('Native off byte identity avoids knowledge reads and dirty repair excludes optional knowledge', async t => {
   const fx = await fixture(t); await fx.capture();
   await fx.put('research.policy.json', { ...fx.policy, mode: 'off' }); fx.commit();

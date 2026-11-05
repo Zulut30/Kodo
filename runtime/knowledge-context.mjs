@@ -54,7 +54,7 @@ function validReference(row) {
   if (!exact(claim, claimKeys) || claim.schemaVersion !== 1 || !bounded(claim.projectKey, 4096) || !bounded(claim.captureId) || !utc(claim.observedAt) || !hash(claim.fingerprint)) return false;
   if (!bounded(claim.subject) || !strings(claim.unknowns) || claim.unknowns.length || !(claim.confidence === null || typeof claim.confidence === 'number' && claim.confidence >= 0 && claim.confidence <= 1)) return false;
   const source = claim.source;
-  if (!exact(source, sourceKeys) || !bounded(source.id) || !['local', 'discovery'].includes(source.kind) || ![source.url, source.path, source.pointer].every(item => item === null || bounded(item, 4096)) || ![source.retrievedAt, source.validAsOf].every(item => item === null || utc(item))) return false;
+  if (!exact(source, sourceKeys) || !bounded(source.id) || !['local', 'discovery'].includes(source.kind) || ![source.url, source.path].every(item => item === null || bounded(item, 4096)) || !(source.pointer === '' || source.pointer === null || bounded(source.pointer, 4096)) || ![source.retrievedAt, source.validAsOf].every(item => item === null || utc(item))) return false;
   if (!hash(claim.id) || !positive(claim.revision) || !domains.includes(claim.domain) || !bounded(claim.key) || !versions(claim.versions) || typeof claim.synthetic !== 'boolean' || !evidence(source.evidenceRef) || size(claim.value) > 262144) return false;
   try { jsonData(claim.value); } catch { return false; }
   if (row.projection === 'local-observation') {
