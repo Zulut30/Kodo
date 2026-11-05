@@ -17,47 +17,58 @@ Node `v24.19.0`: `**/{test,test/**/*,test-*,*[._-]test}.{js,mjs,cjs,ts,mts,cts}`
 это не allowlist только для `tests/*.test.mjs`. Сам runner не соответствует
 шаблону и не находится под `test/`.
 
-Приоритет теперь следует убыванию фактических длительностей завершённых файлов
-из receipt, переданных контрактом Run `1548713d-1cc5-4262-8ed3-fcd048485d75`.
-Это `duration_ms` файлов, а не `observedAtMs` доставки reporter events.
+Коррекция Run `504262c6-2d03-448b-905d-55189698bffe` заменяет устаревший порядок
+данными полного локального check source `821eec5a81b4e20715cc7c99a129a8be00d604d8`,
+Windows, Node `v24.22.1`, concurrency4. Receipt
+`check-c9b54c3c3b46dab3ccfb7042da6116fbebe7cc62641948a24dfb0cd720231816.json`
+содержит 66 успешных completed-file observations из 83 обнаруженных файлов;
+полный check остановился по timeout1200535ms, остальные17 не имеют финального
+наблюдения. Это incomplete/nonpassing full, не AFTER новой перестановки.
+SHA-256 read-only анализа `runner-makespan-821-observation.md`:
+`5c80cda835a06d39004850a9fb7ea35b4a54117c9e35d000fed77d1082d6bd9c`.
+
+Статический список начинает с **всех 19 завершённых файлов ≥90000ms** по убыванию
+`durationMs`, а не `observedAtMs` доставки reporter events. Затем идёт явно
+отделённая lower-bound эвристика scheduling и три прежних лёгких приоритета,
+также упорядоченных по текущему receipt. Это literal names/comments, без весов,
+динамического сбора таймингов и cache.
 Все имена ниже обозначают `tests/<имя>.test.mjs`:
 
 | Файл | Наблюдавшаяся длительность, ms |
 | --- | ---: |
-| delivery | 588139.3066 |
-| project-director | 566770.1329 |
-| architecture-gate-integration | 432286.6863 |
-| engine-4 | 315828.7805 |
-| engine-2 | 310021.1643 |
-| engine-3 | 298955.3369 |
-| engine | 290212.1408 |
-| ci-graph | 239140.7966 |
-| mode-engine-4 | 199378.0839 |
-| ci-cache | 188462.5517 |
-| mode-engine-3 | 182728.3893 |
-| mode-engine-2 | 170410.8459 |
-| mode-engine | 165308.6285 |
-| ci-cli | 120844.2919 |
-| architecture-acceptance | 30060.7548 |
-| project-director-oracle | 25141.873 |
+| delivery | 434779.5897 |
+| project-director | 375928.3714 |
+| architecture-gate-integration | 314342.0235 |
+| architecture-cli | 220780.7633 |
+| engine-2 | 219297.3218 |
+| engine-4 | 210502.2130 |
+| engine-3 | 204285.3006 |
+| benchmark | 200519.1471 |
+| engine | 197217.0646 |
+| knowledge-cli | 187586.6471 |
+| ci-graph | 162527.6399 |
+| knowledge-refresh | 158457.3852 |
+| mode-engine-2 | 125502.3442 |
+| ci-cache | 124490.6677 |
+| efficiency-engine | 124346.2806 |
+| mode-engine | 123214.6159 |
+| mode-engine-4 | 119188.7387 |
+| quality-runner | 114368.0009 |
+| mode-engine-3 | 110802.8659 |
 
-Отдельное исключение по уточнению координатора: `tests/benchmark.test.mjs`
-расположен сразу после `engine` и перед `ci-graph` по prior lower-bound heuristic.
-В сохранённом `check-28c5a1ab8c8d4a693b9d2e4de7f1c744698fe56526a0a45cee8a422de19929a8.json`,
-source88, Node `v24.19.0`, hermetic, наблюдались 16 завершённых top-level benchmark
-cases 563–578 с суммой case work 255773.4331 ms без повторного учёта детей.
-Координатор подтвердил исходные данные через отдельный read-only speed worker;
-здесь benchmark повторно не запускался. Это нижняя граница работы кейсов,
-не измеренный file elapsed, не длительность на текущем Node `v24.22.1` и
-не вес в таблице измеренных файлов. Его реальная длительность файла неизвестна.
+После них `scheduling-engine`: сумма11 из12 последовательных top-level cases
+100233.5395ms — **только нижняя граница работы случаев**, не completed-file
+duration; неизвестный остаток не выдумывается. Сохранённые лёгкие приоритеты:
+`ci-cli`62405.4714ms, `project-director-oracle`22760.5585ms,
+`architecture-acceptance`17840.1058ms. Прочие файлы идут лексически после23
+приоритетных, включая измеренные ниже90s файлы без прежнего приоритета;
+все83 обнаруживаются по прежнему правилу, дубликаты удаляются.
 
-Для остальных файлов длительности не назначены: они идут лексически после
-этих 17 приоритетных; дубликаты удаляются. Наблюдения зависят от окружения и
-перекрывающейся нагрузки. Их сумма не является elapsed time; ускорение не
-измерено и не обещано. По контракту исходный полный локальный check на source
-`88a9fadae1d226539802dfc7f788df47a39ae7ca`, Node `v24.22.1`, остановился через
-1200492 ms; это исходный неуспех, а не AFTER данной перестановки. Успешные
-Windows/Linux CI того же исходника не доказывают локальный AFTER.
+Исторические receipts source88 и benchmark case-work255773.4331ms больше не
+задают текущий порядок: у benchmark теперь есть completed-file observation.
+Наблюдения зависят от окружения и перекрывающейся нагрузки. Их сумма не является
+elapsed time; полного AFTER нет, whole-suite gain и укладывание в20min не
+измерены и не обещаны. Прежние Windows/Linux CI не принимают этот кандидат.
 
 Time limits, assertions, frozen oracles и process isolation сохранены. Потолок
 тестовых файлов ограничен 8 по политике ниже. Cancellation использует AbortSignal штатного runner; CLI SIGINT/SIGTERM
@@ -167,7 +178,47 @@ Native provider, installed/published artifact и deployment не проверя�
 Урок: наблюдать порядок child-start, а не считать порядок CLI-аргументов
 доказательством планирования; локальный barrier не заменяет полный speed test.
 
-### Scoped проверка порядка по длительностям: 5 ноября 2026
+### Текущая scoped коррекция source821: 5 ноября 2026
+
+В назначенном worktree `full-suite-order` независимый literal expected order
+зафиксирован **до** изменения runner по полным66 файловым наблюдениям receipt.
+Регрессия `Scheduler orders observed file durations longest first and retains every discovered file once`
+содержит23 приоритетных имени, два неизвестных, перемешивание и дубликаты;
+все проверки полного набора, discovery, input immutability и fallback сохранены.
+На неизменённом runner821 получен assertion RED (`ERR_ASSERTION`, exit1,
+0 PASS/1 FAIL), после правки только static priority/comments — GREEN (exit0,
+1 PASS/0 FAIL). Raw TAP подтверждает различие порядка, а не setup failure.
+
+Реальная child-start фикстура дополнена `architecture-cli`, `knowledge-cli`,
+`knowledge-refresh`, `efficiency-engine`, `quality-runner`, `scheduling-engine`;
+прежние имена, включая ранний лексический `tests/a.test.mjs`, сохранены.
+Фикстуры короткие, их тела и deadline15s прежние; дорогие suite не запускаются.
+Ожидания независимы от production priority; concurrency1 проверяет точный старт.
+
+После узкого RED/GREEN выполнена ровно одна scoped suite, Node `v24.22.1`:
+
+```powershell
+node --test --test-reporter=tap tests/test-schedule.test.mjs tests/test-git-environment.test.mjs tests/ci-package.test.mjs
+```
+
+Результат: exit0, 58 tests, **56 PASS / 0 FAIL / 0 cancelled / 2 SKIP**,
+25644.5634ms. Два существующих file-symlink SKIP обусловлены правами Windows;
+directory-junction escape, Git metadata/status, package и child-start PASS.
+Это доказательство scoped порядка и регрессий, не whole-suite gain.
+Сырые TAP/stderr, команды, exit codes, полный mapping и current4/frozen3 SHA-256
+сохранены вне Git:
+`C:/Users/zulut/AppData/Local/Kodo/runs/504262c6-2d03-448b-905d-55189698bffe/full-suite-order-evidence`.
+
+Все83 файла, default4, explicit1..8/hard8, isolation, draining/events/failures,
+исходный Director60s и full deadline20min сохранены; cache не добавлен.
+Root ещё должен выполнить integrated full, fresh security и architecture gates,
+независимое review, CI и protected PR15. UI disabled — neutral.
+Native client, published artifact и deployment здесь не проверялись.
+Приёмка06 pending; этапы07–13 остаются **PLAN**, их реализация не начата.
+Урок: текущие completed-file durations заменяют старый порядок, но нижнюю
+границу случаев нельзя выдавать за длительность файла или обещание full PASS.
+
+### Историческая scoped проверка порядка source88: 5 ноября 2026
 
 В назначенном worktree `duration-order`, base
 `88a9fadae1d226539802dfc7f788df47a39ae7ca`, Windows, Node `v24.19.0`,

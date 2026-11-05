@@ -10,30 +10,37 @@ import { readdirSync, lstatSync } from 'node:fs';
 const extensions = process.features.typescript ? 'js,mjs,cjs,ts,mts,cts' : 'js,mjs,cjs';
 const defaultPattern = `**/{test,test/**/*,test-*,*[._-]test}.{${extensions}}`;
 
-// Longest completed-file duration_ms first from the recorded Windows receipt;
-// see docs/WINDOWS-TEST-SPEED.md. Delivery timestamps are not durations.
-// The benchmark placement below uses a separate prior lower-bound heuristic.
-// Environment/overlap affect these observations; no speedup is implied.
+// Source821 Windows/Node24.22.1 receipt c9b54c3c: all completed files >=90000 ms
+// in descending durationMs, not reporter delivery order. Static observations,
+// not runtime weights; environment/overlap differ and no speedup is implied.
+// Scheduling has only a case-work lower bound; retain lighter prior entries.
+// See docs/WINDOWS-TEST-SPEED.md for provenance and the incomplete full check.
 const priority = [
-  'tests/delivery.test.mjs',
-  'tests/project-director.test.mjs',
-  'tests/architecture-gate-integration.test.mjs',
-  'tests/engine-4.test.mjs',
-  'tests/engine-2.test.mjs',
-  'tests/engine-3.test.mjs',
-  'tests/engine.test.mjs',
-  // Prior source88/Node24.19 hermetic receipt: 16 top-level benchmark cases
-  // total 255773.4331 ms of case work. Lower bound, not file elapsed/current24.22.
-  'tests/benchmark.test.mjs',
-  'tests/ci-graph.test.mjs',
-  'tests/mode-engine-4.test.mjs',
-  'tests/ci-cache.test.mjs',
-  'tests/mode-engine-3.test.mjs',
-  'tests/mode-engine-2.test.mjs',
-  'tests/mode-engine.test.mjs',
-  'tests/ci-cli.test.mjs',
-  'tests/architecture-acceptance.test.mjs',
-  'tests/project-director-oracle.test.mjs',
+  'tests/delivery.test.mjs',                      // 434779.5897 ms
+  'tests/project-director.test.mjs',              // 375928.3714 ms
+  'tests/architecture-gate-integration.test.mjs',  // 314342.0235 ms
+  'tests/architecture-cli.test.mjs',              // 220780.7633 ms
+  'tests/engine-2.test.mjs',                      // 219297.3218 ms
+  'tests/engine-4.test.mjs',                      // 210502.2130 ms
+  'tests/engine-3.test.mjs',                      // 204285.3006 ms
+  'tests/benchmark.test.mjs',                     // 200519.1471 ms (completed file)
+  'tests/engine.test.mjs',                        // 197217.0646 ms
+  'tests/knowledge-cli.test.mjs',                 // 187586.6471 ms
+  'tests/ci-graph.test.mjs',                      // 162527.6399 ms
+  'tests/knowledge-refresh.test.mjs',             // 158457.3852 ms
+  'tests/mode-engine-2.test.mjs',                 // 125502.3442 ms
+  'tests/ci-cache.test.mjs',                      // 124490.6677 ms
+  'tests/efficiency-engine.test.mjs',             // 124346.2806 ms
+  'tests/mode-engine.test.mjs',                   // 123214.6159 ms
+  'tests/mode-engine-4.test.mjs',                 // 119188.7387 ms
+  'tests/quality-runner.test.mjs',                // 114368.0009 ms
+  'tests/mode-engine-3.test.mjs',                 // 110802.8659 ms
+  // Same receipt: 11/12 sequential top-level cases total 100233.5395 ms.
+  // Heuristic placement from a LOWER BOUND, never a completed-file duration.
+  'tests/scheduling-engine.test.mjs',
+  'tests/ci-cli.test.mjs',                        // 62405.4714 ms; retained lighter priority
+  'tests/project-director-oracle.test.mjs',       // 22760.5585 ms; retained lighter priority
+  'tests/architecture-acceptance.test.mjs',       // 17840.1058 ms; retained lighter priority
 ];
 
 export function orderTests(files, cwd) {

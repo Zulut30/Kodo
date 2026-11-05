@@ -66,32 +66,38 @@ async function waitFor(predicate) {
 test('Scheduler orders observed file durations longest first and retains every discovered file once', async t => {
   const { temp, put } = await fixture(t);
   const { orderTests, discoverTests } = await import(scheduleUrl);
-  // Independent expected order from completed-file duration_ms receipts, not
-  // reporter delivery timestamps or the runner's priority table. Benchmark is
-  // the coordinator-approved prior case-work lower-bound heuristic, not a
-  // measured file duration.
+  // Independent oracle locked from source821 receipt c9b54c3c: all 19 completed
+  // files >=90000 ms descending, then scheduling's 100233.5395 ms case-work
+  // lower-bound heuristic (not file elapsed), then the three retained lighter
+  // priorities descending. Neither old receipts nor production data define it.
   const expected = [
     'tests/delivery.test.mjs',
     'tests/project-director.test.mjs',
     'tests/architecture-gate-integration.test.mjs',
-    'tests/engine-4.test.mjs',
+    'tests/architecture-cli.test.mjs',
     'tests/engine-2.test.mjs',
+    'tests/engine-4.test.mjs',
     'tests/engine-3.test.mjs',
-    'tests/engine.test.mjs',
     'tests/benchmark.test.mjs',
+    'tests/engine.test.mjs',
+    'tests/knowledge-cli.test.mjs',
     'tests/ci-graph.test.mjs',
-    'tests/mode-engine-4.test.mjs',
-    'tests/ci-cache.test.mjs',
-    'tests/mode-engine-3.test.mjs',
+    'tests/knowledge-refresh.test.mjs',
     'tests/mode-engine-2.test.mjs',
+    'tests/ci-cache.test.mjs',
+    'tests/efficiency-engine.test.mjs',
     'tests/mode-engine.test.mjs',
+    'tests/mode-engine-4.test.mjs',
+    'tests/quality-runner.test.mjs',
+    'tests/mode-engine-3.test.mjs',
+    'tests/scheduling-engine.test.mjs',
     'tests/ci-cli.test.mjs',
-    'tests/architecture-acceptance.test.mjs',
     'tests/project-director-oracle.test.mjs',
+    'tests/architecture-acceptance.test.mjs',
     'tests/a-unobserved.test.mjs',
     'tests/z-unobserved.test.mjs',
   ].map(file => path.resolve(temp, file));
-  const scrambled = [16, 18, 6, 11, 1, 14, 4, 17, 9, 2, 13, 0, 15, 10, 5, 12, 3, 8, 7]
+  const scrambled = [16, 18, 6, 11, 1, 14, 4, 17, 9, 2, 13, 0, 15, 10, 5, 12, 3, 8, 7, 24, 20, 22, 19, 23, 21]
     .map(index => expected[index]);
   for (const file of scrambled) await put(path.relative(temp, file));
   await put('tests/helper.mjs', 'throw Error("not a default test name");');
@@ -110,7 +116,7 @@ test('Scheduler orders observed file durations longest first and retains every d
 test('Scheduler starts heuristic heavy files before lexical files in real isolated children', { timeout: 15000 }, async t => {
   const { temp, put } = await fixture(t);
   const observed = path.join(temp, 'starts');
-  const expected = ['tests/project-director.test.mjs', 'tests/architecture-gate-integration.test.mjs', 'tests/ci-graph.test.mjs', 'tests/mode-engine-4.test.mjs', 'tests/ci-cache.test.mjs', 'tests/mode-engine-3.test.mjs', 'tests/mode-engine-2.test.mjs', 'tests/mode-engine.test.mjs', 'tests/project-director-oracle.test.mjs', 'tests/a.test.mjs', 'tests/z.test.mjs'];
+  const expected = ['tests/project-director.test.mjs', 'tests/architecture-gate-integration.test.mjs', 'tests/architecture-cli.test.mjs', 'tests/knowledge-cli.test.mjs', 'tests/ci-graph.test.mjs', 'tests/knowledge-refresh.test.mjs', 'tests/mode-engine-2.test.mjs', 'tests/ci-cache.test.mjs', 'tests/efficiency-engine.test.mjs', 'tests/mode-engine.test.mjs', 'tests/mode-engine-4.test.mjs', 'tests/quality-runner.test.mjs', 'tests/mode-engine-3.test.mjs', 'tests/scheduling-engine.test.mjs', 'tests/project-director-oracle.test.mjs', 'tests/a.test.mjs', 'tests/z.test.mjs'];
   for (const name of [...expected].reverse()) {
     await put(name, `import { appendFileSync } from 'node:fs'; import test from 'node:test'; appendFileSync(${JSON.stringify(observed)}, ${JSON.stringify(name + '\n')}); test('ok', () => {});`);
   }
