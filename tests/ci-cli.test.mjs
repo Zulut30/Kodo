@@ -463,6 +463,86 @@ test('CI failure diagnostics preserve Unicode and finite per-stream byte boundar
   }
 });
 
+test('CI stopped commands expose bounded sanitized tails and allowlisted metadata without becoming complete', async t => {
+  const secrets = { KODO_CI_STOP_TOKEN: 'alpha-overlap', KODO_CI_STOP_PASSWORD: 'overlap-omega' };
+  const previous = Object.fromEntries(Object.keys(secrets).map(name => [name, process.env[name]]));
+  Object.assign(process.env, secrets);
+  t.after(() => {
+    for (const [name, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[name]; else process.env[name] = value;
+    }
+  });
+  for (const route of ['run profiler', 'explicit profile', 'execute']) {
+    for (const code of ['timeout', 'cancelled', 'invalid_output', 'ENOENT']) await t.test(`${route} ${code}`, async () => {
+      let calls = 0;
+      const throws = async options => {
+        calls++;
+        assert.equal(options.timeoutMs, 1200000);
+        for (const name of Object.keys(secrets)) assert.equal(options.env[name], undefined);
+        throw Object.assign(new Error('private infrastructure message'), {
+          code, exitCode: 0, durationMs: 123.5, outputTruncated: true,
+          stdout: 'private-prefix-' + 'p'.repeat(6000) + 'alpha-overlap-omega' + 'z'.repeat(4090),
+          stderr: '界'.repeat(2000) + '\nlast safe diagnostic',
+          profilePath: '/private/alpha-overlap-omega/profile.json', stack: 'private-stack',
+          env: { hidden: 'environment-snapshot' }, args: ['argv-snapshot'], rawOutput: 'raw-output-snapshot'
+        });
+      };
+      const p = ports({
+        execute: route === 'execute' ? (_command, _args, options) => throws(options) : undefined,
+        runProfiledCommand: throws
+      });
+      const result = await ciCli([route === 'explicit profile' ? 'profile' : 'run', '--tier', 'L2', '--project', root, '--json'], p.dependencies);
+      const receipt = JSON.parse(result.output).receipts[0];
+      assert.equal(calls, 1); assert.equal(result.exitCode, 1);
+      assert.equal(result.report.status, 'blocked'); assert.equal(result.report.complete, false);
+      assert.equal(receipt.status, 'blocked');
+      assert.equal(receipt.reason, code === 'ENOENT' ? 'command_error' : code);
+      assert.equal(receipt.exitCode, 0, 'actual child exit is metadata, never proof that a stopped command passed');
+      assert.equal(receipt.durationMs, 123.5); assert.equal(receipt.outputTruncated, true);
+      assert.equal(receipt.profilePath, '/private/[REDACTED]/profile.json');
+      assert.ok(receipt.diagnostic);
+      assert.deepEqual(Object.keys(receipt.diagnostic).sort(), ['stderrTail', 'stderrTruncated', 'stdoutTail', 'stdoutTruncated']);
+      assert.equal(receipt.diagnostic.stdoutTail, 'ACTED]' + 'z'.repeat(4090));
+      assert.ok(receipt.diagnostic.stderrTail.endsWith('\nlast safe diagnostic'));
+      for (const stream of ['stdout', 'stderr']) {
+        const tail = receipt.diagnostic[`${stream}Tail`];
+        assert.ok(Buffer.byteLength(tail) <= 4096); assert.ok(tail.isWellFormed()); assert.ok(!tail.includes('\uFFFD'));
+        assert.equal(receipt.diagnostic[`${stream}Truncated`], true);
+        assert.equal(receipt[stream], undefined);
+      }
+      assert.deepEqual(Object.keys(receipt).sort(), ['args', 'command', 'diagnostic', 'durationMs', 'exitCode', 'outputTruncated', 'phase', 'profilePath', 'reason', 'status']);
+      for (const hidden of [...Object.keys(secrets), ...Object.values(secrets), '-omega', 'private-prefix-', 'private infrastructure message', 'private-stack', 'environment-snapshot', 'argv-snapshot', 'raw-output-snapshot']) assert.ok(!result.output.includes(hidden));
+    });
+  }
+});
+
+test('CI infrastructure diagnostics reject malformed metadata and preserve unknown null exits', async () => {
+  for (const metadata of [
+    { exitCode: null, durationMs: NaN, outputTruncated: 'private-flag', profilePath: { hidden: 'private-path' } },
+    { exitCode: -1, durationMs: -1, outputTruncated: { hidden: 'private-flag' }, profilePath: 'p'.repeat(4097) },
+    { exitCode: 'private-exit', durationMs: 'private-duration', profilePath: 123 },
+    { exitCode: Infinity, durationMs: Infinity }
+  ]) {
+    const p = ports({ execute: undefined, runProfiledCommand: async () => {
+      throw Object.assign(new Error('private-message'), { code: 'untrusted-code', stdout: 'safe diagnostic', stderr: 42, ...metadata });
+    } });
+    const result = await ciCli(['run', '--tier', 'L2', '--json'], p.dependencies);
+    const receipt = JSON.parse(result.output).receipts[0];
+    assert.equal(result.exitCode, 1); assert.equal(result.report.status, 'blocked'); assert.equal(result.report.complete, false);
+    assert.equal(receipt.reason, 'command_error'); assert.equal(receipt.exitCode, null);
+    assert.ok(Number.isFinite(receipt.durationMs) && receipt.durationMs >= 0);
+    assert.equal(receipt.profilePath, undefined); assert.equal(receipt.outputTruncated, undefined);
+    assert.equal(receipt.diagnostic.stdoutTail, 'safe diagnostic'); assert.equal(receipt.diagnostic.stderrTail, '');
+    assert.doesNotMatch(result.output, /private-|untrusted-code/);
+  }
+  const p = ports({ execute: async () => { throw Object.assign(new Error('private-message'), { code: 'timeout' }); } });
+  const result = await ciCli(['run', '--tier', 'L2', '--json'], p.dependencies);
+  const receipt = result.report.receipts[0];
+  assert.equal(result.exitCode, 1); assert.equal(result.report.status, 'blocked'); assert.equal(result.report.complete, false);
+  assert.equal(receipt.exitCode, null); assert.equal(receipt.diagnostic, undefined);
+  assert.doesNotMatch(result.output, /private-message/);
+});
+
 test('CI passing and incomplete processes omit diagnostics and preserve typed infrastructure failures', async () => {
   for (const profile of [false, true]) {
     for (const code of [0, null, -1, NaN]) {
@@ -480,7 +560,9 @@ test('CI passing and incomplete processes omit diagnostics and preserve typed in
       assert.equal(r.exitCode, 1); assert.equal(r.report.status, 'blocked'); assert.equal(r.report.complete, false);
       assert.equal(r.report.receipts[0].reason, code === 'ENOENT' ? 'command_error' : code);
       assert.equal(r.report.receipts[0].profilePath, '/private/profile.json');
-      assert.equal(r.report.receipts[0].diagnostic, undefined); assert.doesNotMatch(r.output, /invented process stderr|private infrastructure error/);
+      assert.equal(r.report.receipts[0].exitCode, null);
+      assert.equal(r.report.receipts[0].diagnostic.stderrTail, 'invented process stderr');
+      assert.doesNotMatch(r.output, /private infrastructure error/);
     }
   }
 });
