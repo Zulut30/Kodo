@@ -1,0 +1,64 @@
+{
+  "schemaVersion": 1,
+  "version": 1,
+  "productRoots": [
+    "src"
+  ],
+  "modules": [
+    {
+      "id": "domain",
+      "roots": [
+        "src/domain"
+      ],
+      "layer": "domain",
+      "public": [
+        "src/domain/index.mjs"
+      ],
+      "allow": []
+    },
+    {
+      "id": "routes",
+      "roots": [
+        "src/routes"
+      ],
+      "layer": "routes",
+      "public": [
+        "src/routes/index.mjs"
+      ],
+      "allow": [
+        "services"
+      ]
+    },
+    {
+      "id": "services",
+      "roots": [
+        "src/services"
+      ],
+      "layer": "services",
+      "public": [
+        "src/services/index.mjs"
+      ],
+      "allow": [
+        "domain"
+      ]
+    }
+  ],
+  "layers": {
+    "domain": [],
+    "routes": [
+      "services"
+    ],
+    "services": [
+      "domain"
+    ]
+  },
+  "forbiddenImports": [],
+  "cycles": "forbid",
+  "contracts": "architecture.contracts.json",
+  "baseline": [],
+  "exceptions": [],
+  "protectedPaths": [
+    "architecture.contracts.json",
+    "architecture.policy.json"
+  ]
+}

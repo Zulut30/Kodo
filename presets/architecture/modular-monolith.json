@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 1,
+  "version": 1,
+  "productRoots": [
+    "src"
+  ],
+  "modules": [
+    {
+      "id": "app",
+      "roots": [
+        "src/app"
+      ],
+      "layer": "app",
+      "public": [
+        "src/app/index.mjs"
+      ],
+      "allow": [
+        "core"
+      ]
+    },
+    {
+      "id": "core",
+      "roots": [
+        "src/core"
+      ],
+      "layer": "core",
+      "public": [
+        "src/core/index.mjs"
+      ],
+      "allow": []
+    }
+  ],
+  "layers": {
+    "app": [
+      "core"
+    ],
+    "core": []
+  },
+  "forbiddenImports": [],
+  "cycles": "forbid",
+  "contracts": "architecture.contracts.json",
+  "baseline": [],
+  "exceptions": [],
+  "protectedPaths": [
+    "architecture.contracts.json",
+    "architecture.policy.json"
+  ]
+}

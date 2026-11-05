@@ -61,9 +61,10 @@ for (const stage of ['plan', 'review', 'node']) test(`Engine ${stage} envelope p
     fx.engine.verificationGates = async (...args) => {
       await gates(...args);
       // Synthetic disabled-receipt metadata exercises the second JSON envelope;
-      // this makes no claim about a live UI/security gate or filesystem path.
+      // this makes no claim about a live UI/security/architecture gate or filesystem path.
       fx.run.uiVerification.evidenceRoot = quoted + ' ' + known;
       fx.run.securityChecks.evidenceRoot = code + ' ' + shaped;
+      fx.run.architectureChecks.evidenceRoot = quoted + ' ' + code + ' ' + known + ' ' + shaped;
     };
   }
   if (stage === 'plan') await fx.engine.plan(fx.run);
@@ -90,15 +91,24 @@ for (const stage of ['plan', 'review', 'node']) test(`Engine ${stage} envelope p
   assert.ok(!request.prompt.includes(quotedSecret)); assert.ok(!sent.includes(JSON.stringify(quotedSecret).slice(1, -1)));
   if (stage === 'review') {
     const gates = jsonLine(request.prompt, 'Gate evidence: ');
-    assert.deepEqual(gates.map(row => row.status), ['disabled', 'disabled']);
-    assert.deepEqual(gates.map(row => row.evidenceRoot), [quoted + ' [REDACTED]', code + ' [REDACTED]']);
+    assert.deepEqual(gates.map(row => row.status), ['disabled', 'disabled', 'disabled']);
+    assert.deepEqual(gates.map(row => row.evidenceRoot), [quoted + ' [REDACTED]', code + ' [REDACTED]', quoted + ' ' + code + ' [REDACTED] [REDACTED]']);
+    assert.equal(gates[2].headSha, fx.baseSha);
+    assert.equal(gates[2].configHash, sha('{"enabled":false}'));
+    assert.equal(fx.run.architectureChecks.passed, null, 'disabled architecture evidence remains neutral');
   }
   for (const reference of attempt.evidence) {
     const full = await readEvidence(reference.path, fx.baseSha);
     assert.doesNotMatch(JSON.stringify(full), /fixture-sensitive-value|sk-proj-|private-suffix/);
     await fx.engine.assertEvidence(reference);
     if (full.kind === 'analysis') assert.equal(full.value.summary, quoted + '\n' + code);
-    if (full.kind === 'review') assert.equal(full.value.plan.summary, quoted);
+    if (full.kind === 'review') {
+      assert.equal(full.value.plan.summary, quoted);
+      assert.deepEqual(full.value.gates[2], {
+        schemaVersion: 1, status: 'disabled', passed: null, headSha: fx.baseSha, baseSha: fx.baseSha,
+        configHash: sha('{"enabled":false}'), evidenceRoot: quoted + ' ' + code + ' [REDACTED] [REDACTED]'
+      });
+    }
   }
   if (stage === 'node') {
     const reference = attempt.evidence.find(ref => path.basename(ref.path).startsWith('node-contract-'));

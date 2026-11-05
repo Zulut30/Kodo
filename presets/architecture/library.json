@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 1,
+  "version": 1,
+  "productRoots": [
+    "src"
+  ],
+  "modules": [
+    {
+      "id": "api",
+      "roots": [
+        "src/api"
+      ],
+      "layer": "api",
+      "public": [
+        "src/api/index.mjs"
+      ],
+      "allow": [
+        "internal"
+      ]
+    },
+    {
+      "id": "internal",
+      "roots": [
+        "src/internal"
+      ],
+      "layer": "internal",
+      "public": [
+        "src/internal/index.mjs"
+      ],
+      "allow": []
+    }
+  ],
+  "layers": {
+    "api": [
+      "internal"
+    ],
+    "internal": []
+  },
+  "forbiddenImports": [],
+  "cycles": "forbid",
+  "contracts": "architecture.contracts.json",
+  "baseline": [],
+  "exceptions": [],
+  "protectedPaths": [
+    "architecture.contracts.json",
+    "architecture.policy.json"
+  ]
+}

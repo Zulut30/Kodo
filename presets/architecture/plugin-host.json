@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 1,
+  "version": 1,
+  "productRoots": [
+    "src"
+  ],
+  "modules": [
+    {
+      "id": "host",
+      "roots": [
+        "src/host"
+      ],
+      "layer": "host",
+      "public": [
+        "src/host/index.mjs"
+      ],
+      "allow": []
+    },
+    {
+      "id": "plugin",
+      "roots": [
+        "src/plugins/example"
+      ],
+      "layer": "plugin",
+      "public": [
+        "src/plugins/example/index.mjs"
+      ],
+      "allow": [
+        "host"
+      ]
+    }
+  ],
+  "layers": {
+    "host": [],
+    "plugin": [
+      "host"
+    ]
+  },
+  "forbiddenImports": [],
+  "cycles": "forbid",
+  "contracts": "architecture.contracts.json",
+  "baseline": [],
+  "exceptions": [],
+  "protectedPaths": [
+    "architecture.contracts.json",
+    "architecture.policy.json"
+  ]
+}

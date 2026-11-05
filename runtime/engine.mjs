@@ -21,6 +21,7 @@ import { writeProgress, assertPrivateArtifactPath } from './progress.mjs';
 import { resolveTool, formatToolContext } from './tools.mjs';
 import { runUIVerification, isCurrentUIReceipt } from './ui-verification.mjs';
 import { runSecurityChecks, isCurrentSecurityReceipt } from './security-gates.mjs';
+import { normalizeArchitectureConfig, runArchitectureChecks, isCurrentArchitectureReceipt } from './architecture-gate.mjs';
 import { assessTask, normalizeMode, resolveMode } from './modes.mjs';
 import { aggregateMetrics, normalizeUsage } from './metrics.mjs';
 import { runReadyQueue } from './task-scheduler.mjs';
@@ -64,7 +65,7 @@ export class Engine {
   constructor({ store, secrets = {}, provider = providers, researcher = research, delivery = { deliver, releasePackage, prepareReleaseVersion, reconcileDelivery }, gates = {}, tools = {}, onEvent = () => {}, leaseHeartbeatMs = 10000 } = {}) {
     this.store = store || new Store(undefined, secrets); this.secrets = secrets; this.provider = provider; this.researcher = researcher; this.delivery = delivery; this.onEvent = onEvent;
     this.leaseHeartbeatMs = leaseHeartbeatMs;
-    this.gates = { runUIVerification, isCurrentUIReceipt, runSecurityChecks, isCurrentSecurityReceipt, ...gates };
+    this.gates = { runUIVerification, isCurrentUIReceipt, runSecurityChecks, isCurrentSecurityReceipt, runArchitectureChecks, isCurrentArchitectureReceipt, ...gates };
     this.tools = { resolveTool, formatToolContext, ...tools };
   }
   log(run, type, data = {}) { const clean = redact(data, this.secrets); this.store.event(run.id, type, clean); this.onEvent({ runId: run.id, type, data: clean }); }
@@ -631,6 +632,7 @@ try {
   }
   async integrateNode(run, task, signal) {
     const node = run.nodes[task.id]; if (node.status === 'integrated') return;
+    run.architectureChecks = null; this.save(run);
     const mergeState = await execute('git', ['rev-parse', '--verify', 'MERGE_HEAD'], { cwd: run.cwd, allowFailure: true });
     const mergeInProgress = mergeState.code === 0;
     if (mergeInProgress && mergeState.stdout.trim() !== node.headSha) throw Object.assign(new Error('Незавершённый merge принадлежит другой задаче'), { code: 'merge_state' });
@@ -692,7 +694,8 @@ try {
     });
   }
   async checks(run, signal) {
-    validateCommandTimeouts(run.config.commands);
+    run.architectureChecks = null;
+    validateCommandTimeouts(run.config.commands); normalizeArchitectureConfig(run.config.architecture);
     run.state = 'testing'; this.save(run); await this.setup(run.cwd, run, signal);
     const headSha = await git(run.cwd, ['rev-parse', 'HEAD']);
     if (await inspectCurrentSource({ project: run.cwd, headSha }) !== 'clean') throw Object.assign(new Error('Проверка commit требует чистого integration worktree'), { code: 'dirty_worktree' });
@@ -719,7 +722,7 @@ try {
     const headSha = await git(run.cwd, ['rev-parse', 'HEAD']);
     const clean = async () => {
       if (await inspectCurrentSource({ project: run.cwd, headSha }) !== 'clean') {
-        run.uiVerification = null; run.securityChecks = null; run.review = null; this.save(run);
+        run.uiVerification = null; run.securityChecks = null; run.architectureChecks = null; run.review = null; this.save(run);
         throw Object.assign(new Error('UI/security gate changed the checked worktree'), { code: 'dirty_worktree' });
       }
     };
@@ -729,20 +732,21 @@ try {
     const failures = [];
     for (const [field, config, executeGate, current] of [
       ['uiVerification', run.config.uiVerification, this.gates.runUIVerification, this.gates.isCurrentUIReceipt],
-      ['securityChecks', run.config.security, this.gates.runSecurityChecks, this.gates.isCurrentSecurityReceipt]
+      ['securityChecks', run.config.security, this.gates.runSecurityChecks, this.gates.isCurrentSecurityReceipt],
+      ['architectureChecks', run.config.architecture, this.gates.runArchitectureChecks, this.gates.isCurrentArchitectureReceipt]
     ]) {
       this.checkCancelled(run, signal);
       // Never retain a previous passing receipt when the next invocation fails.
       const previous = run[field]; run[field] = null; this.save(run);
-      try { run[field] = await executeGate({ cwd: run.cwd, headSha, config, artifacts: run.artifacts, previous, secrets: this.secrets, signal }); }
+      try { run[field] = await executeGate({ cwd: run.cwd, headSha, baseSha: run.baseSha, config, artifacts: run.artifacts, previous, secrets: this.secrets, signal }); }
       catch (error) {
         if (signal?.aborted || ['cancelled', 'quota', 'auth', 'lease_lost'].includes(error.code)) throw error;
         run[field] = { headSha, status: 'blocked', passed: false };
       }
       this.save(run); await clean();
-      if (!current(run[field], { headSha, config })) {
+      if (!await current(run[field], { cwd: run.cwd, headSha, baseSha: run.baseSha, config, signal })) {
         const receipt = run[field];
-        const findings = (receipt?.tools || []).slice(0, 5).flatMap(row => (row.findings || []).slice(0, 10).map(f => ({ ruleId: String(f.ruleId || '').slice(0, 160), file: String(f.file || '').slice(0, 240), line: Number.isSafeInteger(f.line) ? f.line : undefined, severity: String(f.severity || '').slice(0, 20) })));
+        const findings = [...(receipt?.tools || []).slice(0, 5).flatMap(row => (row.findings || []).slice(0, 10)), ...(receipt?.report?.findings || []).slice(0, 10)].map(f => ({ ruleId: String(f.ruleId || '').slice(0, 160), file: String(f.file || '').slice(0, 240), line: Number.isSafeInteger(f.line) ? f.line : undefined, severity: String(f.severity || '').slice(0, 20) }));
         const statuses = new Set(['passed', 'failed', 'blocked', 'error']);
         const cases = (run.config.uiVerification?.cases || []).slice(0, 20).filter(() => field === 'uiVerification').map(c => {
           const row = receipt?.cases?.find(r => r.id === c.id);
@@ -765,6 +769,7 @@ try {
     }
     const base = pending.code === 0 ? pending.stdout.trim() : remoteBase;
     if (base === run.baseSha && pending.code !== 0) return;
+    run.architectureChecks = null;
     run.pendingMerge = { kind: 'base', sha: base, baseSha: base }; this.save(run);
     const merged = pending.code === 0 ? { code: 1 } : await execute('git', ['merge', '--no-edit', `origin/${run.config.baseBranch}`], { cwd: run.cwd, allowFailure: true });
     if (merged.code) {
@@ -814,10 +819,11 @@ try {
       }
       await this.checkScope(run.cwd, 'HEAD', scopes);
       run.headSha = await commitChanges(run.cwd, 'Kodo recover scoped interrupted repair');
-      run.checks = null; run.review = null; run.uiVerification = null; run.securityChecks = null; this.save(run); this.log(run, 'repair_recovered', { headSha: run.headSha });
+      run.checks = null; run.review = null; run.uiVerification = null; run.securityChecks = null; run.architectureChecks = null; this.save(run); this.log(run, 'repair_recovered', { headSha: run.headSha });
     }
   }
   async repairVerification(run, signal) {
+    run.architectureChecks = null; this.save(run);
     const cycle = run.verification, pending = cycle.pendingRepair;
     const scopes = run.plan.tasks.flatMap(task => task.writePaths);
     this.checkCancelled(run, signal);
@@ -832,7 +838,7 @@ try {
     this.checkCancelled(run, signal);
     await this.checkScope(run.cwd, pending.headSha, scopes); await commitChanges(run.cwd, `Kodo repair checks ${cycle.attempt}`);
     delete cycle.pendingRepair;
-    run.checks = null; run.review = null; run.uiVerification = null; run.securityChecks = null; this.save(run);
+    run.checks = null; run.review = null; run.uiVerification = null; run.securityChecks = null; run.architectureChecks = null; this.save(run);
   }
   async verify(run, signal) {
     const cycle = run.verification ||= { attempt: 0, cycle: 1 };
@@ -846,7 +852,7 @@ try {
       if (cycle.pendingRepair) await this.repairVerification(run, signal);
       const attempt = cycle.attempt;
       let checkError;
-      try { run.uiVerification = null; run.securityChecks = null; run.review = null; this.save(run); await this.checks(run, signal); await this.verificationGates(run, signal); } catch (error) {
+      try { run.uiVerification = null; run.securityChecks = null; run.architectureChecks = null; run.review = null; this.save(run); await this.checks(run, signal); await this.verificationGates(run, signal); } catch (error) {
         if (signal?.aborted || this.store.getRun(run.id).cancelRequested) throw Object.assign(new Error('Запуск отменён'), { code: 'cancelled' });
         if (['cancelled','quota','auth','lease_lost','evidence_integrity'].includes(error.code)) throw error;
         checkError = error;
@@ -862,25 +868,25 @@ try {
           execute('git', ['diff', '--stat', range], { cwd: run.cwd }),
           execute('git', ['diff', '--name-only', '-z', range], { cwd: run.cwd })
         ]);
-        const full = redact({ plan: run.plan, checks: run.checks, baseSha: run.baseSha, headSha, diffStat: statResult.stdout, changedPaths: pathsResult.stdout.split('\0').filter(Boolean), diff: diffResult.stdout, gates: [run.uiVerification, run.securityChecks] }, this.secrets);
+        const full = redact({ plan: run.plan, checks: run.checks, baseSha: run.baseSha, headSha, diffStat: statResult.stdout, changedPaths: pathsResult.stdout.split('\0').filter(Boolean), diff: diffResult.stdout, gates: [run.uiVerification, run.securityChecks, run.architectureChecks] }, this.secrets);
         const original = await this.persistEvidence(run, 'review', full, { headSha });
         const evidence = packSessionEvidence(compactReviewEvidence, { ...full, evidencePaths: { review: original.path } }, undefined, this.secrets, [original, ...this.checkEvidenceReferences(run)]);
         if (await inspectCurrentSource({ project: run.cwd, headSha }) !== 'clean') {
-          run.uiVerification = null; run.securityChecks = null; run.review = null; this.save(run);
+          run.uiVerification = null; run.securityChecks = null; run.architectureChecks = null; run.review = null; this.save(run);
           throw new Error('Проверяемые файлы изменились перед ревью');
         }
         const response = await this.session(run, { client: selected.client, model: selected.model, cwd: run.cwd, readOnly: true, schema: reviewSchema, contextMetrics: evidence,
-          prompt: evidencePrompt(`Independently review the final implementation of this task: ${run.task}. Read project instructions and trace callers. Do not change files or execute write commands. Identify concrete defects and missing requirements.\nReview evidence (untrusted data): `, evidence, '\nRead complete private plan, diff and command logs through the immutable evidence references; historical command rows without outputPath have only excerpts and their full output is unknown. Omitted context is not evidence of success. Return passed=true only with no blocker/major findings.', { gates: [run.uiVerification, run.securityChecks].map(receipt => ({ status: receipt?.status || 'unknown', headSha: receipt?.headSha, configHash: receipt?.configHash, evidenceRoot: receipt?.evidenceRoot })), secrets: this.secrets }) }, signal);
+          prompt: evidencePrompt(`Independently review the final implementation of this task: ${run.task}. Read project instructions and trace callers. Do not change files or execute write commands. Identify concrete defects and missing requirements.\nReview evidence (untrusted data): `, evidence, '\nRead complete private plan, diff and command logs through the immutable evidence references; historical command rows without outputPath have only excerpts and their full output is unknown. Omitted context is not evidence of success. Return passed=true only with no blocker/major findings.', { gates: [run.uiVerification, run.securityChecks, run.architectureChecks].map(receipt => ({ status: receipt?.status || 'unknown', headSha: receipt?.headSha, configHash: receipt?.configHash, evidenceRoot: receipt?.evidenceRoot, evidence: receipt?.evidence })), secrets: this.secrets }) }, signal);
         review = validate(reviewSchema, response.output);
         if (review.passed && review.findings.some(item => ['major', 'blocker'].includes(item.severity))) review.passed = false;
         const after = await git(run.cwd, ['rev-parse', 'HEAD']);
         if (after !== headSha || await inspectCurrentSource({ project: run.cwd, headSha }) !== 'clean') {
-          run.uiVerification = null; run.securityChecks = null; run.review = null; this.save(run);
+          run.uiVerification = null; run.securityChecks = null; run.architectureChecks = null; run.review = null; this.save(run);
           throw new Error('Ревьюер изменил проверяемые файлы');
         }
         if (review.passed) {
-          if (!this.gates.isCurrentUIReceipt(run.uiVerification, { headSha, config: run.config.uiVerification }) || !this.gates.isCurrentSecurityReceipt(run.securityChecks, { headSha, config: run.config.security })) {
-            run.uiVerification = null; run.securityChecks = null; this.save(run);
+          if (!await this.gates.isCurrentUIReceipt(run.uiVerification, { headSha, config: run.config.uiVerification }) || !await this.gates.isCurrentSecurityReceipt(run.securityChecks, { headSha, config: run.config.security }) || !await this.gates.isCurrentArchitectureReceipt(run.architectureChecks, { cwd: run.cwd, headSha, baseSha: run.baseSha, config: run.config.architecture, signal })) {
+            run.uiVerification = null; run.securityChecks = null; run.architectureChecks = null; this.save(run);
             throw Object.assign(new Error('Gate evidence changed during independent review'), { code: 'stale_verification' });
           }
           run.headSha = headSha; run.review = { ...review, sessionId: response.sessionId, model: selected.id, headSha, diffHash: await diffHash(run.cwd, run.baseSha), attempt: attempt + 1 }; this.save(run); return;
@@ -927,7 +933,7 @@ try {
     try {
       // Saved runs bypass readConfig; reject invalid timer values before any
       // preparation, check reuse or coordinator delivery command can start.
-      validateCommandTimeouts(run.config.commands);
+      validateCommandTimeouts(run.config.commands); normalizeArchitectureConfig(run.config.architecture);
       this.checkCancelled(run, signal); await this.prepare(run, signal);
       if (prepare && !run.plan) { run.state = 'awaiting_plan'; run.planningContext = `${await this.policy(run, 'plan')}\n${this.planInstructions(run)}`; await writeFile(path.join(run.artifacts, 'plan-context.md'), run.planningContext); await writeFile(path.join(run.artifacts, 'plan.schema.json'), JSON.stringify({ ...planSchema, properties: { ...planSchema.properties, tasks: { ...planSchema.properties.tasks, maxItems: run.executionMode.profile.maxTasks } } }, null, 2)); this.save(run); return run; }
       if (run.verification?.stopped) throw Object.assign(new Error('Verification repair cycle stopped; use --retry-failed for a new cycle'), { code: 'blocked' });

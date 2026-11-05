@@ -8,6 +8,7 @@ import { redact, workerEnvironment } from './security.mjs';
 import { gitBoundary } from './command.mjs';
 import { isCurrentUIReceipt, uiConfigHash } from './ui-verification.mjs';
 import { isCurrentSecurityReceipt, securityConfigHash } from './security-gates.mjs';
+import { isCurrentArchitectureReceipt, architectureConfigHash } from './architecture-gate.mjs';
 
 const sha256 = value => createHash('sha256').update(value).digest('hex');
 const fail = (code, message, extra = {}) => Object.assign(new Error(message), { code, ...extra });
@@ -427,14 +428,17 @@ async function verifyReview(ctx) {
   if (ctx.review?.passed !== true || ctx.review.headSha !== head || ctx.review.diffHash !== diffHash) throw fail('stale_review', 'A passing review bound to this exact head and diff is required');
   const uiConfig = ctx.config.uiVerification ?? ctx.run.config?.uiVerification;
   const securityConfig = ctx.config.security ?? ctx.run.config?.security;
+  const architectureConfig = ctx.config.architecture ?? ctx.run.config?.architecture;
   if (ctx.run.config?.uiVerification?.enabled && uiConfigHash(uiConfig) !== uiConfigHash(ctx.run.config.uiVerification)) throw fail('stale_ui_verification', 'Delivery configuration differs from the verified run UI configuration');
   if (ctx.run.config?.security?.enabled && securityConfigHash(securityConfig) !== securityConfigHash(ctx.run.config.security)) throw fail('stale_security_checks', 'Delivery configuration differs from the verified run security configuration');
-  if (uiConfig?.enabled || securityConfig?.enabled) {
+  if (ctx.run.config?.architecture?.enabled && architectureConfigHash(architectureConfig) !== architectureConfigHash(ctx.run.config.architecture)) throw fail('stale_architecture_checks', 'Delivery configuration differs from the verified run architecture configuration');
+  if (uiConfig?.enabled || securityConfig?.enabled || architectureConfig?.enabled) {
     if ((await ctx.command('git', ['status', '--porcelain'])).trim()) throw fail('dirty_worktree', 'Delivery requires a clean checked worktree');
     if (ctx.run.checks?.headSha !== head) throw fail('stale_checks', 'Local checks must match the delivered head');
   }
   if (uiConfig?.enabled && !isCurrentUIReceipt(ctx.run.uiVerification, { headSha: head, config: uiConfig })) throw fail('stale_ui_verification', 'Current UI verification evidence is required for delivery');
   if (securityConfig?.enabled && !isCurrentSecurityReceipt(ctx.run.securityChecks, { headSha: head, config: securityConfig })) throw fail('stale_security_checks', 'Current security evidence is required for delivery');
+  if (architectureConfig?.enabled && !await isCurrentArchitectureReceipt(ctx.run.architectureChecks, { cwd: ctx.cwd, headSha: head, baseSha: ctx.run.baseSha, config: architectureConfig, signal: ctx.signal })) throw fail('stale_architecture_checks', 'Current architecture evidence is required for delivery');
   return { head, diffHash };
 }
 
@@ -524,7 +528,7 @@ export async function deliver(options) {
     }
     // CI/queue waits are outside our private evidence boundary; re-read the
     // configured gate evidence immediately before the irreversible merge.
-    if (ctx.config.uiVerification?.enabled || ctx.config.security?.enabled || ctx.run.config?.uiVerification?.enabled || ctx.run.config?.security?.enabled) await verifyReview(ctx);
+    if (ctx.config.uiVerification?.enabled || ctx.config.security?.enabled || ctx.config.architecture?.enabled || ctx.run.config?.uiVerification?.enabled || ctx.run.config?.security?.enabled || ctx.run.config?.architecture?.enabled) await verifyReview(ctx);
     return await ctx.irreversible(async () => {
       let mergeError;
       try { await ctx.command('gh', ['pr', 'merge', String(pr.number), '--repo', ctx.repository, '--squash', '--match-head-commit', head], { ignoreAbort: true }); }

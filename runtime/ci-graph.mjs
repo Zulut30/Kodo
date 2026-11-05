@@ -2,7 +2,7 @@ import path from 'node:path';
 import { lstat, open, realpath } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { isBuiltin } from 'node:module';
-import { parse } from 'acorn';
+import { inspectJavaScriptModule } from './javascript-dependencies.mjs';
 import { execute } from './command.mjs';
 import { workerEnvironment } from './security.mjs';
 import { noLinks } from './toolchains.mjs';
@@ -120,33 +120,12 @@ export async function inspectCurrentSource(input = {}) {
   } catch { return 'unknown'; }
 }
 function staticDependencies(source, file, reasons) {
-  let ast;
-  try { ast = parse(source, { ecmaVersion: 'latest', sourceType: file.endsWith('.cjs') ? 'script' : 'module', allowHashBang: true }); }
-  catch { reasons.add(`parse-error:${file}`); return []; }
-  const dependencies = [];
-  const add = node => {
-    if (node?.type === 'Literal' && typeof node.value === 'string') dependencies.push(node.value);
-    else reasons.add(`dynamic-dependency:${file}`);
-  };
-  function walk(node, parent) {
-    if (!node || typeof node !== 'object') return;
-    if (['ImportDeclaration', 'ExportNamedDeclaration', 'ExportAllDeclaration'].includes(node.type) && node.source) add(node.source);
-    if (node.type === 'ImportExpression') add(node.source);
-    if (node.type === 'CallExpression' && (node.callee?.type === 'Identifier' && node.callee.name === 'require' || node.callee?.type === 'MemberExpression' && node.callee.object?.name === 'require' && node.callee.property?.name === 'resolve')) {
-      if (node.arguments.length !== 1) reasons.add(`dynamic-dependency:${file}`); else add(node.arguments[0]);
-    }
-    // Aliased/custom loaders and eval cannot be modelled by static imports.
-    if (node.type === 'Identifier' && ['require', 'createRequire', 'eval', 'Function'].includes(node.name)) {
-      const directRequire = node.name === 'require' && (parent?.type === 'CallExpression' && parent.callee === node || parent?.type === 'MemberExpression' && parent.object === node && parent.property?.name === 'resolve');
-      if (!directRequire) reasons.add(`dynamic-dependency:${file}`);
-    }
-    for (const [key, value] of Object.entries(node)) {
-      if (key === 'type' || key === 'start' || key === 'end') continue;
-      if (Array.isArray(value)) for (const child of value) walk(child, node);
-      else if (value && typeof value === 'object') walk(value, node);
-    }
+  const inspected = inspectJavaScriptModule({ source, file });
+  for (const item of inspected.unsupported) {
+    if (item.scope !== 'dependency') continue;
+    reasons.add(`${item.reason === 'parse-error' ? 'parse-error' : 'dynamic-dependency'}:${file}`);
   }
-  walk(ast); return sorted(dependencies);
+  return sorted(inspected.dependencies.map(item => item.specifier));
 }
 function buildGraph(tree, reasons) {
   const files = new Set(tree.entries.map(entry => entry.file)), packages = new Map(), names = new Map(), edges = new Map(), publicEntries = new Set();
