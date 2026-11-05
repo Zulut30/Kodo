@@ -38,9 +38,11 @@ async function fixture(t, concurrency = 5) {
   const provider = { runSession: async () => ({ output: { complete: true } }) };
   const engine = new Engine({ store, provider });
   // Keep the actual scheduler, session admission, cancellation and shared SQLite
-  // leases. Policy/tool/environment I/O is unrelated to pool capacity.
+  // leases. Policy/tool/environment and optional knowledge I/O are unrelated
+  // to pool capacity; real knowledge integration is covered separately.
   engine.policy = async () => ''; engine.toolContext = async () => '';
   engine.resolveWorkerTools = async () => ({}); engine.executionEnvironment = async () => ({});
+  engine.nativeKnowledge = async () => ({ text: '', references: [], metrics: {} });
   engine.save = run => store.updateRun(run.id, run, { preserveCancellation: true });
   const run = store.createRun({ task: 'Five independent sessions', project, cwd: project, state: 'implementing',
     config: { concurrency, delivery: { enabled: false } }, models: [model], fixedModel: model,
