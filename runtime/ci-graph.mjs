@@ -68,9 +68,6 @@ export async function inspectCurrentSource(input = {}) {
     if (typeof project !== 'string' || !project || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(headSha || '')) return 'unknown';
     project = path.resolve(project); await noLinks(project);
     project = await realpath(project);
-    const root = path.resolve((await git(project, ['rev-parse', '--show-toplevel'])).trim());
-    await noLinks(root);
-    if (await realpath(root) !== project) return 'unknown';
     const state = async () => {
       // Porcelain v2 binds HEAD and dirty status to the same observation.
       // Optional headers are harmless, but exactly one full OID is authority.
@@ -80,8 +77,21 @@ export async function inspectCurrentSource(input = {}) {
       if (heads.length !== 1 || !/^# branch\.oid (?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(heads[0])) throw new Error('Unknown Git source HEAD');
       return heads[0].slice('# branch.oid '.length) !== headSha || records.some(row => !row.startsWith('# '));
     };
-    if (await state()) return 'dirty';
-    const entries = (await git(project, ['ls-tree', '-rz', '--full-tree', headSha])).split('\0').filter(Boolean);
+    // Overlap only metadata observations; drain every branch before evaluating
+    // root, initial state, then tree in their original authority order.
+    const [rootObservation, treeObservation, initialState] = await Promise.allSettled([
+      git(project, ['rev-parse', '--show-toplevel']),
+      git(project, ['ls-tree', '-rz', '--full-tree', headSha]),
+      state()
+    ]);
+    if (rootObservation.status === 'rejected') throw rootObservation.reason;
+    const root = path.resolve(rootObservation.value.trim());
+    await noLinks(root);
+    if (await realpath(root) !== project) return 'unknown';
+    if (initialState.status === 'rejected') throw initialState.reason;
+    if (initialState.value) return 'dirty';
+    if (treeObservation.status === 'rejected') throw treeObservation.reason;
+    const entries = treeObservation.value.split('\0').filter(Boolean);
     if (!entries.length || entries.length > 50000) return 'unknown';
     let total = 0;
     for (const entry of entries) {

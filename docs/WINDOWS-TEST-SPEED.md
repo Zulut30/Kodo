@@ -178,7 +178,51 @@ Native provider, installed/published artifact и deployment не проверя�
 Урок: наблюдать порядок child-start, а не считать порядок CLI-аргументов
 доказательством планирования; локальный barrier не заменяет полный speed test.
 
-### Текущая scoped коррекция source821: 5 ноября 2026
+### Metadata overlap sourcef0: 5 ноября 2026, приёмка pending
+
+В `inspectCurrentSource` после прежней проверки входа, links и канонического
+project одновременно запускаются root `rev-parse`, `ls-tree` закреплённого
+supplied HEAD и первая guarded state. `Promise.allSettled` дожидается всех
+ветвей; решения принимаются в прежнем порядке root → state → tree. Неверный
+root остаётся unknown, а dirty state сохраняет приоритет над ошибкой tree.
+Tracked bytes читаются только после валидных root и первой границы; весь
+bounded byte loop и последующая state со своим новым config guard сохранены.
+Это metadata-only overlap: status может обновлять Git index.
+
+Новая регрессия `Source inspection overlaps real Git processes with exactly six commands and two fresh guards`
+наблюдает настоящие PID/start/close без задержек или timing-only assertions.
+На старом `f0c06014…`: RED exit1, peak1, ровно6 команд/config2; после узкой
+коррекции: GREEN exit0, peak3, те же6/config2. Отдельные случаи проверяют
+drainage отклонённых ветвей, root/dirty/tree precedence, malformed responses,
+nonrepository, отсутствие раннего чтения bytes и свежую финальную границу.
+Удержание close notification применяется только в изолированных built-in mocks;
+оно не является benchmark или production injection port.
+
+Единственная итоговая scoped команда на Node `v24.22.1`:
+
+```powershell
+node --test --test-reporter=tap tests/ci-graph.test.mjs tests/source-inspection-overlap.test.mjs tests/windows-speed-oracle.test.mjs tests/skill-pin-batch-oracle.test.mjs tests/project-director-oracle.test.mjs
+```
+
+Raw TAP/stderr, exit/command receipts, PID/process counts/drainage и SHA-256
+четырёх файлов изменения и трёх frozen oracles сохраняются вне Git:
+`C:/Users/zulut/AppData/Local/Kodo/runs/a54a324e-462b-4655-adc5-159f15a37ad3/source-overlap-evidence`.
+Все83 прежних тестовых файла/тела и frozen3 сохранены; новый файл даёт84.
+Default4, explicit1..8/hard8, Director60s, full1200000ms/20min, native/model
+и меньшие saved budgets не изменены. Cache и сокращение числа запросов отсутствуют.
+
+Парный BEFORE pilot координатора на f0: pause case1 PASS,19343.4761ms wall,
+255 Git calls/13626.0221ms summed process wall, исходные60s сохранены.
+Сумма child wall не является critical path. Прежний full на f0 завершился
+20-минутным timeout и не превращается в PASS. Сокращение metadata critical
+path с шести до примерно четырёх волн — гипотеза; whole-suite gain, завершённый
+full AFTER и приёмка06 не заявлены. Paired AFTER pilot, integrated full,
+fresh security/architecture, независимое review, CI и protected PR15 — у Root.
+UI disabled — neutral; native client, published artifact и deployment не проверены.
+Этапы07–13 остаются PLAN. Урок: доказывать overlap реальными start/close,
+сохраняя порядок авторитетных решений и полный drain даже при ранней ошибке.
+
+### Историческая scoped коррекция source821: 5 ноября 2026
 
 В назначенном worktree `full-suite-order` независимый literal expected order
 зафиксирован **до** изменения runner по полным66 файловым наблюдениям receipt.
