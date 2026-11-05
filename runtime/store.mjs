@@ -88,14 +88,29 @@ function readKnowledgeCapture(db, project, captureId) {
   const row = db.prepare('SELECT body FROM knowledge_captures WHERE project_key=? AND capture_id=?').get(project, captureId);
   return row ? JSON.parse(row.body) : null;
 }
-function readKnowledgeClaims(db, project, { domain, subject, limit = 200, history = false } = {}) {
+function readKnowledgeClaims(db, project, { domain, subject, limit = 200, history = false } = {}, page = false) {
   requireKnowledge(Number.isSafeInteger(limit) && limit >= 1 && limit <= 1000 && typeof history === 'boolean', 'query_invalid');
   requireKnowledge(domain === undefined || knowledgeDomains.includes(domain), 'query_invalid');
   requireKnowledge(subject === undefined || text(subject, 128), 'query_invalid');
+  if (page && !db) return { claims: [], total: 0, complete: true };
   const clauses = ['r.project_key=?'], parameters = [project];
   if (!history) clauses.push('r.revision=(SELECT MAX(latest.revision) FROM knowledge_claim_revisions latest WHERE latest.project_key=r.project_key AND latest.claim_id=r.claim_id)');
   if (domain !== undefined) { clauses.push("json_extract(r.body,'$.domain')=?"); parameters.push(domain); }
   if (subject !== undefined) { clauses.push("json_extract(r.body,'$.subject')=?"); parameters.push(subject); }
+  if (page) {
+    // Materialize identifiers only. Count and <=limit bodies share one statement's
+    // SQLite snapshot; no extra claim body is fetched to detect overflow.
+    const rows = db.prepare(`WITH matching AS MATERIALIZED (
+      SELECT r.claim_id,r.revision FROM knowledge_claim_revisions r WHERE ${clauses.join(' AND ')}
+    ), bounded AS MATERIALIZED (
+      SELECT claim_id,revision FROM matching ORDER BY revision DESC,claim_id ASC LIMIT ?
+    ) SELECT r.body,totals.total FROM (SELECT COUNT(*) AS total FROM matching) totals
+      LEFT JOIN bounded b ON 1
+      LEFT JOIN knowledge_claim_revisions r ON r.project_key=? AND r.claim_id=b.claim_id AND r.revision=b.revision
+      ORDER BY b.revision DESC,b.claim_id ASC`).all(...parameters, limit, project);
+    const claims = rows.filter(row => row.body !== null).map(row => JSON.parse(row.body)), total = rows[0].total;
+    return { claims, total, complete: total === claims.length };
+  }
   return db.prepare(`SELECT r.body FROM knowledge_claim_revisions r WHERE ${clauses.join(' AND ')} ORDER BY r.revision DESC,r.claim_id ASC LIMIT ?`)
     .all(...parameters, limit).map(row => JSON.parse(row.body));
 }
@@ -136,6 +151,7 @@ export function openKnowledgeReader(home = stateHome()) {
   return {
     findKnowledgeCapture(project, captureId) { return available ? readKnowledgeCapture(db, knowledgeProjectKey(project), captureId) : null; },
     listKnowledgeClaims(project, options = {}) { return available ? readKnowledgeClaims(db, knowledgeProjectKey(project), options) : []; },
+    listKnowledgeClaimsPage(project, options = {}) { return readKnowledgeClaims(available ? db : null, available ? knowledgeProjectKey(project) : project, options, true); },
     close() { if (db) { db.close(); db = null; } available = false; }
   };
 }
@@ -185,6 +201,7 @@ export class Store {
   lessons(project, limit = 5) { return this.db.prepare('SELECT body FROM knowledge WHERE project=? ORDER BY time DESC LIMIT ?').all(projectKey(project), limit).map(row => JSON.parse(row.body)); }
   findKnowledgeCapture(project, captureId) { return readKnowledgeCapture(this.db, knowledgeProjectKey(project), captureId); }
   listKnowledgeClaims(project, options = {}) { return readKnowledgeClaims(this.db, knowledgeProjectKey(project), options); }
+  listKnowledgeClaimsPage(project, options = {}) { return readKnowledgeClaims(this.db, knowledgeProjectKey(project), options, true); }
   appendKnowledgeCapture(input) {
     const capture = validateKnowledgeCapture(input, this.secrets);
     this.db.exec('BEGIN IMMEDIATE');

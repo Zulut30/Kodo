@@ -6,6 +6,8 @@
 
 В каноническом исходном корне читаются `research.policy.json` и `research.context.json`. CLI выбирает корень через `--project`, Engine — через сохранённый `run.project`. Источник/HEAD берётся из фактического назначенного worktree; другой worktree не получает новую идентичность проекта.
 
+Legacy run без исходного `run.project` оставляет optional KB выключенной: cwd worker не подставляется как идентичность проекта. Отсутствующая/off policy завершается до проверки snapshot-пути worker, Git и Store. Включённый путь по-прежнему требует канонического назначенного cwd и принадлежности репозиторию исходного проекта.
+
 Отсутствующая policy равна:
 
 ```json
@@ -70,13 +72,17 @@ kodo knowledge inspect [--subject TEXT] [--context REL_JSON] [--project PATH] [-
 
 Selector — JSON Pointer, `$sha256` или `$exports` для поддерживаемого ESM через существующий inspector. Value должно совпадать с реальной выборкой; семантического extraction нет. URL — metadata: exact HTTPS origin allowlist, safe anchor/numeric HN id; credentials/sensitive parameters отвергаются, неподдерживаемый query превращается в null с unknown. URL не загружается.
 
-После проверки создаётся immutable evidence стандартного Engine envelope с path/bytes/sha256 вне Git. Candidate получает id/fingerprint; Capture — inputHash/policyHash/contextHash/capturedAt; StoredRevision добавляет schemaVersion/projectKey/captureId/revision/observedAt. Канонический SHA-256 сортирует object keys, сохраняя порядок массивов. ID связывает project/domain/subject/key/versions/source.id/synthetic; fingerprint — весь Candidate без id/fingerprint. Source.id связан с locator внутри проекта.
+После проверки создаётся immutable evidence стандартного Engine envelope с path/bytes/sha256 вне Git. Candidate получает id/fingerprint; Capture — inputHash/policyHash/contextHash/capturedAt; StoredRevision добавляет schemaVersion/projectKey/captureId/revision/observedAt. Канонический SHA-256 лексически сортирует object keys, включая числовые строки (`"10"` перед `"2"`), сохраняя порядок массивов; claims, Store и capture/context используют один алгоритм. ID связывает project/domain/subject/key/versions/source.id/synthetic; fingerprint — весь Candidate без id/fingerprint. Source.id связан с locator внутри проекта.
 
 Capture/revisions сохраняются атомарно в SQLite рядом с legacy runs/lessons. Одинаковые captureId и input/policy/context hashes возвращают прежние capturedAt/revisions: **TTL не продлевается**. Изменённый replay блокируется. Новый capture требует перечитывания источника; история сохраняется. Readonly inspect не создаёт отсутствующую DB или новые таблицы.
 
 ## Пригодность и бюджет
 
 Берётся последняя revision каждого ID. Приоритет state: `invalidated → stale → conflicted → untrusted → unknown → fresh`; все reasons сохраняются.
+
+До evidence/evaluation/projection проверяется полнота выборки. Добавочный `listKnowledgeClaimsPage(project, options)` у Store и readonly reader возвращает `{claims,total,complete}` из одного SQL-снимка: не более `limit` тел claims и общее число подходящих revisions; счётчик не требует выдачи дополнительных тел. Прежний `listKnowledgeClaims` и history/replay API сохраняются. У legacy reader без page-порта только результат строго меньше лимита доказывает полноту; точное достижение лимита без метаданных блокируется.
+
+При `maxClaims:1` один подходящий claim разрешён. Два claims из отдельных captures, в том числе конфликтующие источники при одинаковых subject/key/versions, дают `knowledge_incomplete`: CLI inspect возвращает blocked/exit1 без evaluation/projection, Native опускает optional KB и записывает причину unavailable. Лимит не повышается, обрезанная выборка не получает статус fresh. Для полного inspect можно сузить `--subject` либо явно изменить policy; refresh одного capture остаётся ограничен исходным maxClaims.
 
 | Проверка | Результат |
 | --- | --- |
@@ -141,3 +147,5 @@ node $Cli knowledge inspect --subject 'Hearthstone Standard' --context missing-v
 Последствия: явные версии, clean tracked sources и private immutable evidence обязательны; semantic external verification и широкий market/domain study отложены. Legacy research/Store/context interfaces сохранены. Примеры подтверждают локальные replay/TTL/invalidation/conflict/tamper; native subscription client, installed/published artifact и deployment ими не доказаны.
 
 Урок: replay ID не является новым наблюдением. Не обновляйте импортированные даты ради fresh и не переносите confidence в полномочия. Missing sample/population/window остаются unknown; проверяйте state/projection отдельно от успешного exit inspect.
+
+Урок bounded repair: SQL LIMIT ограничивает объём, но сам по себе не доказывает полноту для поиска конфликтов. Проверяйте count/complete того же снимка до оценки и проекции; точный singleton на cap должен проходить, overflow — явно блокироваться. Канонизацию проверяйте числовыми object keys между модулями, а совместимость legacy run — отсутствием исходного project без заимствования cwd.

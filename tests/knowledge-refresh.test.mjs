@@ -7,6 +7,23 @@ import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { loadKnowledgeContext, refreshKnowledge, checkKnowledgeEvidence } from '../runtime/knowledge-refresh.mjs';
 
+test('Numeric version keys share lexical canonical context identity with claims evaluation and capture replay', async t => {
+  const numeric = { '2': 'B', '10': 'A' };
+  const fx = await fixture(t, { context: { schemaVersion: 1, versions: numeric, synthetic: false }, capture: input({ versions: numeric }) });
+  const { evaluateClaims, normalizeClaim, sanitizeKnowledgeUrl } = await import('../runtime/knowledge-claims.mjs');
+  const loaded = await loadKnowledgeContext(fx.options, { secrets: {} });
+  const expected = '{"headSha":' + JSON.stringify(fx.head) + ',"projectKey":' + JSON.stringify(loaded.context.projectKey) + ',"synthetic":false,"versions":{"10":"A","2":"B"}}';
+  assert.equal(loaded.context.contextHash, sha(expected));
+  assert.deepEqual(evaluateClaims({ claims: [], ...loaded, now, evidenceChecks: { schemaVersion: 1, items: [] } }).rows, []);
+  const ports = { ...fx.ports, claims: { normalizeClaim, sanitizeKnowledgeUrl }, secrets: {} };
+  const saved = await refreshKnowledge(fx.options, ports);
+  assert.equal(saved.status, 'refreshed', JSON.stringify(saved));
+  const checks = await checkKnowledgeEvidence({ project: fx.project, evidenceRoot: path.join(fx.home, 'knowledge-evidence'), claims: saved.capture.claims }, ports);
+  const evaluated = evaluateClaims({ claims: saved.capture.claims, ...loaded, now, evidenceChecks: checks });
+  assert.equal(evaluated.rows[0].state, 'fresh');
+  assert.equal((await refreshKnowledge(fx.options, ports)).status, 'replayed');
+});
+
 const now = '2026-11-05T12:00:00.000Z';
 const canonical = value => JSON.stringify(value, (_, item) => item && typeof item === 'object' && !Array.isArray(item)
   ? Object.fromEntries(Object.keys(item).sort().map(key => [key, item[key]])) : item);

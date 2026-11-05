@@ -58,10 +58,10 @@ async function ownedSnapshot(project, snapshotCwd, ownedCwds, repository = true)
 
 /** Fresh fixed context -> readonly claims -> actual evidence -> evaluation -> projection. */
 export async function knowledgeSnapshot({ project, snapshotCwd = project, contextPath = null, subject, task = '', ownedCwds, now }, ports = {}) {
-  if (ownedCwds) await ownedSnapshot(project, snapshotCwd, ownedCwds, false);
+  const contextPorts = ownedCwds ? { ...ports, assertSnapshotOwnership: () => ownedSnapshot(project, snapshotCwd, ownedCwds, false) } : ports;
   // C short-circuits off before Git/Store/clock. No saved snapshot is reused.
   const load = ports.loadKnowledgeContext || loadKnowledgeContext;
-  const loaded = await load({ project, snapshotCwd, contextPath }, ports);
+  const loaded = await load({ project, snapshotCwd, contextPath }, contextPorts);
   if (!loaded.context) return { status: 'disabled', ...loaded, evaluation: null, projection: null };
   assertSafe(loaded, ports.secrets);
   await ownedSnapshot(project, snapshotCwd, ownedCwds);
@@ -69,12 +69,19 @@ export async function knowledgeSnapshot({ project, snapshotCwd = project, contex
   let reader;
   try {
     const store = ports.store || (reader = await (ports.openKnowledgeReader || (await import('./store.mjs')).openKnowledgeReader)(home));
-    const claims = await store.listKnowledgeClaims(loaded.context.projectKey, { ...(subject === undefined ? {} : { subject }), limit: loaded.policy.maxClaims });
+    const query = { ...(subject === undefined ? {} : { subject }), limit: loaded.policy.maxClaims };
+    // A capped legacy list proves completeness only when strictly below its cap.
+    // Exact-cap native Store/readonly reads use count + bodies from one SQL snapshot.
+    const page = store.listKnowledgeClaimsPage ? await store.listKnowledgeClaimsPage(loaded.context.projectKey, query) : null;
+    const claims = page ? page.claims : await store.listKnowledgeClaims(loaded.context.projectKey, query);
     assertSafe(claims, ports.secrets);
+    if (!Array.isArray(claims) || claims.length > query.limit || (page
+      ? !Number.isSafeInteger(page.total) || page.total !== claims.length || page.complete !== true
+      : claims.length >= query.limit)) throw fail('knowledge_incomplete');
     const evidenceChecks = await (ports.checkKnowledgeEvidence || checkKnowledgeEvidence)({ project, snapshotCwd, evidenceRoot: path.join(await realpath(home).catch(error => { if (error.code === 'ENOENT') return path.resolve(home); throw error; }), 'knowledge-evidence'), claims }, ports);
     const evaluatedAt = now ?? ports.now?.() ?? new Date().toISOString();
     const evaluation = evaluateClaims({ claims, ...loaded, now: evaluatedAt, evidenceChecks });
-    const current = await load({ project, snapshotCwd, contextPath }, ports);
+    const current = await load({ project, snapshotCwd, contextPath }, contextPorts);
     if (JSON.stringify(current) !== JSON.stringify(loaded)) throw fail('knowledge_context_changed');
     // A smaller configured limit is never widened. Mandatory D metadata may
     // itself exceed it; optional native context then deliberately stays absent.

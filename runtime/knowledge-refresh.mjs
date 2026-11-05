@@ -10,8 +10,12 @@ const defaults = () => ({ schemaVersion: 1, mode: 'off', sourcePaths: [], allowe
   ttlSeconds: { domain: 86400, product: 86400, technical: 604800, codebase: 3600 },
   maxClaims: 200, maxEvidenceBytes: 1048576, maxContextBytes: 2048 });
 const hashBytes = value => createHash('sha256').update(value).digest('hex');
-const canonical = value => JSON.stringify(value, (_, item) => item && typeof item === 'object' && !Array.isArray(item)
-  ? Object.fromEntries(Object.keys(item).sort().map(key => [key, item[key]])) : item);
+// Match claims/Store exactly, including lexical ordering of integer-looking keys.
+function canonical(value) {
+  if (Array.isArray(value)) return '[' + value.map(canonical).join(',') + ']';
+  if (value && typeof value === 'object') return '{' + Object.keys(value).sort().map(key => JSON.stringify(key) + ':' + canonical(value[key])).join(',') + '}';
+  return JSON.stringify(value);
+}
 const hash = value => hashBytes(canonical(value));
 const identity = value => process.platform === 'win32' ? value.toLowerCase() : value;
 const fail = (code, file = null) => { throw Object.assign(new Error(code), { knowledgeCode: code, file }); };
@@ -131,6 +135,8 @@ export async function loadKnowledgeContext({ project, snapshotCwd = project, con
   const policyBytes = await readOwned(root, 'research.policy.json', 65536, {}, true);
   const policy = policyBytes ? policyValue(parse(policyBytes, 'research.policy.json')) : defaults();
   if (policy.mode === 'off') return { policy, context: null };
+  // Native ownership checks belong after the default-off exit and before Git.
+  await ports.assertSnapshotOwnership?.();
   const secrets = ports.secrets || {};
   clean(policy, secrets);
   const file = contextPath === null ? 'research.context.json' : relative(contextPath);

@@ -7,6 +7,43 @@ import os from 'node:os';
 import path from 'node:path';
 import * as storage from '../runtime/store.mjs';
 
+test('Knowledge bounded pages distinguish empty exact-cap and overflow results without changing legacy listings', t => {
+  const f = fixture(t), absent = f.reader();
+  assert.deepEqual(absent.listKnowledgeClaimsPage(f.projectKey, { limit: 1 }), { claims: [], total: 0, complete: true });
+  assert.equal(existsSync(f.home), false);
+  const store = f.open(), first = store.appendKnowledgeCapture(capture(f.projectKey));
+  const reader = f.reader();
+  for (const port of [store, reader]) assert.deepEqual(port.listKnowledgeClaimsPage(f.projectKey, { limit: 1 }), { claims: first.claims, total: 1, complete: true });
+  const other = claim(f.projectKey, { subject: 'other', key: 'other' });
+  store.appendKnowledgeCapture(capture(f.projectKey, 'second', [other]));
+  store.appendKnowledgeCapture(capture(f.projectKey, 'revision', [claim(f.projectKey, { value: ['changed'] })]));
+  for (const port of [store, reader]) {
+    const page = port.listKnowledgeClaimsPage(f.projectKey, { limit: 1 });
+    assert.equal(page.claims.length, 1); assert.equal(page.total, 2); assert.equal(page.complete, false);
+    assert.deepEqual(page.claims, port.listKnowledgeClaims(f.projectKey, { limit: 1 }));
+    assert.equal(port.listKnowledgeClaimsPage(f.projectKey, { limit: 1, subject: 'runtime', domain: 'codebase' }).complete, true);
+    assert.deepEqual(port.listKnowledgeClaimsPage(f.projectKey, { limit: 1, subject: 'missing' }), { claims: [], total: 0, complete: true });
+    const history = port.listKnowledgeClaimsPage(f.projectKey, { limit: 1, history: true });
+    assert.equal(history.total, 3); assert.equal(history.complete, false); assert.equal(history.claims.length, 1);
+    for (const options of [{ limit: 0 }, { limit: 1001 }, { limit: 1.5 }, { history: 'yes' }, { domain: 'other' }]) assert.throws(() => port.listKnowledgeClaimsPage(f.projectKey, options));
+  }
+});
+
+test('Knowledge page bodies and completeness observe one committed capture snapshot', t => {
+  const f = fixture(t), writer = f.open();
+  const first = writer.appendKnowledgeCapture(capture(f.projectKey));
+  const reader = f.reader(), observations = [];
+  writer.db.function('observe_page_snapshot', () => {
+    observations.push(reader.listKnowledgeClaimsPage(f.projectKey, { limit: 1 })); return 1;
+  });
+  writer.db.exec('CREATE TRIGGER observe_page AFTER INSERT ON knowledge_claim_revisions BEGIN SELECT observe_page_snapshot(); END');
+  writer.appendKnowledgeCapture(capture(f.projectKey, 'next', [claim(f.projectKey, { subject: 'other' })]));
+  assert.deepEqual(observations, [{ claims: first.claims, total: 1, complete: true }]);
+  const page = reader.listKnowledgeClaimsPage(f.projectKey, { limit: 1 });
+  assert.equal(page.total, 2); assert.equal(page.complete, false); assert.equal(page.claims.length, 1);
+  writer.db.exec('DROP TRIGGER observe_page');
+});
+
 // Fixture hashing is independent of Store and uses the frozen public fields.
 const canonical = value => JSON.stringify(value, function (_key, item) {
   return item && typeof item === 'object' && !Array.isArray(item)

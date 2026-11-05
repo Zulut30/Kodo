@@ -301,6 +301,8 @@ try {
     return environment;
   }
   async nativeKnowledge(run, cwd, node, identity = node) {
+    // Legacy runs have no original project identity. A worker cwd cannot supply it.
+    if (typeof run.project !== 'string' || !run.project.trim()) return { text: '', references: [], metrics: {} };
     let snapshot;
     const assigned = node || (identity && Object.values(run.nodes || {}).find(item => item.pendingRefresh === identity));
     try {

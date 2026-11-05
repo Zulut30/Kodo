@@ -8,6 +8,39 @@ import { fileURLToPath } from 'node:url';
 import { randomUUID, createHash } from 'node:crypto';
 import { workerEnvironment } from '../runtime/security.mjs';
 
+test('CLI bounded inspection accepts a complete singleton but blocks separate conflicting captures before projection', async t => {
+  const fx = await fixture(t);
+  const rules = { ...policy, maxClaims: 1, sourcePaths: ['a.json', 'b.json'] };
+  await fx.put('research.policy.json', rules);
+  await fx.put('research.context.json', { schemaVersion: 1, versions: {}, synthetic: false });
+  for (const [name, value] of [['a', 7], ['b', 8]]) {
+    await fx.put(`${name}.json`, { value });
+    await fx.put(`${name}-input.json`, { schemaVersion: 1, captureId: name, synthetic: false, claims: [{
+      ...fx.input.claims[0], domain: 'codebase', value, versions: {}, source: { ...fx.input.claims[0].source, id: name, path: `${name}.json`, retrievedAt: null, validAsOf: null }
+    }] });
+  }
+  fx.commit();
+  assert.equal(fx.invoke(['research', 'refresh', '--input', 'a-input.json']).report.status, 'refreshed');
+  const singleton = fx.invoke(['knowledge', 'inspect']);
+  assert.equal(singleton.exitCode, 0); assert.equal(singleton.report.policy.maxClaims, 1);
+  assert.equal(singleton.report.evaluation.rows[0].state, 'fresh');
+  assert.deepEqual(singleton.report.projection.references.map(row => row.value), [7]);
+  assert.equal(fx.invoke(['research', 'refresh', '--input', 'b-input.json']).report.status, 'refreshed');
+  const { Store } = await import('../runtime/store.mjs'); const store = new Store(fx.home, {});
+  try {
+    const rows = store.listKnowledgeClaims(fx.project, { limit: 2 });
+    assert.equal(rows.length, 2); assert.deepEqual(rows.map(row => row.value).sort(), [7, 8]);
+    assert.deepEqual(rows[0].versions, rows[1].versions);
+    assert.equal(store.listKnowledgeClaims(fx.project, { limit: 1 }).length, 1, 'legacy bounded API is preserved');
+  } finally { store.close(); }
+  for (const args of [['knowledge', 'inspect'], ['knowledge', 'inspect', '--subject', 'fixture']]) {
+    const conflict = fx.invoke(args);
+    assert.equal(conflict.exitCode, 1); assert.equal(conflict.report.status, 'blocked');
+    assert.deepEqual(conflict.report.errors.map(row => row.code), ['knowledge_incomplete']);
+    assert.equal(conflict.report.evaluation, undefined); assert.equal(conflict.report.projection, undefined);
+  }
+});
+
 const cli = fileURLToPath(new URL('../cli/index.mjs', import.meta.url));
 // Fail closed and report observed Node network entry-point attempts in each CLI child.
 const networkGuard = 'data:text/javascript,' + encodeURIComponent(`
