@@ -21,6 +21,9 @@ kodo run "TASK" --client codex|claude-code [--model MODEL] [--mode quick|standar
 kodo benchmark run --models MODEL,... [--client codex|claude-code] [--mode quick|standard|deep] [--repeats N] [--seed N] [--output ABSOLUTE_DIR] [--json]
 kodo benchmark resume|report PATH [--json]
 kodo status|logs|resume|cancel RUN_ID [--json]
+kodo research status [--project PATH] [--json]
+kodo research refresh --input REL_JSON [--context REL_JSON] [--project PATH] [--json]
+kodo knowledge inspect [--subject TEXT] [--context REL_JSON] [--project PATH] [--json]
 kodo audit RUN_ID [--json]
 kodo tools list|doctor [--live] [--json]
 kodo tools install <id|all> [--json]
@@ -71,6 +74,10 @@ async function main() {
   if (!command || ['help', '--help', '-h'].includes(command)) return console.log(help);
   // Offline reports and argument errors must not initialize the runtime's
   // SQLite store or credential/provider startup path.
+  if (['research', 'knowledge'].includes(command)) {
+    const { knowledgeCli } = await import('../runtime/knowledge-cli.mjs');
+    const result = await knowledgeCli([command, ...argv]); console.log(result.output); process.exitCode = result.exitCode; return;
+  }
   if (command === 'architecture') {
     const { architectureCli } = await import('../runtime/architecture-cli.mjs');
     const controller = new AbortController(), abort = () => controller.abort();
