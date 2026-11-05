@@ -24,9 +24,9 @@ function complete(snapshot) {
     requireValue(count?.complete === true && count.total === snapshot[name]?.length && count.returned === count.total, 'snapshot_incomplete');
   }
 }
-function control(snapshot) {
+function control(snapshot, allowReleased = false) {
   complete(snapshot);
-  requireValue(!snapshot.project.paused && !['cancelled', 'failed', 'blocked', 'released'].includes(snapshot.project.status), 'control_blocked');
+  requireValue(!snapshot.project.paused && !['cancelled', 'failed', 'blocked', ...(allowReleased ? [] : ['released'])].includes(snapshot.project.status), 'control_blocked');
 }
 function storedRun(store, id) {
   // Missing is distinguished from a corrupt/closed Store. No raw DB access.
@@ -35,7 +35,7 @@ function storedRun(store, id) {
 }
 async function contractsFor(contracts) { return contracts || await import('./project-contracts.mjs'); }
 async function evidenceFor(evaluator) { return evaluator || await import('./project-evidence.mjs'); }
-async function verifyRef(engine, ref, run) {
+async function verifyRef(engine, ref, run, container = false) {
   requireValue(typeof engine.assertEvidence === 'function');
   if (run && ref.kind !== 'interface') {
     const root = await realpath(path.join(run.artifacts, 'evidence')), file = await realpath(ref.path);
@@ -45,6 +45,11 @@ async function verifyRef(engine, ref, run) {
   await engine.assertEvidence(ref);
   if (run && ['acceptance', 'contract', 'checks', 'review', 'delivery', 'release'].includes(ref.kind)) {
     const envelope = JSON.parse(await readFile(ref.path, 'utf8'));
+    if (container && ['acceptance', 'contract'].includes(ref.kind)) {
+      // Own mappings may reference independently supplied immutable observations.
+      // The generic Task success observation is never a container's own proof.
+      requireValue(!['project-acceptance', 'project-contract'].includes(envelope.kind)); return;
+    }
     requireValue(envelope.kind === `project-${ref.kind}` && isDeepStrictEqual(envelope.value, observation(run, ref.kind)));
   }
 }
@@ -62,6 +67,12 @@ async function validateRun({ store, engine, contracts, snapshot, run, publicatio
     && attempt.taskRevision === task.revision && attempt.contractHash === contracts.directorContractHash(task, options)
     && run.task === contracts.buildDirectorTaskInput({ project: snapshot.project, task }, options), 'binding_invalid');
   requireValue(await canonical(run.project) === snapshot.project.projectKey, 'root_changed');
+  for (const root of new Set([run.project, run.cwd])) {
+    const current = await readConfig(root, { client: run.client });
+    for (const field of ['commands', 'checks', 'security', 'uiVerification', 'architecture', 'repository', 'baseBranch'])
+      requireValue(isDeepStrictEqual(current[field], run.config[field]), 'config_changed');
+    if (run.fixedModel) requireValue(current.models[run.fixedModel.client]?.includes(run.fixedModel.model), 'model_unavailable');
+  }
   requireValue(!run.cancelRequested && !['cancelled', 'blocked', 'failed', 'waiting_limits'].includes(run.state), 'run_blocked');
   requireValue(await git(run.cwd, ['rev-parse', 'HEAD']) === run.headSha
     && await inspectCurrentSource({ project: run.cwd, headSha: run.headSha }) === 'clean', 'head_changed');
@@ -132,7 +143,7 @@ export function createProjectTransitionAuthorizer({ store, engine, contracts, ev
       run = storedRun(store, attempts[0].runId); requireValue(run, 'binding_invalid');
     }
     const result = await D.evaluateProjectTransition({ command, snapshot, run }, { contracts: A, knownValues: options.knownValues,
-      verifyRef: ref => verifyRef(engine, ref, run),
+      verifyRef: ref => verifyRef(engine, ref, run, !['task', 'attempt'].includes(action.kind)),
       validateRun: value => validateRun({ store, engine, contracts: A, snapshot, run: value, publication: action.to === 'released' }) });
     requireValue(result?.eligibleStates?.includes(action.to), 'transition_blocked');
   };
@@ -199,8 +210,41 @@ export function createProjectDirector({ repo, engine, planner, evaluator, clock 
     return selected;
   }
 
+  async function priorRetryRun(snapshot, attempt) {
+    if (attempt.number === 1) return null;
+    // Only metadata is examined. Never replay old provider/gate sessions. The
+    // atomic reservation events order predecessors even across an install crash.
+    const runs = new Map(store.listRuns(snapshot.project.root).filter(run => run.directorBinding?.projectId === attempt.projectId
+      && run.directorBinding.taskId === attempt.taskId && run.id !== attempt.runId).map(run => [run.directorBinding.attemptId, run]));
+    let after = 0, previous = null;
+    for (let page = 0; page < 64; page++) {
+      const history = await repo.history(attempt.projectId, { after, limit: 1000 });
+      requireValue(history.revision === snapshot.revision, 'revision_conflict');
+      for (const event of history.events) if (event.type === 'reserveAttempt' && event.entity.kind === 'attempt') {
+        if (event.entity.id === attempt.id) { requireValue(previous, 'retry_policy_missing'); return previous; }
+        if (runs.has(event.entity.id)) previous = runs.get(event.entity.id);
+      }
+      if (history.complete) break;
+      requireValue(history.nextAfter > after, 'retry_history_incomplete'); after = history.nextAfter;
+    }
+    fail('retry_history_incomplete');
+  }
+  async function retrySettings(snapshot, previous) {
+    if (!previous) return null;
+    (await ports()).contracts.assertDirectorSafe(previous, { knownValues: known(engine) });
+    requireValue(await canonical(previous.project) === snapshot.project.projectKey, 'retry_binding_invalid');
+    const model = previous.fixedModel?.model || previous.config.primaryModel || undefined;
+    const current = await readConfig(snapshot.project.root, { client: previous.client });
+    requireValue(!model || current.models[previous.client]?.includes(model), 'retry_model_unavailable');
+    return { client: previous.client, ...(model ? { model } : {}), providers: previous.providers,
+      mode: previous.requestedMode || previous.executionMode?.selected || previous.config.executionMode || 'standard',
+      concurrency: Math.min(current.concurrency, previous.config.concurrency) };
+  }
+
   async function foreground(id, options = {}) {
-    let snapshot = await snapshotFor(id); control(snapshot);
+    let snapshot = await snapshotFor(id);
+    if (snapshot.project.status === 'released') return { status: 'succeeded', projectStatus: 'released' };
+    control(snapshot);
     const token = store.acquireLease(`project:${id}`, randomUUID(), { ttlMs: 60000, limit: 1 });
     requireValue(token, 'busy');
     const controller = new AbortController(), abort = () => controller.abort();
@@ -219,11 +263,11 @@ export function createProjectDirector({ repo, engine, planner, evaluator, clock 
       catch { abort(); }
       finally { pollingBusy = false; }
     }, 250); polling.unref();
-    const guard = async (revision, attempt) => {
+    const guard = async (revision, attempt, allowReleased = false) => {
       renew(); requireValue(!leaseLost, 'lease_lost'); requireValue(!controller.signal.aborted, 'control_blocked');
       const before = await snapshotFor(id);
       requireValue(await canonical(before.project.root) === before.project.projectKey, 'root_changed');
-      const s = await snapshotFor(id); control(s); renew(); requireValue(!leaseLost, 'lease_lost');
+      const s = await snapshotFor(id); control(s, allowReleased); renew(); requireValue(!leaseLost, 'lease_lost');
       requireValue(s.revision === before.revision, 'revision_conflict');
       requireValue(revision === undefined || s.revision === revision, 'revision_conflict');
       if (attempt) requireValue(isDeepStrictEqual(s.currentAttempts.find(row => row.taskId === attempt.taskId), attempt), 'binding_changed');
@@ -233,12 +277,14 @@ export function createProjectDirector({ repo, engine, planner, evaluator, clock 
       snapshot = await guard(snapshot.revision);
       const active = snapshot.currentAttempts.filter(row => !settled(row.status) && !retryable(row.status));
       requireValue(active.length <= 1, 'multiple_active_attempts');
-      let attempt = active[0], task;
+      let attempt = active[0], task, previous = null;
       if (!attempt && options.retryFailed) {
         const candidates = snapshot.currentAttempts.filter(row => retryable(row.status));
         if (candidates.length) {
           requireValue(candidates.length === 1, 'retry_ambiguous');
           task = snapshot.tasks.find(row => row.id === candidates[0].taskId);
+          previous = storedRun(store, candidates[0].runId) || await priorRetryRun(snapshot, candidates[0]);
+          await retrySettings(snapshot, previous);
           await guard(snapshot.revision);
           attempt = (await apply(snapshot, { op: 'reserveAttempt', taskId: task.id, retryFailed: true }, options)).attempt;
           snapshot = await guard();
@@ -247,7 +293,10 @@ export function createProjectDirector({ repo, engine, planner, evaluator, clock 
       if (!attempt) {
         const horizon = await plan(id, options);
         snapshot = await guard(horizon.revision);
-        if (!horizon.taskIds.length) return { status: 'blocked', blockers: horizon.blocked };
+        if (!horizon.taskIds.length) {
+          if (snapshot.tasks.every(task => settled(task.status))) return containerResult(await advanceContainers(guard));
+          return { status: 'blocked', blockers: horizon.blocked };
+        }
         task = snapshot.tasks.find(row => row.id === horizon.taskIds[0]);
         if (task.status !== 'ready') {
           await guard(snapshot.revision);
@@ -262,11 +311,17 @@ export function createProjectDirector({ repo, engine, planner, evaluator, clock 
       const A = await ports(), input = A.contracts.buildDirectorTaskInput({ project: snapshot.project, task }, A);
       let run = storedRun(store, attempt.runId);
       if (!run) {
+        previous ||= await priorRetryRun(snapshot, attempt);
+        const retry = await retrySettings(snapshot, previous);
         const baseSha = await frontier(snapshot, task);
         snapshot = await guard(snapshot.revision, attempt);
-        run = await engine.createReserved(input, { ...options, project: snapshot.project.root, providers: options.providers || 'current', baseSha }, {
+        run = await engine.createReserved(input, { ...options, project: snapshot.project.root, providers: options.providers || 'current', ...retry, baseSha }, {
           binding: bindingFor(attempt), installRun: async value => {
             await guard(snapshot.revision, attempt);
+            if (previous) for (const field of ['researchBudget', 'repairRounds', 'concurrency', 'maxTasks']) {
+              const limit = previous.config[field] ?? previous.executionMode?.profile[field];
+              if (limit !== undefined) value.runDraft.config[field] = Math.min(value.runDraft.config[field] ?? limit, limit);
+            }
             const revision = snapshot.revision, installed = await repo.installRun(value);
             snapshot = await guard(revision + 1, attempt);
             return installed;
@@ -290,11 +345,57 @@ export function createProjectDirector({ repo, engine, planner, evaluator, clock 
       await advance(id, run, guard);
       snapshot = await guard();
       const accepted = snapshot.tasks.find(row => row.id === attempt.taskId);
+      if (settled(accepted.status) && snapshot.tasks.every(task => settled(task.status)))
+        return { ...containerResult(await advanceContainers(guard)), runId: run.id };
       return { status: settled(accepted.status) ? 'succeeded' : 'blocked', runId: run.id,
         ...(settled(accepted.status) ? {} : { blockers: ['task_acceptance_unverified'] }) };
     } finally {
       clearInterval(timer); clearInterval(polling); options.signal?.removeEventListener('abort', abort); store.releaseLease(token);
     }
+  }
+
+  function containerResult({ snapshot, blockers }) {
+    return { status: settled(snapshot.project.status) ? 'succeeded' : 'blocked', projectStatus: snapshot.project.status,
+      ...(blockers.length ? { blockers } : {}) };
+  }
+  async function advanceContainers(guard) {
+    const A = await ports(), D = await evidenceFor(evaluator), blockers = [];
+    let snapshot = await guard();
+    const entities = [...snapshot.epics.map(row => ['epic', row.id]), ...snapshot.milestones.map(row => ['milestone', row.id]), ['project', snapshot.project.projectId]];
+    for (const [kind, id] of entities) {
+      for (let step = 0; step < stages.length; step++) {
+        snapshot = await guard();
+        const record = kind === 'project' ? snapshot.project : snapshot[`${kind}s`].find(row => row.id === id);
+        if (record.status === 'released') break;
+        if (record.status === 'accepted' && !record.evidence.some(ref => ref.kind === 'release')) break;
+        const children = kind === 'project' ? snapshot.milestones : kind === 'milestone'
+          ? snapshot.epics.filter(row => row.milestoneId === id) : snapshot.tasks.filter(row => row.epicId === id);
+        if (!children.length || !children.every(row => settled(row.status))) { blockers.push(`${kind}:${id}:children_not_accepted`); break; }
+        const criteria = kind === 'project' ? record.definitionOfDone : record.acceptance;
+        const byHash = new Map(record.evidence.map(ref => [ref.sha256, ref]));
+        const ownProof = criteria.every(criterion => {
+          const mapping = record.mappings.find(row => row.criterionId === criterion.id);
+          return mapping?.refs.length && mapping.refs.every(digest => byHash.has(digest))
+            && criterion.evidenceKinds.every(type => mapping.refs.some(digest => byHash.get(digest).kind === type));
+        });
+        if (!ownProof) { blockers.push(`${kind}:${id}:own_proof_missing`); break; }
+        const ids = new Set(record.evidence.filter(ref => ['checks', 'review'].includes(ref.kind)).map(ref => ref.runId).filter(Boolean));
+        if (ids.size !== 1) { blockers.push(`${kind}:${id}:bound_run_ambiguous`); break; }
+        const run = storedRun(store, [...ids][0]);
+        if (!run) { blockers.push(`${kind}:${id}:bound_run_missing`); break; }
+        const to = record.status === 'proposed' ? 'ready' : stages[stages.indexOf(record.status) + 1];
+        if (!to) { blockers.push(`${kind}:${id}:state_blocked`); break; }
+        const c = command(snapshot, { op: 'transition', kind, id, to, evidence: record.evidence, mappings: record.mappings });
+        const result = await D.evaluateProjectTransition({ snapshot, command: c, run }, { ...A,
+          verifyRef: ref => verifyRef(engine, ref, run, true),
+          validateRun: value => validateRun({ store, engine, contracts: A.contracts, snapshot, run: value, publication: to === 'released' }) });
+        if (!result.eligibleStates.includes(to)) { blockers.push(...result.blockers.map(reason => `${kind}:${id}:${reason}`)); break; }
+        await guard(snapshot.revision);
+        await repo.apply(c);
+        if (kind === 'project' && to === 'released') return { snapshot: await guard(undefined, undefined, true), blockers };
+      }
+    }
+    return { snapshot: await guard(), blockers: [...new Set(blockers)] };
   }
 
   async function advance(id, run, guard) {
@@ -356,7 +457,7 @@ export function createProjectDirector({ repo, engine, planner, evaluator, clock 
   }
   async function resume(id, options = {}) {
     const snapshot = await snapshotFor(id);
-    requireValue(!['cancelled', 'failed', 'released'].includes(snapshot.project.status), 'control_blocked');
+    requireValue(!['cancelled', 'failed'].includes(snapshot.project.status), 'control_blocked');
     if (snapshot.project.paused) await apply(snapshot, { op: 'setPaused', paused: false }, optionsFor(options));
     return foreground(id, options);
   }

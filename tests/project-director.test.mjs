@@ -17,7 +17,7 @@ const proof = id => ({ id, text: 'The assigned file exists and passes its indepe
 const task = (id, dependsOn = []) => ({ id, epicId: 'epic', title: id, description: `Implement ${id}.`, owner: 'developer',
   dependsOn, writePaths: [`${id}.txt`], acceptance: [proof(`${id}-proof`)], interfaceRefs: [], priority: 50,
   userValue: 1, risk: 1, estimatedEffort: 1, riskApprovalRequired: false });
-async function fixture(t, { tasks = [task('first')], trusted = false } = {}) {
+async function fixture(t, { tasks = [task('first')], trusted = false, security = false } = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'kodo-project-e-'));
   const root = path.join(directory, 'repo'), home = path.join(directory, 'state'), isolated = path.join(directory, 'empty-home');
   await mkdir(root); await mkdir(isolated); await writeFile(path.join(isolated, 'gitconfig'), '');
@@ -35,7 +35,7 @@ async function fixture(t, { tasks = [task('first')], trusted = false } = {}) {
   });
   const config = { schemaVersion: 1, client: 'codex', executionMode: 'quick', maxTasks: 1, concurrency: 1,
     researchBudget: 0, repairRounds: 1, commands: { test: [{ command: process.execPath, args: ['check.mjs'] }], build: [], deploy: [], smoke: [] },
-    delivery: { enabled: false, release: false }, uiVerification: { enabled: false }, security: { enabled: false }, architecture: { enabled: false } };
+    delivery: { enabled: false, release: false }, uiVerification: { enabled: false }, security: { enabled: security }, architecture: { enabled: false } };
   await writeFile(path.join(root, 'kodo.config.json'), JSON.stringify(config));
   await writeFile(path.join(root, 'check.mjs'), "import {existsSync} from 'node:fs'; import assert from 'node:assert/strict'; assert.ok(existsSync('first.txt'));\n");
   for (const args of [['init', '-b', 'main'], ['config', 'user.name', 'Owned Project E'], ['config', 'user.email', 'project-e@example.invalid'],
@@ -43,6 +43,7 @@ async function fixture(t, { tasks = [task('first')], trusted = false } = {}) {
     await execute('git', args, { cwd: root, env: environment });
   const store = new Store(home, {}); stores.add(store);
   const engine = new Engine({ store, secrets: {}, leaseHeartbeatMs: 10 });
+  if (security) engine.gates.isCurrentSecurityReceipt = async () => true;
   const contract = await engine.persistEvidence({ artifacts: path.join(home, 'interfaces') }, 'interface', { taskBoundary: 'Owned assigned file' }, { headSha: null });
   tasks = tasks.map(row => ({ ...row, interfaceRefs: [{ kind: 'interface', runId: null, headSha: null, path: contract.path, sha256: contract.sha256 }] }));
   const authorizer = createProjectTransitionAuthorizer({ store, engine, contracts: A, evaluator: D });
@@ -105,6 +106,35 @@ test('Director explicit retry creates a new Run and preserves failed attempt his
   assert.ok(f.repo.history(f.id, { after: 0, limit: 1000 }).events.some(event => event.entity.id === first.id));
 });
 
+test('Same-task retry after reservation crash keeps the fixed model provider and lower budgets with fresh config', async t => {
+  const f = await fixture(t); await f.ready('first');
+  f.engine.run = async id => f.store.updateRun(id, { state: 'blocked' });
+  await f.director.run(f.id, { mode: 'quick', model: 'gpt-6.1-sol', providers: 'current' });
+  const prior = f.repo.snapshot(f.id).currentAttempts[0], priorRun = f.store.getRun(prior.runId);
+  await writeFile(path.join(f.root, 'kodo.config.json'), JSON.stringify({ ...f.config, executionMode: 'deep', maxTasks: 24,
+    concurrency: 5, researchBudget: 40, repairRounds: 5, security: { enabled: true } }));
+  // A restart between B reservation and E install must recover old limits from
+  // durable state, rather than depending on a variable in the previous process.
+  await f.apply({ op: 'reserveAttempt', taskId: 'first', retryFailed: true });
+  f.engine.run = async id => f.store.updateRun(id, { state: 'waiting_limits' });
+  const restarted = createProjectDirector({ repo: f.repo, engine: f.engine });
+  await restarted.resume(f.id, { mode: 'deep', model: 'gpt-6-astra', providers: 'both', concurrency: 5 });
+  const current = f.repo.snapshot(f.id).currentAttempts[0], run = f.store.getRun(current.runId);
+  assert.equal(current.number, 2); assert.notEqual(run.id, priorRun.id);
+  assert.deepEqual(run.fixedModel, priorRun.fixedModel); assert.equal(run.providers, 'current'); assert.equal(run.requestedMode, 'quick');
+  for (const key of ['researchBudget', 'repairRounds', 'concurrency', 'maxTasks']) assert.equal(run.config[key], priorRun.config[key]);
+  assert.equal(run.config.security.enabled, true, 'Fresh policy cannot inherit a disabled gate or old PASS');
+});
+
+test('Retry blocks before installing when the prior fixed model was removed from current allowlist', async t => {
+  const f = await fixture(t); await f.ready('first');
+  f.engine.run = async id => f.store.updateRun(id, { state: 'blocked' });
+  await f.director.run(f.id, { mode: 'quick', model: 'gpt-6.1-sol' });
+  await writeFile(path.join(f.root, 'kodo.config.json'), JSON.stringify({ ...f.config, models: { codex: ['gpt-6-astra'] } }));
+  await assert.rejects(() => f.director.resume(f.id, { retryFailed: true }), { code: 'project_retry_model_unavailable' });
+  assert.equal(f.store.db.prepare('SELECT count(*) AS n FROM runs').get().n, 1);
+});
+
 test('Director pause or lost lease during reserved initialization prevents atomic install and dispatch', async t => {
   for (const interruption of ['pause', 'lease']) await t.test(interruption, async sub => {
     const f = await fixture(sub); await f.ready('first');
@@ -134,6 +164,7 @@ async function checkedRun(f, id, file) {
   await f.engine.checks(run);
   run.review = { passed: true, findings: [], sessionId: 'owned-independent-review', headSha: run.headSha,
     diffHash: await diffHash(run.cwd, run.baseSha) };
+  if (run.config.security.enabled) run.securityChecks = { status: 'passed', passed: true, headSha: run.headSha };
   run.state = 'succeeded'; f.engine.save(run); return run;
 }
 
@@ -152,18 +183,41 @@ test('Trusted acceptance and owned Git restart preserve the first local task fil
   const restarted = createProjectDirector({ repo: f.repo, engine: f.engine });
   f.engine.run = id => checkedRun(f, id, 'second');
   await f.ready('second');
-  assert.equal((await restarted.resume(f.id)).status, 'succeeded');
+  const finalTask = await restarted.resume(f.id);
+  assert.equal(finalTask.status, 'blocked');
+  assert.ok(finalTask.blockers.includes('epic:epic:own_proof_missing'));
   snapshot = f.repo.snapshot(f.id);
   const second = snapshot.currentAttempts.find(row => row.taskId === 'second'), secondRun = f.store.getRun(second.runId);
   assert.equal(secondRun.baseSha, firstRun.headSha);
   assert.equal(await readFile(path.join(secondRun.cwd, 'first.txt'), 'utf8'), 'accepted dependency\n');
   assert.equal(snapshot.tasks.find(row => row.id === 'second').status, 'accepted');
+  // Completed task counts alone cannot accept a container. Explicit own proof
+  // may arrive later; foreground resume must then advance without any new Run.
+  const totalRuns = f.store.db.prepare('SELECT count(*) AS n FROM runs').get().n;
+  const own = await f.engine.persistEvidence(secondRun, 'acceptance', {
+    observed: { first: await readFile(path.join(secondRun.cwd, 'first.txt'), 'utf8'),
+      second: await readFile(path.join(secondRun.cwd, 'second.txt'), 'utf8') },
+    criteria: ['epic-proof', 'milestone-proof', 'project-proof']
+  }, { headSha: secondRun.headSha });
+  const ownRef = { kind: 'acceptance', runId: secondRun.id, headSha: secondRun.headSha, path: own.path, sha256: own.sha256 };
+  const checksReview = snapshot.tasks.find(row => row.id === 'second').evidence.filter(ref => ['checks', 'review'].includes(ref.kind));
+  for (const [kind, entity, criterionId] of [['epic', 'epic', 'epic-proof'], ['milestone', 'milestone', 'milestone-proof'], ['project', f.id, 'project-proof']]) {
+    await f.transition(kind, entity, 'ready', [ownRef, ...checksReview], [{ criterionId, refs: [ownRef.sha256],
+      actor: 'owned-container-reviewer', reason: 'Observed both required files through explicit own criterion evidence' }]);
+  }
+  f.engine.run = async () => { assert.fail('Container-only resume cannot restart a task Run'); };
+  const completed = await restarted.resume(f.id);
+  assert.equal(completed.status, 'succeeded'); assert.equal(completed.projectStatus, 'accepted');
+  snapshot = f.repo.snapshot(f.id);
+  assert.equal(snapshot.epics[0].status, 'accepted'); assert.equal(snapshot.milestones[0].status, 'accepted');
+  assert.equal(snapshot.project.status, 'accepted');
+  assert.equal(f.store.db.prepare('SELECT count(*) AS n FROM runs').get().n, totalRuns);
   // Existing direct create still uses the actual user checkout, not a hidden frontier.
   assert.equal((await f.engine.create('Legacy caller', { project: f.root })).baseSha, await git(f.root, ['rev-parse', 'HEAD']));
 });
 
 test('Production authorizer awaits enabled gate freshness and rejects stale logs or changed actual HEAD', async t => {
-  const f = await fixture(t, { trusted: true }); await f.ready('first');
+  const f = await fixture(t, { trusted: true, security: true }); await f.ready('first');
   f.engine.run = id => checkedRun(f, id, 'first');
   await f.director.run(f.id);
   const snapshot = f.repo.snapshot(f.id), attempt = snapshot.currentAttempts[0], stored = f.store.getRun(attempt.runId);
@@ -174,14 +228,18 @@ test('Production authorizer awaits enabled gate freshness and rejects stale logs
   const c = f.c(snapshot, { op: 'transition', kind: 'task', id: 'first', to: 'accepted', evidence: refs, mappings });
   let entered, release;
   const waiting = new Promise(resolve => { entered = resolve; }), gate = new Promise(resolve => { release = resolve; });
-  stored.config.security.enabled = true; stored.securityChecks = { status: 'passed', passed: true, headSha: stored.headSha };
-  f.store.updateRun(stored.id, stored);
   f.engine.gates.isCurrentSecurityReceipt = async () => { entered(); await gate; return false; };
   let finished = false;
   const authorization = f.authorizer({ command: c, snapshot }).finally(() => { finished = true; });
   await Promise.race([waiting, authorization]); assert.equal(finished, false); release();
   await assert.rejects(() => authorization, { code: 'project_transition_blocked' });
-  stored.config.security.enabled = false; f.store.updateRun(stored.id, stored);
+  f.engine.gates.isCurrentSecurityReceipt = async () => true;
+  const configText = await readFile(path.join(f.root, 'kodo.config.json'), 'utf8');
+  await writeFile(path.join(f.root, 'kodo.config.json'), JSON.stringify({ ...f.config, commands: {
+    ...f.config.commands, test: [{ command: process.execPath, args: ['new-required-check.mjs'] }]
+  } }));
+  await assert.rejects(() => f.authorizer({ command: c, snapshot }), { code: 'project_transition_blocked' });
+  await writeFile(path.join(f.root, 'kodo.config.json'), configText);
   const log = await readFile(stored.checks.results[0].outputPath);
   await writeFile(stored.checks.results[0].outputPath, '{}');
   await assert.rejects(() => f.authorizer({ command: c, snapshot }), { code: 'project_transition_blocked' });
@@ -189,6 +247,38 @@ test('Production authorizer awaits enabled gate freshness and rejects stale logs
   await writeFile(path.join(stored.cwd, 'unreviewed.txt'), 'Unreviewed change\n');
   await git(stored.cwd, ['add', 'unreviewed.txt']); await git(stored.cwd, ['commit', '-m', 'Owned stale-head observation']);
   await assert.rejects(() => f.authorizer({ command: c, snapshot }), { code: 'project_transition_blocked' });
+});
+
+test('Director returns final confirmed release and repeated resume is read-only without restarting a Run', async t => {
+  const f = await fixture(t); await f.ready('first');
+  const attempt = (await f.apply({ op: 'reserveAttempt', taskId: 'first', retryFailed: false })).attempt;
+  const snapshot = f.repo.snapshot(f.id), head = await git(f.root, ['rev-parse', 'HEAD']);
+  snapshot.currentAttempts[0].status = 'released'; snapshot.tasks[0].status = 'released';
+  for (const record of [snapshot.epics[0], snapshot.milestones[0], snapshot.project]) record.status = 'accepted';
+  const refs = ['acceptance', 'checks', 'review', 'release'].map((kind, index) => ({ kind, runId: attempt.runId, headSha: head,
+    path: path.join(f.home, 'owned-evidence', `${kind}-${String(index + 1).repeat(64)}.json`), sha256: String(index + 1).repeat(64) }));
+  for (const record of [snapshot.epics[0], snapshot.milestones[0], snapshot.project]) {
+    record.evidence = refs;
+    record.mappings = [{ criterionId: (record.definitionOfDone || record.acceptance)[0].id, refs: [refs[0].sha256],
+      actor: 'owned-publication-test', reason: 'Trusted repository transition fixture' }];
+  }
+  let transitions = 0;
+  const repo = { snapshot: () => structuredClone(snapshot), async apply(c) {
+    const record = c.action.kind === 'project' ? snapshot.project : snapshot[`${c.action.kind}s`].find(row => row.id === c.action.id);
+    record.status = c.action.to; snapshot.revision++; snapshot.project.revision = snapshot.revision; transitions++;
+  } };
+  // Fake only the already trusted acceptance boundary for this control-flow unit;
+  // this does not claim that any remote artifact was actually published.
+  const engine = { store: f.store, secrets: {}, run: async () => assert.fail('Settled tasks cannot restart') };
+  const original = f.store.getRun.bind(f.store);
+  f.store.getRun = id => id === attempt.runId ? { id, state: 'succeeded' } : original(id);
+  const director = createProjectDirector({ repo, engine, evaluator: {
+    evaluateProjectTransition: async ({ command: c }) => ({ schemaVersion: 1, eligibleStates: [c.action.to], blockers: [], evidence: refs })
+  } });
+  assert.deepEqual(await director.resume(f.id), { status: 'succeeded', projectStatus: 'released' });
+  assert.equal(transitions, 3);
+  assert.deepEqual(await director.resume(f.id), { status: 'succeeded', projectStatus: 'released' });
+  assert.equal(transitions, 3);
 });
 
 test('Project plan preserves lower limits and verifies actual immutable interfaces before offering work', async t => {

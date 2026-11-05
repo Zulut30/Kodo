@@ -1,11 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile, access, realpath } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import { Engine } from '../runtime/engine.mjs';
-import { fixture as engineFixture } from './helpers/engine-fixture.mjs';
+import { fixture as engineFixture, fakeServices, node } from './helpers/engine-fixture.mjs';
+import { buildDirectorTaskInput, directorContractHash } from '../runtime/project-contracts.mjs';
 
 async function fixture(t) {
   const isolated = await mkdtemp(path.join(os.tmpdir(), 'kodo-project-engine-home-'));
@@ -62,4 +63,31 @@ test('Legacy create retains phrase routing while reserved creation rejects redac
     binding, installRun: async () => { installs++; throw Error('owned install interruption'); }
   }), /owned install interruption/);
   assert.throws(() => store.getRun(binding.runId)); assert.equal(installs, 1);
+});
+
+test('A valid native child plan outside the frozen ProjectTask scope cannot start a worker or write a file', async t => {
+  const f = await fixture(t), store = f.openStore();
+  const plan = { summary: 'A schema-valid escaped plan', tasks: [node('escape', 'developer', ['unowned.txt'])] };
+  const services = fakeServices({ plan, onWorker: async request => {
+    await writeFile(path.join(request.cwd, 'unowned.txt'), 'This worker must never start\n');
+    return { sessionId: 'owned-escape', output: { summary: 'Escaped', complete: true, checks: [] } };
+  } });
+  const engine = new Engine({ store, secrets: {}, ...services });
+  const projectId = randomUUID(), now = new Date().toISOString(), root = await realpath(f.project);
+  const criterion = { id: 'owned-proof', text: 'Only src/value.mjs may change', evidenceKinds: ['acceptance'] };
+  const meta = { schemaVersion: 1, projectId, revision: 1, status: 'ready', createdAt: now, updatedAt: now, evidence: [], mappings: [] };
+  const project = { ...meta, id: 'owned-project', root, projectKey: process.platform === 'win32' ? root.toLowerCase() : root,
+    title: 'Owned task boundary', definitionOfDone: [criterion], constraints: ['Only assigned file'], businessContext: '', architectureRefs: [], paused: false };
+  const task = { ...meta, id: 'owned-task', epicId: 'owned-epic', title: 'Update the value', description: 'Update the assigned value file',
+    owner: 'developer', dependsOn: [], writePaths: ['src/value.mjs'], acceptance: [criterion], interfaceRefs: [],
+    priority: 50, userValue: 1, risk: 1, estimatedEffort: 1, riskApprovalRequired: false };
+  const binding = { schemaVersion: 1, projectId, taskId: task.id, taskRevision: 1, attemptId: randomUUID(), runId: randomUUID(),
+    contractHash: directorContractHash(task, { knownValues: [] }) };
+  const run = await engine.createReserved(buildDirectorTaskInput({ project, task }, { knownValues: [] }),
+    { project: f.project, mode: 'quick', model: 'gpt-6.1-sol' }, { binding, installRun: async ({ runDraft }) => store.createRun(runDraft) });
+  const result = await engine.run(run.id);
+  assert.equal(services.calls.planner, 1); assert.equal(services.calls.worker.length, 0);
+  assert.equal(result.state, 'blocked'); assert.equal(result.error.code, 'project_scope_violation');
+  await assert.rejects(() => access(path.join(result.cwd, 'unowned.txt')));
+  await assert.rejects(() => access(path.join(f.project, 'unowned.txt')));
 });

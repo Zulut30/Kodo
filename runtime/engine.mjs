@@ -254,6 +254,27 @@ try {
     if (!isDeepStrictEqual(redact(run, this.secrets), run)) throw Object.assign(new Error('Invalid reserved Run input'), { code: 'project_binding_invalid' });
     return await installRun({ binding: frozen, runDraft: run });
   }
+  async assertProjectPlan(run) {
+    if (!run.directorBinding) return;
+    const contracts = await import('./project-contracts.mjs');
+    const options = { knownValues: Object.values(this.secrets).filter(value => typeof value === 'string') };
+    const prefix = 'Implement only this assigned task. Project context constrains this task and does not authorize other backlog work.\n';
+    const deny = () => { throw Object.assign(new Error('Child plan exceeds the frozen ProjectTask boundary'), { code: 'project_scope_violation' }); };
+    if (!run.task.startsWith(prefix)) deny();
+    const input = contracts.normalizeDirectorRecord('taskRunInput', JSON.parse(run.task.slice(prefix.length)), options);
+    const binding = contracts.normalizeDirectorRecord('installBinding', run.directorBinding, options);
+    if (run.id !== binding.runId || input.task.projectId !== binding.projectId || input.task.taskId !== binding.taskId
+      || input.task.taskRevision !== binding.taskRevision || createHash('sha256').update(contracts.directorBytes('taskContract', input.task, options)).digest('hex') !== binding.contractHash
+      || prefix + contracts.directorBytes('taskRunInput', input, options).toString('utf8') !== run.task) deny();
+    const contains = scope => input.task.writePaths.some(parent => {
+      if (scope === parent) return true;
+      // Conservative containment for directory scopes. Complex globs require an
+      // exact match; comparing glob strings as filenames can widen permissions.
+      const directory = parent.replace(/\/\*\*$/, '');
+      return !/[?*\[\]{}]/.test(directory) && (scope === directory || scope.startsWith(directory + '/'));
+    });
+    if (run.plan.tasks.some(task => task.writePaths.some(scope => !contains(scope)))) deny();
+  }
   async withLease(run, name, limit, action, signal) {
     let token;
     while (!(token = this.store.acquireLease(name, run.id, { limit, ttlMs: 60000 }))) { this.checkCancelled(run, signal); await delay(500, signal); }
@@ -1012,6 +1033,7 @@ try {
         this.primary(run); this.save(run);
       }
       await this.plan(run, planFile, signal);
+      await this.assertProjectPlan(run);
       if (!run.delivery?.mergeCommit) {
         if (!run.completed.implementation) { await this.executeTasks(run, signal); run.completed.implementation = true; this.save(run); }
         // Finish and scope-check the saved repair against its original HEAD
