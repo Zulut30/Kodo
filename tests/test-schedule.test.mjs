@@ -63,10 +63,54 @@ async function waitFor(predicate) {
   }
 }
 
+test('Scheduler orders observed file durations longest first and retains every discovered file once', async t => {
+  const { temp, put } = await fixture(t);
+  const { orderTests, discoverTests } = await import(scheduleUrl);
+  // Independent expected order from completed-file duration_ms receipts, not
+  // reporter delivery timestamps or the runner's priority table. Benchmark is
+  // the coordinator-approved prior case-work lower-bound heuristic, not a
+  // measured file duration.
+  const expected = [
+    'tests/delivery.test.mjs',
+    'tests/project-director.test.mjs',
+    'tests/architecture-gate-integration.test.mjs',
+    'tests/engine-4.test.mjs',
+    'tests/engine-2.test.mjs',
+    'tests/engine-3.test.mjs',
+    'tests/engine.test.mjs',
+    'tests/benchmark.test.mjs',
+    'tests/ci-graph.test.mjs',
+    'tests/mode-engine-4.test.mjs',
+    'tests/ci-cache.test.mjs',
+    'tests/mode-engine-3.test.mjs',
+    'tests/mode-engine-2.test.mjs',
+    'tests/mode-engine.test.mjs',
+    'tests/ci-cli.test.mjs',
+    'tests/architecture-acceptance.test.mjs',
+    'tests/project-director-oracle.test.mjs',
+    'tests/a-unobserved.test.mjs',
+    'tests/z-unobserved.test.mjs',
+  ].map(file => path.resolve(temp, file));
+  const scrambled = [16, 18, 6, 11, 1, 14, 4, 17, 9, 2, 13, 0, 15, 10, 5, 12, 3, 8, 7]
+    .map(index => expected[index]);
+  for (const file of scrambled) await put(path.relative(temp, file));
+  await put('tests/helper.mjs', 'throw Error("not a default test name");');
+  const input = [...scrambled, scrambled[0], path.relative(temp, scrambled[11])];
+  const original = [...input];
+  const ordered = orderTests(input, temp);
+  assert.equal(ordered.length, expected.length);
+  assert.equal(new Set(ordered).size, expected.length);
+  assert.deepEqual([...ordered].sort(), [...expected].sort(), 'same complete file multiset');
+  assert.deepEqual(input, original, 'ordering must not mutate caller input');
+  assert.deepEqual([...discoverTests(temp)].sort(), [...expected].sort(), 'default discovery remains complete');
+  assert.deepEqual(ordered, expected);
+  assert.deepEqual(orderTests([...input].reverse(), temp), expected);
+});
+
 test('Scheduler starts heuristic heavy files before lexical files in real isolated children', { timeout: 15000 }, async t => {
   const { temp, put } = await fixture(t);
   const observed = path.join(temp, 'starts');
-  const expected = ['tests/project-director.test.mjs', 'tests/project-director-oracle.test.mjs', 'tests/ci-graph.test.mjs', 'tests/ci-cache.test.mjs', 'tests/architecture-gate-integration.test.mjs', 'tests/mode-engine.test.mjs', 'tests/mode-engine-2.test.mjs', 'tests/mode-engine-3.test.mjs', 'tests/mode-engine-4.test.mjs', 'tests/a.test.mjs', 'tests/z.test.mjs'];
+  const expected = ['tests/project-director.test.mjs', 'tests/architecture-gate-integration.test.mjs', 'tests/ci-graph.test.mjs', 'tests/mode-engine-4.test.mjs', 'tests/ci-cache.test.mjs', 'tests/mode-engine-3.test.mjs', 'tests/mode-engine-2.test.mjs', 'tests/mode-engine.test.mjs', 'tests/project-director-oracle.test.mjs', 'tests/a.test.mjs', 'tests/z.test.mjs'];
   for (const name of [...expected].reverse()) {
     await put(name, `import { appendFileSync } from 'node:fs'; import test from 'node:test'; appendFileSync(${JSON.stringify(observed)}, ${JSON.stringify(name + '\n')}); test('ok', () => {});`);
   }
@@ -120,7 +164,7 @@ test('Scheduler never traverses directory links outside checkout or duplicate li
 test('Scheduler deduplicates priorities and preserves deterministic lexical fallback', async () => {
   const { orderTests } = await import(scheduleUrl);
   const files = ['z.test.mjs', 'tests/ci-cache.test.mjs', 'tests/project-director.test.mjs', 'A.test.mjs', 'a.test.mjs', 'tests/ci-graph.test.mjs', 'tests/project-director-oracle.test.mjs', 'tests/ci-cache.test.mjs'];
-  const expected = ['tests/project-director.test.mjs', 'tests/project-director-oracle.test.mjs', 'tests/ci-graph.test.mjs', 'tests/ci-cache.test.mjs', 'A.test.mjs', 'a.test.mjs', 'z.test.mjs'].map(file => path.resolve(root, file));
+  const expected = ['tests/project-director.test.mjs', 'tests/ci-graph.test.mjs', 'tests/ci-cache.test.mjs', 'tests/project-director-oracle.test.mjs', 'A.test.mjs', 'a.test.mjs', 'z.test.mjs'].map(file => path.resolve(root, file));
   assert.deepEqual(orderTests(files.map(file => path.resolve(root, file)), root), expected);
   assert.deepEqual(orderTests([...files].reverse().map(file => path.resolve(root, file)), root), expected);
 });
