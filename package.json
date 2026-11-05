@@ -13,7 +13,7 @@
   "scripts": {
     "start": "node cli/index.mjs",
     "validate": "node cli/index.mjs validate",
-    "test": "node --test --test-concurrency=4",
+    "test": "node --test --test-concurrency=8",
     "check": "npm run validate && npm test"
   },
   "files": [
