@@ -71,8 +71,15 @@ export async function inspectCurrentSource(input = {}) {
     const root = path.resolve((await git(project, ['rev-parse', '--show-toplevel'])).trim());
     await noLinks(root);
     if (await realpath(root) !== project) return 'unknown';
-    const state = async () => (await git(project, ['rev-parse', '--verify', 'HEAD'])).trim() !== headSha ||
-      Boolean(await git(project, ['status', '--porcelain=v1', '-z', '--untracked-files=all']));
+    const state = async () => {
+      // Porcelain v2 binds HEAD and dirty status to the same observation.
+      // Optional headers are harmless, but exactly one full OID is authority.
+      const output = await git(project, ['status', '--porcelain=v2', '--branch', '-z', '--untracked-files=all']);
+      if (!output.endsWith('\0')) throw new Error('Malformed Git source status');
+      const records = output.slice(0, -1).split('\0'), heads = records.filter(row => row.startsWith('# branch.oid'));
+      if (heads.length !== 1 || !/^# branch\.oid (?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(heads[0])) throw new Error('Unknown Git source HEAD');
+      return heads[0].slice('# branch.oid '.length) !== headSha || records.some(row => !row.startsWith('# '));
+    };
     if (await state()) return 'dirty';
     const entries = (await git(project, ['ls-tree', '-rz', '--full-tree', headSha])).split('\0').filter(Boolean);
     if (!entries.length || entries.length > 50000) return 'unknown';
