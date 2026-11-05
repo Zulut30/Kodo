@@ -43,8 +43,19 @@ async function noLinks(root, target, missing = false) {
   }
 }
 function clean(value, secrets = {}) {
+  const known = Object.values(secrets).filter(secret => typeof secret === 'string' && secret.length > 0);
+  // Inspect decoded strings and keys: JSON escaping can hide even short known
+  // credentials from a substring check on serialized bytes.
+  function inspect(item) {
+    if (typeof item === 'string') {
+      if (known.some(secret => item.includes(secret))) fail('knowledge_secret');
+    } else if (item && typeof item === 'object') {
+      for (const [key, child] of Object.entries(item)) { inspect(key); inspect(child); }
+    }
+  }
+  inspect(value);
   const text = typeof value === 'string' ? value : JSON.stringify(value);
-  if (Object.values(secrets).some(secret => typeof secret === 'string' && secret && text.includes(secret)) || redact(text, secrets) !== text) fail('knowledge_secret');
+  if (redact(text, secrets) !== text) fail('knowledge_secret');
   return value;
 }
 function jsonValue(value) {
@@ -142,6 +153,7 @@ export async function loadKnowledgeContext({ project, snapshotCwd = project, con
   const file = contextPath === null ? 'research.context.json' : relative(contextPath);
   const bytes = await readOwned(root, file, 16384, secrets, contextPath === null);
   const metadata = bytes ? parse(bytes, file) : { schemaVersion: 1, versions: {}, synthetic: false };
+  clean(metadata, secrets);
   keys(metadata, ['schemaVersion', 'versions', 'synthetic'], file);
   if (metadata.schemaVersion !== 1 || typeof metadata.synthetic !== 'boolean') fail('knowledge_context', file);
   versions(metadata.versions);
@@ -245,8 +257,9 @@ export async function refreshKnowledge(options, ports = {}) {
     const inputPath = relative(options.inputPath);
     const inputOid = await tracked(root, inputPath);
     const inputBytes = await readOwned(root, inputPath, policy.maxEvidenceBytes, secrets);
-    assertTrackedBytes(inputBytes, inputOid);
     const input = parse(inputBytes, inputPath);
+    clean(input, secrets);
+    assertTrackedBytes(inputBytes, inputOid);
     validateInput(input, policy);
     const claimsPort = ports.claims || await import('./knowledge-claims.mjs');
     for (const claim of input.claims) {

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, readFile, rm, realpath, link, symlink } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, readdir, rm, realpath, link, symlink } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -155,6 +155,75 @@ test('Known secret values and provider shaped secrets never reach evidence or ha
     assert.ok(!JSON.stringify(result).includes(value)); assert.equal(fx.calls.writes, 0); assert.equal(fx.calls.appends, 0);
   }
 });
+function escapedValue(secret, location) {
+  return { nested: [location === 'key' ? { ['field:' + secret]: 'neutral' } : { field: 'before ' + secret + ' after' }] };
+}
+
+test('Short escaped known strings in nested keys and values block before normalization or writer calls', async t => {
+  for (const secret of ['q"9', 'q\\9', '\t']) for (const location of ['key', 'value']) {
+    await t.test(JSON.stringify({ secret, location }), async t => {
+      const value = escapedValue(secret, location);
+      const fx = await fixture(t, { capture: input({ value }), files: { 'src/data.json': { version: value } } });
+      let normalizations = 0;
+      const claims = Object.fromEntries(Object.entries(fx.ports.claims).map(([name, method]) => [name, (...args) => { normalizations++; return method(...args); }]));
+      const result = await refreshKnowledge(fx.options, { ...fx.ports, claims, secrets: { fake: secret, empty: '' } });
+      assert.deepEqual(fx.calls, { writes: 0, appends: 0, finds: 0 });
+      assert.equal(normalizations, 0);
+      blocked(result, 'knowledge_secret');
+    });
+  }
+});
+
+test('Short escaped known strings leave no evidence or capture with the default Engine writer and SQLite Store', async t => {
+  const { Store } = await import('../runtime/store.mjs');
+  for (const secret of ['q"9', 'q\\9', '\t']) for (const location of ['key', 'value']) {
+    await t.test(JSON.stringify({ secret, location }), async t => {
+      const value = escapedValue(secret, location), secrets = { fake: secret, empty: '' };
+      const fx = await fixture(t, { capture: input({ value }), files: { 'src/data.json': { version: value } } });
+      const store = new Store(fx.home, secrets);
+      try {
+        const result = await refreshKnowledge(fx.options, { store, secrets });
+        assert.equal(store.findKnowledgeCapture(fx.project, 'capture-1'), null);
+        assert.deepEqual(store.listKnowledgeClaims(fx.project, { history: true }), []);
+        const files = await readdir(path.join(fx.home, 'knowledge-evidence'), { recursive: true }).catch(error => {
+          if (error.code === 'ENOENT') return [];
+          throw error;
+        });
+        assert.deepEqual(files, []);
+        blocked(result, 'knowledge_secret');
+      } finally { store.close(); }
+    });
+  }
+});
+
+test('Short escaped known metadata keys block before context hashing', async t => {
+  const secret = 'q"9';
+  const fx = await fixture(t, { context: { schemaVersion: 1, versions: { [secret]: 'current' }, synthetic: false } });
+  await assert.rejects(loadKnowledgeContext(fx.options, { secrets: { fake: secret } }), error => error.knowledgeCode === 'knowledge_secret');
+});
+
+test('Neutral escaped keys and values capture and replay unchanged with empty credentials and the default writer', async t => {
+  const { Store } = await import('../runtime/store.mjs');
+  const value = { nested: [{ 'field:q"9': 'q\\9', tab: '\t' }] }, secrets = { empty: '' };
+  const fx = await fixture(t, { capture: input({ value }), files: { 'src/data.json': { version: value } } });
+  const store = new Store(fx.home, secrets), ports = { store, secrets };
+  try {
+    const first = await refreshKnowledge(fx.options, ports);
+    assert.equal(first.status, 'refreshed', JSON.stringify(first));
+    assert.deepEqual(first.capture.claims[0].value, value);
+    const ref = first.capture.claims[0].source.evidenceRef, bytes = await readFile(ref.path);
+    assert.equal(sha(bytes), ref.sha256);
+    assert.deepEqual(JSON.parse(bytes).value.value, value);
+    const second = await refreshKnowledge({ ...fx.options, now: '2026-11-06T12:00:00.000Z' }, ports);
+    assert.equal(second.status, 'replayed', JSON.stringify(second));
+    assert.equal(second.capture.capturedAt, now);
+    assert.deepEqual(second.capture.claims, first.capture.claims);
+    assert.deepEqual(await readFile(ref.path), bytes);
+    assert.equal(store.listKnowledgeClaims(fx.project, { history: true }).length, 1);
+    assert.equal((await readdir(path.dirname(ref.path))).length, 1);
+  } finally { store.close(); }
+});
+
 test('Policy caps apply before source or evidence persistence', async t => {
   const fx = await fixture(t, { rules: policy({ maxEvidenceBytes: 200 }) });
   blocked(await refreshKnowledge(fx.options, fx.ports), 'knowledge_limit'); assert.equal(fx.calls.writes, 0);
