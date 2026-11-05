@@ -17,12 +17,48 @@ Node `v24.19.0`: `**/{test,test/**/*,test-*,*[._-]test}.{js,mjs,cjs,ts,mts,cts}`
 это не allowlist только для `tests/*.test.mjs`. Сам runner не соответствует
 шаблону и не находится под `test/`.
 
-Эвристический приоритет: `project-director`, `project-director-oracle`,
-`ci-graph`, `ci-cache`, `architecture-gate-integration`, `mode-engine`,
-`mode-engine-2`, `mode-engine-3`, `mode-engine-4`,
-`ci-cli`, `delivery`, затем четыре `engine`-файла
-из `tests/` (полные имена перечислены в модуле). Остальные пути идут лексически;
-дубликаты удаляются. Это прозрачный порядок, без выдуманных весов времени.
+Приоритет теперь следует убыванию фактических длительностей завершённых файлов
+из receipt, переданных контрактом Run `1548713d-1cc5-4262-8ed3-fcd048485d75`.
+Это `duration_ms` файлов, а не `observedAtMs` доставки reporter events.
+Все имена ниже обозначают `tests/<имя>.test.mjs`:
+
+| Файл | Наблюдавшаяся длительность, ms |
+| --- | ---: |
+| delivery | 588139.3066 |
+| project-director | 566770.1329 |
+| architecture-gate-integration | 432286.6863 |
+| engine-4 | 315828.7805 |
+| engine-2 | 310021.1643 |
+| engine-3 | 298955.3369 |
+| engine | 290212.1408 |
+| ci-graph | 239140.7966 |
+| mode-engine-4 | 199378.0839 |
+| ci-cache | 188462.5517 |
+| mode-engine-3 | 182728.3893 |
+| mode-engine-2 | 170410.8459 |
+| mode-engine | 165308.6285 |
+| ci-cli | 120844.2919 |
+| architecture-acceptance | 30060.7548 |
+| project-director-oracle | 25141.873 |
+
+Отдельное исключение по уточнению координатора: `tests/benchmark.test.mjs`
+расположен сразу после `engine` и перед `ci-graph` по prior lower-bound heuristic.
+В сохранённом `check-28c5a1ab8c8d4a693b9d2e4de7f1c744698fe56526a0a45cee8a422de19929a8.json`,
+source88, Node `v24.19.0`, hermetic, наблюдались 16 завершённых top-level benchmark
+cases 563–578 с суммой case work 255773.4331 ms без повторного учёта детей.
+Координатор подтвердил исходные данные через отдельный read-only speed worker;
+здесь benchmark повторно не запускался. Это нижняя граница работы кейсов,
+не измеренный file elapsed, не длительность на текущем Node `v24.22.1` и
+не вес в таблице измеренных файлов. Его реальная длительность файла неизвестна.
+
+Для остальных файлов длительности не назначены: они идут лексически после
+этих 17 приоритетных; дубликаты удаляются. Наблюдения зависят от окружения и
+перекрывающейся нагрузки. Их сумма не является elapsed time; ускорение не
+измерено и не обещано. По контракту исходный полный локальный check на source
+`88a9fadae1d226539802dfc7f788df47a39ae7ca`, Node `v24.22.1`, остановился через
+1200492 ms; это исходный неуспех, а не AFTER данной перестановки. Успешные
+Windows/Linux CI того же исходника не доказывают локальный AFTER.
+
 Time limits, assertions, frozen oracles, process isolation и общий потолок4
 сохранены. Cancellation использует AbortSignal штатного runner; CLI SIGINT/SIGTERM
 запрашивают abort и дренирование. Принудительное OS-завершение процесса не даёт
@@ -61,6 +97,70 @@ cancel failures, abort owned child, explicit paths/name patterns и явный �
 Native provider, installed/published artifact и deployment не проверялись.
 Урок: наблюдать порядок child-start, а не считать порядок CLI-аргументов
 доказательством планирования; локальный barrier не заменяет полный speed test.
+
+### Scoped проверка порядка по длительностям: 5 ноября 2026
+
+В назначенном worktree `duration-order`, base
+`88a9fadae1d226539802dfc7f788df47a39ae7ca`, Windows, Node `v24.19.0`,
+до изменения priority добавлена независимая регрессия
+`Scheduler orders observed file durations longest first and retains every discovered file once`.
+Она передаёт все 17 приоритетных файлов (16 с измерениями и benchmark с отдельной
+эвристикой) в перемешанном порядке, два неизвестных
+файла и повторения абсолютного/относительного пути. Проверяются полный набор,
+отсутствие дубликатов, неизменность input, default discovery, убывание известных
+длительностей и лексический fallback. Ожидаемый порядок не читается из runner.
+
+Фактически выполнены команды:
+
+```powershell
+node scripts/run-tests.mjs --test-name-pattern='Scheduler orders observed file durations' tests/test-schedule.test.mjs
+node scripts/run-tests.mjs tests/test-schedule.test.mjs tests/ci-package.test.mjs
+```
+
+Первая команда до изменения priority: exit1, 0 PASS / 1 FAIL,
+TAP duration 148.6661 ms; failure — несовпадение старого порядка с заданным.
+После изменения priority та же команда: exit0, 1 PASS / 0 FAIL,
+136.1799 ms. Это короткий RED/GREEN для новой регрессии, не замер полной suite.
+
+Первый запуск второй команды: exit1, 11 PASS / 2 FAIL, 4740.7416 ms. Прошли новая регрессия,
+package test, default discovery/strip-types, links, concurrency4/разные PID,
+assertion/import/cancellation diagnostics, explicit selection, caps и abort.
+Два существующих теста — `Scheduler starts heuristic heavy files before lexical files in real isolated children`
+и `Scheduler deduplicates priorities and preserves deterministic lexical fallback` —
+жёстко ожидали прежний порядок. После явного узкого уточнения координатора
+обновлены только два literal expected-order arrays. Assertions, inputs,
+child execution, проверки уникальности/полного набора и все остальные тела
+существующих тестов сохранены. Исходный failure сохранён в `focused.tap`.
+Это изменение ожидаемого порядка вслед за требованием, без ослабления проверки.
+
+Повтор той же второй команды: exit0, 13 PASS / 0 FAIL / 0 cancelled /
+0 skipped, 5945.5787 ms (`focused-green.tap`). Все существующие scheduler
+assertions и package regression прошли. Полная suite и общий PASS по-прежнему
+не заявлены; различие времени коротких прогонов не является speedup evidence.
+
+После дополнительного уточнения про benchmark регрессия расширена до 17
+приоритетных файлов. До добавления benchmark в priority первая команда снова
+дала exit1, 0 PASS / 1 FAIL, 145.5035 ms (`benchmark-red.tap`): файл был
+в лексическом хвосте вместо согласованной позиции. После минимального изменения
+priority вторая команда дала exit0, 13 PASS / 0 FAIL / 0 cancelled / 0 skipped,
+5582.7569 ms (`focused-benchmark-green.tap`). Два старых expected-массива больше
+не менялись: их inputs не содержат benchmark. Первый GREEN сохранён отдельно.
+Это проверка порядка короткими фикстурами; полный benchmark и speed test
+не запускались, overall speed неизвестна.
+
+Сырые `red.tap`, `green.tap`, `focused.tap`, `focused-green.tap`,
+`benchmark-red.tap`, `focused-benchmark-green.tap` и JSON receipts с командами,
+cwd, Node, source HEAD и exit codes сохранены вне Git:
+`C:/Users/zulut/AppData/Local/Kodo/runs/1548713d-1cc5-4262-8ed3-fcd048485d75/duration-order-evidence`.
+Изменены только priority/comment, новая регрессия, два согласованных expected
+arrays и эта документация;
+discovery/runTests/options/failure/cancellation, concurrency4, deadlines и
+frozen oracles не менялись. Полная suite, модели, native provider, внешняя
+публикация и deployment не запускались. Локальная упаковка в package regression
+не является опубликованным артефактом. UI disabled — neutral; security и
+интегрированные проверки остаются координатору.
+Урок: при смене scheduling policy отдельно согласовать старые order literals;
+сохранение assertions не делает противоречащие порядки одновременно истинными.
 
 ## Коррекция Phase06: текущая граница
 

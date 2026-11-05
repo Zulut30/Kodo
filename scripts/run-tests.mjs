@@ -10,23 +10,30 @@ import { readdirSync, lstatSync } from 'node:fs';
 const extensions = process.features.typescript ? 'js,mjs,cjs,ts,mts,cts' : 'js,mjs,cjs';
 const defaultPattern = `**/{test,test/**/*,test-*,*[._-]test}.{${extensions}}`;
 
-// Scheduling heuristics only: no fabricated durations or speedup estimates.
+// Longest completed-file duration_ms first from the recorded Windows receipt;
+// see docs/WINDOWS-TEST-SPEED.md. Delivery timestamps are not durations.
+// The benchmark placement below uses a separate prior lower-bound heuristic.
+// Environment/overlap affect these observations; no speedup is implied.
 const priority = [
-  'tests/project-director.test.mjs',
-  'tests/project-director-oracle.test.mjs',
-  'tests/ci-graph.test.mjs',
-  'tests/ci-cache.test.mjs',
-  'tests/architecture-gate-integration.test.mjs',
-  'tests/mode-engine.test.mjs',
-  'tests/mode-engine-2.test.mjs',
-  'tests/mode-engine-3.test.mjs',
-  'tests/mode-engine-4.test.mjs',
-  'tests/ci-cli.test.mjs',
   'tests/delivery.test.mjs',
-  'tests/engine.test.mjs',
+  'tests/project-director.test.mjs',
+  'tests/architecture-gate-integration.test.mjs',
+  'tests/engine-4.test.mjs',
   'tests/engine-2.test.mjs',
   'tests/engine-3.test.mjs',
-  'tests/engine-4.test.mjs',
+  'tests/engine.test.mjs',
+  // Prior source88/Node24.19 hermetic receipt: 16 top-level benchmark cases
+  // total 255773.4331 ms of case work. Lower bound, not file elapsed/current24.22.
+  'tests/benchmark.test.mjs',
+  'tests/ci-graph.test.mjs',
+  'tests/mode-engine-4.test.mjs',
+  'tests/ci-cache.test.mjs',
+  'tests/mode-engine-3.test.mjs',
+  'tests/mode-engine-2.test.mjs',
+  'tests/mode-engine.test.mjs',
+  'tests/ci-cli.test.mjs',
+  'tests/architecture-acceptance.test.mjs',
+  'tests/project-director-oracle.test.mjs',
 ];
 
 export function orderTests(files, cwd) {
