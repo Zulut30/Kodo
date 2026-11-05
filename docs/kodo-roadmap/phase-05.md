@@ -1,0 +1,38 @@
+# Этап 05 — Research knowledge
+
+2026-11-05. **IN PROGRESS, NOT ACCEPTED**. Предпосылка04 принята: [PR13](https://github.com/Zulut30/Kodo/pull/13), merge `a6740910373186f823c6c207804762f333c26031`. Здесь только scoped local evidence05; общий check/security/independent review/required Windows/Linux CI ещё **pending**.
+
+## Результат и критерии MVP
+
+| Требование | Реализация / проверяемый сценарий |
+| --- | --- |
+| Структурированные domain/product/technical/codebase claims | A: strict records, canonical id/fingerprint, provenance, latest revision, TTL/version/HEAD invalidation, сопоставимые конфликты |
+| Durable provenance/history | B: atomic SQLite captures/revisions, source.id→locator, replay без нового capturedAt, readonly reader без создания legacy DB/tables |
+| Owned offline refresh | C: fixed current files, clean tracked sources, JSON Pointer/hash/ESM exports, standard Engine evidence вне Git, requests0 |
+| Bounded typed references | D: whole-record UTF-8 budget, deterministic relevance, excluded/omitted counts; текст остаётся untrusted data |
+| Реальные CLI/Engine callers | E: status/refresh/inspect с actual A/B/C/D; fresh context/evidence, off byte identity, legacy envelope и lower budgets |
+| Воспроизведение | H: временный Git fixture, отдельный KODO_HOME, 18 actual CLI observations без внешних вызовов |
+
+Frozen ports v1 SHA-256 `72f8670725e0217b67b619c24ed822ecf2f0452231e0c628cc58eece0990a52d`; final root clarifications приоритетнее proposal. [Policy/context, схемы, команды, доверие и решение](../KNOWLEDGE.md), [runtime](../RUNTIME.md#структурированное-knowledge-offline-mvp05).
+
+MVP не добавляет broad live market/domain study, embeddings, универсальный semantic fact checker или новую parser dependency. Legacy discovery research остаётся отдельным. Hearthstone Standard/Wild/BG и Rust VCS — **synthetic fixtures**, без настоящих статистик; sample/population/window неизвестны. Rust fixture проверяет JSON, не native Rust.
+
+## Scoped evidence и текущая граница
+
+Прочитаны actual completions/coordinator records в private `speed-five/coordination/phase05`. A:62/62 PASS; B:14/14 плюс2 legacy Store/lease; C:21/21; D:16/16. E интегрирован как dependency `5257806e4dc2ccef500ef8621aee34d1401bdc72`: scoped48/48, затем post-integration5/5 с пересечением — **не53 уникальных теста**. Это результаты scoped workers, не новый прогон H и не общий PASS05. Provider в E — fixture.
+
+H worktree source head `19bab3c32d5e496687b2c5db037cff495fc5471c`; Windows x64, Node24.19.0/ABI137. CLI продемонстрировал disabled без Store, refreshed/replayed с прежним capturedAt, changed replay blocked, TTL stale, conflict, version mismatch/missing current version, malformed metadata/dirty source blocked и tamper excluded. Все18 наблюдений: requests0; private Node network guard: attempts0. Hearthstone в matching format остался unknown/references0, synthetic Rust JSON дал одну synthetic-reference до намеренного tamper.
+
+Exact argv/raw outputs/exits/source hashes и fixture сохранены вне Git: `C:/Users/zulut/AppData/Local/Temp/kodo-roadmap-20261104/phase05-receipts/knowledge-docs/observations.json`. В [KNOWLEDGE](../KNOWLEDGE.md#воспроизведённые-offline-команды-и-ограничения) указаны private reproduction и первая ошибка harness до старта продукта; она не засчитана как product RED. Репозиторные tests/full suites H не запускал.
+
+F отдельно изменил только test-file ceiling4→8 и EFFICIENCY: static RED→GREEN, без runtime/performance PASS. Это не увеличение пяти model workers и не измеренное ускорение. Условная приёмка/откат — [EFFICIENCY](../EFFICIENCY.md); H этот файл не меняет.
+
+## Оставшаяся приёмка и урок
+
+Координатору нужны integrated clean head после всех deliverables, полный `npm run check`, fresh configured security, независимый differential review и required Windows/Linux CI с artifact smoke на том же кандидате. UI и selfhost architecture disabled — neutral, не PASS. Installed/published artifact05, real native subscription client, release/tag/deployment здесь не доказаны; historical04 evidence на05 не переносится.
+
+До общих gates Root подтвердил isolated fake-only probe: known-credential gap в default CLI refresh/inspect. Нужен один bounded Native repair в текущих mode/limits; H реализацию не меняет и новых проверок не запускает. Реальных ключей/API в probe не было; raw диагностика остаётся приватной. Безопасность этой границы не объявляется принятой.
+
+Явный standard и сохранённые concurrency5/maxTasks12/repair3/research10 остаются верхними границами; меньшие project/run/byte limits не расширяются, resume/retry не повышает режим. GPT/Claude — только подписочные клиенты, без API fallback; workers не получают ключей.
+
+Урок: capture replay не обновляет наблюдение, успешный inspect не означает authoritative claim. Проверяйте state/reasons/projection и missing sample/population/window отдельно; записанная instruction policy не доказывает семантическое применение методики. [Прогресс roadmap](progress.md).
