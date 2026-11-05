@@ -158,8 +158,8 @@ export function createProjectDirector({ repo, engine, planner, evaluator, clock 
   const snapshotFor = async id => { const snapshot = await repo.snapshot(id); complete(snapshot); return snapshot; };
   const ports = async () => ({ contracts: await contractsFor(), knownValues: known(engine) });
 
-  async function plan(id, options = {}) {
-    const snapshot = await snapshotFor(id), A = await ports();
+  async function horizonFor(snapshot, options = {}) {
+    const A = await ports();
     const config = await readConfig(snapshot.project.root, options.mode === undefined ? {} : { executionMode: options.mode });
     requireValue(Number.isSafeInteger(options.limit ?? 24) && (options.limit ?? 24) >= 1 && (options.limit ?? 24) <= 24, 'limit_invalid');
     const limit = Math.min(options.limit ?? 24, resolveMode({ requested: options.mode, config }).profile.maxTasks);
@@ -172,6 +172,26 @@ export function createProjectDirector({ repo, engine, planner, evaluator, clock 
     }
     const planHorizon = typeof planner === 'function' ? planner : planner?.planProjectHorizon || (await import('./project-planner.mjs')).planProjectHorizon;
     return planHorizon({ snapshot, limit, availability, now: clock() }, A);
+  }
+  async function plan(id, options = {}) {
+    return horizonFor(await snapshotFor(id), options);
+  }
+
+  async function admission(snapshot, task, options, retry = false) {
+    // C evaluates the actual snapshot, including current approvals and immutable
+    // interfaces. Only the existing reservation's scheduling exclusions are
+    // waived: recovery/retry is not selection of another horizon task.
+    const horizon = await horizonFor(snapshot, options);
+    requireValue(horizon.revision === snapshot.revision, 'revision_conflict');
+    const blocked = horizon.blocked.find(row => row.taskId === task.id);
+    requireValue(blocked || horizon.taskIds.includes(task.id), 'admission_invalid');
+    const expected = new Set(['horizon_limit', retry ? 'retry_required' : 'attempt_exists']);
+    if (retry) {
+      expected.add('attempt_revision_mismatch');
+      if (retryable(task.status)) expected.add(`task_${task.status}`);
+    } else if (['running', 'verifying', 'integrated'].includes(task.status)) expected.add(`task_${task.status}`);
+    const reasons = blocked?.reasons.filter(reason => !expected.has(reason)) || [];
+    return reasons.length ? { status: 'blocked', blockers: [{ taskId: task.id, reasons }] } : null;
   }
 
   // A durable branch/head is a frontier only when all accepted code is present.
@@ -259,7 +279,9 @@ export function createProjectDirector({ repo, engine, planner, evaluator, clock 
     const polling = setInterval(async () => {
       if (pollingBusy) return;
       pollingBusy = true;
-      try { const s = await repo.snapshot(id); if (s.project.paused || s.project.status === 'cancelled') abort(); }
+      // Pause gates later starts/advancement through guard; admitted Engine work
+      // keeps its session. Abort retains its cancellation meaning for Engine.
+      try { const s = await repo.snapshot(id); if (s.project.status === 'cancelled') abort(); }
       catch { abort(); }
       finally { pollingBusy = false; }
     }, 250); polling.unref();
@@ -285,7 +307,9 @@ export function createProjectDirector({ repo, engine, planner, evaluator, clock 
           task = snapshot.tasks.find(row => row.id === candidates[0].taskId);
           previous = storedRun(store, candidates[0].runId) || await priorRetryRun(snapshot, candidates[0]);
           await retrySettings(snapshot, previous);
+          const denied = await admission(snapshot, task, options, true);
           await guard(snapshot.revision);
+          if (denied) return denied;
           attempt = (await apply(snapshot, { op: 'reserveAttempt', taskId: task.id, retryFailed: true }, options)).attempt;
           snapshot = await guard();
         }
@@ -303,11 +327,16 @@ export function createProjectDirector({ repo, engine, planner, evaluator, clock 
           await apply(snapshot, { op: 'transition', kind: 'task', id: task.id, to: 'ready', evidence: [], mappings: [] });
           snapshot = await guard(); task = snapshot.tasks.find(row => row.id === task.id);
         }
+        const denied = await admission(snapshot, task, options);
         await guard(snapshot.revision);
+        if (denied) return denied;
         attempt = (await apply(snapshot, { op: 'reserveAttempt', taskId: task.id, retryFailed: false }, options)).attempt;
         snapshot = await guard();
       }
       task = snapshot.tasks.find(row => row.id === attempt.taskId);
+      const denied = await admission(snapshot, task, options);
+      await guard(snapshot.revision, attempt);
+      if (denied) return denied;
       const A = await ports(), input = A.contracts.buildDirectorTaskInput({ project: snapshot.project, task }, A);
       let run = storedRun(store, attempt.runId);
       if (!run) {
@@ -317,7 +346,9 @@ export function createProjectDirector({ repo, engine, planner, evaluator, clock 
         snapshot = await guard(snapshot.revision, attempt);
         run = await engine.createReserved(input, { ...options, project: snapshot.project.root, providers: options.providers || 'current', ...retry, baseSha }, {
           binding: bindingFor(attempt), installRun: async value => {
+            const denied = await admission(snapshot, task, options);
             await guard(snapshot.revision, attempt);
+            requireValue(!denied, 'admission_blocked');
             if (previous) for (const field of ['researchBudget', 'repairRounds', 'concurrency', 'maxTasks']) {
               const limit = previous.config[field] ?? previous.executionMode?.profile[field];
               if (limit !== undefined) value.runDraft.config[field] = Math.min(value.runDraft.config[field] ?? limit, limit);
@@ -329,8 +360,10 @@ export function createProjectDirector({ repo, engine, planner, evaluator, clock 
         });
       }
       requireValue(run.task === input && isDeepStrictEqual(run.directorBinding, bindingFor(attempt)), 'binding_invalid');
+      const dispatchDenied = await admission(snapshot, task, options);
       await guard(snapshot.revision, attempt);
-      if (!settled(attempt.status) && !['blocked', 'failed', 'cancelled'].includes(run.state)) {
+      if (dispatchDenied) return dispatchDenied;
+      if (!settled(attempt.status) && !['succeeded', 'blocked', 'failed', 'cancelled'].includes(run.state)) {
         // Resume preserves Engine's fixed mode/model, quota, budget and sessions.
         // Project retry reserves a NEW Run; it never resets a saved Engine cycle.
         await engine.run(run.id, { signal: controller.signal });
