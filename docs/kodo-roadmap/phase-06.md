@@ -1,66 +1,31 @@
 # Этап 06 — Project Director
 
-2026-11-05. **IN PROGRESS, NOT ACCEPTED**. Предпосылка05 принята: [PR14](https://github.com/Zulut30/Kodo/pull/14), merge `72215c821ea8d2be32123e8212bdc3d22cd526f1`. Code/CLI и admission/pause correction ранее интегрированы в `3817af81796803fe3311e44e7d3e3b4a79425c4f`. Родительский Run `cf04d9ae-e733-48d6-8d7e-c29220084ef0` остановлен на `verification3/cycle1`, без сброса бюджета. Отдельный corrective Run `7a424d6f-6392-483c-b1f8-6918824f0baf` использует clean source `3c39de09eaca16997834c3de07f2e936072915a5`; его A/B/C/D интегрированы в `0ee548b74413fba1c917eab4a49e12f6235869be` до docs. Общие full checks, enabled security, final independent review и required CI06 остаются **pending**. Это blocker06, не этап07.
+Функциональный MVP реализован. Окончательная приёмка и актуальные checks конкретного кандидата отражены в [PR15](https://github.com/Zulut30/Kodo/pull/15) и связанных Windows/Linux CI. Этот отчёт описывает поведение и границы; исторические receipts ниже не переносят PASS на новый head. [Следующие этапы 07–13](NEXT-STAGES.md) — только план; код 07 начинается после принятия 06.
 
-## Результат и критерии MVP
+## Реализовано
 
-| Требование | Реализация / проверяемый сценарий |
-| --- | --- |
-| Durable hierarchy рядом с legacy Run | Strict Project/Milestone/Epic/Task/Attempt, revision-bound risk approval, общие schema-order bytes/contract hash; legacy callers без нового default I/O |
-| Recovery/idempotency | Additive SQLite migration с actual consistent WAL backup; coherent complete snapshots/history, CAS/replay, atomic reserved Run install; crash не дублирует Run |
-| Ограниченный следующий горизонт | Полный DAG до1000 Task,1–24 horizon с меньшим mode/project cap; accepted dependencies, verified interfaces, approval; mandatory task input≤12000 UTF-8 bytes или split_required |
-| Evidence-based acceptance | Trusted awaited authorizer, current bound Run/head/config/checks/review/gates, own criterion mappings; нет JSON eligibility bypass, incomplete не принимается |
-| Lifecycle/control | Foreground одна Task→Engine, lease/restart/quota; pause сохраняет active Run/session, cancel сохраняется до forwarding, fresh admission перед reserve/install/dispatch |
-| CLI | create/status/plan/resume/cancel/pause/reprioritize/approve-risk; strict args, bounded safe output и exit0/1/2 |
-| Примеры | Два source-only synthetic ProjectSpec: Rust Git CLI и Hearthstone analytics; actual owned offline create/status/plan, без реализации продуктов |
+- Durable `Project → Milestone → Epic → Task → Attempt` рядом с legacy Run: additive SQLite migration, WAL-consistent backup, coherent snapshots/history, CAS и idempotent replay.
+- Bounded DAG horizon учитывает принятые зависимости, проверенные interfaces и актуальное revision-bound risk approval. `plan` — dry-run без резервирования Attempt и запуска Engine.
+- Foreground-выполнение одной Task через существующий Engine; reservation/atomic Run install переживают restart без дубликата Run. Lease исключает второго controller. Saved mode/fixed model, provider/session/quota и меньшие бюджеты сохраняются при resume/retry.
+- Pause блокирует новые starts/advancement, сохраняя active session. Cancel сначала сохраняет control и owned Run flag, затем передаёт отмену Engine; исторические blocked/failed/cancelled Attempts сохраняют revision, contractHash и evidence после reprioritize. Accepted/released history не переписывается.
+- Trusted authorizer проверяет actual bindings, source/head/config, checks, review, criterion mappings и enabled gates; Store повторяет CAS/control/binding checks в write transaction. Prose и `verified:true` не заменяют proof.
 
-Frozen ports SHA-256 `1741c9c19b717a15220b94e4c871911e0f21645abeef600905bdec85760539bf`, включая Root final clarifications. [PROJECTS: схемы/API/config/точные команды/ограничения](../PROJECTS.md), [ADR-0008: решения и альтернативы](../decisions/0008-project-director.md), [runtime](../RUNTIME.md#project-director-mvp06).
+CLI: `create/status/plan/resume/cancel/pause/reprioritize/approve-risk`; strict args, bounded безопасный вывод. Config задаёт mode/model/concurrency; новых Project CLI flags для них нет. [PROJECTS: API и примеры](../PROJECTS.md), [ADR-0008](../decisions/0008-project-director.md).
 
-MVP не добавляет daemon, sophisticated priority UI или generic framework. Project CLI не принимает mode/model/concurrency flags: config задаётся отдельно, saved Run сохраняет свой выбор; retry не расширяет limits. GPT/Claude остаются subscription-only, keys вне workers/Git/prompts/logs. Released требует проверенную publication chain и нужные released milestones; disabled gate нейтрален.
+## Ограничения
 
-## Scoped evidence и текущая граница
+Typed collections ≤1000, глубина ≤16, raw safety budget 32 MiB; horizon 1–24 с меньшим mode/project cap. Обязательный task input ≤12000 UTF-8 bytes, иначе `split_required`, без обрезания acceptance. GPT/Claude — подписочные клиенты; credentials вне Git/prompts/workers/logs.
 
-Координатор сообщил actual scoped группы A20/B34/C21/D67/E14, oracle23, legacy3, F16, correction retry5 и selected oracle/CLI28. Группы **пересекаются**, не суммируются как unique/full tests и не являются общим PASS06. Ранние core runtime regressions сохранены как исторические: исправлены freshness risk/interfaces до reserve/install/dispatch и pause, который сохраняет active Run/session; explicit cancel/lease-loss semantics сохранены. Documenter не повторял эти scoped suites.
+Source fences проверяют tracked bytes, включая hidden edits, links/stat/size и HEAD; fresh filter-config guards и обе границы сохранены. Все 183 pinned skill resources проверяются заново без success cache. Timeout/cancel дают очищенное partial evidence и incomplete receipt, не PASS.
 
-H на source `3817af8…`: Windows x64, Node24.19.0/ABI137;14 actual CLI subprocess observations, по7 на шаблон. Сначала absent owned root→exit1/invalid; затем actual temporary Git root: create/replay/status/plan-dry/plan-default/status→exit0. Revision1, Task3, currentAttempts0, status до/после идентичен; Rust выбирает `cli-contract`, Hearthstone — `data-contract`, две зависимые Task blocked. Network/provider guard: attempts0. Это input-validation/offline evidence, не regression suite или native product proof.
+Принятые Task **не принимают контейнеры автоматически**: Epic/Milestone/Project требуют собственные criterion mappings/evidence. CLI пока не импортирует container proof — его предоставляет trusted coordinator integration. Даже после всех Task возможен `own_proof_missing`; Released дополнительно требует publication chain. Daemon и сложный priority UI вне MVP. Rust Git CLI и Hearthstone analytics — source-only synthetic orchestration examples, не готовые продукты и не bundled package resources; offline observations не подтверждают native/domain behavior.
 
-Только собственные JSON copies, отдельные empty credential/state/client homes и allowlisted environment, явные knownValues[]/secrets{}. Fixture config quick/maxTasks1/research0/repair1/concurrency1; commands пустые, gates/delivery disabled только у fixtures. Actual Kodo enabled security этим не изменяется. Resume/provider/session/реальные keys не использовались.
+## Доказательства и приёмка
 
-Private `C:/Users/zulut/AppData/Local/Temp/kodo-roadmap-20261104/phase06-receipts/project-docs/`: `offline-examples.mjs`, `observations.json` с exact argv/env/raw outputs/exits/source hashes, `offline-run.log`, `source-snapshots/`, `manifest.json`. Первая ошибка harness до CLI (`--import` Windows path вместо file URL) сохранена отдельно, не засчитана product RED. Schema/scope/link проверки documenter записаны в `documentation-check.json`.
+**Датированный BASELINE до ресурсной коррекции, 5 ноября 2026:** source `6dfedcad…` имел Windows/Linux SUCCESS в [CI42042356804](https://github.com/Zulut30/Kodo/actions/runs/42042356804), но локальный full остановился по timeout 1200479 ms с incomplete receipt. Это история кандидата, а не текущий verdict.
 
-Принятые Task **не принимают автоматически контейнеры**: Epic/Milestone/Project требуют own mapped proof. В CLI нет importer/amend evidence/mappings контейнера, поэтому все Task могут быть accepted при blocked Project (`own_proof_missing` и др.). Шаблоны это ограничение сохраняют; empty refs не выдают себя за frozen interfaces. Ни Rust native behavior, ни Hearthstone patch/source/sample/statistics не проверены и не утверждаются.
+Одна неизменённая восьмифайловая подвыборка дала 30/30 PASS при 4 за 180896 ms и при 8 за 113540 ms. Добавлен небольшой test-file selector: 8 при конечных parallelism≥16/freeMemory≥4GiB, иначе 4; explicit 1–8 приоритетен. Независимые проверки: RED 3 PASS/28 FAIL → GREEN 31/31; восемь разных child PID, 11 файлов ровно по одному разу, bounded admission/drain. Это не whole-suite/model benchmark. Полный набор, порядок, isolation, assertions, frozen oracles, failure/cancel и 20-минутный deadline сохранены. [Контракт и scoped evidence](../WINDOWS-TEST-SPEED.md).
 
-## Оставшаяся приёмка и урок
+Процесс приёмки через PR15 требует exact-head full check, fresh enabled gates, независимое review, required Windows/Linux CI/installed smoke и protected merge. Актуальный результат фиксируют PR и его checks, а не этот исторический снимок. UI disabled нейтрален. Native client, опубликованный артефакт, release/tag/deployment этим scoped исправлением не подтверждаются; финальный Release предусмотрен только этапом 13.
 
-### Windows corrective evidence
-
-На baseline один неизменённый Director case прошёл: outer wall 107157.4236 ms,
-1238 Git и 13 PowerShell вызовов; две общие Windows-попытки достигли 20 минут.
-Это не доказательство причины full timeout. Source correction сокращает успешный
-`inspectCurrentSource` с 8 до 6 Git-процессов: 4 CORE + 2 обязательных свежих
-filter-config queries. Первоначальный предел 4 TOTAL был ошибкой Root, исправленной
-закреплённым addendum; filters/hidden-byte/link/stat/CRLF guards и обе source fences
-сохранены, удалены только два избыточных внешних HEAD-вызова Director.
-
-Stopped `execute` фиксирует первую причину и очищенный bounded `error.result`;
-Engine сохраняет failed row/evidence с `complete:false` и исходную typed error;
-`runCi` сохраняет очищенные 4096-byte tails с проверенными metadata, оставляя catch
-receipt blocked и общий результат incomplete. Lifecycle, deadlines, file concurrency 4/native capacity 5,
-subscription-only providers и меньшие saved budgets сохранены.
-
-Прямые зависимости сообщили scoped A 54+1 Director, B 32+18, C 75 PASS; группы
-не суммируются в общий результат. D oracle SHA-256
-`ad4033f1f7eb8084ec0201c083d460d69b4607e89a55e751054b3062c3a93bcc`
-заморожен: baseline RED 23/10 PASS/13 FAIL — только preparation, не feature PASS.
-Root сообщил actual frozen composite на clean code `0ee548b…` до docs:
-23/23 PASS, 0 fail/skip/cancel, 36995.3723 ms, Node24.19/Windows;
-source/head до и после неизменны. Это PRE-DOCS scoped component proof,
-не общий check/PASS или reuse для будущего HEAD после H. Performance AFTER
-остаётся PENDING и принадлежит Root после стабилизации H/native boundary.
-Полные контракты, pins,
-provenance и границы — [Windows test speed](../WINDOWS-TEST-SPEED.md).
-Пока нет измеренного глобального ускорения, benchmark или нового release proof.
-
-Координатору нужны интеграция docs/examples в clean candidate head, полный `npm run check`, fresh configured Semgrep/Gitleaks, независимый differential review и required Windows/Linux CI с installed artifact smoke на том же кандидате. UI verification disabled — neutral; selfhost architecture policy/gates оцениваются по фактическому config, disabled не PASS. Published artifact, release/tag/deployment06 и real provider/native-client check здесь не доказаны. Historical05 receipts на06 не переносятся.
-
-Урок: admission и terminal authorization требуют свежих фактов после plan/restart; pause и cancel различаются по влиянию на active session. Проверяйте критерии/refs/revision на каждой границе, а container proof отдельно от task count. Наличие адаптеров skills остаётся recorded instructions, не semantic compliance. [Прогресс roadmap](progress.md).
+Урок: terminal history независима от текущей revision; container proof проверяется отдельно от task count. Реальные CPU/memory boundaries и PID barrier не заменяют полную приёмку.

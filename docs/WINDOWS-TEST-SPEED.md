@@ -4,7 +4,7 @@
 
 `npm test` теперь вызывает `scripts/run-tests.mjs`: официальный Node24
 [`node:test.run`](https://nodejs.org/docs/latest-v24.x/api/test.html#runoptions)
-с `files`, `concurrency: 4`, `isolation: 'process'` и встроенным TAP reporter.
+с `files`, ресурсным default concurrency 4/8, `isolation: 'process'` и встроенным TAP reporter.
 Прямой `node --test` сортирует explicit files, поэтому перестановка аргументов
 CLI сама по себе не меняет стартовый порядок. Programmatic API сохраняет
 переданный порядок; это проверено короткими реальными child-процессами.
@@ -59,10 +59,44 @@ cases 563–578 с суммой case work 255773.4331 ms без повторно
 1200492 ms; это исходный неуспех, а не AFTER данной перестановки. Успешные
 Windows/Linux CI того же исходника не доказывают локальный AFTER.
 
-Time limits, assertions, frozen oracles, process isolation и общий потолок4
-сохранены. Cancellation использует AbortSignal штатного runner; CLI SIGINT/SIGTERM
+Time limits, assertions, frozen oracles и process isolation сохранены. Потолок
+тестовых файлов ограничен 8 по политике ниже. Cancellation использует AbortSignal штатного runner; CLI SIGINT/SIGTERM
 запрашивают abort и дренирование. Принудительное OS-завершение процесса не даёт
 выполнить JS cleanup; Windows tree termination остаётся границей координатора.
+
+### Ресурсный default 4/8: 5 ноября 2026
+
+Чистый `chooseTestConcurrency(parallelism, freeMemoryBytes)` выбирает 8 только
+при конечном CPU parallelism ≥16 и конечной свободной памяти ≥4 GiB
+(`4 * 1024 ** 3` bytes); иначе 4, включая неизвестные/нечисловые/Infinity inputs.
+Без явного выбора `runTests` читает `os.availableParallelism()` и `os.freemem()`
+один раз при вызове. Это бюджет одновременно выполняемых тестовых файлов,
+а не динамический регулятор и не лимит native/model сессий. Explicit 1–8 имеет
+приоритет даже при меньших ресурсах; новых env/settings нет. Общий deadline
+20 минут не расширен; discovery, полный набор, порядок, diagnostics, nonzero,
+abort/drain и официальный process-isolated Node runner сохранены.
+
+Основание — один контролируемый опыт на неизменённом source
+`6dfedcad39d1efed5b31c77a036375a90487219d`, Windows, Node `v24.22.1`, 32 CPU:
+одни и те же 30 cases в восьми Engine/mode-engine файлах прошли 30/30 при 4
+за 180896.4247 ms, затем при 8 за 113540.1556 ms. Это последовательная
+подвыборка одного host, без статистических повторов, не whole-suite speedup,
+не model/provider benchmark и не объяснение причины прежнего timeout.
+
+До source-изменения независимые boundary/default/CLI/barrier проверки дали
+3 PASS / 28 FAIL; после — 31 PASS / 0 FAIL/cancel/skip, exit0, Windows,
+Node `v24.19.0`. Barrier удерживает восемь разных child PID до release,
+проверяет верхнюю границу, выполнение всех 11 файлов ровно по одному разу
+и drain. Default wiring проверяется с контролируемыми OS readings, настоящим
+filesystem и Node children, без зависимости от текущей свободной памяти host.
+Старый barrier сохраняет все assertions и timeout с explicit4; старый cap-negative
+изменён только с 5 на 9. Остальные старые тела и frozen oracles сохранены.
+Сырые `resource-red.tap`, `resource-green.tap`, команды, exit codes и source hashes
+сохранены приватно вне Git в Run `d44ff299-c1df-4c21-a3c2-74fcd8d768cf`,
+`throughput-evidence`. Полный check, fresh gates, review и CI точного кандидата
+выполняет координатор; [окончательная приёмка06](https://github.com/Zulut30/Kodo/pull/15).
+Урок: проверять CPU и память независимо и наблюдать реальную границу child PID;
+одна удачная подвыборка не заменяет полный check.
 
 Поддерживаемый CLI:
 
@@ -74,7 +108,7 @@ npm test -- --test-concurrency=1 tests/test-schedule.test.mjs
 ```
 
 Оба флага принимают `=value` или отдельное значение; повторные name patterns
-передаются Node как массив. Concurrency разрешена от1 до4, default4. Explicit
+передаются Node как массив. Concurrency разрешена от1 до8, default по ресурсам 4/8. Explicit
 paths — только существующие literal-файлы внутри checkout, без ссылок,
 `node_modules`/`.git`; повторения запускаются один раз. Globs, каталоги и остальные
 флаги явно отклоняются с nonzero exit, а не меняют выбор тестов незаметно.
@@ -83,7 +117,7 @@ paths — только существующие literal-файлы внутри 
 остаются самостоятельными. Runner нужен только checkout разработчика и не входит в установочный CLI-пакет; shipped script asset остаётся `ci-reporter.mjs`. Существующий пакетный regression test проверяет этот состав.
 
 Локальное доказательство ограничено `tests/test-schedule.test.mjs` с короткими
-фикстурами: default discovery (включая TypeScript/strip-types), exclusions/links,
+фикстурами (историческая коррекция порядка, до ресурсного default): default discovery (включая TypeScript/strip-types), exclusions/links,
 детерминированный duplicate-free порядок, фактический старт при concurrency1,
 readiness barrier с четырьмя отдельными PID, exit0 и реальные assertion/import/
 cancel failures, abort owned child, explicit paths/name patterns и явный отказ
