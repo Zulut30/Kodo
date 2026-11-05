@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 1,
+  "id": "rust-git-cli-example",
+  "root": "C:/Kodo-Owned-Examples/rust-git-cli",
+  "title": "Synthetic orchestration template: read-only Rust Git CLI",
+  "definitionOfDone": [
+    { "id": "project-proof", "text": "Independently verify the agreed CLI contract and all accepted child deliverables in an owned repository; this template itself is not an implemented product.", "evidenceKinds": ["acceptance", "checks", "review"] }
+  ],
+  "constraints": [
+    "Replace root with an existing owned absolute Git root with an initial commit; do not execute against the Kodo repository or an arbitrary user checkout.",
+    "Template only: Rust toolchain/version, Git implementation/library, supported platforms, distribution and performance are unknown until the contract task verifies them.",
+    "Execution mode is configured separately in kodo.config.json. Suggested offline planning: executionMode quick, maxTasks 1, researchBudget 0, repairRounds 1, concurrency 1. Project CLI accepts no --mode or --model. No provider execution is authorized by the example smoke.",
+    "Future execution uses signed-in GPT/Claude subscription clients only. Preserve fixed model and lower saved budgets; no API fallback or credentials in project data.",
+    "Read-only status/log commands only; no reset, checkout, clean, push, credential helper execution or repository mutation. Use synthetic disposable Git fixtures.",
+    "No invented benchmark, release or deployment claim; container acceptance needs its own verified evidence and mappings, not merely accepted tasks."
+  ],
+  "businessContext": "Illustrative task hierarchy for a small Rust command-line tool. No Rust product, native build or Git semantic compatibility is supplied or measured by this JSON.",
+  "architectureRefs": [],
+  "milestones": [
+    { "id": "offline-mvp", "title": "Owned offline CLI milestone", "acceptance": [{ "id": "milestone-proof", "text": "Verify contract, implementation and tests together with independent milestone evidence.", "evidenceKinds": ["acceptance", "checks", "review"] }], "releaseRequired": false }
+  ],
+  "epics": [
+    { "id": "read-only-git", "milestoneId": "offline-mvp", "title": "Read-only Git inspection", "acceptance": [{ "id": "epic-proof", "text": "Verify status/log behavior and safe failure in owned repositories against the agreed interface.", "evidenceKinds": ["acceptance", "checks", "review"] }] }
+  ],
+  "tasks": [
+    {
+      "id": "cli-contract", "epicId": "read-only-git", "title": "Freeze supported CLI behavior",
+      "description": "Document supported status/log options, output/exit behavior, encoding and clean/dirty/invalid repository scenarios. Inspect available Rust and Git versions before selecting dependencies; record unknowns. Produce a reviewable interface without implementing the tool.",
+      "owner": "developer", "dependsOn": [], "writePaths": ["docs/cli-contract.md"],
+      "acceptance": [{ "id": "contract-proof", "text": "Contract has observable examples, errors, supported versions and explicit unsupported operations; independently reviewed.", "evidenceKinds": ["acceptance", "checks", "review"] }],
+      "interfaceRefs": [], "priority": 80, "userValue": 4, "risk": 1, "estimatedEffort": 1, "riskApprovalRequired": false
+    },
+    {
+      "id": "cli-implementation", "epicId": "read-only-git", "title": "Implement only the accepted CLI contract",
+      "description": "After cli-contract acceptance, implement read-only commands in the assigned Rust files. Obtain and verify immutable interface evidence before execution; the empty template interfaceRefs does not supply that proof. Preserve repository contents and report unsupported states explicitly.",
+      "owner": "developer", "dependsOn": ["cli-contract"], "writePaths": ["Cargo.toml", "Cargo.lock", "src"],
+      "acceptance": [{ "id": "implementation-proof", "text": "Commands satisfy the frozen contract on owned fixtures and cannot mutate repositories through their public interface.", "evidenceKinds": ["acceptance", "checks", "review"] }],
+      "interfaceRefs": [], "priority": 70, "userValue": 4, "risk": 2, "estimatedEffort": 2, "riskApprovalRequired": false
+    },
+    {
+      "id": "cli-regressions", "epicId": "read-only-git", "title": "Verify public behavior independently",
+      "description": "Test clean/dirty repositories, Unicode filenames, missing repository and invalid flags through the actual binary in temporary Git roots. Verify no filesystem changes and preserve raw command evidence. No publishing or performance ranking.",
+      "owner": "tester", "dependsOn": ["cli-implementation"], "writePaths": ["tests"],
+      "acceptance": [{ "id": "regression-proof", "text": "Actual native checks exercise public outputs/exits and mutation boundaries; failures remain visible and evidence identifies the tested head/toolchain.", "evidenceKinds": ["acceptance", "checks", "review"] }],
+      "interfaceRefs": [], "priority": 60, "userValue": 4, "risk": 1, "estimatedEffort": 1, "riskApprovalRequired": false
+    }
+  ]
+}
