@@ -1,0 +1,46 @@
+name: Kodo Linux scoped probe
+
+on:
+  push:
+    branches: ['codex/kodo-linux-probe-**']
+
+permissions:
+  contents: read
+
+jobs:
+  scoped-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 05057ea015977731e2c0dfcfd25f241ee5126ba2
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Verify exact source, Node and frozen oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo 'Expected source HEAD: 05057ea015977731e2c0dfcfd25f241ee5126ba2'
+          git rev-parse HEAD
+          test "$(git rev-parse HEAD)" = '05057ea015977731e2c0dfcfd25f241ee5126ba2'
+          node --version
+          echo 'fa0a150b981f9b0ea609e2204bf562a5b04f546f86dc74450ec541bf8635c7c5  tests/project-director-oracle.test.mjs' | sha256sum --check
+          echo '351abf9f5c45e6144561aa3759c177a9d7a25c68f4ce257a8ef0ef2877e3e039  tests/project-director.test.mjs' | sha256sum --check
+          echo 'ad4033f1f7eb8084ec0201c083d460d69b4607e89a55e751054b3062c3a93bcc  tests/windows-speed-oracle.test.mjs' | sha256sum --check
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          echo 'SCOPED ONLY: no full-check, installed-package, release or deployment claim'
+      - name: Install locked dependencies without scripts
+        run: npm ci --ignore-scripts
+      - name: Exact frozen 1000-amendment SQLite coherence scenario
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --test '--test-name-pattern=Director actual SQLite snapshot counts bodies and revision stay coherent during concurrent amendments' tests/project-director-oracle.test.mjs | tee "$RUNNER_TEMP/kodo-linux-coherence.tap"
+      - name: Actual Director and both unchanged frozen oracles, concurrency 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --test --test-concurrency=2 tests/project-director.test.mjs tests/project-director-oracle.test.mjs tests/windows-speed-oracle.test.mjs | tee "$RUNNER_TEMP/kodo-linux-director-oracle.tap"
