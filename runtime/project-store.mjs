@@ -109,7 +109,18 @@ export async function openProjectStore({ store, contracts, authorizeTransition }
   }
   const options = { knownValues: Object.values(store.secrets || {}).filter(value => typeof value === 'string' && value.length > 0) };
   const db = store.db;
+  // Cache only validated persisted bytes, never caller-owned objects or revisions.
+  // Both the encoded keys and detached values count toward the per-repository cap.
+  const validationCache = new Map(), validationLimit = 8 * 1024 * 1024;
+  let validationBytes = 0, validationSecrets = structuredClone(store.secrets || {});
+  function refreshValidationContext() {
+    if (isDeepStrictEqual(validationSecrets, store.secrets || {})) return;
+    validationCache.clear(); validationBytes = 0;
+    validationSecrets = structuredClone(store.secrets || {});
+    options.knownValues = Object.values(validationSecrets).filter(value => typeof value === 'string' && value.length > 0);
+  }
   function safe(value) {
+    refreshValidationContext();
     contracts.assertDirectorSafe(value, options);
     requireValue(isDeepStrictEqual(value, redact(value, store.secrets || {})), 'secret_redaction_required');
   }
@@ -121,8 +132,26 @@ export async function openProjectStore({ store, contracts, authorizeTransition }
   const bytes = (kind, value) => { safe(value); return contracts.directorBytes(kind, value, options); };
   const recordHash = (kind, value) => hash(bytes(kind, value));
   const body = (kind, value) => bytes(kind, value).toString('utf8');
+  function validated(kind, text, parse = () => JSON.parse(text)) {
+    refreshValidationContext();
+    const key = kind + '\0' + text, cached = validationCache.get(key);
+    if (cached) {
+      validationCache.delete(key); validationCache.set(key, cached);
+      return structuredClone(cached.value);
+    }
+    const value = normalize(kind, parse());
+    const size = Buffer.byteLength(key) + Buffer.byteLength(JSON.stringify(value));
+    if (size <= validationLimit) {
+      while (validationCache.size && (validationCache.size >= 2048 || validationBytes + size > validationLimit)) {
+        const oldest = validationCache.keys().next().value;
+        validationBytes -= validationCache.get(oldest).size; validationCache.delete(oldest);
+      }
+      validationCache.set(key, { value: structuredClone(value), size }); validationBytes += size;
+    }
+    return value;
+  }
   function decode(kind, text) {
-    try { return normalize(kind, JSON.parse(text)); }
+    try { return validated(kind, text); }
     catch { fail('database_corrupt'); }
   }
   await migrate(store);
@@ -192,7 +221,10 @@ export async function openProjectStore({ store, contracts, authorizeTransition }
         requireValue(value.projectId === projectId && value.taskId === row.task_id && value.taskRevision === row.task_revision, 'database_corrupt');
         return value;
       });
-    return normalize('snapshot', { schemaVersion: 1, project, revision: project.revision, ...sets, currentAttempts, riskApprovals, completeness });
+    const value = { schemaVersion: 1, project, revision: project.revision, ...sets, currentAttempts, riskApprovals, completeness };
+    // Counts, relational columns and bodies are still read/checked in this SQL
+    // transaction. Only an exact aggregate may reuse its pure validation result.
+    return validated('snapshot', JSON.stringify(value), () => value);
   }
   function snapshot(projectId) { return transaction(db, 'BEGIN', () => readSnapshot(projectId)); }
   function history(projectId, { after = 0, limit = 1000 } = {}) {
@@ -309,6 +341,13 @@ export async function openProjectStore({ store, contracts, authorizeTransition }
           kind = 'project'; previous = project; record = { ...project, paused: action.paused };
         } else if (action.op === 'insert' || action.op === 'amend') {
           requireValue(children.includes(kind), 'record_invalid'); control(project);
+          if (action.op === 'insert') {
+            const ancestors = [project];
+            if (kind === 'task') ancestors.push(get(projectId, 'epic', action.record.epicId));
+            if (kind !== 'milestone') ancestors.push(get(projectId, 'milestone',
+              kind === 'epic' ? action.record.milestoneId : ancestors[1].milestoneId));
+            requireValue(ancestors.every(parent => !['accepted', 'released'].includes(parent.status)), 'insertion_blocked');
+          }
           if (action.op === 'amend') {
             previous = get(projectId, kind, action.id);
             requireValue(action.record.id === action.id, 'identity_conflict');

@@ -440,3 +440,125 @@ test('Creation identity canonicalizes aliases before shared hashing and retains 
   }
   await assert.rejects(repo.apply(command(null, null, { op: 'create', spec: spec('relative-project') })));
 });
+
+test('Exact persisted snapshot validation is reused without sharing mutable results or trusting revisions', async t => {
+  const A = await import('../runtime/project-contracts.mjs');
+  let validations = 0;
+  const f = await fixture(t), { repo, store } = await f.open({ contracts: { ...A,
+    normalizeDirectorRecord(...args) { validations++; return A.normalizeDirectorRecord(...args); }
+  } });
+  const { result } = await create(repo, f.project, 1000), id = result.projectId;
+  const first = repo.snapshot(id), count = validations;
+  first.tasks[0].acceptance[0].text = 'Caller mutation'; first.tasks.pop(); first.completeness.tasks.total = 0;
+  const next = repo.snapshot(id);
+  assert.equal(validations, count, 'unchanged DB bytes do not repeat pure normalization');
+  assert.equal(next.tasks.length, 1000); assert.equal(next.tasks[0].acceptance[0].text, criterion.text);
+  assert.deepEqual(next.completeness.tasks, { total: 1000, returned: 1000, complete: true });
+  const row = store.db.prepare("SELECT body FROM kodo_project_records WHERE kind='task' AND id='task-0'").get();
+  const changed = { ...JSON.parse(row.body), priority: 81 };
+  store.db.prepare("UPDATE kodo_project_records SET body=? WHERE kind='task' AND id='task-0'").run(JSON.stringify(changed));
+  const fresh = repo.snapshot(id);
+  assert.equal(fresh.revision, next.revision); assert.equal(fresh.tasks.find(task => task.id === 'task-0').priority, 81);
+  assert.ok(validations > count, 'changed body with unchanged revision must be validated');
+  store.db.prepare("UPDATE kodo_project_records SET body=? WHERE kind='task' AND id='task-0'").run(JSON.stringify({ ...changed, writePaths: ['../escape'] }));
+  assert.throws(() => repo.snapshot(id), { code: 'project_database_corrupt' });
+  store.db.prepare("UPDATE kodo_project_records SET body=? WHERE kind='task' AND id='task-0'").run(row.body);
+  assert.equal(repo.snapshot(id).tasks.find(task => task.id === 'task-0').priority, 50);
+  store.db.prepare("UPDATE kodo_project_records SET id='wrong-row' WHERE kind='task' AND id='task-0'").run();
+  assert.throws(() => repo.snapshot(id), { code: 'project_database_corrupt' });
+  store.db.prepare("UPDATE kodo_project_records SET id='task-0' WHERE kind='task' AND id='wrong-row'").run();
+  store.db.prepare("DELETE FROM kodo_project_records WHERE kind='task' AND id='task-0'").run();
+  assert.deepEqual(repo.snapshot(id).completeness.tasks, { total: 999, returned: 999, complete: true });
+});
+
+test('Cached persisted bytes are revalidated when known secrets change and never hide new unsafe bytes', async t => {
+  const A = await import('../runtime/project-contracts.mjs');
+  const f = await fixture(t), { repo, store } = await f.open({ contracts: A });
+  const { result } = await create(repo, f.project), id = result.projectId;
+  repo.snapshot(id);
+  store.secrets.fixture = 'Observable result works';
+  assert.throws(() => repo.snapshot(id), { code: 'project_database_corrupt' });
+  delete store.secrets.fixture;
+  repo.snapshot(id);
+  const row = store.db.prepare("SELECT body FROM kodo_project_records WHERE kind='task'").get();
+  const task = JSON.parse(row.body);
+  for (const description of ['sk-proj-' + 'a'.repeat(30), '-----BEGIN PRIVATE KEY-----\nfixture\n-----END PRIVATE KEY-----']) {
+    store.db.prepare("UPDATE kodo_project_records SET body=? WHERE kind='task'").run(JSON.stringify({ ...task, description }));
+    assert.throws(() => repo.snapshot(id), { code: 'project_database_corrupt' });
+  }
+  store.db.prepare("UPDATE kodo_project_records SET body=? WHERE kind='task'").run(row.body);
+  assert.equal(repo.snapshot(id).tasks[0].description, task.description);
+});
+
+test('Inserting under accepted or released containers rejects atomically with actual contracts', async t => {
+  const A = await import('../runtime/project-contracts.mjs');
+  for (const parentKind of ['epic', 'milestone', 'project']) for (const status of ['accepted', 'released']) {
+    const f = await fixture(t), { repo, store } = await f.open({ contracts: A, authorizeTransition: async () => {} });
+    const initial = spec(f.project, 0);
+    if (parentKind !== 'epic') initial.epics = [];
+    if (parentKind === 'project') initial.milestones = [];
+    const { projectId: id } = await repo.apply(command(null, null, { op: 'create', spec: initial }));
+    const parentId = parentKind === 'project' ? id : parentKind === 'milestone' ? 'm' : 'e';
+    const proof = { kind: 'checks', runId: null, headSha: null, path: path.join(f.root, 'proof.json'), sha256: 'a'.repeat(64) };
+    const mapping = { criterionId: 'works', refs: [proof.sha256], actor: 'fixture', reason: 'Owned acceptance evidence' };
+    for (const to of ['ready', 'running', 'verifying', 'integrated', 'accepted', ...(status === 'released' ? ['released'] : [])]) {
+      const evidence = to === 'accepted' ? [proof] : to === 'released' ? [{ ...proof, kind: 'release', sha256: 'b'.repeat(64) }] : [];
+      await repo.apply(command(id, repo.snapshot(id).revision,
+        { op: 'transition', kind: parentKind, id: parentId, to, evidence, mappings: to === 'accepted' ? [mapping] : [] }));
+    }
+    const childKind = parentKind === 'project' ? 'milestone' : parentKind === 'milestone' ? 'epic' : 'task';
+    const child = spec(f.project)[childKind + 's'][0];
+    // Compare every durable table, not just the user-visible revision.
+    const durable = () => Object.fromEntries(['records', 'attempts', 'current', 'approvals', 'commands', 'events'].map(name =>
+      [name, store.db.prepare('SELECT * FROM kodo_project_' + name + ' ORDER BY rowid').all()]));
+    const before = durable();
+    const insert = command(id, repo.snapshot(id).revision, { op: 'insert', kind: childKind, record: child });
+    await assert.rejects(repo.apply(insert), error => ['project_insertion_blocked', 'project_control_blocked'].includes(error.code), `${parentKind} ${status}`);
+    assert.deepEqual(durable(), before, `${parentKind} ${status}: no rows, events or command replay survive rejection`);
+    if (parentKind !== 'project') {
+      await assert.rejects(repo.apply(command(id, repo.snapshot(id).revision, { op: 'amend', kind: parentKind,
+        id: parentId, record: { ...spec(f.project)[parentKind + 's'][0], title: 'Changed accepted contract' } })),
+      { code: 'project_amendment_blocked' });
+      assert.deepEqual(durable(), before, `${parentKind} ${status}: rejected amendment is atomic`);
+    }
+  }
+});
+
+test('Persisted validation reuse evicts old byte content within a bounded cache', async t => {
+  let taskValidations = 0;
+  const f = await fixture(t), { repo, store } = await f.open({ contracts: { ...contracts,
+    normalizeDirectorRecord(kind, value) { if (kind === 'task') taskValidations++; return structuredClone(value); }
+  } });
+  const { result } = await create(repo, f.project), id = result.projectId;
+  const row = store.db.prepare("SELECT body FROM kodo_project_records WHERE kind='task'").get();
+  const first = { ...JSON.parse(row.body), description: 'Owned large fixture ' + 'x'.repeat(60000) };
+  const update = store.db.prepare("UPDATE kodo_project_records SET body=? WHERE kind='task'");
+  update.run(JSON.stringify(first)); repo.snapshot(id);
+  for (let n = 0; n < 80; n++) {
+    update.run(JSON.stringify({ ...first, description: first.description + n })); repo.snapshot(id);
+  }
+  const before = taskValidations;
+  update.run(JSON.stringify(first));
+  assert.equal(repo.snapshot(id).tasks[0].description, first.description);
+  assert.ok(taskValidations > before, 'old validated bytes must be evicted rather than retained without a bound');
+});
+
+test('Warm validation cache never lets raw secrets or accessors reach canonical encoding', async t => {
+  const A = await import('../runtime/project-contracts.mjs');
+  let encodings = 0, reads = 0;
+  const f = await fixture(t), { repo, store } = await f.open({ contracts: { ...A,
+    directorBytes(...args) { encodings++; return A.directorBytes(...args); }
+  } });
+  const { result } = await create(repo, f.project), id = result.projectId;
+  const base = command(id, repo.snapshot(id).revision, { op: 'setPaused', paused: true });
+  store.secrets.fixture = 'quote"slash\\line\n';
+  const getter = { ...base };
+  Object.defineProperty(getter, 'reason', { enumerable: true, get() { reads++; return 'not evaluated'; } });
+  const before = encodings;
+  for (const input of [getter, { ...base, reason: store.secrets.fixture }, { ...base, [store.secrets.fixture]: 'ordinary' }]) {
+    await assert.rejects(repo.apply(input));
+    assert.equal(encodings, before, 'unsafe raw data must fail before canonical bytes or hashing');
+  }
+  assert.equal(reads, 0);
+  assert.equal(repo.snapshot(id).revision, result.revision);
+});
