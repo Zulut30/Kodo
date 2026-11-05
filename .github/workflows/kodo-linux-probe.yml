@@ -1,0 +1,46 @@
+name: Kodo Linux scoped probe
+
+on:
+  push:
+    branches: ['codex/kodo-linux-probe-**']
+
+permissions:
+  contents: read
+
+jobs:
+  scoped-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 5c1be87e13363471a0a9138fe1895a92216003b5
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Verify exact source, Node and frozen oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo 'Expected source HEAD: 5c1be87e13363471a0a9138fe1895a92216003b5'
+          git rev-parse HEAD
+          test "$(git rev-parse HEAD)" = '5c1be87e13363471a0a9138fe1895a92216003b5'
+          node --version
+          echo 'fa0a150b981f9b0ea609e2204bf562a5b04f546f86dc74450ec541bf8635c7c5  tests/project-director-oracle.test.mjs' | sha256sum --check
+          echo '351abf9f5c45e6144561aa3759c177a9d7a25c68f4ce257a8ef0ef2877e3e039  tests/project-director.test.mjs' | sha256sum --check
+          echo 'ad4033f1f7eb8084ec0201c083d460d69b4607e89a55e751054b3062c3a93bcc  tests/windows-speed-oracle.test.mjs' | sha256sum --check
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          echo 'DIAGNOSTIC ONLY: full command below may fail; no acceptance, installed-package, release or deployment claim'
+      - name: Install locked dependencies without scripts
+        run: npm ci --ignore-scripts
+      - name: Short new scheduler regressions, raw TAP
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --test --test-reporter=tap tests/test-schedule.test.mjs | tee "$RUNNER_TEMP/kodo-linux-coherence.tap"
+      - name: Reproduce current full command with raw TAP to retain failure identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run check | tee "$RUNNER_TEMP/kodo-linux-director-oracle.tap"
