@@ -241,10 +241,12 @@ async function verifyReference(ref, { root, projectKey, source, value, headSha, 
   if (bytes.length !== ref.bytes || hashBytes(bytes) !== ref.sha256) fail('knowledge_evidence');
   const envelope = parse(bytes, relativePath);
   keys(envelope, ['schemaVersion', 'kind', 'baseSha', 'headSha', 'value']);
-  if (envelope.schemaVersion !== 1 || envelope.kind !== 'knowledge' || envelope.headSha !== headSha || envelope.baseSha !== headSha
+  if (envelope.schemaVersion !== 1 || envelope.kind !== 'knowledge' || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(envelope.headSha)
+    || envelope.baseSha !== envelope.headSha || headSha !== undefined && envelope.headSha !== headSha
     || !isDeepStrictEqual(envelope.value, envelopeValue(projectKey, source, value))) fail('knowledge_evidence');
-  await adapter.assert({ ...ref, headSha });
-  return bytes.length;
+  const reference = { ...ref, headSha: envelope.headSha };
+  await adapter.assert(reference);
+  return reference;
 }
 
 export async function refreshKnowledge(options, ports = {}) {
@@ -333,7 +335,7 @@ export async function refreshKnowledge(options, ports = {}) {
 }
 
 export async function checkKnowledgeEvidence({ project, snapshotCwd = project, evidenceRoot, claims }, ports = {}) {
-  const items = [], roots = {};
+  const items = [], roots = {}, verified = [];
   let remaining;
   // Per-record failures are neutral evidence failures, never success or leaked
   // filesystem/parser errors. Nothing here mutates a capture or its timestamps.
@@ -356,7 +358,11 @@ export async function checkKnowledgeEvidence({ project, snapshotCwd = project, e
       const { policy, context } = roots.loaded;
       if (claim.projectKey !== context.projectKey || claim.source.kind !== 'local' && claim.source.kind !== 'discovery') fail('knowledge_evidence');
       adapter ||= await evidenceAdapter(ports, ports.store || { home: path.dirname(roots.evidence) });
-      remaining -= await verifyReference(ref, { root: roots.evidence, projectKey: context.projectKey, source: claim.source, value: claim.value, headSha: roots.source.head, adapter, limit: remaining });
+      // Capture bytes retain their original HEAD. Only codebase observations
+      // require that HEAD to equal the current owned source snapshot.
+      const reference = await verifyReference(ref, { root: roots.evidence, projectKey: context.projectKey, source: claim.source, value: claim.value,
+        headSha: claim.domain === 'codebase' ? roots.source.head : undefined, adapter, limit: remaining });
+      remaining -= reference.bytes;
       item.intact = true;
       if (claim.source.kind !== 'local') continue;
       relative(claim.source.path);
@@ -366,11 +372,17 @@ export async function checkKnowledgeEvidence({ project, snapshotCwd = project, e
       const bytes = await readOwned(roots.source.root, claim.source.path, remaining, ports.secrets || {});
       assertTrackedBytes(bytes, oid); remaining -= bytes.length;
       item.sourceMatches = isDeepStrictEqual(await selection(bytes, claim.source), claim.value);
+      if (item.sourceMatches) verified.push({ item, reference });
     } catch { /* This exact revision/hash stays ineligible. */ }
   }
   if (!roots.invalid) {
     try { if ((await snapshot(roots.source.root)).head !== roots.source.head) throw new Error('head'); }
     catch { for (const item of items) item.sourceMatches = false; }
+  }
+  // The trusted seam is separate from the public serialized checks and is
+  // emitted only after source verification and the final clean-HEAD fence.
+  for (const { item, reference } of verified) if (item.intact && item.sourceMatches) {
+    ports.onVerifiedReference?.({ id: item.id, revision: item.revision, reference: { ...reference } });
   }
   return { schemaVersion: 1, items };
 }
