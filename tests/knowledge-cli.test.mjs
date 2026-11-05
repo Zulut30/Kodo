@@ -55,14 +55,14 @@ const networkGuard = 'data:text/javascript,' + encodeURIComponent(`
 const now = '2026-11-05T12:00:00.000Z';
 const git = (cwd, ...args) => execFileSync('git', ['-c', 'core.autocrlf=false', ...args], { cwd, encoding: 'utf8', windowsHide: true, env: workerEnvironment() }).trim();
 const policy = { schemaVersion: 1, mode: 'local-only', sourcePaths: ['data.json'], allowedOrigins: [], maxRequests: 0, ttlSeconds: { domain: 86400, product: 86400, technical: 604800, codebase: 3600 }, maxClaims: 200, maxEvidenceBytes: 1048576, maxContextBytes: 2048 };
-async function fixture(t) {
+async function fixture(t, { objectFormat = 'sha1' } = {}) {
   const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'kodo-knowledge-cli-'))), project = path.join(root, 'project'), home = path.join(root, 'state');
   await mkdir(project); t.after(() => rm(root, { recursive: true, force: true }));
   const put = (file, data) => writeFile(path.join(project, file), JSON.stringify(data));
   const context = { schemaVersion: 1, versions: { patch: 'A' }, synthetic: true };
   const input = { schemaVersion: 1, captureId: 'first', synthetic: true, claims: [{ domain: 'product', subject: 'fixture', key: 'value', value: 7, versions: { patch: 'A' }, source: { id: 'fixture-value', kind: 'local', url: null, path: 'data.json', pointer: '/value', retrievedAt: now, validAsOf: now }, confidence: null, unknowns: [] }] };
   await put('research.policy.json', policy); await put('research.context.json', context); await put('override.json', { ...context, versions: { patch: 'B' } }); await put('input.json', input); await put('data.json', { value: 7 });
-  git(project, 'init', '-q'); git(project, 'config', 'user.name', 'Fixture'); git(project, 'config', 'user.email', 'fixture@example.invalid');
+  git(project, 'init', '-q', '--object-format=' + objectFormat); git(project, 'config', 'user.name', 'Fixture'); git(project, 'config', 'user.email', 'fixture@example.invalid');
   const commit = () => { git(project, 'add', '-A'); git(project, 'commit', '-qm', 'fixture'); return git(project, 'rev-parse', 'HEAD'); }; commit();
   const invoke = (args, environment = {}, json = true) => {
     const result = spawnSync(process.execPath, ['--import', networkGuard, cli, ...args, '--project', project, ...(json ? ['--json'] : [])], { encoding: 'utf8', windowsHide: true, env: { ...workerEnvironment(), ...environment, KODO_HOME: home, KODO_CREDENTIAL_HOME: path.join(root, 'absent-credentials') } });
@@ -117,6 +117,67 @@ test('Actual CLI refresh reopen patch history source and tamper invalidation rem
   const history = reader.listKnowledgeClaims(fx.project, { history: true }); reader.close(); assert.equal(history.length, 1); assert.equal(history[0].versions.patch, 'A');
   const ref = history[0].source.evidenceRef; await chmod(ref.path, 0o600); await writeFile(ref.path, '{}');
   current = await inspect(); assert.equal(current.report.projection.references.length, 0); assert.ok(current.report.evaluation.rows[0].reasons.includes('evidence_unverified'));
+});
+
+test('Capture HEAD CLI retains fresh product after unrelated commit with current codebase invalidated', async t => {
+  const fx = await fixture(t), capturedAt = new Date(Date.now() - 1000).toISOString();
+  fx.input.claims[0].source.retrievedAt = capturedAt; fx.input.claims[0].source.validAsOf = capturedAt;
+  fx.input.claims.push({ ...structuredClone(fx.input.claims[0]), domain: 'codebase', source: { ...fx.input.claims[0].source, id: 'codebase-value' } });
+  await fx.put('input.json', fx.input); const captureHead = fx.commit();
+  const saved = fx.invoke(['research', 'refresh', '--input', 'input.json']); assert.equal(saved.report.status, 'refreshed');
+  const original = structuredClone(saved.report.capture);
+  await fx.put('unrelated.json', { note: 'new head' }); const currentHead = fx.commit(); assert.notEqual(currentHead, captureHead);
+  const inspected = fx.invoke(['knowledge', 'inspect']); assert.equal(inspected.exitCode, 0);
+  assert.deepEqual(inspected.report.projection.references.map(row => row.domain), ['product']);
+  assert.equal(inspected.report.context.headSha, currentHead);
+  const codebase = inspected.report.evaluation.rows.find(row => row.claim.domain === 'codebase');
+  assert.equal(codebase.state, 'invalidated'); assert.ok(codebase.reasons.includes('version_mismatch:headSha'));
+  assert.equal(Object.hasOwn(inspected.report, 'evidenceReferences'), false, 'trusted metadata stays internal');
+  const { openKnowledgeReader } = await import('../runtime/store.mjs'); const reader = openKnowledgeReader(fx.home);
+  try { assert.deepEqual(reader.listKnowledgeClaims(fx.project, { history: true }).sort((a, b) => a.id.localeCompare(b.id)), original.claims.sort((a, b) => a.id.localeCompare(b.id))); }
+  finally { reader.close(); }
+});
+
+test('Capture HEAD composition requires exact verified metadata and preserves eligibility fences', async t => {
+  const fx = await fixture(t, { objectFormat: 'sha256' }), { knowledgeCli, knowledgeSnapshot } = await import('../runtime/knowledge-cli.mjs');
+  const { checkKnowledgeEvidence } = await import('../runtime/knowledge-refresh.mjs');
+  const ports = { secrets: {}, home: fx.home, now: () => now };
+  const saved = await knowledgeCli(['research', 'refresh', '--project', fx.project, '--input', 'input.json'], ports);
+  assert.equal(saved.report.status, 'refreshed'); const claim = saved.report.capture.claims[0];
+  const recordedHead = git(fx.project, 'rev-parse', 'HEAD'), beforeBytes = await readFile(claim.source.evidenceRef.path);
+  assert.equal(recordedHead.length, 64);
+  await fx.put('unrelated.json', { note: 'new HEAD' }); const currentHead = fx.commit(); assert.notEqual(currentHead, recordedHead);
+  const args = { project: fx.project, now }, snapshot = await knowledgeSnapshot(args, ports);
+  assert.deepEqual(snapshot.evidenceReferences, [{ ...claim.source.evidenceRef, headSha: recordedHead }]);
+  assert.equal(snapshot.context.headSha, currentHead); assert.equal(snapshot.projection.references.length, 1);
+  for (const corrupt of [
+    () => null,
+    row => ({ ...row, id: 'different' }),
+    row => ({ ...row, revision: row.revision + 1 }),
+    row => ({ ...row, reference: { ...row.reference, path: row.reference.path + '.other' } }),
+    row => ({ ...row, reference: { ...row.reference, bytes: row.reference.bytes + 1 } }),
+    row => ({ ...row, reference: { ...row.reference, sha256: '0'.repeat(64) } }),
+    row => ({ ...row, reference: { ...row.reference, headSha: 'invented' } }),
+    row => ({ ...row, reference: { ...row.reference, headSha: 'a'.repeat(63) } }),
+    row => ({ ...row, reference: { ...row.reference, headSha: undefined } })
+  ]) {
+    const checker = (options, scoped) => checkKnowledgeEvidence(options, { ...scoped, onVerifiedReference(row) { const altered = corrupt(row); if (altered) scoped.onVerifiedReference(altered); } });
+    await assert.rejects(knowledgeSnapshot(args, { ...ports, checkKnowledgeEvidence: checker }), { code: 'knowledge_evidence' });
+  }
+  const duplicate = (options, scoped) => checkKnowledgeEvidence(options, { ...scoped, onVerifiedReference(row) { scoped.onVerifiedReference(row); scoped.onVerifiedReference(row); } });
+  await assert.rejects(knowledgeSnapshot(args, { ...ports, checkKnowledgeEvidence: duplicate }), { code: 'knowledge_evidence' });
+  const stale = await knowledgeSnapshot({ ...args, now: '2026-11-06T12:00:00.000Z' }, ports);
+  assert.equal(stale.evaluation.rows[0].state, 'stale'); assert.deepEqual(stale.evidenceReferences, []);
+  const mismatch = await knowledgeSnapshot({ ...args, contextPath: 'override.json' }, ports);
+  assert.ok(mismatch.evaluation.rows[0].reasons.includes('version_mismatch:patch')); assert.deepEqual(mismatch.evidenceReferences, []);
+  await fx.put('research.context.json', { ...fx.context, synthetic: false }); fx.commit();
+  const nonSynthetic = await knowledgeSnapshot(args, ports); assert.deepEqual(nonSynthetic.projection.references, []); assert.deepEqual(nonSynthetic.evidenceReferences, []);
+  await fx.put('research.context.json', fx.context); await fx.put('data.json', { value: 8 }); fx.commit();
+  const changed = await knowledgeSnapshot(args, ports); assert.ok(changed.evaluation.rows[0].reasons.includes('evidence_unverified')); assert.deepEqual(changed.evidenceReferences, []);
+  await fx.put('data.json', { value: 7 }); fx.commit();
+  await chmod(claim.source.evidenceRef.path, 0o600); await writeFile(claim.source.evidenceRef.path, '{}');
+  const tampered = await knowledgeSnapshot(args, ports); assert.ok(tampered.evaluation.rows[0].reasons.includes('evidence_unverified')); assert.deepEqual(tampered.evidenceReferences, []);
+  assert.equal(JSON.parse(beforeBytes).headSha, recordedHead);
 });
 
 async function secretFixture(t) {

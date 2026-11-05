@@ -35,12 +35,12 @@ const policy = overrides => ({ schemaVersion: 1, mode: 'local-only', sourcePaths
 const input = overrides => ({ schemaVersion: 1, captureId: 'capture-1', synthetic: false, claims: [{ domain: 'codebase', subject: 'app', key: 'version', value: '1.0', versions: {},
   source: { id: 'package-version', kind: 'local', url: null, path: 'src/data.json', pointer: '/version', retrievedAt: null, validAsOf: null }, confidence: null, unknowns: [], ...overrides }] });
 async function put(root, name, value) { await mkdir(path.dirname(path.join(root, name)), { recursive: true }); await writeFile(path.join(root, name), typeof value === 'string' ? value : JSON.stringify(value)); }
-async function fixture(t, { capture = input(), rules = policy(), context = { schemaVersion: 1, versions: { patch: 'current' }, synthetic: false }, files = {} } = {}) {
+async function fixture(t, { capture = input(), rules = policy(), context = { schemaVersion: 1, versions: { patch: 'current' }, synthetic: false }, files = {}, objectFormat = 'sha1' } = {}) {
   const temporary = await mkdtemp(path.join(os.tmpdir(), 'kodo-capture-'));
   t.after(() => rm(temporary, { recursive: true, force: true }));
   const root = await realpath(temporary), project = path.join(root, 'project'), home = path.join(root, 'private');
   await mkdir(project); await mkdir(home);
-  git(project, 'init', '-q'); git(project, 'config', 'user.name', 'Fixture'); git(project, 'config', 'user.email', 'fixture@example.invalid');
+  git(project, 'init', '-q', '--object-format=' + objectFormat); git(project, 'config', 'user.name', 'Fixture'); git(project, 'config', 'user.email', 'fixture@example.invalid');
   for (const [name, value] of Object.entries({ 'src/data.json': { version: '1.0', 'a/b': { '~key': [7, 8] } }, 'research.policy.json': rules, 'input.json': capture,
     ...(context === null ? {} : { 'research.context.json': context }), ...files })) await put(project, name, value);
   const commit = () => { git(project, 'add', '-A'); git(project, 'commit', '-qm', 'fixture'); return git(project, 'rev-parse', 'HEAD'); };
@@ -138,6 +138,66 @@ test('Tampered immutable evidence and changed current source fail fresh evidence
   await writeFile(file, original); await put(fx.project, 'src/data.json', { version: '2.0' });
   checks = await checkKnowledgeEvidence(args, fx.ports); assert.equal(checks.items[0].sourceMatches, false);
 });
+test('Capture HEAD checker retains noncodebase evidence after an unrelated commit and keeps codebase invalidation', async t => {
+  const capture = input(); capture.synthetic = true;
+  capture.claims = ['domain', 'product', 'technical', 'codebase'].map(domain => {
+    const row = input({ domain }).claims[0];
+    row.source.id = domain; row.source.retrievedAt = now; row.source.validAsOf = now;
+    return row;
+  });
+  const fx = await fixture(t, { capture, context: { schemaVersion: 1, versions: {}, synthetic: true } });
+  const saved = await refreshKnowledge(fx.options, fx.ports);
+  assert.equal(saved.status, 'refreshed');
+  const before = structuredClone(saved.capture), verified = [];
+  await put(fx.project, 'unrelated.json', { note: 'new HEAD, same source' });
+  const currentHead = fx.commit(); assert.notEqual(currentHead, fx.head);
+  const checks = await checkKnowledgeEvidence({ project: fx.project, evidenceRoot: path.join(fx.home, 'knowledge-evidence'), claims: saved.capture.claims },
+    { ...fx.ports, onVerifiedReference: row => verified.push(row) });
+  assert.deepEqual(Object.keys(checks).sort(), ['items', 'schemaVersion']);
+  for (const item of checks.items) assert.deepEqual(Object.keys(item).sort(), ['evidenceHash', 'id', 'intact', 'revision', 'sourceMatches']);
+  assert.deepEqual(checks.items.map(item => item.sourceMatches), [true, true, true, false]);
+  assert.deepEqual(verified, saved.capture.claims.slice(0, 3).map(claim => ({ id: claim.id, revision: claim.revision, reference: { ...claim.source.evidenceRef, headSha: fx.head } })));
+  assert.deepEqual(saved.capture, before, 'verification never rewrites capture hashes, history or dates');
+  await put(fx.project, 'src/data.json', { version: 'changed' }); fx.commit();
+  verified.length = 0;
+  const changed = await checkKnowledgeEvidence({ project: fx.project, evidenceRoot: path.join(fx.home, 'knowledge-evidence'), claims: saved.capture.claims }, { ...fx.ports, onVerifiedReference: row => verified.push(row) });
+  assert.ok(changed.items.every(item => !item.sourceMatches)); assert.deepEqual(verified, []);
+});
+
+test('Capture HEAD SHA256 repositories retain the verified 64 character capture head', async t => {
+  const fx = await fixture(t, { capture: input({ domain: 'product' }), objectFormat: 'sha256' });
+  assert.equal(fx.head.length, 64);
+  const saved = await refreshKnowledge(fx.options, fx.ports); assert.equal(saved.status, 'refreshed');
+  await put(fx.project, 'unrelated.json', { note: 'new SHA256 head' }); assert.notEqual(fx.commit(), fx.head);
+  const verified = [], checks = await checkKnowledgeEvidence({ project: fx.project, evidenceRoot: path.join(fx.home, 'knowledge-evidence'), claims: saved.capture.claims }, { ...fx.ports, onVerifiedReference: row => verified.push(row) });
+  assert.equal(checks.items[0].intact, true); assert.equal(checks.items[0].sourceMatches, true);
+  assert.deepEqual(verified, [{ id: saved.capture.claims[0].id, revision: 1, reference: { ...saved.capture.claims[0].source.evidenceRef, headSha: fx.head } }]);
+});
+
+test('Capture HEAD metadata is withheld for malformed heads inconsistent base tamper and final HEAD fence', async t => {
+  const capture = input({ domain: 'product' });
+  const fx = await fixture(t, { capture }), saved = await refreshKnowledge(fx.options, fx.ports);
+  assert.equal(saved.status, 'refreshed');
+  const claim = saved.capture.claims[0], original = JSON.parse(await readFile(claim.source.evidenceRef.path, 'utf8'));
+  for (const envelope of [{ ...original, headSha: null, baseSha: null }, { ...original, headSha: 'invented', baseSha: 'invented' }, { ...original, headSha: 'a'.repeat(39), baseSha: 'a'.repeat(39) }, { ...original, headSha: 'a'.repeat(65), baseSha: 'a'.repeat(65) }, { ...original, baseSha: 'b'.repeat(40) }]) {
+    const text = JSON.stringify(envelope), sha256 = sha(text), filename = path.join(path.dirname(claim.source.evidenceRef.path), `knowledge-${sha256}.json`);
+    await writeFile(filename, text);
+    const changed = structuredClone(claim); changed.source.evidenceRef = { path: filename, bytes: Buffer.byteLength(text), sha256 };
+    const verified = [], checks = await checkKnowledgeEvidence({ project: fx.project, evidenceRoot: path.join(fx.home, 'knowledge-evidence'), claims: [changed] }, { ...fx.ports, onVerifiedReference: row => verified.push(row) });
+    assert.equal(checks.items[0].intact, false); assert.deepEqual(verified, []);
+  }
+  await writeFile(claim.source.evidenceRef.path, '{}');
+  const verified = [], checks = await checkKnowledgeEvidence({ project: fx.project, evidenceRoot: path.join(fx.home, 'knowledge-evidence'), claims: [claim] }, { ...fx.ports, onVerifiedReference: row => verified.push(row) });
+  assert.equal(checks.items[0].intact, false); assert.deepEqual(verified, []);
+  await writeFile(claim.source.evidenceRef.path, JSON.stringify(original));
+  const fenced = await checkKnowledgeEvidence({ project: fx.project, evidenceRoot: path.join(fx.home, 'knowledge-evidence'), claims: [claim] }, {
+    ...fx.ports, onVerifiedReference: row => verified.push(row), assertEvidence: async reference => {
+      await fx.ports.assertEvidence(reference); await put(fx.project, 'unrelated.json', { note: 'HEAD changes during verification' }); fx.commit();
+    }
+  });
+  assert.equal(fenced.items[0].intact, true); assert.equal(fenced.items[0].sourceMatches, false); assert.deepEqual(verified, [], 'metadata cannot escape the final clean HEAD fence');
+});
+
 test('Traversal secret filenames links hardlinks and unallowlisted sources are refused', async t => {
   for (const name of ['../outside.json', 'src/../data.json', 'src/.env', 'src/credentials.json', 'src/.git/config', 'other/data.json', 'src/data.json:stream']) {
     const capture = input(); capture.claims[0].source.path = name;

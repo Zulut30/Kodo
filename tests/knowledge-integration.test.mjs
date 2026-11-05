@@ -70,6 +70,37 @@ test('Native actual composition counts typed JSON and immutable refs without alt
   assert.equal(attempt.metrics.contextOriginalBytes, fx.requests[0].contextMetrics.originalBytes);
 });
 
+test('Capture HEAD native session verifies original references at A and new context at B before and after provider', async t => {
+  const fx = await fixture(t);
+  fx.input.synthetic = true;
+  fx.input.claims = ['product', 'codebase'].map(domain => ({ ...structuredClone(fx.input.claims[0]), domain, key: domain + '-value', source: { ...fx.input.claims[0].source, id: domain, retrievedAt: fx.now, validAsOf: fx.now } }));
+  await fx.put('input.json', fx.input);
+  await fx.put('research.context.json', { schemaVersion: 1, versions: { patch: 'A' }, synthetic: true });
+  const capturedHead = fx.commit(), saved = await fx.capture(), original = saved.capture.claims.find(row => row.domain === 'product');
+  const originalBytes = await readFile(original.source.evidenceRef.path);
+  await fx.put('unrelated.json', { note: 'unrelated commit' }); const currentHead = fx.commit();
+  assert.notEqual(currentHead, capturedHead); fx.run.headSha = currentHead; fx.engine.save(fx.run);
+  const checked = [], strictAssert = fx.engine.assertEvidence.bind(fx.engine);
+  fx.engine.assertEvidence = async ref => { checked.push({ ...ref }); await strictAssert(ref); };
+  fx.during(async request => {
+    const references = JSON.parse(request.prompt.split(label)[1]).references;
+    assert.deepEqual(references.map(row => row.domain), ['product']);
+    assert.equal(references[0].value, original.value);
+    assert.equal(fx.run.sessionAttempts.at(-1).evidence.find(ref => ref.path === original.source.evidenceRef.path).headSha, capturedHead);
+  });
+  await fx.session();
+  assert.equal(fx.requests.length, 1); assert.equal(fx.run.sessionAttempts.at(-1).status, 'completed');
+  const refs = fx.run.sessionAttempts.at(-1).evidence;
+  assert.equal(refs.length, 2); assert.equal(refs[0].headSha, capturedHead); assert.equal(refs[1].headSha, currentHead);
+  assert.equal(checked.filter(ref => ref.path === refs[0].path).length, 2, 'original is checked before and after native session');
+  assert.equal(checked.filter(ref => ref.path === refs[1].path).length, 3, 'new context is checked at persistence and before/after session');
+  assert.deepEqual(await readFile(original.source.evidenceRef.path), originalBytes);
+  assert.equal(fx.run.config.researchBudget, 0); assert.equal(fx.run.config.repairRounds, 1);
+  fx.during(async () => { await chmod(original.source.evidenceRef.path, 0o600); await writeFile(original.source.evidenceRef.path, '{}'); });
+  await assert.rejects(fx.session(), { code: 'evidence_integrity' });
+  assert.equal(fx.run.sessionAttempts.at(-1).status, 'failed', 'original capture integrity remains strict after provider');
+});
+
 test('Native off byte identity avoids knowledge reads and dirty repair excludes optional knowledge', async t => {
   const fx = await fixture(t); await fx.capture();
   await fx.put('research.policy.json', { ...fx.policy, mode: 'off' }); fx.commit();
@@ -139,7 +170,10 @@ test('Composed snapshot excludes negative states and preserves lower metadata li
   const fresh = claim('fresh'), stale = claim('stale', { source: { ...claim('stale').source, retrievedAt: '2026-11-05T11:59:00.000Z' } });
   let rows = [fresh, stale, claim('invalidated', { versions: { patch: 'B', headSha } }), claim('unknown', { unknowns: ['population absent'] }), claim('untrusted', { domain: 'product', versions: { patch: 'A' } }), claim('conflict-one', { subject: 'conflict' }), claim('conflict-two', { subject: 'conflict' }), claim('synthetic', { synthetic: true, domain: 'product', versions: { patch: 'A' } })];
   let fetches = 0;
-  const ports = { now: () => now, loadKnowledgeContext: async () => ({ context, policy }), store: { home: project, listKnowledgeClaims(key) { assert.equal(key, projectKey); return structuredClone(rows); } }, checkKnowledgeEvidence: async ({ claims }) => ({ schemaVersion: 1, items: claims.map(item => ({ id: item.id, revision: item.revision, evidenceHash: item.source.evidenceRef.sha256, intact: true, sourceMatches: true })) }), fetchImpl: () => { fetches++; throw new Error('no remote calls'); } };
+  const ports = { now: () => now, loadKnowledgeContext: async () => ({ context, policy }), store: { home: project, listKnowledgeClaims(key) { assert.equal(key, projectKey); return structuredClone(rows); } }, checkKnowledgeEvidence: async ({ claims }, { onVerifiedReference }) => {
+    for (const item of claims) onVerifiedReference({ id: item.id, revision: item.revision, reference: { ...item.source.evidenceRef, headSha } });
+    return { schemaVersion: 1, items: claims.map(item => ({ id: item.id, revision: item.revision, evidenceHash: item.source.evidenceRef.sha256, intact: true, sourceMatches: true })) };
+  }, fetchImpl: () => { fetches++; throw new Error('no remote calls'); } };
   const result = await knowledgeSnapshot({ project }, ports); assert.equal(fetches, 0);
   assert.deepEqual(result.projection.references.map(item => item.id), [fresh.id]);
   for (const state of ['stale', 'invalidated', 'unknown', 'untrusted', 'conflicted']) assert.ok(result.evaluation.rows.some(row => row.state === state));

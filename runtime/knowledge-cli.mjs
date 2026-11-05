@@ -78,7 +78,9 @@ export async function knowledgeSnapshot({ project, snapshotCwd = project, contex
     if (!Array.isArray(claims) || claims.length > query.limit || (page
       ? !Number.isSafeInteger(page.total) || page.total !== claims.length || page.complete !== true
       : claims.length >= query.limit)) throw fail('knowledge_incomplete');
-    const evidenceChecks = await (ports.checkKnowledgeEvidence || checkKnowledgeEvidence)({ project, snapshotCwd, evidenceRoot: path.join(await realpath(home).catch(error => { if (error.code === 'ENOENT') return path.resolve(home); throw error; }), 'knowledge-evidence'), claims }, ports);
+    const verified = [];
+    const evidenceChecks = await (ports.checkKnowledgeEvidence || checkKnowledgeEvidence)({ project, snapshotCwd, evidenceRoot: path.join(await realpath(home).catch(error => { if (error.code === 'ENOENT') return path.resolve(home); throw error; }), 'knowledge-evidence'), claims },
+      { ...ports, onVerifiedReference: row => verified.push({ id: row?.id, revision: row?.revision, reference: { ...row?.reference } }) });
     const evaluatedAt = now ?? ports.now?.() ?? new Date().toISOString();
     const evaluation = evaluateClaims({ claims, ...loaded, now: evaluatedAt, evidenceChecks });
     const current = await load({ project, snapshotCwd, contextPath }, contextPorts);
@@ -86,7 +88,14 @@ export async function knowledgeSnapshot({ project, snapshotCwd = project, contex
     // A smaller configured limit is never widened. Mandatory D metadata may
     // itself exceed it; optional native context then deliberately stays absent.
     const projection = projectKnowledge({ evaluation, task, maxBytes: loaded.policy.maxContextBytes });
-    return { status: 'ready', ...loaded, evaluatedAt, evaluation, projection };
+    const evidenceReferences = projection.references.map(item => {
+      const matches = verified.filter(row => row.id === item.id && row.revision === item.revision && row.reference.sha256 === item.evidenceRef.sha256);
+      if (matches.length !== 1) throw fail('knowledge_evidence');
+      const reference = matches[0].reference;
+      if (reference.path !== item.evidenceRef.path || reference.bytes !== item.evidenceRef.bytes || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(reference.headSha)) throw fail('knowledge_evidence');
+      return { ...reference };
+    });
+    return { status: 'ready', ...loaded, evaluatedAt, evaluation, projection, evidenceReferences };
   } finally { reader?.close(); }
 }
 
