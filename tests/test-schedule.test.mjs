@@ -545,3 +545,29 @@ test(
     }
   },
 );
+
+test('Fast subset lists distinct discovered files outside the slow priority list', async () => {
+  const { fastTests, discoverTests, orderTests } = await import(scheduleUrl);
+  assert.ok(fastTests.length > 0, 'test:fast must select files');
+  assert.equal(new Set(fastTests).size, fastTests.length, 'no duplicate fast entries');
+  const discovered = new Set(discoverTests(root).map(file => path.relative(root, file).split(path.sep).join('/')));
+  for (const file of fastTests) assert.ok(discovered.has(file), `${file} is a discovered test file`);
+  // orderTests puts slow priority files first, then the rest lexically; '!' sorts
+  // before every test name, so anything ranked ahead of the probe is a slow file.
+  const probe = path.join(root, 'tests', '!unranked.test.mjs');
+  const ranked = orderTests([...fastTests.map(file => path.join(root, file)), probe], root);
+  assert.deepEqual(
+    ranked.slice(0, ranked.indexOf(probe)).map(file => path.relative(root, file)),
+    [],
+    'fast files must not be in the slow priority list',
+  );
+});
+
+test('Scheduler --fast runs from the checkout root and rejects explicit paths', { timeout: 15000 }, async t => {
+  const { temp, put } = await fixture(t);
+  await put('extra.test.cjs');
+  const result = await child(t, temp, [runner, '--fast', 'extra.test.cjs']).done;
+  assert.notEqual(result.code, 0);
+  assert.match(result.stderr, /--fast selects its own files/);
+  assert.doesNotMatch(result.stdout, /fixture passes/);
+});

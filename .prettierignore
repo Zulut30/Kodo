@@ -10,3 +10,6 @@
 scripts/fixtures/
 tests/fixtures/
 node_modules/
+# Frozen oracle/acceptance tests: their bytes are pinned by SHA-256 in tests and docs.
+tests/*-oracle.test.mjs
+tests/*-acceptance.test.mjs

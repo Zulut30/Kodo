@@ -48,18 +48,11 @@ async function fixture(t) {
 // Parallel callers reach the barrier together, independent of disk latency.
 async function observed(bundle, run, { release, failures = new Map() } = {}) {
   const pinned = new Set(bundle.records.map(file => path.resolve(bundle.root, file.path)));
-  const reads = [],
-    stats = [],
-    pending = new Set(),
-    held = [];
+  const reads = [], stats = [], pending = new Set(), held = [];
   const state = { active: 0, peak: 0, nativeActive: 0, settled: false, releases: 0 };
-  let scheduled = false,
-    stopping = false,
-    controlError;
+  let scheduled = false, stopping = false, controlError;
   const relative = filename => path.relative(bundle.root, filename).replaceAll('\\', '/');
-  const inside = filename =>
-    typeof filename === 'string' &&
-    (path.resolve(filename) === bundle.root || path.resolve(filename).startsWith(bundle.root + path.sep));
+  const inside = filename => typeof filename === 'string' && (path.resolve(filename) === bundle.root || path.resolve(filename).startsWith(bundle.root + path.sep));
   function pump() {
     if (scheduled) return;
     scheduled = true;
@@ -70,35 +63,23 @@ async function observed(bundle, run, { release, failures = new Map() } = {}) {
       state.releases++;
       try {
         if (release && !stopping) await release(batch, state);
-      } catch (error) {
-        controlError = error;
-      } finally {
-        for (const entry of batch) entry.resolve();
-      }
+      } catch (error) { controlError = error; }
+      finally { for (const entry of batch) entry.resolve(); }
     });
   }
   function track(promise) {
     pending.add(promise);
-    promise.then(
-      () => pending.delete(promise),
-      () => pending.delete(promise),
-    );
+    promise.then(() => pending.delete(promise), () => pending.delete(promise));
     return promise;
   }
   fs.lstat = (...args) => {
     if (!inside(args[0])) return native.lstat(...args);
     stats.push(relative(args[0]));
     state.nativeActive++;
-    return track(
-      (async () => {
-        try {
-          return await native.lstat(...args);
-        } finally {
-          state.nativeActive--;
-          pump();
-        }
-      })(),
-    );
+    return track((async () => {
+      try { return await native.lstat(...args); }
+      finally { state.nativeActive--; pump(); }
+    })());
   };
   fs.readFile = (...args) => {
     if (!inside(args[0])) return native.readFile(...args);
@@ -109,52 +90,33 @@ async function observed(bundle, run, { release, failures = new Map() } = {}) {
     state.active++;
     state.peak = Math.max(state.peak, state.active);
     state.nativeActive++;
-    return track(
-      (async () => {
-        try {
-          let bytes, failure;
-          try {
-            bytes = await native.readFile(...args);
-          } catch (error) {
-            failure = error;
-          } finally {
-            state.nativeActive--;
-          }
-          await new Promise(resolve => {
-            held.push({ name, resolve });
-            pump();
-          });
-          if (failures.has(name)) throw Object.assign(new Error(failures.get(name)), { code: 'EIO' });
-          if (failure) throw failure;
-          return bytes;
-        } finally {
-          state.active--;
-        }
-      })(),
-    );
+    return track((async () => {
+      try {
+        let bytes, failure;
+        try { bytes = await native.readFile(...args); }
+        catch (error) { failure = error; }
+        finally { state.nativeActive--; }
+        await new Promise(resolve => { held.push({ name, resolve }); pump(); });
+        if (failures.has(name)) throw Object.assign(new Error(failures.get(name)), { code: 'EIO' });
+        if (failure) throw failure;
+        return bytes;
+      } finally { state.active--; }
+    })());
   };
   syncBuiltinESMExports();
   let outcome;
   try {
-    outcome = await Promise.resolve()
-      .then(run)
-      .then(
-        value => {
-          state.settled = true;
-          return { value, activeAtSettlement: state.active, nativeAtSettlement: state.nativeActive };
-        },
-        error => {
-          state.settled = true;
-          return { error, activeAtSettlement: state.active, nativeAtSettlement: state.nativeActive };
-        },
-      );
+    outcome = await Promise.resolve().then(run).then(
+      value => { state.settled = true; return { value, activeAtSettlement: state.active, nativeAtSettlement: state.nativeActive }; },
+      error => { state.settled = true; return { error, activeAtSettlement: state.active, nativeAtSettlement: state.nativeActive }; }
+    );
   } finally {
     // Even a broken fail-fast implementation must leave no spy or suspended
     // readonly operation behind after this test has recorded its failure.
     stopping = true;
     while (pending.size) {
       for (const entry of held.splice(0)) entry.resolve();
-      await Promise.allSettled(pending);
+      await Promise.allSettled([...pending]);
     }
     fs.lstat = native.lstat;
     fs.readFile = native.readFile;
@@ -166,11 +128,7 @@ async function observed(bundle, run, { release, failures = new Map() } = {}) {
 
 function assertDrained(observation) {
   assert.equal(observation.activeAtSettlement, 0, 'all started resource reads settle before the public promise');
-  assert.equal(
-    observation.nativeAtSettlement,
-    0,
-    'all started native lstat/read operations settle before the public promise',
-  );
+  assert.equal(observation.nativeAtSettlement, 0, 'all started native lstat/read operations settle before the public promise');
 }
 
 function assertFresh(bundle, observation) {
@@ -185,10 +143,7 @@ function assertFresh(bundle, observation) {
     for (let index = 1; index <= parts.length; index++) {
       assert.ok(observation.stats.includes(parts.slice(0, index).join('/')), `fresh path guard: ${file.path}`);
     }
-    assert.ok(
-      observation.stats.filter(name => name === file.path).length >= 2,
-      `fresh regular-file guard: ${file.path}`,
-    );
+    assert.ok(observation.stats.filter(name => name === file.path).length >= 2, `fresh regular-file guard: ${file.path}`);
   }
   assert.ok(observation.stats.filter(name => name === '').length >= 184, 'every read rechecks the real root');
   assert.equal(observation.reads.filter(name => bundle.expected.has(name)).length, 183);
@@ -203,8 +158,7 @@ function integrity(error, message) {
 test('Pin batch oracle', { concurrency: false }, async t => {
   const bundle = await fixture(t);
   const verify = () => verifyDefaultSkillPins(bundle.root);
-  const policy = () =>
-    loadDefaultPolicy({ root: bundle.root, project: bundle.project, stage: 'tester', task: 'Review command parser' });
+  const policy = () => loadDefaultPolicy({ root: bundle.root, project: bundle.project, stage: 'tester', task: 'Review command parser' });
 
   await t.test('Fresh reads overlap within the hard four-read bound and retain all 183 ordered resources', async t => {
     const peaks = [];
@@ -212,10 +166,7 @@ test('Pin batch oracle', { concurrency: false }, async t => {
       const observation = await observed(bundle, verify);
       assertFresh(bundle, observation);
       assert.deepEqual(observation.value.lock, bundle.lock);
-      assert.deepEqual(
-        [...observation.value.byId],
-        bundle.lock.components.map(component => [component.id, component]),
-      );
+      assert.deepEqual([...observation.value.byId], bundle.lock.components.map(component => [component.id, component]));
       assert.deepEqual([...observation.value.resources], [...bundle.expected]);
       t.diagnostic(`call=${call} real pinned reads=183 peak=${observation.peak}`);
       peaks.push(observation.peak);
@@ -229,80 +180,44 @@ test('Pin batch oracle', { concurrency: false }, async t => {
   await t.test('Read completion order cannot reorder Maps or the frozen baseline context and hash', async () => {
     const observations = [];
     for (let call = 0; call < 2; call++) {
-      observations.push(
-        await observed(bundle, policy, {
-          release: async entries => {
-            for (const entry of entries.toReversed()) {
-              entry.resolve();
-              await turn();
-            }
-          },
-        }),
-      );
+      observations.push(await observed(bundle, policy, {
+        release: async entries => {
+          for (const entry of entries.toReversed()) { entry.resolve(); await turn(); }
+        }
+      }));
     }
     for (const observation of observations) {
       assertFresh(bundle, observation);
       const result = observation.value;
-      assert.deepEqual(
-        result.skills.map(row => row.id),
-        [...defaultSkillIds],
-      );
-      assert.deepEqual(
-        result.skills.filter(row => row.applies).map(row => row.id),
-        [
-          'skills/e2e-testing-patterns',
-          'skills/subagent-driven-development',
-          'skills/systematic-debugging',
-          'skills/test-driven-development',
-          'skills/using-git-worktrees',
-        ],
-      );
-      const normalized = result.context
-        .replace(/\]\(<([^>]+)>\)/g, ']($1)')
-        .replaceAll(bundle.root.replaceAll('\\', '/'), '<BUNDLE>');
-      assert.equal(
-        digest(normalized),
-        baselineContextHash,
-        'exact pre-change public context, normalized only for its temporary root',
-      );
-      assert.equal(
-        result.hash,
-        digest(
-          JSON.stringify({
-            policyVersion: 1,
-            provenanceVersion: 1,
-            facts: { react: false, monorepo: false, reactVersion: null, manifests: [], markers: [] },
-            context: result.context,
-          }),
-        ),
-      );
+      assert.deepEqual(result.skills.map(row => row.id), [...defaultSkillIds]);
+      assert.deepEqual(result.skills.filter(row => row.applies).map(row => row.id), [
+        'skills/e2e-testing-patterns', 'skills/subagent-driven-development',
+        'skills/systematic-debugging', 'skills/test-driven-development', 'skills/using-git-worktrees'
+      ]);
+      const normalized = result.context.replace(/\]\(<([^>]+)>\)/g, ']($1)').replaceAll(bundle.root.replaceAll('\\', '/'), '<BUNDLE>');
+      assert.equal(digest(normalized), baselineContextHash, 'exact pre-change public context, normalized only for its temporary root');
+      assert.equal(result.hash, digest(JSON.stringify({
+        policyVersion: 1, provenanceVersion: 1,
+        facts: { react: false, monorepo: false, reactVersion: null, manifests: [], markers: [] },
+        context: result.context
+      })));
     }
     assert.deepEqual(observations[1].value, observations[0].value);
     const maps = await observed(bundle, verify, {
       release: async entries => {
-        for (const entry of entries.toReversed()) {
-          entry.resolve();
-          await turn();
-        }
-      },
+        for (const entry of entries.toReversed()) { entry.resolve(); await turn(); }
+      }
     });
     assertFresh(bundle, maps);
     assert.deepEqual([...maps.value.resources], [...bundle.expected]);
-    assert.deepEqual(
-      [...maps.value.byId],
-      bundle.lock.components.map(component => [component.id, component]),
-    );
+    assert.deepEqual([...maps.value.byId], bundle.lock.components.map(component => [component.id, component]));
   });
 
   await t.test('A later faster read failure cannot replace the first lock-order error', async () => {
     const [first, second] = bundle.records;
-    let reversed = false,
-      pendingAfterLaterFailure = false;
+    let reversed = false, pendingAfterLaterFailure = false;
     const observation = await observed(bundle, verify, {
-      failures: new Map([
-        [first.path, 'oracle-first-read'],
-        [second.path, 'oracle-second-read'],
-      ]),
+      failures: new Map([[first.path, 'oracle-first-read'], [second.path, 'oracle-second-read']]),
       release: async (entries, state) => {
         const later = entries.find(entry => entry.name === second.path);
         const earlier = entries.find(entry => entry.name === first.path);
@@ -313,7 +228,7 @@ test('Pin batch oracle', { concurrency: false }, async t => {
           pendingAfterLaterFailure = !state.settled;
           earlier.resolve();
         }
-      },
+      }
     });
     integrity(observation.error, `cannot read ${first.path}: oracle-first-read`);
     assertDrained(observation);
@@ -324,8 +239,7 @@ test('Pin batch oracle', { concurrency: false }, async t => {
 
   await t.test('A failed first read waits for every started readonly sibling before rejecting', async () => {
     const first = bundle.records[0];
-    let sawPendingSibling = false,
-      pendingAfterFirstFailure = false;
+    let sawPendingSibling = false, pendingAfterFirstFailure = false;
     const observation = await observed(bundle, verify, {
       failures: new Map([[first.path, 'oracle-drain-read']]),
       release: async (entries, state) => {
@@ -335,16 +249,12 @@ test('Pin batch oracle', { concurrency: false }, async t => {
         failed.resolve();
         await turn();
         pendingAfterFirstFailure = !state.settled && state.active > 0;
-      },
+      }
     });
     integrity(observation.error, `cannot read ${first.path}: oracle-drain-read`);
     assertDrained(observation);
     assert.equal(sawPendingSibling, true, 'the controlled failing group contains started siblings');
-    assert.equal(
-      pendingAfterFirstFailure,
-      true,
-      'the public promise remains pending while successful siblings are held',
-    );
+    assert.equal(pendingAfterFirstFailure, true, 'the public promise remains pending while successful siblings are held');
     assert.ok(observation.peak <= 4);
   });
 
@@ -352,45 +262,32 @@ test('Pin batch oracle', { concurrency: false }, async t => {
     const [first, second] = bundle.records;
     const firstName = path.join(bundle.root, first.path);
     const bytes = await native.readFile(firstName);
-    const changed = Buffer.from(bytes);
-    changed[0] ^= 1;
+    const changed = Buffer.from(bytes); changed[0] ^= 1;
     await native.writeFile(firstName, changed);
     try {
       const observation = await observed(bundle, verify, {
         failures: new Map([[second.path, 'oracle-after-hash']]),
         release: async entries => {
-          for (const entry of entries.toReversed()) {
-            entry.resolve();
-            await turn();
-          }
-        },
+          for (const entry of entries.toReversed()) { entry.resolve(); await turn(); }
+        }
       });
       integrity(observation.error, `hash mismatch: ${first.path}`);
       assertDrained(observation);
       assert.ok(observation.peak <= 4);
-    } finally {
-      await native.writeFile(firstName, bytes);
-    }
+    } finally { await native.writeFile(firstName, bytes); }
   });
 
-  await t.test(
-    'An earlier byte failure wins over a later malformed file record without abandoning started reads',
-    async () => {
-      const lock = structuredClone(bundle.lock);
-      lock.components[0].files[1].sha256 = 'invalid';
-      await native.writeFile(path.join(bundle.root, lockName), JSON.stringify(lock));
-      try {
-        const first = bundle.records[0];
-        const observation = await observed(bundle, verify, {
-          failures: new Map([[first.path, 'oracle-before-metadata']]),
-        });
-        integrity(observation.error, `cannot read ${first.path}: oracle-before-metadata`);
-        assertDrained(observation);
-      } finally {
-        await native.writeFile(path.join(bundle.root, lockName), bundle.lockBytes);
-      }
-    },
-  );
+  await t.test('An earlier byte failure wins over a later malformed file record without abandoning started reads', async () => {
+    const lock = structuredClone(bundle.lock);
+    lock.components[0].files[1].sha256 = 'invalid';
+    await native.writeFile(path.join(bundle.root, lockName), JSON.stringify(lock));
+    try {
+      const first = bundle.records[0];
+      const observation = await observed(bundle, verify, { failures: new Map([[first.path, 'oracle-before-metadata']]) });
+      integrity(observation.error, `cannot read ${first.path}: oracle-before-metadata`);
+      assertDrained(observation);
+    } finally { await native.writeFile(path.join(bundle.root, lockName), bundle.lockBytes); }
+  });
 
   await t.test('A malformed file record after valid reads rejects only after draining them', async () => {
     const lock = structuredClone(bundle.lock);
@@ -401,9 +298,7 @@ test('Pin batch oracle', { concurrency: false }, async t => {
       integrity(observation.error, `invalid file record: ${bundle.lock.components[0].id}`);
       assertDrained(observation);
       assert.ok(observation.peak <= 4);
-    } finally {
-      await native.writeFile(path.join(bundle.root, lockName), bundle.lockBytes);
-    }
+    } finally { await native.writeFile(path.join(bundle.root, lockName), bundle.lockBytes); }
   });
 
   const unused = bundle.lock.components.find(component => component.id === 'skills/react-best-practices').files.at(-1);
@@ -411,65 +306,19 @@ test('Pin batch oracle', { concurrency: false }, async t => {
   const originalBytes = await native.readFile(filename);
   const originalStat = await native.stat(filename);
   const corruptions = [
-    {
-      name: 'same-size corruption with restored mtime',
-      change: async () => {
-        const changed = Buffer.from(originalBytes);
-        changed[0] ^= 1;
-        await native.writeFile(filename, changed);
-        await native.utimes(filename, originalStat.atime, originalStat.mtime);
-      },
-      message: `hash mismatch: ${unused.path}`,
-    },
-    {
-      name: 'changed byte count',
-      change: () => native.writeFile(filename, Buffer.concat([originalBytes, Buffer.from('\n')])),
-      message: `hash mismatch: ${unused.path}`,
-    },
-    {
-      name: 'changed pinned hash',
-      lock: lock => {
-        lock.components.find(row => row.id === 'skills/react-best-practices').files.at(-1).sha256 = '0'.repeat(64);
-      },
-      message: `hash mismatch: ${unused.path}`,
-    },
+    { name: 'same-size corruption with restored mtime', change: async () => {
+      const changed = Buffer.from(originalBytes); changed[0] ^= 1;
+      await native.writeFile(filename, changed);
+      await native.utimes(filename, originalStat.atime, originalStat.mtime);
+    }, message: `hash mismatch: ${unused.path}` },
+    { name: 'changed byte count', change: () => native.writeFile(filename, Buffer.concat([originalBytes, Buffer.from('\n')])), message: `hash mismatch: ${unused.path}` },
+    { name: 'changed pinned hash', lock: lock => { lock.components.find(row => row.id === 'skills/react-best-practices').files.at(-1).sha256 = '0'.repeat(64); }, message: `hash mismatch: ${unused.path}` },
     { name: 'missing source', change: () => native.unlink(filename), pattern: /cannot read .*ENOENT/ },
-    {
-      name: 'non-regular source',
-      change: async () => {
-        await native.unlink(filename);
-        await native.mkdir(filename);
-      },
-      message: `cannot read ${unused.path}: Default skill integrity: resource is not a regular file: ${unused.path}`,
-    },
-    {
-      name: 'unsupported license',
-      lock: lock => {
-        lock.components.at(-1).license.spdx = 'UNLICENSED';
-      },
-      message: `missing entry point or license: ${bundle.lock.components.at(-1).id}`,
-    },
-    {
-      name: 'missing license pin',
-      lock: lock => {
-        lock.components.at(-1).license.localPath += '.missing';
-      },
-      message: `missing entry point or license: ${bundle.lock.components.at(-1).id}`,
-    },
-    {
-      name: 'missing entry point pin',
-      lock: lock => {
-        lock.components.at(-1).entryPoint += '.missing';
-      },
-      message: `missing entry point or license: ${bundle.lock.components.at(-1).id}`,
-    },
-    {
-      name: 'changed provenance revision',
-      lock: lock => {
-        lock.components.at(-1).revision = 'main';
-      },
-      message: `invalid component record: ${bundle.lock.components.at(-1).id}`,
-    },
+    { name: 'non-regular source', change: async () => { await native.unlink(filename); await native.mkdir(filename); }, message: `cannot read ${unused.path}: Default skill integrity: resource is not a regular file: ${unused.path}` },
+    { name: 'unsupported license', lock: lock => { lock.components.at(-1).license.spdx = 'UNLICENSED'; }, message: `missing entry point or license: ${bundle.lock.components.at(-1).id}` },
+    { name: 'missing license pin', lock: lock => { lock.components.at(-1).license.localPath += '.missing'; }, message: `missing entry point or license: ${bundle.lock.components.at(-1).id}` },
+    { name: 'missing entry point pin', lock: lock => { lock.components.at(-1).entryPoint += '.missing'; }, message: `missing entry point or license: ${bundle.lock.components.at(-1).id}` },
+    { name: 'changed provenance revision', lock: lock => { lock.components.at(-1).revision = 'main'; }, message: `invalid component record: ${bundle.lock.components.at(-1).id}` }
   ];
   for (const item of corruptions) {
     await t.test(`A prior PASS cannot hide ${item.name} in a later policy load`, async () => {
@@ -478,8 +327,7 @@ test('Pin batch oracle', { concurrency: false }, async t => {
       try {
         if (item.change) await item.change();
         if (item.lock) {
-          const lock = structuredClone(bundle.lock);
-          item.lock(lock);
+          const lock = structuredClone(bundle.lock); item.lock(lock);
           await native.writeFile(path.join(bundle.root, lockName), JSON.stringify(lock));
         }
         await assert.rejects(policy, error => {
@@ -506,25 +354,15 @@ test('Pin batch oracle', { concurrency: false }, async t => {
       await native.unlink(filename);
       await native.symlink(target, filename, 'junction');
       assert.equal((await native.lstat(filename)).isSymbolicLink(), true);
-      await assert.rejects(policy, error =>
-        integrity(
-          error,
-          `cannot read ${unused.path}: Default skill integrity: resource link is not allowed: ${unused.path}`,
-        ),
-      );
+      await assert.rejects(policy, error => integrity(error, `cannot read ${unused.path}: Default skill integrity: resource link is not allowed: ${unused.path}`));
     } finally {
       await native.unlink(filename);
       await native.writeFile(filename, originalBytes);
     }
     await native.symlink(bundle.root, rootLink, 'junction');
     try {
-      await assert.rejects(
-        () => verifyDefaultSkillPins(rootLink),
-        error => integrity(error, 'bundle root must be a real directory'),
-      );
-    } finally {
-      await native.unlink(rootLink);
-    }
+      await assert.rejects(() => verifyDefaultSkillPins(rootLink), error => integrity(error, 'bundle root must be a real directory'));
+    } finally { await native.unlink(rootLink); }
     assert.equal((await policy()).hash, before.hash);
   });
 
@@ -540,9 +378,7 @@ test('Pin batch oracle', { concurrency: false }, async t => {
       linked = true;
       assert.equal((await native.lstat(upstream)).isSymbolicLink(), true);
       const first = component.files[0].path;
-      await assert.rejects(policy, error =>
-        integrity(error, `cannot read ${first}: Default skill integrity: resource link is not allowed: ${first}`),
-      );
+      await assert.rejects(policy, error => integrity(error, `cannot read ${first}: Default skill integrity: resource link is not allowed: ${first}`));
     } finally {
       if (linked) await native.unlink(upstream);
       await native.rename(parked, upstream);

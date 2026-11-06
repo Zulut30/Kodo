@@ -1,7 +1,7 @@
 import { run } from 'node:test';
 import { tap } from 'node:test/reporters';
 import { pipeline } from 'node:stream/promises';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import path from 'node:path';
 import { readdirSync, lstatSync } from 'node:fs';
 
@@ -41,6 +41,50 @@ const priority = [
   'tests/ci-cli.test.mjs', // 62405.4714 ms; retained lighter priority
   'tests/project-director-oracle.test.mjs', // 22760.5585 ms; retained lighter priority
   'tests/architecture-acceptance.test.mjs', // 17840.1058 ms; retained lighter priority
+];
+
+// `npm run test:fast`: unit-level files measured at a few seconds each on
+// Windows, for edit-time feedback in well under a minute. It never replaces
+// the full suite in `npm run check`; tests/test-schedule.test.mjs keeps every
+// entry a discovered test file outside the slow priority list.
+export const fastTests = [
+  'tests/architecture-debt.test.mjs',
+  'tests/architecture-policy.test.mjs',
+  'tests/audit.test.mjs',
+  'tests/benchmark-cli.test.mjs',
+  'tests/cli-retry.test.mjs',
+  'tests/context-pack.test.mjs',
+  'tests/contract-registry.test.mjs',
+  'tests/efficiency-acceptance.test.mjs',
+  'tests/knowledge-claims.test.mjs',
+  'tests/knowledge-context.test.mjs',
+  'tests/knowledge-store.test.mjs',
+  'tests/metrics.test.mjs',
+  'tests/modes.test.mjs',
+  'tests/progress.test.mjs',
+  'tests/project-cancel.test.mjs',
+  'tests/project-contracts.test.mjs',
+  'tests/project-evidence.test.mjs',
+  'tests/project-planner.test.mjs',
+  'tests/project-progress.test.mjs',
+  'tests/providers.test.mjs',
+  'tests/quality-cli.test.mjs',
+  'tests/quality-protocol-regressions.test.mjs',
+  'tests/quality-tools.test.mjs',
+  'tests/registry-stats.test.mjs',
+  'tests/rtk.test.mjs',
+  'tests/runtime.test.mjs',
+  'tests/security.test.mjs',
+  'tests/skill-pin-batch-oracle.test.mjs',
+  'tests/skill-policy.test.mjs',
+  'tests/task-context.test.mjs',
+  'tests/task-scheduler.test.mjs',
+  'tests/test-git-environment.test.mjs',
+  'tests/test-schedule.test.mjs',
+  'tests/tools.test.mjs',
+  'tests/ui-bridge.test.mjs',
+  'tests/ui-verification.test.mjs',
+  'tests/utf8-process.test.mjs',
 ];
 
 export function orderTests(files, cwd) {
@@ -154,6 +198,10 @@ function parseArgs(args) {
       literal = true;
       continue;
     }
+    if (!literal && arg === '--fast') {
+      options.fast = true;
+      continue;
+    }
     if (!literal && arg.startsWith('--')) {
       const split = arg.indexOf('='),
         key = split === -1 ? arg : arg.slice(0, split);
@@ -169,6 +217,13 @@ function parseArgs(args) {
     }
   }
   if (!options.testNamePatterns.length) delete options.testNamePatterns;
+  if (options.fast) {
+    if (options.paths.length) throw new Error('--fast selects its own files; do not combine it with test paths');
+    const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+    options.cwd = root;
+    options.paths = fastTests;
+    delete options.fast;
+  }
   return options;
 }
 

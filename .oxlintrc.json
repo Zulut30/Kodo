@@ -7,7 +7,9 @@
   "ignorePatterns": [
     "skills/**",
     "**/fixtures/**",
-    "node_modules/**"
+    "node_modules/**",
+    "tests/*-oracle.test.mjs",
+    "tests/*-acceptance.test.mjs"
   ],
   "rules": {
     "no-control-regex": "off",
