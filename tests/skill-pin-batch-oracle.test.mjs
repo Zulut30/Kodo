@@ -154,7 +154,7 @@ async function observed(bundle, run, { release, failures = new Map() } = {}) {
     stopping = true;
     while (pending.size) {
       for (const entry of held.splice(0)) entry.resolve();
-      await Promise.allSettled([...pending]);
+      await Promise.allSettled(pending);
     }
     fs.lstat = native.lstat;
     fs.readFile = native.readFile;

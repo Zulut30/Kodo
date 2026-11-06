@@ -608,7 +608,8 @@ async function readyFile(directory, name) {
     function finish(error, value) {
       clearTimeout(watchdog);
       watcher.close();
-      error ? reject(error) : resolve(value);
+      if (error) reject(error);
+      else resolve(value);
     }
     async function check() {
       try {

@@ -313,6 +313,7 @@ test('Strict data rejects accessors symbols metadata cycles sparse arrays and ex
     { x: undefined },
     { x: 1n },
     { x: new Date() },
+    // oxlint-disable-next-line no-sparse-arrays -- a hole is the rejected input
     { x: [, 1] },
     { x: Object.assign([], { extra: 1 }) },
   ])

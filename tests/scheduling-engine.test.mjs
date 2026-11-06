@@ -38,7 +38,7 @@ async function fixture(t, tasks, worker) {
     active = new Set();
   t.after(async () => {
     cleanup.abort();
-    await Promise.allSettled([...active]);
+    await Promise.allSettled(active);
     store?.close();
     const resolved = path.resolve(directory);
     assert.equal(path.dirname(resolved), path.resolve(os.tmpdir()));

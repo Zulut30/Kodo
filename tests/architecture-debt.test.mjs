@@ -125,7 +125,7 @@ test('Debt cannot manufacture history when the base policy was genuinely absent'
 });
 
 test('Debt rejects new and worsened findings while keeping the old waiver invalid', () => {
-  const old = finding(),
+  const _old = finding(),
     changed = finding({ offset: 20 }),
     added = finding({ ruleId: 'entry.private' });
   const result = applyArchitectureDebt(debtInput({ findings: [changed, added] }));

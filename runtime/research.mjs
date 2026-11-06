@@ -97,7 +97,7 @@ function acceptableResult(url, source, query, title, excerpt) {
       .match(/[a-z][a-z0-9+#.-]{2,}/g)
       ?.filter(word => !ignored.has(word)) || [];
   const evidence = `${parsed.hostname} ${parsed.pathname} ${title} ${excerpt}`.toLowerCase();
-  return keywords.length > 0 && keywords.some(word => evidence.includes(word));
+  return keywords.some(word => evidence.includes(word));
 }
 
 function walkResults(value, source, query, output = [], depth = 0) {

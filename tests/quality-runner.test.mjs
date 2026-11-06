@@ -817,7 +817,7 @@ test('Quality passing receipts become stale on evidence config source head or pi
   assert.equal(await isCurrentQualityReceipt(result, { project: fx.project, resolve: fakeTools() }), false);
 });
 
-test('Quality parsers accept observed native JSON channels and reject incomplete formatter coverage', async t => {
+test('Quality parsers accept observed native JSON channels and reject incomplete formatter coverage', async () => {
   const { parseQualityOutput: parse } = await api();
   const project = process.cwd();
   const check = (tool, file) => ({ tool, files: [file], root: '', capability: 'lint' });

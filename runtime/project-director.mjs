@@ -404,7 +404,7 @@ export function createProjectDirector({
       return result.code === 0;
     };
     let selected = current;
-    for (const head of [...new Set(heads)]) {
+    for (const head of new Set(heads)) {
       if (await ancestor(selected, head)) selected = head;
     }
     for (const head of [current, ...heads])

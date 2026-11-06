@@ -83,11 +83,9 @@ async function processHelper(command, args, input) {
     });
     helper.on('close', code => {
       clearTimeout(timer);
-      error
-        ? reject(error)
-        : code !== 0
-          ? reject(fail('process_teardown', `Owned process teardown helper failed (${code})`))
-          : resolve(output);
+      if (error) reject(error);
+      else if (code !== 0) reject(fail('process_teardown', `Owned process teardown helper failed (${code})`));
+      else resolve(output);
     });
     helper.stdin.on('error', () => {});
     helper.stdin.end(input);
@@ -424,7 +422,7 @@ export async function execute(
             command,
             terminalError.code ?? 'command_failed',
             result,
-            { ...(teardownError ? { teardownError } : {}) },
+            teardownError ? { teardownError } : {},
             redactions,
           ),
         );
@@ -1399,7 +1397,7 @@ export async function releasePackage(options) {
         throw fail('release_conflict', 'Saved release version differs from its exact commit');
       const smoke = await smokePackage(ctx, info.downloadedArtifact, directory, manifest);
       const receipt = { ...savedReceipt, url: info.url, smoke };
-      await ctx.save({ delivery: { ...(ctx.run.delivery ?? {}), release: receipt } });
+      await ctx.save({ delivery: { ...ctx.run.delivery, release: receipt } });
       return receipt;
     }
     source = path.join(directory, 'source');
@@ -1587,7 +1585,7 @@ export async function releasePackage(options) {
         smoke,
         published: true,
       };
-      await ctx.save({ delivery: { ...(ctx.run.delivery ?? {}), mergeCommit: candidate, release: receipt } });
+      await ctx.save({ delivery: { ...ctx.run.delivery, mergeCommit: candidate, release: receipt } });
       await ctx.event('delivery.released', receipt);
       return receipt;
     });

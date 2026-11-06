@@ -156,7 +156,7 @@ export async function projectCli(argv, ports = {}) {
       report = { schemaVersion: 1, projectId, revision: snapshot.revision, result };
     } else if (options.action === 'plan') {
       result = await director.plan(projectId, {
-        ...(options.flags['--limit'] ? { limit: Number(options.flags['--limit']) } : {}),
+        ...(options.flags['--limit'] && { limit: Number(options.flags['--limit']) }),
       });
       report = { schemaVersion: 1, projectId, revision: result.revision, result };
       if (!result.taskIds.length) exitCode = 2;

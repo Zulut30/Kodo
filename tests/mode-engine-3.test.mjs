@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { Store } from '../runtime/store.mjs';
-import { choice, high, task, metrics, fixture } from './helpers/mode-engine-fixture.mjs';
+import { high, task, metrics, fixture } from './helpers/mode-engine-fixture.mjs';
 
 test('Quick performs one executor and fresh independent review with actual test build and head-bound gates', async t => {
   const fx = await fixture(t, { assessment: high });

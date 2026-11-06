@@ -368,13 +368,11 @@ test('Capture HEAD checker retains noncodebase evidence after an unrelated commi
   );
   assert.deepEqual(
     verified,
-    saved.capture.claims
-      .slice(0, 3)
-      .map(claim => ({
-        id: claim.id,
-        revision: claim.revision,
-        reference: { ...claim.source.evidenceRef, headSha: fx.head },
-      })),
+    saved.capture.claims.slice(0, 3).map(claim => ({
+      id: claim.id,
+      revision: claim.revision,
+      reference: { ...claim.source.evidenceRef, headSha: fx.head },
+    })),
   );
   assert.deepEqual(saved.capture, before, 'verification never rewrites capture hashes, history or dates');
   await put(fx.project, 'src/data.json', { version: 'changed' });

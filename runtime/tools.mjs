@@ -670,6 +670,7 @@ export async function doctorTools({ home, project, signal, runner = execute, liv
           path.dirname(scratch) !== path.dirname(status.directory) ||
           !path.basename(scratch).startsWith('probe-')
         )
+          // oxlint-disable-next-line no-unsafe-finally -- an unsafe cleanup path is fatal
           throw new Error('Unsafe probe cleanup path');
         await noLinks(scratch);
         await rm(scratch, { recursive: true, force: true });

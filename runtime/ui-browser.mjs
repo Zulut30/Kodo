@@ -450,11 +450,13 @@ export async function runInstalledCase({ case: c, config, tool, evidenceDir, sec
           allowFailure: true,
           rawOutput: true,
         });
+        // oxlint-disable-next-line no-unsafe-finally -- failed browser cleanup must fail the verification
         if (output?.code !== 0 || parseJSON(output.stdout).status !== 'cleaned') throw fail('cleanup_failed');
       }
     }
   } finally {
     const closed = await Promise.allSettled(browsers.reverse().map(browser => browser.close()));
+    // oxlint-disable-next-line no-unsafe-finally -- failed browser cleanup must fail the verification
     if (closed.some(c => c.status === 'rejected')) throw fail('cleanup_failed');
   }
 }

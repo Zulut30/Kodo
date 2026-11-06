@@ -441,7 +441,7 @@ async function validateManifestScope(root, files, documents) {
       };
       await visit(documents.get(name));
     }
-    if (/\.csproj$/.test(base) || /^Directory\.Build\.(?:props|targets)$/.test(base)) {
+    if (base.endsWith('.csproj') || /^Directory\.Build\.(?:props|targets)$/.test(base)) {
       const text = await readFile(path.join(root, name), 'utf8');
       if (
         /<!DOCTYPE|<!ENTITY/i.test(text) ||

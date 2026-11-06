@@ -4,7 +4,6 @@ import {
   readFile,
   writeFile,
   mkdir,
-  access,
   rename,
   mkdtemp,
   realpath,
@@ -2514,6 +2513,7 @@ try {
       await writeFile(path.join(run.artifacts, 'receipt.json'), JSON.stringify(redact(run, this.secrets), null, 2));
       return run;
     } catch (error) {
+      // oxlint-disable-next-line no-ex-assign -- a lost lease outranks the stage error
       error = leaseError || error;
       run.state = this.store.getRun(run.id).cancelRequested
         ? 'cancelled'

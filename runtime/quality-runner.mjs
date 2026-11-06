@@ -883,7 +883,7 @@ export async function runQuality(options = {}) {
       receipt.toolIdentity = await toolIdentity(tool);
       if (check.tool === 'go' && check.capability === 'typecheck')
         await mkdir(path.join(evidenceRoot, 'go-output'), { recursive: true, mode: 0o700 });
-      const toolEnv = { ...env, ...(tool.env ?? {}) },
+      const toolEnv = { ...env, ...tool.env },
         prefix = tool.args ?? [];
       if (check.tool === 'go' && !check.configured) {
         // Native resolver additions cannot reopen workspaces, user GOENV,

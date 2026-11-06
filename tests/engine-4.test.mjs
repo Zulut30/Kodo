@@ -3,7 +3,6 @@ import assert from 'node:assert/strict';
 import { writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { Engine } from '../runtime/engine.mjs';
-import { runUIVerification } from '../runtime/ui-verification.mjs';
 import {
   read,
   exists,

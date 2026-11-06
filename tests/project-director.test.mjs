@@ -661,7 +661,7 @@ test('Director pause or lost lease during reserved initialization prevents atomi
         if (interruption === 'pause') await f.director.pause(f.id);
         else {
           const renew = f.store.renewLease.bind(f.store);
-          f.store.renewLease = token => false;
+          f.store.renewLease = _token => false;
           sub.after(() => {
             f.store.renewLease = renew;
           });

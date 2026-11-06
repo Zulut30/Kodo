@@ -74,6 +74,7 @@ export function writeProgress(run, { home = stateHome(), secrets = {} } = {}) {
     try {
       unlinkSync(temporary);
     } catch (error) {
+      // oxlint-disable-next-line no-unsafe-finally -- an unexpected cleanup error is fatal
       if (error.code !== 'ENOENT') throw error;
     }
   }
