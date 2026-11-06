@@ -46,10 +46,14 @@ if (result.status !== 0 && !diagnostics.length) {
   process.exit(1);
 }
 
+// Messages are stored for readers but are not part of the ratchet: improving a
+// signature rewrites the text of unrelated diagnostics that quote it. The gate
+// is the count per file and error code, which may only go down.
 const key = d => `${d.file}\n${d.code}\n${d.message}`;
-const count = rows =>
-  rows.reduce((map, row) => map.set(key(row), (map.get(key(row)) ?? 0) + (row.count ?? 1)), new Map());
-const current = count(diagnostics);
+const bucket = d => `${d.file}\n${d.code}`;
+const count = (rows, by) =>
+  rows.reduce((map, row) => map.set(by(row), (map.get(by(row)) ?? 0) + (row.count ?? 1)), new Map());
+const current = count(diagnostics, key);
 
 if (update) {
   const rows = [...current]
@@ -63,26 +67,29 @@ if (update) {
   process.exit(0);
 }
 
-const baseline = count(JSON.parse(readFileSync(baselineFile, 'utf8')));
+const recorded = JSON.parse(readFileSync(baselineFile, 'utf8'));
+const baseline = count(recorded, bucket),
+  now = count(diagnostics, bucket),
+  known = new Set(recorded.map(key));
 const added = [],
   fixed = [];
-for (const [id, total] of current)
-  if (total > (baseline.get(id) ?? 0)) added.push([id, total - (baseline.get(id) ?? 0)]);
-for (const [id, total] of baseline)
-  if (total > (current.get(id) ?? 0)) fixed.push([id, total - (current.get(id) ?? 0)]);
-const show = ([id, n]) => `  ${id.split('\n').join(' | ')}${n > 1 ? ` (x${n})` : ''}`;
+for (const [id, total] of now) if (total > (baseline.get(id) ?? 0)) added.push([id, total - (baseline.get(id) ?? 0)]);
+for (const [id, total] of baseline) if (total > (now.get(id) ?? 0)) fixed.push([id, total - (now.get(id) ?? 0)]);
+const show = ([id, n]) => `  ${id.split('\n').join(' | ')} (+${n})`;
 
 if (added.length) {
-  process.stderr.write(`typecheck: ${added.length} new diagnostic group(s) not in the baseline:\n`);
+  process.stderr.write(`typecheck: ${added.length} file/code bucket(s) gained diagnostics:\n`);
   process.stderr.write(`${added.map(show).join('\n')}\n`);
+  // Point at the diagnostics whose text the baseline has not seen; they are the likely newcomers.
   const ids = new Set(added.map(([id]) => id));
-  for (const d of diagnostics) if (ids.has(key(d)) && d.at) process.stderr.write(`  at ${d.at}\n`);
+  for (const d of diagnostics)
+    if (ids.has(bucket(d)) && !known.has(key(d)) && d.at) process.stderr.write(`  at ${d.at}: ${d.message}\n`);
 }
 if (fixed.length) {
   process.stderr.write(
-    `typecheck: ${fixed.length} baseline group(s) are fixed; run \`npm run typecheck -- --update\`:\n`,
+    `typecheck: ${fixed.length} file/code bucket(s) shrank; run \`npm run typecheck -- --update\`:\n`,
   );
-  process.stderr.write(`${fixed.map(show).join('\n')}\n`);
+  process.stderr.write(`${fixed.map(([id, n]) => `  ${id.split('\n').join(' | ')} (-${n})`).join('\n')}\n`);
 }
 if (added.length || fixed.length) process.exit(1);
 process.stdout.write(`typecheck: no new diagnostics (${diagnostics.length} known in baseline)\n`);
