@@ -14,7 +14,7 @@ const defaultPattern = `**/{test,test/**/*,test-*,*[._-]test}.{${extensions}}`;
 // in descending durationMs, not reporter delivery order. Static observations,
 // not runtime weights; environment/overlap differ and no speedup is implied.
 // Scheduling has only a case-work lower bound; retain lighter prior entries.
-// See docs/WINDOWS-TEST-SPEED.md for provenance and the incomplete full check.
+// See docs/archive/WINDOWS-TEST-SPEED.md for provenance and the incomplete full check.
 const priority = [
   'tests/delivery.test.mjs', // 434779.5897 ms
   'tests/project-director.test.mjs', // 375928.3714 ms
