@@ -28,7 +28,12 @@ export function subscriptionEnvironment(base = process.env) {
 }
 
 async function isFile(filename) {
-  try { await access(filename); return true; } catch { return false; }
+  try {
+    await access(filename);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export async function resolveClient(client, environment = process.env) {
@@ -39,13 +44,18 @@ export async function resolveClient(client, environment = process.env) {
       environment.KODO_CODEX_CLIJS,
       path.join(appdata, 'npm/node_modules/@openai/codex/bin/codex.js'),
       '/usr/local/lib/node_modules/@openai/codex/bin/codex.js',
-      '/usr/lib/node_modules/@openai/codex/bin/codex.js'
+      '/usr/lib/node_modules/@openai/codex/bin/codex.js',
     ].filter(Boolean);
-    for (const launcher of launchers) if (await isFile(launcher)) return { command: process.execPath, args: [launcher] };
+    for (const launcher of launchers)
+      if (await isFile(launcher)) return { command: process.execPath, args: [launcher] };
   }
   const commandName = client === 'claude-code' ? 'claude' : client;
   if (process.platform === 'win32') {
-    const result = spawnSync('where.exe', [commandName + '.exe'], { encoding: 'utf8', windowsHide: true, env: environment });
+    const result = spawnSync('where.exe', [commandName + '.exe'], {
+      encoding: 'utf8',
+      windowsHide: true,
+      env: environment,
+    });
     const native = result.stdout?.split(/\r?\n/).find(line => line.trim());
     if (native) return { command: native.trim(), args: [] };
     if (client === 'claude-code') {
@@ -60,21 +70,44 @@ export async function resolveClient(client, environment = process.env) {
   throw new Error(`Не найден исполняемый файл клиента ${client}`);
 }
 
-export async function runProcess({ command, args = [], cwd, input = '', env = process.env, signal, timeoutMs = 1800000, onLine, maxOutputBytes = 16 * 1024 * 1024 }) {
+export async function runProcess({
+  command,
+  args = [],
+  cwd,
+  input = '',
+  env = process.env,
+  signal,
+  timeoutMs = 1800000,
+  onLine,
+  maxOutputBytes = 16 * 1024 * 1024,
+}) {
   signal?.throwIfAborted();
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { cwd, env, windowsHide: true, shell: false, stdio: ['pipe', 'pipe', 'pipe'] });
-    let stdout = '', stderr = '', pending = '', finished = false, terminalError;
+    let stdout = '',
+      stderr = '',
+      pending = '',
+      finished = false,
+      terminalError;
     const terminate = error => {
       if (finished) return;
       terminalError = error;
       // Windows process groups require taskkill to stop the CLI's native child too.
-      if (process.platform === 'win32' && child.pid) spawnSync('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+      if (process.platform === 'win32' && child.pid)
+        spawnSync('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
       else child.kill('SIGTERM');
     };
-    const timer = setTimeout(() => terminate(Object.assign(new Error('Истекло время выполнения клиента'), { code: 'KODO_TIMEOUT' })), timeoutMs);
+    const timer = setTimeout(
+      () => terminate(Object.assign(new Error('Истекло время выполнения клиента'), { code: 'KODO_TIMEOUT' })),
+      timeoutMs,
+    );
     timer.unref();
-    const aborted = () => terminate(signal.reason instanceof Error ? signal.reason : Object.assign(new Error('Запуск отменён'), { name: 'AbortError' }));
+    const aborted = () =>
+      terminate(
+        signal.reason instanceof Error
+          ? signal.reason
+          : Object.assign(new Error('Запуск отменён'), { name: 'AbortError' }),
+      );
     signal?.addEventListener('abort', aborted, { once: true });
     const finish = callback => {
       if (finished) return;
@@ -89,32 +122,51 @@ export async function runProcess({ command, args = [], cwd, input = '', env = pr
     child.stdout.on('data', chunk => {
       stdout += chunk;
       pending += chunk;
-      if (Buffer.byteLength(stdout) + Buffer.byteLength(stderr) > maxOutputBytes) return terminate(Object.assign(new Error('Превышен предел вывода клиента'), { code: 'KODO_OUTPUT_LIMIT' }));
+      if (Buffer.byteLength(stdout) + Buffer.byteLength(stderr) > maxOutputBytes)
+        return terminate(Object.assign(new Error('Превышен предел вывода клиента'), { code: 'KODO_OUTPUT_LIMIT' }));
       let newline;
       while ((newline = pending.indexOf('\n')) !== -1) {
         const line = pending.slice(0, newline).replace(/\r$/, '');
         pending = pending.slice(newline + 1);
-        try { onLine?.(line); } catch (error) { terminate(error); }
+        try {
+          onLine?.(line);
+        } catch (error) {
+          terminate(error);
+        }
       }
     });
     child.stderr.on('data', chunk => {
       stderr += chunk;
-      if (Buffer.byteLength(stdout) + Buffer.byteLength(stderr) > maxOutputBytes) terminate(Object.assign(new Error('Превышен предел вывода клиента'), { code: 'KODO_OUTPUT_LIMIT' }));
+      if (Buffer.byteLength(stdout) + Buffer.byteLength(stderr) > maxOutputBytes)
+        terminate(Object.assign(new Error('Превышен предел вывода клиента'), { code: 'KODO_OUTPUT_LIMIT' }));
     });
-    child.on('close', (exitCode, exitSignal) => finish(() => {
-      if (pending) { try { onLine?.(pending.replace(/\r$/, '')); } catch (error) { terminalError ??= error; } }
-      if (terminalError) reject(terminalError);
-      else resolve({ stdout, stderr, exitCode, signal: exitSignal, pid: child.pid });
-    }));
-    child.stdin.on('error', error => { if (error.code !== 'EPIPE') terminate(error); });
+    child.on('close', (exitCode, exitSignal) =>
+      finish(() => {
+        if (pending) {
+          try {
+            onLine?.(pending.replace(/\r$/, ''));
+          } catch (error) {
+            terminalError ??= error;
+          }
+        }
+        if (terminalError) reject(terminalError);
+        else resolve({ stdout, stderr, exitCode, signal: exitSignal, pid: child.pid });
+      }),
+    );
+    child.stdin.on('error', error => {
+      if (error.code !== 'EPIPE') terminate(error);
+    });
     child.stdin.end(input);
   });
 }
 
 export async function readCodexModelCache(environment = process.env) {
   const home = environment.CODEX_HOME || path.join(environment.USERPROFILE || os.homedir(), '.codex');
-  try { return JSON.parse(await readFile(path.join(home, 'models_cache.json'), 'utf8')).models ?? []; }
-  catch { return []; }
+  try {
+    return JSON.parse(await readFile(path.join(home, 'models_cache.json'), 'utf8')).models ?? [];
+  } catch {
+    return [];
+  }
 }
 
 export async function codexIsolationOverrides(cwd, environment = process.env) {
@@ -128,19 +180,28 @@ export async function codexIsolationOverrides(cwd, environment = process.env) {
     if (parent === current) break;
     current = parent;
   }
-  const serverNames = new Set(), pluginNames = new Set();
+  const serverNames = new Set(),
+    pluginNames = new Set();
   for (const filename of filenames) {
     let text;
-    try { text = await readFile(filename, 'utf8'); }
-    catch (error) { if (error.code === 'ENOENT') continue; throw new Error('Не удалось прочитать конфигурацию Codex для изоляции рабочих инструментов'); }
+    try {
+      text = await readFile(filename, 'utf8');
+    } catch (error) {
+      if (error.code === 'ENOENT') continue;
+      throw new Error('Не удалось прочитать конфигурацию Codex для изоляции рабочих инструментов');
+    }
     let config;
-    try { config = parseToml(text.replace(/^\uFEFF/, '')); }
-    catch { throw new Error('Некорректная конфигурация Codex; запуск инструментов не начат'); }
+    try {
+      config = parseToml(text.replace(/^\uFEFF/, ''));
+    } catch {
+      throw new Error('Некорректная конфигурация Codex; запуск инструментов не начат');
+    }
     for (const name of Object.keys(config.mcp_servers || {})) serverNames.add(name);
     for (const name of Object.keys(config.plugins || {})) pluginNames.add(name);
   }
   const args = ['-c', 'notify=[]', '-c', 'plugins._default.enabled=false'];
   for (const name of [...serverNames].sort()) args.push('-c', `mcp_servers.${JSON.stringify(name)}.enabled=false`);
-  for (const name of [...pluginNames].filter(name => name !== '_default').sort()) args.push('-c', `plugins.${JSON.stringify(name)}.enabled=false`);
+  for (const name of [...pluginNames].filter(name => name !== '_default').sort())
+    args.push('-c', `plugins.${JSON.stringify(name)}.enabled=false`);
   return args;
 }

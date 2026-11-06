@@ -14,7 +14,7 @@ const expectedStats = {
   version: registry.version,
   total: 33,
   byType: { skill: 18, agent: 5, pipeline: 4, mcp: 3, preset: 3 },
-  dependencies: 51
+  dependencies: 51,
 };
 
 // Independently checked manifest order and existing text output, including spacing.
@@ -38,12 +38,21 @@ const listRows = [
   ['presets/dotnet', 'presets/dotnet                Комплект для .NET-приложения'],
   ['presets/wordpress', 'presets/wordpress             Комплект для WordPress-сайта или плагина'],
   ['agents/documenter', 'agents/documenter             Документирование реализованного поведения и команд проекта'],
-  ['skills/kodo-build-feature', 'skills/kodo-build-feature     Выполнение задачи через движок Kodo с анализом планом агентами проверками и доставкой'],
+  [
+    'skills/kodo-build-feature',
+    'skills/kodo-build-feature     Выполнение задачи через движок Kodo с анализом планом агентами проверками и доставкой',
+  ],
   ['skills/architecture-patterns', 'skills/architecture-patterns  Стандарт Kodo architecture patterns'],
-  ['skills/architecture-decision-records', 'skills/architecture-decision-records Стандарт Kodo architecture decision records'],
+  [
+    'skills/architecture-decision-records',
+    'skills/architecture-decision-records Стандарт Kodo architecture decision records',
+  ],
   ['skills/monorepo-management', 'skills/monorepo-management    Стандарт Kodo monorepo management'],
   ['skills/e2e-testing-patterns', 'skills/e2e-testing-patterns   Стандарт Kodo e2e testing patterns'],
-  ['skills/subagent-driven-development', 'skills/subagent-driven-development Стандарт Kodo subagent driven development'],
+  [
+    'skills/subagent-driven-development',
+    'skills/subagent-driven-development Стандарт Kodo subagent driven development',
+  ],
   ['skills/systematic-debugging', 'skills/systematic-debugging   Стандарт Kodo systematic debugging'],
   ['skills/test-driven-development', 'skills/test-driven-development Стандарт Kodo test driven development'],
   ['skills/using-git-worktrees', 'skills/using-git-worktrees    Стандарт Kodo using git worktrees'],
@@ -51,13 +60,15 @@ const listRows = [
   ['skills/react-best-practices', 'skills/react-best-practices   Стандарт Kodo react best practices'],
   ['skills/composition-patterns', 'skills/composition-patterns   Стандарт Kodo composition patterns'],
   ['skills/ce-compound', 'skills/ce-compound            Стандарт Kodo ce compound'],
-  ['skills/spec-kit', 'skills/spec-kit               Стандарт Kodo spec kit']
+  ['skills/spec-kit', 'skills/spec-kit               Стандарт Kodo spec kit'],
 ];
 const skillRows = [listRows[0], listRows[1], listRows[2], listRows[3], ...listRows.slice(19)];
 
 function run(args, cwd = root) {
   const result = spawnSync(process.execPath, [cli, ...args], {
-    encoding: 'utf8', cwd, timeout: 30_000
+    encoding: 'utf8',
+    cwd,
+    timeout: 30_000,
   });
   assert.ifError(result.error);
   assert.equal(result.signal, null, 'CLI must exit normally');
@@ -73,25 +84,26 @@ function successful(args, cwd) {
 
 const workingDirectories = [
   ['project directory', root],
-  ['unrelated working directory', os.tmpdir()]
+  ['unrelated working directory', os.tmpdir()],
 ];
 
 test('Registry stats JSON has exactly the required keys, types and values', async t => {
   assert.notEqual(path.resolve(os.tmpdir()), root);
-  for (const [name, cwd] of workingDirectories) await t.test(name, () => {
-    // Parse all stdout so banners, tables and trailing messages are rejected.
-    const stats = JSON.parse(successful(['registry', 'stats', '--json'], cwd));
-    assert.ok(stats !== null && typeof stats === 'object' && !Array.isArray(stats));
-    assert.deepEqual(Object.keys(stats).sort(), ['byType', 'dependencies', 'total', 'version']);
-    assert.equal(typeof stats.version, 'string');
-    assert.ok(stats.byType !== null && typeof stats.byType === 'object' && !Array.isArray(stats.byType));
-    assert.deepEqual(Object.keys(stats.byType).sort(), ['agent', 'mcp', 'pipeline', 'preset', 'skill']);
-    for (const value of [stats.total, stats.dependencies, ...Object.values(stats.byType)]) {
-      assert.equal(typeof value, 'number');
-      assert.ok(Number.isInteger(value) && value >= 0);
-    }
-    assert.deepEqual(stats, expectedStats);
-  });
+  for (const [name, cwd] of workingDirectories)
+    await t.test(name, () => {
+      // Parse all stdout so banners, tables and trailing messages are rejected.
+      const stats = JSON.parse(successful(['registry', 'stats', '--json'], cwd));
+      assert.ok(stats !== null && typeof stats === 'object' && !Array.isArray(stats));
+      assert.deepEqual(Object.keys(stats).sort(), ['byType', 'dependencies', 'total', 'version']);
+      assert.equal(typeof stats.version, 'string');
+      assert.ok(stats.byType !== null && typeof stats.byType === 'object' && !Array.isArray(stats.byType));
+      assert.deepEqual(Object.keys(stats.byType).sort(), ['agent', 'mcp', 'pipeline', 'preset', 'skill']);
+      for (const value of [stats.total, stats.dependencies, ...Object.values(stats.byType)]) {
+        assert.equal(typeof value, 'number');
+        assert.ok(Number.isInteger(value) && value >= 0);
+      }
+      assert.deepEqual(stats, expectedStats);
+    });
 });
 
 test('Registry dependencies counts 51 direct requires references including repeated targets', () => {
@@ -106,11 +118,11 @@ test('Registry dependencies counts 51 direct requires references including repea
     ['presets/nextjs', 7],
     ['presets/dotnet', 5],
     ['presets/wordpress', 6],
-    ['skills/kodo-build-feature', 15]
+    ['skills/kodo-build-feature', 15],
   ];
   assert.deepEqual(
     registry.components.filter(item => item.requires.length > 0).map(item => [item.id, item.requires.length]),
-    directReferenceCounts
+    directReferenceCounts,
   );
   assert.equal(new Set(registry.components.flatMap(item => item.requires)).size, 29);
   const stats = JSON.parse(successful(['registry', 'stats', '--json']));
@@ -127,13 +139,17 @@ test('Registry stats table associates every label with its value', async t => {
     ['pipeline', '4'],
     ['mcp', '3'],
     ['preset', '3'],
-    ['Ссылок requires', '51']
+    ['Ссылок requires', '51'],
   ];
-  for (const [name, cwd] of workingDirectories) await t.test(name, () => {
-    const stdout = successful(['registry', 'stats'], cwd);
-    const rows = stdout.trimEnd().split(/\r?\n/).map(line => line.split('|').map(cell => cell.trim()));
-    assert.deepEqual(rows, expectedRows);
-  });
+  for (const [name, cwd] of workingDirectories)
+    await t.test(name, () => {
+      const stdout = successful(['registry', 'stats'], cwd);
+      const rows = stdout
+        .trimEnd()
+        .split(/\r?\n/)
+        .map(line => line.split('|').map(cell => cell.trim()));
+      assert.deepEqual(rows, expectedRows);
+    });
 });
 
 const invalidInvocations = [
@@ -144,17 +160,21 @@ const invalidInvocations = [
   ['inapplicable target', ['registry', 'stats', '--target', 'unused-project']],
   ['inapplicable client', ['registry', 'stats', '--client', 'codex']],
   ['inapplicable preset', ['registry', 'stats', '--preset', 'nextjs']],
-  ['inapplicable dry run', ['registry', 'stats', '--dry-run']]
+  ['inapplicable dry run', ['registry', 'stats', '--dry-run']],
 ];
 
 for (const [name, args] of invalidInvocations) {
   test(`Registry CLI rejects ${name} without stdout`, async t => {
-    for (const [format, flags] of [['text', []], ['JSON', ['--json']]]) await t.test(format, () => {
-      const result = run([...args, ...flags], os.tmpdir());
-      assert.equal(result.status, 1, result.stderr);
-      assert.equal(result.stdout, '');
-      assert.match(result.stderr, /^Ошибка:/);
-    });
+    for (const [format, flags] of [
+      ['text', []],
+      ['JSON', ['--json']],
+    ])
+      await t.test(format, () => {
+        const result = run([...args, ...flags], os.tmpdir());
+        assert.equal(result.status, 1, result.stderr);
+        assert.equal(result.stdout, '');
+        assert.match(result.stderr, /^Ошибка:/);
+      });
   });
 }
 
@@ -165,14 +185,17 @@ test('CLI help advertises registry stats and its JSON option', () => {
 
 for (const [name, args, rows] of [
   ['list', ['list'], listRows],
-  ['list skill', ['list', 'skill'], skillRows]
+  ['list skill', ['list', 'skill'], skillRows],
 ]) {
   test(`CLI ${name} preserves JSON contents, order and formatting`, () => {
     const stdout = successful([...args, '--json'], os.tmpdir());
     const items = JSON.parse(stdout);
     const ids = rows.map(([id]) => id);
     assert.ok(Array.isArray(items));
-    assert.deepEqual(items.map(item => item.id), ids);
+    assert.deepEqual(
+      items.map(item => item.id),
+      ids,
+    );
     const expected = ids.map(id => {
       const component = registry.components.find(item => item.id === id);
       assert.ok(component, `Missing manifest component: ${id}`);

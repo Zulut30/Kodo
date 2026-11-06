@@ -1,0 +1,15 @@
+# Only first-party JavaScript is formatted. Docs, JSON pins and vendored
+# skills keep their reviewed bytes.
+*
+!*/
+!adapters/**/*.mjs
+!cli/**/*.mjs
+!runtime/**/*.mjs
+!scripts/**/*.mjs
+!tests/**/*.mjs
+scripts/fixtures/
+tests/fixtures/
+node_modules/
+# Frozen oracle/acceptance tests: their bytes are pinned by SHA-256 in tests and docs.
+tests/*-oracle.test.mjs
+tests/*-acceptance.test.mjs

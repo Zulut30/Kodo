@@ -1,6 +1,6 @@
 # CI profiler (phase 03 draft)
 
-Профайлер измеряет локально выполненную команду через существующий owned-process port `runtime/delivery.mjs`. Он не запускает провайдеров и не заменяет обязательные checks. Phase02 принят (PR #11 / `dabecb7`); phase03 остаётся pending full/review/CI у координатора. Этот документ не подтверждает CI, публикацию или deployment.
+Профайлер измеряет локально выполненную команду через существующий owned-process port `runtime/delivery-process.mjs` (реэкспортируется из `runtime/delivery.mjs`). Он не запускает провайдеров и не заменяет обязательные checks. Phase02 принят (PR #11 / `dabecb7`); phase03 остаётся pending full/review/CI у координатора. Этот документ не подтверждает CI, публикацию или deployment.
 
 ## Контракт для CI task 5
 

@@ -50,7 +50,7 @@ RTK не применяется к JSON/protocol/porcelain/NUL, Node/TAP, scanne
 
 Findings сохраняют только `ruleId`, `file`, `line`, `severity`; `Secret`, `Match`, snippets и raw stderr не экспортируются. Ошибки scanner, timeout, malformed JSON, отсутствие файла/бинарника или нулевое/неполное покрытие не могут считаться чистым результатом. Receipts привязаны к head/config/pins, source/rules hashes и байтам evidence. Изменённые исходники или rules делают их неактуальными. Приватные отчёты находятся вне Git, а generated scanner homes удаляются штатной ограниченной процедурой.
 
-На Windows Semgrep 1.183.0 требует короткого собственного OS-temp для IPC: длинный вложенный TEMP вызвал реальную RPC-ошибку на чистой fixture. Адаптер выделяет свой короткий временный каталог и передаёт его только scanner через `TEMP`/`TMP`/`TMPDIR`. Глобальный TEMP и службы WSL не изменяются. [Фактическое live evidence](VALIDATION.md#реальные-квитанции-run9fc).
+На Windows Semgrep 1.183.0 требует короткого собственного OS-temp для IPC: длинный вложенный TEMP вызвал реальную RPC-ошибку на чистой fixture. Адаптер выделяет свой короткий временный каталог и передаёт его только scanner через `TEMP`/`TMP`/`TMPDIR`. Глобальный TEMP и службы WSL не изменяются. [Фактическое live evidence](archive/VALIDATION.md#реальные-квитанции-run9fc).
 
 ## UI и приватность
 

@@ -25,9 +25,22 @@ test('Packed CI reporter loads by installed runtime file URL and observes one re
   delete env.NODE_TEST_CONTEXT;
   const userConfig = path.join(scratch, 'npmrc');
   await writeFile(userConfig, '');
-  const packed = await execute('npm', ['pack', '--offline', '--ignore-scripts', '--json',
-    '--pack-destination', scratch, '--userconfig', userConfig, '--cache', path.join(scratch, 'npm-cache')],
-  { cwd: root, env, timeoutMs: 60000 });
+  const packed = await execute(
+    'npm',
+    [
+      'pack',
+      '--offline',
+      '--ignore-scripts',
+      '--json',
+      '--pack-destination',
+      scratch,
+      '--userconfig',
+      userConfig,
+      '--cache',
+      path.join(scratch, 'npm-cache'),
+    ],
+    { cwd: root, env, timeoutMs: 60000 },
+  );
   const packages = JSON.parse(packed.stdout);
   assert.equal(packages.length, 1);
   const archiveName = packages[0].filename;
@@ -42,11 +55,26 @@ test('Packed CI reporter loads by installed runtime file URL and observes one re
   const project = path.join(scratch, 'project');
   await mkdir(project);
   const fixture = path.join(project, 'passing.test.mjs');
-  await writeFile(fixture, "import test from 'node:test'; import assert from 'node:assert/strict'; test('packed reporter fixture', () => assert.equal(2 + 2, 4));\n");
-  const result = await runProfiledCommand({ command: process.execPath,
-    args: ['--test', `--test-reporter=${reporter.href}`, '--test-reporter-destination=stderr',
-      '--test-reporter=tap', '--test-reporter-destination=stdout', fixture],
-    cwd: project, env, evidenceDir: path.join(scratch, 'evidence'), timeoutMs: 20000, phase: 'package' });
+  await writeFile(
+    fixture,
+    "import test from 'node:test'; import assert from 'node:assert/strict'; test('packed reporter fixture', () => assert.equal(2 + 2, 4));\n",
+  );
+  const result = await runProfiledCommand({
+    command: process.execPath,
+    args: [
+      '--test',
+      `--test-reporter=${reporter.href}`,
+      '--test-reporter-destination=stderr',
+      '--test-reporter=tap',
+      '--test-reporter-destination=stdout',
+      fixture,
+    ],
+    cwd: project,
+    env,
+    evidenceDir: path.join(scratch, 'evidence'),
+    timeoutMs: 20000,
+    phase: 'package',
+  });
   assert.equal(result.exitCode, 0, result.stderr);
   assert.equal((await lstat(reporter)).isFile(), true, 'runtime reporter must be a delivered file');
   assert.deepEqual(await readdir(new URL('./', reporter)), ['ci-reporter.mjs'], 'ship only the required script asset');
@@ -55,7 +83,10 @@ test('Packed CI reporter loads by installed runtime file URL and observes one re
   assert.match(result.stdout, /# tests 1\b/);
   assert.match(result.stdout, /# pass 1\b/);
   assert.match(result.stdout, /# fail 0\b/);
-  const events = result.stderr.trim().split(/\r?\n/).map(line => JSON.parse(line));
+  const events = result.stderr
+    .trim()
+    .split(/\r?\n/)
+    .map(line => JSON.parse(line));
   assert.equal(events.length, 2, 'one file summary plus the overall summary');
   for (const event of events) {
     assert.equal(event.type, 'test:summary');

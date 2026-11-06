@@ -69,11 +69,18 @@ function parse(argv) {
 
 function checkOptions(command, options) {
   const allowed = {
-    list: ['json', 'search'], show: ['json'], plan: ['json'], validate: ['json'], registry: ['json'],
-    install: ['json', 'dry-run', 'target', 'clients'], init: ['json', 'dry-run', 'target', 'clients', 'preset']
+    list: ['json', 'search'],
+    show: ['json'],
+    plan: ['json'],
+    validate: ['json'],
+    registry: ['json'],
+    install: ['json', 'dry-run', 'target', 'clients'],
+    init: ['json', 'dry-run', 'target', 'clients', 'preset'],
   }[command];
   if (!allowed) throw new Error(`Неизвестная команда: ${command}`);
-  for (const key of Object.keys(options)) if (key !== 'positional' && !(key === 'clients' && !options.clients.length) && !allowed.includes(key)) throw new Error(`Параметр ${key} неприменим к ${command}`);
+  for (const key of Object.keys(options))
+    if (key !== 'positional' && !(key === 'clients' && !options.clients.length) && !allowed.includes(key))
+      throw new Error(`Параметр ${key} неприменим к ${command}`);
 }
 
 async function main() {
@@ -83,41 +90,79 @@ async function main() {
   // SQLite store or credential/provider startup path.
   if (command === 'project') {
     const { projectCli } = await import('../runtime/project-cli.mjs');
-    const controller = new AbortController(), abort = () => controller.abort();
-    process.once('SIGINT', abort); process.once('SIGTERM', abort);
-    try { const result = await projectCli(argv, { signal: controller.signal }); console.log(result.output); process.exitCode = result.exitCode; }
-    finally { process.removeListener('SIGINT', abort); process.removeListener('SIGTERM', abort); }
+    const controller = new AbortController(),
+      abort = () => controller.abort();
+    process.once('SIGINT', abort);
+    process.once('SIGTERM', abort);
+    try {
+      const result = await projectCli(argv, { signal: controller.signal });
+      console.log(result.output);
+      process.exitCode = result.exitCode;
+    } finally {
+      process.removeListener('SIGINT', abort);
+      process.removeListener('SIGTERM', abort);
+    }
     return;
   }
   if (['research', 'knowledge'].includes(command)) {
     const { knowledgeCli } = await import('../runtime/knowledge-cli.mjs');
-    const result = await knowledgeCli([command, ...argv]); console.log(result.output); process.exitCode = result.exitCode; return;
+    const result = await knowledgeCli([command, ...argv]);
+    console.log(result.output);
+    process.exitCode = result.exitCode;
+    return;
   }
   if (command === 'architecture') {
     const { architectureCli } = await import('../runtime/architecture-cli.mjs');
-    const controller = new AbortController(), abort = () => controller.abort();
-    process.once('SIGINT', abort); process.once('SIGTERM', abort);
-    try { const result = await architectureCli(argv, { signal: controller.signal }); console.log(result.output); process.exitCode = result.exitCode; }
-    finally { process.removeListener('SIGINT', abort); process.removeListener('SIGTERM', abort); }
+    const controller = new AbortController(),
+      abort = () => controller.abort();
+    process.once('SIGINT', abort);
+    process.once('SIGTERM', abort);
+    try {
+      const result = await architectureCli(argv, { signal: controller.signal });
+      console.log(result.output);
+      process.exitCode = result.exitCode;
+    } finally {
+      process.removeListener('SIGINT', abort);
+      process.removeListener('SIGTERM', abort);
+    }
     return;
   }
   if (command === 'ci') {
     const { ciCli } = await import('../runtime/ci-cli.mjs');
-    const controller = new AbortController(), abort = () => controller.abort();
-    process.once('SIGINT', abort); process.once('SIGTERM', abort);
-    try { const result = await ciCli(argv, { signal: controller.signal }); console.log(result.output); process.exitCode = result.exitCode; }
-    finally { process.removeListener('SIGINT', abort); process.removeListener('SIGTERM', abort); }
+    const controller = new AbortController(),
+      abort = () => controller.abort();
+    process.once('SIGINT', abort);
+    process.once('SIGTERM', abort);
+    try {
+      const result = await ciCli(argv, { signal: controller.signal });
+      console.log(result.output);
+      process.exitCode = result.exitCode;
+    } finally {
+      process.removeListener('SIGINT', abort);
+      process.removeListener('SIGTERM', abort);
+    }
     return;
   }
   if (command === 'quality') {
     const { qualityCli } = await import('../runtime/quality-cli.mjs');
-    const result = await qualityCli(argv); console.log(result.output); process.exitCode = result.exitCode; return;
+    const result = await qualityCli(argv);
+    console.log(result.output);
+    process.exitCode = result.exitCode;
+    return;
   }
   if (command === 'benchmark') {
     const { benchmarkCli } = await import('../runtime/benchmark-cli.mjs');
-    const result = await benchmarkCli(argv); console.log(result.output); process.exitCode = result.exitCode; return;
+    const result = await benchmarkCli(argv);
+    console.log(result.output);
+    process.exitCode = result.exitCode;
+    return;
   }
-  if (['doctor','run','status','logs','resume','cancel','migrate','audit','tools','ui','security'].includes(command) || command === 'init' && !argv.includes('--preset')) {
+  if (
+    ['doctor', 'run', 'status', 'logs', 'resume', 'cancel', 'migrate', 'audit', 'tools', 'ui', 'security'].includes(
+      command,
+    ) ||
+    (command === 'init' && !argv.includes('--preset'))
+  ) {
     const { runtimeCli } = await import('../runtime/cli.mjs');
     return runtimeCli(command, argv);
   }
@@ -139,7 +184,7 @@ async function main() {
       version: catalog.registry.version,
       total: catalog.registry.components.length,
       byType,
-      dependencies
+      dependencies,
     };
     if (options.json) return output(result);
     const rows = [
@@ -147,23 +192,35 @@ async function main() {
       ['Версия registry', result.version],
       ['Всего компонентов', result.total],
       ...Object.entries(result.byType),
-      ['Ссылок requires', result.dependencies]
+      ['Ссылок requires', result.dependencies],
     ];
     return console.log(rows.map(([label, value]) => `${label.padEnd(20)} | ${value}`).join('\n'));
   }
   if (command === 'validate') {
     if (ids.length) throw new Error('validate не принимает аргументы');
     const result = { valid: true, version: catalog.registry.version, components: catalog.registry.components.length };
-    return options.json ? output(result) : console.log(`Каталог корректен: ${result.components} компонентов, версия ${result.version}`);
+    return options.json
+      ? output(result)
+      : console.log(`Каталог корректен: ${result.components} компонентов, версия ${result.version}`);
   }
   if (command === 'list') {
-    if (ids.length > 1 || ids[0] && !['skill', 'agent', 'pipeline', 'mcp', 'preset'].includes(ids[0])) throw new Error('Укажи тип: skill, agent, pipeline, mcp или preset');
-    const normalize = text => String(text ?? '').normalize('NFC').toLocaleLowerCase('ru');
+    if (ids.length > 1 || (ids[0] && !['skill', 'agent', 'pipeline', 'mcp', 'preset'].includes(ids[0])))
+      throw new Error('Укажи тип: skill, agent, pipeline, mcp или preset');
+    const normalize = text =>
+      String(text ?? '')
+        .normalize('NFC')
+        .toLocaleLowerCase('ru');
     const query = options.search === undefined ? '' : normalize(options.search.trim());
     if (options.search !== undefined && !query) throw new Error('Требуется значение --search');
-    const list = catalog.registry.components.filter(item => (!ids[0] || item.type === ids[0]) && (!query || normalize(item.id).includes(query) || normalize(item.description).includes(query)));
+    const list = catalog.registry.components.filter(
+      item =>
+        (!ids[0] || item.type === ids[0]) &&
+        (!query || normalize(item.id).includes(query) || normalize(item.description).includes(query)),
+    );
     if (query && !list.length && !options.json) return;
-    return options.json ? output(list) : console.log(list.map(item => `${item.id.padEnd(29)} ${item.description}`).join('\n'));
+    return options.json
+      ? output(list)
+      : console.log(list.map(item => `${item.id.padEnd(29)} ${item.description}`).join('\n'));
   }
   if (command === 'show' || command === 'plan') {
     if (ids.length !== 1) throw new Error(`${command} требует один id компонента`);
@@ -172,24 +229,41 @@ async function main() {
     if (command === 'plan' && component.type !== 'pipeline') throw new Error('plan принимает только pipelines/name');
     const content = catalog.bundles.get(component.id).get(component.entry).toString('utf8');
     const dependencies = resolveComponents(catalog.registry, component.requires).map(item => item.id);
-    if (options.json) return output({ ...component, dependencies, content: component.type === 'pipeline' ? JSON.parse(content) : content });
-    return console.log(`${component.id} v${component.version}\n${component.description}\nЗависимости: ${dependencies.join(', ') || 'нет'}\n\n${content}`);
+    if (options.json)
+      return output({
+        ...component,
+        dependencies,
+        content: component.type === 'pipeline' ? JSON.parse(content) : content,
+      });
+    return console.log(
+      `${component.id} v${component.version}\n${component.description}\nЗависимости: ${dependencies.join(', ') || 'нет'}\n\n${content}`,
+    );
   }
   if (!options.target) throw new Error('Укажи --target <папка проекта>');
   let selected = ids;
   if (command === 'init') {
-    if (ids.length || !options.preset || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(options.preset)) throw new Error('init требует --preset <name> без позиционных аргументов');
+    if (ids.length || !options.preset || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(options.preset))
+      throw new Error('init требует --preset <name> без позиционных аргументов');
     selected = [`presets/${options.preset}`];
   }
   if (!selected.length) throw new Error('Укажи хотя бы один компонент');
   const plan = await planInstallation(catalog, selected, options.clients, options.target);
   if (!options['dry-run']) await applyInstallation(plan);
   const result = {
-    dryRun: Boolean(options['dry-run']), target: plan.root, clients: plan.clients, components: plan.components,
-    files: plan.changes.map(({ path: name, status }) => ({ path: name, status }))
+    dryRun: Boolean(options['dry-run']),
+    target: plan.root,
+    clients: plan.clients,
+    components: plan.components,
+    files: plan.changes.map(({ path: name, status }) => ({ path: name, status })),
   };
   if (options.json) return output(result);
-  console.log(`${result.dryRun ? 'План установки' : 'Установлено'} → ${plan.root}\nКлиенты: ${plan.clients.join(', ')}\nКомпонентов: ${plan.components.length}\n` + result.files.map(item => `${item.status.padEnd(9)} ${item.path}`).join('\n'));
+  console.log(
+    `${result.dryRun ? 'План установки' : 'Установлено'} → ${plan.root}\nКлиенты: ${plan.clients.join(', ')}\nКомпонентов: ${plan.components.length}\n` +
+      result.files.map(item => `${item.status.padEnd(9)} ${item.path}`).join('\n'),
+  );
 }
 
-main().catch(error => { console.error(`Ошибка: ${error.message}`); process.exitCode = 1; });
+main().catch(error => {
+  console.error(`Ошибка: ${error.message}`);
+  process.exitCode = 1;
+});

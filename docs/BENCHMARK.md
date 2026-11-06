@@ -84,4 +84,4 @@ Codex `inputTokens` включает `cachedInputTokens`: total = input + output
 
 Для вывода о скорости сопоставляй wall time, native-session duration и правильность в одинаковых парах. Разность wall/native duration включает setup, oracle, очереди и прочую работу; её нельзя называть исключительно стоимостью Kodo или чистой LLM latency. Две маленькие fixture и два повтора не устанавливают универсально лучшую модель или качество на больших проектах. После завершения эксперимента координатор публикует отдельный проверенный обезличенный отчёт конкретного выпуска с failure/pending/excluded, условиями окружения и ограничениями выводов. Сырые prompts, provider output, ключи и приватные traces в публичный отчёт не копируются.
 
-Проверки методики и разделение уровней доказательств — в [VALIDATION](VALIDATION.md#режимы-метрики-и-парный-benchmark), архитектурное решение — [ADR-0003](decisions/0003-execution-modes-and-benchmarks.md).
+Проверки методики и разделение уровней доказательств — в [VALIDATION](archive/VALIDATION.md#режимы-метрики-и-парный-benchmark), архитектурное решение — [ADR-0003](decisions/0003-execution-modes-and-benchmarks.md).

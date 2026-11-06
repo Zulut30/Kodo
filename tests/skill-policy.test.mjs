@@ -15,9 +15,19 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const text = filename => readFile(filename, 'utf8');
 const digest = data => createHash('sha256').update(data).digest('hex');
 const expectedIds = [
-  'skills/architecture-patterns','skills/architecture-decision-records','skills/monorepo-management','skills/e2e-testing-patterns',
-  'skills/subagent-driven-development','skills/systematic-debugging','skills/test-driven-development','skills/using-git-worktrees',
-  'skills/differential-review','skills/react-best-practices','skills/composition-patterns','skills/ce-compound','skills/spec-kit'
+  'skills/architecture-patterns',
+  'skills/architecture-decision-records',
+  'skills/monorepo-management',
+  'skills/e2e-testing-patterns',
+  'skills/subagent-driven-development',
+  'skills/systematic-debugging',
+  'skills/test-driven-development',
+  'skills/using-git-worktrees',
+  'skills/differential-review',
+  'skills/react-best-practices',
+  'skills/composition-patterns',
+  'skills/ce-compound',
+  'skills/spec-kit',
 ];
 
 async function temporary(t) {
@@ -35,14 +45,26 @@ test('Default policy evaluates all thirteen pinned skills at every runtime stage
   const project = await temporary(t);
   const originalFetch = globalThis.fetch;
   let requests = 0;
-  globalThis.fetch = async () => { requests++; throw new Error('policy must not use network'); };
-  t.after(() => { globalThis.fetch = originalFetch; });
+  globalThis.fetch = async () => {
+    requests++;
+    throw new Error('policy must not use network');
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
   assert.deepEqual(defaultSkillIds, expectedIds);
-  for (const stage of ['analyze','plan','developer','tester','documenter','review','repair','complete']) {
+  for (const stage of ['analyze', 'plan', 'developer', 'tester', 'documenter', 'review', 'repair', 'complete']) {
     const result = await loadDefaultPolicy({ project, stage, task: 'Improve a command line parser' });
-    assert.deepEqual(result.skills.map(item => item.id), expectedIds);
+    assert.deepEqual(
+      result.skills.map(item => item.id),
+      expectedIds,
+    );
     assert.equal(result.skills.length, 13);
-    assert.ok(result.skills.every(item => typeof item.applies === 'boolean' && item.reason.length > 0 && /^[a-f0-9]{40}$/.test(item.revision)));
+    assert.ok(
+      result.skills.every(
+        item => typeof item.applies === 'boolean' && item.reason.length > 0 && /^[a-f0-9]{40}$/.test(item.revision),
+      ),
+    );
     assert.ok(result.skills.every(item => item.source.startsWith('https://github.com/')));
     assert.match(result.context, /All 13 bundled skills were evaluated/);
     assert.match(result.context, /coordinator owns model routing/);
@@ -57,7 +79,10 @@ test('Default policy evaluates all thirteen pinned skills at every runtime stage
 
 test('Default policy loads differential sources for review and omits React and monorepo content for a plain project', async t => {
   const project = await temporary(t);
-  await writeFile(path.join(project, 'package.json'), JSON.stringify({ name: 'plain-cli', dependencies: { ajv: '^8.0.0' } }));
+  await writeFile(
+    path.join(project, 'package.json'),
+    JSON.stringify({ name: 'plain-cli', dependencies: { ajv: '^8.0.0' } }),
+  );
   const result = await loadDefaultPolicy({ project, stage: 'review', task: 'Review retry handling in a CLI' });
   assert.equal(result.skills.find(item => item.id === 'skills/differential-review').applies, true);
   assert.equal(result.skills.find(item => item.id === 'skills/react-best-practices').applies, false);
@@ -73,9 +98,13 @@ test('Default policy detects React in a nested workspace and selects both Vercel
   const project = await temporary(t);
   await writeFile(path.join(project, 'package.json'), JSON.stringify({ name: 'workspace', workspaces: ['apps/*'] }));
   await mkdir(path.join(project, 'apps/web'), { recursive: true });
-  await writeFile(path.join(project, 'apps/web/package.json'), JSON.stringify({ name: 'web', dependencies: { react: '^19.0.0', next: '^16.0.0' } }));
+  await writeFile(
+    path.join(project, 'apps/web/package.json'),
+    JSON.stringify({ name: 'web', dependencies: { react: '^19.0.0', next: '^16.0.0' } }),
+  );
   const result = await loadDefaultPolicy({ project, stage: 'developer', task: 'Improve component request handling' });
-  for (const id of ['skills/monorepo-management','skills/react-best-practices','skills/composition-patterns']) assert.equal(result.skills.find(item => item.id === id).applies, true, id);
+  for (const id of ['skills/monorepo-management', 'skills/react-best-practices', 'skills/composition-patterns'])
+    assert.equal(result.skills.find(item => item.id === id).applies, true, id);
   assert.match(result.context, /### skills\/react-best-practices/);
   assert.match(result.context, /### skills\/composition-patterns/);
   assert.match(result.context, /vercel-react-best-practices/);
@@ -84,8 +113,12 @@ test('Default policy detects React in a nested workspace and selects both Vercel
 
 test('Default policy supports pnpm workspaces and explicit new React requirements before dependencies exist', async t => {
   const project = await temporary(t);
-  await writeFile(path.join(project, 'pnpm-workspace.yaml'), "packages:\n  - packages/*\n");
-  const result = await loadDefaultPolicy({ project, stage: 'plan', task: 'Build a React client for the existing command' });
+  await writeFile(path.join(project, 'pnpm-workspace.yaml'), 'packages:\n  - packages/*\n');
+  const result = await loadDefaultPolicy({
+    project,
+    stage: 'plan',
+    task: 'Build a React client for the existing command',
+  });
   assert.equal(result.skills.find(item => item.id === 'skills/monorepo-management').applies, true);
   assert.equal(result.skills.find(item => item.id === 'skills/react-best-practices').applies, true);
   const unrelated = await loadDefaultPolicy({ project, stage: 'documenter', task: 'Explain the command line usage' });
@@ -118,19 +151,28 @@ test('Default provenance verifies original resources and retained license declar
 });
 
 test('Default policy rejects altered pinned source and invalid provenance before building a prompt', async t => {
-  const directory = await temporary(t), copiedRoot = path.join(directory, 'bundle with spaces'), project = path.join(directory, 'project');
-  await mkdir(copiedRoot); await mkdir(project);
+  const directory = await temporary(t),
+    copiedRoot = path.join(directory, 'bundle with spaces'),
+    project = path.join(directory, 'project');
+  await mkdir(copiedRoot);
+  await mkdir(project);
   await cp(path.join(root, 'skills'), path.join(copiedRoot, 'skills'), { recursive: true });
   const lock = JSON.parse(await text(path.join(root, 'third-party-skills.lock.json')));
   await writeFile(path.join(copiedRoot, 'third-party-skills.lock.json'), JSON.stringify(lock));
   const entry = lock.components[0].entryPoint;
   const original = await readFile(path.join(copiedRoot, entry));
   await writeFile(path.join(copiedRoot, entry), Buffer.concat([original, Buffer.from('\nmodified source\n')]));
-  await assert.rejects(loadDefaultPolicy({ project, root: copiedRoot, stage: 'plan' }), error => error.code === 'skill_integrity' && /hash mismatch/.test(error.message));
+  await assert.rejects(
+    loadDefaultPolicy({ project, root: copiedRoot, stage: 'plan' }),
+    error => error.code === 'skill_integrity' && /hash mismatch/.test(error.message),
+  );
   await writeFile(path.join(copiedRoot, entry), original);
   lock.components[0].revision = 'main';
   await writeFile(path.join(copiedRoot, 'third-party-skills.lock.json'), JSON.stringify(lock));
-  await assert.rejects(loadDefaultPolicy({ project, root: copiedRoot, stage: 'plan' }), error => error.code === 'skill_integrity' && /invalid component/.test(error.message));
+  await assert.rejects(
+    loadDefaultPolicy({ project, root: copiedRoot, stage: 'plan' }),
+    error => error.code === 'skill_integrity' && /invalid component/.test(error.message),
+  );
 });
 
 test('Default policy hash is stable for identical context and changes with applicability or stage', async t => {
@@ -147,13 +189,20 @@ test('Default policy hash is stable for identical context and changes with appli
 });
 
 test('Adapted upstream skill installs as one discoverable wrapper with intact local supporting files', async t => {
-  const target = await temporary(t), id = 'skills/systematic-debugging';
+  const target = await temporary(t),
+    id = 'skills/systematic-debugging';
   const bundle = await readBundle(path.join(root, id));
   const catalog = {
-    registry: { schemaVersion: 1, version: '0.2.0', components: [{ id, type: 'skill', version: '0.2.0', description: 'Systematic debugging', entry: 'SKILL.md', requires: [] }] },
-    bundles: new Map([[id, bundle]])
+    registry: {
+      schemaVersion: 1,
+      version: '0.2.0',
+      components: [
+        { id, type: 'skill', version: '0.2.0', description: 'Systematic debugging', entry: 'SKILL.md', requires: [] },
+      ],
+    },
+    bundles: new Map([[id, bundle]]),
   };
-  const plan = await planInstallation(catalog, [id], ['codex','claude-code'], target);
+  const plan = await planInstallation(catalog, [id], ['codex', 'claude-code'], target);
   await applyInstallation(plan);
   const base = path.join(target, '.agents/skills/systematic-debugging');
   validateSkill(await text(path.join(base, 'SKILL.md')), 'systematic-debugging');
@@ -170,14 +219,20 @@ test('Default policy resolves bundled resources outside a generic target project
   assert.match(result.context, /Bundle resource root \(read-only\):/);
   assert.match(result.context, /never from the target project cwd/);
   assert.doesNotMatch(result.context, /\]\(references\/upstream\//);
-  const links = [...result.context.matchAll(/\]\(<?((?:[A-Za-z]:\/|\/)[^)>]+)>?\)/g)].map(match => match[1].split('#')[0]);
+  const links = [...result.context.matchAll(/\]\(<?((?:[A-Za-z]:\/|\/)[^)>]+)>?\)/g)].map(
+    match => match[1].split('#')[0],
+  );
   assert.ok(links.length >= 15, 'loaded adapters must retain usable local reference links');
   for (const filename of links) {
     assert.ok(!filename.startsWith(project.replaceAll('\\', '/') + '/'));
     await access(filename);
   }
   const before = JSON.parse(await text(path.join(root, 'third-party-skills.lock.json'))).components[0].files[1];
-  assert.equal(digest(await readFile(path.join(root, before.path))), before.sha256, 'context link resolution must not rewrite pinned source bytes');
+  assert.equal(
+    digest(await readFile(path.join(root, before.path))),
+    before.sha256,
+    'context link resolution must not rewrite pinned source bytes',
+  );
 });
 
 test('Compact policy keeps complete adapters and provenance with on-demand upstream references instead of excerpts', async t => {
@@ -185,7 +240,10 @@ test('Compact policy keeps complete adapters and provenance with on-demand upstr
   const result = await loadDefaultPolicy({ project, stage: 'review', task: 'Review a React monorepo' });
   assert.match(result.context, /^Kodo default skill policy v1, stage review/);
   assert.equal(result.skills.filter(row => row.applies).length, 12);
-  assert.doesNotMatch(result.context, /Pinned upstream reference excerpt|# Security-focused code review|# Systematic Debugging/);
+  assert.doesNotMatch(
+    result.context,
+    /Pinned upstream reference excerpt|# Security-focused code review|# Systematic Debugging/,
+  );
   for (const skill of result.skills) {
     assert.ok(result.context.includes(skill.id));
     assert.ok(result.context.includes(skill.revision), `${skill.id} provenance`);
@@ -198,13 +256,19 @@ test('Compact policy keeps complete adapters and provenance with on-demand upstr
 });
 
 test('Repeated compact policy loads recheck even non-applicable pinned resources', async t => {
-  const directory = await temporary(t), copiedRoot = path.join(directory, 'bundle with spaces'), project = path.join(directory, 'project');
-  await mkdir(copiedRoot); await mkdir(project);
+  const directory = await temporary(t),
+    copiedRoot = path.join(directory, 'bundle with spaces'),
+    project = path.join(directory, 'project');
+  await mkdir(copiedRoot);
+  await mkdir(project);
   await cp(path.join(root, 'skills'), path.join(copiedRoot, 'skills'), { recursive: true });
   const lock = JSON.parse(await text(path.join(root, 'third-party-skills.lock.json')));
   await writeFile(path.join(copiedRoot, 'third-party-skills.lock.json'), JSON.stringify(lock));
   const adapterPath = path.join(copiedRoot, 'skills/ce-compound/SKILL.md');
-  await writeFile(adapterPath, (await text(adapterPath)) + '\n' + 'Complete adapter obligation. '.repeat(100) + '\nADAPTER_TAIL_MUST_SURVIVE\n');
+  await writeFile(
+    adapterPath,
+    (await text(adapterPath)) + '\n' + 'Complete adapter obligation. '.repeat(100) + '\nADAPTER_TAIL_MUST_SURVIVE\n',
+  );
   const first = await loadDefaultPolicy({ root: copiedRoot, project, stage: 'complete' });
   assert.match(first.context, /ADAPTER_TAIL_MUST_SURVIVE/);
   const links = [...first.context.matchAll(/\]\(<([^>]+)>\)/g)].map(match => match[1]);
@@ -213,7 +277,10 @@ test('Repeated compact policy loads recheck even non-applicable pinned resources
   assert.equal(first.skills.find(row => row.id === 'skills/react-best-practices').applies, false);
   const unused = lock.components.find(row => row.id === 'skills/react-best-practices').files.at(-1).path;
   await writeFile(path.join(copiedRoot, unused), 'changed unused upstream rule');
-  await assert.rejects(loadDefaultPolicy({ root: copiedRoot, project, stage: 'complete' }), error => error.code === 'skill_integrity' && /hash mismatch/.test(error.message));
+  await assert.rejects(
+    loadDefaultPolicy({ root: copiedRoot, project, stage: 'complete' }),
+    error => error.code === 'skill_integrity' && /hash mismatch/.test(error.message),
+  );
 });
 
 test('Pinned verification overlaps at most four fresh resource operations and preserves all lock entries', async t => {
@@ -223,11 +290,17 @@ test('Pinned verification overlaps at most four fresh resource operations and pr
   for (const file of files) expected.set(file.path, await text(path.join(root, file.path)));
   assert.equal(expected.size, 183);
   const targets = new Set(files.map(file => path.join(root, file.path)));
-  const originalLstat = fs.lstat, originalReadFile = fs.readFile;
-  let lockRead = false, active = 0, peak = 0;
+  const originalLstat = fs.lstat,
+    originalReadFile = fs.readFile;
+  let lockRead = false,
+    active = 0,
+    peak = 0;
   const reads = new Map();
   const statSpy = t.mock.method(fs, 'lstat', async (filename, ...args) => {
-    if (filename === root && lockRead) { active++; peak = Math.max(peak, active); }
+    if (filename === root && lockRead) {
+      active++;
+      peak = Math.max(peak, active);
+    }
     return originalLstat(filename, ...args);
   });
   const readSpy = t.mock.method(fs, 'readFile', async (filename, ...args) => {
@@ -237,24 +310,35 @@ test('Pinned verification overlaps at most four fresh resource operations and pr
       return data;
     }
     reads.set(filename, (reads.get(filename) || 0) + 1);
-    try { return await originalReadFile(filename, ...args); }
-    finally { active--; }
+    try {
+      return await originalReadFile(filename, ...args);
+    } finally {
+      active--;
+    }
   });
   syncBuiltinESMExports();
   try {
     for (let call = 1; call <= 2; call++) {
       lockRead = false;
       const verified = await verifyDefaultSkillPins(root);
-      assert.deepEqual([...verified.byId.keys()], lock.components.map(component => component.id));
+      assert.deepEqual(
+        [...verified.byId.keys()],
+        lock.components.map(component => component.id),
+      );
       assert.deepEqual([...verified.resources], [...expected]);
       assert.equal(active, 0);
       assert.equal(reads.size, 183);
-      assert.ok([...reads.values()].every(count => count === call), 'every pinned file must be read again');
+      assert.ok(
+        [...reads.values()].every(count => count === call),
+        'every pinned file must be read again',
+      );
     }
     assert.ok(peak > 1, `independent resource operations must overlap; observed ${peak}`);
     assert.ok(peak <= 4, `resource operation bound exceeded: ${peak}`);
   } finally {
-    statSpy.mock.restore(); readSpy.mock.restore(); syncBuiltinESMExports();
+    statSpy.mock.restore();
+    readSpy.mock.restore();
+    syncBuiltinESMExports();
   }
 });
 
@@ -263,8 +347,10 @@ test('Pinned verification drains started siblings and reports the first lock-ord
   const firstFiles = lock.components[0].files.slice(0, 4).map(file => path.join(root, file.path));
   assert.equal(firstFiles.length, 4);
   const originalReadFile = fs.readFile;
-  const entered = [], finished = [];
-  const allStarted = Promise.withResolvers(), releaseSibling = Promise.withResolvers();
+  const entered = [],
+    finished = [];
+  const allStarted = Promise.withResolvers(),
+    releaseSibling = Promise.withResolvers();
   const readSpy = t.mock.method(fs, 'readFile', async (filename, ...args) => {
     const index = firstFiles.indexOf(filename);
     if (index < 0) return originalReadFile(filename, ...args);
@@ -279,20 +365,27 @@ test('Pinned verification drains started siblings and reports the first lock-ord
       if (index === 1) throw new Error('earlier completion but later lock entry');
       if (index === 2) await releaseSibling.promise;
       return await originalReadFile(filename, ...args);
-    } finally { finished.push(filename); }
+    } finally {
+      finished.push(filename);
+    }
   });
   syncBuiltinESMExports();
   try {
     await assert.rejects(verifyDefaultSkillPins(root), error => {
       assert.equal(error.code, 'skill_integrity');
-      assert.equal(error.message, `Default skill integrity: cannot read ${lock.components[0].files[0].path}: first ordered failure`);
+      assert.equal(
+        error.message,
+        `Default skill integrity: cannot read ${lock.components[0].files[0].path}: first ordered failure`,
+      );
       assert.equal(entered.length, 4);
       assert.deepEqual(new Set(finished), new Set(firstFiles), 'all started reads must finish before rejection');
       return true;
     });
   } finally {
-    allStarted.resolve(); releaseSibling.resolve();
-    readSpy.mock.restore(); syncBuiltinESMExports();
+    allStarted.resolve();
+    releaseSibling.resolve();
+    readSpy.mock.restore();
+    syncBuiltinESMExports();
   }
 });
 
@@ -319,19 +412,30 @@ test('Pinned verification drains an earlier read before reporting a later duplic
   lock.components[0].files[1] = { ...first };
   await writeFile(path.join(directory, 'third-party-skills.lock.json'), JSON.stringify(lock));
   const originalReadFile = fs.readFile;
-  const started = Promise.withResolvers(), release = Promise.withResolvers();
-  let finished = false, settled = false;
+  const started = Promise.withResolvers(),
+    release = Promise.withResolvers();
+  let finished = false,
+    settled = false;
   const readSpy = t.mock.method(fs, 'readFile', async (filename, ...args) => {
     if (filename !== path.join(directory, first.path)) return originalReadFile(filename, ...args);
     started.resolve();
     await release.promise;
-    try { return await originalReadFile(filename, ...args); }
-    finally { finished = true; }
+    try {
+      return await originalReadFile(filename, ...args);
+    } finally {
+      finished = true;
+    }
   });
   syncBuiltinESMExports();
   const outcome = verifyDefaultSkillPins(directory).then(
-    value => { settled = true; return { value }; },
-    error => { settled = true; return { error }; }
+    value => {
+      settled = true;
+      return { value };
+    },
+    error => {
+      settled = true;
+      return { error };
+    },
   );
   try {
     await started.promise;
@@ -343,7 +447,9 @@ test('Pinned verification drains an earlier read before reporting a later duplic
     assert.equal(error?.code, 'skill_integrity');
     assert.equal(error.message, `Default skill integrity: invalid file record: ${lock.components[0].id}`);
   } finally {
-    release.resolve(); await outcome;
-    readSpy.mock.restore(); syncBuiltinESMExports();
+    release.resolve();
+    await outcome;
+    readSpy.mock.restore();
+    syncBuiltinESMExports();
   }
 });

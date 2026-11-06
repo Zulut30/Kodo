@@ -11,9 +11,23 @@ import { defaultSkillIds } from '../runtime/skill-policy.mjs';
 
 const cli = fileURLToPath(new URL('../cli/index.mjs', import.meta.url));
 const stages = ['analyze', 'plan', 'developer', 'tester', 'documenter', 'review', 'complete'];
-const hash = 'ab'.repeat(32), revision = 'cd'.repeat(20), headSha = '34'.repeat(20);
+const hash = 'ab'.repeat(32),
+  revision = 'cd'.repeat(20),
+  headSha = '34'.repeat(20);
 const marker = 'DO-NOT-EXPORT-CLI-FIXTURE';
-const reportKeys = ['schemaVersion', 'runId', 'state', 'baseSha', 'headSha', 'evidenceLevel', 'skills', 'checks', 'review', 'delivery', 'release'];
+const reportKeys = [
+  'schemaVersion',
+  'runId',
+  'state',
+  'baseSha',
+  'headSha',
+  'evidenceLevel',
+  'skills',
+  'checks',
+  'review',
+  'delivery',
+  'release',
+];
 
 // Exercise the real CLI and Store. Only prohibited boundaries are trapped: a
 // future regression must fail before it can contact a provider or invoke Git.
@@ -56,23 +70,48 @@ const guardUrl = `data:text/javascript,${encodeURIComponent(guardSource)}`;
 
 function savedRun(id = 'audit-cli-run') {
   return {
-    id, state: 'succeeded', baseSha: '12'.repeat(20), headSha,
-    task: marker, analysis: { text: marker }, config: { private: marker }, nodes: { worker: { prompt: marker } },
+    id,
+    state: 'succeeded',
+    baseSha: '12'.repeat(20),
+    headSha,
+    task: marker,
+    analysis: { text: marker },
+    config: { private: marker },
+    nodes: { worker: { prompt: marker } },
     plan: { tasks: [{ role: 'documenter' }, { role: 'tester' }, { role: 'developer' }] },
-    defaultSkills: Object.fromEntries(stages.map(stage => [stage, {
-      hash, skills: defaultSkillIds.map((id, index) => ({
-        id, applies: index < 7, reason: index < 7 ? 'Relevant to this stage' : 'Not relevant to this stage',
-        revision, source: marker
-      }))
-    }])),
+    defaultSkills: Object.fromEntries(
+      stages.map(stage => [
+        stage,
+        {
+          hash,
+          skills: defaultSkillIds.map((id, index) => ({
+            id,
+            applies: index < 7,
+            reason: index < 7 ? 'Relevant to this stage' : 'Not relevant to this stage',
+            revision,
+            source: marker,
+          })),
+        },
+      ]),
+    ),
     checks: { headSha, results: [{ exitCode: 0, stdout: marker, command: { args: [marker] } }] },
     review: { passed: true, headSha, diffHash: hash, findings: [marker] },
-    delivery: { pr: { number: 42, url: 'https://example.invalid/pull/42', body: marker }, reviewedHead: headSha, mergeCommit: headSha },
+    delivery: {
+      pr: { number: 42, url: 'https://example.invalid/pull/42', body: marker },
+      reviewedHead: headSha,
+      mergeCommit: headSha,
+    },
     release: {
-      version: '1.2.3', tag: 'v1.2.3', commit: headSha, url: 'https://example.invalid/releases/v1.2.3',
-      artifact: 'kodo-1.2.3.tgz', artifactUrl: 'https://example.invalid/kodo-1.2.3.tgz', sha256: hash,
-      published: true, smoke: { passed: true, node: 'v24.19.0', platform: 'win32', stdout: marker }
-    }
+      version: '1.2.3',
+      tag: 'v1.2.3',
+      commit: headSha,
+      url: 'https://example.invalid/releases/v1.2.3',
+      artifact: 'kodo-1.2.3.tgz',
+      artifactUrl: 'https://example.invalid/kodo-1.2.3.tgz',
+      sha256: hash,
+      published: true,
+      smoke: { passed: true, node: 'v24.19.0', platform: 'win32', stdout: marker },
+    },
   };
 }
 
@@ -83,13 +122,16 @@ async function fixture(t, run = savedRun()) {
     assert.ok(path.basename(root).startsWith('kodo-audit-cli-'));
     await rm(root, { recursive: true, force: true });
   });
-  const home = path.join(root, 'state'), cwd = path.join(root, 'unrelated-cwd');
-  const credentials = path.join(root, 'credentials'), worktrees = path.join(root, 'worktrees');
+  const home = path.join(root, 'state'),
+    cwd = path.join(root, 'unrelated-cwd');
+  const credentials = path.join(root, 'credentials'),
+    worktrees = path.join(root, 'worktrees');
   const project = path.join(root, 'saved-project');
   for (const directory of [cwd, credentials, worktrees, project]) await mkdir(directory);
   // Deliberately broken *fixture* data, never real credentials. Reading either
   // credential format, legacy secrets or the saved project's config is a bug.
-  for (const name of ['credentials.dpapi.json', 'credentials.json']) await writeFile(path.join(credentials, name), 'intentionally invalid JSON fixture');
+  for (const name of ['credentials.dpapi.json', 'credentials.json'])
+    await writeFile(path.join(credentials, name), 'intentionally invalid JSON fixture');
   await writeFile(path.join(project, 'kodo.config.json'), 'intentionally invalid config fixture');
   await writeFile(path.join(worktrees, 'sentinel.txt'), 'unchanged fixture');
   const store = new Store(home);
@@ -98,22 +140,33 @@ async function fixture(t, run = savedRun()) {
     store.event(run.id, 'fixture-event', { text: marker });
     // An expired lease detects accidental lease cleanup through engine startup.
     store.db.prepare('INSERT INTO leases VALUES(?,?,?,?,?)').run('fixture-lease', 'fixture', 'fixture', 1, 0);
-  } finally { store.close(); }
+  } finally {
+    store.close();
+  }
   await writeFile(path.join(home, 'secrets.json'), 'intentionally invalid legacy fixture');
-  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => /^(?:SystemRoot|WINDIR|COMSPEC|PATHEXT|LANG|TEMP|TMP)$/i.test(key)));
+  const env = Object.fromEntries(
+    Object.entries(process.env).filter(([key]) => /^(?:SystemRoot|WINDIR|COMSPEC|PATHEXT|LANG|TEMP|TMP)$/i.test(key)),
+  );
   Object.assign(env, {
-    KODO_HOME: home, KODO_CREDENTIAL_HOME: credentials, KODO_WORKTREE_HOME: worktrees,
-    HOME: root, USERPROFILE: root, LOCALAPPDATA: root, XDG_CONFIG_HOME: root,
-    PATH: path.join(root, 'no-executables'), NODE_NO_WARNINGS: '1'
+    KODO_HOME: home,
+    KODO_CREDENTIAL_HOME: credentials,
+    KODO_WORKTREE_HOME: worktrees,
+    HOME: root,
+    USERPROFILE: root,
+    LOCALAPPDATA: root,
+    XDG_CONFIG_HOME: root,
+    PATH: path.join(root, 'no-executables'),
+    NODE_NO_WARNINGS: '1',
   });
   return { root, home, cwd, project, env, id: run.id };
 }
 
 function invoke(f, args, options = {}) {
-  const result = spawnSync(process.execPath, [
-    '--permission', '--allow-fs-read=*', `--allow-fs-write=${f.root}`,
-    '--import', guardUrl, cli, ...args
-  ], { cwd: f.cwd, env: f.env, encoding: 'utf8', timeout: 15_000, windowsHide: true, ...options });
+  const result = spawnSync(
+    process.execPath,
+    ['--permission', '--allow-fs-read=*', `--allow-fs-write=${f.root}`, '--import', guardUrl, cli, ...args],
+    { cwd: f.cwd, env: f.env, encoding: 'utf8', timeout: 15_000, windowsHide: true, ...options },
+  );
   assert.ifError(result.error);
   assert.equal(result.signal, null, 'CLI must terminate without timeout or signal');
   assert.notEqual(result.status, 86, result.stderr);
@@ -128,7 +181,11 @@ function failure(result) {
   assert.notEqual(result.status, 0, 'invalid invocation must fail');
   assert.equal(result.stdout, '', 'errors must not contaminate machine-readable stdout');
   assert.match(result.stderr, /error|ошибка/i);
-  assert.doesNotMatch(result.stderr, /неизвестная команда|unknown command/i, 'failure must concern audit arguments or run lookup, not a missing command');
+  assert.doesNotMatch(
+    result.stderr,
+    /неизвестная команда|unknown command/i,
+    'failure must concern audit arguments or run lookup, not a missing command',
+  );
   assert.doesNotMatch(result.stderr, /ERR_MODULE_NOT_FOUND|SyntaxError|ERR_ACCESS_DENIED|credential_store/);
 }
 
@@ -137,17 +194,29 @@ function stateSnapshot(home) {
   try {
     // Compare logical state, not SQLite/WAL bytes: Store's existing open path
     // initializes schema and journal mode and is not a zero-filesystem-write API.
-    return Object.fromEntries(['runs', 'events', 'leases', 'knowledge', 'sqlite_sequence'].map(table => [
-      table, store.db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()
-    ]));
-  } finally { store.close(); }
+    return Object.fromEntries(
+      ['runs', 'events', 'leases', 'knowledge', 'sqlite_sequence'].map(table => [
+        table,
+        store.db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all(),
+      ]),
+    );
+  } finally {
+    store.close();
+  }
 }
 async function nonDatabaseSnapshot(root, relative = '') {
   const result = {};
   for (const entry of await readdir(path.join(root, relative), { withFileTypes: true })) {
     const name = path.join(relative, entry.name);
-    if (name === path.join('state', 'state.sqlite') || name === path.join('state', 'state.sqlite-wal') || name === path.join('state', 'state.sqlite-shm')) continue;
-    result[name] = entry.isDirectory() ? await nonDatabaseSnapshot(root, name) : (await readFile(path.join(root, name))).toString('base64');
+    if (
+      name === path.join('state', 'state.sqlite') ||
+      name === path.join('state', 'state.sqlite-wal') ||
+      name === path.join('state', 'state.sqlite-shm')
+    )
+      continue;
+    result[name] = entry.isDirectory()
+      ? await nonDatabaseSnapshot(root, name)
+      : (await readFile(path.join(root, name))).toString('base64');
   }
   return result;
 }
@@ -169,7 +238,10 @@ test('Audit CLI JSON reads a saved run from an unrelated no-config cwd', async t
   for (const entry of report.skills.stages) {
     assert.equal(entry.valid, true);
     assert.equal(entry.hash, hash);
-    assert.deepEqual(entry.skills.map(skill => skill.id), defaultSkillIds);
+    assert.deepEqual(
+      entry.skills.map(skill => skill.id),
+      defaultSkillIds,
+    );
     assert.equal(entry.skills.filter(skill => skill.applies).length, 7);
   }
   assert.deepEqual(report.checks, { headSha, results: [{ exitCode: 0 }] });
@@ -182,7 +254,8 @@ test('Audit CLI JSON reads a saved run from an unrelated no-config cwd', async t
 test('Audit CLI ignores broken credentials and configs without changing saved state or worktrees', async t => {
   const f = await fixture(t);
   await writeFile(path.join(f.cwd, 'kodo.config.json'), 'intentionally invalid unrelated config fixture');
-  const beforeState = stateSnapshot(f.home), beforeFiles = await nonDatabaseSnapshot(f.root);
+  const beforeState = stateSnapshot(f.home),
+    beforeFiles = await nonDatabaseSnapshot(f.root);
   const report = JSON.parse(success(invoke(f, ['audit', f.id, '--json'])));
   assert.equal(report.runId, f.id);
   success(invoke(f, ['audit', f.id]));
@@ -192,12 +265,15 @@ test('Audit CLI ignores broken credentials and configs without changing saved st
 
 test('Audit CLI reads saved state with filesystem writes forbidden', async t => {
   const f = await fixture(t);
-  const beforeState = stateSnapshot(f.home), beforeFiles = await nonDatabaseSnapshot(f.root);
+  const beforeState = stateSnapshot(f.home),
+    beforeFiles = await nonDatabaseSnapshot(f.root);
   // A read-only query must work without granting fs.write to the CLI process.
   // This detects opening SQLite in write mode even if no run rows are changed.
-  const result = spawnSync(process.execPath, [
-    '--permission', '--allow-fs-read=*', '--import', guardUrl, cli, 'audit', f.id, '--json'
-  ], { cwd: f.cwd, env: f.env, encoding: 'utf8', timeout: 15_000, windowsHide: true });
+  const result = spawnSync(
+    process.execPath,
+    ['--permission', '--allow-fs-read=*', '--import', guardUrl, cli, 'audit', f.id, '--json'],
+    { cwd: f.cwd, env: f.env, encoding: 'utf8', timeout: 15_000, windowsHide: true },
+  );
   assert.ifError(result.error);
   assert.equal(result.signal, null, 'CLI must terminate without timeout or signal');
   const report = JSON.parse(success(result));
@@ -213,11 +289,15 @@ test('Audit CLI unknown run does not initialize a missing state home', async t =
   const absentHome = path.join(f.root, 'never-initialized-state');
   const beforeFiles = (await readdir(f.root)).sort();
   const result = invoke(f, ['audit', 'missing-audit-run', '--json'], {
-    env: { ...f.env, KODO_HOME: absentHome }
+    env: { ...f.env, KODO_HOME: absentHome },
   });
   failure(result);
   assert.match(result.stderr, /не найден|not found|unknown run|no saved state|хранилище.*отсутств/i);
-  assert.deepEqual((await readdir(f.root)).sort(), beforeFiles, 'read-only audit must not create a state directory or database');
+  assert.deepEqual(
+    (await readdir(f.root)).sort(),
+    beforeFiles,
+    'read-only audit must not create a state directory or database',
+  );
 });
 
 test('Audit CLI reads a legacy saved run without changing database bytes or adding schema', async t => {
@@ -228,24 +308,48 @@ test('Audit CLI reads a legacy saved run without changing database bytes or addi
   const db = new DatabaseSync(filename);
   try {
     db.exec('CREATE TABLE runs(id TEXT PRIMARY KEY, body TEXT NOT NULL, updated INTEGER NOT NULL)');
-    db.prepare('INSERT INTO runs VALUES(?,?,?)').run('legacy-read-only', JSON.stringify({
-      id: 'legacy-read-only', state: 'awaiting_plan'
-    }), 1);
-  } finally { db.close(); }
-  const beforeBytes = await readFile(filename), beforeFiles = (await readdir(legacyHome)).sort();
-  const report = JSON.parse(success(invoke(f, ['audit', 'legacy-read-only', '--json'], {
-    env: { ...f.env, KODO_HOME: legacyHome }
-  })));
+    db.prepare('INSERT INTO runs VALUES(?,?,?)').run(
+      'legacy-read-only',
+      JSON.stringify({
+        id: 'legacy-read-only',
+        state: 'awaiting_plan',
+      }),
+      1,
+    );
+  } finally {
+    db.close();
+  }
+  const beforeBytes = await readFile(filename),
+    beforeFiles = (await readdir(legacyHome)).sort();
+  const report = JSON.parse(
+    success(
+      invoke(f, ['audit', 'legacy-read-only', '--json'], {
+        env: { ...f.env, KODO_HOME: legacyHome },
+      }),
+    ),
+  );
   assert.equal(report.runId, 'legacy-read-only');
   assert.equal(report.skills.complete, false);
   const inspected = new DatabaseSync(filename, { readOnly: true });
   let tableNames;
   try {
-    tableNames = inspected.prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name").all().map(row => row.name);
-  } finally { inspected.close(); }
+    tableNames = inspected
+      .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")
+      .all()
+      .map(row => row.name);
+  } finally {
+    inspected.close();
+  }
   assert.deepEqual(tableNames, ['runs'], 'read-only audit must not initialize unrelated tables in legacy state');
-  assert.ok((await readFile(filename)).equals(beforeBytes), 'read-only audit must preserve the existing database and journal mode');
-  assert.deepEqual((await readdir(legacyHome)).sort(), beforeFiles, 'read-only audit must not leave new files in legacy state');
+  assert.ok(
+    (await readFile(filename)).equals(beforeBytes),
+    'read-only audit must preserve the existing database and journal mode',
+  );
+  assert.deepEqual(
+    (await readdir(legacyHome)).sort(),
+    beforeFiles,
+    'read-only audit must not leave new files in legacy state',
+  );
 });
 
 test('Audit CLI returns exit zero and incomplete JSON for old saved runs', async t => {
@@ -278,7 +382,10 @@ test('Audit CLI text explains coverage missing and invalid stages applied skills
   assert.match(output, /succeeded/);
   assert.match(output, /recorded-instructions/);
   assert.match(output, /incomplete|неполн|не полн|complete\s*[:=]\s*false/i);
-  assert.match(output, /(?:missing|отсутств|не запис)[^\r\n]*developer|developer[^\r\n]*(?:missing|отсутств|не запис)/i);
+  assert.match(
+    output,
+    /(?:missing|отсутств|не запис)[^\r\n]*developer|developer[^\r\n]*(?:missing|отсутств|не запис)/i,
+  );
   assert.match(output, /(?:invalid|некоррект|невалид)[^\r\n]*tester|tester[^\r\n]*(?:invalid|некоррект|невалид)/i);
   assert.match(output, /7\s*(?:\/|of|из)\s*13|(?:applied|примен)[^\r\n]*\b7\b|\b7\b[^\r\n]*(?:applied|примен)/i);
   assert.match(output, /e2e-testing-patterns/);
@@ -297,30 +404,41 @@ test('Audit CLI text identifies complete coverage', async t => {
   assert.match(output, /recorded-instructions/);
 });
 
-for (const flags of [[], ['--json']]) test(`Audit CLI rejects an unknown run in ${flags.length ? 'JSON' : 'text'} mode without state changes`, async t => {
-  const f = await fixture(t);
-  const before = stateSnapshot(f.home);
-  const result = invoke(f, ['audit', 'missing-audit-run', ...flags]);
-  failure(result);
-  assert.match(result.stderr, /missing-audit-run/);
-  assert.match(result.stderr, /не найден|not found|unknown run/i);
-  assert.deepEqual(stateSnapshot(f.home), before);
-});
+for (const flags of [[], ['--json']])
+  test(`Audit CLI rejects an unknown run in ${flags.length ? 'JSON' : 'text'} mode without state changes`, async t => {
+    const f = await fixture(t);
+    const before = stateSnapshot(f.home);
+    const result = invoke(f, ['audit', 'missing-audit-run', ...flags]);
+    failure(result);
+    assert.match(result.stderr, /missing-audit-run/);
+    assert.match(result.stderr, /не найден|not found|unknown run/i);
+    assert.deepEqual(stateSnapshot(f.home), before);
+  });
 
 for (const [name, args] of [
-  ['missing ID', []], ['JSON without ID', ['--json']], ['empty ID', ['']],
-  ['blank ID', [' \t ']], ['flag before ID', ['--json', 'audit-cli-run']],
+  ['missing ID', []],
+  ['JSON without ID', ['--json']],
+  ['empty ID', ['']],
+  ['blank ID', [' \t ']],
+  ['flag before ID', ['--json', 'audit-cli-run']],
   ['duplicate JSON flag', ['audit-cli-run', '--json', '--json']],
-  ['extra ID', ['audit-cli-run', 'other']], ['extra ID with JSON', ['audit-cli-run', '--json', 'other']],
-  ['unknown flag', ['audit-cli-run', '--unknown']], ['valued JSON flag', ['audit-cli-run', '--json=true']],
-  ['project flag', ['audit-cli-run', '--project', '.']], ['target flag', ['audit-cli-run', '--target', '.']],
-  ['client flag', ['audit-cli-run', '--client', 'codex']], ['model flag', ['audit-cli-run', '--model', 'fake']],
-  ['live flag', ['audit-cli-run', '--live']], ['prepare flag', ['audit-cli-run', '--prepare']],
-  ['retry flag', ['audit-cli-run', '--retry-failed']], ['plan flag', ['audit-cli-run', '--plan', 'missing.json']]
-]) test(`Audit CLI rejects ${name}`, async t => {
-  const f = await fixture(t);
-  failure(invoke(f, ['audit', ...args]));
-});
+  ['extra ID', ['audit-cli-run', 'other']],
+  ['extra ID with JSON', ['audit-cli-run', '--json', 'other']],
+  ['unknown flag', ['audit-cli-run', '--unknown']],
+  ['valued JSON flag', ['audit-cli-run', '--json=true']],
+  ['project flag', ['audit-cli-run', '--project', '.']],
+  ['target flag', ['audit-cli-run', '--target', '.']],
+  ['client flag', ['audit-cli-run', '--client', 'codex']],
+  ['model flag', ['audit-cli-run', '--model', 'fake']],
+  ['live flag', ['audit-cli-run', '--live']],
+  ['prepare flag', ['audit-cli-run', '--prepare']],
+  ['retry flag', ['audit-cli-run', '--retry-failed']],
+  ['plan flag', ['audit-cli-run', '--plan', 'missing.json']],
+])
+  test(`Audit CLI rejects ${name}`, async t => {
+    const f = await fixture(t);
+    failure(invoke(f, ['audit', ...args]));
+  });
 
 test('Audit CLI help advertises audit RUN_ID and optional JSON output', async t => {
   const f = await fixture(t);
