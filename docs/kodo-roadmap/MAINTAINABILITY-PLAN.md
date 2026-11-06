@@ -129,6 +129,13 @@ T1–T4 независимы друг от друга. T5–T8 начинают�
 
 ## T5. Декомпозиция `openProjectStore` (L)
 
+**Статус: в основном сделано.**
+- Замыкания подняты на уровень модуля с явным `ctx` (`5e99e8e`): `openProjectStore` сократилась с 696 строк до 51.
+- Команды `apply()` вынесены в таблицу обработчиков `operations` (`6d67894`): `apply` сократилась с 245 строк до 108.
+- Осталась одна метка: сложность транзакции в `installRun` (49).
+- Вынос в отдельные модули (`project-store-records`/`-validation`/`-transitions`) пока не сделан. После подъёма на уровень модуля это механическая работа.
+- Codemod (`ctx` первым параметром, состояние через `ctx.<name>`) применим только если нет перекрытия имён. Это проверено правилом `no-shadow`.
+
 **Сейчас.** `runtime/project-store.mjs`: функция `openProjectStore({ store, contracts, authorizeTransition })` на 696 строк, 156 ветвлений, 25 внутренних функций. Состояние: `options`, `db`, кэш валидации (`validationCache`, `validationLimit`, `validationBytes`, `validationSecrets`). Возвращает `{ apply, snapshot, history, installRun }`. Модуль загружается только из `runtime/project-cli.mjs:121` через `await import()`.
 
 **Шаги** (каждый отдельным коммитом, после каждого `node scripts/run-tests.mjs tests/project-store.test.mjs tests/project-director.test.mjs tests/project-director-oracle.test.mjs`):
@@ -152,6 +159,8 @@ T1–T4 независимы друг от друга. T5–T8 начинают�
 ---
 
 ## T6. Декомпозиция `createProjectDirector` (L)
+
+**Статус: частично.** Замыкания подняты тем же codemod (`4ab4bfb`): `createProjectDirector` сократилась с 657 строк до 19. Осталось разбить `foreground` (239 строк) на фазы (шаг 4).
 
 **Сейчас.** `runtime/project-director.mjs`: функция `createProjectDirector({ repo, engine, planner, evaluator, clock })` на 657 строк, 143 ветвления, 20 внутренних функций. Единственное состояние — `store`. Возвращает `{ plan, run, resume, cancel, pause, reprioritize, approveRisk }`. Самая большая внутренняя функция — `foreground` (242 строки).
 
