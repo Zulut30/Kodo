@@ -349,8 +349,8 @@ async function intactTypeScriptConfig(item, check, plan, evidenceRoot) {
     expected = typeScriptConfigContent(check, plan);
   return content.length === item.bytes && sha256(content) === item.sha256 && content.toString('utf8') === expected;
 }
-// oxlint-disable-next-line max-lines-per-function, complexity -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
-export async function runQuality(options = {}) {
+/** Shared state of one quality run: plan, limits, private evidence and the checked head. */
+async function qualityRunContext(options) {
   const {
     project = process.cwd(),
     runner = execute,
@@ -426,346 +426,402 @@ export async function runQuality(options = {}) {
   } catch (error) {
     headError = error.code === 'cancelled' ? 'cancelled' : 'git_head_required';
   }
-  for (const check of plan.checks) {
-    const began = performance.now(),
-      logs = [];
-    let capturedBytes = 0;
-    const receipt = {
-      schemaVersion: 1,
-      id: check.id,
-      language: check.language,
-      capability: check.capability,
-      tool: check.tool,
-      version: check.version,
-      status: check.status,
-      reason: check.reason,
-      files: check.files,
-      scopeReason: check.scopeReason,
-      headSha,
-      configHash: plan.configHash,
-      sourceHash: plan.sourceHash,
-      pinsHash: pinsHash(check, plan),
-      findings: [],
-      debtCount: 0,
-      durationMs: 0,
-      evidence: [],
+  return {
+    options,
+    plan,
+    start,
+    receipts,
+    sqlObservations,
+    timeoutMs,
+    maxOutputBytes,
+    evidenceRoot,
+    env,
+    clean,
+    headSha,
+    headError,
+    head,
+    runner,
+    resolve,
+    nativeResolve,
+    signal,
+  };
+}
+
+/** The bounded process port of one check: shared deadline, output budget and exact SQL reuse. */
+function createCheckCall(ctx, check, receipt, logs, began) {
+  const { plan, signal, timeoutMs, maxOutputBytes, env, sqlObservations, headSha, runner, clean } = ctx;
+  let capturedBytes = 0;
+  return async (command, args, overrides = {}) => {
+    signal?.throwIfAborted();
+    const remaining = Math.ceil(timeoutMs - (performance.now() - began));
+    if (remaining < 1) throw qualityError('timeout', 'quality check deadline exceeded');
+    if (capturedBytes >= maxOutputBytes) throw qualityError('output_limit', 'quality check output budget exhausted');
+    const settings = {
+      cwd: path.join(plan.project, check.root),
+      signal,
+      timeoutMs: remaining,
+      maxOutputBytes: maxOutputBytes - capturedBytes,
+      allowFailure: true,
+      env,
+      ...overrides,
     };
-    receipts.push(receipt);
-    const call = async (command, args, overrides = {}) => {
+    const sharedKey =
+      check.tool === 'sqlfluff' && !check.configured
+        ? sha256(
+            JSON.stringify({
+              command,
+              args,
+              cwd: settings.cwd,
+              env: settings.env,
+              toolIdentity: receipt.toolIdentity,
+              version: check.version,
+              files: check.files,
+              sourceHash: plan.sourceHash,
+              configHash: plan.configHash,
+              headSha,
+            }),
+          )
+        : null;
+    const observation = sharedKey ? sqlObservations.get(sharedKey) : undefined;
+    if (observation) {
+      receipt.reusedFrom = [...new Set([...(receipt.reusedFrom ?? []), observation.id])];
+      logs.push({
+        stage: overrides.stage ?? 'check',
+        reusedFrom: observation.id,
+        durationMs: 0,
+        observationHash: observation.hash,
+      });
+      if (observation.error) throw observation.error;
+      return structuredClone(observation.output);
+    }
+    const callStart = performance.now();
+    try {
+      const output = await runner(command, args, settings);
+      // A dependency-injected process port must honor the same complete contract.
+      if (
+        !output ||
+        typeof output.stdout !== 'string' ||
+        typeof output.stderr !== 'string' ||
+        !Number.isInteger(output.code)
+      )
+        throw qualityError('invalid_output', 'incomplete quality process result');
+      capturedBytes += Buffer.byteLength(output.stdout) + Buffer.byteLength(output.stderr);
+      if (capturedBytes > maxOutputBytes || output.outputTruncated)
+        throw Object.assign(qualityError('output_limit', 'quality output exceeded limit'), { result: output });
+      logs.push(
+        clean({
+          stage: overrides.stage ?? 'check',
+          command,
+          args,
+          durationMs: performance.now() - callStart,
+          ...output,
+        }),
+      );
       signal?.throwIfAborted();
-      const remaining = Math.ceil(timeoutMs - (performance.now() - began));
-      if (remaining < 1) throw qualityError('timeout', 'quality check deadline exceeded');
-      if (capturedBytes >= maxOutputBytes) throw qualityError('output_limit', 'quality check output budget exhausted');
-      const settings = {
-        cwd: path.join(plan.project, check.root),
-        signal,
-        timeoutMs: remaining,
-        maxOutputBytes: maxOutputBytes - capturedBytes,
-        allowFailure: true,
-        env,
-        ...overrides,
-      };
-      const sharedKey =
-        check.tool === 'sqlfluff' && !check.configured
-          ? sha256(
-              JSON.stringify({
-                command,
-                args,
-                cwd: settings.cwd,
-                env: settings.env,
-                toolIdentity: receipt.toolIdentity,
-                version: check.version,
-                files: check.files,
-                sourceHash: plan.sourceHash,
-                configHash: plan.configHash,
-                headSha,
-              }),
-            )
-          : null;
-      const observation = sharedKey ? sqlObservations.get(sharedKey) : undefined;
-      if (observation) {
-        receipt.reusedFrom = [...new Set([...(receipt.reusedFrom ?? []), observation.id])];
+      if (sharedKey)
+        sqlObservations.set(sharedKey, { id: receipt.id, output, hash: sha256(JSON.stringify(clean(output))) });
+      return output;
+    } catch (error) {
+      if (error.result) {
+        const output = clean(error.result),
+          available = Math.max(
+            0,
+            maxOutputBytes -
+              logs.reduce(
+                (total, row) => total + Buffer.byteLength(row.stdout ?? '') + Buffer.byteLength(row.stderr ?? ''),
+                0,
+              ),
+          );
+        const stdout = Buffer.from(output.stdout ?? '')
+            .subarray(0, available)
+            .toString('utf8'),
+          stderr = Buffer.from(output.stderr ?? '')
+            .subarray(0, Math.max(0, available - Buffer.byteLength(stdout)))
+            .toString('utf8');
         logs.push({
           stage: overrides.stage ?? 'check',
-          reusedFrom: observation.id,
-          durationMs: 0,
-          observationHash: observation.hash,
+          command: clean(command),
+          args: clean(args),
+          durationMs: performance.now() - callStart,
+          ...output,
+          stdout,
+          stderr,
         });
-        if (observation.error) throw observation.error;
-        return structuredClone(observation.output);
       }
-      const callStart = performance.now();
-      try {
-        const output = await runner(command, args, settings);
-        // A dependency-injected process port must honor the same complete contract.
-        if (
-          !output ||
-          typeof output.stdout !== 'string' ||
-          typeof output.stderr !== 'string' ||
-          !Number.isInteger(output.code)
-        )
-          throw qualityError('invalid_output', 'incomplete quality process result');
-        capturedBytes += Buffer.byteLength(output.stdout) + Buffer.byteLength(output.stderr);
-        if (capturedBytes > maxOutputBytes || output.outputTruncated)
-          throw Object.assign(qualityError('output_limit', 'quality output exceeded limit'), { result: output });
-        logs.push(
-          clean({
-            stage: overrides.stage ?? 'check',
-            command,
-            args,
-            durationMs: performance.now() - callStart,
-            ...output,
-          }),
-        );
-        signal?.throwIfAborted();
-        if (sharedKey)
-          sqlObservations.set(sharedKey, { id: receipt.id, output, hash: sha256(JSON.stringify(clean(output))) });
-        return output;
-      } catch (error) {
-        if (error.result) {
-          const output = clean(error.result),
-            available = Math.max(
-              0,
-              maxOutputBytes -
-                logs.reduce(
-                  (total, row) => total + Buffer.byteLength(row.stdout ?? '') + Buffer.byteLength(row.stderr ?? ''),
-                  0,
-                ),
-            );
-          const stdout = Buffer.from(output.stdout ?? '')
-              .subarray(0, available)
-              .toString('utf8'),
-            stderr = Buffer.from(output.stderr ?? '')
-              .subarray(0, Math.max(0, available - Buffer.byteLength(stdout)))
-              .toString('utf8');
-          logs.push({
-            stage: overrides.stage ?? 'check',
-            command: clean(command),
-            args: clean(args),
-            durationMs: performance.now() - callStart,
-            ...output,
-            stdout,
-            stderr,
-          });
-        }
-        if (sharedKey)
-          sqlObservations.set(sharedKey, {
-            id: receipt.id,
-            error,
-            hash: sha256(JSON.stringify(clean({ code: error.code ?? 'process_failed', result: error.result ?? null }))),
-          });
-        throw error;
-      }
-    };
-    try {
-      if (check.status !== 'applicable') continue;
-      if (headError) throw qualityError(headError, headError);
-      signal?.throwIfAborted();
-      if (sha256(JSON.stringify(await qualityInventory(plan.project))) !== plan.sourceHash)
-        throw qualityError('source_mutation', 'source changed since quality plan');
-      let tool;
-      if (managed.has(check.tool)) {
-        tool = await resolve(check.tool, {
-          project: plan.project,
-          home: options.toolHome,
-          platform: options.platform,
-          arch: options.arch,
+      if (sharedKey)
+        sqlObservations.set(sharedKey, {
+          id: receipt.id,
+          error,
+          hash: sha256(JSON.stringify(clean({ code: error.code ?? 'process_failed', result: error.result ?? null }))),
         });
-        if (!tool?.ready || tool.status !== 'ready')
-          throw qualityError(
-            ['missing', 'unsupported'].includes(tool?.status) ? tool.status : 'tool_integrity',
-            'managed quality tool is not ready',
-          );
-        if (
-          tool.id !== check.tool ||
-          tool.version !== check.version ||
-          typeof tool.command !== 'string' ||
-          !Array.isArray(tool.args) ||
-          tool.args.some(a => typeof a !== 'string')
-        )
-          throw qualityError('tool_integrity', 'invalid managed tool port');
-      } else tool = await nativeResolve(['phpcs', 'phpstan'].includes(check.tool) ? 'php' : check.tool);
-      receipt.binaryHash = tool.binaryHash ?? null;
-      receipt.toolIdentity = await toolIdentity(tool);
-      if (check.tool === 'go' && check.capability === 'typecheck')
-        await mkdir(path.join(evidenceRoot, 'go-output'), { recursive: true, mode: 0o700 });
-      const toolEnv = { ...env, ...tool.env },
-        prefix = tool.args ?? [];
-      if (check.tool === 'go' && !check.configured) {
-        // Native resolver additions cannot reopen workspaces, user GOENV,
-        // overlays, downloads or external module caches after sanitization.
-        const fixed = [
-          'GOENV',
-          'GOWORK',
-          'GO111MODULE',
-          'GOTOOLCHAIN',
-          'GOPROXY',
-          'GOSUMDB',
-          'GOPATH',
-          'GOCACHE',
-          'GOMODCACHE',
-          'GOFLAGS',
-        ];
-        // Windows environment names are case-insensitive.
-        for (const key of Object.keys(toolEnv)) if (fixed.includes(key.toUpperCase())) delete toolEnv[key];
-        for (const key of fixed) toolEnv[key] = env[key];
-        toolEnv.GOFLAGS = `-mod=${check.goModuleMode}`;
-      }
-      if (check.tool === 'cargo') {
-        const rustc = await nativeResolve('rustc');
-        const compiler = await call(rustc.command, [...(rustc.args ?? []), '--version'], { stage: 'version' });
-        if (
-          compiler.code !== 0 ||
-          compiler.stderr.trim() ||
-          !validVersion('rustc', compiler.stdout, check.rustcVersion)
-        )
-          throw qualityError('version_mismatch', 'Rust compiler version mismatch');
-        receipt.compilerIdentity = await toolIdentity(rustc);
-        if (check.capability === 'lint') {
-          const clippy = await call(tool.command, [...prefix, 'clippy', '--version'], {
-            env: toolEnv,
-            stage: 'version',
-          });
-          if (clippy.code !== 0 || clippy.stderr.trim() || !validVersion('clippy', clippy.stdout, check.clippyVersion))
-            throw qualityError('version_mismatch', 'Clippy version mismatch');
-        }
-      }
-      if (['phpcs', 'phpstan'].includes(check.tool)) {
-        const php = await call(tool.command, [...prefix, '--version'], { env: toolEnv, stage: 'version' });
-        if (php.code !== 0 || php.stderr.trim() || !validVersion('php', php.stdout, check.phpVersion))
-          throw qualityError('version_mismatch', 'PHP runtime version mismatch');
-        receipt.entryHash = await safeProjectEntrypoint(
-          plan.project,
-          (check.root ? check.root + '/' : '') + check.entry,
-        );
-      }
-      if (check.configured && ['node', 'php'].includes(check.tool)) {
-        receipt.entryHash = await safeProjectEntrypoint(plan.project, check.configured.args[0].replace(/^\.\//, ''));
-      }
-      if (check.configured)
-        for (const arg of check.configured.args) {
-          const value = arg.startsWith('-') && arg.includes('=') ? arg.slice(arg.indexOf('=') + 1) : arg;
-          if (value.includes('/') || value.includes('\\') || value.includes(':')) {
-            const name = value.replace(/^\.\//, '');
-            qualityPath(name);
-            if (!plan.files.some(f => f.path === name))
-              throw qualityError('unsafe_path', 'configured quality command path is outside its source scope');
-          }
-        }
-      let version;
-      if (check.tool === 'gofmt') {
-        const go = await nativeResolve('go');
-        version = await call(go.command, [...(go.args ?? []), 'version', tool.command], { stage: 'version' });
-        const expected = `${tool.command}: go${check.version}`;
-        const observed = version.stdout.replace(/\r?\n$/, '');
-        if (version.code !== 0 || version.stderr.trim() || /[\r\n\0]/.test(observed) || observed !== expected)
-          throw qualityError('version_mismatch', 'gofmt binary version mismatch');
-      } else {
-        const versionArgs = ['phpcs', 'phpstan'].includes(check.tool)
-          ? [check.entry, '--version']
-          : check.tool === 'go'
-            ? ['version']
-            : ['--version'];
-        version = await call(tool.command, [...prefix, ...versionArgs], { env: toolEnv, stage: 'version' });
-        if (
-          version.code !== 0 ||
-          version.stderr.trim() ||
-          (check.configured
-            ? version.stdout.trim() !== check.configured.versionOutput
-            : !validVersion(check.tool, version.stdout, check.version))
-        )
-          throw qualityError('version_mismatch', 'exact quality tool version mismatch');
-      }
-      receipt.actualVersion = check.version;
-      let executionCheck = check;
-      if (check.tool === 'typescript' && !check.configured) {
-        const content = typeScriptConfigContent(check, plan),
-          filename = path.join(evidenceRoot, `typescript-${sha256(check.id).slice(0, 12)}.json`);
-        await writeFile(filename, content, { flag: 'wx', mode: 0o400 });
-        receipt.typecheckConfig = { path: filename, sha256: sha256(content), bytes: Buffer.byteLength(content) };
-        executionCheck = { ...check, typecheckConfig: receipt.typecheckConfig };
-        if (!(await intactTypeScriptConfig(receipt.typecheckConfig, check, plan, evidenceRoot)))
-          throw qualityError('typecheck_config_integrity', 'private TypeScript config changed');
-      }
-      const groups =
-        check.tool === 'php' && !check.configured
-          ? check.files.map(file => ({ ...check, files: [file] }))
-          : [executionCheck];
-      let successful = true;
-      for (const group of groups) {
-        const output = await call(tool.command, [...prefix, ...argumentsFor(group, evidenceRoot, plan)], {
-          env: toolEnv,
-        });
-        let parsed = parseQualityOutput(group, output, plan.project);
-        const debt = allowDebt(check, parsed.findings, plan);
-        receipt.findings.push(...debt.findings);
-        receipt.debtCount += debt.debtCount;
-        // Only known diagnostic exit codes with fully matched old observations
-        // may be adopted. Crashes and arbitrary nonzero codes never become PASS.
-        const diagnosticExitCodes = {
-          oxlint: [1],
-          stylelint: [2],
-          'html-validate': [1],
-          sqlfluff: [1],
-          phpcs: [1, 2],
-          phpstan: [1],
-        };
-        const baselined =
-          parsed.findings.length > 0 &&
-          debt.findings.length === 0 &&
-          diagnosticExitCodes[check.tool]?.includes(output.code);
-        successful &&= (parsed.clean && output.code === 0) || baselined;
-      }
-      receipt.status = successful ? 'passed' : 'failed';
-      if (!successful) receipt.reason = receipt.findings.length ? 'violations' : 'tool_failed';
-    } catch (error) {
-      const code = signal?.aborted
-        ? 'cancelled'
-        : error.result?.outputTruncated
-          ? 'output_limit'
-          : (error.code ?? 'process_failed');
-      receipt.status = ['missing', 'unsupported'].includes(code) ? code : 'blocked';
-      receipt.reason = code === 'ENOENT' ? 'missing' : code;
-    } finally {
-      if (check.status === 'applicable') {
-        try {
-          if (
-            receipt.typecheckConfig &&
-            !(await intactTypeScriptConfig(receipt.typecheckConfig, check, plan, evidenceRoot))
-          ) {
-            receipt.status = 'blocked';
-            receipt.reason = 'typecheck_config_integrity';
-          } else if (sha256(JSON.stringify(await qualityInventory(plan.project))) !== plan.sourceHash) {
-            receipt.status = 'blocked';
-            receipt.reason = 'source_mutation';
-          } else if (!headError && (await head()) !== headSha) {
-            receipt.status = 'blocked';
-            receipt.reason = 'head_mutation';
-          }
-        } catch (error) {
-          receipt.status = 'blocked';
-          receipt.reason = signal?.aborted ? 'cancelled' : (error.code ?? 'source_mutation');
-        }
-      }
-      receipt.durationMs = performance.now() - began;
-      if (!resultStates.has(receipt.status)) {
-        receipt.status = 'blocked';
-        receipt.reason = 'incomplete_receipt';
-      }
-      const content = JSON.stringify(clean({ ...receipt, evidence: undefined, logs })) + '\n';
-      const filename = path.join(
-        evidenceRoot,
-        `${String(receipts.length).padStart(4, '0')}-${sha256(check.id).slice(0, 12)}.json`,
+      throw error;
+    }
+  };
+}
+
+/** Resolve the managed or native tool, its identity and its sanitized environment. */
+async function resolveCheckTool(ctx, check, receipt) {
+  const { options, plan, signal, headError, resolve, nativeResolve, evidenceRoot, env } = ctx;
+  if (headError) throw qualityError(headError, headError);
+  signal?.throwIfAborted();
+  if (sha256(JSON.stringify(await qualityInventory(plan.project))) !== plan.sourceHash)
+    throw qualityError('source_mutation', 'source changed since quality plan');
+  let tool;
+  if (managed.has(check.tool)) {
+    tool = await resolve(check.tool, {
+      project: plan.project,
+      home: options.toolHome,
+      platform: options.platform,
+      arch: options.arch,
+    });
+    if (!tool?.ready || tool.status !== 'ready')
+      throw qualityError(
+        ['missing', 'unsupported'].includes(tool?.status) ? tool.status : 'tool_integrity',
+        'managed quality tool is not ready',
       );
-      try {
-        await writeFile(filename, content, { flag: 'wx', mode: 0o600 });
-        receipt.evidence = [{ path: filename, sha256: sha256(content), bytes: Buffer.byteLength(content) }];
-      } catch {
-        receipt.status = 'blocked';
-        receipt.reason = 'evidence_write_failed';
-      }
+    if (
+      tool.id !== check.tool ||
+      tool.version !== check.version ||
+      typeof tool.command !== 'string' ||
+      !Array.isArray(tool.args) ||
+      tool.args.some(a => typeof a !== 'string')
+    )
+      throw qualityError('tool_integrity', 'invalid managed tool port');
+  } else tool = await nativeResolve(['phpcs', 'phpstan'].includes(check.tool) ? 'php' : check.tool);
+  receipt.binaryHash = tool.binaryHash ?? null;
+  receipt.toolIdentity = await toolIdentity(tool);
+  if (check.tool === 'go' && check.capability === 'typecheck')
+    await mkdir(path.join(evidenceRoot, 'go-output'), { recursive: true, mode: 0o700 });
+  const toolEnv = { ...env, ...tool.env },
+    prefix = tool.args ?? [];
+  if (check.tool === 'go' && !check.configured) {
+    // Native resolver additions cannot reopen workspaces, user GOENV,
+    // overlays, downloads or external module caches after sanitization.
+    const fixed = [
+      'GOENV',
+      'GOWORK',
+      'GO111MODULE',
+      'GOTOOLCHAIN',
+      'GOPROXY',
+      'GOSUMDB',
+      'GOPATH',
+      'GOCACHE',
+      'GOMODCACHE',
+      'GOFLAGS',
+    ];
+    // Windows environment names are case-insensitive.
+    for (const key of Object.keys(toolEnv)) if (fixed.includes(key.toUpperCase())) delete toolEnv[key];
+    for (const key of fixed) toolEnv[key] = env[key];
+    toolEnv.GOFLAGS = `-mod=${check.goModuleMode}`;
+  }
+  return { tool, toolEnv, prefix };
+}
+
+/** Exact compiler, runtime and tool versions plus safe configured entrypoints and paths. */
+async function verifyCheckRuntime(ctx, check, receipt, call, { tool, toolEnv, prefix }) {
+  const { plan, nativeResolve } = ctx;
+  if (check.tool === 'cargo') {
+    const rustc = await nativeResolve('rustc');
+    const compiler = await call(rustc.command, [...(rustc.args ?? []), '--version'], { stage: 'version' });
+    if (compiler.code !== 0 || compiler.stderr.trim() || !validVersion('rustc', compiler.stdout, check.rustcVersion))
+      throw qualityError('version_mismatch', 'Rust compiler version mismatch');
+    receipt.compilerIdentity = await toolIdentity(rustc);
+    if (check.capability === 'lint') {
+      const clippy = await call(tool.command, [...prefix, 'clippy', '--version'], {
+        env: toolEnv,
+        stage: 'version',
+      });
+      if (clippy.code !== 0 || clippy.stderr.trim() || !validVersion('clippy', clippy.stdout, check.clippyVersion))
+        throw qualityError('version_mismatch', 'Clippy version mismatch');
     }
   }
+  if (['phpcs', 'phpstan'].includes(check.tool)) {
+    const php = await call(tool.command, [...prefix, '--version'], { env: toolEnv, stage: 'version' });
+    if (php.code !== 0 || php.stderr.trim() || !validVersion('php', php.stdout, check.phpVersion))
+      throw qualityError('version_mismatch', 'PHP runtime version mismatch');
+    receipt.entryHash = await safeProjectEntrypoint(plan.project, (check.root ? check.root + '/' : '') + check.entry);
+  }
+  if (check.configured && ['node', 'php'].includes(check.tool)) {
+    receipt.entryHash = await safeProjectEntrypoint(plan.project, check.configured.args[0].replace(/^\.\//, ''));
+  }
+  if (check.configured)
+    for (const arg of check.configured.args) {
+      const value = arg.startsWith('-') && arg.includes('=') ? arg.slice(arg.indexOf('=') + 1) : arg;
+      if (value.includes('/') || value.includes('\\') || value.includes(':')) {
+        const name = value.replace(/^\.\//, '');
+        qualityPath(name);
+        if (!plan.files.some(f => f.path === name))
+          throw qualityError('unsafe_path', 'configured quality command path is outside its source scope');
+      }
+    }
+  let version;
+  if (check.tool === 'gofmt') {
+    const go = await nativeResolve('go');
+    version = await call(go.command, [...(go.args ?? []), 'version', tool.command], { stage: 'version' });
+    const expected = `${tool.command}: go${check.version}`;
+    const observed = version.stdout.replace(/\r?\n$/, '');
+    if (version.code !== 0 || version.stderr.trim() || /[\r\n\0]/.test(observed) || observed !== expected)
+      throw qualityError('version_mismatch', 'gofmt binary version mismatch');
+  } else {
+    const versionArgs = ['phpcs', 'phpstan'].includes(check.tool)
+      ? [check.entry, '--version']
+      : check.tool === 'go'
+        ? ['version']
+        : ['--version'];
+    version = await call(tool.command, [...prefix, ...versionArgs], { env: toolEnv, stage: 'version' });
+    if (
+      version.code !== 0 ||
+      version.stderr.trim() ||
+      (check.configured
+        ? version.stdout.trim() !== check.configured.versionOutput
+        : !validVersion(check.tool, version.stdout, check.version))
+    )
+      throw qualityError('version_mismatch', 'exact quality tool version mismatch');
+  }
+  receipt.actualVersion = check.version;
+}
+
+/** Resolve and verify the exact tool, runtimes and entrypoints before a check runs. */
+async function prepareCheckTool(ctx, check, receipt, call) {
+  const prepared = await resolveCheckTool(ctx, check, receipt);
+  await verifyCheckRuntime(ctx, check, receipt, call, prepared);
+  return prepared;
+}
+
+/** Run the check (per file for native PHP lint) and adopt only fully matched debt. */
+async function executeCheckGroups(ctx, check, receipt, call, { tool, toolEnv, prefix }) {
+  const { plan, evidenceRoot } = ctx;
+  let executionCheck = check;
+  if (check.tool === 'typescript' && !check.configured) {
+    const content = typeScriptConfigContent(check, plan),
+      filename = path.join(evidenceRoot, `typescript-${sha256(check.id).slice(0, 12)}.json`);
+    await writeFile(filename, content, { flag: 'wx', mode: 0o400 });
+    receipt.typecheckConfig = { path: filename, sha256: sha256(content), bytes: Buffer.byteLength(content) };
+    executionCheck = { ...check, typecheckConfig: receipt.typecheckConfig };
+    if (!(await intactTypeScriptConfig(receipt.typecheckConfig, check, plan, evidenceRoot)))
+      throw qualityError('typecheck_config_integrity', 'private TypeScript config changed');
+  }
+  const groups =
+    check.tool === 'php' && !check.configured
+      ? check.files.map(file => ({ ...check, files: [file] }))
+      : [executionCheck];
+  let successful = true;
+  for (const group of groups) {
+    const output = await call(tool.command, [...prefix, ...argumentsFor(group, evidenceRoot, plan)], {
+      env: toolEnv,
+    });
+    let parsed = parseQualityOutput(group, output, plan.project);
+    const debt = allowDebt(check, parsed.findings, plan);
+    receipt.findings.push(...debt.findings);
+    receipt.debtCount += debt.debtCount;
+    // Only known diagnostic exit codes with fully matched old observations
+    // may be adopted. Crashes and arbitrary nonzero codes never become PASS.
+    const diagnosticExitCodes = {
+      oxlint: [1],
+      stylelint: [2],
+      'html-validate': [1],
+      sqlfluff: [1],
+      phpcs: [1, 2],
+      phpstan: [1],
+    };
+    const baselined =
+      parsed.findings.length > 0 &&
+      debt.findings.length === 0 &&
+      diagnosticExitCodes[check.tool]?.includes(output.code);
+    successful &&= (parsed.clean && output.code === 0) || baselined;
+  }
+  receipt.status = successful ? 'passed' : 'failed';
+  if (!successful) receipt.reason = receipt.findings.length ? 'violations' : 'tool_failed';
+}
+
+/** Re-verify config, sources and head after a check, then persist its private evidence. */
+async function settleCheckReceipt(ctx, check, receipt, logs, began) {
+  const { plan, signal, headError, headSha, head, evidenceRoot, receipts, clean } = ctx;
+  if (check.status === 'applicable') {
+    try {
+      if (
+        receipt.typecheckConfig &&
+        !(await intactTypeScriptConfig(receipt.typecheckConfig, check, plan, evidenceRoot))
+      ) {
+        receipt.status = 'blocked';
+        receipt.reason = 'typecheck_config_integrity';
+      } else if (sha256(JSON.stringify(await qualityInventory(plan.project))) !== plan.sourceHash) {
+        receipt.status = 'blocked';
+        receipt.reason = 'source_mutation';
+      } else if (!headError && (await head()) !== headSha) {
+        receipt.status = 'blocked';
+        receipt.reason = 'head_mutation';
+      }
+    } catch (error) {
+      receipt.status = 'blocked';
+      receipt.reason = signal?.aborted ? 'cancelled' : (error.code ?? 'source_mutation');
+    }
+  }
+  receipt.durationMs = performance.now() - began;
+  if (!resultStates.has(receipt.status)) {
+    receipt.status = 'blocked';
+    receipt.reason = 'incomplete_receipt';
+  }
+  const content = JSON.stringify(clean({ ...receipt, evidence: undefined, logs })) + '\n';
+  const filename = path.join(
+    evidenceRoot,
+    `${String(receipts.length).padStart(4, '0')}-${sha256(check.id).slice(0, 12)}.json`,
+  );
+  try {
+    await writeFile(filename, content, { flag: 'wx', mode: 0o600 });
+    receipt.evidence = [{ path: filename, sha256: sha256(content), bytes: Buffer.byteLength(content) }];
+  } catch {
+    receipt.status = 'blocked';
+    receipt.reason = 'evidence_write_failed';
+  }
+}
+
+async function runQualityCheck(ctx, check) {
+  const { plan, headSha, receipts, signal } = ctx;
+  const began = performance.now(),
+    logs = [];
+  const receipt = {
+    schemaVersion: 1,
+    id: check.id,
+    language: check.language,
+    capability: check.capability,
+    tool: check.tool,
+    version: check.version,
+    status: check.status,
+    reason: check.reason,
+    files: check.files,
+    scopeReason: check.scopeReason,
+    headSha,
+    configHash: plan.configHash,
+    sourceHash: plan.sourceHash,
+    pinsHash: pinsHash(check, plan),
+    findings: [],
+    debtCount: 0,
+    durationMs: 0,
+    evidence: [],
+  };
+  receipts.push(receipt);
+  const call = createCheckCall(ctx, check, receipt, logs, began);
+  try {
+    if (check.status !== 'applicable') return;
+    await executeCheckGroups(ctx, check, receipt, call, await prepareCheckTool(ctx, check, receipt, call));
+  } catch (error) {
+    const code = signal?.aborted
+      ? 'cancelled'
+      : error.result?.outputTruncated
+        ? 'output_limit'
+        : (error.code ?? 'process_failed');
+    receipt.status = ['missing', 'unsupported'].includes(code) ? code : 'blocked';
+    receipt.reason = code === 'ENOENT' ? 'missing' : code;
+  } finally {
+    await settleCheckReceipt(ctx, check, receipt, logs, began);
+  }
+}
+
+export async function runQuality(options = {}) {
+  const ctx = await qualityRunContext(options);
+  const { plan, receipts, start, headSha, evidenceRoot, clean } = ctx;
+  for (const check of plan.checks) await runQualityCheck(ctx, check);
   const status = receipts.some(r => ['blocked', 'missing', 'unsupported'].includes(r.status))
     ? 'blocked'
     : receipts.some(r => r.status === 'failed')

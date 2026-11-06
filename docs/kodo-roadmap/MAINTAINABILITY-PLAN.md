@@ -166,23 +166,17 @@ T1–T4 независимы друг от друга. T5–T8 начинают�
 
 ---
 
-## T7. Декомпозиция `quality-runner` (M)
+## T7. Декомпозиция `quality-runner` (M) — сделано
 
-**Сейчас.** В `runtime/quality-runner.mjs` две проблемные функции:
-- `parseQualityOutput(check, result, project)`: 241 строка, 152 ветвления. Это цепочка `else if (id === '<tool>')` по 12 инструментам: `oxlint`, `gofmt`, `oxfmt`, `typescript`, `rustfmt`, `cargo`, `go`, `dotnet`, `php`, `phpcs`, `phpstan` и т. д.;
-- `runQuality(options)`: 438 строк, 12 переменных состояния, 377 строк инлайн-кода.
+**Было.** `parseQualityOutput`: 241 строка, 152 ветвления, цепочка `else if` по 13 путям. `runQuality`: 438 строк, 12 переменных состояния.
 
-**Шаги**
-1. Добавить в `tests/quality-runner.test.mjs` (34 теста) недостающие тесты, чтобы у каждого инструмента был хотя бы один случай с находкой и один чистый. Список инструментов взять из цепочки.
-2. Ветки парсера вынести в `runtime/quality-parsers.mjs` как `const parsers = { oxlint: parseOxlint, … }`. `parseQualityOutput` остаётся диспетчером: общая проверка `result`, путь для configured-инструментов и `parsers[id]`.
-3. `runQuality` разбить на `prepareQualityRun(options)` (возвращает контекст с `plan`, `timeoutMs`, `maxOutputBytes`, `evidenceRoot`, `env`, `secrets`), `runQualityCheck(context, check)` и `finalizeQualityReceipt(context)`.
-4. Обновить `pins()`, убрать файл из overrides.
+**Сделано**
+1. Характеризационный тест `tests/quality-parsers.test.mjs` (53 входа: находки, чистый и битый вывод для каждой ветки) сравнивает результат с эталоном `tests/fixtures/quality-parsers-golden.json` вплоть до fingerprint. Ветки `phpcs` и `phpstan` до этого не выполнял ни один тест.
+2. `runtime/quality-parsers.mjs`: функция на каждый инструмент и таблица `parsers`. Тела ветвей перенесены дословно, `parseQualityOutput` сократилась до 20 строк, самый длинный парсер — 55 строк.
+3. `runQuality` (26 строк) разбит на стадии: `qualityRunContext`, `runQualityCheck`, `createCheckCall` (бывшее замыкание `call`), `resolveCheckTool`, `verifyCheckRuntime`, `executeCheckGroups` и `settleCheckReceipt` (бывший `finally`). Тела перенесены дословно. `continue` внутри `try/finally` стал `return`, `finally` выполняется как прежде.
+4. Модули quality не входят в `pins()` architecture-gate, менять его не понадобилось.
 
-**Приёмка**
-- Функция `parseQualityOutput` не длиннее 40 строк, каждый парсер не длиннее 60.
-- `runQuality` не длиннее 80 строк.
-- `tests/quality-runner.test.mjs` и `tests/quality-protocol-regressions.test.mjs` проходят.
-- `npm run check` проходит.
+**Проверено.** Эталон парсеров совпадает. 70 тестов quality и 188 интеграционных (`ci-cli`, `ci-graph`, замороженный `quality-acceptance`) проходят. Метка долга с `runQuality` снята, lint это подтверждает.
 
 ---
 
