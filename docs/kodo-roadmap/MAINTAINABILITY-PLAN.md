@@ -106,12 +106,12 @@ T1–T4 независимы друг от друга. T5–T8 начинают�
 - `options` в модулях: `runtime/providers.mjs` (33), `runtime/tools.mjs` (18), `runtime/modes.mjs` (14), `runtime/architecture-gate.mjs` (13);
 - объект `run` в `runtime/engine-*.mjs`: `engine-execution` (18), `engine-core` (17).
 
-**Правило для всех подзадач.** Меняются только JSDoc-комментарии, исполняемый код не трогается. Всё, что сокращает baseline, проходит через `npm run typecheck -- --update`. В `git diff scripts/typecheck-baseline.json` допустимы только удаления и уменьшение `count`, новых записей быть не должно.
+**Правило для всех подзадач.** Меняются только JSDoc-комментарии, исполняемый код не трогается. Сокращение baseline оформляется через `npm run typecheck -- --update`. Гейт с `4f1c3b4` считает диагностики по паре «файл + код»: при уточнении типа меняется текст несвязанных сообщений, поэтому сам текст в ключ не входит. Если уточнение показывает реальный дефект, он остаётся в baseline, записывается в «Найдено по ходу» и исправляется отдельным коммитом с RED-тестом.
 
-**4a. Исполнитель команд**
-- `runtime/command.mjs`: `@typedef {object} CommandOptions` (все восемь полей), `@typedef {object} CommandResult`, `@typedef {(command: string, args?: string[], options?: CommandOptions) => Promise<CommandResult>} CommandRunner`; `@param` для `execute`.
-- Каждый параметр `runner = …` (их найдёт `rg -n "runner =" runtime`) аннотировать как `@param {import('./command.mjs').CommandRunner} [runner]`.
-- Приёмка: в baseline нет диагностик с типом `{ allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; … }`, общее число не больше 275.
+**4a. Исполнитель команд — сделано.**
+- `runtime/command.mjs`: добавлены `@typedef CommandOptions` (все восемь полей), `CommandResult` и `CommandRunner`, а также JSDoc для `execute`.
+- Аннотировать параметры `runner = execute` не понадобилось: их тип теперь выводится из `execute`.
+- Итог: baseline сократился с 302 до 251, цель была не больше 275. Из них −53 устранённые диагностики и +2 показанных дефекта (см. «Найдено по ходу»).
 
 **4b. Options модулей.** `@typedef` для `options` в `providers.mjs`, `tools.mjs`, `modes.mjs` и `architecture-gate.mjs`. Приёмка: в этих четырёх файлах суммарно не больше 15 диагностик (было 78).
 
@@ -212,3 +212,7 @@ T1–T4 независимы друг от друга. T5–T8 начинают�
 - Диапазоны в T1 могли быть намеренными. Нужно решение владельца.
 - В шаге 0 T2 нужно подтвердить, что покрытие собирается при `isolation: 'process'`.
 - Сокращать ли время Windows-suite (около 21 мин): это решается после T2 отдельным планом.
+
+## Найдено по ходу
+
+- `runtime/engine-execution.mjs` (интеграция узла и `synchronizeBase`). Когда слияние уже идёт, результат подменяется заглушкой `{ code: 1 }`. Если при этом пропал `MERGE_HEAD`, ошибка формируется как `…: ${merged.stderr}` и заканчивается словом `undefined`. На поведение это не влияет, страдает только текст ошибки. Обнаружено благодаря T4a (2 диагностики TS2339 в baseline). Исправление: заглушка `{ code: 1, stdout: '', stderr: '' }` или явный текст причины, с RED-тестом на сообщение.

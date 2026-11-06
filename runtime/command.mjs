@@ -91,6 +91,34 @@ function stoppedOutput(text, secrets) {
   return redact(parts.join(''), secrets);
 }
 
+/**
+ * @typedef {object} CommandOptions
+ * @property {string} [cwd]
+ * @property {NodeJS.ProcessEnv} [env]
+ * @property {AbortSignal} [signal]
+ * @property {string | Buffer} [input] Written to stdin, then stdin is closed.
+ * @property {number} [timeoutMs]
+ * @property {boolean} [allowFailure] Resolve instead of reject on a non-zero exit code.
+ * @property {Record<string, string>} [secrets] Values redacted from output and errors.
+ * @property {boolean} [rawOutput] Resolve with unredacted stdout/stderr.
+ */
+
+/**
+ * @typedef {object} CommandResult
+ * @property {string} stdout
+ * @property {string} stderr
+ * @property {number | null} code
+ */
+
+/** @typedef {(command: string, args?: string[], options?: CommandOptions) => Promise<CommandResult>} CommandRunner */
+
+/**
+ * Run a command without a shell; output is redacted unless `rawOutput` is set.
+ * @param {string} command
+ * @param {string[]} [args]
+ * @param {CommandOptions} [options]
+ * @returns {Promise<CommandResult>}
+ */
 export async function execute(
   command,
   args = [],

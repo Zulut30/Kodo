@@ -2,25 +2,7 @@
   {
     "file": "runtime/architecture-cli.mjs",
     "code": "TS2353",
-    "message": "Object literal may only specify known properties, and 'cwd' does not exist in type '{ allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }'.",
-    "count": 2
-  },
-  {
-    "file": "runtime/architecture-cli.mjs",
-    "code": "TS2353",
     "message": "Object literal may only specify known properties, and 'env' does not exist in type '{ allowFailure?: boolean; maxOutputBytes?: number; secrets?: {}; timeoutMs?: number; }'.",
-    "count": 1
-  },
-  {
-    "file": "runtime/architecture-cli.mjs",
-    "code": "TS2353",
-    "message": "Object literal may only specify known properties, and 'input' does not exist in type '{ allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }'.",
-    "count": 1
-  },
-  {
-    "file": "runtime/architecture-cli.mjs",
-    "code": "TS2353",
-    "message": "Object literal may only specify known properties, and 'signal' does not exist in type '{ allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }'.",
     "count": 1
   },
   {
@@ -96,21 +78,9 @@
     "count": 1
   },
   {
-    "file": "runtime/architecture-gate.mjs",
-    "code": "TS2353",
-    "message": "Object literal may only specify known properties, and 'input' does not exist in type '{ allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }'.",
-    "count": 1
-  },
-  {
     "file": "runtime/architecture-policy.mjs",
     "code": "TS2339",
     "message": "Property 'code' does not exist on type 'Error'.",
-    "count": 1
-  },
-  {
-    "file": "runtime/benchmark-fixtures.mjs",
-    "code": "TS2353",
-    "message": "Object literal may only specify known properties, and 'cwd' does not exist in type '{ allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }'.",
     "count": 1
   },
   {
@@ -126,27 +96,9 @@
     "count": 1
   },
   {
-    "file": "runtime/ci-cache.mjs",
-    "code": "TS2353",
-    "message": "Object literal may only specify known properties, and 'cwd' does not exist in type '{ allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }'.",
-    "count": 1
-  },
-  {
-    "file": "runtime/ci-cache.mjs",
-    "code": "TS2353",
-    "message": "Object literal may only specify known properties, and 'input' does not exist in type '{ allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }'.",
-    "count": 1
-  },
-  {
     "file": "runtime/ci-cli.mjs",
     "code": "TS2353",
-    "message": "Object literal may only specify known properties, and 'cwd' does not exist in type '{ allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }'.",
-    "count": 1
-  },
-  {
-    "file": "runtime/ci-cli.mjs",
-    "code": "TS2353",
-    "message": "Object literal may only specify known properties, and 'headSha' does not exist in type '{ cwd?: string; runner?: (command: any, args?: any[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: { allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }) => Promise<any>; secrets?: {}; }'.",
+    "message": "Object literal may only specify known properties, and 'headSha' does not exist in type '{ cwd?: string; runner?: (command: string, args?: string[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: CommandOptions) => Promise<CommandResult>; secrets?: {}; }'.",
     "count": 1
   },
   {
@@ -194,7 +146,7 @@
   {
     "file": "runtime/cli.mjs",
     "code": "TS2353",
-    "message": "Object literal may only specify known properties, and 'headSha' does not exist in type '{ cwd?: string; runner?: (command: any, args?: any[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: { allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }) => Promise<any>; secrets?: {}; }'.",
+    "message": "Object literal may only specify known properties, and 'headSha' does not exist in type '{ cwd?: string; runner?: (command: string, args?: string[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: CommandOptions) => Promise<CommandResult>; secrets?: {}; }'.",
     "count": 1
   },
   {
@@ -206,31 +158,13 @@
   {
     "file": "runtime/cli.mjs",
     "code": "TS2353",
-    "message": "Object literal may only specify known properties, and 'project' does not exist in type '{ live?: boolean; runner?: (command: any, args?: any[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: { allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }) => Promise<any>; }'.",
+    "message": "Object literal may only specify known properties, and 'project' does not exist in type '{ live?: boolean; runner?: (command: string, args?: string[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: CommandOptions) => Promise<CommandResult>; }'.",
     "count": 1
   },
   {
     "file": "runtime/cli.mjs",
     "code": "TS2353",
-    "message": "Object literal may only specify known properties, and 'project' does not exist in type '{ runner?: (command: any, args?: any[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: { allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }) => Promise<any>; }'.",
-    "count": 1
-  },
-  {
-    "file": "runtime/command.mjs",
-    "code": "TS2339",
-    "message": "Property 'cwd' does not exist on type '{ allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }'.",
-    "count": 1
-  },
-  {
-    "file": "runtime/command.mjs",
-    "code": "TS2339",
-    "message": "Property 'input' does not exist on type '{ allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }'.",
-    "count": 1
-  },
-  {
-    "file": "runtime/command.mjs",
-    "code": "TS2339",
-    "message": "Property 'signal' does not exist on type '{ allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }'.",
+    "message": "Object literal may only specify known properties, and 'project' does not exist in type '{ runner?: (command: string, args?: string[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: CommandOptions) => Promise<CommandResult>; }'.",
     "count": 1
   },
   {
@@ -404,18 +338,6 @@
   {
     "file": "runtime/engine-core.mjs",
     "code": "TS2353",
-    "message": "Object literal may only specify known properties, and 'cwd' does not exist in type '{ allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }'.",
-    "count": 2
-  },
-  {
-    "file": "runtime/engine-core.mjs",
-    "code": "TS2353",
-    "message": "Object literal may only specify known properties, and 'input' does not exist in type '{ allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }'.",
-    "count": 1
-  },
-  {
-    "file": "runtime/engine-core.mjs",
-    "code": "TS2353",
     "message": "Object literal may only specify known properties, and 'project' does not exist in type '{ arch?: Architecture; platform?: Platform; }'.",
     "count": 1
   },
@@ -457,9 +379,9 @@
   },
   {
     "file": "runtime/engine-execution.mjs",
-    "code": "TS2353",
-    "message": "Object literal may only specify known properties, and 'cwd' does not exist in type '{ allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }'.",
-    "count": 17
+    "code": "TS2339",
+    "message": "Property 'stderr' does not exist on type 'CommandResult | { code: number; }'.\nProperty 'stderr' does not exist on type '{ code: number; }'.",
+    "count": 2
   },
   {
     "file": "runtime/engine-execution.mjs",
@@ -490,12 +412,6 @@
     "code": "TS2353",
     "message": "Object literal may only specify known properties, and 'task' does not exist in type '{ budget?: number; cache?: any[]; reason?: string; }'.",
     "count": 1
-  },
-  {
-    "file": "runtime/engine-verification.mjs",
-    "code": "TS2353",
-    "message": "Object literal may only specify known properties, and 'cwd' does not exist in type '{ allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }'.",
-    "count": 4
   },
   {
     "file": "runtime/engine-verification.mjs",
@@ -716,12 +632,6 @@
   {
     "file": "runtime/project-director.mjs",
     "code": "TS2353",
-    "message": "Object literal may only specify known properties, and 'cwd' does not exist in type '{ allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }'.",
-    "count": 1
-  },
-  {
-    "file": "runtime/project-director.mjs",
-    "code": "TS2353",
     "message": "Object literal may only specify known properties, and 'requested' does not exist in type '{ concurrencyExplicit?: boolean; config?: {}; }'.",
     "count": 1
   },
@@ -741,12 +651,6 @@
     "file": "runtime/project-store.mjs",
     "code": "TS2339",
     "message": "Property 'store' does not exist on type '{}'.",
-    "count": 1
-  },
-  {
-    "file": "runtime/project-store.mjs",
-    "code": "TS2353",
-    "message": "Object literal may only specify known properties, and 'input' does not exist in type '{ allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }'.",
     "count": 1
   },
   {
@@ -1004,13 +908,13 @@
   {
     "file": "runtime/security-gates.mjs",
     "code": "TS2339",
-    "message": "Property 'artifacts' does not exist on type '{ cwd?: string; runner?: (command: any, args?: any[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: { allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }) => Promise<any>; secrets?: {}; }'.",
+    "message": "Property 'artifacts' does not exist on type '{ cwd?: string; runner?: (command: string, args?: string[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: CommandOptions) => Promise<CommandResult>; secrets?: {}; }'.",
     "count": 1
   },
   {
     "file": "runtime/security-gates.mjs",
     "code": "TS2339",
-    "message": "Property 'config' does not exist on type '{ cwd?: string; runner?: (command: any, args?: any[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: { allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }) => Promise<any>; secrets?: {}; }'.",
+    "message": "Property 'config' does not exist on type '{ cwd?: string; runner?: (command: string, args?: string[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: CommandOptions) => Promise<CommandResult>; secrets?: {}; }'.",
     "count": 1
   },
   {
@@ -1022,7 +926,7 @@
   {
     "file": "runtime/security-gates.mjs",
     "code": "TS2339",
-    "message": "Property 'headSha' does not exist on type '{ cwd?: string; runner?: (command: any, args?: any[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: { allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }) => Promise<any>; secrets?: {}; }'.",
+    "message": "Property 'headSha' does not exist on type '{ cwd?: string; runner?: (command: string, args?: string[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: CommandOptions) => Promise<CommandResult>; secrets?: {}; }'.",
     "count": 1
   },
   {
@@ -1034,19 +938,19 @@
   {
     "file": "runtime/security-gates.mjs",
     "code": "TS2339",
-    "message": "Property 'previous' does not exist on type '{ cwd?: string; runner?: (command: any, args?: any[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: { allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }) => Promise<any>; secrets?: {}; }'.",
+    "message": "Property 'previous' does not exist on type '{ cwd?: string; runner?: (command: string, args?: string[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: CommandOptions) => Promise<CommandResult>; secrets?: {}; }'.",
     "count": 1
   },
   {
     "file": "runtime/security-gates.mjs",
     "code": "TS2339",
-    "message": "Property 'signal' does not exist on type '{ cwd?: string; runner?: (command: any, args?: any[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: { allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }) => Promise<any>; secrets?: {}; }'.",
+    "message": "Property 'signal' does not exist on type '{ cwd?: string; runner?: (command: string, args?: string[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: CommandOptions) => Promise<CommandResult>; secrets?: {}; }'.",
     "count": 1
   },
   {
     "file": "runtime/security-gates.mjs",
     "code": "TS2339",
-    "message": "Property 'toolHome' does not exist on type '{ cwd?: string; runner?: (command: any, args?: any[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: { allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }) => Promise<any>; secrets?: {}; }'.",
+    "message": "Property 'toolHome' does not exist on type '{ cwd?: string; runner?: (command: string, args?: string[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: CommandOptions) => Promise<CommandResult>; secrets?: {}; }'.",
     "count": 1
   },
   {
@@ -1064,7 +968,7 @@
   {
     "file": "runtime/security-gates.mjs",
     "code": "TS2353",
-    "message": "Object literal may only specify known properties, and 'home' does not exist in type '{ runner?: (command: any, args?: any[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: { allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }) => Promise<any>; }'.",
+    "message": "Object literal may only specify known properties, and 'home' does not exist in type '{ runner?: (command: string, args?: string[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: CommandOptions) => Promise<CommandResult>; }'.",
     "count": 1
   },
   {
@@ -1148,7 +1052,7 @@
   {
     "file": "runtime/tools.mjs",
     "code": "TS2339",
-    "message": "Property 'home' does not exist on type '{ live?: boolean; runner?: (command: any, args?: any[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: { allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }) => Promise<any>; }'.",
+    "message": "Property 'home' does not exist on type '{ live?: boolean; runner?: (command: string, args?: string[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: CommandOptions) => Promise<CommandResult>; }'.",
     "count": 1
   },
   {
@@ -1160,7 +1064,7 @@
   {
     "file": "runtime/tools.mjs",
     "code": "TS2339",
-    "message": "Property 'home' does not exist on type '{ runner?: (command: any, args?: any[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: { allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }) => Promise<any>; }'.",
+    "message": "Property 'home' does not exist on type '{ runner?: (command: string, args?: string[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: CommandOptions) => Promise<CommandResult>; }'.",
     "count": 1
   },
   {
@@ -1172,13 +1076,13 @@
   {
     "file": "runtime/tools.mjs",
     "code": "TS2339",
-    "message": "Property 'project' does not exist on type '{ live?: boolean; runner?: (command: any, args?: any[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: { allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }) => Promise<any>; }'.",
+    "message": "Property 'project' does not exist on type '{ live?: boolean; runner?: (command: string, args?: string[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: CommandOptions) => Promise<CommandResult>; }'.",
     "count": 1
   },
   {
     "file": "runtime/tools.mjs",
     "code": "TS2339",
-    "message": "Property 'project' does not exist on type '{ runner?: (command: any, args?: any[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: { allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }) => Promise<any>; }'.",
+    "message": "Property 'project' does not exist on type '{ runner?: (command: string, args?: string[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: CommandOptions) => Promise<CommandResult>; }'.",
     "count": 1
   },
   {
@@ -1190,13 +1094,13 @@
   {
     "file": "runtime/tools.mjs",
     "code": "TS2339",
-    "message": "Property 'signal' does not exist on type '{ live?: boolean; runner?: (command: any, args?: any[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: { allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }) => Promise<any>; }'.",
+    "message": "Property 'signal' does not exist on type '{ live?: boolean; runner?: (command: string, args?: string[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: CommandOptions) => Promise<CommandResult>; }'.",
     "count": 1
   },
   {
     "file": "runtime/tools.mjs",
     "code": "TS2339",
-    "message": "Property 'signal' does not exist on type '{ runner?: (command: any, args?: any[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: { allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }) => Promise<any>; }'.",
+    "message": "Property 'signal' does not exist on type '{ runner?: (command: string, args?: string[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: CommandOptions) => Promise<CommandResult>; }'.",
     "count": 1
   },
   {
@@ -1256,12 +1160,6 @@
   {
     "file": "runtime/ui-browser.mjs",
     "code": "TS2353",
-    "message": "Object literal may only specify known properties, and 'cwd' does not exist in type '{ allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }'.",
-    "count": 3
-  },
-  {
-    "file": "runtime/ui-browser.mjs",
-    "code": "TS2353",
     "message": "Object literal may only specify known properties, and 'signal' does not exist in type '{ timeoutMs?: number; }'.",
     "count": 2
   },
@@ -1274,19 +1172,19 @@
   {
     "file": "runtime/ui-verification.mjs",
     "code": "TS2339",
-    "message": "Property 'artifacts' does not exist on type '{ cwd?: string; runner?: (command: any, args?: any[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: { allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }) => Promise<any>; secrets?: {}; }'.",
+    "message": "Property 'artifacts' does not exist on type '{ cwd?: string; runner?: (command: string, args?: string[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: CommandOptions) => Promise<CommandResult>; secrets?: {}; }'.",
     "count": 1
   },
   {
     "file": "runtime/ui-verification.mjs",
     "code": "TS2339",
-    "message": "Property 'caseRunner' does not exist on type '{ cwd?: string; runner?: (command: any, args?: any[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: { allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }) => Promise<any>; secrets?: {}; }'.",
+    "message": "Property 'caseRunner' does not exist on type '{ cwd?: string; runner?: (command: string, args?: string[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: CommandOptions) => Promise<CommandResult>; secrets?: {}; }'.",
     "count": 1
   },
   {
     "file": "runtime/ui-verification.mjs",
     "code": "TS2339",
-    "message": "Property 'config' does not exist on type '{ cwd?: string; runner?: (command: any, args?: any[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: { allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }) => Promise<any>; secrets?: {}; }'.",
+    "message": "Property 'config' does not exist on type '{ cwd?: string; runner?: (command: string, args?: string[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: CommandOptions) => Promise<CommandResult>; secrets?: {}; }'.",
     "count": 1
   },
   {
@@ -1298,7 +1196,7 @@
   {
     "file": "runtime/ui-verification.mjs",
     "code": "TS2339",
-    "message": "Property 'headSha' does not exist on type '{ cwd?: string; runner?: (command: any, args?: any[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: { allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }) => Promise<any>; secrets?: {}; }'.",
+    "message": "Property 'headSha' does not exist on type '{ cwd?: string; runner?: (command: string, args?: string[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: CommandOptions) => Promise<CommandResult>; secrets?: {}; }'.",
     "count": 1
   },
   {
@@ -1310,19 +1208,19 @@
   {
     "file": "runtime/ui-verification.mjs",
     "code": "TS2339",
-    "message": "Property 'previous' does not exist on type '{ cwd?: string; runner?: (command: any, args?: any[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: { allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }) => Promise<any>; secrets?: {}; }'.",
+    "message": "Property 'previous' does not exist on type '{ cwd?: string; runner?: (command: string, args?: string[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: CommandOptions) => Promise<CommandResult>; secrets?: {}; }'.",
     "count": 1
   },
   {
     "file": "runtime/ui-verification.mjs",
     "code": "TS2339",
-    "message": "Property 'signal' does not exist on type '{ cwd?: string; runner?: (command: any, args?: any[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: { allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }) => Promise<any>; secrets?: {}; }'.",
+    "message": "Property 'signal' does not exist on type '{ cwd?: string; runner?: (command: string, args?: string[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: CommandOptions) => Promise<CommandResult>; secrets?: {}; }'.",
     "count": 1
   },
   {
     "file": "runtime/ui-verification.mjs",
     "code": "TS2339",
-    "message": "Property 'toolHome' does not exist on type '{ cwd?: string; runner?: (command: any, args?: any[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: { allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }) => Promise<any>; secrets?: {}; }'.",
+    "message": "Property 'toolHome' does not exist on type '{ cwd?: string; runner?: (command: string, args?: string[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: CommandOptions) => Promise<CommandResult>; secrets?: {}; }'.",
     "count": 1
   },
   {
@@ -1340,26 +1238,14 @@
   {
     "file": "runtime/ui-verification.mjs",
     "code": "TS2353",
-    "message": "Object literal may only specify known properties, and 'home' does not exist in type '{ runner?: (command: any, args?: any[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: { allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }) => Promise<any>; }'.",
+    "message": "Object literal may only specify known properties, and 'home' does not exist in type '{ runner?: (command: string, args?: string[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: CommandOptions) => Promise<CommandResult>; }'.",
     "count": 1
-  },
-  {
-    "file": "runtime/workspace.mjs",
-    "code": "TS2353",
-    "message": "Object literal may only specify known properties, and 'cwd' does not exist in type '{ allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }'.",
-    "count": 4
   },
   {
     "file": "scripts/ci-profiler.mjs",
     "code": "TS2353",
     "message": "Object literal may only specify known properties, and 'command' does not exist in type '{ args?: any[]; cwd?: string; env?: ProcessEnv; evidenceDir?: string; redactions?: {}; timeoutMs?: number; }'.",
     "count": 1
-  },
-  {
-    "file": "scripts/package-smoke.mjs",
-    "code": "TS2353",
-    "message": "Object literal may only specify known properties, and 'cwd' does not exist in type '{ allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }'.",
-    "count": 3
   },
   {
     "file": "scripts/run-tests.mjs",
@@ -1394,13 +1280,7 @@
   {
     "file": "scripts/ui-smoke.mjs",
     "code": "TS2353",
-    "message": "Object literal may only specify known properties, and 'cwd' does not exist in type '{ allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }'.",
-    "count": 5
-  },
-  {
-    "file": "scripts/ui-smoke.mjs",
-    "code": "TS2353",
-    "message": "Object literal may only specify known properties, and 'headSha' does not exist in type '{ cwd?: string; runner?: (command: any, args?: any[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: { allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }) => Promise<any>; secrets?: {}; }'.",
+    "message": "Object literal may only specify known properties, and 'headSha' does not exist in type '{ cwd?: string; runner?: (command: string, args?: string[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: CommandOptions) => Promise<CommandResult>; secrets?: {}; }'.",
     "count": 1
   },
   {
