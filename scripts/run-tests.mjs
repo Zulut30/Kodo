@@ -70,6 +70,7 @@ export const fastTests = [
   'tests/project-progress.test.mjs',
   'tests/providers.test.mjs',
   'tests/quality-cli.test.mjs',
+  'tests/quality-parsers.test.mjs',
   'tests/quality-protocol-regressions.test.mjs',
   'tests/quality-tools.test.mjs',
   'tests/registry-stats.test.mjs',
