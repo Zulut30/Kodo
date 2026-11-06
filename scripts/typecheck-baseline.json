@@ -324,75 +324,183 @@
     "count": 1
   },
   {
-    "file": "runtime/delivery.mjs",
+    "file": "runtime/delivery-process.mjs",
     "code": "TS2339",
     "message": "Property 'cwd' does not exist on type '{ allowFailure?: boolean; maxOutputBytes?: number; secrets?: {}; timeoutMs?: number; }'.",
     "count": 1
   },
   {
-    "file": "runtime/delivery.mjs",
+    "file": "runtime/delivery-process.mjs",
     "code": "TS2339",
     "message": "Property 'env' does not exist on type '{ allowFailure?: boolean; maxOutputBytes?: number; secrets?: {}; timeoutMs?: number; }'.",
     "count": 1
   },
   {
-    "file": "runtime/delivery.mjs",
+    "file": "runtime/delivery-process.mjs",
     "code": "TS2339",
     "message": "Property 'signal' does not exist on type '{ allowFailure?: boolean; maxOutputBytes?: number; secrets?: {}; timeoutMs?: number; }'.",
     "count": 1
   },
   {
-    "file": "runtime/delivery.mjs",
+    "file": "runtime/delivery-process.mjs",
     "code": "TS2538",
     "message": "Type 'symbol' cannot be used as an index type.",
     "count": 4
   },
   {
-    "file": "runtime/delivery.mjs",
-    "code": "TS2741",
-    "message": "Property 'expectedSha' is missing in type '{ tag: string; }' but required in type '{ expectedSha: any; tag: any; }'.",
-    "count": 1
-  },
-  {
-    "file": "runtime/delivery.mjs",
+    "file": "runtime/delivery-process.mjs",
     "code": "TS2810",
     "message": "Expected 1 argument, but got 0. 'new Promise()' needs a JSDoc hint to produce a 'resolve' that can be called without arguments.",
     "count": 1
   },
   {
-    "file": "runtime/engine.mjs",
-    "code": "TS2339",
-    "message": "Property 'assessTask' does not exist on type 'typeof import(\"D:/AIToolkit-quality/runtime/providers\")'.",
+    "file": "runtime/delivery-release.mjs",
+    "code": "TS2741",
+    "message": "Property 'expectedSha' is missing in type '{ tag: string; }' but required in type '{ expectedSha: any; tag: any; }'.",
     "count": 1
   },
   {
-    "file": "runtime/engine.mjs",
+    "file": "runtime/engine-core.mjs",
     "code": "TS2339",
     "message": "Property 'binding' does not exist on type '{}'.",
     "count": 1
   },
   {
-    "file": "runtime/engine.mjs",
+    "file": "runtime/engine-core.mjs",
     "code": "TS2339",
     "message": "Property 'executionMode' does not exist on type '{ schemaVersion: number; repository: any; baseBranch: string; client: string; primaryModel: any; concurrency: number; repairRounds: number; researchBudget: number; uiVerification: { enabled: any; cases: any[]; autoInstall: any; maxSteps: any; timeoutMs: any; }; ... 5 more ...; delivery: any; }'.",
     "count": 1
   },
   {
-    "file": "runtime/engine.mjs",
+    "file": "runtime/engine-core.mjs",
     "code": "TS2339",
     "message": "Property 'gates' does not exist on type '{ secrets?: {}; }'.",
     "count": 1
   },
   {
-    "file": "runtime/engine.mjs",
+    "file": "runtime/engine-core.mjs",
     "code": "TS2339",
     "message": "Property 'installRun' does not exist on type '{}'.",
     "count": 1
   },
   {
-    "file": "runtime/engine.mjs",
+    "file": "runtime/engine-core.mjs",
     "code": "TS2339",
     "message": "Property 'nodeContext' does not exist on type '{ secrets?: {}; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/engine-core.mjs",
+    "code": "TS2339",
+    "message": "Property 'store' does not exist on type '{ delivery?: { deliver: (options: any) => Promise<any>; releasePackage: (options: any) => Promise<any>; prepareReleaseVersion: (options: any) => Promise<{ version: any; changed: boolean; files: any[]; }>; reconcileDelivery: (options: any) => Promise<...>; }; ... 6 more ...; tools?: {}; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/engine-core.mjs",
+    "code": "TS2353",
+    "message": "Object literal may only specify known properties, and 'contractPath' does not exist in type '{ secrets?: {}; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/engine-core.mjs",
+    "code": "TS2353",
+    "message": "Object literal may only specify known properties, and 'cwd' does not exist in type '{ allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }'.",
+    "count": 2
+  },
+  {
+    "file": "runtime/engine-core.mjs",
+    "code": "TS2353",
+    "message": "Object literal may only specify known properties, and 'input' does not exist in type '{ allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/engine-core.mjs",
+    "code": "TS2353",
+    "message": "Object literal may only specify known properties, and 'project' does not exist in type '{ arch?: Architecture; platform?: Platform; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/engine-core.mjs",
+    "code": "TS2353",
+    "message": "Object literal may only specify known properties, and 'project' does not exist in type '{ root?: string; task?: string; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/engine-core.mjs",
+    "code": "TS2353",
+    "message": "Object literal may only specify known properties, and 'stage' does not exist in type '{ tools?: any[]; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/engine-core.mjs",
+    "code": "TS2538",
+    "message": "Type 'unique symbol' cannot be used as an index type.",
+    "count": 1
+  },
+  {
+    "file": "runtime/engine-core.mjs",
+    "code": "TS2554",
+    "message": "Expected 0 arguments, but got 1.",
+    "count": 1
+  },
+  {
+    "file": "runtime/engine-core.mjs",
+    "code": "TS2739",
+    "message": "Type '{ project: any; snapshotCwd: any; ownedCwds: any[]; task: any; }' is missing the following properties from type '{ contextPath?: any; now: any; ownedCwds: any; project: any; snapshotCwd?: any; subject: any; task?: string; }': now, subject",
+    "count": 1
+  },
+  {
+    "file": "runtime/engine-core.mjs",
+    "code": "TS2810",
+    "message": "Expected 1 argument, but got 0. 'new Promise()' needs a JSDoc hint to produce a 'resolve' that can be called without arguments.",
+    "count": 1
+  },
+  {
+    "file": "runtime/engine-execution.mjs",
+    "code": "TS2353",
+    "message": "Object literal may only specify known properties, and 'cwd' does not exist in type '{ allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }'.",
+    "count": 17
+  },
+  {
+    "file": "runtime/engine-execution.mjs",
+    "code": "TS2353",
+    "message": "Object literal may only specify known properties, and 'nodeContext' does not exist in type '{ secrets?: {}; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/engine-planning.mjs",
+    "code": "TS2339",
+    "message": "Property 'assessTask' does not exist on type 'typeof import(\"D:/AIToolkit-quality/runtime/providers\")'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/engine-planning.mjs",
+    "code": "TS2353",
+    "message": "Object literal may only specify known properties, and 'requested' does not exist in type '{ concurrencyExplicit?: boolean; config?: {}; }'.",
+    "count": 2
+  },
+  {
+    "file": "runtime/engine-planning.mjs",
+    "code": "TS2353",
+    "message": "Object literal may only specify known properties, and 'signal' does not exist in type '{ attempt?: number; models: any; node: any; task: any; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/engine-planning.mjs",
+    "code": "TS2353",
+    "message": "Object literal may only specify known properties, and 'task' does not exist in type '{ budget?: number; cache?: any[]; reason?: string; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/engine-verification.mjs",
+    "code": "TS2353",
+    "message": "Object literal may only specify known properties, and 'cwd' does not exist in type '{ allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }'.",
+    "count": 4
+  },
+  {
+    "file": "runtime/engine-verification.mjs",
+    "code": "TS2353",
+    "message": "Object literal may only specify known properties, and 'gates' does not exist in type '{ secrets?: {}; }'.",
     "count": 1
   },
   {
@@ -409,42 +517,6 @@
   },
   {
     "file": "runtime/engine.mjs",
-    "code": "TS2339",
-    "message": "Property 'store' does not exist on type '{ delivery?: { deliver: (options: any) => Promise<any>; releasePackage: (options: any) => Promise<any>; prepareReleaseVersion: (options: any) => Promise<{ version: any; changed: boolean; files: any[]; }>; reconcileDelivery: (options: any) => Promise<...>; }; ... 6 more ...; tools?: {}; }'.",
-    "count": 1
-  },
-  {
-    "file": "runtime/engine.mjs",
-    "code": "TS2353",
-    "message": "Object literal may only specify known properties, and 'contractPath' does not exist in type '{ secrets?: {}; }'.",
-    "count": 1
-  },
-  {
-    "file": "runtime/engine.mjs",
-    "code": "TS2353",
-    "message": "Object literal may only specify known properties, and 'cwd' does not exist in type '{ allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }'.",
-    "count": 23
-  },
-  {
-    "file": "runtime/engine.mjs",
-    "code": "TS2353",
-    "message": "Object literal may only specify known properties, and 'gates' does not exist in type '{ secrets?: {}; }'.",
-    "count": 1
-  },
-  {
-    "file": "runtime/engine.mjs",
-    "code": "TS2353",
-    "message": "Object literal may only specify known properties, and 'input' does not exist in type '{ allowFailure?: boolean; env?: ProcessEnv; rawOutput?: boolean; secrets?: {}; timeoutMs?: number; }'.",
-    "count": 1
-  },
-  {
-    "file": "runtime/engine.mjs",
-    "code": "TS2353",
-    "message": "Object literal may only specify known properties, and 'nodeContext' does not exist in type '{ secrets?: {}; }'.",
-    "count": 1
-  },
-  {
-    "file": "runtime/engine.mjs",
     "code": "TS2353",
     "message": "Object literal may only specify known properties, and 'primaryModel' does not exist in type '{ client?: string; providers?: string; }'.",
     "count": 1
@@ -452,67 +524,7 @@
   {
     "file": "runtime/engine.mjs",
     "code": "TS2353",
-    "message": "Object literal may only specify known properties, and 'project' does not exist in type '{ arch?: Architecture; platform?: Platform; }'.",
-    "count": 1
-  },
-  {
-    "file": "runtime/engine.mjs",
-    "code": "TS2353",
-    "message": "Object literal may only specify known properties, and 'project' does not exist in type '{ root?: string; task?: string; }'.",
-    "count": 1
-  },
-  {
-    "file": "runtime/engine.mjs",
-    "code": "TS2353",
-    "message": "Object literal may only specify known properties, and 'requested' does not exist in type '{ concurrencyExplicit?: boolean; config?: {}; }'.",
-    "count": 2
-  },
-  {
-    "file": "runtime/engine.mjs",
-    "code": "TS2353",
-    "message": "Object literal may only specify known properties, and 'signal' does not exist in type '{ attempt?: number; models: any; node: any; task: any; }'.",
-    "count": 1
-  },
-  {
-    "file": "runtime/engine.mjs",
-    "code": "TS2353",
-    "message": "Object literal may only specify known properties, and 'stage' does not exist in type '{ tools?: any[]; }'.",
-    "count": 1
-  },
-  {
-    "file": "runtime/engine.mjs",
-    "code": "TS2353",
     "message": "Object literal may only specify known properties, and 'store' does not exist in type '{ delivery?: { deliver: (options: any) => Promise<any>; releasePackage: (options: any) => Promise<any>; prepareReleaseVersion: (options: any) => Promise<{ version: any; changed: boolean; files: any[]; }>; reconcileDelivery: (options: any) => Promise<...>; }; ... 6 more ...; tools?: {}; }'.",
-    "count": 1
-  },
-  {
-    "file": "runtime/engine.mjs",
-    "code": "TS2353",
-    "message": "Object literal may only specify known properties, and 'task' does not exist in type '{ budget?: number; cache?: any[]; reason?: string; }'.",
-    "count": 1
-  },
-  {
-    "file": "runtime/engine.mjs",
-    "code": "TS2538",
-    "message": "Type 'unique symbol' cannot be used as an index type.",
-    "count": 1
-  },
-  {
-    "file": "runtime/engine.mjs",
-    "code": "TS2554",
-    "message": "Expected 0 arguments, but got 1.",
-    "count": 1
-  },
-  {
-    "file": "runtime/engine.mjs",
-    "code": "TS2739",
-    "message": "Type '{ project: any; snapshotCwd: any; ownedCwds: any[]; task: any; }' is missing the following properties from type '{ contextPath?: any; now: any; ownedCwds: any; project: any; snapshotCwd?: any; subject: any; task?: string; }': now, subject",
-    "count": 1
-  },
-  {
-    "file": "runtime/engine.mjs",
-    "code": "TS2810",
-    "message": "Expected 1 argument, but got 0. 'new Promise()' needs a JSDoc hint to produce a 'resolve' that can be called without arguments.",
     "count": 1
   },
   {

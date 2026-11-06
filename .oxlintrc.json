@@ -1,5 +1,9 @@
 {
   "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "env": {
+    "node": true,
+    "es2024": true
+  },
   "ignorePatterns": [
     "skills/**",
     "**/fixtures/**",
@@ -16,6 +20,7 @@
         "caughtErrors": "none"
       }
     ],
-    "no-useless-escape": "off"
+    "no-useless-escape": "off",
+    "no-undef": "error"
   }
 }
