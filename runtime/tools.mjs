@@ -50,6 +50,25 @@ function freeze(value) {
   }
   return value;
 }
+/**
+ * @typedef {object} ToolLocationOptions
+ * @property {string} [home] Dedicated tool home; defaults to KODO_TOOL_HOME or the Kodo state home.
+ * @property {string} [project] Project checkout the tool home must stay outside of.
+ */
+
+/**
+ * @typedef {object} ToolStatus
+ * @property {string} id
+ * @property {string} version
+ * @property {string | null} command
+ * @property {string[]} args
+ * @property {boolean} ready
+ * @property {string} status
+ * @property {string} [reason]
+ * @property {string} [directory] Installation directory of a ready tool.
+ * @property {string} [receipt] Receipt path of a ready tool.
+ */
+
 export const toolCatalog = freeze(catalog);
 const byId = new Map(toolCatalog.map(tool => [tool.id, tool]));
 const SCHEMA = 1;
@@ -71,6 +90,7 @@ function supported(tool, platform, arch) {
     (tool.assets ? Boolean(tool.assets[`${platform}-${arch}`]) : tool.platforms.includes(`${platform}-${arch}`))
   );
 }
+/** @returns {ToolStatus} */
 function result(tool, status, reason, extra = {}) {
   return {
     id: tool.id,
@@ -108,7 +128,9 @@ async function readJSON(filename, maxBytes = 32 * 1024 ** 2) {
 }
 
 /** A dedicated absolute home outside the project and every Git checkout.
- * Existing arbitrary directories are never adopted or cleaned up. */
+ * Existing arbitrary directories are never adopted or cleaned up.
+ * @param {ToolLocationOptions} [options]
+ */
 async function locations({ home, project = process.cwd() } = {}) {
   const selected = home ?? process.env.KODO_TOOL_HOME ?? path.join(path.dirname(stateHome()), 'Kodo-Tools');
   if (typeof selected !== 'string' || !selected.trim() || !path.isAbsolute(selected))
@@ -281,6 +303,10 @@ async function resolved(tool, home, platform, arch) {
   }
 }
 
+/**
+ * @param {string} id
+ * @param {ToolLocationOptions & { platform?: NodeJS.Platform, arch?: NodeJS.Architecture }} [options]
+ */
 export async function resolveTool(id, { home, project, platform = process.platform, arch = process.arch } = {}) {
   const tool = toolFor(id),
     location = await locations({ home, project });
@@ -549,6 +575,8 @@ async function installNative(tool, directory, platform, arch, runner, signal) {
  * report; invalid ids/homes and cancellation throw before any installation.
  * Reuse checks exact pins and every installed file. Failed/stale installs are
  * retained; a new private attempt replaces only the atomic receipt pointer.
+ * @param {string | string[]} ids
+ * @param {ToolLocationOptions & { signal?: AbortSignal, runner?: import('./command.mjs').CommandRunner }} [options]
  */
 export async function installTools(ids, { home, project, signal, runner = execute } = {}) {
   const selected =
@@ -641,7 +669,9 @@ export async function installTools(ids, { home, project, signal, runner = execut
 }
 
 /** Probe versions/metadata only, even with live=true. Real UI acceptance belongs
- * to the coordinator's owned fixtures. No install, browser attachment or API. */
+ * to the coordinator's owned fixtures. No install, browser attachment or API.
+ * @param {ToolLocationOptions & { signal?: AbortSignal, runner?: import('./command.mjs').CommandRunner, live?: boolean }} [options]
+ */
 export async function doctorTools({ home, project, signal, runner = execute, live = false } = {}) {
   const location = await locations({ home, project }),
     reports = [];
@@ -681,7 +711,9 @@ export async function doctorTools({ home, project, signal, runner = execute, liv
 }
 
 /** Only allowlisted static capabilities/status enter worker prompts. Never
- * serialize supplied config, paths, URLs, arguments, reasons or credentials. */
+ * serialize supplied config, paths, URLs, arguments, reasons or credentials.
+ * @param {{ stage?: string, uiVerification?: Record<string, any>, security?: Record<string, any>, tools?: ToolStatus[] }} [context]
+ */
 export function formatToolContext({ stage, uiVerification, security, tools = [] } = {}) {
   const role = ['analyze', 'plan', 'developer', 'tester', 'documenter', 'review', 'repair', 'complete'].includes(stage)
     ? stage

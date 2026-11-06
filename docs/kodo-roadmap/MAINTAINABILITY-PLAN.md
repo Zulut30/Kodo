@@ -113,7 +113,11 @@ T1–T4 независимы друг от друга. T5–T8 начинают�
 - Аннотировать параметры `runner = execute` не понадобилось: их тип теперь выводится из `execute`.
 - Итог: baseline сократился с 302 до 251, цель была не больше 275. Из них −53 устранённые диагностики и +2 показанных дефекта (см. «Найдено по ходу»).
 
-**4b. Options модулей.** `@typedef` для `options` в `providers.mjs`, `tools.mjs`, `modes.mjs` и `architecture-gate.mjs`. Приёмка: в этих четырёх файлах суммарно не больше 15 диагностик (было 78).
+**4b. Options модулей — сделано.**
+- Причина шума: TypeScript 7 в JS при `{ a, b = 1 } = {}` выводит тип только из полей со значением по умолчанию, и `a` теряется. Лечится явным `@param`.
+- Добавлены `@param` и `@typedef`: `ToolLocationOptions`/`ToolStatus` (`tools.mjs`), `AssessmentReceipt` (`modes.mjs`), `RequestOptions`/`SessionRequest`/`ProcessDeps` (`providers.mjs`), `ArchitectureGateOptions` (`architecture-gate.mjs`), общий `Secrets` (`security.mjs`), а также `research()`.
+- Итог: в четырёх файлах 3 диагностики (было 78, цель не больше 15). Весь baseline: 251 → 155.
+- JSDoc ставится над меткой `oxlint-disable-next-line`, а не между ней и функцией, иначе метка перестаёт действовать. Lint с `--report-unused-disable-directives` это ловит.
 
 **4c. Запись запуска.** `@typedef {object} KodoRun` в `runtime/store.mjs` (там создаются записи `run`). Аннотировать `run` в методах `EngineCore`, `EnginePlanning`, `EngineExecution` и `EngineVerification`. Приёмка: baseline не больше 150.
 

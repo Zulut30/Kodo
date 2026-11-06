@@ -171,6 +171,16 @@ const snapshot = receipt => Object.fromEntries(Object.entries(receipt).filter(([
 const staticReport = report =>
   Object.fromEntries(Object.entries(report).filter(([key]) => !['status', 'passed', 'receipts'].includes(key)));
 
+/**
+ * @typedef {object} ArchitectureGateOptions
+ * @property {string} [cwd] Checked project checkout.
+ * @property {string} [headSha] Exact head the receipt is bound to.
+ * @property {string} [baseSha] Merge base of the affected-module plan.
+ * @property {Record<string, any>} [config] Raw `architecture` configuration; normalized here.
+ * @property {AbortSignal} [signal]
+ */
+
+/** @param {ArchitectureGateOptions & { artifacts?: string, secrets?: import('./security.mjs').Secrets }} [options] */
 export async function runArchitectureChecks({
   cwd = process.cwd(),
   headSha,
@@ -248,6 +258,10 @@ export async function runArchitectureChecks({
   return receipt;
 }
 
+/**
+ * @param {any} receipt
+ * @param {ArchitectureGateOptions & { project?: string, now?: any }} [options] `now` is a clock override forwarded to the CLI.
+ */
 // oxlint-disable-next-line complexity -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
 export async function isCurrentArchitectureReceipt(
   receipt,

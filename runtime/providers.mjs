@@ -29,6 +29,43 @@ const defaults = {
   'claude-code': ['opus', 'sonnet'],
 };
 
+/**
+ * @typedef {object} RequestOptions
+ * @property {string} [method]
+ * @property {Record<string, string>} [headers]
+ * @property {unknown} [body] Serialized as JSON.
+ * @property {AbortSignal} [signal]
+ * @property {typeof fetch} [fetchImpl]
+ * @property {import('./security.mjs').Secrets} [secrets]
+ * @property {number} [timeoutMs]
+ * @property {number} [retries] Retries for HTTP 5xx and network failures.
+ */
+
+/**
+ * @typedef {object} SessionRequest
+ * @property {string} client
+ * @property {string} [model]
+ * @property {string} cwd
+ * @property {string} prompt
+ * @property {Record<string, any>} [schema] JSON schema of the final answer.
+ * @property {string} [sessionId] Resume this native session.
+ * @property {boolean} [readOnly]
+ * @property {AbortSignal} [signal]
+ * @property {(event: any) => void} [onEvent]
+ * @property {NodeJS.ProcessEnv} [env]
+ * @property {number} [timeoutMs]
+ */
+
+/**
+ * @typedef {object} ProcessDeps
+ * @property {typeof runProcess} [processImpl]
+ * @property {typeof resolveClient} [resolveClientImpl]
+ */
+
+/**
+ * @param {unknown} message
+ * @param {{ status?: number, retryAfter?: string | null, secrets?: import('./security.mjs').Secrets }} [details]
+ */
 export function classifyProviderFailure(message, { status, retryAfter, secrets = {} } = {}) {
   const safe = redact(String(message), secrets).slice(0, 600);
   if (
@@ -56,6 +93,10 @@ function retryDate(value) {
   return Number.isNaN(parsed) ? undefined : new Date(parsed).toISOString();
 }
 
+/**
+ * @param {string} url
+ * @param {RequestOptions} [options]
+ */
 export async function requestJson(
   url,
   { method = 'GET', headers = {}, body, signal, fetchImpl = fetch, secrets = {}, timeoutMs = 120000, retries = 2 } = {},
@@ -115,6 +156,10 @@ function delay(ms, signal) {
   });
 }
 
+/**
+ * @param {string} client
+ * @param {ProcessDeps & { env?: NodeJS.ProcessEnv }} [deps]
+ */
 export async function subscriptionStatus(
   client,
   { env, processImpl = runProcess, resolveClientImpl = resolveClient } = {},
@@ -154,6 +199,10 @@ export async function subscriptionStatus(
   return { available: true, auth: 'subscription', executable };
 }
 
+/**
+ * @param {{ client?: string, providers?: string, primaryModel?: string }} [request]
+ * @param {{ config?: Record<string, any>, live?: boolean, secrets?: import('./security.mjs').Secrets, statusImpl?: typeof subscriptionStatus, cacheImpl?: typeof readCodexModelCache, sessionImpl?: typeof runSession }} [deps]
+ */
 export async function discoverProviders(
   { client = 'codex', providers = 'current', primaryModel } = {},
   {
@@ -327,6 +376,11 @@ export function sessionInvocation({ client, model, cwd, schemaPath, schema, sess
   throw new ProviderError(`Неподдерживаемый исполнитель ${client}`, 'unavailable');
 }
 
+/**
+ * @param {string} client
+ * @param {any[]} events
+ * @param {{ schema?: Record<string, any>, sessionId?: string, model?: string, durationMs?: number }} [details]
+ */
 export function parseSessionEvents(client, events, { schema, sessionId, model, durationMs } = {}) {
   let output,
     usage,
@@ -380,6 +434,10 @@ export function parseSessionEvents(client, events, { schema, sessionId, model, d
   return { sessionId, output, usage, model, metrics: sessionMetrics(client, events, { durationMs, usage }) };
 }
 
+/**
+ * @param {SessionRequest} request
+ * @param {ProcessDeps & { nowImpl?: () => number }} [deps]
+ */
 export async function runSession(
   { client, model, cwd, prompt, schema, sessionId, readOnly = false, signal, onEvent, env, timeoutMs = 1800000 },
   { processImpl = runProcess, resolveClientImpl = resolveClient, nowImpl = () => performance.now() } = {},
@@ -455,6 +513,10 @@ export async function runSession(
   }
 }
 
+/**
+ * @param {{ task: string, files?: any[], signal?: AbortSignal }} input
+ * @param {{ secrets?: import('./security.mjs').Secrets, fetchImpl?: typeof fetch }} [deps]
+ */
 export async function analyzeGemini({ task, files = [], signal }, { secrets = {}, fetchImpl = fetch } = {}) {
   if (!secrets.GEMINI_API_KEY) throw new ProviderError('Не настроен GEMINI_API_KEY', 'auth');
   const names = files.map(file => (typeof file === 'string' ? file : (file.path ?? file.name)));
@@ -513,6 +575,10 @@ function strongest(models) {
   );
 }
 
+/**
+ * @param {{ task: string, models: any[], node: any, attempt?: number }} input
+ * @param {{ secrets?: import('./security.mjs').Secrets, fetchImpl?: typeof fetch }} [deps]
+ */
 export async function decideJev({ task, models, node, attempt = 0 }, { secrets = {}, fetchImpl = fetch } = {}) {
   const available = models.filter(item => item.available !== false);
   if (!available.length) throw new ProviderError('Нет доступных моделей по подписке', 'unavailable');
@@ -607,6 +673,7 @@ export async function decideJev({ task, models, node, attempt = 0 }, { secrets =
   }
 }
 
+/** @param {{ secrets?: import('./security.mjs').Secrets, config?: Record<string, any>, live?: boolean, signal?: AbortSignal }} [options] */
 export async function doctorProviders({ secrets = {}, config = {}, live = false, signal } = {}) {
   const checks = [];
   for (const client of Object.keys(defaults)) {

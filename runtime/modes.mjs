@@ -71,6 +71,28 @@ function typedAnswer(value, dimension) {
   };
 }
 
+/**
+ * @typedef {object} DimensionAnswer
+ * @property {string} choice
+ * @property {number} confidence
+ * @property {Record<string, number>} probabilities
+ */
+
+/**
+ * @typedef {object} AssessmentReceipt
+ * @property {boolean} fallback
+ * @property {string} [code]
+ * @property {string} [reason]
+ * @property {number | null} confidence
+ * @property {DimensionAnswer | null} [complexity]
+ * @property {DimensionAnswer | null} [risk]
+ * @property {DimensionAnswer | null} [scope]
+ * @property {string | null} jevModel Allowlisted Jev model name.
+ * @property {boolean} [contextTruncated]
+ * @property {number} requests
+ */
+
+/** @returns {AssessmentReceipt} */
 function fallback(code = 'unavailable', requests = 0) {
   return {
     fallback: true,
@@ -110,6 +132,10 @@ function assessmentState(task, files, secrets) {
   return state;
 }
 
+/**
+ * @param {{ task?: string, files?: any[], signal?: AbortSignal }} [input]
+ * @param {{ secrets?: import('./security.mjs').Secrets, fetchImpl?: typeof fetch }} [deps]
+ */
 export async function assessTask({ task, files = [], signal } = {}, { secrets = {}, fetchImpl = fetch } = {}) {
   signal?.throwIfAborted();
   if (!secrets.TYPESAFE_API_KEY) return fallback('auth');
@@ -154,6 +180,7 @@ export async function assessTask({ task, files = [], signal } = {}, { secrets = 
   }
 }
 
+/** @returns {AssessmentReceipt} */
 function assessmentReceipt(assessment) {
   if (!assessment || assessment.fallback !== false)
     return fallback(
@@ -177,6 +204,9 @@ function assessmentReceipt(assessment) {
   }
 }
 
+/**
+ * @param {{ requested?: string, assessment?: Record<string, any>, config?: Record<string, any>, concurrencyExplicit?: boolean }} [options]
+ */
 export function resolveMode({ requested, assessment, config = {}, concurrencyExplicit = true } = {}) {
   const explicit = normalizeMode(requested === undefined ? config.executionMode : requested);
   const receipt = assessmentReceipt(assessment);

@@ -274,6 +274,8 @@ export function createCredentialStore({
 export async function loadSecrets() {
   return createCredentialStore().load();
 }
+/** @typedef {Record<string, string>} Secrets Secret values by name; redacted from every output. */
+
 export function redact(value, secrets = {}) {
   if (typeof value !== 'string') {
     if (Array.isArray(value)) return value.map(item => redact(item, secrets));

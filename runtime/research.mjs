@@ -169,6 +169,10 @@ function parseSearchHtml(html, source, query) {
   return items;
 }
 
+/**
+ * @param {{ task?: string, reason?: string, budget?: number, cache?: any[], signal?: AbortSignal }} [request]
+ * @param {{ secrets?: import('./security.mjs').Secrets, fetchImpl?: typeof fetch }} [deps]
+ */
 // oxlint-disable-next-line complexity -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
 export async function research(
   { task, reason = 'initial', budget = 40, cache = [], signal } = {},
