@@ -1,0 +1,12 @@
+# Only first-party JavaScript is formatted. Docs, JSON pins and vendored
+# skills keep their reviewed bytes.
+*
+!*/
+!adapters/**/*.mjs
+!cli/**/*.mjs
+!runtime/**/*.mjs
+!scripts/**/*.mjs
+!tests/**/*.mjs
+scripts/fixtures/
+tests/fixtures/
+node_modules/

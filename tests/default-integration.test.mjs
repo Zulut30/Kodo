@@ -8,9 +8,19 @@ import { Engine } from '../runtime/engine.mjs';
 import { Store } from '../runtime/store.mjs';
 
 const expected = [
-  'skills/architecture-patterns','skills/architecture-decision-records','skills/monorepo-management','skills/e2e-testing-patterns',
-  'skills/subagent-driven-development','skills/systematic-debugging','skills/test-driven-development','skills/using-git-worktrees',
-  'skills/differential-review','skills/react-best-practices','skills/composition-patterns','skills/ce-compound','skills/spec-kit'
+  'skills/architecture-patterns',
+  'skills/architecture-decision-records',
+  'skills/monorepo-management',
+  'skills/e2e-testing-patterns',
+  'skills/subagent-driven-development',
+  'skills/systematic-debugging',
+  'skills/test-driven-development',
+  'skills/using-git-worktrees',
+  'skills/differential-review',
+  'skills/react-best-practices',
+  'skills/composition-patterns',
+  'skills/ce-compound',
+  'skills/spec-kit',
 ];
 const read = filename => readFile(filename, 'utf8');
 function git(cwd, ...args) {
@@ -26,16 +36,24 @@ async function projectFixture(t) {
   await mkdir(path.join(project, 'src'), { recursive: true });
   await writeFile(path.join(project, 'src/value.mjs'), 'export const value = 7;\n');
   await writeFile(path.join(project, 'verify.mjs'), "import './tests/contract.mjs';\n");
-  await writeFile(path.join(project, 'kodo.config.json'), JSON.stringify({
-    schemaVersion: 1, client: 'codex', concurrency: 2, repairRounds: 1, researchBudget: 4,
-    commands: { test: [{ command: process.execPath, args: ['verify.mjs'] }], build: [], deploy: [], smoke: [] },
-    delivery: { enabled: false, release: false }
-  }));
+  await writeFile(
+    path.join(project, 'kodo.config.json'),
+    JSON.stringify({
+      schemaVersion: 1,
+      client: 'codex',
+      concurrency: 2,
+      repairRounds: 1,
+      researchBudget: 4,
+      commands: { test: [{ command: process.execPath, args: ['verify.mjs'] }], build: [], deploy: [], smoke: [] },
+      delivery: { enabled: false, release: false },
+    }),
+  );
   git(project, 'init', '-b', 'main');
   git(project, 'config', 'core.autocrlf', 'false');
   git(project, 'config', 'user.name', 'Kodo Default Integration Test');
   git(project, 'config', 'user.email', 'default-integration@example.invalid');
-  git(project, 'add', '.'); git(project, 'commit', '-m', 'Fixture baseline');
+  git(project, 'add', '.');
+  git(project, 'commit', '-m', 'Fixture baseline');
   const base = git(project, 'rev-parse', 'HEAD');
   const store = new Store(home);
   t.after(async () => {
@@ -50,21 +68,53 @@ async function projectFixture(t) {
 
 function services({ failWorker = false } = {}) {
   const calls = { analyses: [], sessions: [] };
-  const plan = { summary: 'Expose value eight with a contract test and usage documentation.', tasks: [
-    { id: 'feature', role: 'developer', description: 'Set the value export to eight', dependsOn: [], writePaths: ['src/value.mjs'], acceptance: ['The public value export is eight'], parallel: false },
-    { id: 'contract', role: 'tester', description: 'Test the public value contract', dependsOn: ['feature'], writePaths: ['tests/contract.mjs'], acceptance: ['The contract test asserts value eight independently'], parallel: true },
-    { id: 'documentation', role: 'documenter', description: 'Document the value export', dependsOn: ['feature'], writePaths: ['docs/usage.md'], acceptance: ['The usage documentation reflects value eight'], parallel: true }
-  ] };
+  const plan = {
+    summary: 'Expose value eight with a contract test and usage documentation.',
+    tasks: [
+      {
+        id: 'feature',
+        role: 'developer',
+        description: 'Set the value export to eight',
+        dependsOn: [],
+        writePaths: ['src/value.mjs'],
+        acceptance: ['The public value export is eight'],
+        parallel: false,
+      },
+      {
+        id: 'contract',
+        role: 'tester',
+        description: 'Test the public value contract',
+        dependsOn: ['feature'],
+        writePaths: ['tests/contract.mjs'],
+        acceptance: ['The contract test asserts value eight independently'],
+        parallel: true,
+      },
+      {
+        id: 'documentation',
+        role: 'documenter',
+        description: 'Document the value export',
+        dependsOn: ['feature'],
+        writePaths: ['docs/usage.md'],
+        acceptance: ['The usage documentation reflects value eight'],
+        parallel: true,
+      },
+    ],
+  };
   const provider = {
     analyzeGemini: async request => {
       calls.analyses.push(request);
       assert.match(request.task, /Kodo default skill policy v1, stage analyze/);
       assert.match(request.task, /All 13 bundled skills were evaluated/);
-      return { summary: 'The fixture has one public value module.', model: 'gemini-fixture', files: request.files.map(item => item.path), limitations: [] };
+      return {
+        summary: 'The fixture has one public value module.',
+        model: 'gemini-fixture',
+        files: request.files.map(item => item.path),
+        limitations: [],
+      };
     },
     discoverProviders: async () => [
       { id: 'codex-sol', client: 'codex', model: 'gpt-6.1-sol', available: true },
-      { id: 'codex-astra', client: 'codex', model: 'gpt-6-astra', available: true }
+      { id: 'codex-astra', client: 'codex', model: 'gpt-6-astra', available: true },
     ],
     decideJev: async () => ({ model: 'codex-sol', confidence: 0.99, parallel: true, sessionMode: 'fresh' }),
     runSession: async request => {
@@ -82,11 +132,18 @@ function services({ failWorker = false } = {}) {
         const role = /Complete this (developer|tester|documenter) task/.exec(request.prompt)?.[1];
         assert.ok(role);
         assert.match(request.prompt, new RegExp(`Kodo default skill policy v1, stage ${role}`));
-        if (failWorker) return { sessionId: 'failed-worker', output: { summary: 'fixture cannot verify requested behavior', checks: [], complete: false } };
+        if (failWorker)
+          return {
+            sessionId: 'failed-worker',
+            output: { summary: 'fixture cannot verify requested behavior', checks: [], complete: false },
+          };
         if (role === 'developer') await writeFile(path.join(request.cwd, 'src/value.mjs'), 'export const value = 8;\n');
         if (role === 'tester') {
           await mkdir(path.join(request.cwd, 'tests'), { recursive: true });
-          await writeFile(path.join(request.cwd, 'tests/contract.mjs'), "import assert from 'node:assert/strict'; import {value} from '../src/value.mjs'; assert.equal(value,8);\n");
+          await writeFile(
+            path.join(request.cwd, 'tests/contract.mjs'),
+            "import assert from 'node:assert/strict'; import {value} from '../src/value.mjs'; assert.equal(value,8);\n",
+          );
         }
         if (role === 'documenter') {
           await mkdir(path.join(request.cwd, 'docs'), { recursive: true });
@@ -97,28 +154,44 @@ function services({ failWorker = false } = {}) {
       const sessionId = `default-session-${calls.sessions.length}`;
       request.onEvent({ sessionId });
       return { sessionId, output };
-    }
+    },
   };
   return { provider, researcher: async () => ({ items: [], requests: 0, errors: [], cache: [] }), calls };
 }
 
 test('Engine records every default skill at each completed role and carries checked knowledge into a subsequent analysis', async t => {
-  const fx = await projectFixture(t), injected = services();
+  const fx = await projectFixture(t),
+    injected = services();
   const engine = new Engine({ store: fx.store, ...injected });
   const run = await engine.create('Expose value eight with tests and docs', { project: fx.project });
   const completed = await engine.run(run.id);
   assert.equal(completed.state, 'succeeded', completed.error?.message);
   const persisted = fx.store.getRun(run.id);
-  for (const stage of ['analyze','plan','developer','tester','documenter','review','complete']) {
+  for (const stage of ['analyze', 'plan', 'developer', 'tester', 'documenter', 'review', 'complete']) {
     const record = persisted.defaultSkills[stage];
     assert.ok(record, stage);
     assert.match(record.hash, /^[a-f0-9]{64}$/);
-    assert.deepEqual(record.skills.map(item => item.id), expected, stage);
-    assert.ok(record.skills.every(item => typeof item.applies === 'boolean' && item.reason && /^[a-f0-9]{40}$/.test(item.revision)), stage);
+    assert.deepEqual(
+      record.skills.map(item => item.id),
+      expected,
+      stage,
+    );
+    assert.ok(
+      record.skills.every(
+        item => typeof item.applies === 'boolean' && item.reason && /^[a-f0-9]{40}$/.test(item.revision),
+      ),
+      stage,
+    );
   }
   assert.equal(persisted.defaultSkills.complete.skills.find(item => item.id === 'skills/ce-compound').applies, true);
-  assert.equal(persisted.defaultSkills.developer.skills.find(item => item.id === 'skills/react-best-practices').applies, false);
-  assert.equal(persisted.defaultSkills.plan.skills.find(item => item.id === 'skills/monorepo-management').applies, false);
+  assert.equal(
+    persisted.defaultSkills.developer.skills.find(item => item.id === 'skills/react-best-practices').applies,
+    false,
+  );
+  assert.equal(
+    persisted.defaultSkills.plan.skills.find(item => item.id === 'skills/monorepo-management').applies,
+    false,
+  );
   assert.equal(persisted.checks.headSha, persisted.headSha);
   assert.equal(persisted.review.headSha, persisted.headSha);
   assert.equal(persisted.review.passed, true);
@@ -148,7 +221,8 @@ test('Engine records every default skill at each completed role and carries chec
 });
 
 test('Engine does not remember an unverified failed run or feed it into subsequent planning', async t => {
-  const fx = await projectFixture(t), injected = services({ failWorker: true });
+  const fx = await projectFixture(t),
+    injected = services({ failWorker: true });
   const engine = new Engine({ store: fx.store, ...injected });
   const run = await engine.create('Expose value eight', { project: fx.project });
   const failed = await engine.run(run.id);

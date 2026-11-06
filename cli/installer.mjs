@@ -6,12 +6,17 @@ import { renderComponent, selectClients } from '../adapters/index.mjs';
 
 const lockPath = '.kodo/lock.json';
 const hash = data => createHash('sha256').update(data).digest('hex');
-const sameBytes = (left, right) => left === null ? right === null : right !== null && left.equals(right);
-const allowedPath = value => /^(\.agents\/skills\/|\.claude\/(skills|agents)\/|\.opencode\/agents\/|\.kodo\/components\/)/.test(value);
+const sameBytes = (left, right) => (left === null ? right === null : right !== null && left.equals(right));
+const allowedPath = value =>
+  /^(\.agents\/skills\/|\.claude\/(skills|agents)\/|\.opencode\/agents\/|\.kodo\/components\/)/.test(value);
 
 async function statOrNull(filename) {
-  try { return await lstat(filename); }
-  catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+  try {
+    return await lstat(filename);
+  } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  }
 }
 
 export async function destination(root, relative) {
@@ -31,10 +36,18 @@ export async function destination(root, relative) {
 
 function parseLock(data) {
   const lock = JSON.parse(data.toString('utf8'));
-  if (!lock || lock.schemaVersion !== 1 || !lock.files || typeof lock.files !== 'object' || Array.isArray(lock.files)) throw new Error('Некорректный .kodo/lock.json');
+  if (!lock || lock.schemaVersion !== 1 || !lock.files || typeof lock.files !== 'object' || Array.isArray(lock.files))
+    throw new Error('Некорректный .kodo/lock.json');
   for (const [name, meta] of Object.entries(lock.files)) {
     safeRelative(name);
-    if (!allowedPath(name) || !meta || !/^[a-f0-9]{64}$/.test(meta.sha256) || typeof meta.component !== 'string' || typeof meta.version !== 'string') throw new Error('Некорректная запись lock.json');
+    if (
+      !allowedPath(name) ||
+      !meta ||
+      !/^[a-f0-9]{64}$/.test(meta.sha256) ||
+      typeof meta.component !== 'string' ||
+      typeof meta.version !== 'string'
+    )
+      throw new Error('Некорректная запись lock.json');
   }
   return lock;
 }
@@ -55,13 +68,17 @@ export async function planInstallation(catalog, ids, clientNames, target) {
     const bundle = catalog.bundles.get(component.id);
     for (const [name, data] of bundle) add(`.kodo/components/${component.id}/${name}`, data, component);
     const dependencies = resolveComponents(catalog.registry, component.requires);
-    for (const client of selectedClients) for (const [name, data] of renderComponent(component, bundle, dependencies, catalog.bundles, client)) add(name, data, component);
+    for (const client of selectedClients)
+      for (const [name, data] of renderComponent(component, bundle, dependencies, catalog.bundles, client))
+        add(name, data, component);
   }
   const lockAbsolute = await destination(root, lockPath);
   const lockStat = await statOrNull(lockAbsolute);
   if (lockStat && !lockStat.isFile()) throw new Error(`Ожидался файл: ${lockAbsolute}`);
   const beforeLock = lockStat ? await readFile(lockAbsolute) : null;
-  const lock = beforeLock ? parseLock(beforeLock) : { schemaVersion: 1, toolkitVersion: catalog.registry.version, files: {} };
+  const lock = beforeLock
+    ? parseLock(beforeLock)
+    : { schemaVersion: 1, toolkitVersion: catalog.registry.version, files: {} };
   const changes = [];
   for (const [name, item] of planned) {
     const absolute = await destination(root, name);
@@ -74,7 +91,12 @@ export async function planInstallation(catalog, ids, clientNames, target) {
     const sha256 = hash(item.data);
     const status = before ? (before.equals(item.data) ? 'unchanged' : 'update') : 'create';
     changes.push({ path: name, status, data: item.data, before });
-    Object.defineProperty(lock.files, name, { value: { sha256, component: item.component, version: item.version }, enumerable: true, writable: true, configurable: true });
+    Object.defineProperty(lock.files, name, {
+      value: { sha256, component: item.component, version: item.version },
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
   }
   lock.toolkitVersion = catalog.registry.version;
   const orderedFiles = Object.fromEntries(Object.entries(lock.files).sort(([a], [b]) => a.localeCompare(b, 'en')));
@@ -91,7 +113,9 @@ async function atomicWrite(root, relative, data) {
     await writeFile(temporary, data, { flag: 'wx' });
     await rename(temporary, filename);
   } finally {
-    await unlink(temporary).catch(error => { if (error.code !== 'ENOENT') throw error; });
+    await unlink(temporary).catch(error => {
+      if (error.code !== 'ENOENT') throw error;
+    });
   }
 }
 
@@ -102,35 +126,47 @@ export async function applyInstallation(plan) {
   const guardAbsolute = await destination(plan.root, guard);
   await mkdir(path.dirname(guardAbsolute), { recursive: true });
   await destination(plan.root, guard);
-  try { await writeFile(guardAbsolute, 'kodo installation\n', { flag: 'wx' }); }
-  catch (error) { if (error.code === 'EEXIST') throw new Error('Другая установка выполняется: .kodo/install.guard'); throw error; }
+  try {
+    await writeFile(guardAbsolute, 'kodo installation\n', { flag: 'wx' });
+  } catch (error) {
+    if (error.code === 'EEXIST') throw new Error('Другая установка выполняется: .kodo/install.guard');
+    throw error;
+  }
   const applied = [];
   try {
     const lockAbsolute = await destination(plan.root, lockPath);
     const stat = await statOrNull(lockAbsolute);
     const currentLock = stat ? await readFile(lockAbsolute) : null;
-    if (!sameBytes(currentLock, plan.beforeLock)) throw new Error('lock.json изменился после планирования; повтори команду');
+    if (!sameBytes(currentLock, plan.beforeLock))
+      throw new Error('lock.json изменился после планирования; повтори команду');
     // Recheck every file before the first mutation, including unchanged files.
     for (const change of plan.changes) {
       const filename = await destination(plan.root, change.path);
       const currentStat = await statOrNull(filename);
       const current = currentStat?.isFile() ? await readFile(filename) : null;
-      if (currentStat && !currentStat.isFile() || !sameBytes(current, change.before)) throw new Error(`Файл изменился после планирования: ${change.path}`);
+      if ((currentStat && !currentStat.isFile()) || !sameBytes(current, change.before))
+        throw new Error(`Файл изменился после планирования: ${change.path}`);
     }
     for (const change of plan.changes.filter(item => item.status !== 'unchanged')) {
       await atomicWrite(plan.root, change.path, change.data);
       applied.push(change);
     }
-    if (!plan.nextLock.equals(plan.beforeLock ?? Buffer.alloc(0))) await atomicWrite(plan.root, lockPath, plan.nextLock);
+    if (!plan.nextLock.equals(plan.beforeLock ?? Buffer.alloc(0)))
+      await atomicWrite(plan.root, lockPath, plan.nextLock);
   } catch (error) {
     const rollbackErrors = [];
     for (const change of applied.reverse()) {
       try {
         if (change.before) await atomicWrite(plan.root, change.path, change.before);
         else await unlink(await destination(plan.root, change.path));
-      } catch (rollbackError) { rollbackErrors.push(`${change.path}: ${rollbackError.message}`); }
+      } catch (rollbackError) {
+        rollbackErrors.push(`${change.path}: ${rollbackError.message}`);
+      }
     }
-    if (rollbackErrors.length) throw new Error(`${error.message}\nНе удалось полностью откатить файлы:\n${rollbackErrors.join('\n')}`);
+    if (rollbackErrors.length)
+      throw new Error(`${error.message}\nНе удалось полностью откатить файлы:\n${rollbackErrors.join('\n')}`);
     throw error;
-  } finally { await unlink(guardAbsolute); }
+  } finally {
+    await unlink(guardAbsolute);
+  }
 }

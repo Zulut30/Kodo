@@ -9,7 +9,8 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const registry = JSON.parse(readFileSync(join(root, 'registry.json'), 'utf8'));
 const components = registry.components;
 
-const kodo = (...args) => spawnSync(process.execPath, ['cli/index.mjs', 'list', ...args], { cwd: root, encoding: 'utf8' });
+const kodo = (...args) =>
+  spawnSync(process.execPath, ['cli/index.mjs', 'list', ...args], { cwd: root, encoding: 'utf8' });
 const run = (...args) => spawnSync(process.execPath, ['cli/index.mjs', ...args], { cwd: root, encoding: 'utf8' });
 
 function listJson(...args) {
@@ -49,11 +50,15 @@ test('поиск по id не зависит от регистра', () => {
 
 test('поиск находит совпадения только в description', () => {
   const item = components.find(candidate => {
-    const word = candidate.description.split(/\s+/).find(part => part.length >= 5 && !candidate.id.toLowerCase().includes(part.toLowerCase()));
+    const word = candidate.description
+      .split(/\s+/)
+      .find(part => part.length >= 5 && !candidate.id.toLowerCase().includes(part.toLowerCase()));
     return word && !components.some(other => other.id.toLowerCase().includes(word.toLowerCase()));
   });
   assert.ok(item, 'в реестре нужен компонент со словом описания, отсутствующим в id');
-  const word = item.description.split(/\s+/).find(part => part.length >= 5 && !components.some(other => other.id.toLowerCase().includes(part.toLowerCase())));
+  const word = item.description
+    .split(/\s+/)
+    .find(part => part.length >= 5 && !components.some(other => other.id.toLowerCase().includes(part.toLowerCase())));
   const found = listJson('--search', word);
   assert.ok(found.includes(item.id));
   assert.deepEqual(found, expected(word));
@@ -84,8 +89,14 @@ test('поиск сочетается с фильтром типа', () => {
       const result = kodo(type, '--search', query, '--json');
       assert.equal(result.status, 0, result.stderr);
       const items = JSON.parse(result.stdout);
-      assert.ok(items.every(item => item.type === type), `все элементы должны быть типа ${type}`);
-      assert.deepEqual(items.map(item => item.id), expected(query, type));
+      assert.ok(
+        items.every(item => item.type === type),
+        `все элементы должны быть типа ${type}`,
+      );
+      assert.deepEqual(
+        items.map(item => item.id),
+        expected(query, type),
+      );
     }
   }
   // Порядок аргументов не важен.
@@ -100,7 +111,10 @@ test('--json выдаёт массив без дублей в порядке р�
     assert.equal(new Set(ids).size, ids.length, `дубли id для запроса ${query}`);
     const positions = ids.map(id => order.indexOf(id));
     assert.ok(positions.every(position => position >= 0));
-    assert.deepEqual(positions, [...positions].sort((a, b) => a - b));
+    assert.deepEqual(
+      positions,
+      [...positions].sort((a, b) => a - b),
+    );
     assert.deepEqual(ids, expected(query));
   }
   const result = kodo('--search', idSample, '--json');
@@ -139,7 +153,13 @@ test('--search неприменим к команде show', () => {
 });
 
 test('list без --search возвращает весь каталог', () => {
-  assert.deepEqual(listJson(), components.map(item => item.id));
+  assert.deepEqual(
+    listJson(),
+    components.map(item => item.id),
+  );
   const type = components[0].type;
-  assert.deepEqual(listJson(type), components.filter(item => item.type === type).map(item => item.id));
+  assert.deepEqual(
+    listJson(type),
+    components.filter(item => item.type === type).map(item => item.id),
+  );
 });

@@ -19,12 +19,19 @@ test('Standalone runner imports and executes a fixture without the unshipped Git
   delete env.NODE_TEST_CONTEXT;
   delete env.NODE_TEST_WORKER_ID;
   const pathKey = Object.keys(env).find(key => key.toLowerCase() === 'path');
-  await writeFile(path.join(staged, 'tiny.test.mjs'), `
+  await writeFile(
+    path.join(staged, 'tiny.test.mjs'),
+    `
     import test from 'node:test'; import assert from 'node:assert/strict';
     test('standalone fixture',()=>assert.equal(process.env[${JSON.stringify(pathKey)}],${JSON.stringify(env[pathKey])}));
-  `);
+  `,
+  );
   const options = { cwd: staged, env, encoding: 'utf8', windowsHide: true, timeout: 5000, maxBuffer: 64 * 1024 };
-  const imported = spawnSync(process.execPath, ['--input-type=module', '-e', `await import(${JSON.stringify(pathToFileURL(stagedRunner).href)});`], options);
+  const imported = spawnSync(
+    process.execPath,
+    ['--input-type=module', '-e', `await import(${JSON.stringify(pathToFileURL(stagedRunner).href)});`],
+    options,
+  );
   assert.equal(imported.status, 0, imported.stdout + imported.stderr);
   const executed = spawnSync(process.execPath, [stagedRunner, 'tiny.test.mjs'], options);
   assert.equal(executed.status, 0, executed.stdout + executed.stderr);
@@ -53,7 +60,10 @@ async function installation(t) {
 
 // Only built-in process metadata and child_process probes are mocked, inside a
 // fresh child. Path discovery/lstat/native realpath use actual owned files.
-function exercise({ launcher, core }, { env, platform = 'win32', probe = 'ok', real = false, cwd, action = 'configure' } = {}) {
+function exercise(
+  { launcher, core },
+  { env, platform = 'win32', probe = 'ok', real = false, cwd, action = 'configure' } = {},
+) {
   const script = `
     import assert from 'node:assert/strict';
     import {mock} from 'node:test';
@@ -103,7 +113,11 @@ function exercise({ launcher, core }, { env, platform = 'win32', probe = 'ok', r
     console.log(JSON.stringify({before,after:{...process.env},calls,rejectedCode}));
   `;
   const result = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
-    encoding: 'utf8', windowsHide: true, timeout: 15000, maxBuffer: 1024 * 1024, cwd,
+    encoding: 'utf8',
+    windowsHide: true,
+    timeout: 15000,
+    maxBuffer: 1024 * 1024,
+    cwd,
   });
   assert.equal(result.error, undefined);
   assert.equal(result.status, 0, result.stdout + result.stderr);
@@ -115,31 +129,69 @@ test('Git dev bootstrap prepends verified same-install core and preserves PATH c
   const { before, after, calls } = exercise(layout);
   assert.deepEqual(after, { ...before, PaTh: path.dirname(layout.core) + ';' + before.PaTh });
   assert.equal(Object.keys(after).filter(key => key.toLowerCase() === 'path').length, 1);
-  assert.deepEqual(calls.map(({ file, args }) => [file, args]), [
-    [layout.launcher, ['--version']], [layout.core, ['--version']],
-    [layout.launcher, ['--exec-path']], [layout.core, ['--exec-path']],
-  ]);
+  assert.deepEqual(
+    calls.map(({ file, args }) => [file, args]),
+    [
+      [layout.launcher, ['--version']],
+      [layout.core, ['--version']],
+      [layout.launcher, ['--exec-path']],
+      [layout.core, ['--exec-path']],
+    ],
+  );
 });
 
 test('Git metadata probes receive only allowed OS path and locale env without credentials or config values', async t => {
   const layout = await installation(t);
   const allowed = {
-    PaTh: path.dirname(layout.launcher) + ';keep-tail', SystemRoot: 'C:\\Windows',
-    WINDIR: 'C:\\Windows', COMSPEC: 'C:\\Windows\\System32\\cmd.exe', PATHEXT: '.COM;.EXE;.BAT;.CMD',
-    TEMP: 'C:\\owned-temp', TMP: 'C:\\owned-tmp', HOME: 'C:\\owned-home', USERPROFILE: 'C:\\owned-profile',
-    HOMEDRIVE: 'C:', HOMEPATH: '\\owned-profile', SystemDrive: 'C:',
-    GIT_EXEC_PATH: 'C:\\owned-git\\libexec\\git-core', LANG: 'en_US.UTF-8', lc_all: 'C',
+    PaTh: path.dirname(layout.launcher) + ';keep-tail',
+    SystemRoot: 'C:\\Windows',
+    WINDIR: 'C:\\Windows',
+    COMSPEC: 'C:\\Windows\\System32\\cmd.exe',
+    PATHEXT: '.COM;.EXE;.BAT;.CMD',
+    TEMP: 'C:\\owned-temp',
+    TMP: 'C:\\owned-tmp',
+    HOME: 'C:\\owned-home',
+    USERPROFILE: 'C:\\owned-profile',
+    HOMEDRIVE: 'C:',
+    HOMEPATH: '\\owned-profile',
+    SystemDrive: 'C:',
+    GIT_EXEC_PATH: 'C:\\owned-git\\libexec\\git-core',
+    LANG: 'en_US.UTF-8',
+    lc_all: 'C',
   };
-  const env = { ...allowed, OPENAI_API_KEY: 'fake-openai', ANTHROPIC_API_KEY: 'fake-claude',
-    GITHUB_TOKEN: 'fake-github', GH_TOKEN: 'fake-gh', API_TOKEN: 'fake-api',
-    KODO_GEMINI_API_KEY: 'fake-google', GIT_CONFIG_COUNT: '1', GIT_CONFIG_VALUE_0: 'fake-config-secret' };
+  const env = {
+    ...allowed,
+    OPENAI_API_KEY: 'fake-openai',
+    ANTHROPIC_API_KEY: 'fake-claude',
+    GITHUB_TOKEN: 'fake-github',
+    GH_TOKEN: 'fake-gh',
+    API_TOKEN: 'fake-api',
+    KODO_GEMINI_API_KEY: 'fake-google',
+    GIT_CONFIG_COUNT: '1',
+    GIT_CONFIG_VALUE_0: 'fake-config-secret',
+  };
   const result = exercise(layout, { env });
   assert.equal(result.calls.length, 4);
   for (const call of result.calls) assert.deepEqual(call.options.env, allowed);
   assert.deepEqual(result.after, { ...env, PaTh: path.dirname(layout.core) + ';' + allowed.PaTh });
 });
 
-for (const probe of ['--version', '--exec-path', 'throw', 'error', 'nonzero', 'null-status', 'signal', 'stderr', 'empty', 'whitespace', 'malformed-version', 'malformed-exec', 'nul', 'nonstring']) {
+for (const probe of [
+  '--version',
+  '--exec-path',
+  'throw',
+  'error',
+  'nonzero',
+  'null-status',
+  'signal',
+  'stderr',
+  'empty',
+  'whitespace',
+  'malformed-version',
+  'malformed-exec',
+  'nul',
+  'nonstring',
+]) {
   test(`Git dev bootstrap falls back unchanged on probe ${probe}`, async t => {
     const layout = await installation(t);
     const { before, after, calls } = exercise(layout, { probe });
@@ -157,7 +209,10 @@ test('Git dev bootstrap is a non-Windows no-op even with an eligible layout', as
 for (const action of ['import', 'invalid-cli', 'recursive-cli']) {
   test(`Git dev bootstrap does not probe during ${action}`, async t => {
     const layout = await installation(t);
-    const env = { Path: path.dirname(layout.launcher), ...(action === 'recursive-cli' ? { NODE_TEST_CONTEXT: 'child-v8' } : {}) };
+    const env = {
+      Path: path.dirname(layout.launcher),
+      ...(action === 'recursive-cli' ? { NODE_TEST_CONTEXT: 'child-v8' } : {}),
+    };
     const result = exercise(layout, { action, env });
     assert.deepEqual(result.after, result.before);
     assert.deepEqual(result.calls, []);
@@ -175,20 +230,40 @@ test('Git dev bootstrap preserves a custom Git shadowing PATH in the current dir
   assert.deepEqual(result.calls, []);
 });
 
-for (const kind of ['custom-first', 'git-com-first', 'unknown-launcher-first', 'core-selected', 'missing-core', 'missing-launcher', 'directory-core', 'no-path', 'empty-path', 'duplicate-keys']) {
+for (const kind of [
+  'custom-first',
+  'git-com-first',
+  'unknown-launcher-first',
+  'core-selected',
+  'missing-core',
+  'missing-launcher',
+  'directory-core',
+  'no-path',
+  'empty-path',
+  'duplicate-keys',
+]) {
   test(`Git dev bootstrap preserves environment for ${kind}`, async t => {
     const layout = await installation(t);
     let env = { PATH: path.dirname(layout.launcher), HOME: 'keep', MARKER: 'untouched' };
     if (['custom-first', 'git-com-first', 'unknown-launcher-first'].includes(kind)) {
       const custom = path.join(layout.temp, 'custom');
       await mkdir(custom);
-      await writeFile(path.join(custom, kind === 'git-com-first' ? 'git.com' : kind === 'unknown-launcher-first' ? 'git.cmd' : 'git.exe'), 'custom');
+      await writeFile(
+        path.join(
+          custom,
+          kind === 'git-com-first' ? 'git.com' : kind === 'unknown-launcher-first' ? 'git.cmd' : 'git.exe',
+        ),
+        'custom',
+      );
       env.PATH = custom + ';' + env.PATH;
     }
     if (kind === 'core-selected') env.PATH = path.dirname(layout.core) + ';' + env.PATH;
     if (kind === 'missing-core') await rm(layout.core);
     if (kind === 'missing-launcher') await rm(layout.launcher);
-    if (kind === 'directory-core') { await rm(layout.core); await mkdir(layout.core); }
+    if (kind === 'directory-core') {
+      await rm(layout.core);
+      await mkdir(layout.core);
+    }
     if (kind === 'no-path') delete env.PATH;
     if (kind === 'empty-path') env.PATH = '';
     if (kind === 'duplicate-keys') env.Path = env.PATH;
@@ -216,11 +291,16 @@ for (const kind of ['candidate-file', 'launcher-file', 'directory-escape', 'earl
         await symlink(path.join(target, 'git.exe'), file, 'file');
       }
     } catch (error) {
-      if (error.code === 'EPERM' || error.code === 'ENOTSUP') { t.skip('host does not allow this symlink type'); return; }
+      if (error.code === 'EPERM' || error.code === 'ENOTSUP') {
+        t.skip('host does not allow this symlink type');
+        return;
+      }
       throw error;
     }
-    const options = kind === 'earlier-directory-link'
-      ? { env: { Path: path.join(layout.temp, 'custom') + ';' + path.dirname(layout.launcher) } } : {};
+    const options =
+      kind === 'earlier-directory-link'
+        ? { env: { Path: path.join(layout.temp, 'custom') + ';' + path.dirname(layout.launcher) } }
+        : {};
     const result = exercise(layout, options);
     assert.deepEqual(result.after, result.before);
     assert.deepEqual(result.calls, []);
@@ -229,34 +309,70 @@ for (const kind of ['candidate-file', 'launcher-file', 'directory-escape', 'earl
 
 test('Git dev bootstrap uses the first real Git installation in PATH', async t => {
   const layout = await installation(t);
-  const result = exercise(layout, { env: { Path: path.join(layout.temp, 'absent') + ';' + path.dirname(layout.launcher) + ';later', MARKER: 'same' } });
+  const result = exercise(layout, {
+    env: { Path: path.join(layout.temp, 'absent') + ';' + path.dirname(layout.launcher) + ';later', MARKER: 'same' },
+  });
   assert.deepEqual(result.after, { ...result.before, Path: path.dirname(layout.core) + ';' + result.before.Path });
 });
 
 test('Git dev bootstrap verifies real installed Windows Git and runs status in an owned repository', async t => {
-  if (process.platform !== 'win32') { t.skip('Windows installed Git only'); return; }
+  if (process.platform !== 'win32') {
+    t.skip('Windows installed Git only');
+    return;
+  }
   const { temp } = await installation(t);
   const { lstatSync, realpathSync } = await import('node:fs');
   const key = Object.keys(process.env).find(key => key.toLowerCase() === 'path');
   let launcher;
   for (const directory of (process.env[key] ?? '').split(';')) {
     const file = path.resolve(directory.replace(/^"(.*)"$/, '$1'), 'git.exe');
-    try { if (lstatSync(file).isFile() && !lstatSync(file).isSymbolicLink()) { launcher = file; break; } } catch {}
+    try {
+      if (lstatSync(file).isFile() && !lstatSync(file).isSymbolicLink()) {
+        launcher = file;
+        break;
+      }
+    } catch {}
   }
   // The outer dev runner may already have prepended the core. Exercise the
   // real wrapper explicitly in an owned child, without changing our PATH.
-  if (launcher && path.basename(path.dirname(launcher)).toLowerCase() === 'bin'
-    && path.basename(path.dirname(path.dirname(launcher))).toLowerCase() === 'mingw64') {
+  if (
+    launcher &&
+    path.basename(path.dirname(launcher)).toLowerCase() === 'bin' &&
+    path.basename(path.dirname(path.dirname(launcher))).toLowerCase() === 'mingw64'
+  ) {
     launcher = path.resolve(path.dirname(launcher), '../../cmd/git.exe');
   }
-  if (!launcher || path.basename(path.dirname(launcher)).toLowerCase() !== 'cmd') { t.skip('installed Git cmd launcher unavailable'); return; }
+  if (!launcher || path.basename(path.dirname(launcher)).toLowerCase() !== 'cmd') {
+    t.skip('installed Git cmd launcher unavailable');
+    return;
+  }
   const core = path.resolve(path.dirname(launcher), '../mingw64/bin/git.exe');
-  try { assert.ok(lstatSync(core).isFile()); realpathSync.native(core); } catch { t.skip('same-install core unavailable'); return; }
-  const result = exercise({ launcher, core }, { real: true, env: { ...process.env, [key]: path.dirname(launcher) + ';' + process.env[key] } });
+  try {
+    assert.ok(lstatSync(core).isFile());
+    realpathSync.native(core);
+  } catch {
+    t.skip('same-install core unavailable');
+    return;
+  }
+  const result = exercise(
+    { launcher, core },
+    { real: true, env: { ...process.env, [key]: path.dirname(launcher) + ';' + process.env[key] } },
+  );
   assert.equal(result.after[key], path.dirname(core) + ';' + result.before[key]);
-  const initialized = spawnSync(core, ['init', '--quiet', temp], { env: result.after, encoding: 'utf8', windowsHide: true, timeout: 5000 });
+  const initialized = spawnSync(core, ['init', '--quiet', temp], {
+    env: result.after,
+    encoding: 'utf8',
+    windowsHide: true,
+    timeout: 5000,
+  });
   assert.equal(initialized.status, 0, initialized.stderr);
-  const status = spawnSync('git', ['status', '--porcelain'], { cwd: temp, env: result.after, encoding: 'utf8', windowsHide: true, timeout: 5000 });
+  const status = spawnSync('git', ['status', '--porcelain'], {
+    cwd: temp,
+    env: result.after,
+    encoding: 'utf8',
+    windowsHide: true,
+    timeout: 5000,
+  });
   assert.equal(status.status, 0, status.stderr);
   assert.equal(status.stdout, '?? Git/\n');
 });
