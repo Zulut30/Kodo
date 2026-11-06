@@ -535,7 +535,165 @@ function assertGraph(ctx, s) {
   for (const id of tasks.keys()) visit(id);
 }
 
-// oxlint-disable-next-line max-lines-per-function -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
+// Per-op project commands inside the apply() transaction. Each handler may set
+// change.kind/previous/record/attempt; apply() then bumps the project revision.
+function applySetPaused(ctx, { action, project }, change) {
+  change.kind = 'project';
+  change.previous = project;
+  change.record = { ...project, paused: action.paused };
+}
+
+function applyRecordEdit(ctx, { action, project, projectId, now }, change) {
+  requireValue(children.includes(change.kind), 'record_invalid');
+  control(ctx, project);
+  if (action.op === 'insert') {
+    const ancestors = [project];
+    if (change.kind === 'task') ancestors.push(get(ctx, projectId, 'epic', action.record.epicId));
+    if (change.kind !== 'milestone')
+      ancestors.push(
+        get(ctx, projectId, 'milestone', change.kind === 'epic' ? action.record.milestoneId : ancestors[1].milestoneId),
+      );
+    requireValue(
+      ancestors.every(parent => !['accepted', 'released'].includes(parent.status)),
+      'insertion_blocked',
+    );
+  }
+  if (action.op === 'amend') {
+    change.previous = get(ctx, projectId, change.kind, action.id);
+    requireValue(action.record.id === action.id, 'identity_conflict');
+    requireValue(!['accepted', 'released'].includes(change.previous.status), 'amendment_blocked');
+    if (change.kind === 'task') {
+      requireValue(action.record.epicId === change.previous.epicId, 'reparent_blocked');
+      const active = currentAttempt(ctx, projectId, action.id);
+      requireValue(!active || settledStates.has(active.status), 'active_attempt');
+    } else if (change.kind === 'epic')
+      requireValue(action.record.milestoneId === change.previous.milestoneId, 'reparent_blocked');
+  }
+  change.record = {
+    ...action.record,
+    ...metadata(ctx, projectId, now),
+    revision: change.previous ? change.previous.revision + 1 : 1,
+    createdAt: change.previous?.createdAt ?? now,
+  };
+  put(ctx, change.kind, change.record, action.op === 'insert');
+}
+
+function applyRiskApproval(ctx, { command, action, project, projectId, now }, change) {
+  control(ctx, project);
+  change.kind = 'task';
+  change.record = get(ctx, projectId, change.kind, action.taskId);
+  requireValue(change.record.revision === action.taskRevision, 'revision_conflict');
+  const approval = {
+    schemaVersion: 1,
+    projectId,
+    taskId: change.record.id,
+    taskRevision: change.record.revision,
+    actor: command.actor,
+    reason: command.reason,
+    approvedAt: now,
+  };
+  ctx.db
+    .prepare(
+      'INSERT INTO kodo_project_approvals VALUES(?,?,?,?) ON CONFLICT(project_id,task_id,task_revision) DO UPDATE SET body=excluded.body',
+    )
+    .run(projectId, change.record.id, change.record.revision, body(ctx, 'riskApproval', approval));
+  change.previous = change.record;
+}
+
+function applyReserveAttempt(ctx, { action, project, projectId, now }, change) {
+  control(ctx, project);
+  change.kind = 'attempt';
+  const task = get(ctx, projectId, 'task', action.taskId),
+    current = currentAttempt(ctx, projectId, task.id);
+  requireValue(
+    !['accepted', 'released'].includes(task.status) && (task.status !== 'cancelled' || action.retryFailed),
+    'reservation_blocked',
+  );
+  if (current && !retryStates.has(current.status)) {
+    requireValue(!settledStates.has(current.status), 'reservation_blocked');
+    frozenAttempt(ctx, current, task);
+    change.attempt = current;
+    change.previous = current;
+    change.record = current;
+  } else {
+    requireValue(!current || action.retryFailed, 'retry_required');
+    const number = ctx.db
+      .prepare('SELECT COALESCE(MAX(number),0)+1 AS n FROM kodo_project_attempts WHERE project_id=? AND task_id=?')
+      .get(projectId, task.id).n;
+    const contractHash = ctx.contracts.directorContractHash(task, ctx.options);
+    safe(ctx, ctx.contracts.buildDirectorTaskInput({ project, task }, ctx.options));
+    change.attempt = {
+      schemaVersion: 1,
+      id: randomUUID(),
+      projectId,
+      taskId: task.id,
+      taskRevision: task.revision,
+      number,
+      runId: randomUUID(),
+      contractHash,
+      status: 'reserved',
+      baseSha: null,
+      headSha: null,
+      evidence: [],
+      reason: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+    writeAttempt(ctx, change.attempt, true);
+    ctx.db
+      .prepare(
+        'INSERT INTO kodo_project_current VALUES(?,?,?) ON CONFLICT(project_id,task_id) DO UPDATE SET attempt_id=excluded.attempt_id',
+      )
+      .run(projectId, task.id, change.attempt.id);
+    change.record = change.attempt;
+  }
+}
+
+function applyTransition(ctx, { action, projectId, now }, change) {
+  requireValue(['project', ...children, 'attempt'].includes(change.kind), 'record_invalid');
+  change.previous =
+    change.kind === 'attempt'
+      ? attemptRecord(
+          ctx,
+          ctx.db.prepare('SELECT * FROM kodo_project_attempts WHERE id=? AND project_id=?').get(action.id, projectId),
+        )
+      : get(ctx, projectId, change.kind, action.id);
+  requireValue(change.previous, 'entity_not_found');
+  if (change.kind === 'attempt') {
+    requireValue(currentAttempt(ctx, projectId, change.previous.taskId)?.id === change.previous.id, 'binding_conflict');
+    frozenAttempt(ctx, change.previous, get(ctx, projectId, 'task', change.previous.taskId));
+  }
+  const s = readSnapshot(ctx, projectId);
+  complete(ctx, s);
+  ctx.contracts.assertProjectTransition({
+    record: change.previous,
+    to: action.to,
+    snapshot: s,
+    evidence: action.evidence,
+    mappings: action.mappings,
+  });
+  change.record = {
+    ...change.previous,
+    status: action.to,
+    evidence: mergeBy(change.previous.evidence, action.evidence, 'sha256'),
+    updatedAt: now,
+  };
+  if (change.kind !== 'attempt')
+    change.record.mappings = mergeBy(change.previous.mappings, action.mappings, 'criterionId');
+  else change.attempt = change.record;
+  if (change.kind === 'attempt') writeAttempt(ctx, change.record);
+  else if (change.kind !== 'project') put(ctx, change.kind, change.record);
+}
+
+const operations = {
+  setPaused: applySetPaused,
+  insert: applyRecordEdit,
+  amend: applyRecordEdit,
+  approveRisk: applyRiskApproval,
+  reserveAttempt: applyReserveAttempt,
+  transition: applyTransition,
+};
+
 async function apply(ctx, input) {
   safe(ctx, input);
   // Canonicalize before shared command encoding, including creation replay.
@@ -567,7 +725,6 @@ async function apply(ctx, input) {
     const decision = await pending;
     requireValue(decision === undefined, 'authorization_denied');
   }
-  // oxlint-disable-next-line max-lines-per-function -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
   return transaction(ctx.db, 'BEGIN IMMEDIATE', () => {
     const repeated = replay(ctx, namespace, command.commandId, payloadHash);
     if (repeated) return repeated;
@@ -618,148 +775,12 @@ async function apply(ctx, input) {
           );
       }
       const projectId = project.projectId;
-      if (action.op === 'setPaused') {
-        kind = 'project';
-        previous = project;
-        record = { ...project, paused: action.paused };
-      } else if (action.op === 'insert' || action.op === 'amend') {
-        requireValue(children.includes(kind), 'record_invalid');
-        control(ctx, project);
-        if (action.op === 'insert') {
-          const ancestors = [project];
-          if (kind === 'task') ancestors.push(get(ctx, projectId, 'epic', action.record.epicId));
-          if (kind !== 'milestone')
-            ancestors.push(
-              get(ctx, projectId, 'milestone', kind === 'epic' ? action.record.milestoneId : ancestors[1].milestoneId),
-            );
-          requireValue(
-            ancestors.every(parent => !['accepted', 'released'].includes(parent.status)),
-            'insertion_blocked',
-          );
-        }
-        if (action.op === 'amend') {
-          previous = get(ctx, projectId, kind, action.id);
-          requireValue(action.record.id === action.id, 'identity_conflict');
-          requireValue(!['accepted', 'released'].includes(previous.status), 'amendment_blocked');
-          if (kind === 'task') {
-            requireValue(action.record.epicId === previous.epicId, 'reparent_blocked');
-            const active = currentAttempt(ctx, projectId, action.id);
-            requireValue(!active || settledStates.has(active.status), 'active_attempt');
-          } else if (kind === 'epic')
-            requireValue(action.record.milestoneId === previous.milestoneId, 'reparent_blocked');
-        }
-        record = {
-          ...action.record,
-          ...metadata(ctx, projectId, now),
-          revision: previous ? previous.revision + 1 : 1,
-          createdAt: previous?.createdAt ?? now,
-        };
-        put(ctx, kind, record, action.op === 'insert');
-      } else if (action.op === 'approveRisk') {
-        control(ctx, project);
-        kind = 'task';
-        record = get(ctx, projectId, kind, action.taskId);
-        requireValue(record.revision === action.taskRevision, 'revision_conflict');
-        const approval = {
-          schemaVersion: 1,
-          projectId,
-          taskId: record.id,
-          taskRevision: record.revision,
-          actor: command.actor,
-          reason: command.reason,
-          approvedAt: now,
-        };
-        ctx.db
-          .prepare(
-            'INSERT INTO kodo_project_approvals VALUES(?,?,?,?) ON CONFLICT(project_id,task_id,task_revision) DO UPDATE SET body=excluded.body',
-          )
-          .run(projectId, record.id, record.revision, body(ctx, 'riskApproval', approval));
-        previous = record;
-      } else if (action.op === 'reserveAttempt') {
-        control(ctx, project);
-        kind = 'attempt';
-        const task = get(ctx, projectId, 'task', action.taskId),
-          current = currentAttempt(ctx, projectId, task.id);
-        requireValue(
-          !['accepted', 'released'].includes(task.status) && (task.status !== 'cancelled' || action.retryFailed),
-          'reservation_blocked',
-        );
-        if (current && !retryStates.has(current.status)) {
-          requireValue(!settledStates.has(current.status), 'reservation_blocked');
-          frozenAttempt(ctx, current, task);
-          attempt = current;
-          previous = current;
-          record = current;
-        } else {
-          requireValue(!current || action.retryFailed, 'retry_required');
-          const number = ctx.db
-            .prepare(
-              'SELECT COALESCE(MAX(number),0)+1 AS n FROM kodo_project_attempts WHERE project_id=? AND task_id=?',
-            )
-            .get(projectId, task.id).n;
-          const contractHash = ctx.contracts.directorContractHash(task, ctx.options);
-          safe(ctx, ctx.contracts.buildDirectorTaskInput({ project, task }, ctx.options));
-          attempt = {
-            schemaVersion: 1,
-            id: randomUUID(),
-            projectId,
-            taskId: task.id,
-            taskRevision: task.revision,
-            number,
-            runId: randomUUID(),
-            contractHash,
-            status: 'reserved',
-            baseSha: null,
-            headSha: null,
-            evidence: [],
-            reason: null,
-            createdAt: now,
-            updatedAt: now,
-          };
-          writeAttempt(ctx, attempt, true);
-          ctx.db
-            .prepare(
-              'INSERT INTO kodo_project_current VALUES(?,?,?) ON CONFLICT(project_id,task_id) DO UPDATE SET attempt_id=excluded.attempt_id',
-            )
-            .run(projectId, task.id, attempt.id);
-          record = attempt;
-        }
-      } else if (action.op === 'transition') {
-        requireValue(['project', ...children, 'attempt'].includes(kind), 'record_invalid');
-        previous =
-          kind === 'attempt'
-            ? attemptRecord(
-                ctx,
-                ctx.db
-                  .prepare('SELECT * FROM kodo_project_attempts WHERE id=? AND project_id=?')
-                  .get(action.id, projectId),
-              )
-            : get(ctx, projectId, kind, action.id);
-        requireValue(previous, 'entity_not_found');
-        if (kind === 'attempt') {
-          requireValue(currentAttempt(ctx, projectId, previous.taskId)?.id === previous.id, 'binding_conflict');
-          frozenAttempt(ctx, previous, get(ctx, projectId, 'task', previous.taskId));
-        }
-        const s = readSnapshot(ctx, projectId);
-        complete(ctx, s);
-        ctx.contracts.assertProjectTransition({
-          record: previous,
-          to: action.to,
-          snapshot: s,
-          evidence: action.evidence,
-          mappings: action.mappings,
-        });
-        record = {
-          ...previous,
-          status: action.to,
-          evidence: mergeBy(previous.evidence, action.evidence, 'sha256'),
-          updatedAt: now,
-        };
-        if (kind !== 'attempt') record.mappings = mergeBy(previous.mappings, action.mappings, 'criterionId');
-        else attempt = record;
-        if (kind === 'attempt') writeAttempt(ctx, record);
-        else if (kind !== 'project') put(ctx, kind, record);
-      } else fail('command_invalid');
+      {
+        const change = { kind, previous, record, attempt };
+        if (!Object.hasOwn(operations, action.op)) fail('command_invalid');
+        operations[action.op](ctx, { command, action, project, projectId, now }, change);
+        ({ kind, previous, record, attempt } = change);
+      }
       project = { ...(kind === 'project' ? record : project), revision: project.revision + 1, updatedAt: now };
       put(ctx, 'project', project);
       if (kind === 'project') record = project;
