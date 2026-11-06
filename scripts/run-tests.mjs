@@ -149,7 +149,22 @@ function concurrencyValue(value) {
   return Number(value);
 }
 
-export async function runTests({ cwd = process.cwd(), paths = [], concurrency = 4, testNamePatterns, signal } = {}) {
+// `--coverage`: Node's built-in V8 coverage, limited to first-party sources.
+// Only modules the selected tests actually load appear in the report.
+const coverageOptions = {
+  coverage: true,
+  coverageIncludeGlobs: ['adapters/**/*.mjs', 'cli/**/*.mjs', 'runtime/**/*.mjs', 'scripts/**/*.mjs'],
+  coverageExcludeGlobs: ['**/fixtures/**'],
+};
+
+export async function runTests({
+  cwd = process.cwd(),
+  paths = [],
+  concurrency = 4,
+  testNamePatterns,
+  coverage = false,
+  signal,
+} = {}) {
   // Never accept Node's recursive-run warning as a successful empty suite.
   if (process.env.NODE_TEST_CONTEXT !== undefined) throw new Error('Unsupported recursive test runner invocation');
   const files = paths.length ? explicitTests(cwd, paths) : discoverTests(cwd);
@@ -166,6 +181,7 @@ export async function runTests({ cwd = process.cwd(), paths = [], concurrency = 
       isolation: 'process',
       testNamePatterns,
       signal,
+      ...(coverage && coverageOptions),
     });
     let reportedFailures = 0;
     stream.on('test:fail', data => {
@@ -201,6 +217,10 @@ function parseArgs(args) {
     }
     if (!literal && arg === '--fast') {
       options.fast = true;
+      continue;
+    }
+    if (!literal && arg === '--coverage') {
+      options.coverage = true;
       continue;
     }
     if (!literal && arg.startsWith('--')) {

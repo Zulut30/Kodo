@@ -1370,19 +1370,19 @@
   {
     "file": "scripts/run-tests.mjs",
     "code": "TS2339",
-    "message": "Property 'signal' does not exist on type '{ concurrency?: number; cwd?: string; paths?: undefined[]; }'.",
+    "message": "Property 'signal' does not exist on type '{ concurrency?: number; coverage?: boolean; cwd?: string; paths?: undefined[]; }'.",
     "count": 1
   },
   {
     "file": "scripts/run-tests.mjs",
     "code": "TS2339",
-    "message": "Property 'testNamePatterns' does not exist on type '{ concurrency?: number; cwd?: string; paths?: undefined[]; }'.",
+    "message": "Property 'testNamePatterns' does not exist on type '{ concurrency?: number; coverage?: boolean; cwd?: string; paths?: undefined[]; }'.",
     "count": 1
   },
   {
     "file": "scripts/run-tests.mjs",
     "code": "TS2353",
-    "message": "Object literal may only specify known properties, and 'signal' does not exist in type '{ concurrency?: number; cwd?: string; paths?: any[]; }'.",
+    "message": "Object literal may only specify known properties, and 'signal' does not exist in type '{ concurrency?: number; coverage?: boolean; cwd?: string; paths?: any[]; }'.",
     "count": 1
   },
   {

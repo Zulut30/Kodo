@@ -571,3 +571,28 @@ test('Scheduler --fast runs from the checkout root and rejects explicit paths', 
   assert.match(result.stderr, /--fast selects its own files/);
   assert.doesNotMatch(result.stdout, /fixture passes/);
 });
+
+test('Scheduler --coverage reports first-party sources only and stays opt-in', { timeout: 30000 }, async t => {
+  const { temp, put } = await fixture(t);
+  await put('runtime/covered.mjs', 'export const pick = flag => (flag ? "yes" : "no");\n');
+  await put('runtime/fixtures/ignored.mjs', 'export const ignored = 1;\n');
+  await put(
+    'covered.test.mjs',
+    [
+      "import { test } from 'node:test';",
+      "import { pick } from './runtime/covered.mjs';",
+      "import './runtime/fixtures/ignored.mjs';",
+      "test('fixture passes', () => pick(true));",
+      '',
+    ].join('\n'),
+  );
+  const covered = await child(t, temp, [runner, '--coverage', 'covered.test.mjs']).done;
+  assert.equal(covered.code, 0, covered.stderr);
+  assert.match(covered.stdout, /fixture passes/);
+  assert.match(covered.stdout, /# start of coverage report/);
+  assert.match(covered.stdout, /covered\.mjs/);
+  assert.doesNotMatch(covered.stdout, /ignored\.mjs|covered\.test\.mjs \|/);
+  const plain = await child(t, temp, [runner, 'covered.test.mjs']).done;
+  assert.equal(plain.code, 0, plain.stderr);
+  assert.doesNotMatch(plain.stdout, /start of coverage report/);
+});
