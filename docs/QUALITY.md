@@ -170,10 +170,10 @@ Engine не переписан. Чтобы сделать quality обязате
 ## Проверка этого среза
 
 ```powershell
-node --test tests/quality-profiles.test.mjs tests/quality-runner.test.mjs tests/quality-cli.test.mjs
+node --test tests/quality-profiles.test.mjs tests/quality-runner.test.mjs tests/quality-parsers.test.mjs tests/quality-cli.test.mjs
 ```
 
-Эти scoped tests используют настоящие temp Git-проекты, fake managed/native tool ports для языковых контрактов и настоящий Node process port для configured checks, deadline/tree/output/cancel. Это offline evidence, а не proof работы девяти установленных SDK или UI. Координатор отдельно выполняет integrated `npm run check`, security gates, live tool/profile проверки и CI. [ADR-0005](decisions/0005-language-quality-profiles.md).
+Разбор вывода инструментов живёт в `runtime/quality-parsers.mjs` (по функции на инструмент); `tests/quality-parsers.test.mjs` сверяет каждую ветку с эталоном `tests/fixtures/quality-parsers-golden.json`. Эти scoped tests используют настоящие temp Git-проекты, fake managed/native tool ports для языковых контрактов и настоящий Node process port для configured checks, deadline/tree/output/cancel. Это offline evidence, а не proof работы девяти установленных SDK или UI. Координатор отдельно выполняет integrated `npm run check`, security gates, live tool/profile проверки и CI. [ADR-0005](decisions/0005-language-quality-profiles.md).
 
 
 Второй scope repair проверен на `1574a3c1b022e9e746326ca297cf89f0bf0d43a6` (2026-11-04, Windows, Node `v24.19.0`):
