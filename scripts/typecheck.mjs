@@ -21,8 +21,18 @@ const result = spawnSync(process.execPath, [tsc, '-p', path.join(root, 'tsconfig
 });
 if (result.error) throw result.error;
 
+// tsc quotes absolute module paths in some messages; keep the baseline portable
+// across checkouts (local worktrees, CI runners) by masking the checkout root.
+const escape = text => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const rootPattern = new RegExp(
+  [root, root.replaceAll('\\', '/')].map(escape).join('|'),
+  process.platform === 'win32' ? 'gi' : 'g',
+);
+const portable = text => text.replace(rootPattern, '<root>');
+
 const diagnostics = [];
-for (const line of `${result.stdout}${result.stderr}`.split(/\r?\n/)) {
+for (const raw of `${result.stdout}${result.stderr}`.split(/\r?\n/)) {
+  const line = portable(raw);
   const match = /^(.+?)\((\d+,\d+)\): error (TS\d+): (.*)$/.exec(line);
   if (match) {
     const file = match[1].replaceAll('\\', '/');

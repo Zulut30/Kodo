@@ -320,7 +320,7 @@
   {
     "file": "runtime/contracts.mjs",
     "code": "TS2351",
-    "message": "This expression is not constructable.\nType 'typeof import(\"D:/AIToolkit-quality/node_modules/ajv/dist/ajv\")' has no construct signatures.",
+    "message": "This expression is not constructable.\nType 'typeof import(\"<root>/node_modules/ajv/dist/ajv\")' has no construct signatures.",
     "count": 1
   },
   {
@@ -470,7 +470,7 @@
   {
     "file": "runtime/engine-planning.mjs",
     "code": "TS2339",
-    "message": "Property 'assessTask' does not exist on type 'typeof import(\"D:/AIToolkit-quality/runtime/providers\")'.",
+    "message": "Property 'assessTask' does not exist on type 'typeof import(\"<root>/runtime/providers\")'.",
     "count": 1
   },
   {
@@ -860,7 +860,7 @@
   {
     "file": "runtime/providers.mjs",
     "code": "TS2351",
-    "message": "This expression is not constructable.\nType 'typeof import(\"D:/AIToolkit-quality/node_modules/ajv/dist/ajv\")' has no construct signatures.",
+    "message": "This expression is not constructable.\nType 'typeof import(\"<root>/node_modules/ajv/dist/ajv\")' has no construct signatures.",
     "count": 1
   },
   {
