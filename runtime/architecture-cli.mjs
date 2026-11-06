@@ -425,6 +425,7 @@ function tapCounts(stdout) {
   return counts;
 }
 
+// oxlint-disable-next-line max-lines-per-function, complexity -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
 async function compose(options, ports, plan) {
   if (!options || !sha(options.baseSha) || (options.headSha !== undefined && !sha(options.headSha)))
     throw fail('arguments');

@@ -422,6 +422,7 @@ async function probe(manifest, context) {
   return true;
 }
 
+// oxlint-disable-next-line max-lines-per-function, complexity -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
 async function trial(cell, manifest, context) {
   const { directory, provider, account, secrets, Engine, Store, save, signal } = context,
     { options } = manifest.identity;

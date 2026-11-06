@@ -11,6 +11,7 @@ import { EngineVerification } from './engine-verification.mjs';
 
 /** Public engine: the durable run loop over the layered stages. */
 export class Engine extends EngineVerification {
+  // oxlint-disable-next-line max-lines-per-function, complexity -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
   async run(id, { prepare = false, planFile, signal, resumeCancelled = false, retryFailed = false } = {}) {
     const run = this.store.getRun(id);
     writeProgress(run, {

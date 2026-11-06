@@ -169,6 +169,7 @@ function parseSearchHtml(html, source, query) {
   return items;
 }
 
+// oxlint-disable-next-line complexity -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
 export async function research(
   { task, reason = 'initial', budget = 40, cache = [], signal } = {},
   { secrets = {}, fetchImpl = fetch } = {},

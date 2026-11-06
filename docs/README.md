@@ -55,8 +55,9 @@
 ```powershell
 npm ci
 npm run test:fast     # быстрые модульные тесты, меньше минуты
+npm run test:coverage # полная suite с покрытием (`-- --fast` для быстрого набора)
 npm run format        # Prettier для собственного JavaScript
-npm run lint          # oxlint, предупреждения запрещены
+npm run lint          # oxlint, предупреждения запрещены, сложность ограничена
 npm run typecheck     # tsc --checkJs против baseline известных диагностик
 npm run check         # validate + format:check + lint + typecheck + полная suite
 ```
@@ -64,3 +65,7 @@ npm run check         # validate + format:check + lint + typecheck + полна�
 `npm run check` — обязательная проверка, её выполняет CI на Linux и Windows. Полная suite в основном интеграционная и идёт около 20 минут; `test:fast` даёт обратную связь при правке, но не заменяет её.
 
 `typecheck` работает как храповик: новые диагностики `tsc --checkJs` валят проверку, а исправленные требуют `npm run typecheck -- --update`, чтобы baseline (`scripts/typecheck-baseline.json`) только уменьшался.
+
+`lint` тоже храповик для размера функций: вне `tests/` функция не длиннее 150 строк и не сложнее 40 (`max-lines-per-function`, `complexity`). Существующие нарушители помечены `oxlint-disable-next-line … -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md`; `--report-unused-disable-directives` валит lint, если пометка осталась после рефакторинга.
+
+Покрытие (`test:coverage`) — встроенный V8-отчёт Node по `adapters/`, `cli/`, `runtime/`, `scripts/`; в отчёт попадают только модули, загруженные тестами. Это не гейт. Замер 2026-11-06, Windows, полная suite: строки 93.7 %, ветки 89.4 %, функции 94.9 %. Самые низкие — модули, которые обычные тесты намеренно не запускают по-настоящему: `providers.mjs` (19.6 % строк: вызовы подписочных клиентов), `ui-browser.mjs` (66 %: браузер), `process.mjs` (72 %).

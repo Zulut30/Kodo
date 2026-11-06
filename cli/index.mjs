@@ -83,6 +83,7 @@ function checkOptions(command, options) {
       throw new Error(`Параметр ${key} неприменим к ${command}`);
 }
 
+// oxlint-disable-next-line max-lines-per-function, complexity -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
 async function main() {
   const [command, ...argv] = process.argv.slice(2);
   if (!command || ['help', '--help', '-h'].includes(command)) return console.log(help);

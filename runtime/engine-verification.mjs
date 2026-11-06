@@ -291,6 +291,7 @@ export class EngineVerification extends EngineExecution {
     run.architectureChecks = null;
     this.save(run);
   }
+  // oxlint-disable-next-line max-lines-per-function -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
   async verify(run, signal) {
     const cycle = (run.verification ||= { attempt: 0, cycle: 1 });
     if (cycle.stopped || cycle.attempt >= run.config.repairRounds) {

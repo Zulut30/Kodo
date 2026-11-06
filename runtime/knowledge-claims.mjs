@@ -324,6 +324,7 @@ export function normalizeClaim(input) {
   };
 }
 
+// oxlint-disable-next-line max-lines-per-function, complexity -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
 export function evaluateClaims(input) {
   shape(input, ['claims', 'context', 'policy', 'now', 'evidenceChecks']);
   const policy = validateResearchPolicy(input.policy);

@@ -640,6 +640,7 @@ export function buildDirectorTaskInput(input, options) {
 
 /** Structural lifecycle checks are NOT trusted evidence authorization. Store
  * additionally invokes the coordinator's authorizer for every forward edge. */
+// oxlint-disable-next-line complexity -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
 export function assertProjectTransition(input) {
   // This API has no credential options; external callers guard the full command
   // with their known values before invoking structural transition validation.

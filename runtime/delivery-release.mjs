@@ -361,6 +361,7 @@ async function assertCandidateFresh(ctx, candidate, version, latest) {
  * and artifact URL are authoritative. Kodo v1 never changes GitHub's mutable
  * "latest" alias, because independent publishers do not share a local lease.
  */
+// oxlint-disable-next-line max-lines-per-function, complexity -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
 export async function releasePackage(options) {
   const ctx = context(options);
   validateRepository(ctx.repository, ctx.baseBranch);

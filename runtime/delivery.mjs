@@ -78,6 +78,7 @@ export async function reconcileDelivery(options) {
   return receipt;
 }
 
+// oxlint-disable-next-line complexity -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
 async function verifyReview(ctx) {
   const head = (await ctx.command('git', ['rev-parse', 'HEAD'])).trim();
   if (head !== ctx.run.headSha) throw fail('stale_review', 'Working commit differs from the reviewed run head');
@@ -177,6 +178,7 @@ async function awaitChecks(ctx, number, expectedHead, names) {
   }
 }
 
+// oxlint-disable-next-line max-lines-per-function, complexity -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
 export async function deliver(options) {
   const ctx = context(options);
   validateRepository(ctx.repository, ctx.baseBranch);

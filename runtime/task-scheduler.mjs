@@ -1,5 +1,6 @@
 // Dispatch only. Persisted state, routing, worktrees and bounded retries belong
 // to the caller; a fulfilled attempt need not have integrated its task yet.
+// oxlint-disable-next-line complexity -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
 export async function runReadyQueue({ tasks, limit, isIntegrated, prepare, compatible, execute, integrate, signal }) {
   const invalid = message => Object.assign(new Error(message), { code: 'invalid_plan' });
   if (!Array.isArray(tasks) || !Number.isSafeInteger(limit) || limit < 1)

@@ -240,6 +240,7 @@ function finding(file, ruleId, line, severity, identity) {
   };
 }
 /** Parsers never equate arbitrary exit-zero output with a completed check. */
+// oxlint-disable-next-line max-lines-per-function, complexity -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
 export function parseQualityOutput(check, result, project) {
   if (
     !result ||
@@ -644,6 +645,7 @@ async function intactTypeScriptConfig(item, check, plan, evidenceRoot) {
     expected = typeScriptConfigContent(check, plan);
   return content.length === item.bytes && sha256(content) === item.sha256 && content.toString('utf8') === expected;
 }
+// oxlint-disable-next-line max-lines-per-function, complexity -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
 export async function runQuality(options = {}) {
   const {
     project = process.cwd(),
@@ -1084,6 +1086,7 @@ export async function runQuality(options = {}) {
 }
 
 /** Current-head validation is for callers reusing a receipt; Engine is unchanged. */
+// oxlint-disable-next-line complexity -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
 export async function isCurrentQualityReceipt(
   report,
   { project, runner = execute, resolve = resolveTool, nativeResolve = nativeTool, toolHome } = {},

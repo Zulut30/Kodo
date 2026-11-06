@@ -20,6 +20,7 @@ import { runSecurityChecks, isCurrentSecurityReceipt } from './security-gates.mj
 import { git } from './workspace.mjs';
 import { writeProgress, assertPrivateArtifactPath } from './progress.mjs';
 
+// oxlint-disable-next-line max-lines-per-function, complexity -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
 export async function runtimeCli(command, args) {
   if (command === 'benchmark') {
     const { benchmarkCli } = await import('./benchmark-cli.mjs');

@@ -1,6 +1,7 @@
 import { parse } from 'acorn';
 
 /** Inspect source as data. Occurrences retain UTF-16 AST offsets; nothing is loaded. */
+// oxlint-disable-next-line complexity -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
 export function inspectJavaScriptModule({ file, source }) {
   const dependencies = [],
     exports = new Set(),

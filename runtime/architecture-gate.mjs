@@ -248,6 +248,7 @@ export async function runArchitectureChecks({
   return receipt;
 }
 
+// oxlint-disable-next-line complexity -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
 export async function isCurrentArchitectureReceipt(
   receipt,
   { cwd, project, headSha, baseSha, config, signal, now } = {},

@@ -110,6 +110,7 @@ export function qualityPath(name) {
     throw qualityError('unsafe_path', 'unsafe or secret path');
   return name;
 }
+// oxlint-disable-next-line max-lines-per-function, complexity -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
 export function normalizeQualityConfig(input = {}) {
   keys(
     input,
@@ -376,6 +377,7 @@ function jsonc(text) {
     throw qualityError('configuration', 'invalid quality JSONC compiler configuration');
   }
 }
+// oxlint-disable-next-line complexity -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
 async function validateManifestScope(root, files, documents) {
   const checkedPath = async (from, value, glob = false) => {
     if (typeof value !== 'string' || !value || /[\\\x00-\x1f]/.test(value) || /^(?:[A-Za-z]:|\/|~)/.test(value))
@@ -603,6 +605,7 @@ export class QualityProfileRegistry {
   constructor() {
     this.languages = qualityLanguages;
   }
+  // oxlint-disable-next-line max-lines-per-function -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
   async _discover(project) {
     const requested = path.resolve(project);
     await noLinks(requested);
@@ -768,6 +771,7 @@ export class QualityProfileRegistry {
   async discover(project) {
     return this._discover(project);
   }
+  // oxlint-disable-next-line max-lines-per-function, complexity -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
   async plan(project, options = {}) {
     const { result: report, documents } = await this.discover(project),
       { config } = report;

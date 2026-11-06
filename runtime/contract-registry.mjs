@@ -156,6 +156,7 @@ function reverseModules(graphs) {
 }
 
 export class ContractRegistry {
+  // oxlint-disable-next-line max-lines-per-function, complexity -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
   plan(input) {
     record(input, ['base', 'head', 'baseGraph', 'headGraph', 'changedPaths']);
     const { base, head, baseGraph, headGraph, changedPaths } = input;

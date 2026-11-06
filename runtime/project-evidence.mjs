@@ -277,6 +277,7 @@ export async function evaluateProjectAttempt(input, ports = {}) {
 
 // Evaluate the actual command against a coherent stored snapshot. No eligibility
 // or verification flags from the command are consumed.
+// oxlint-disable-next-line complexity -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
 export async function evaluateProjectTransition(input, ports = {}) {
   let record;
   try {

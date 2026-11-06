@@ -15,7 +15,7 @@
     "validate": "node cli/index.mjs validate",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "lint": "oxlint --deny-warnings .",
+    "lint": "oxlint --deny-warnings --report-unused-disable-directives .",
     "typecheck": "node scripts/typecheck.mjs",
     "test": "node scripts/run-tests.mjs",
     "test:fast": "node scripts/run-tests.mjs --fast",

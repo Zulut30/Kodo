@@ -136,6 +136,7 @@ async function migrate(store) {
 }
 
 /** Additive Project Director repository on the existing legacy Store connection. */
+// oxlint-disable-next-line max-lines-per-function -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
 export async function openProjectStore({ store, contracts, authorizeTransition } = {}) {
   requireValue(store?.db && typeof store.createRun === 'function', 'store_invalid');
   requireValue(authorizeTransition === undefined || typeof authorizeTransition === 'function', 'authorizer_invalid');
@@ -490,6 +491,7 @@ export async function openProjectStore({ store, contracts, authorizeTransition }
     };
     for (const id of tasks.keys()) visit(id);
   }
+  // oxlint-disable-next-line max-lines-per-function -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
   async function apply(input) {
     safe(input);
     // Canonicalize before shared command encoding, including creation replay.
@@ -521,6 +523,7 @@ export async function openProjectStore({ store, contracts, authorizeTransition }
       const decision = await pending;
       requireValue(decision === undefined, 'authorization_denied');
     }
+    // oxlint-disable-next-line max-lines-per-function -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
     return transaction(db, 'BEGIN IMMEDIATE', () => {
       const repeated = replay(namespace, command.commandId, payloadHash);
       if (repeated) return repeated;
@@ -736,6 +739,7 @@ export async function openProjectStore({ store, contracts, authorizeTransition }
     );
     const binding = normalize('installBinding', input.binding),
       runDraft = structuredClone(input.runDraft);
+    // oxlint-disable-next-line complexity -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
     return transaction(db, 'BEGIN IMMEDIATE', () => {
       const s = readSnapshot(binding.projectId);
       complete(s);

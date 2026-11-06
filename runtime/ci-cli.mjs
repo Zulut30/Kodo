@@ -285,6 +285,7 @@ function failureDiagnostic(result, secrets) {
   return diagnostic;
 }
 
+// oxlint-disable-next-line max-lines-per-function, complexity -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
 export async function runCi(options, dependencies = {}) {
   const plan = await planCi(options, dependencies),
     receipts = [],

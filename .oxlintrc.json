@@ -23,6 +23,14 @@
       }
     ],
     "no-useless-escape": "off",
-    "no-undef": "error"
-  }
+    "no-undef": "error",
+    "max-lines-per-function": ["error", { "max": 150, "skipBlankLines": true, "skipComments": true }],
+    "complexity": ["error", { "max": 40 }]
+  },
+  "overrides": [
+    {
+      "files": ["tests/**"],
+      "rules": { "max-lines-per-function": "off", "complexity": "off" }
+    }
+  ]
 }

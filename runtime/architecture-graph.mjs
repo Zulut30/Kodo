@@ -195,6 +195,7 @@ async function sources(project, entries) {
 }
 
 /** An immutable graph, independent of checkout HEAD/cleanliness (the runner owns that fence). */
+// oxlint-disable-next-line max-lines-per-function, complexity -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
 export async function readArchitectureGraph({ project, headSha, policy }) {
   if (typeof project !== 'string' || !project || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(headSha || ''))
     throw failure('arguments');

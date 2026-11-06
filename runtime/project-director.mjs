@@ -92,6 +92,7 @@ function observation(run, kind) {
   if (kind === 'contract') return { directorBinding: run.directorBinding, task: run.task };
   return run[kind];
 }
+// oxlint-disable-next-line complexity -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
 async function validateRun({ store, engine, contracts, snapshot, run, publication = false }) {
   const options = { knownValues: known(engine) };
   contracts.assertDirectorSafe(run, options);
@@ -273,6 +274,7 @@ export function createProjectTransitionAuthorizer({ store, engine, contracts, ev
   };
 }
 
+// oxlint-disable-next-line max-lines-per-function -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
 export function createProjectDirector({
   repo,
   engine,
@@ -462,6 +464,7 @@ export function createProjectDirector({
     };
   }
 
+  // oxlint-disable-next-line max-lines-per-function -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
   async function foreground(id, options = {}) {
     let snapshot = await snapshotFor(id);
     if (snapshot.project.status === 'released') return { status: 'succeeded', projectStatus: 'released' };

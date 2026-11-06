@@ -24,6 +24,7 @@ const synchronous = value => {
  * All ports are synchronous pure A contracts, explicitly injected so importing
  * the planner never loads absent siblings or introduces default I/O.
  */
+// oxlint-disable-next-line max-lines-per-function, complexity -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
 export function planProjectHorizon(input, ports) {
   const contracts = ports?.contracts;
   if (
