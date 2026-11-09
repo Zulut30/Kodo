@@ -16,6 +16,7 @@
 
 - [Исполнение задач](RUNTIME.md) — подготовка проекта, режимы, план, маршрутизация, сбои, аудит и доставка.
 - [Project Director](PROJECTS.md) — offline backlog и foreground execution.
+- [Durable jobs](JOBS.md) — очередь заданий с арендами, восстановлением и однократной интеграцией.
 - [Контекст, вывод и очередь](EFFICIENCY.md) — компактный контекст и непрерывная очередь готовых задач.
 - [Research knowledge](KNOWLEDGE.md) — локальные знания и история источников.
 - [Парный benchmark](BENCHMARK.md) — сравнение Kodo и native-клиента.
@@ -41,6 +42,7 @@
 - [0006 — ступени CI и ёмкость пяти сессий](decisions/0006-tiered-ci-and-parallel-capacity.md)
 - [0007 — границы Architecture Guardian](decisions/0007-architecture-guardian.md)
 - [0008 — durable Project Director](decisions/0008-project-director.md)
+- [0009 — durable jobs](decisions/0009-durable-jobs.md)
 
 ## Архив проверок и журнал разработки
 

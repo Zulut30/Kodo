@@ -28,6 +28,8 @@ kodo project resume PROJECT_ID [--retry-failed] [--command-id UUID] [--json]
 kodo project cancel|pause PROJECT_ID [--command-id UUID] [--json]
 kodo project reprioritize PROJECT_ID TASK_ID --priority 0..100 [--command-id UUID] [--json]
 kodo project approve-risk PROJECT_ID TASK_ID --reason TEXT [--command-id UUID] [--json]
+kodo jobs list [--queue QUEUE] [--json]
+kodo jobs status JOB_ID [--json]
 kodo research status [--project PATH] [--json]
 kodo research refresh --input REL_JSON [--context REL_JSON] [--project PATH] [--json]
 kodo knowledge inspect [--subject TEXT] [--context REL_JSON] [--project PATH] [--json]
@@ -103,6 +105,13 @@ async function main() {
       process.removeListener('SIGINT', abort);
       process.removeListener('SIGTERM', abort);
     }
+    return;
+  }
+  if (command === 'jobs') {
+    const { jobsCli } = await import('../runtime/job-cli.mjs');
+    const result = await jobsCli(argv);
+    console.log(result.output);
+    process.exitCode = result.exitCode;
     return;
   }
   if (['research', 'knowledge'].includes(command)) {
