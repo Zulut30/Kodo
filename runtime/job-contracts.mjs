@@ -43,7 +43,7 @@ import { scopesOverlap } from './contracts.mjs';
 
 /** @typedef {Record<string, { available?: boolean, reason?: string }>} HostConnections */
 
-/** @typedef {{ admit: true } | { admit: false, reason: string, detail?: string }} AdmissionDecision */
+/** @typedef {{ admit: boolean, reason?: string, detail?: string }} AdmissionDecision `reason` is set when `admit` is false. */
 
 export const JOB_STATES = Object.freeze([
   'queued',
@@ -77,7 +77,7 @@ const holding = new Set(['running', 'waiting_quota', 'verifying', 'integrating']
 const unavailable = new Set(['blocked', 'failed', 'cancelled']);
 const transitions = {
   queued: ['running', 'blocked', 'cancelled'],
-  running: ['verifying', 'queued', 'waiting_quota', 'failed', 'cancelled'],
+  running: ['verifying', 'queued', 'waiting_quota', 'blocked', 'failed', 'cancelled'],
   waiting_quota: ['queued', 'cancelled'],
   verifying: ['integrating', 'cancelled'],
   integrating: ['integrated', 'verifying', 'blocked', 'cancelled'],
@@ -286,7 +286,7 @@ function conflictDecision(job, jobs) {
  */
 export function admission(job, { jobs, limits, hosts = {}, worker = {} }) {
   const pools = assertLimits(limits);
-  const deny = decision => ({ admit: /** @type {const} */ (false), ...decision });
+  const deny = decision => ({ admit: false, ...decision });
   const dependency = dependencyDecision(job, jobs);
   if (dependency) return deny(dependency);
   if (!hostStatus(job.spec.host, hosts).available) return deny({ reason: 'host_unavailable', detail: job.spec.host });
