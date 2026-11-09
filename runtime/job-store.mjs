@@ -378,7 +378,7 @@ function owned(ctx, id, token) {
 }
 
 /**
- * Renew a lease. A lost or cancelled job reports why so the worker stops.
+ * Renew an execution or integration lease. A lost or cancelled job reports why so the worker stops.
  * @param {JobContext} ctx
  * @param {string} id
  * @param {string} token
@@ -390,7 +390,8 @@ function heartbeat(ctx, id, token, { ttlMs } = {}) {
   return transaction(ctx, () => {
     const row = rowById(ctx, id);
     if (row.state === 'cancelled') return { ok: false, reason: 'cancelled' };
-    if (row.state !== 'running' || row.lease_token !== token) return { ok: false, reason: 'lease_lost' };
+    if (!['running', 'integrating'].includes(row.state) || row.lease_token !== token)
+      return { ok: false, reason: 'lease_lost' };
     ctx.db.prepare('UPDATE kodo_jobs SET lease_expires=? WHERE id=?').run(ctx.now() + ttl, id);
     return { ok: true };
   });
@@ -439,6 +440,26 @@ function failJob(ctx, id, token, { reason, retryable = true } = {}) {
     const retry = retryable && row.attempt < JSON.parse(row.spec).retry.maxAttempts;
     const state = retry ? 'queued' : 'failed';
     return view(update(ctx, row, { state, reason: safeReason(ctx, reason) ?? 'failed', ...noLease }, state));
+  });
+}
+
+/**
+ * Hand a running job back without a verdict (coordinator stop or pause). It
+ * returns to the queue and the interrupted claim does not count as an attempt.
+ * @param {JobContext} ctx
+ * @param {string} id
+ * @param {string} token
+ * @param {{ reason?: string }} [options]
+ */
+function release(ctx, id, token, { reason } = {}) {
+  return transaction(ctx, () => {
+    const row = owned(ctx, id, token);
+    const patch = {
+      state: 'queued',
+      attempt: Math.max(0, row.attempt - 1),
+      reason: safeReason(ctx, reason) ?? 'released',
+    };
+    return view(update(ctx, row, { ...patch, ...noLease }, 'released'));
   });
 }
 
@@ -642,6 +663,7 @@ export function openJobStore({ store, now = Date.now }) {
     complete: bind(complete),
     fail: bind(failJob),
     waitQuota: bind(waitQuota),
+    release: bind(release),
     beginIntegration: bind(beginIntegration),
     finishIntegration: bind(finishIntegration),
     abortIntegration: bind(abortIntegration),
