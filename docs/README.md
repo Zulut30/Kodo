@@ -68,7 +68,7 @@ npm run typecheck     # tsc --checkJs против baseline известных �
 npm run check         # validate + format:check + lint + typecheck + полная suite
 ```
 
-`npm run check` — обязательная проверка, её выполняет CI на Linux и Windows. Полная suite в основном интеграционная: в CI около 4 минут на Linux и 16–20 минут на Windows; одна команда CI ограничена 40 минутами; `test:fast` даёт обратную связь при правке, но не заменяет её.
+`npm run check` — обязательная проверка, её выполняет CI на Linux и Windows. Полная suite в основном интеграционная: в CI 3–4 минуты на Linux и 16–20 минут на Windows; одна команда CI ограничена 40 минутами; `test:fast` даёт обратную связь при правке, но не заменяет её.
 
 `typecheck` работает как храповик: новые диагностики `tsc --checkJs` валят проверку, а исправленные требуют `npm run typecheck -- --update`, чтобы baseline (`scripts/typecheck-baseline.json`) только уменьшался.
 

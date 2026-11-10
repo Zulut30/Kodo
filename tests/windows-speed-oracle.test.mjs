@@ -351,7 +351,7 @@ test('Windows speed oracle: runCi retains real profiled timeout tails bounded re
       assert.equal(options.command, process.execPath);
       assert.deepEqual(options.args, ['scripts/package-smoke.mjs']);
       // The owned child uses a short local deadline; runCi still supplies its
-      // unchanged public 20-minute deadline. No whole-suite command executes.
+      // public 40-minute deadline. No whole-suite command executes.
       try { return await runProfiledCommand({ ...options, env: childEnv(), timeoutMs: 2000 }); }
       catch (error) {
         // Untrusted producer metadata must not be spread into the public receipt.

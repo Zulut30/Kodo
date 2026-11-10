@@ -357,7 +357,7 @@ $audit.skills.stages | Where-Object { -not $_.valid }
 
 ### Deadline, завершение процессов и cleanup выпуска
 
-У self-project команды `npm run check` задан `timeoutMs: 1200000` (20 минут). В `releasePackage` тот же ограниченный fallback действует отдельно для каждой test/build-команды; явно заданный `timeoutMs` имеет приоритет. Остальные delivery-команды сохраняют свой deadline, по умолчанию 120000 мс.
+У self-project команды `npm run check` задан `timeoutMs: 1800000` (30 минут). В `releasePackage` для каждой test/build-команды отдельно действует ограниченный fallback 1200000 мс (20 минут); явно заданный `timeoutMs` имеет приоритет. Остальные delivery-команды сохраняют свой deadline, по умолчанию 120000 мс.
 
 Обычный `Engine.checks` также передаёт `command.timeoutMs` каждой test/build-команде. Без этого поля сохраняется default общего executor — 1800000 мс (30 минут); `0` означает немедленный deadline. Для test/build/deploy/smoke принимаются только целые числовые значения от 0 до 2147483647 включительно. Отрицательные, дробные, строковые, `null`, нечисловые и бесконечные значения, а также превышение предела дают `configuration` с путём `commands.<kind>[<index>].timeoutMs`. Проверка выполняется при чтении config и повторно для saved run до подготовки/доставки; `checks` проверяет её до setup и reuse квитанций. Это исключает приведение и переполнение Node timer в старых сохранённых запусках.
 
