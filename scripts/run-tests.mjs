@@ -56,6 +56,7 @@ export const fastTests = [
   'tests/context-manifest.test.mjs',
   'tests/context-pack.test.mjs',
   'tests/contract-registry.test.mjs',
+  'tests/delivery-operations.test.mjs',
   'tests/efficiency-acceptance.test.mjs',
   'tests/fast-path.test.mjs',
   'tests/job-cli.test.mjs',

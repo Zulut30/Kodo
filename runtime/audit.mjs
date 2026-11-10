@@ -103,7 +103,12 @@ export function buildAuditReport(run) {
     published: 'boolean',
   });
   if (release && Object.hasOwn(run.release, 'smoke'))
-    release.smoke = receipt(run.release.smoke, { passed: 'boolean', node: 'string', platform: 'string' });
+    release.smoke = receipt(run.release.smoke, {
+      passed: 'boolean',
+      node: 'string',
+      platform: 'string',
+      artifactSha256: 'string',
+    });
   return {
     schemaVersion: 1,
     runId: stringOrNull(run.id),

@@ -61,6 +61,7 @@ async function pins() {
     'delivery-process.mjs',
     'delivery-context.mjs',
     'delivery-release.mjs',
+    'delivery-operations.mjs',
     'config.mjs',
     'engine.mjs',
     'engine-core.mjs',

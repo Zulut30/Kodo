@@ -16,7 +16,7 @@ MVP Project Director реализован. Фактическая приёмка
 | 08 Context/budget | **CANDIDATE**, ветка `kodo/08-context-budget`: ContextManifest каждой сессии, детерминированный быстрый путь для правок стилей, сохраняемые лимиты `budgets.sessions`/`budgets.contextBytes`; адаптеры T3/Orca и TokenEconomizer не сделаны | [Phase08](phase-08.md); приёмка — после CI и merge PR этапа |
 | 09 Verification/evolution | **CANDIDATE**, ветка `kodo/09-behavior-gate`: behaviour gate перед ревью (защита тестов, оракулы проекта, политика по типу изменения), необязательный базовый прогон; OpenCodeReview и Evolution Gate не сделаны | [Phase09](phase-09.md); приёмка — после CI и merge PR этапа |
 | 10 Progress/maintenance | **CANDIDATE**, ветка `kodo/10-watchdog`: прогресс только по принятым критериям, необязательный порог `watchdog.stalledRounds`, отказ узлу без изменений (`rejectUnchanged`), текущий блокер с историей в Run и `progress.md`; очередь maintenance и ai-memory не сделаны | [Phase10](phase-10.md); приёмка — после CI и merge PR этапа |
-| 11 Merge/release | NOT STARTED | После10: immutable queue/recovery/smoke |
+| 11 Merge/release | **CANDIDATE**, ветка `kodo/11-delivery-recovery`: аудит существующей доставки, журнал операций с состоянием `uncertain`, привязка проверки установленного пакета к SHA-256, статус развёртывания `not_configured`; batch merge и адаптеры развёртывания не сделаны | [Phase11](phase-11.md); приёмка — после CI и merge PR этапа |
 | 12 Observability | NOT STARTED; benchmark campaigns отложены пользователем | После11: реальные operational metrics/JSON; неизвестные метрики null |
 | 13 Final acceptance | NOT STARTED | После12: реальные сценарии и проверенный выпуск |
 

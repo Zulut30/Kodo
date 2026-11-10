@@ -20,6 +20,7 @@ import {
   assertFreshRelease,
   execute,
 } from '../runtime/delivery.mjs';
+import { deliveryOperations, uncertainOperations } from '../runtime/delivery-operations.mjs';
 
 const digest = value => createHash('sha256').update(value).digest('hex');
 const receiptSchema = {
@@ -38,12 +39,13 @@ const receiptSchema = {
     smoke: {
       type: 'object',
       additionalProperties: false,
-      required: ['passed', 'commands', 'node', 'platform'],
+      required: ['passed', 'commands', 'node', 'platform', 'artifactSha256'],
       properties: {
         passed: { const: true },
         commands: { type: 'array', minItems: 1, items: { type: 'string' } },
         node: { type: 'string' },
         platform: { type: 'string' },
+        artifactSha256: { type: 'string', pattern: '^[a-f0-9]{64}$' },
       },
     },
   },
@@ -2316,4 +2318,88 @@ test('Release freshness fetches a newly announced tag before resolving its commi
   assert.equal(await ctx.git('rev-parse', 'refs/tags/v0.1.0^{commit}'), ctx.run.baseSha);
   assert.equal(ctx.state.publishes, 1);
   assert.equal(ctx.leases.size, 0);
+});
+
+const operations = ctx => Object.fromEntries(deliveryOperations(ctx.events).map(item => [item.operation, item.status]));
+const timeoutAfter = (ctx, matches) => {
+  const runner = ctx.exec;
+  let fired = 0;
+  ctx.exec = async (command, args, options) => {
+    const result = await runner(command, args, options);
+    if (command === 'gh' && matches(args) && !fired++)
+      throw Object.assign(new Error('network timeout after the remote accepted the request'), { code: 'timeout' });
+    return result;
+  };
+};
+
+test('A network timeout after a successful remote merge is settled by read-back, never by a second merge', async t => {
+  const ctx = await fixture(t);
+  timeoutAfter(ctx, args => args[0] === 'pr' && args[1] === 'merge');
+  const receipt = await deliver(ctx);
+  assert.equal(receipt.mergeCommit, ctx.run.headSha);
+  assert.equal(ctx.state.merges, 1);
+  assert.deepEqual(operations(ctx), { pr: 'confirmed', merge: 'reconciled' });
+  assert.deepEqual(uncertainOperations(ctx.events), []);
+  // A later delivery of the same run finds the merge by read-back and sends no command.
+  assert.equal((await deliver(ctx)).mergeCommit, receipt.mergeCommit);
+  assert.equal(ctx.state.merges, 1);
+  assert.equal(ctx.state.creates, 1);
+  assert.equal(ctx.leases.size, 0);
+});
+
+test('A crash between the remote merge and its saved receipt leaves an uncertain operation that resume reconciles', async t => {
+  const ctx = await fixture(t),
+    save = ctx.store.updateRun;
+  let crash = true,
+    persisted;
+  ctx.store.updateRun = (id, patch) => {
+    if (crash && patch.delivery?.mergeCommit) {
+      crash = false;
+      throw new Error('process died before the receipt was saved');
+    }
+    if (patch.delivery) persisted = structuredClone(patch.delivery);
+    return save(id, patch);
+  };
+  await assert.rejects(deliver(ctx), /process died/);
+  assert.equal(ctx.state.merges, 1, 'the remote merge happened');
+  // A new process loads what was actually persisted: the PR, but no merge receipt.
+  ctx.run.delivery = persisted;
+  assert.equal(ctx.run.delivery.pr.number, 7);
+  assert.equal(ctx.run.delivery.mergeCommit, undefined, 'the saved state does not know about the merge');
+  assert.deepEqual(uncertainOperations(ctx.events), ['merge'], 'the journal says the effect is uncertain');
+  assert.equal(ctx.leases.size, 0);
+
+  const receipt = await deliver(ctx);
+  assert.equal(receipt.mergeCommit, ctx.run.headSha);
+  assert.equal(ctx.state.merges, 1, 'resume read the remote state back instead of merging again');
+  assert.deepEqual(operations(ctx), { pr: 'confirmed', merge: 'reconciled' });
+  assert.equal(deliveryOperations(ctx.events).find(item => item.operation === 'merge').attempts, 1);
+});
+
+test('A timeout after the release assets were uploaded completes the same draft without a second upload', async t => {
+  const ctx = await fixture(t);
+  const delivered = await deliver(ctx);
+  timeoutAfter(ctx, args => args[0] === 'release' && args[1] === 'create');
+  await assert.rejects(releasePackage({ ...ctx, mergeCommit: delivered.mergeCommit }), { code: 'timeout' });
+  assert.deepEqual([ctx.state.releaseCreates, ctx.state.publishes], [1, 0]);
+  assert.deepEqual(uncertainOperations(ctx.events), ['release']);
+
+  const release = await releasePackage({ ...ctx, mergeCommit: delivered.mergeCommit });
+  assert.equal(validateReceipt(release), true, JSON.stringify(validateReceipt.errors));
+  assert.deepEqual([ctx.state.releaseCreates, ctx.state.uploads, ctx.state.publishes], [1, 0, 1]);
+  assert.equal(operations(ctx).release, 'reconciled');
+  assert.equal(release.sha256, digest(await readFile(path.join(ctx.assets, release.artifact))));
+  assert.equal(release.smoke.artifactSha256, release.sha256, 'the smoke ran on the bytes the receipt publishes');
+  assert.equal(ctx.leases.size, 0);
+});
+
+test('A recovered published release re-runs the installed smoke on the downloaded bytes of the same checksum', async t => {
+  const ctx = await fixture(t);
+  const delivered = await deliver(ctx);
+  const release = await releasePackage({ ...ctx, mergeCommit: delivered.mergeCommit });
+  assert.equal(operations(ctx).release, 'confirmed');
+  const resumed = await releasePackage({ ...ctx, mergeCommit: delivered.mergeCommit });
+  assert.equal(resumed.smoke.artifactSha256, release.sha256);
+  assert.equal(operations(ctx).release, 'reconciled');
+  assert.equal(ctx.state.publishes, 1);
 });

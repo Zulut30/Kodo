@@ -3,6 +3,7 @@ import { access, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, writeFil
 import os from 'node:os';
 import path from 'node:path';
 import { sha256, fail, parse } from './delivery-process.mjs';
+import { operationIntent, operationOutcome } from './delivery-operations.mjs';
 import {
   context,
   validateRepository,
@@ -35,6 +36,8 @@ async function pack(ctx, source, destination) {
 }
 
 async function smokePackage(ctx, artifact, directory, manifest) {
+  // The smoke receipt names the exact bytes it installed.
+  const artifactSha256 = sha256(await readFile(artifact));
   const install = path.join(directory, 'install');
   await mkdir(install);
   await ctx.command('npm', ['install', '--prefix', install, '--ignore-scripts', '--no-audit', '--no-fund', artifact], {
@@ -80,7 +83,14 @@ async function smokePackage(ctx, artifact, directory, manifest) {
     commands: ['kodo --help', 'kodo list --json', 'kodo validate --json'],
     node: process.version,
     platform: process.platform,
+    artifactSha256,
   };
+}
+
+/** An installed smoke counts only for the artifact whose checksum the receipt publishes. */
+function assertSmokeBinding(smoke, checksum) {
+  if (smoke?.passed !== true || smoke.artifactSha256 !== checksum)
+    throw fail('release_conflict', 'Installed smoke was not run on the published artifact');
 }
 
 async function writeMetadata(filename, content) {
@@ -383,8 +393,14 @@ export async function releasePackage(options) {
       if (manifest.version !== savedReceipt.version)
         throw fail('release_conflict', 'Saved release version differs from its exact commit');
       const smoke = await smokePackage(ctx, info.downloadedArtifact, directory, manifest);
+      assertSmokeBinding(smoke, savedReceipt.sha256);
       const receipt = { ...savedReceipt, url: info.url, smoke };
       await ctx.save({ delivery: { ...ctx.run.delivery, release: receipt } });
+      await operationOutcome(ctx, 'release', 'reconciled', {
+        tag: receipt.tag,
+        commit: candidate,
+        sha256: receipt.sha256,
+      });
       return receipt;
     }
     source = path.join(directory, 'source');
@@ -477,6 +493,7 @@ export async function releasePackage(options) {
       }
     }
     const smoke = await smokePackage(ctx, artifactPath, directory, manifest);
+    assertSmokeBinding(smoke, checksum);
     if (!existing) {
       await assertCandidateFresh(ctx, candidate, version, latest);
       const latestBeforePublish = (await publishedReleases(ctx)).at(-1);
@@ -492,6 +509,7 @@ export async function releasePackage(options) {
       await writeFile(notes, content);
     }
     return await ctx.irreversible(async () => {
+      await operationIntent(ctx, 'release', { tag, commit: candidate, sha256: checksum });
       if (existingInfo) {
         // A process can die after creating the release but before uploading every
         // asset. Upload only absent names; never replace an existing asset.
@@ -574,6 +592,12 @@ export async function releasePackage(options) {
       };
       await ctx.save({ delivery: { ...ctx.run.delivery, mergeCommit: candidate, release: receipt } });
       await ctx.event('delivery.released', receipt);
+      // `existingInfo` is a release found on the remote: publication was completed, not started, by this call.
+      await operationOutcome(ctx, 'release', existingInfo ? 'reconciled' : 'confirmed', {
+        tag,
+        commit: candidate,
+        sha256: checksum,
+      });
       return receipt;
     });
   } catch (error) {

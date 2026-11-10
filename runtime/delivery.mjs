@@ -5,6 +5,7 @@ import { isCurrentUIReceipt, uiConfigHash } from './ui-verification.mjs';
 import { isCurrentSecurityReceipt, securityConfigHash } from './security-gates.mjs';
 import { isCurrentArchitectureReceipt, architectureConfigHash } from './architecture-gate.mjs';
 import { sha256, fail, parse, wait } from './delivery-process.mjs';
+import { operationIntent, operationOutcome } from './delivery-operations.mjs';
 import {
   context,
   validateRepository,
@@ -75,6 +76,8 @@ export async function reconcileDelivery(options) {
   const expectedHead = saved.reviewedHead || options.review?.headSha || ctx.run.review?.headSha || ctx.run.headSha;
   const receipt = mergedReceipt(ctx, previous, saved, expectedHead);
   await ctx.save({ delivery: receipt });
+  // Found by reading the remote state back: no merge command is sent again.
+  await operationOutcome(ctx, 'merge', 'reconciled', { pr: receipt.pr.number, mergeCommit: receipt.mergeCommit });
   return receipt;
 }
 
@@ -225,6 +228,7 @@ export async function deliver(options) {
         filename,
         `${ctx.run.task}\n\nImplemented and checked by Kodo.\n\n- Run: \`${ctx.run.id}\`\n- Reviewed head: \`${head}\`\n- Diff SHA-256: \`${diffHash}\`\n\n<!-- kodo-run:${ctx.run.id} -->\n`,
       );
+      await operationIntent(ctx, 'pr', { head });
       const url = await ctx.command('gh', [
         'pr',
         'create',
@@ -253,6 +257,8 @@ export async function deliver(options) {
   saved = { ...saved, pr: { number: pr.number, url: pr.url }, reviewedHead: head, diffHash };
   await ctx.save({ delivery: saved });
   await ctx.event('delivery.pr_created', { pr: saved.pr });
+  // `matches[0]` means the PR was found by listing the branch, not created by this call.
+  await operationOutcome(ctx, 'pr', matches[0] ? 'reconciled' : 'confirmed', { pr: pr.number, head });
   if (pr.state === 'MERGED') {
     const merged = await getPr(ctx, pr.number);
     const receipt = mergedReceipt(ctx, merged, saved, saved.reviewedHead || head);
@@ -317,6 +323,7 @@ export async function deliver(options) {
       await verifyReview(ctx);
     return await ctx.irreversible(async () => {
       let mergeError;
+      await operationIntent(ctx, 'merge', { pr: pr.number, head });
       try {
         await ctx.command(
           'gh',
@@ -328,6 +335,7 @@ export async function deliver(options) {
       }
       const merged = await getPr(ctx, pr.number);
       if (merged.state !== 'MERGED' || !merged.mergeCommit?.oid) {
+        await operationOutcome(ctx, 'merge', 'absent', { pr: pr.number, head });
         if ((await fetchBase(ctx)) !== ctx.run.baseSha)
           throw fail('stale_base', 'Target branch changed while merging; synchronize and retry');
         if (mergeError) throw mergeError;
@@ -336,6 +344,11 @@ export async function deliver(options) {
       const receipt = mergedReceipt(ctx, merged, saved, saved.reviewedHead || head);
       await ctx.save({ delivery: receipt });
       await ctx.event('delivery.merged', { pr: receipt.pr, mergeCommit: receipt.mergeCommit });
+      // A command error followed by a confirmed merge is an uncertain effect resolved by read-back.
+      await operationOutcome(ctx, 'merge', mergeError ? 'reconciled' : 'confirmed', {
+        pr: receipt.pr.number,
+        mergeCommit: receipt.mergeCommit,
+      });
       return receipt;
     });
   } finally {
