@@ -148,7 +148,9 @@ const hints = {
  */
 export function recordBlocker(blockers, { code, message, scope, at, headSha = null, reasons = [], evidence = [] }) {
   const text = String(message ?? '').slice(0, 2000);
-  const signature = hash(JSON.stringify([code, scope, headSha]));
+  // A stop with its own place and reason is the same blocker whatever its wording. A generic
+  // run-level error has no such identity, so there its text is part of it.
+  const signature = hash(JSON.stringify([code, scope, headSha, scope === 'run' ? text : null]));
   let history = blockers?.history || [],
     current = blockers?.current;
   // A resume that stops for the same reason continues the same blocker instead of piling up copies.
@@ -195,45 +197,41 @@ export function resolveBlocker(blockers, { at, outcome }) {
   };
 }
 
-/** Line-comment and block-comment syntax by file extension. An unknown extension is never judged cosmetic. */
-const cLike = { line: /^\s*\/\//, block: true };
-const hashLike = { line: /^\s*#(?!!)/, block: false };
-const syntaxes = {
-  ...Object.fromEntries(
-    'js mjs cjs jsx ts mts cts tsx java c h cc cpp hpp cs go rs kt kts swift scala scss less'
-      .split(' ')
-      .map(ext => [ext, cLike]),
-  ),
-  css: { line: null, block: true },
-  ...Object.fromEntries('py rb sh bash zsh yml yaml toml'.split(' ').map(ext => [ext, hashLike])),
+/**
+ * The only files judged: plain JS/TS and Python. A line comment there is a comment unless the file
+ * has a construct in which a line starting with the marker can be text: a template literal
+ * (backtick) in JS/TS, a triple-quoted string in Python. JSX, shell, YAML, CSS and every other
+ * type are never judged: block comments, heredocs and block scalars need a parser.
+ */
+const judged = {
+  ...Object.fromEntries('js mjs cjs ts mts cts'.split(' ').map(ext => [ext, { comment: /^\s*\/\/(.*)$/, text: /`/ }])),
+  py: { comment: /^\s*#(.*)$/, text: /"""|'''/ },
 };
-const MAX_COSMETIC_FILES = 50;
+/** Comments that tools read: suppressions, build tags, source maps, encodings, shebangs, doc tests. */
+const directive =
+  /^\s*(?:[@#!/]|[\w.-]+-(?:ignore|disable|enable|expect|lint)\b|(?:eslint|oxlint|prettier|istanbul|c8|v8|jest|vitest|stryker|biome|deno|jshint|tslint|webpack|sourceMappingURL|noqa|pragma|pylint|mypy|type|fmt|isort|flake8|ruff|coding|frozen_string_literal)\b)/i;
+const MAX_COSMETIC_FILES = 20;
+const MAX_COSMETIC_BYTES = 1048576;
 
-function commentOnly(line, syntax) {
-  if (!line.trim()) return true;
-  if (syntax.line?.test(line)) return true;
-  if (!syntax.block) return false;
-  // `/* note */ code` is code: a block comment line may have nothing after its end.
-  if (/^\s*\/\*/.test(line)) return !line.includes('*/') || /\*\/\s*$/.test(line);
-  // A continuation line of a block comment. `*ptr = x;` and `*gen() {` are code.
-  return /^\s*\*(?:\s|\/\s*$|$)/.test(line) && !/[;{]\s*$/.test(line);
-}
+/** Git output as it is: a redacted path or line would no longer be the path or the line. */
+const gitRaw = async (cwd, args) =>
+  (await execute('git', ['--literal-pathspecs', ...args], { cwd, rawOutput: true, allowFailure: true })).stdout;
 
 /**
  * True only when the staged change against `baseSha` is certainly cosmetic:
- * nothing changed, or every changed line of every modified file is blank, a
- * comment, or differs in trailing whitespace. Anything else counts as real
- * work: added, deleted or renamed files, mode changes, binary files,
- * indentation (it is meaning in Python and YAML), unknown file types.
+ * nothing changed, or every changed line of every modified file is blank or a
+ * plain line comment in a file where that judgement is safe. Everything else
+ * counts as real work, and that includes whatever this function cannot judge:
+ * added, deleted or renamed files, mode changes, binary files, indentation and
+ * trailing whitespace, other file types, block comments, tool directives.
+ * It may miss a cosmetic change; it must not call real work cosmetic.
  * @param {string} cwd
  * @param {string} baseSha
  */
 export async function cosmeticOnly(cwd, baseSha) {
   await execute('git', ['add', '-A'], { cwd });
   const base = ['diff', '--cached', '--no-color', '--no-ext-diff', '--no-renames'];
-  const status = (await execute('git', [...base, '--name-status', '-z', baseSha, '--'], { cwd })).stdout
-    .split('\0')
-    .filter(Boolean);
+  const status = (await gitRaw(cwd, [...base, '--name-status', '-z', baseSha, '--'])).split('\0').filter(Boolean);
   if (!status.length) return true;
   const files = [];
   for (let index = 0; index < status.length; index += 2) {
@@ -241,22 +239,32 @@ export async function cosmeticOnly(cwd, baseSha) {
     files.push(status[index + 1]);
   }
   if (files.length > MAX_COSMETIC_FILES) return false;
-  if (/^ mode change /m.test((await execute('git', [...base, '--summary', baseSha, '--'], { cwd })).stdout))
-    return false;
+  if (/^ mode change /m.test(await gitRaw(cwd, [...base, '--summary', baseSha, '--']))) return false;
   for (const file of files) {
-    const syntax = syntaxes[file.slice(file.lastIndexOf('.') + 1).toLowerCase()];
+    const syntax = judged[file.slice(file.lastIndexOf('.') + 1).toLowerCase()];
     if (!syntax) return false;
-    const diff = await execute(
-      'git',
-      [...base, '-U0', '--ignore-space-at-eol', '--ignore-cr-at-eol', '--ignore-blank-lines', baseSha, '--', file],
-      { cwd },
-    );
-    if (/^Binary files /m.test(diff.stdout)) return false;
-    const changed = diff.stdout
+    // Both sides of the file must be free of constructs that can hold comment-looking text.
+    for (const revision of [`${baseSha}:${file}`, `:${file}`]) {
+      const content = await gitRaw(cwd, ['show', revision]);
+      if (!content || Buffer.byteLength(content) > MAX_COSMETIC_BYTES || content.includes('\0')) return false;
+      if (syntax.text.test(content)) return false;
+    }
+    const diff = await gitRaw(cwd, [...base, '-U0', baseSha, '--', file]);
+    const hunks = diff.indexOf('\n@@');
+    if (hunks < 0) return false; // Listed as modified but no text hunk: binary or unreadable.
+    const changed = diff
+      .slice(hunks + 1)
       .split('\n')
-      .filter(line => /^[+-]/.test(line) && !/^(?:\+\+\+|---) /.test(line))
+      .filter(line => line.startsWith('+') || line.startsWith('-'))
       .map(line => line.slice(1));
-    if (!changed.every(line => commentOnly(line, syntax))) return false;
+    for (const line of changed) {
+      if (!line.trim()) {
+        if (line !== '') return false; // Whitespace on a line may matter; an empty line does not.
+        continue;
+      }
+      const comment = syntax.comment.exec(line);
+      if (!comment || directive.test(comment[1])) return false;
+    }
   }
   return true;
 }

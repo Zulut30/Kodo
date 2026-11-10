@@ -16,7 +16,8 @@ function blockerLines(run) {
   if (blocker?.current) {
     const current = blocker.current;
     lines.push(
-      `Current blocker: ${short(current.code, 60)} [${short(current.scope, 60)}] ${short(current.message, 600)}`,
+      // The latest wording first: an earlier text must not pass for the present failure.
+      `Current blocker: ${short(current.code, 60)} [${short(current.scope, 60)}] ${short(current.lastMessage ?? current.message, 600)}`,
       `Seen ${short(current.occurrences, 6)} time(s): first ${short(current.firstSeen, 40)}, last ${short(current.lastSeen, 40)}; commit ${short(current.headSha, 64)}`,
     );
     for (const hypothesis of (current.hypotheses || []).slice(0, 4))
@@ -31,7 +32,7 @@ function blockerLines(run) {
   } else if (run.error)
     // After a resume the saved error is the previous attempt's, not what blocks the run now.
     lines.push(
-      `${!blocker ? 'Pending blocker' : run.state === 'cancelled' ? 'Stopped' : 'Last error (previous attempt, not the current blocker)'}: ${short(run.error.code, 60)} ${short(run.error.message, 600)}`,
+      `${run.state === 'cancelled' ? 'Stopped' : !blocker ? 'Pending blocker' : 'Last error (previous attempt, not the current blocker)'}: ${short(run.error.code, 60)} ${short(run.error.message, 600)}`,
     );
   if (blocker?.history?.length) {
     lines.push(`Earlier blockers: ${blocker.history.length}`);

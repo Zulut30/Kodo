@@ -205,3 +205,28 @@ test('A real fix after an explicit retry cycle succeeds and leaves no current bl
   assert.deepEqual([result.watchdog.stalled, result.watchdog.stopped], [0, undefined]);
   assert.doesNotMatch(await progress(result), /Current blocker|Pending blocker/);
 });
+
+test('When two nodes stop together the blocker names the node whose error stopped the run', async t => {
+  const fx = await fixture(t, { config: { repairRounds: 1, researchBudget: 0 }, testScript: 'process.exit(0);\n' });
+  const bothRunning = Promise.withResolvers();
+  let running = 0;
+  const services = fakeServices({
+    plan: {
+      summary: 'Two independent files',
+      tasks: [node('alpha', 'developer', ['out/alpha.txt']), node('beta', 'developer', ['out/beta.txt'])],
+    },
+    onWorker: async () => {
+      if (++running === 2) bothRunning.resolve();
+      await bothRunning.promise;
+      return { sessionId: 'stuck', output: { summary: 'cannot finish', checks: [], complete: false } };
+    },
+  });
+  const engine = new Engine({ store: fx.openStore(), ...services });
+  const result = await engine.run((await engine.create('Two files', { project: fx.project })).id);
+  assert.equal(result.state, 'blocked');
+  assert.deepEqual([result.nodes.alpha.status, result.nodes.beta.status], ['blocked', 'blocked']);
+  const { scope, message } = result.blocker.current;
+  assert.ok(['alpha', 'beta'].includes(scope));
+  assert.match(message, new RegExp(`в ${scope}:|${scope}:`), 'the scope and the text describe the same node');
+  assert.deepEqual(result.blocker.current.evidence, [], 'check output does not explain a node stop');
+});

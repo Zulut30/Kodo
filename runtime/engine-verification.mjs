@@ -124,7 +124,7 @@ export class EngineVerification extends EngineExecution {
           `Behaviour gate failed; a review report cannot override it: ${JSON.stringify(redact(run.behavior.findings.slice(0, 20), this.secrets))}`,
         ),
         // Only a person can fix a finding such as a required gate that the project disabled.
-        { code: run.behavior.repairable ? 'behavior_failed' : 'behavior_blocked' },
+        { code: run.behavior.repairable ? 'behavior_failed' : 'behavior_blocked', scope: 'verification' },
       );
   }
   async checks(run, signal) {

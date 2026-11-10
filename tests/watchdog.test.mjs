@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { buildProgress } from '../runtime/progress.mjs';
@@ -148,10 +148,10 @@ test('The same blocker is counted, a different one moves the old into history, a
   );
   assert.equal(resolveBlocker(blockers, { at: at(4), outcome: 'succeeded' }), blockers, 'nothing current to resolve');
   // The resumed run stops for the same reason on the same commit: one blocker, not another copy.
-  const again = recordBlocker(blockers, { code: 'quota', message: 'limit reached again', scope: 'run', at: at(4) });
+  const again = recordBlocker(blockers, { code: 'quota', message: 'limit reached', scope: 'run', at: at(4) });
   assert.deepEqual(
     [again.current.occurrences, again.current.firstSeen, again.current.lastSeen, again.current.lastMessage],
-    [2, at(2), at(4), 'limit reached again'],
+    [2, at(2), at(4), 'limit reached'],
   );
   assert.deepEqual(
     again.history.map(item => item.code),
@@ -159,6 +159,23 @@ test('The same blocker is counted, a different one moves the old into history, a
     'the resumed entry left the history',
   );
   assert.equal(again.current.endedAt, undefined);
+  // A run-level stop has no place or reason of its own: another text is another failure.
+  const other = recordBlocker(blockers, { code: 'quota', message: 'a different failure', scope: 'run', at: at(4) });
+  assert.deepEqual(
+    [other.current.occurrences, other.current.message, other.history.length],
+    [1, 'a different failure', 2],
+  );
+  // A stop with its own place and reason keeps its identity when only the wording changes, and shows the latest wording.
+  let worded = recordBlocker(undefined, { code: 'no_progress', message: 'first text', scope: 'node-a', at: at(0) });
+  worded = recordBlocker(worded, { code: 'no_progress', message: 'second text', scope: 'node-a', at: at(1) });
+  assert.deepEqual(
+    [worded.current.occurrences, worded.current.message, worded.current.lastMessage],
+    [2, 'first text', 'second text'],
+  );
+  assert.match(
+    buildProgress({ id: 'run-1', state: 'blocked', nodes: {}, blocker: worded }),
+    /Current blocker: no_progress \[node-a\] second text/,
+  );
   const moved = recordBlocker(blockers, {
     code: 'quota',
     message: 'limit',
@@ -210,6 +227,11 @@ test('The recovery summary shows the current blocker and never presents an older
     error: { code: 'cancelled', message: 'stopped by user' },
   });
   assert.match(cancelled, /Stopped: cancelled stopped by user/);
+  // A run cancelled before it ever stopped has no blocker record yet.
+  assert.match(
+    buildProgress({ ...run, state: 'cancelled', error: { code: 'cancelled', message: 'stopped by user' } }),
+    /Stopped: cancelled stopped by user/,
+  );
   assert.doesNotMatch(cancelled, /previous attempt/);
   assert.doesNotMatch(
     buildProgress({ ...run, blocker, watchdog: { stalled: 0 } }),
@@ -222,7 +244,7 @@ test('The recovery summary shows the current blocker and never presents an older
   );
 });
 
-test('Only a certain cosmetic change is cosmetic: comments, blank lines, trailing spaces, or nothing', async t => {
+test('Only a certain cosmetic change is cosmetic; whatever cannot be judged safely is real work', async t => {
   const cwd = mkdtempSync(path.join(os.tmpdir(), 'kodo-cosmetic-'));
   t.after(() => rmSync(cwd, { recursive: true, force: true }));
   const git = (...args) => {
@@ -231,16 +253,28 @@ test('Only a certain cosmetic change is cosmetic: comments, blank lines, trailin
     return result.stdout.trim();
   };
   const files = {
-    'math.mjs': 'export function add(a, b) {\n  return a + b;\n}\n',
+    'math.mjs': 'export function add(a, b) {\n  // sum\n  return a + b;\n}\n',
     'counter.mjs': 'export class Counter {\n  #count = 0;\n  *each() {\n    yield this.#count;\n  }\n}\n',
+    'template.mjs': 'export const prompt = `\n// Role: reviewer\nBe strict.\n`;\n',
+    'area.mjs': 'export const area = (width, height) =>\n  width\n  * height;\n',
+    'toggle.mjs': 'export function start() {}\n/*\nstart();\n*/\n',
+    // The long path segment looks like a credential to output redaction.
+    'src/task-management-service/handler.mjs': 'export const limit = 1;\n',
+    'view.tsx': 'export const View = () => (\n  <p>\n    // shown to the user\n  </p>\n);\n',
     'total.py':
       'def total(items):\n    result = 0\n    for item in items:\n        result += item\n        return result\n',
+    'prompt.py': 'PROMPT = """\n# Role\nBe strict.\n"""\n',
     'run.sh': '#!/bin/sh\n# start\nnode app.mjs \\\n  --port 80\n',
     'deploy.yml': 'steps:\n  # build first\n  - run: build\n',
+    'theme.css': '/* palette */\n* { box-sizing: border-box; }\n',
     'query.sql': '-- totals\nSELECT 1;\n',
     'pointer.c': 'void set(int *ptr) {\n  *ptr = 1;\n}\n',
+    'blob.mjs': 'export const data = "\u0000\u0001";\n',
   };
-  for (const [name, content] of Object.entries(files)) writeFileSync(path.join(cwd, name), content);
+  for (const [name, content] of Object.entries(files)) {
+    mkdirSync(path.dirname(path.join(cwd, name)), { recursive: true });
+    writeFileSync(path.join(cwd, name), content);
+  }
   git('init', '-b', 'main');
   git('config', 'user.name', 'Cosmetic Test');
   git('config', 'user.email', 'cosmetic@example.invalid');
@@ -255,27 +289,60 @@ test('Only a certain cosmetic change is cosmetic: comments, blank lines, trailin
   assert.equal(await cosmeticOnly(cwd, base), true, 'no change at all');
   const edit = (name, change) => [name, files[name], change];
   for (const [label, [name, content, change], expected] of [
-    ['line comment', edit('math.mjs', text => `// analysis: looks correct\n${text}`), true],
-    ['block comment and blank lines', edit('math.mjs', text => `/*\n * notes\n */\n\n${text}\n\n`), true],
-    ['trailing spaces', edit('math.mjs', text => text.replace('a + b;', 'a + b;   ')), true],
-    ['python comment', edit('total.py', text => `# reviewed\n${text}`), true],
-    ['yaml comment', edit('deploy.yml', text => text.replace('# build first', '# build before test')), true],
+    // Certainly cosmetic.
+    ['js line comment added', edit('math.mjs', text => `// analysis: looks correct\n${text}`), true],
+    ['js line comment reworded', edit('math.mjs', text => text.replace('// sum', '// the sum of both')), true],
+    ['js empty lines', edit('math.mjs', text => `\n${text}\n`), true],
+    ['python line comment', edit('total.py', text => `# reviewed\n${text}`), true],
+    // Real behaviour.
     ['behaviour', edit('math.mjs', text => text.replace('a + b', 'a - b')), false],
     ['comment plus behaviour', edit('math.mjs', text => `// fix\n${text.replace('a + b', 'b + a')}`), false],
-    // Indentation is meaning in Python: moving `return` out of the loop is a real fix.
     ['python indentation', edit('total.py', text => text.replace('        return', '    return')), false],
     ['js indentation', edit('math.mjs', text => text.replace('  return', '      return')), false],
     ['private field', edit('counter.mjs', text => text.replace('#count = 0', '#count = 1')), false],
     ['generator', edit('counter.mjs', text => text.replace('*each() {', '*every() {')), false],
-    ['pointer write', edit('pointer.c', text => text.replace('*ptr = 1;', '*ptr = 2;')), false],
+    ['operator at line start', edit('area.mjs', text => text.replace('* height', '* (height + 1)')), false],
+    ['decrement removed', edit('math.mjs', text => text.replace('  return a + b;', '  -- a;\n  return a + b;')), false],
+    [
+      'redacted-looking path',
+      edit('src/task-management-service/handler.mjs', text => text.replace('= 1', '= 2')),
+      false,
+    ],
+    // Comment-looking text that is not a comment, or that a tool reads.
+    [
+      'comment-like line in a template literal',
+      edit('template.mjs', text => text.replace('Role: reviewer', 'Role: author')),
+      false,
+    ],
+    ['comment added to a file with a template literal', edit('template.mjs', text => `// note\n${text}`), false],
+    ['comment-like line in a python string', edit('prompt.py', text => text.replace('# Role', '# Persona')), false],
+    ['jsx text', edit('view.tsx', text => text.replace('// shown to the user', '// shown to everyone')), false],
+    ['uncommenting a block', edit('toggle.mjs', text => text.replace('/*\n', '').replace('*/\n', '')), false],
+    ['block comment', edit('math.mjs', text => `/*\n * notes\n */\n${text}`), false],
     [
       'code after a block comment',
       edit('math.mjs', text => text.replace('  return a + b;', '  /* note */ return a - b;')),
       false,
     ],
+    [
+      'suppression directive',
+      edit('math.mjs', text => text.replace('// sum', '// eslint-disable-next-line no-undef')),
+      false,
+    ],
+    ['type directive', edit('math.mjs', text => text.replace('// sum', '// @ts-expect-error')), false],
+    ['python type directive', edit('total.py', text => `# type: ignore\n${text}`), false],
+    ['trailing spaces', edit('math.mjs', text => text.replace('a + b;', 'a + b;   ')), false],
+    ['whitespace-only line', edit('math.mjs', text => text.replace('  // sum\n', '  // sum\n   \n')), false],
+    ['line endings', edit('math.mjs', text => text.replaceAll('\n', '\r\n')), false],
+    // File types that are never judged.
+    ['css universal selector', edit('theme.css', text => text.replace('border-box', 'content-box')), false],
+    ['css comment', edit('theme.css', text => text.replace('palette', 'colours')), false],
+    ['yaml comment', edit('deploy.yml', text => text.replace('# build first', '# build before test')), false],
+    ['shell comment', edit('run.sh', text => text.replace('# start', '# launch')), false],
     ['shebang', edit('run.sh', text => text.replace('#!/bin/sh', '#!/bin/bash')), false],
-    ['shell continuation flag', edit('run.sh', text => text.replace('--port 80', '--port 8080')), false],
-    ['unknown file type', edit('query.sql', text => text.replace('-- totals', '-- sums')), false],
+    ['sql comment', edit('query.sql', text => text.replace('-- totals', '-- sums')), false],
+    ['c pointer write', edit('pointer.c', text => text.replace('*ptr = 1;', '*ptr = 2;')), false],
+    ['binary content', edit('blob.mjs', text => text.replace('\u0001', '\u0002')), false],
   ]) {
     writeFileSync(path.join(cwd, name), change(content));
     assert.equal(await cosmeticOnly(cwd, base), expected, label);
@@ -296,8 +363,9 @@ test('Only a certain cosmetic change is cosmetic: comments, blank lines, trailin
   git('rm', '-q', 'pointer.c');
   assert.equal(await cosmeticOnly(cwd, base), false, 'a deleted file');
   reset();
-  writeFileSync(path.join(cwd, 'image.bin'), Buffer.from([0, 1, 2, 3, 0, 255]));
-  assert.equal(await cosmeticOnly(cwd, base), false, 'a binary change is not judged cosmetic');
+  git('update-index', '--chmod=+x', 'math.mjs');
+  assert.equal(await cosmeticOnly(cwd, base), false, 'a mode change');
+  git('update-index', '--chmod=-x', 'math.mjs');
 });
 
 test('The watchdog block is optional, bounded and strict about keys', () => {
