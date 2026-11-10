@@ -426,6 +426,8 @@ export class EngineVerification extends EngineExecution {
       }
       throw Object.assign(new Error('Verification repair cycle stopped; use --retry-failed for a new cycle'), {
         code: 'blocked',
+        scope: 'verification',
+        reason: cycle.stopped,
       });
     }
     while (cycle.attempt < run.config.repairRounds) {
@@ -603,7 +605,11 @@ export class EngineVerification extends EngineExecution {
               ? 'no_progress'
               : 'no_verified_progress';
         this.assess(run, { scope: 'verification', attempts: cycle.attempt, reason: cycle.stopped, problem });
-        throw Object.assign(new Error(`Проверки не пройдены: ${problem}`), { code: 'blocked' });
+        throw Object.assign(new Error(`Проверки не пройдены: ${problem}`), {
+          code: 'blocked',
+          scope: 'verification',
+          reason: cycle.stopped,
+        });
       }
       cycle.pendingRepair = { headSha, problem };
       this.save(run);

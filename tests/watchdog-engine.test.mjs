@@ -61,15 +61,19 @@ test('Rounds that only produce new output and commits stop at the stalled limit,
   assert.match(summary, /Current blocker: no_verified_progress \[verification\]/);
   assert.match(summary, /Watchdog: 2 round\(s\) without verified progress; stopped at limit 2/);
 
-  // A plain resume cannot spend more: the stop is durable, and the old blocker becomes history.
+  // A plain resume cannot spend more: the stop is durable. Stopping again for the same reason
+  // on the same commit continues the same blocker instead of adding a copy to the history.
   const again = await engine.run(run.id);
   assert.equal(again.state, 'blocked');
   assert.equal(repairs(), 2);
   assert.deepEqual(
-    again.blocker.history.map(item => [item.code, item.outcome]),
-    [['no_verified_progress', 'resumed']],
+    [again.blocker.current.code, again.blocker.current.scope, again.blocker.current.occurrences],
+    ['no_verified_progress', 'verification', 2],
   );
-  assert.match(await progress(again), /Earlier blockers: 1\n- resumed/);
+  assert.equal(again.blocker.current.firstSeen, blocker.firstSeen);
+  assert.match(again.blocker.current.message, /Проверка test не пройдена/, 'the original failure text is kept');
+  assert.deepEqual(again.blocker.history, []);
+  assert.match(await progress(again), /Seen 2 time\(s\)/);
 });
 
 test('Without a configured limit the existing repair budget alone decides', async t => {

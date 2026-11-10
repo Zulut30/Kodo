@@ -13,20 +13,26 @@ import { EngineVerification } from './engine-verification.mjs';
 /** Public engine: the durable run loop over the layered stages. */
 /** Why the run stopped now, with the facts and evidence the next session needs. */
 function currentBlocker(run, error) {
-  const assessed = error.code === 'blocked' ? run.controllerAssessment : null;
+  // The stop error names its own place and reason. The saved controller assessment is not
+  // used: with two nodes stopping together it may belong to the other one.
+  const scope = typeof error.scope === 'string' ? error.scope : 'run';
   return recordBlocker(run.blocker, {
-    code: assessed?.reason || run.error.code,
+    code: typeof error.reason === 'string' ? error.reason : run.error.code,
     message: run.error.message,
-    scope: assessed?.scope || 'run',
+    scope,
     at: new Date().toISOString(),
     headSha: run.headSha || null,
     reasons: [run.error.code, error.classification, run.behavior?.passed === false ? 'behavior_failed' : null].filter(
       Boolean,
     ),
-    evidence: [
-      ...(run.checks?.results || []).map(row => ({ sha256: row.outputHash, kind: 'check' })),
-      ...(run.behavior?.oracles || []).map(row => ({ sha256: row.outputHash, kind: 'oracle' })),
-    ].filter(item => typeof item.sha256 === 'string'),
+    // Check and oracle output explains a verification stop only.
+    evidence:
+      scope === 'verification'
+        ? [
+            ...(run.checks?.results || []).map(row => ({ sha256: row.outputHash, kind: 'check' })),
+            ...(run.behavior?.oracles || []).map(row => ({ sha256: row.outputHash, kind: 'oracle' })),
+          ].filter(item => typeof item.sha256 === 'string')
+        : [],
   });
 }
 export class Engine extends EngineVerification {
@@ -127,6 +133,8 @@ export class Engine extends EngineVerification {
       if (run.verification?.stopped)
         throw Object.assign(new Error('Verification repair cycle stopped; use --retry-failed for a new cycle'), {
           code: 'blocked',
+          scope: 'verification',
+          reason: run.verification.stopped,
         });
       // Recover a completed external merge before requiring native clients.
       // A lost delivery receipt must not rediscover models or replay analysis.

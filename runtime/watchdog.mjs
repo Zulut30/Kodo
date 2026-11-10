@@ -73,8 +73,24 @@ export function verifiedProgress(before, after) {
   return { progressed: reasons.length > 0, reasons };
 }
 
+const least = (a, b) => (typeof a !== 'number' ? b : typeof b !== 'number' ? a : Math.min(a, b));
+
+/** The best accepted state seen so far: a round that breaks something and repairs it again adds nothing. */
+function bestOf(a, b) {
+  return {
+    integrated: Math.max(a.integrated, b.integrated),
+    checksPassed: Math.max(a.checksPassed, b.checksPassed),
+    behaviorPassed: a.behaviorPassed || b.behaviorPassed,
+    behaviorFindings: least(a.behaviorFindings, b.behaviorFindings),
+    gatesPassed: Math.max(a.gatesPassed, b.gatesPassed),
+    reviewPassed: a.reviewPassed || b.reviewPassed,
+    reviewFindings: least(a.reviewFindings, b.reviewFindings),
+  };
+}
+
 /**
- * One watchdog step after a failed round. Repeating a step with the same key
+ * One watchdog step after a failed round. A round progresses only when it
+ * beats the best state reached so far. Repeating a step with the same key
  * changes nothing, so a crash between the step and its save is harmless.
  * @param {any} state Saved state, or undefined for the first step.
  * @param {{ key: string, observation: ReturnType<typeof observeRun>, limit: number | null }} input
@@ -82,14 +98,14 @@ export function verifiedProgress(before, after) {
 export function watchdogStep(state, { key, observation, limit }) {
   const previous = state?.schemaVersion === WATCHDOG_VERSION ? state : undefined;
   if (previous?.lastKey === key) return previous;
-  const progress = previous?.last
-    ? verifiedProgress(previous.last, observation)
+  const progress = previous?.best
+    ? verifiedProgress(previous.best, observation)
     : { progressed: true, reasons: ['first_round'] };
   const stalled = progress.progressed ? 0 : previous.stalled + 1;
   const next = {
     schemaVersion: WATCHDOG_VERSION,
     lastKey: key,
-    last: observation,
+    best: previous?.best ? bestOf(previous.best, observation) : observation,
     stalled,
     rounds: [...(previous?.rounds || []), { key, progressed: progress.progressed, reasons: progress.reasons }].slice(
       -HISTORY,
@@ -104,7 +120,7 @@ export function watchdogStep(state, { key, observation, limit }) {
 export function resetWatchdog(state) {
   if (state?.schemaVersion !== WATCHDOG_VERSION) return state;
   const { stopped: _stopped, ...rest } = state;
-  return { ...rest, stalled: 0, last: null };
+  return { ...rest, stalled: 0, best: null };
 }
 
 const hints = {
@@ -123,19 +139,30 @@ const hints = {
 };
 
 /**
- * Record why a run stopped. The same blocker seen again is counted, not
- * duplicated; a different one moves the previous into history.
+ * Record why a run stopped. The same blocker (the same reason, in the same
+ * place, on the same commit) seen again is counted, not duplicated; a
+ * different one moves the previous into history.
  * @param {any} blockers `{ current, history }` or undefined.
  * @param {{ code: string, message: string, scope: string, at: string, headSha?: string | null,
  *   reasons?: string[], evidence?: { sha256: string, kind?: string }[] }} blocker
  */
 export function recordBlocker(blockers, { code, message, scope, at, headSha = null, reasons = [], evidence = [] }) {
   const text = String(message ?? '').slice(0, 2000);
-  const signature = hash(JSON.stringify([code, scope, text]));
-  const history = blockers?.history || [];
-  const current = blockers?.current;
+  const signature = hash(JSON.stringify([code, scope, headSha]));
+  let history = blockers?.history || [],
+    current = blockers?.current;
+  // A resume that stops for the same reason continues the same blocker instead of piling up copies.
+  const last = history.at(-1);
+  if (!current && last?.outcome === 'resumed' && last.signature === signature) {
+    const { endedAt: _endedAt, outcome: _outcome, ...resumed } = last;
+    current = resumed;
+    history = history.slice(0, -1);
+  }
   if (current?.signature === signature)
-    return { current: { ...current, lastSeen: at, occurrences: current.occurrences + 1, headSha }, history };
+    return {
+      current: { ...current, lastSeen: at, occurrences: current.occurrences + 1, lastMessage: text },
+      history,
+    };
   return {
     current: {
       code,
@@ -168,25 +195,68 @@ export function resolveBlocker(blockers, { at, outcome }) {
   };
 }
 
-const commentLine = /^\s*(?:\/\/|#|\/\*|\*\/?|<!--|-->|--|;|%|"""|''')/;
+/** Line-comment and block-comment syntax by file extension. An unknown extension is never judged cosmetic. */
+const cLike = { line: /^\s*\/\//, block: true };
+const hashLike = { line: /^\s*#(?!!)/, block: false };
+const syntaxes = {
+  ...Object.fromEntries(
+    'js mjs cjs jsx ts mts cts tsx java c h cc cpp hpp cs go rs kt kts swift scala scss less'
+      .split(' ')
+      .map(ext => [ext, cLike]),
+  ),
+  css: { line: null, block: true },
+  ...Object.fromEntries('py rb sh bash zsh yml yaml toml'.split(' ').map(ext => [ext, hashLike])),
+};
+const MAX_COSMETIC_FILES = 50;
+
+function commentOnly(line, syntax) {
+  if (!line.trim()) return true;
+  if (syntax.line?.test(line)) return true;
+  if (!syntax.block) return false;
+  // `/* note */ code` is code: a block comment line may have nothing after its end.
+  if (/^\s*\/\*/.test(line)) return !line.includes('*/') || /\*\/\s*$/.test(line);
+  // A continuation line of a block comment. `*ptr = x;` and `*gen() {` are code.
+  return /^\s*\*(?:\s|\/\s*$|$)/.test(line) && !/[;{]\s*$/.test(line);
+}
 
 /**
- * True when the staged change against `baseSha` touches only whitespace and
- * comment lines, or nothing at all. A cosmetic change is not progress.
+ * True only when the staged change against `baseSha` is certainly cosmetic:
+ * nothing changed, or every changed line of every modified file is blank, a
+ * comment, or differs in trailing whitespace. Anything else counts as real
+ * work: added, deleted or renamed files, mode changes, binary files,
+ * indentation (it is meaning in Python and YAML), unknown file types.
  * @param {string} cwd
  * @param {string} baseSha
  */
 export async function cosmeticOnly(cwd, baseSha) {
   await execute('git', ['add', '-A'], { cwd });
-  const diff = await execute(
-    'git',
-    ['diff', '--cached', '--no-color', '--no-ext-diff', '-U0', '-w', '--ignore-blank-lines', baseSha, '--'],
-    { cwd },
-  );
-  if (/^Binary files /m.test(diff.stdout)) return false;
-  const changed = diff.stdout
-    .split('\n')
-    .filter(line => /^[+-]/.test(line) && !/^(?:\+\+\+|---) /.test(line))
-    .map(line => line.slice(1));
-  return changed.every(line => !line.trim() || commentLine.test(line));
+  const base = ['diff', '--cached', '--no-color', '--no-ext-diff', '--no-renames'];
+  const status = (await execute('git', [...base, '--name-status', '-z', baseSha, '--'], { cwd })).stdout
+    .split('\0')
+    .filter(Boolean);
+  if (!status.length) return true;
+  const files = [];
+  for (let index = 0; index < status.length; index += 2) {
+    if (status[index] !== 'M') return false;
+    files.push(status[index + 1]);
+  }
+  if (files.length > MAX_COSMETIC_FILES) return false;
+  if (/^ mode change /m.test((await execute('git', [...base, '--summary', baseSha, '--'], { cwd })).stdout))
+    return false;
+  for (const file of files) {
+    const syntax = syntaxes[file.slice(file.lastIndexOf('.') + 1).toLowerCase()];
+    if (!syntax) return false;
+    const diff = await execute(
+      'git',
+      [...base, '-U0', '--ignore-space-at-eol', '--ignore-cr-at-eol', '--ignore-blank-lines', baseSha, '--', file],
+      { cwd },
+    );
+    if (/^Binary files /m.test(diff.stdout)) return false;
+    const changed = diff.stdout
+      .split('\n')
+      .filter(line => /^[+-]/.test(line) && !/^(?:\+\+\+|---) /.test(line))
+      .map(line => line.slice(1));
+    if (!changed.every(line => commentOnly(line, syntax))) return false;
+  }
+  return true;
 }

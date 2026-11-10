@@ -179,6 +179,8 @@ export class EngineExecution extends EnginePlanning {
       }
       throw Object.assign(new Error(`Исчерпаны попытки ${task.id}: ${node.error || 'требуется устранить блокер'}`), {
         code: 'blocked',
+        scope: task.id,
+        reason: node.stopped,
       });
     }
     while (node.attempt < run.config.repairRounds) {
@@ -290,7 +292,11 @@ export class EngineExecution extends EnginePlanning {
           node.stopped = node.attempt >= run.config.repairRounds ? 'repair_budget_exhausted' : 'no_progress';
           node.status = 'blocked';
           this.assess(run, { scope: task.id, attempts: node.attempt, reason: node.stopped, problem: node.error });
-          throw Object.assign(new Error(`Нет прогресса в ${task.id}: ${node.error}`), { code: 'blocked' });
+          throw Object.assign(new Error(`Нет прогресса в ${task.id}: ${node.error}`), {
+            code: 'blocked',
+            scope: task.id,
+            reason: node.stopped,
+          });
         }
         await this.moreResearch(run, node.error, signal);
         delete node.routing;

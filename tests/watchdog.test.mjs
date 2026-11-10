@@ -99,6 +99,12 @@ test('The watchdog counts stalled rounds, stops at the limit and repeats a step 
   for (let round = 0; round < 30; round++)
     unlimited = watchdogStep(unlimited, { key: `r${round}`, observation: same, limit: null });
   assert.deepEqual([unlimited.stalled, unlimited.stopped, unlimited.rounds.length], [29, undefined, 20]);
+  // A round that breaks a check and the next that repairs it only return to the best state already reached.
+  const broken = observation({ checks: { results: [{ exitCode: 1 }, { exitCode: 1 }] }, behavior: null });
+  let ping = watchdogStep(undefined, { key: 'p0', observation: same, limit: 2 });
+  ping = watchdogStep(ping, { key: 'p1', observation: broken, limit: 2 });
+  ping = watchdogStep(ping, { key: 'p2', observation: same, limit: 2 });
+  assert.deepEqual([ping.stalled, ping.stopped?.reason], [2, 'no_verified_progress']);
   // An explicit retry cycle counts again and keeps the history.
   const reset = resetWatchdog(state);
   assert.deepEqual([reset.stalled, reset.stopped, reset.rounds.length], [0, undefined, 3]);
@@ -113,7 +119,7 @@ test('The same blocker is counted, a different one moves the old into history, a
   assert.equal(blockers.current.occurrences, 1);
   assert.deepEqual(blockers.history, []);
   assert.equal(blockers.current.hypotheses.length, 2, 'hypotheses come from the recorded facts');
-  blockers = recordBlocker(blockers, { ...failure, at: at(1) });
+  blockers = recordBlocker(blockers, { ...failure, at: at(1), headSha: 'a'.repeat(40), message: 'other wording' });
   assert.deepEqual(
     [blockers.current.occurrences, blockers.current.firstSeen, blockers.current.lastSeen, blockers.history.length],
     [2, at(0), at(1), 0],
@@ -141,10 +147,30 @@ test('The same blocker is counted, a different one moves the old into history, a
     ],
   );
   assert.equal(resolveBlocker(blockers, { at: at(4), outcome: 'succeeded' }), blockers, 'nothing current to resolve');
+  // The resumed run stops for the same reason on the same commit: one blocker, not another copy.
+  const again = recordBlocker(blockers, { code: 'quota', message: 'limit reached again', scope: 'run', at: at(4) });
+  assert.deepEqual(
+    [again.current.occurrences, again.current.firstSeen, again.current.lastSeen, again.current.lastMessage],
+    [2, at(2), at(4), 'limit reached again'],
+  );
+  assert.deepEqual(
+    again.history.map(item => item.code),
+    ['no_progress'],
+    'the resumed entry left the history',
+  );
+  assert.equal(again.current.endedAt, undefined);
+  const moved = recordBlocker(blockers, {
+    code: 'quota',
+    message: 'limit',
+    scope: 'run',
+    at: at(4),
+    headSha: 'b'.repeat(40),
+  });
+  assert.deepEqual([moved.current.occurrences, moved.history.length], [1, 2], 'another commit is another blocker');
   assert.equal(resolveBlocker(undefined, { at: at(4), outcome: 'resumed' }), undefined);
   let long = undefined;
   for (let index = 0; index < 30; index++)
-    long = recordBlocker(long, { code: 'blocked', message: `failure ${index}`, scope: 'run', at: at(5) });
+    long = recordBlocker(long, { code: 'blocked', message: 'failure', scope: `node-${index}`, at: at(5) });
   assert.equal(long.history.length, 20, 'history is bounded');
 });
 
@@ -177,9 +203,26 @@ test('The recovery summary shows the current blocker and never presents an older
     resumed,
     /Earlier blockers: 1\n- resumed 2026-11-10T11:00:00.000Z: no_verified_progress \[verification\]/,
   );
+  const cancelled = buildProgress({
+    ...run,
+    state: 'cancelled',
+    blocker,
+    error: { code: 'cancelled', message: 'stopped by user' },
+  });
+  assert.match(cancelled, /Stopped: cancelled stopped by user/);
+  assert.doesNotMatch(cancelled, /previous attempt/);
+  assert.doesNotMatch(
+    buildProgress({ ...run, blocker, watchdog: { stalled: 0 } }),
+    /Watchdog:/,
+    'no limit, no counter line',
+  );
+  assert.match(
+    buildProgress({ ...run, blocker, watchdog: { stalled: 1 }, config: { watchdog: { stalledRounds: 2 } } }),
+    /Watchdog: 1 round\(s\) without verified progress\n/,
+  );
 });
 
-test('A change of comments and whitespace only, or no change, is cosmetic; code is not', async t => {
+test('Only a certain cosmetic change is cosmetic: comments, blank lines, trailing spaces, or nothing', async t => {
   const cwd = mkdtempSync(path.join(os.tmpdir(), 'kodo-cosmetic-'));
   t.after(() => rmSync(cwd, { recursive: true, force: true }));
   const git = (...args) => {
@@ -187,8 +230,17 @@ test('A change of comments and whitespace only, or no change, is cosmetic; code 
     assert.equal(result.status, 0, result.stderr);
     return result.stdout.trim();
   };
-  const source = 'export function add(a, b) {\n  return a + b;\n}\n';
-  writeFileSync(path.join(cwd, 'math.mjs'), source);
+  const files = {
+    'math.mjs': 'export function add(a, b) {\n  return a + b;\n}\n',
+    'counter.mjs': 'export class Counter {\n  #count = 0;\n  *each() {\n    yield this.#count;\n  }\n}\n',
+    'total.py':
+      'def total(items):\n    result = 0\n    for item in items:\n        result += item\n        return result\n',
+    'run.sh': '#!/bin/sh\n# start\nnode app.mjs \\\n  --port 80\n',
+    'deploy.yml': 'steps:\n  # build first\n  - run: build\n',
+    'query.sql': '-- totals\nSELECT 1;\n',
+    'pointer.c': 'void set(int *ptr) {\n  *ptr = 1;\n}\n',
+  };
+  for (const [name, content] of Object.entries(files)) writeFileSync(path.join(cwd, name), content);
   git('init', '-b', 'main');
   git('config', 'user.name', 'Cosmetic Test');
   git('config', 'user.email', 'cosmetic@example.invalid');
@@ -201,22 +253,48 @@ test('A change of comments and whitespace only, or no change, is cosmetic; code 
     git('clean', '-qfd');
   };
   assert.equal(await cosmeticOnly(cwd, base), true, 'no change at all');
-  for (const [name, text, expected] of [
-    ['comment', `// analysis: the function looks correct\n${source}`, true],
-    ['block comment and blank lines', `/*\n * notes\n */\n\n${source}\n\n`, true],
-    ['indentation', source.replace('  return', '      return'), true],
-    ['behaviour', source.replace('a + b', 'a - b'), false],
-    ['comment plus behaviour', `// fix\n${source.replace('a + b', 'b + a')}`, false],
+  const edit = (name, change) => [name, files[name], change];
+  for (const [label, [name, content, change], expected] of [
+    ['line comment', edit('math.mjs', text => `// analysis: looks correct\n${text}`), true],
+    ['block comment and blank lines', edit('math.mjs', text => `/*\n * notes\n */\n\n${text}\n\n`), true],
+    ['trailing spaces', edit('math.mjs', text => text.replace('a + b;', 'a + b;   ')), true],
+    ['python comment', edit('total.py', text => `# reviewed\n${text}`), true],
+    ['yaml comment', edit('deploy.yml', text => text.replace('# build first', '# build before test')), true],
+    ['behaviour', edit('math.mjs', text => text.replace('a + b', 'a - b')), false],
+    ['comment plus behaviour', edit('math.mjs', text => `// fix\n${text.replace('a + b', 'b + a')}`), false],
+    // Indentation is meaning in Python: moving `return` out of the loop is a real fix.
+    ['python indentation', edit('total.py', text => text.replace('        return', '    return')), false],
+    ['js indentation', edit('math.mjs', text => text.replace('  return', '      return')), false],
+    ['private field', edit('counter.mjs', text => text.replace('#count = 0', '#count = 1')), false],
+    ['generator', edit('counter.mjs', text => text.replace('*each() {', '*every() {')), false],
+    ['pointer write', edit('pointer.c', text => text.replace('*ptr = 1;', '*ptr = 2;')), false],
+    [
+      'code after a block comment',
+      edit('math.mjs', text => text.replace('  return a + b;', '  /* note */ return a - b;')),
+      false,
+    ],
+    ['shebang', edit('run.sh', text => text.replace('#!/bin/sh', '#!/bin/bash')), false],
+    ['shell continuation flag', edit('run.sh', text => text.replace('--port 80', '--port 8080')), false],
+    ['unknown file type', edit('query.sql', text => text.replace('-- totals', '-- sums')), false],
   ]) {
-    writeFileSync(path.join(cwd, 'math.mjs'), text);
-    assert.equal(await cosmeticOnly(cwd, base), expected, name);
+    writeFileSync(path.join(cwd, name), change(content));
+    assert.equal(await cosmeticOnly(cwd, base), expected, label);
     reset();
   }
   writeFileSync(path.join(cwd, 'new.mjs'), 'export const value = 1;\n');
   assert.equal(await cosmeticOnly(cwd, base), false, 'a new file with code');
   reset();
+  writeFileSync(path.join(cwd, '__init__.py'), '');
+  assert.equal(await cosmeticOnly(cwd, base), false, 'a new empty file is a real change');
+  reset();
   writeFileSync(path.join(cwd, 'notes.mjs'), '// only a note\n');
-  assert.equal(await cosmeticOnly(cwd, base), true, 'a new file with comments only');
+  assert.equal(await cosmeticOnly(cwd, base), false, 'an added file is never judged cosmetic');
+  reset();
+  git('mv', 'math.mjs', 'sum.mjs');
+  assert.equal(await cosmeticOnly(cwd, base), false, 'a rename');
+  reset();
+  git('rm', '-q', 'pointer.c');
+  assert.equal(await cosmeticOnly(cwd, base), false, 'a deleted file');
   reset();
   writeFileSync(path.join(cwd, 'image.bin'), Buffer.from([0, 1, 2, 3, 0, 255]));
   assert.equal(await cosmeticOnly(cwd, base), false, 'a binary change is not judged cosmetic');
