@@ -91,7 +91,7 @@ test('Job state machine allows only the documented transitions', () => {
     ['running', 'verifying'],
     ['running', 'queued'],
     ['running', 'waiting_quota'],
-    ['waiting_quota', 'queued'],
+    ['waiting_quota', 'running'],
     ['verifying', 'integrating'],
     ['integrating', 'integrated'],
     ['integrating', 'verifying'],
@@ -102,6 +102,7 @@ test('Job state machine allows only the documented transitions', () => {
     assertJobTransition(from, to);
   for (const [from, to] of [
     ['queued', 'verifying'],
+    ['waiting_quota', 'queued'],
     ['queued', 'integrated'],
     ['running', 'integrated'],
     ['running', 'integrating'],
@@ -217,4 +218,37 @@ test('A starved job reserves its scopes against later conflicting work', () => {
   assert.equal(admission(other, { jobs, limits }).admit, true, 'unrelated work keeps flowing');
   const fresh = { ...wide, bypassed: STARVATION_BYPASSES - 1 };
   assert.equal(admission(narrow, { jobs: [fresh, narrow, other, active], limits }).admit, true);
+});
+
+test('A starved job that cannot start anyway reserves nothing', () => {
+  const narrow = job('narrow', 'queued', { seq: 9, spec: { writePaths: ['src/x.mjs'] } });
+  const starved = extra =>
+    job('wide', 'queued', { seq: 1, bypassed: STARVATION_BYPASSES, spec: { writePaths: ['src'], ...extra } });
+  const admitted = (wide, context = {}) => admission(narrow, { jobs: [wide, narrow], limits, ...context }).admit;
+  assert.equal(admitted(starved({})), false, 'a startable starved job reserves its scope');
+  assert.equal(
+    admitted(starved({ pool: 'codex' }), { limits: { workers: 4, pools: { codex: 0 } } }),
+    true,
+    'closed pool',
+  );
+  assert.equal(admitted(starved({ host: 't3' })), true, 'unconnected host');
+  assert.equal(admitted(starved({ capabilities: ['gpu'] })), true, 'no matching worker');
+  assert.equal(admitted(starved({ capabilities: ['gpu'] }), { worker: { capabilities: ['gpu'] } }), false);
+});
+
+test('A starved job also reserves its shared locks', () => {
+  const wide = job('wide', 'queued', { seq: 1, bypassed: STARVATION_BYPASSES, spec: { locks: ['api:public'] } });
+  const other = job('other', 'queued', { seq: 9, spec: { locks: ['api:public'] } });
+  assert.deepEqual(admission(other, { jobs: [wide, other], limits }), {
+    admit: false,
+    reason: 'yield_to_starved',
+    detail: 'wide',
+  });
+});
+
+test('A job resuming after a quota wait keeps its scope and does not yield', () => {
+  const resuming = job('paused', 'waiting_quota', { spec: { writePaths: ['src/x.mjs'] } });
+  const starved = job('wide', 'queued', { seq: 1, bypassed: STARVATION_BYPASSES, spec: { writePaths: ['src'] } });
+  assert.equal(admission(resuming, { jobs: [resuming, starved], limits }).admit, true);
+  assert.equal(admission(starved, { jobs: [resuming, starved], limits }).reason, 'scope_conflict');
 });

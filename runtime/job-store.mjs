@@ -6,11 +6,14 @@
  * `job-scheduler.mjs`); this module only records who owns what.
  */
 import { createHash, randomUUID } from 'node:crypto';
+import { statSync } from 'node:fs';
+import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+import { pathToFileURL } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
 import { redact } from './security.mjs';
 import {
   MAX_JOB_BYTES,
-  STARVATION_BYPASSES,
   admission,
   assertJobTransition,
   hostStatus,
@@ -49,8 +52,6 @@ import {
 export const MAX_QUEUE_JOBS = 1000;
 export const MAX_QUOTA_WAITS = 12;
 export const MAX_INTEGRATION_ATTEMPTS = 3;
-/** A job resumed after a quota wait outranks new work and reserves its scopes. */
-const RESUME_BYPASSES = 100 + STARVATION_BYPASSES;
 
 const migrationSql = `
   CREATE TABLE kodo_jobs(
@@ -286,15 +287,19 @@ function enqueue(ctx, queue, inputs) {
   });
 }
 
-/** Expired leases, due quota waits and (un)blocked dependents. Runs inside a transaction. */
-function sweep(ctx, queue, hosts = {}) {
+/**
+ * Expired leases and (un)blocked dependents. Runs inside a transaction. Host
+ * blocks are decided only when the caller knows its connections (`hosts`).
+ * @param {JobContext} ctx
+ * @param {string} queue
+ * @param {import('./job-contracts.mjs').HostConnections} [hosts]
+ */
+function sweep(ctx, queue, hosts) {
   const now = ctx.now();
   for (const row of rowsOf(ctx, queue)) {
-    if (row.state === 'running' && row.lease_expires <= now) {
-      const exhausted = row.attempt >= JSON.parse(row.spec).retry.maxAttempts;
-      update(ctx, row, { state: exhausted ? 'failed' : 'queued', reason: 'lease_lost', ...noLease }, 'lease_lost');
-    } else if (row.state === 'waiting_quota' && row.retry_at <= now)
-      update(ctx, row, { state: 'queued', retry_at: null, bypassed: RESUME_BYPASSES }, 'quota_resumed');
+    if (row.state !== 'running' || row.lease_expires > now) continue;
+    const exhausted = row.attempt >= JSON.parse(row.spec).retry.maxAttempts;
+    update(ctx, row, { state: exhausted ? 'failed' : 'queued', reason: 'lease_lost', ...noLease }, 'lease_lost');
   }
   // Dependency and host blocks cascade, so repeat until nothing changes.
   for (let pass = 0, changed = true; changed && pass <= MAX_QUEUE_JOBS; pass++) {
@@ -304,9 +309,11 @@ function sweep(ctx, queue, hosts = {}) {
     for (const row of rows) {
       const spec = JSON.parse(row.spec);
       const broken = spec.dependsOn.find(key => ['blocked', 'failed', 'cancelled'].includes(state.get(key)));
-      const host = hostStatus(spec.host, hosts).available ? null : spec.host;
+      const hostBlocked = (row.reason ?? '').startsWith('host_unavailable:');
+      // Without host knowledge an existing host block stands and no new one is made.
+      const host = hosts ? (hostStatus(spec.host, hosts).available ? null : spec.host) : hostBlocked ? spec.host : null;
       const reason = broken !== undefined ? `dependency:${broken}` : host ? `host_unavailable:${host}` : null;
-      const automatic = /^(?:dependency|host_unavailable):/.test(row.reason ?? '');
+      const automatic = hostBlocked || (row.reason ?? '').startsWith('dependency:');
       if (row.state === 'queued' && reason) update(ctx, row, { state: 'blocked', reason }, 'blocked');
       else if (row.state === 'blocked' && automatic && !reason)
         update(ctx, row, { state: 'queued', reason: null }, 'unblocked');
@@ -319,7 +326,8 @@ function sweep(ctx, queue, hosts = {}) {
 const admissionView = row => ({ ...row, spec: JSON.parse(row.spec) });
 
 /**
- * Atomically start the best admissible job of a queue for one worker.
+ * Atomically start the best admissible job of a queue for one worker. A job
+ * whose quota wait is over resumes first: it never left its scopes.
  * @param {JobContext} ctx
  * @param {string} queue
  * @param {{ owner: string, ttlMs?: number, limits: import('./job-contracts.mjs').JobLimits, hosts?: import('./job-contracts.mjs').HostConnections, worker?: { capabilities?: string[], tools?: string[] } }} options
@@ -332,10 +340,9 @@ function claim(ctx, queue, { owner, ttlMs, limits, hosts = {}, worker = {} }) {
   return transaction(ctx, () => {
     sweep(ctx, queue, hosts);
     const jobs = rowsOf(ctx, queue).map(admissionView);
-    const decisions = rankJobs(jobs.filter(job => job.state === 'queued')).map(job => ({
-      job,
-      decision: admission(job, { jobs, limits, hosts, worker }),
-    }));
+    const resuming = jobs.filter(job => job.state === 'waiting_quota' && job.retry_at <= ctx.now());
+    const candidates = [...rankJobs(resuming), ...rankJobs(jobs.filter(job => job.state === 'queued'))];
+    const decisions = candidates.map(job => ({ job, decision: admission(job, { jobs, limits, hosts, worker }) }));
     const picked = decisions.find(item => item.decision.admit)?.job;
     const waiting = decisions
       .filter(item => item.job !== picked)
@@ -349,7 +356,9 @@ function claim(ctx, queue, { owner, ttlMs, limits, hosts = {}, worker = {} }) {
     // Ready work that lost this claim ages, so it cannot be bypassed forever.
     const aging = new Set(['outranked', 'scope_conflict', 'lock_conflict', 'pool_full', 'yield_to_starved']);
     for (const row of waiting.filter(item => aging.has(item.reason)))
-      ctx.db.prepare('UPDATE kodo_jobs SET bypassed=bypassed+1 WHERE queue=? AND key=?').run(queue, row.key);
+      ctx.db
+        .prepare("UPDATE kodo_jobs SET bypassed=bypassed+1 WHERE queue=? AND key=? AND state='queued'")
+        .run(queue, row.key);
     const token = randomUUID();
     const next = update(
       ctx,
@@ -359,11 +368,12 @@ function claim(ctx, queue, { owner, ttlMs, limits, hosts = {}, worker = {} }) {
         attempt: picked.attempt + 1,
         bypassed: 0,
         reason: null,
+        retry_at: null,
         lease_owner: owner,
         lease_token: token,
         lease_expires: ctx.now() + ttl,
       },
-      'claimed',
+      picked.state === 'waiting_quota' ? 'quota_resumed' : 'claimed',
       { owner },
     );
     return { job: view(next), token, waiting };
@@ -674,5 +684,61 @@ export function openJobStore({ store, now = Date.now }) {
     list: bind(list),
     queues: bind(queues),
     events: bind(events),
+  };
+}
+
+const jobTables = ['kodo_job_events', 'kodo_job_migrations', 'kodo_jobs'];
+
+/** A read-only connection, or null when the home has no job tables yet. */
+function readOnlyDatabase(home) {
+  const filename = path.join(home, 'state.sqlite');
+  if (!statSync(filename, { throwIfNoEntry: false })?.isFile()) return null;
+  let db;
+  // A cleanly closed WAL database has no sidecars and plain READONLY would
+  // create them. Without pending WAL frames an immutable open reads the file as is.
+  if (statSync(`${filename}-wal`, { throwIfNoEntry: false })?.size) db = new DatabaseSync(filename, { readOnly: true });
+  else {
+    const uri = pathToFileURL(path.resolve(filename));
+    uri.searchParams.set('mode', 'ro');
+    uri.searchParams.set('immutable', '1');
+    db = new DatabaseSync(uri.href, { readOnly: true });
+  }
+  try {
+    db.exec('PRAGMA query_only=ON; PRAGMA busy_timeout=5000');
+    const present = db
+      .prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name IN (${jobTables.map(() => '?').join(',')})`)
+      .all(...jobTables);
+    if (present.length !== jobTables.length) {
+      db.close();
+      return null;
+    }
+    /** @type {any} */
+    const latest = db.prepare('SELECT version,digest FROM kodo_job_migrations ORDER BY version DESC LIMIT 1').get();
+    requireValue(latest?.version === 1 && latest.digest === migrationHash, 'migration_unsupported');
+    return db;
+  } catch (error) {
+    db.close();
+    throw error;
+  }
+}
+
+/**
+ * Open the job tables strictly for reading: no migration, no write lock and no
+ * state directory or database created. A home without job tables reads as empty.
+ * @param {{ home: string }} options
+ */
+export function openJobReader({ home }) {
+  const db = readOnlyDatabase(home);
+  /** @type {JobContext} */
+  const ctx = { db, secrets: {}, now: Date.now };
+  return {
+    /** @param {string} id */
+    get: id => (db ? get(ctx, id) : fail('not_found')),
+    /** @param {string} queue */
+    list: queue => (db ? list(ctx, queue) : (queueName(queue), [])),
+    queues: () => (db ? queues(ctx) : []),
+    /** @param {string} id */
+    events: id => (db ? events(ctx, id) : fail('not_found')),
+    close: () => db?.close(),
   };
 }

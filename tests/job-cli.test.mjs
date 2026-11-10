@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { Store } from '../runtime/store.mjs';
@@ -99,4 +99,58 @@ test('jobs CLI rejects unknown actions, flags and identifiers with constant diag
   const missing = await cli(['status', '00000000-0000-4000-8000-000000000000', '--json']);
   assert.equal(missing.exitCode, 1);
   assert.deepEqual(missing.report.result, { status: 'invalid', code: 'jobs_not_found' });
+});
+
+test('jobs CLI creates no state: a fresh home stays absent and a legacy database gains no tables', async t => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'kodo-job-cli-fresh-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const fresh = path.join(root, 'never-created');
+  const empty = await jobsCli(['list', '--json'], { home: fresh, secrets: {} });
+  assert.deepEqual([empty.exitCode, empty.report.result], [0, { status: 'ok', queues: [] }]);
+  assert.equal(existsSync(fresh), false, 'a report must not create the state directory');
+
+  const legacyHome = path.join(root, 'legacy');
+  const legacy = new Store(legacyHome);
+  legacy.createRun({ id: 'legacy-run', cwd: process.cwd() });
+  const tables = () =>
+    legacy.db
+      .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+      .all()
+      .map(row => row.name);
+  const before = tables();
+  try {
+    const report = await jobsCli(['list', '--queue', Q, '--json'], { home: legacyHome, secrets: {} });
+    assert.deepEqual(report.report.result, { status: 'ok', counts: {}, jobs: [] });
+    assert.deepEqual(tables(), before, 'no job tables are created by a report');
+  } finally {
+    legacy.close();
+  }
+});
+
+test('jobs CLI does not hold a write lock against the coordinator', async t => {
+  const { cli, store, jobs } = fixture(t);
+  store.db.exec('BEGIN IMMEDIATE');
+  try {
+    const { exitCode, report } = await cli(['list', '--queue', Q, '--json']);
+    assert.equal(exitCode, 0, 'a reader works while a writer transaction is open');
+    assert.equal(report.result.jobs.length, 3);
+  } finally {
+    store.db.exec('ROLLBACK');
+  }
+  assert.equal(jobs.list(Q).length, 3);
+});
+
+test('jobs CLI reports only reasons the queue itself shows', async t => {
+  const { cli, jobs } = fixture(t);
+  jobs.enqueue(Q, [
+    spec('remote', { host: 't3' }),
+    spec('needs-gpu', { capabilities: ['gpu'], requiredTools: ['ripgrep'] }),
+    spec('overlap', { writePaths: ['src/a.mjs'] }),
+  ]);
+  const { report } = await cli(['list', '--queue', Q, '--json']);
+  const waiting = Object.fromEntries(report.result.jobs.map(job => [job.key, job.waitingFor]));
+  assert.equal(waiting.remote, null, 'host availability belongs to the coordinator');
+  assert.equal(waiting['needs-gpu'], null, 'worker capabilities belong to the coordinator');
+  assert.equal(waiting.overlap, 'scope_conflict:a');
+  assert.equal(waiting.c, 'dependency_pending:a');
 });

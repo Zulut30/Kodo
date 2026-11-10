@@ -2,7 +2,7 @@
  * dependency graph. Nothing here claims, sweeps or cancels; the coordinator
  * that owns a queue is the only writer.
  */
-import { admission } from './job-contracts.mjs';
+import { JOB_HOSTS, admission } from './job-contracts.mjs';
 
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const queuePattern = /^[A-Za-z][\w.:-]{0,119}$/;
@@ -33,11 +33,25 @@ const counts = jobs => {
   return result;
 };
 
-/** Why a queued job cannot start, ignoring free worker slots. Pure, no sweep. */
+/**
+ * Why a queued job cannot start, as far as the queue itself shows: dependencies,
+ * scopes and locks. Hosts, worker capabilities and limits belong to whichever
+ * coordinator drives the queue, so a report assumes them satisfied instead of
+ * inventing a reason. Pure, no sweep.
+ */
 function waitingFor(job, jobs) {
   if (job.state !== 'queued') return null;
-  const decision = admission(job, { jobs, limits: { workers: 8, pools: {} } });
-  if (decision.admit || decision.reason === 'workers_full') return null;
+  const decision = admission(job, {
+    jobs,
+    limits: { workers: 8, pools: {} },
+    hosts: Object.fromEntries(JOB_HOSTS.map(id => [id, { available: true }])),
+    worker: {
+      capabilities: jobs.flatMap(item => item.spec.capabilities),
+      tools: jobs.flatMap(item => item.spec.requiredTools),
+    },
+  });
+  if (decision.admit || !['dependency', 'scope', 'lock', 'yield'].some(kind => decision.reason.startsWith(kind)))
+    return null;
   return decision.detail === undefined ? decision.reason : `${decision.reason}:${decision.detail}`;
 }
 
@@ -84,13 +98,12 @@ function human(report) {
 
 /**
  * @param {string[]} argv
- * @param {{ home?: string, secrets?: Record<string, string>, store?: any, loadSecrets?: () => Promise<Record<string, string>> }} [ports]
+ * @param {{ home?: string, secrets?: Record<string, string>, loadSecrets?: () => Promise<Record<string, string>> }} [ports]
  *   Supplied by the coordinator or a test harness, never by decoded CLI data.
  */
 export async function jobsCli(argv, ports = {}) {
   let options,
-    store,
-    ownedStore = false,
+    jobs,
     report,
     exitCode = 0,
     phase = 'arguments';
@@ -99,11 +112,9 @@ export async function jobsCli(argv, ports = {}) {
     phase = 'state';
     const security = await import('./security.mjs');
     const secrets = ports.secrets === undefined ? await (ports.loadSecrets || security.loadSecrets)() : ports.secrets;
-    const { Store } = await import('./store.mjs');
-    store = ports.store || new Store(ports.home || security.stateHome(), secrets);
-    ownedStore = !ports.store;
-    const { openJobStore } = await import('./job-store.mjs');
-    const jobs = openJobStore({ store });
+    // Strictly read-only: no Store, no migration, no write lock, nothing created.
+    const { openJobReader } = await import('./job-store.mjs');
+    jobs = openJobReader({ home: ports.home || security.stateHome() });
     let result;
     if (options.action === 'status') {
       const job = jobs.get(options.id),
@@ -130,7 +141,7 @@ export async function jobsCli(argv, ports = {}) {
     const code = phase === 'arguments' ? 'jobs_arguments' : known ? 'jobs_not_found' : 'jobs_blocked';
     report = { schemaVersion: 1, queue: null, result: { status: known ? 'invalid' : 'blocked', code } };
   } finally {
-    if (ownedStore) store?.close();
+    jobs?.close();
   }
   const json = options?.json || (Array.isArray(argv) && argv.includes('--json'));
   return { report, exitCode, output: json ? JSON.stringify(report, null, 2) : human(report) };

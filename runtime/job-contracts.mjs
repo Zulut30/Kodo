@@ -78,7 +78,7 @@ const unavailable = new Set(['blocked', 'failed', 'cancelled']);
 const transitions = {
   queued: ['running', 'blocked', 'cancelled'],
   running: ['verifying', 'queued', 'waiting_quota', 'blocked', 'failed', 'cancelled'],
-  waiting_quota: ['queued', 'cancelled'],
+  waiting_quota: ['running', 'cancelled'],
   verifying: ['integrating', 'cancelled'],
   integrating: ['integrated', 'verifying', 'blocked', 'cancelled'],
   integrated: [],
@@ -258,45 +258,58 @@ function dependencyDecision(job, jobs) {
   return pending === undefined ? null : { reason: 'dependency_pending', detail: pending };
 }
 
+/** Dependencies, host and worker: reasons no other job of the queue can remove. */
+function ownDecision(job, { jobs, hosts, worker }) {
+  const dependency = dependencyDecision(job, jobs);
+  if (dependency) return dependency;
+  if (!hostStatus(job.spec.host, hosts).available) return { reason: 'host_unavailable', detail: job.spec.host };
+  const offered = { capabilities: worker.capabilities ?? [], tools: worker.tools ?? [] };
+  const matches =
+    job.spec.capabilities.every(name => offered.capabilities.includes(name)) &&
+    job.spec.requiredTools.every(name => offered.tools.includes(name));
+  return matches ? null : { reason: 'worker_mismatch' };
+}
+
+const sharedLock = (a, b) => a.spec.locks.find(name => b.spec.locks.includes(name));
+
 /** Scope, lock and starvation conflicts with other jobs of the queue. */
-function conflictDecision(job, jobs) {
-  const dependenciesMet = other => !dependencyDecision(other, jobs);
-  for (const other of jobs) {
+function conflictDecision(job, context, pools) {
+  const { jobs } = context;
+  // A job paused for quota already holds its scopes and never yields them.
+  for (const other of job.state === 'waiting_quota' ? [] : jobs) {
     if (other.id === job.id || other.state !== 'queued' || other.bypassed < STARVATION_BYPASSES) continue;
     const yields = job.bypassed < STARVATION_BYPASSES || before(other, job);
-    if (yields && dependenciesMet(other) && (scopeCollision(job, other) || scopeCollision(other, job)))
-      return { reason: 'yield_to_starved', detail: other.key };
+    const collides = scopeCollision(job, other) || scopeCollision(other, job) || sharedLock(job, other) !== undefined;
+    // Only a job that could actually start reserves anything: not one behind a
+    // closed pool, an unconnected host, a missing capability or a dependency.
+    const startable = (other.spec.pool === null || pools[other.spec.pool] !== 0) && !ownDecision(other, context);
+    if (yields && collides && startable) return { reason: 'yield_to_starved', detail: other.key };
   }
   const active = jobs.filter(other => other.id !== job.id && holding.has(other.state));
   const collision = active.find(other => scopeCollision(job, other));
   if (collision) return { reason: 'scope_conflict', detail: collision.key };
   for (const other of active) {
-    const lock = job.spec.locks.find(name => other.spec.locks.includes(name));
+    const lock = sharedLock(job, other);
     if (lock) return { reason: 'lock_conflict', detail: lock };
   }
   return null;
 }
 
 /**
- * Decide whether a queued job may start now. Pure: the caller supplies every
- * job of the queue as it is inside the claiming transaction.
+ * Decide whether a job may start now: a queued job, or one whose quota wait is
+ * over. Pure: the caller supplies every job of the queue as it is inside the
+ * claiming transaction.
  * @param {JobView} job
  * @param {{ jobs: JobView[], limits: JobLimits, hosts?: HostConnections, worker?: { capabilities?: string[], tools?: string[] } }} context
  * @returns {AdmissionDecision}
  */
 export function admission(job, { jobs, limits, hosts = {}, worker = {} }) {
   const pools = assertLimits(limits);
+  const context = { jobs, hosts, worker };
   const deny = decision => ({ admit: false, ...decision });
-  const dependency = dependencyDecision(job, jobs);
-  if (dependency) return deny(dependency);
-  if (!hostStatus(job.spec.host, hosts).available) return deny({ reason: 'host_unavailable', detail: job.spec.host });
-  const offered = { capabilities: worker.capabilities ?? [], tools: worker.tools ?? [] };
-  if (
-    !job.spec.capabilities.every(name => offered.capabilities.includes(name)) ||
-    !job.spec.requiredTools.every(name => offered.tools.includes(name))
-  )
-    return deny({ reason: 'worker_mismatch' });
-  const conflict = conflictDecision(job, jobs);
+  const own = ownDecision(job, context);
+  if (own) return deny(own);
+  const conflict = conflictDecision(job, context, pools);
   if (conflict) return deny(conflict);
   const running = jobs.filter(other => other.id !== job.id && other.state === 'running');
   if (running.length >= limits.workers) return deny({ reason: 'workers_full' });

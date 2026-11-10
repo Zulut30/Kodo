@@ -1,10 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { Store } from '../runtime/store.mjs';
-import { openJobStore } from '../runtime/job-store.mjs';
+import { openJobReader, openJobStore } from '../runtime/job-store.mjs';
 import { STARVATION_BYPASSES } from '../runtime/job-contracts.mjs';
 
 const Q = 'project:demo';
@@ -397,7 +397,8 @@ test('Two connections never claim or integrate the same job twice', t => {
     Q,
     Array.from({ length: 12 }, (_, i) => spec(`j${i}`)),
   );
-  const claimed = [];
+  const claimed = [],
+    seen = new Set();
   for (let i = 0; i < 12; i++) {
     const side = i % 2 ? jobs : other;
     const run = side.claim(Q, { owner: `w${i % 2}`, limits: { workers: 8, pools: {} } });
@@ -408,16 +409,9 @@ test('Two connections never claim or integrate the same job twice', t => {
       i--;
       continue;
     }
+    assert.ok(!seen.has(run.job.id), 'a job is handed out once');
+    seen.add(run.job.id);
     claimed.push([run.job.id, run.token]);
-    assert.equal(
-      new Set(
-        jobs
-          .list(Q)
-          .filter(job => job.attempt > 0)
-          .map(job => job.id),
-      ).size,
-      jobs.list(Q).filter(job => job.attempt > 0).length,
-    );
   }
   assert.ok(
     jobs.list(Q).every(job => job.attempt === 1),
@@ -438,4 +432,91 @@ test('The job schema is additive, versioned and refuses an unknown version', t =
   assert.deepEqual(reopened.jobs.queues(), [Q]);
   reopened.store.db.prepare('UPDATE kodo_job_migrations SET digest=?').run('tampered');
   code(() => openJobStore({ store: reopened.store }), 'job_migration_unsupported');
+});
+
+test('Integration never blocks jobs of a connected host', t => {
+  const { jobs } = fixture(t);
+  const hosts = { t3: { available: true } };
+  jobs.enqueue(Q, [spec('local'), spec('remote', { host: 't3' }), spec('after', { dependsOn: ['remote'] })]);
+  const one = { workers: 1, pools: {} };
+  assert.equal(claim(jobs, { hosts, limits: one }).job.key, 'local');
+  assert.equal(jobs.beginIntegration(Q, { owner: 'coordinator' }), null);
+  jobs.recover(Q);
+  assert.deepEqual(
+    jobs.list(Q).map(job => job.state),
+    ['running', 'queued', 'queued'],
+    'a sweep without host knowledge leaves host decisions alone',
+  );
+  assert.deepEqual(
+    jobs.events(jobs.list(Q)[1].id).map(event => event.type),
+    ['enqueued'],
+  );
+});
+
+test('A job waiting for quota keeps its scope and locks until it actually resumes', t => {
+  const { jobs, clock } = fixture(t);
+  jobs.enqueue(Q, [
+    spec('paused', { pool: 'codex', locks: ['api:public'] }),
+    spec('same-lock', { locks: ['api:public'] }),
+    spec('same-file', { writePaths: ['src/paused.mjs'] }),
+  ]);
+  const paused = claim(jobs);
+  jobs.waitQuota(paused.job.id, paused.token, { retryAt: clock.now + 1000, checkpoint: { step: 2 } });
+  clock.now += 5000;
+  // Due, but its pool is closed: nothing that conflicts with its progress may start.
+  const closed = claim(jobs, { limits: { workers: 4, pools: { codex: 0 } } });
+  assert.equal(closed.job, null);
+  assert.deepEqual(closed.waiting, [
+    { key: 'paused', reason: 'pool_full', detail: 'codex' },
+    { key: 'same-lock', reason: 'lock_conflict', detail: 'api:public' },
+    { key: 'same-file', reason: 'scope_conflict', detail: 'paused' },
+  ]);
+  assert.equal(jobs.list(Q)[0].state, 'waiting_quota');
+  const resumed = claim(jobs);
+  assert.deepEqual([resumed.job.key, resumed.job.attempt, resumed.job.checkpoint], ['paused', 1, { step: 2 }]);
+});
+
+test('A read-only reader reports jobs without creating or changing any state', t => {
+  const { jobs, home, store } = fixture(t);
+  jobs.enqueue(Q, [spec('a')]);
+  const tables = () =>
+    JSON.stringify(store.db.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all());
+  const before = tables();
+  const reader = openJobReader({ home });
+  assert.deepEqual(reader.queues(), [Q]);
+  assert.deepEqual(
+    reader.list(Q).map(job => job.key),
+    ['a'],
+  );
+  assert.equal(reader.get(jobs.list(Q)[0].id).state, 'queued');
+  assert.equal(reader.events(jobs.list(Q)[0].id).length, 1);
+  assert.equal(tables(), before);
+  jobs.enqueue(Q, [spec('b')]);
+  assert.equal(reader.list(Q).length, 2, 'the reader sees later commits');
+  reader.close(); // Before the fixture removes the directory: Windows locks open files.
+
+  const empty = path.join(home, 'never-created');
+  const none = openJobReader({ home: empty });
+  assert.deepEqual([none.queues(), none.list(Q)], [[], []]);
+  code(() => none.get('00000000-0000-4000-8000-000000000000'), 'job_not_found');
+  none.close();
+  assert.equal(existsSync(empty), false, 'a report never creates a state directory');
+});
+
+test('A reader on a pre-jobs database adds no tables', t => {
+  const home = mkdtempSync(path.join(os.tmpdir(), 'kodo-jobs-legacy-'));
+  const store = new Store(home);
+  t.after(() => {
+    store.close();
+    rmSync(home, { recursive: true, force: true });
+  });
+  store.createRun({ id: 'legacy-run', cwd: process.cwd() });
+  const reader = openJobReader({ home });
+  assert.deepEqual(reader.queues(), []);
+  reader.close();
+  const names = store.db
+    .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+    .all()
+    .map(row => row.name);
+  assert.ok(!names.some(name => name.startsWith('kodo_job')), names.join(','));
 });

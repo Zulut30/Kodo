@@ -6,11 +6,11 @@
 
 | Scope из [плана](NEXT-STAGES.md) | Реализация | Проверка |
 | --- | --- | --- |
-| ① JobSpec/admission | `runtime/job-contracts.mjs`: каноничный JobSpec, таблица переходов, чистый `admission()`, `hostStatus()` | `tests/job-contracts.test.mjs`, 11 тестов |
-| ① read-only jobs CLI | `runtime/job-cli.mjs`, `kodo jobs list\|status [--json]` | `tests/job-cli.test.mjs`, 5 тестов; запуск через `node cli/index.mjs jobs` на временном `KODO_HOME` |
-| ② SQLite jobs/leases/CAS/receipts | `runtime/job-store.mjs`: таблицы `kodo_jobs`, `kodo_job_events`, `kodo_job_migrations`; CAS по `revision`; события как квитанции статуса | `tests/job-store.test.mjs`, 20 тестов |
-| ③ адаптер очереди | `runtime/job-scheduler.mjs`: `runJobQueue` с портами `execute`/`integrate`/`reconcile` | `tests/job-scheduler.test.mjs`, 15 тестов |
-| ④ concurrency/recovery fixtures | fake providers с барьером на 1/2/4/8 слотов; настоящая цепочка Git + SQLite | `tests/job-git-chain.test.mjs`, 2 теста |
+| ① JobSpec/admission | `runtime/job-contracts.mjs`: каноничный JobSpec, таблица переходов, чистый `admission()`, `hostStatus()` | `tests/job-contracts.test.mjs`, 14 тестов |
+| ① read-only jobs CLI | `runtime/job-cli.mjs`, `kodo jobs list\|status [--json]` через `openJobReader` | `tests/job-cli.test.mjs`, 8 тестов; запуск через `node cli/index.mjs jobs` на временном `KODO_HOME` |
+| ② SQLite jobs/leases/CAS/receipts | `runtime/job-store.mjs`: таблицы `kodo_jobs`, `kodo_job_events`, `kodo_job_migrations`; CAS по `revision`; события как квитанции статуса | `tests/job-store.test.mjs`, 24 теста |
+| ③ адаптер очереди | `runtime/job-scheduler.mjs`: `runJobQueue` с портами `execute`/`integrate`/`reconcile` | `tests/job-scheduler.test.mjs`, 21 тест |
+| ④ concurrency/recovery fixtures | fake providers с барьером на 1/2/4/8 слотов; четыре процесса на одной базе; настоящая цепочка Git + SQLite | `tests/job-concurrency.test.mjs` (1), `tests/job-git-chain.test.mjs` (2) |
 
 Решения и отклонённые альтернативы — [ADR-0009](../decisions/0009-durable-jobs.md), руководство — [JOBS](../JOBS.md).
 
@@ -25,12 +25,31 @@
 | Управляемое перекрытие подтверждено fixture | При 1/2/4/8 слотах наблюдаемое перекрытие равно лимиту, интеграция строго по одной |
 | Нет неконтролируемых внешних вызовов | Модули jobs не обращаются к провайдерам и сети; исполнение и интеграция — только переданные порты |
 
-Устойчивость тестов к ошибкам реализации проверена 10 ручными мутациями (зависимость по `verifying`, снятие слота интеграции, отключение резервирования и старения, доверие чужому токену, слепой повтор интеграции, отключение heartbeat и другие): каждую ловит хотя бы один тест.
+Устойчивость тестов к ошибкам реализации проверена 11 ручными мутациями (зависимость по `verifying`, снятие слота интеграции, отключение резервирования и старения, доверие чужому токену, слепой повтор интеграции, отключение heartbeat, транзакция без `IMMEDIATE` и другие): каждую ловит хотя бы один тест.
+
+## Независимое ревью
+
+Первая версия прошла read-only ревью отдельным агентом, не видевшим хода разработки. Он нашёл 9 дефектов и 2 слабых теста. Все исправлены, на каждый добавлен тест, который падал до исправления:
+
+| Замечание | Исправление |
+| --- | --- |
+| `kodo jobs` создавал базу, выполнял миграцию и брал блокировку записи | `openJobReader`: read-only, без миграции; на пустом home ничего не создаётся |
+| Отклонённый хранилищем результат останавливал очередь | Задание сразу `failed: result_rejected:<код>`, очередь продолжает; негодный checkpoint не срывает паузу по квоте |
+| После зависания планировщик мог повторно запустить своё живое задание | Свои аренды продлеваются перед каждым sweep; учёт по токену аренды |
+| Интеграция, завершённая после перехвата аренды, проглатывалась | Явная ошибка `job_integration_ownership_lost`; порту дан `confirmOwnership()` |
+| Голодающее задание, которое не может стартовать, блокировало чужую работу | Резерв только у задания, способного стартовать; резерв учитывает locks |
+| `beginIntegration` блокировал задания подключённого host | Sweep без сведений о host не принимает решений о host |
+| После паузы по квоте задание теряло locks | Задание остаётся `waiting_quota` до возобновления и удерживает scopes и locks |
+| Пустая очередь давала `integrated` | Статус `empty` |
+| CLI выдумывал `host_unavailable`/`worker_mismatch` | `waitingFor` показывает только причины, видимые из очереди |
+| Тест «только чтение» не ловил создание таблиц; тест двух соединений был тавтологией | Тесты на свежий home, legacy-базу и открытую транзакцию записи; тест с четырьмя процессами |
+
+Остаточный риск из ревью: окно двойной интеграции при зависании координатора дольше TTL аренды нельзя закрыть без fencing на стороне Git. Оно описано в [JOBS](../JOBS.md) и [ADR-0009](../decisions/0009-durable-jobs.md).
 
 ## Что не сделано
 
 - **Wiring.** Project Director и Engine не ставят задания в очередь; Director по-прежнему ведёт один активный Attempt. Это главный оставшийся шаг этапа и единственное место, где меняется существующее поведение.
-- **Общий gate этапа.** Интегрированный `npm run check` замороженного head, security gates, независимое ревью, CI Windows/Linux, установленный CLI smoke и PR.
+- **Общий gate этапа.** Security gates, повторное ревью итогового head после wiring, CI Windows/Linux, установленный CLI smoke и PR. Локальный `npm run check` выполняется для текущего head, но замороженным кандидатом он станет только после wiring.
 - **Анализ Gemini и оценка Jev** перед этапом в этой сессии не выполнялись. Контракты заморожены по [NEXT-STAGES](NEXT-STAGES.md) и исходному сценарию 07.
 - **Реальный нативный пилот** подписочных клиентов по ограниченному бюджету.
 

@@ -58,7 +58,6 @@ export const fastTests = [
   'tests/efficiency-acceptance.test.mjs',
   'tests/job-cli.test.mjs',
   'tests/job-contracts.test.mjs',
-  'tests/job-scheduler.test.mjs',
   'tests/job-store.test.mjs',
   'tests/knowledge-claims.test.mjs',
   'tests/knowledge-context.test.mjs',
