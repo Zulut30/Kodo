@@ -1,13 +1,15 @@
 import path from 'node:path';
 import { readFile } from 'node:fs/promises';
 import { redact, secretFile } from './security.mjs';
-import { validate, planSchema, routingSchema, scopesOverlap } from './contracts.mjs';
+import { validate, validatePlan, planSchema, routingSchema, scopesOverlap } from './contracts.mjs';
 import { git, makeWorktree, collectFiles } from './workspace.mjs';
-import { maxTaskContractBytes } from './task-context.mjs';
+import { maxTaskContractBytes, validateTaskContract } from './task-context.mjs';
 import { assessTask, resolveMode } from './modes.mjs';
+import { FAST_PATH_VERSION, classifyLocalTask, fastPathAllowsPlan } from './fast-path.mjs';
 import { EngineCore, contentHash, defaultModel, evidencePrompt, lstatSafe } from './engine-core.mjs';
 
 /** Assessment, research, planning and routing stages. */
+const budgetKeys = ['researchBudget', 'repairRounds', 'concurrency', 'maxTasks'];
 export class EnginePlanning extends EngineCore {
   async preparePlanningContext(run) {
     const before = `${await this.policy(run, 'plan')}\n${this.planInstructions(run)}`;
@@ -86,6 +88,53 @@ export class EnginePlanning extends EngineCore {
       contextTruncated,
     };
   }
+  /** The ordinary route: one Jev assessment, then quick, standard or deep. */
+  async assessedMode(run, context, signal) {
+    let assessment;
+    try {
+      assessment = await this.logical(run, 'assessment', () =>
+        (this.provider.assessTask || assessTask)(
+          { task: run.task, files: context.files, signal },
+          { secrets: this.secrets },
+        ),
+      );
+    } catch (error) {
+      if (signal?.aborted || error.name === 'AbortError' || error.code === 'cancelled')
+        throw Object.assign(new Error('Запуск отменён'), { code: 'cancelled' });
+      assessment = { fallback: true, code: error.code || 'unavailable' };
+    }
+    // A large unrelated project map is normal. Only missing/truncated
+    // task-focused evidence prevents automatic quick selection.
+    if (assessment?.fallback === false && context.contextTruncated)
+      assessment = { ...assessment, contextTruncated: true };
+    // Missing provenance belongs to legacy runs: retain their original
+    // profile clamp and saved lower budgets rather than widening on resume.
+    return resolveMode({
+      requested: run.requestedMode ?? undefined,
+      assessment,
+      config: run.config,
+      concurrencyExplicit: run.requestedConcurrency != null,
+    });
+  }
+  /**
+   * A fast-path plan must stay inside the files the proof named. Otherwise the
+   * proof no longer covers the work: restore the saved budgets and take the
+   * ordinary route. Returns true when the mode was re-resolved.
+   */
+  async fastPathGuard(run, candidate, signal) {
+    if (run.executionMode?.source !== 'fast-path' || fastPathAllowsPlan(candidate, run.fastPath.files)) return false;
+    for (const key of budgetKeys) {
+      if (run.fastPath.budgets[key] === null) delete run.config[key];
+      else run.config[key] = run.fastPath.budgets[key];
+    }
+    run.fastPath = { ...run.fastPath, revoked: 'plan_outside_proof' };
+    delete run.executionMode;
+    delete run.completed.analysis;
+    this.log(run, 'fast_path_revoked', { reason: run.fastPath.revoked });
+    this.save(run);
+    await this.prepare(run, signal);
+    return true;
+  }
   async prepare(run, signal) {
     await makeWorktree(run.project, run.cwd, run.branch, run.baseSha);
     let bundle;
@@ -111,33 +160,40 @@ export class EnginePlanning extends EngineCore {
         bundle = await collectFiles(run.cwd, run.task, this.secrets);
         const context = await this.assessmentContext(run, bundle);
         run.modeContext = context.summary;
-        let assessment;
-        try {
-          assessment = await this.logical(run, 'assessment', () =>
-            (this.provider.assessTask || assessTask)(
-              { task: run.task, files: context.files, signal },
-              { secrets: this.secrets },
-            ),
-          );
-        } catch (error) {
-          if (signal?.aborted || error.name === 'AbortError' || error.code === 'cancelled')
-            throw Object.assign(new Error('Запуск отменён'), { code: 'cancelled' });
-          assessment = { fallback: true, code: error.code || 'unavailable' };
-        }
-        // A large unrelated project map is normal. Only missing/truncated
-        // task-focused evidence prevents automatic quick selection.
-        if (assessment?.fallback === false && context.contextTruncated)
-          assessment = { ...assessment, contextTruncated: true };
-        // Missing provenance belongs to legacy runs: retain their original
-        // profile clamp and saved lower budgets rather than widening on resume.
-        run.executionMode = resolveMode({
-          requested: run.requestedMode ?? undefined,
-          assessment,
-          config: run.config,
-          concurrencyExplicit: run.requestedConcurrency != null,
-        });
-        for (const key of ['researchBudget', 'repairRounds', 'concurrency', 'maxTasks'])
-          run.config[key] = run.executionMode.profile[key];
+        // A local proof needs no model. Any doubt takes the ordinary route below.
+        const local = run.fastPath?.revoked
+          ? { fastPath: false, reason: 'revoked' }
+          : await classifyLocalTask({ cwd: run.cwd, task: run.task, requested: run.requestedMode });
+        if (local.fastPath) {
+          run.fastPath = {
+            version: FAST_PATH_VERSION,
+            files: local.files,
+            reason: local.reason,
+            // Restored if the plan leaves the proof and the ordinary route takes over.
+            budgets: Object.fromEntries(budgetKeys.map(key => [key, run.config[key] ?? null])),
+          };
+          // No assessment was requested, so the receipt carries none of the fields of an
+          // unavailable one (`fallback`, `code`, `assessmentReason`).
+          const {
+            fallback: _fallback,
+            code: _code,
+            assessmentReason: _assessmentReason,
+            ...mode
+          } = resolveMode({
+            requested: 'quick',
+            config: run.config,
+            concurrencyExplicit: run.requestedConcurrency != null,
+          });
+          run.executionMode = {
+            ...mode,
+            assessment: 'not_requested',
+            requests: 0,
+            requested: run.requestedMode ?? null,
+            source: 'fast-path',
+            reason: 'Deterministic local proof: the task names only existing tracked style files',
+          };
+        } else run.executionMode = await this.assessedMode(run, context, signal);
+        for (const key of budgetKeys) run.config[key] = run.executionMode.profile[key];
       }
       this.save(run);
       this.log(run, 'mode_selected', run.executionMode);
@@ -183,14 +239,18 @@ export class EnginePlanning extends EngineCore {
     await this.policy(run, 'plan');
     if (planFile) {
       const candidate = JSON.parse(await readFile(planFile, 'utf8'));
-      this.validateModePlan(run, candidate, {
-        legacy: Boolean(run.plan && contentHash(candidate) === contentHash(run.plan)),
-      });
+      // A broken, oversized or forbidden plan is refused before it can change the mode of the run.
+      // Only the task count depends on the mode; it is checked after the mode is settled.
+      const legacy = Boolean(run.plan && contentHash(candidate) === contentHash(run.plan));
+      validatePlan(candidate);
+      if (!legacy) candidate.tasks.forEach(validateTaskContract);
       if (
         Object.values(run.nodes).some(node => node.status === 'integrated') &&
         contentHash(candidate) !== contentHash(run.plan)
       )
         throw new Error('Нельзя заменить план после интеграции задач');
+      await this.fastPathGuard(run, candidate, signal);
+      this.validateModePlan(run, candidate, { legacy });
       run.plan = candidate;
       run.planSource = 'host';
       this.save(run);
@@ -222,17 +282,25 @@ export class EnginePlanning extends EngineCore {
       },
       signal,
     );
+    // One wasted planner session at most: the ordinary route plans again under its own mode.
+    if (await this.fastPathGuard(run, result.output, signal)) return this.plan(run, undefined, signal);
     run.plan = this.validateModePlan(run, result.output);
     run.planSource = 'cli';
     run.plannerSession = result.sessionId;
     this.save(run);
   }
   planInstructions(run) {
+    // The fast path was proven for named files only: a plan that writes anything else revokes it.
+    const proven =
+      run.executionMode.source === 'fast-path'
+        ? ` This run was admitted for a style-only change: writePaths must be exactly these files and nothing else: ${JSON.stringify(run.fastPath.files)}. Do not add test or documentation files; state their checks as acceptance of the same task.`
+        : '';
     return (
       `Execution mode ${run.executionMode.selected}; at most ${run.executionMode.profile.maxTasks} tasks. Keep each mandatory node contract below ${maxTaskContractBytes} UTF-8 bytes; decompose oversized contracts without losing criteria. Prefer small cohesive deliverables and early scoped tests; a tiny change needs no artificial split. ` +
       (run.executionMode.selected === 'quick'
         ? 'Use a single developer task with tests and documentation as scoped acceptance in the same deliverable. Do not create unconditional separate tester or documenter tasks. Actual configured tests, build, UI/security gates and fresh independent review remain mandatory.'
-        : 'Split substantial work into small cohesive module deliverables with explicit interfaces and narrow non-overlapping write scopes. Define shared interface contracts before parallel implementation. Mark independent prepared nodes parallel=true; add only real dependencies, and let module tests and documentation start as their own prerequisites finish rather than waiting for all implementation. Avoid one giant developer task and unnecessary global dependency chains. Create separate tester or documenter tasks only where requirements need independent deliverables. Each worker receives its own scoped context, acceptance and dependency outcomes. Actual configured tests, build, UI/security gates and fresh independent review remain mandatory.')
+        : 'Split substantial work into small cohesive module deliverables with explicit interfaces and narrow non-overlapping write scopes. Define shared interface contracts before parallel implementation. Mark independent prepared nodes parallel=true; add only real dependencies, and let module tests and documentation start as their own prerequisites finish rather than waiting for all implementation. Avoid one giant developer task and unnecessary global dependency chains. Create separate tester or documenter tasks only where requirements need independent deliverables. Each worker receives its own scoped context, acceptance and dependency outcomes. Actual configured tests, build, UI/security gates and fresh independent review remain mandatory.') +
+      proven
     );
   }
   async route(run, task, state, signal) {

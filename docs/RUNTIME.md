@@ -84,7 +84,7 @@ kodo run "<локальная задача>" --client codex --mode quick --model
 - Автоматический `deep`: хотя бы один выбор high complexity, high risk или cross-cutting scope. Для этого условия отдельный порог 0.75 не применяется.
 - Остальные валидные оценки дают `standard`. При отсутствии ключа, недоступном Jev или некорректном ответе сохраняется явный fallback `standard` с причиной и неизвестными измерениями оценки; явный режим всё равно побеждает. Другой модельный API для классификации не подключается.
 
-`run.executionMode` содержит `requested`, `selected`, `source`, `reason`, эффективный `profile` и квитанцию оценки. `source` различает `explicit`, `jev`, `fallback`; старые запуски могут иметь `compatibility`. Выбор записывается событием `mode_selected`.
+`run.executionMode` содержит `requested`, `selected`, `source`, `reason`, эффективный `profile` и квитанцию оценки. `source` различает `explicit`, `jev`, `fallback`, `fast-path`; старые запуски могут иметь `compatibility`. Выбор записывается событием `mode_selected`.
 
 | Профиль | `gemini` | `researchBudget` | `maxTasks` | `repairRounds` | `concurrency` |
 | --- | --- | --- | --- | --- | --- |
@@ -176,6 +176,8 @@ Engine добавляет отдельный bounded JSON после renderSessi
 `runReadyQueue` допускает узлы непрерывно: после интеграции A готовый C стартует, даже если независимый B ещё выполняется. Лимит запуска и глобальные subscription leases сохраняются. Совместная работа требует parallel в плане и routing и непересекающихся scopes; scope удерживается до конца последовательной интеграции. Jev получает bounded snapshot готовых/активных peers, без завершённых предков и заблокированных потомков. Подготовленный routing переиспользуется, сохранённый serial-выбор не переигрывается ради скорости.
 
 Необязательный ключ `"scheduler": "durable"` в `kodo.config.json` исполняет узлы плана через [durable jobs](JOBS.md): те же лимиты и запреты параллельности, плюс очередь в SQLite, видимая через `kodo jobs`, и сверка merge после сбоя. Без ключа или с `"legacy"` работает прежний диспетчер.
+
+Задача, которая называет только существующие файлы стилей, выбирает `quick` без обращения к Jev (`executionMode.source: "fast-path"`); необязательный ключ `budgets` задаёт сохраняемые лимиты сессий и размера контекста. Подробности — [CONTEXT](CONTEXT.md).
 
 `concurrency:5` — ёмкость, а не обещание пяти одновременно активных workers. Реальный допуск сохраняет `task.parallel` и решение Jev: `parallelConfidence` ниже 0.75 (например 0.72) оставляет узлы последовательными даже при пяти слотах. При отсутствии отдельного поля проверяется общая `confidence`. Quick сохраняет serial routing policy. В standard/deep `--model` фиксирует точные provider/model, а существующий Jev оценивает scheduling/session с единственной разрешённой моделью; model-вопрос для неё не отправляется. Смена модели и model escalation запрещены, включая повторы и fallback при недоступном Jev. Низкая уверенность, `parallel:false`, пересечение scopes и незавершённые зависимости не обходятся флагом concurrency.
 

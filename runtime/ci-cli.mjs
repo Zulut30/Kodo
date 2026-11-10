@@ -285,13 +285,24 @@ function failureDiagnostic(result, secrets) {
   return diagnostic;
 }
 
+/**
+ * Deadline of one CI command. The full check took 16 to 20 minutes on the hosted Windows runner and
+ * was being cut off at the former 20 minute limit; see docs/decisions/0006-tiered-ci-and-parallel-capacity.md.
+ */
+const CI_COMMAND_TIMEOUT_MS = 2400000;
+
 // oxlint-disable-next-line max-lines-per-function, complexity -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
 export async function runCi(options, dependencies = {}) {
   const plan = await planCi(options, dependencies),
     receipts = [],
     began = performance.now();
   const evidenceDir = options.evidenceDir ?? path.join(os.tmpdir(), 'kodo-ci-evidence', randomUUID());
-  const common = { cwd: plan.project, env: workerEnvironment(), signal: options.signal, timeoutMs: 1200000 };
+  const common = {
+    cwd: plan.project,
+    env: workerEnvironment(),
+    signal: options.signal,
+    timeoutMs: CI_COMMAND_TIMEOUT_MS,
+  };
   const secrets = Object.fromEntries(Object.entries(process.env).filter(([name]) => !(name in common.env)));
   if (options.signal?.aborted)
     return {

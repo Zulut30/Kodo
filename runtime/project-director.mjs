@@ -632,6 +632,11 @@ async function foreground(ctx, id, options = {}) {
                 if (limit !== undefined)
                   value.runDraft.config[field] = Math.min(value.runDraft.config[field] ?? limit, limit);
               }
+            // Explicit run caps follow the same rule: a retry never widens a saved cap.
+            for (const [key, cap] of Object.entries(previous?.config.budgets ?? {})) {
+              const budgets = (value.runDraft.config.budgets ??= {});
+              budgets[key] = Math.min(budgets[key] ?? cap, cap);
+            }
             const revision = snapshot.revision,
               installed = await ctx.repo.installRun(value);
             snapshot = await guard(revision + 1, attempt);

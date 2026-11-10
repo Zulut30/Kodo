@@ -67,6 +67,8 @@ async function pins() {
     'engine-planning.mjs',
     'engine-execution.mjs',
     'engine-jobs.mjs',
+    'fast-path.mjs',
+    'context-manifest.mjs',
     'engine-verification.mjs',
     'security.mjs',
     'toolchains.mjs',

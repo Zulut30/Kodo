@@ -600,10 +600,15 @@ test('Director cancel and lease loss still abort active work and drain before re
 test('Same-task retry after reservation crash keeps the fixed model provider and lower budgets with fresh config', async t => {
   const f = await fixture(t);
   await f.ready('first');
+  await writeFile(
+    path.join(f.root, 'kodo.config.json'),
+    JSON.stringify({ ...f.config, budgets: { sessions: 5, contextBytes: 65536 } }),
+  );
   f.engine.run = async id => f.store.updateRun(id, { state: 'blocked' });
   await f.director.run(f.id, { mode: 'quick', model: 'gpt-6.1-sol', providers: 'current' });
   const prior = f.repo.snapshot(f.id).currentAttempts[0],
     priorRun = f.store.getRun(prior.runId);
+  assert.deepEqual(priorRun.config.budgets, { sessions: 5, contextBytes: 65536 });
   await writeFile(
     path.join(f.root, 'kodo.config.json'),
     JSON.stringify({
@@ -613,6 +618,7 @@ test('Same-task retry after reservation crash keeps the fixed model provider and
       concurrency: 5,
       researchBudget: 40,
       repairRounds: 5,
+      budgets: { sessions: 500 },
       security: { enabled: true },
     }),
   );
@@ -631,6 +637,11 @@ test('Same-task retry after reservation crash keeps the fixed model provider and
   assert.equal(run.requestedMode, 'quick');
   for (const key of ['researchBudget', 'repairRounds', 'concurrency', 'maxTasks'])
     assert.equal(run.config[key], priorRun.config[key]);
+  assert.deepEqual(
+    run.config.budgets,
+    { sessions: 5, contextBytes: 65536 },
+    'a retry never widens or drops a saved cap',
+  );
   assert.equal(run.config.security.enabled, true, 'Fresh policy cannot inherit a disabled gate or old PASS');
 });
 

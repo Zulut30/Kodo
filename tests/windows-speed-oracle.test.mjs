@@ -347,7 +347,7 @@ test('Windows speed oracle: runCi retains real profiled timeout tails bounded re
   let observedFailure;
   const result = await runCi({ project: fx.project, tier: 'L3', evidenceDir: path.join(fx.root, 'ci-evidence') }, {
     runProfiledCommand: async options => {
-      assert.equal(options.timeoutMs, 1200000, 'the production CI deadline remains fixed');
+      assert.equal(options.timeoutMs, 2400000, 'the production CI deadline remains fixed');
       assert.equal(options.command, process.execPath);
       assert.deepEqual(options.args, ['scripts/package-smoke.mjs']);
       // The owned child uses a short local deadline; runCi still supplies its
