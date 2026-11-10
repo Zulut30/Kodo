@@ -38,7 +38,7 @@ const relativeScope = scope =>
 /**
  * @typedef {object} VerificationConfig
  * @property {boolean} baseline Run the check commands on the base commit before any edit.
- * @property {boolean} testProtection Refuse deleted and skipped tests.
+ * @property {boolean} testProtection Refuse removed and switched-off tests.
  * @property {string[]} testRemovalAllowed Test paths (globs) this run may delete or reduce: an explicit, narrow exception.
  * @property {boolean} strictGates A gate the policy needs but the project disabled fails the gate.
  * @property {{ id: string, command: string, args: string[], timeoutMs?: number, protect: string[] }[]} oracles
@@ -116,7 +116,7 @@ export const verificationConfigHash = config =>
 const changeTypes = [
   [
     'ci',
-    /(^|\/)\.github\/(?:workflows|actions)\/|(^|\/)\.gitlab-ci\.yml$|(^|\/)azure-pipelines\.yml$|(^|\/)Jenkinsfile$|(^|\/)\.circleci\/|(^|\/)Dockerfile[^/]*$|(^|\/)docker-compose[^/]*\.ya?ml$|\.tf$/i,
+    /(^|\/)\.github\/(?:workflows|actions)\/|(^|\/)\.github\/dependabot\.ya?ml$|(^|\/)\.gitlab-ci\.yml$|(^|\/)azure-pipelines\.yml$|(^|\/)Jenkinsfile$|(^|\/)\.circleci\/|(^|\/)Dockerfile[^/]*$|(^|\/)docker-compose[^/]*\.ya?ml$|\.tf$/i,
   ],
   [
     'release',
@@ -126,7 +126,7 @@ const changeTypes = [
   [
     'security',
     // Whole words only: `AUTHORS.md` and `src/author.ts` are not authentication.
-    /(^|\/)(?:auth|authn|authz|authentication|authorization|oauth\d?|login|security|crypto|cryptography|permissions?|secrets?|sessions?|acl)(?:\/|\.|-|_|$)/i,
+    /(^|\/)(?:auth|authn|authz|authentication|authorization|oauth\d?|login|security|crypto|cryptography|permissions?|secrets?|sessions?|acl)(?:\/|\.|-|_|$)|(^|\/)\.env[^/]*$/i,
   ],
   [
     'api',
@@ -144,7 +144,7 @@ const changeTypes = [
   ],
   [
     'config',
-    /(^|\/)(?:package(?:-lock)?\.json|pnpm-lock\.yaml|yarn\.lock|Cargo\.(?:toml|lock)|go\.(?:mod|sum)|pyproject\.toml|requirements[^/]*\.txt|CMakeLists\.txt|Makefile|kodo\.config\.json|tsconfig[^/]*\.json|\.[a-z]+rc(?:\.[a-z]+)?)$/i,
+    /(^|\/)(?:package(?:-lock)?\.json|pnpm-lock\.yaml|yarn\.lock|Cargo\.(?:toml|lock)|go\.(?:mod|sum)|pyproject\.toml|requirements[^/]*\.txt|CMakeLists\.txt|Makefile|kodo\.config\.json|tsconfig[^/]*\.json|(?:jest|vitest|vite|webpack|rollup|babel|eslint|prettier|playwright)\.config\.[cm]?[jt]s|\.[a-z]+rc(?:\.[a-z]+)?)$/i,
   ],
 ];
 const isTestFile = file => changeTypes.find(([type]) => type === 'tests')[1].test(file);
@@ -204,43 +204,204 @@ export function qualityPolicy({ types, config, verification }) {
 
 /** Files larger than this are not inspected; the receipt says so. */
 const MAX_INSPECTED_BYTES = 262144;
-const markers = {
-  // A test case, not `regex.test(` and not a `describe` group. Linear: no nested quantifiers.
-  cases:
-    /(?<![.\w$])(?:test|it)(?:\s*\.\s*\w+){0,3}\s*[(`]|\bdef\s+test_\w+|#\[(?:\w+::)?test\]|\bfunc\s+Test\w+\s*\(|@Test\b/g,
-  // Explicit ways to keep a test from running.
-  skips:
-    /(?<![.\w$])(?:test|it|describe|suite)\s*\.\s*(?:skip|todo|only)\b|(?<![.\w$])x(?:it|describe|test)\s*\(|\b(?:t|this|ctx|context)\.(?:skip|todo)\s*\(|\b(?:skip|todo)\s*:\s*(?!false\b)[^\s,}]|@pytest\.mark\.(?:skip|xfail)|pytest\.skip\s*\(|@(?:unittest\.)?skip\w*|#\[ignore\b|\bt\.Skip(?:f|Now)?\(|@(?:Disabled|Ignore)\b/g,
-  assertions: /\bassert\w*|\bexpect\s*\(|\.should\b|\brequire\.\w+\(/g,
+const MARK = '\u0001';
+const languages = {
+  ...Object.fromEntries('js mjs cjs jsx ts mts cts tsx'.split(' ').map(ext => [ext, 'js'])),
+  py: 'py',
+  rs: 'rs',
+  go: 'go',
+  java: 'java',
+  kt: 'java',
 };
-const count = (text, pattern) => (text.match(pattern) || []).length;
-const hashComments = /\.(?:py|rb|sh|bash|zsh|ya?ml|toml)$/i;
+const languageOf = file => languages[file.slice(file.lastIndexOf('.') + 1).toLowerCase()];
+/** A file that names itself a test, whatever its language. */
+const namedTest = /\.(?:test|spec)\.[^/]+$|_test\.[^/]+$|(^|\/)test_[^/]+$/i;
+const regexAfterWord = /(?:^|[^\w$.])(?:return|typeof|case|in|of|delete|void|throw|new|else|do|await|yield)$/;
+
 /**
- * Remove comments, so a commented-out test is a removed test. Not string-aware:
- * `//` after a colon (a URL) is kept; this is a counter, not a parser.
+ * JS/TS source as code only: comments are removed and every string, template
+ * and regex literal becomes a numbered placeholder. So a `/*` inside a string
+ * opens no comment, a commented-out test is gone, and test code quoted inside
+ * a string (a fixture) is not a test. A scanner, not a parser: enough to find
+ * calls and their first argument.
+ * @param {string} source
  */
-function withoutComments(file, text) {
-  return hashComments.test(file)
-    ? text.replace(/(^|\s)#.*$/gm, '$1')
-    : text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
+function scanJs(source) {
+  const strings = [],
+    length = source.length;
+  let code = '',
+    last = '',
+    index = 0;
+  const literal = text => {
+    strings.push(text);
+    last = MARK;
+    return `${MARK}${strings.length - 1}${MARK}`;
+  };
+  while (index < length) {
+    const char = source[index],
+      next = source[index + 1];
+    if (char === '/' && next === '/') {
+      while (index < length && source[index] !== '\n') index++;
+    } else if (char === '/' && next === '*') {
+      const end = source.indexOf('*/', index + 2);
+      index = end < 0 ? length : end + 2;
+      code += ' ';
+    } else if (char === '"' || char === "'") {
+      let end = index + 1;
+      while (end < length && source[end] !== char && source[end] !== '\n') end += source[end] === '\\' ? 2 : 1;
+      code += literal(source.slice(index + 1, end));
+      index = end + 1;
+    } else if (char === '`') {
+      let end = index + 1,
+        depth = 0;
+      for (; end < length; end++) {
+        const inner = source[end];
+        if (inner === '\\') end++;
+        else if (inner === '`' && depth === 0) break;
+        else if (inner === '$' && source[end + 1] === '{') {
+          depth++;
+          end++;
+        } else if (inner === '{' && depth > 0) depth++;
+        else if (inner === '}' && depth > 0) depth--;
+      }
+      code += literal(source.slice(index + 1, end));
+      index = end + 1;
+    } else if (
+      char === '/' &&
+      (last === '' || '(,=:[!&|?{};+-*%<>~^'.includes(last) || regexAfterWord.test(code.trimEnd()))
+    ) {
+      // A regex literal: it may hold quotes and slashes that are not code.
+      let end = index + 1,
+        inClass = false;
+      for (; end < length && source[end] !== '\n'; end++) {
+        const inner = source[end];
+        if (inner === '\\') end++;
+        else if (inner === '[') inClass = true;
+        else if (inner === ']') inClass = false;
+        else if (inner === '/' && !inClass) break;
+      }
+      code += literal(source.slice(index + 1, end));
+      index = end + 1;
+    } else {
+      code += char;
+      if (!/\s/.test(char)) last = char;
+      index++;
+    }
+  }
+  return { code, strings };
 }
 
-/** Marker counts of one revision of a file, or a reason why it was not inspected. Never throws. */
+/** Python source as code only: comments removed, string literals (also triple-quoted) blanked. */
+function scanPython(source) {
+  const length = source.length;
+  let code = '',
+    index = 0;
+  while (index < length) {
+    const char = source[index];
+    if (char === '#') {
+      while (index < length && source[index] !== '\n') index++;
+    } else if (char === '"' || char === "'") {
+      const triple = source.startsWith(char.repeat(3), index),
+        quote = triple ? char.repeat(3) : char;
+      let end = index + quote.length;
+      while (end < length && !source.startsWith(quote, end) && (triple || source[end] !== '\n'))
+        end += source[end] === '\\' ? 2 : 1;
+      code += MARK;
+      index = Math.min(length, end + quote.length);
+    } else {
+      code += char;
+      index++;
+    }
+  }
+  return code;
+}
+
+/** Call modifiers that still make a test case; anything else (`describe`, `step`, hooks) is not one. */
+const jsModifiers = new Set(
+  'skip only todo fixme fails failing concurrent serial parallel sequential skipIf runIf'.split(' '),
+);
+/** Modifiers that keep the case, or every other case, from running. */
+const jsSkips = new Set('skip only todo fixme fails failing skipIf runIf'.split(' '));
+const jsCall = new RegExp(
+  `(?<![.\\w$])(x?)(test|it|specify)((?:\\s*\\.\\s*[A-Za-z]+)*)\\s*\\(\\s*(?:${MARK}(\\d+)${MARK}((?:\\s*,\\s*\\{[^{}]*\\})?)|([A-Za-z_$]))`,
+  'g',
+);
+const jsSubtest = new RegExp(`(?<![\\w$])t\\s*\\.\\s*test\\s*\\(\\s*${MARK}(\\d+)${MARK}`, 'g');
+const skipOption = new RegExp(`\\b(?:skip|todo)\\s*:\\s*(?!false\\b)[^\\s,}]`);
+const count = (text, pattern) => (text.match(pattern) || []).length;
+
+/**
+ * The test cases of one file: `{ name, skipped }` for each case named by a
+ * literal, and the number of cases named by an expression. Null for a language
+ * this gate does not read.
+ * @param {string} file
+ * @param {string} source
+ */
+function casesOf(file, source) {
+  const cases = [];
+  let dynamic = 0,
+    code = source;
+  const language = languageOf(file);
+  if (language === 'js') {
+    const scanned = scanJs(source);
+    code = scanned.code;
+    for (const match of code.matchAll(jsCall)) {
+      const modifiers = match[3]
+        .split('.')
+        .map(part => part.trim())
+        .filter(Boolean);
+      if (modifiers.some(modifier => !jsModifiers.has(modifier))) continue;
+      if (match[4] === undefined) dynamic++;
+      else
+        cases.push({
+          name: scanned.strings[Number(match[4])],
+          skipped:
+            match[1] === 'x' || modifiers.some(modifier => jsSkips.has(modifier)) || skipOption.test(match[5] || ''),
+        });
+    }
+    for (const match of code.matchAll(jsSubtest))
+      cases.push({ name: scanned.strings[Number(match[1])], skipped: false });
+  } else if (language === 'py') {
+    code = scanPython(source);
+    for (const match of code.matchAll(/((?:^[ \t]*@.*\n)*)^[ \t]*(?:async[ \t]+)?def[ \t]+(test\w*)[ \t]*\(/gm))
+      cases.push({ name: match[2], skipped: /@(?:[\w.]*\.)?(?:skip\w*|xfail)\b/i.test(match[1]) });
+  } else if (language === 'rs') {
+    for (const match of source.matchAll(/((?:#\[[^\]\n]*\]\s*)+)(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+(\w+)/g))
+      if (/\btest\b/.test(match[1])) cases.push({ name: match[2], skipped: /\bignore\b/.test(match[1]) });
+  } else if (language === 'go') {
+    for (const match of source.matchAll(/^func\s+(Test\w+)\s*\(/gm)) cases.push({ name: match[1], skipped: false });
+  } else if (language === 'java') {
+    for (const match of source.matchAll(
+      /@(?:Test|ParameterizedTest|RepeatedTest)\b([\s\S]{0,300}?)\b(?:void|fun)\s+(\w+)\s*\(/g,
+    ))
+      cases.push({
+        name: match[2],
+        skipped: /@(?:Disabled|Ignore)\b/.test(source.slice(Math.max(0, match.index - 160), match.index) + match[1]),
+      });
+  } else return null;
+  return {
+    cases,
+    dynamic,
+    assertions: count(code, /\bassert\w*|\bexpect\s*\(/g),
+    // Skips called from inside a test body; they cannot be tied to one case without a parser.
+    bodySkips: count(
+      code,
+      /(?<![\w$])(?:t|this|ctx|context)\s*\.\s*(?:skip|todo)\s*\(|\bpytest\.skip\s*\(|\bself\.skipTest\s*\(|\bt\.Skip(?:f|Now)?\(/g,
+    ),
+  };
+}
+
+/** The cases of one revision of a file, or the reason it was not inspected. Never throws. */
 async function inspect(cwd, revision, file) {
   let result;
   try {
-    result = await execute('git', ['show', `${revision}:${file}`], { cwd, allowFailure: true });
+    result = await execute('git', ['show', `${revision}:${file}`], { cwd, allowFailure: true, rawOutput: true });
   } catch {
     return { reason: 'unreadable' };
   }
   if (result.code !== 0) return { reason: 'unreadable' };
   if (Buffer.byteLength(result.stdout) > MAX_INSPECTED_BYTES) return { reason: 'too_large' };
-  const text = withoutComments(file, result.stdout);
-  return {
-    cases: count(text, markers.cases),
-    skips: count(text, markers.skips),
-    assertions: count(text, markers.assertions),
-  };
+  return casesOf(file, result.stdout) ?? { reason: 'unsupported_language' };
 }
 
 /** Changed files between base and head as `{ status, from, to }`, renames followed. */
@@ -258,65 +419,131 @@ async function changes(cwd, baseSha, headSha) {
   return rows;
 }
 
+const listNames = names =>
+  `${names
+    .slice(0, 5)
+    .map(name => JSON.stringify(String(name).slice(0, 80)))
+    .join(', ')}${names.length > 5 ? `, and ${names.length - 5} more` : ''}`;
+
 /**
- * Tests that existed on the base and were deleted, removed or switched off.
+ * Tests that existed on the base and were removed or switched off.
  *
- * A heuristic over marker counts, tuned to refuse the unambiguous cases and to
- * let honest test work through: cases are counted across all changed test
- * files, so moving or splitting tests is not a removal; fewer assertions is
- * only a warning. It cannot see semantic weakening (an early `return`,
- * `assert.ok(true)`); that stays with checks, oracles and review.
- * @param {{ cwd: string, baseSha: string, headSha: string }} input
- * @returns {Promise<{ findings: { rule: string, file: string, detail: string }[],
- *   warnings: { rule: string, file: string | null, detail: string }[], unchecked: { file: string, reason: string }[] }>}
+ * Cases are compared by name across all changed test files: a case that moved
+ * to another file, or a file that was split or renamed, is still there; a case
+ * whose name is gone is removed, whatever was added in its place. Comments and
+ * string contents are not code, so a commented-out test is a removed one. A
+ * case that gains a skip (`.skip`, `.only`, `.todo`, `xit`, an options object
+ * with `skip:`, a skip decorator or attribute) is switched off.
+ *
+ * What it cannot see is in the docs: a body emptied under the same name, an
+ * early `return`, a skip called inside the body, a renamed case (reported as
+ * removed).
+ * @param {{ cwd: string, baseSha: string, headSha: string, allowed?: string[] }} input
+ *   `allowed`: test paths this run may delete or reduce.
  */
-export async function testWeakening({ cwd, baseSha, headSha }) {
-  const rows = [],
-    unchecked = [];
-  for (const { status, from, to } of await changes(cwd, baseSha, headSha)) {
-    // A renamed test that no longer looks like a test to any runner is a removed test.
-    const before = status !== 'A' && status !== 'C' && isTestFile(from) ? await inspect(cwd, baseSha, from) : null;
-    const after = status !== 'D' && isTestFile(to) ? await inspect(cwd, headSha, to) : null;
-    for (const [side, file] of [
-      [before, from],
-      [after, to],
-    ])
-      if (side?.reason) unchecked.push({ file, reason: side.reason });
-    if (before?.reason || after?.reason) continue;
-    if (before || after) rows.push({ status, from, to, before, after });
-  }
-  const sum = (side, field) => rows.reduce((total, row) => total + (row[side]?.[field] ?? 0), 0);
-  const removedOverall = sum('after', 'cases') < sum('before', 'cases');
-  const findings = [],
+export async function testWeakening({ cwd, baseSha, headSha, allowed = [] }) {
+  const base = [],
+    head = [],
+    unchecked = [],
+    findings = [],
+    permitted = [],
     warnings = [];
-  for (const { status, from, to, before, after } of rows) {
-    if (!before?.cases) continue; // New, or a helper or fixture without test cases.
-    const file = after ? to : from;
-    const now = after ?? { cases: 0, skips: 0, assertions: 0 };
-    // Fewer cases here and no fewer overall is a move or a split, not a removal.
-    if (removedOverall && now.cases < before.cases)
-      findings.push(
-        after
-          ? { rule: 'tests_removed', file, detail: `test cases ${before.cases} -> ${now.cases}` }
-          : {
+  const report = finding =>
+    (finding.rule !== 'test_skipped' && ownsPath(allowed, finding.file) ? permitted : findings).push(finding);
+  for (const { status, from, to } of await changes(cwd, baseSha, headSha)) {
+    // A test renamed to a path no runner would pick up is gone.
+    const gone = status === 'D' || !isTestFile(to);
+    if (status !== 'A' && status !== 'C' && isTestFile(from)) {
+      const before = await inspect(cwd, baseSha, from);
+      if (!before.reason)
+        base.push({ file: from, at: gone ? from : to, gone, renamedTo: status === 'D' ? null : to, ...before });
+      else if (before.reason !== 'unsupported_language' || namedTest.test(from)) {
+        unchecked.push({ file: from, reason: before.reason });
+        // A removed test file is a removed test even when its cases could not be read.
+        if (gone && languageOf(from))
+          report({ rule: 'test_deleted', file: from, detail: `removed and not inspected (${before.reason})` });
+      }
+    }
+    if (status !== 'D' && isTestFile(to)) {
+      const after = await inspect(cwd, headSha, to);
+      if (!after.reason) head.push({ file: to, ...after });
+      else if (after.reason !== 'unsupported_language' || namedTest.test(to))
+        unchecked.push({ file: to, reason: after.reason });
+    }
+  }
+  const tally = (entries, pick = _item => true) => {
+    const names = new Map();
+    for (const entry of entries)
+      for (const item of entry.cases) if (pick(item)) names.set(item.name, (names.get(item.name) ?? 0) + 1);
+    return names;
+  };
+  // Every base case must still exist somewhere among the changed test files.
+  const remaining = tally(head);
+  for (const entry of base) {
+    const removed = [];
+    for (const { name } of entry.cases) {
+      const left = remaining.get(name) ?? 0;
+      if (left > 0) remaining.set(name, left - 1);
+      else removed.push(name);
+    }
+    if (removed.length)
+      report(
+        entry.gone
+          ? {
               rule: 'test_deleted',
-              file: from,
-              detail:
-                status === 'D'
-                  ? `${before.cases} test cases removed with the file`
-                  : `renamed to ${to}, which no test runner picks up`,
+              file: entry.file,
+              detail: `${entry.renamedTo ? `renamed to ${entry.renamedTo}, which no test runner picks up; ` : ''}${removed.length} test cases are gone: ${listNames(removed)}`,
+            }
+          : {
+              rule: 'tests_removed',
+              // The base path: it is what a permission names, and Git may pair a deleted file with a new one.
+              file: entry.file,
+              detail: `${entry.at === entry.file ? '' : `now ${entry.at}; `}test cases removed: ${listNames(removed)}`,
             },
       );
-    if (now.skips > before.skips)
-      findings.push({ rule: 'test_skipped', file, detail: `skip/only/todo markers ${before.skips} -> ${now.skips}` });
   }
-  if (sum('after', 'assertions') < sum('before', 'assertions') && sum('after', 'cases') <= sum('before', 'cases'))
+  const dynamic = entries => entries.reduce((total, entry) => total + entry.dynamic, 0);
+  if (dynamic(head) < dynamic(base)) {
+    const entry = base.find(item => item.dynamic > 0);
+    report({
+      rule: 'tests_removed',
+      file: entry.at,
+      detail: `cases named by an expression: ${dynamic(base)} -> ${dynamic(head)} across changed tests`,
+    });
+  }
+  // An existing case that gained a skip. A new case that is born skipped is not weakening.
+  const known = tally(base),
+    skippedBefore = tally(base, item => item.skipped);
+  for (const entry of head) {
+    const names = [...new Set(entry.cases.filter(item => item.skipped).map(item => item.name))].filter(
+      name =>
+        known.has(name) &&
+        tally([entry], item => item.skipped && item.name === name).get(name) > (skippedBefore.get(name) ?? 0),
+    );
+    if (names.length) report({ rule: 'test_skipped', file: entry.file, detail: `switched off: ${listNames(names)}` });
+  }
+  // A skip call added to a file that gained no case was added to an existing test.
+  const sameFile = new Map(base.filter(entry => !entry.gone).map(entry => [entry.at, entry]));
+  for (const entry of head) {
+    const before = sameFile.get(entry.file);
+    if (!before || entry.bodySkips <= before.bodySkips || entry.dynamic > before.dynamic) continue;
+    const names = new Set(before.cases.map(item => item.name));
+    if (entry.cases.every(item => names.has(item.name)))
+      report({
+        rule: 'test_skipped',
+        file: entry.file,
+        detail: `skip calls inside existing tests ${before.bodySkips} -> ${entry.bodySkips}`,
+      });
+  }
+  const total = (entries, field) =>
+    entries.reduce((sum, entry) => sum + (field ? entry[field] : entry.cases.length), 0);
+  if (total(head, 'assertions') < total(base, 'assertions') && total(head) <= total(base))
     warnings.push({
       rule: 'assertions_removed',
       file: null,
-      detail: `assertions ${sum('before', 'assertions')} -> ${sum('after', 'assertions')} across changed tests`,
+      detail: `assertions ${total(base, 'assertions')} -> ${total(head, 'assertions')} across changed tests`,
     });
-  return { findings, warnings, unchecked };
+  return { findings, allowed: permitted, warnings, unchecked };
 }
 
 /** Findings a repair session cannot fix: only a person can change the configuration. */
@@ -392,12 +619,12 @@ export async function runBehaviorGate({
         detail: `${gap.gate} gate is required for this change`,
       });
   if (verification.testProtection) {
-    const tests = await testWeakening({ cwd, baseSha, headSha });
+    const tests = await testWeakening({ cwd, baseSha, headSha, allowed: verification.testRemovalAllowed });
+    findings.push(...tests.findings);
+    // Removals this run was explicitly allowed; the receipt still shows them.
+    allowed.push(...tests.allowed);
     warnings.push(...tests.warnings);
     unchecked.push(...tests.unchecked);
-    // The run was explicitly allowed to remove these tests; the receipt still shows that it did.
-    for (const finding of tests.findings)
-      (ownsPath(verification.testRemovalAllowed, finding.file) ? allowed : findings).push(finding);
   }
   const oracles = [];
   for (const oracle of verification.oracles) {
@@ -426,7 +653,8 @@ export async function runBehaviorGate({
     status: findings.length ? 'failed' : 'passed',
     passed: findings.length === 0,
     // Nothing a repair session could change: the run stops for a person instead of spending sessions.
-    repairable: findings.some(finding => !unrepairable.has(finding.rule)),
+    // One finding only a person can fix means no repair can make the gate pass.
+    repairable: !findings.some(finding => unrepairable.has(finding.rule)),
     policy,
     findings,
     allowed,

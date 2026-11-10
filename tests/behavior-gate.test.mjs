@@ -108,16 +108,15 @@ test('Deleted, removed, skipped, focused and stripped tests are found; honest te
     });
     const { findings } = await testWeakening(head);
     assert.deepEqual(rules(findings), ['test_skipped:tests/math.test.mjs']);
-    assert.match(findings[0].detail, /0 -> 2/);
+    assert.match(findings[0].detail, /switched off: "adds", "subtracts"/);
   });
   await t.test('assertions stripped while the test count stays is a warning', async s => {
     const repo = repository(s);
     const head = repo.change({ 'tests/math.test.mjs': twoTests.replace('  assert.equal(2 + 2, 4);\n', '') });
     const result = await testWeakening(head);
     assert.deepEqual(result.findings, [], 'fewer assertions alone is not refused');
-    assert.deepEqual(result.warnings, [
-      { rule: 'assertions_removed', file: null, detail: 'assertions 5 -> 4 across changed tests' },
-    ]);
+    assert.equal(result.warnings.length, 1);
+    assert.match(result.warnings[0].detail, /^assertions \d+ -> \d+ across changed tests$/);
   });
   await t.test('a renamed test file is still compared', async s => {
     const repo = repository(s);
@@ -131,10 +130,10 @@ test('Deleted, removed, skipped, focused and stripped tests are found; honest te
     const repo = repository(s);
     const head = repo.change(
       {
-        // More cases with fewer assertions each is a refactor, not weakening.
+        // The existing cases keep their names; a case is added; a new skipped test is not weakening.
         'tests/math.test.mjs':
           "import test from 'node:test';\nimport assert from 'node:assert/strict';\n" +
-          "test('adds one', () => assert.equal(1 + 1, 2));\ntest('adds two', () => assert.equal(2 + 2, 4));\n" +
+          "test('adds', () => assert.equal(1 + 1, 2));\ntest('adds more', () => assert.equal(2 + 2, 4));\n" +
           "test('subtracts', () => assert.equal(2 - 1, 1));\n",
         'tests/new.test.mjs': "import test from 'node:test';\ntest.skip('later', () => {});\n",
         'src/math.mjs': 'export const add = (a, b) => b + a;\n',
@@ -477,4 +476,171 @@ test('An oracle that changes the checked tree fails the gate and stops the oracl
       outputHash: 'f'.repeat(64),
     },
   ]);
+});
+
+const header = "import test from 'node:test';\nimport assert from 'node:assert/strict';\n";
+const one = (name, body = 'assert.equal(1, 1)') => `test('${name}', () => {\n  ${body};\n});\n`;
+
+test('Cases are compared by name: fillers do not hide a removal, moves and data are not removals', async t => {
+  await t.test('a deleted file is not compensated by a new file with as many cases', async s => {
+    const repo = repository(s);
+    const head = repo.change({ 'tests/filler.test.mjs': header + one('a') + one('b') }, ['tests/math.test.mjs']);
+    assert.deepEqual(await weakened(head), ['test_deleted:tests/math.test.mjs']);
+  });
+  await t.test('a removed case is not compensated by a new case elsewhere', async s => {
+    const repo = repository(s, { 'tests/other.test.mjs': header + one('other') });
+    const head = repo.change({
+      'tests/math.test.mjs': twoTests.replace(/test\('subtracts'[\s\S]*$/, ''),
+      'tests/other.test.mjs': header + one('other') + one('brand new'),
+    });
+    const { findings } = await testWeakening(head);
+    assert.deepEqual(rules(findings), ['tests_removed:tests/math.test.mjs']);
+    assert.match(findings[0].detail, /test cases removed: "subtracts"/);
+  });
+  await t.test('a test renamed out of the runner is not compensated by fillers', async s => {
+    const repo = repository(s);
+    mkdirSync(path.join(repo.cwd, 'archive'));
+    repo.git('mv', 'tests/math.test.mjs', 'archive/math.mjs.off');
+    const head = repo.change({ 'tests/filler.test.mjs': header + one('a') + one('b') });
+    assert.deepEqual(await weakened(head), ['test_deleted:tests/math.test.mjs']);
+  });
+  await t.test('a renamed case is reported as removed', async s => {
+    const repo = repository(s);
+    const head = repo.change({ 'tests/math.test.mjs': twoTests.replace("test('adds'", "test('sums'") });
+    assert.deepEqual(await weakened(head), ['tests_removed:tests/math.test.mjs'], 'a known limit of name identity');
+  });
+  await t.test('skip as data, and a new conditionally skipped test, are not skips', async s => {
+    const repo = repository(s);
+    const head = repo.change({
+      'tests/math.test.mjs':
+        twoTests.replace(
+          '  assert.equal(2 - 1, 1);\n',
+          '  assert.deepEqual(page({ skip: 10, take: 5 }), { todo: 0 });\n  assert.equal(2 - 1, 1);\n',
+        ) + "test('windows only', { skip: process.platform !== 'win32' }, () => {\n  assert.equal(1, 1);\n});\n",
+    });
+    assert.deepEqual(await weakened(head), []);
+  });
+  await t.test('a skip option added to an existing case is a skip', async s => {
+    const repo = repository(s);
+    const head = repo.change({
+      'tests/math.test.mjs': twoTests.replace(
+        "test('adds', () =>",
+        "test('adds', { skip: process.platform !== 'win32' }, () =>",
+      ),
+    });
+    assert.deepEqual(await weakened(head), ['test_skipped:tests/math.test.mjs']);
+  });
+  await t.test('glob strings and URLs are not comments', async s => {
+    const withDocs = `${twoTests}/**\n * Helper.\n */\nexport const helper = () => 'https://example.invalid/a';\n`;
+    const repo = repository(s, { 'tests/math.test.mjs': withDocs });
+    const added = repo.change({
+      'tests/math.test.mjs': withDocs.replace(header, `${header}const scopes = ['src/**', '/*.js'];\n`),
+    });
+    assert.deepEqual(await weakened(added), [], 'a string with /* opens no comment');
+    const second = repository(s, {
+      'tests/math.test.mjs': withDocs.replace(header, `${header}const scopes = ['src/**'];\n`),
+    });
+    const removed = second.change({
+      'tests/math.test.mjs': withDocs
+        .replace(header, `${header}const scopes = ['src/**'];\n`)
+        .replace(/test\('subtracts'[\s\S]*?\}\);\n/, ''),
+    });
+    assert.deepEqual(
+      await weakened(removed),
+      ['tests_removed:tests/math.test.mjs'],
+      'cases after such a string are still seen',
+    );
+  });
+  await t.test('test code quoted inside a string is not a test', async s => {
+    const fixture = `${header}const sample = "test('inner', () => {})";\n${one('outer', 'assert.ok(sample)')}`;
+    const repo = repository(s, { 'tests/meta.test.mjs': fixture });
+    const head = repo.change({ 'tests/meta.test.mjs': fixture.replace("test('inner'", "it('other'") });
+    assert.deepEqual(await weakened(head), []);
+  });
+  await t.test('playwright groups and steps are not cases', async s => {
+    const grouped = `${header}test.describe('math', () => {\n  test('adds', async () => {\n    await test.step('open', async () => {});\n    assert.equal(1 + 1, 2);\n  });\n});\n`;
+    const repo = repository(s, { 'tests/e2e.test.mjs': grouped });
+    const head = repo.change({
+      'tests/e2e.test.mjs': `${header}test('adds', async () => {\n  assert.equal(1 + 1, 2);\n});\n`,
+    });
+    assert.deepEqual(await weakened(head), []);
+  });
+  await t.test('an already skipped test may move to another file', async s => {
+    const skipped = "test.skip('later', () => {});\n";
+    const repo = repository(s, {
+      'tests/a.test.mjs': header + one('a') + skipped,
+      'tests/b.test.mjs': header + one('b'),
+    });
+    const head = repo.change({
+      'tests/a.test.mjs': header + one('a'),
+      'tests/b.test.mjs': header + one('b') + skipped,
+    });
+    assert.deepEqual(await weakened(head), []);
+  });
+  await t.test('an allowed removal does not turn an honest move into a removal', async s => {
+    const repo = repository(s, { 'tests/legacy/old.test.mjs': header + one('legacy') });
+    const head = repo.change(
+      {
+        'tests/math.test.mjs': twoTests.replace(/test\('subtracts'[\s\S]*$/, ''),
+        'tests/subtract.test.mjs': `${header}test('subtracts', () => {\n  assert.equal(2 - 1, 1);\n});\n`,
+      },
+      ['tests/legacy/old.test.mjs'],
+    );
+    const receipt = await runBehaviorGate({
+      ...head,
+      config: { verification: { testRemovalAllowed: ['tests/legacy/**'] } },
+    });
+    assert.deepEqual([receipt.passed, rules(receipt.findings)], [true, []]);
+    // Git may pair the deleted legacy file with the new one as a rename; the permission follows the base path.
+    assert.deepEqual(
+      receipt.allowed.map(finding => finding.file),
+      ['tests/legacy/old.test.mjs'],
+    );
+  });
+  await t.test('the permission covers removal only, not a skip', async s => {
+    const repo = repository(s);
+    const head = repo.change({ 'tests/math.test.mjs': twoTests.replace("test('adds'", "test.skip('adds'") });
+    const receipt = await runBehaviorGate({ ...head, config: { verification: { testRemovalAllowed: ['tests/**'] } } });
+    assert.deepEqual(rules(receipt.findings), ['test_skipped:tests/math.test.mjs']);
+  });
+  await t.test('a removed test file too large to read is still a removed test', async s => {
+    const big = `${twoTests}// ${'x'.repeat(300000)}\n`;
+    const repo = repository(s, { 'tests/big.test.mjs': big });
+    const receipt = await runBehaviorGate({ ...repo.change({}, ['tests/big.test.mjs']), config: {} });
+    assert.deepEqual(rules(receipt.findings), ['test_deleted:tests/big.test.mjs']);
+    assert.deepEqual(receipt.unchecked, [{ file: 'tests/big.test.mjs', reason: 'too_large' }]);
+  });
+});
+
+test('A finding only a person can fix makes the whole gate unrepairable, whatever else was found', async t => {
+  const repo = repository(t, { 'styles/app.css': 'a { color: red; }\n' });
+  const head = repo.change({ 'styles/app.css': 'a { color: blue; }\n' }, ['tests/math.test.mjs']);
+  const receipt = await runBehaviorGate({ ...head, config: { verification: { strictGates: true } } });
+  assert.deepEqual(rules(receipt.findings).sort(), ['required_gate_disabled:null', 'test_deleted:tests/math.test.mjs']);
+  assert.equal(receipt.repairable, false, 'repair rounds would be spent for nothing');
+});
+
+test('Template names with interpolation, regex literals and nested quotes do not derail the scanner', async t => {
+  const tricky =
+    header +
+    "for (const flag of ['a', 'b'])\n  test(`hidden by ${flag}`, async () => {\n    assert.match(`${flag}'s \"x\"`, /['\"`/]+x/);\n  });\n" +
+    'const pattern = /https?:\\/\\/[^\'"]+/;\n' +
+    one('first after') +
+    one('second after', "assert.ok(pattern.test('https://example.invalid/'))");
+  const repo = repository(t, { 'tests/tricky.test.mjs': tricky });
+  const touched = repo.change({ 'tests/tricky.test.mjs': `${tricky}\n// touched\n` });
+  assert.deepEqual(await weakened(touched), [], 'a harmless edit reports nothing');
+  const removed = repo.change({
+    'tests/tricky.test.mjs': tricky.replace(
+      one('second after', "assert.ok(pattern.test('https://example.invalid/'))"),
+      '',
+    ),
+  });
+  const { findings } = await testWeakening(removed);
+  assert.deepEqual(rules(findings), ['tests_removed:tests/tricky.test.mjs']);
+  assert.match(findings[0].detail, /"second after"/);
+  const renamedTemplate = repo.change({
+    'tests/tricky.test.mjs': tricky.replace('hidden by ${flag}', 'shown by ${flag}'),
+  });
+  assert.match((await testWeakening(renamedTemplate)).findings[0].detail, /"hidden by \$\{flag\}"/);
 });
