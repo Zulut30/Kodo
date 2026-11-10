@@ -4,6 +4,7 @@ import { normalizeUIConfig } from './ui-verification.mjs';
 import { normalizeSecurityConfig } from './security-gates.mjs';
 import { normalizeArchitectureConfig } from './architecture-gate.mjs';
 import { normalizeMode } from './modes.mjs';
+import { normalizeVerificationConfig } from './behavior-gate.mjs';
 // Read-time provenance only: Engine persists the explicit choice on a new run.
 // The default 2 must not become an explicit override of quick's default 1.
 export const configuredConcurrency = Symbol('configuredConcurrency');
@@ -99,6 +100,8 @@ export async function readConfig(project, overrides = {}) {
   if (scheduler !== undefined && !['legacy', 'durable'].includes(scheduler))
     throw new Error('Некорректная конфигурация Kodo: scheduler must be "legacy" or "durable"');
   normalizeBudgets(/** @type {any} */ (config).budgets);
+  // Validated only: defaults are applied where the block is read, so saved configs keep their shape.
+  normalizeVerificationConfig(/** @type {any} */ (config).verification);
   normalizeMode(config.executionMode);
   if (
     config.maxTasks !== undefined &&

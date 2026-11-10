@@ -17,6 +17,7 @@
 - [Исполнение задач](RUNTIME.md) — подготовка проекта, режимы, план, маршрутизация, сбои, аудит и доставка.
 - [Project Director](PROJECTS.md) — offline backlog и foreground execution.
 - [Durable jobs](JOBS.md) — очередь заданий с арендами, восстановлением и однократной интеграцией.
+- [Независимая проверка поведения](VERIFICATION.md) — защита тестов, оракулы проекта, политика по типу изменения и базовый прогон.
 - [Контекст и бюджеты](CONTEXT.md) — манифест сессии, быстрый путь для правок стилей и явные лимиты запуска.
 - [Контекст, вывод и очередь](EFFICIENCY.md) — компактный контекст и непрерывная очередь готовых задач.
 - [Research knowledge](KNOWLEDGE.md) — локальные знания и история источников.
@@ -45,6 +46,7 @@
 - [0008 — durable Project Director](decisions/0008-project-director.md)
 - [0009 — durable jobs](decisions/0009-durable-jobs.md)
 - [0010 — манифест контекста, быстрый путь и лимиты запуска](decisions/0010-context-manifest-fast-path-budgets.md)
+- [0011 — behaviour gate](decisions/0011-behavior-gate.md)
 
 ## Архив проверок и журнал разработки
 

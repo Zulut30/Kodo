@@ -7,11 +7,119 @@ import { git, commitChanges, diffHash } from './workspace.mjs';
 import { inspectCurrentSource } from './ci-graph.mjs';
 import { compactReviewEvidence } from './context-pack.mjs';
 import { normalizeArchitectureConfig } from './architecture-gate.mjs';
+import {
+  compareWithBaseline,
+  isCurrentBehaviorReceipt,
+  normalizeVerificationConfig,
+  runBehaviorGate,
+} from './behavior-gate.mjs';
 import { EngineExecution } from './engine-execution.mjs';
 import { contentHash, packSessionEvidence, evidencePrompt } from './engine-core.mjs';
 
 /** Checks, verification gates, review and repair stages. */
+/** The error of a failed check. Labelled against the baseline when one exists; still a failure. */
+function failedCheck(run, kind, result, comparison) {
+  // Old defects are never ignored automatically: the label only tells which failure the change introduced.
+  const classification = comparison?.at(-1).classification;
+  const label =
+    classification === 'pre_existing'
+      ? `[pre-existing: already failed on base ${run.baseline.headSha.slice(0, 12)}] `
+      : classification === 'regression'
+        ? '[regression: passed on the base commit] '
+        : '';
+  return Object.assign(
+    new Error(
+      `Проверка ${kind} не пройдена (exit ${result.code}): ${label}${(result.stdout + result.stderr).slice(-6000)}`,
+    ),
+    { code: 'check_failed', ...(classification ? { classification } : {}) },
+  );
+}
 export class EngineVerification extends EngineExecution {
+  /**
+   * Optional (`verification.baseline`): run the check commands on the untouched
+   * base commit once, before any edit. The result only labels later failures
+   * as pre-existing or introduced; it never excuses one.
+   */
+  async baseline(run, signal) {
+    if (run.baseline || !normalizeVerificationConfig(run.config.verification).baseline) return;
+    const headSha = await git(run.cwd, ['rev-parse', 'HEAD']);
+    if (headSha !== run.baseSha || (await inspectCurrentSource({ project: run.cwd, headSha })) !== 'clean') {
+      // Edits already exist (a run created before the baseline was enabled): never measure a changed tree.
+      run.baseline = { schemaVersion: 1, headSha: run.baseSha, status: 'not_run', reason: 'not_at_base', results: [] };
+      this.save(run);
+      return;
+    }
+    validateCommandTimeouts(run.config.commands);
+    await this.setup(run.cwd, run, signal);
+    const results = [];
+    for (const kind of ['test', 'build'])
+      for (const command of run.config.commands[kind]) {
+        this.checkCancelled(run, signal);
+        let exitCode = null,
+          output = '';
+        try {
+          const result = await execute(command.command, command.args, {
+            cwd: run.cwd,
+            signal,
+            env: workerEnvironment(),
+            secrets: this.secrets,
+            timeoutMs: command.timeoutMs,
+            allowFailure: true,
+          });
+          exitCode = result.code;
+          output = (result.stdout + result.stderr).slice(-24000);
+        } catch (error) {
+          if (signal?.aborted || error.code === 'cancelled') throw error;
+          output = `not completed: ${error.code || 'execution_failed'}`;
+        }
+        if ((await inspectCurrentSource({ project: run.cwd, headSha })) !== 'clean')
+          throw Object.assign(new Error('Команда проверки изменила базовый commit или файлы'), {
+            code: 'dirty_worktree',
+          });
+        const evidence = await this.persistEvidence(
+          run,
+          'baseline-check',
+          { kind, command, exitCode, output },
+          { headSha },
+        );
+        results.push({ kind, command, exitCode, outputPath: evidence.path, outputHash: evidence.sha256 });
+      }
+    run.baseline = { schemaVersion: 1, headSha, status: 'complete', results };
+    this.save(run);
+    this.log(run, 'baseline', {
+      headSha,
+      failed: results.filter(row => row.exitCode !== 0).length,
+      checks: results.length,
+    });
+  }
+  /**
+   * Deterministic checks of the final head that a reviewer's report cannot
+   * override: test protection, behavioural oracles and the quality policy.
+   */
+  async behaviorGate(run, signal) {
+    const headSha = await git(run.cwd, ['rev-parse', 'HEAD']);
+    run.behavior = null;
+    this.save(run);
+    run.behavior = await runBehaviorGate({
+      cwd: run.cwd,
+      headSha,
+      baseSha: run.baseSha,
+      config: run.config,
+      signal,
+      secrets: this.secrets,
+      persist: (kind, value) => this.persistEvidence(run, kind, value, { headSha }),
+    });
+    this.save(run);
+    if ((await inspectCurrentSource({ project: run.cwd, headSha })) !== 'clean')
+      throw Object.assign(new Error('Behaviour oracle changed the checked worktree'), { code: 'dirty_worktree' });
+    if (!isCurrentBehaviorReceipt(run.behavior, { headSha, baseSha: run.baseSha, config: run.config }))
+      throw Object.assign(
+        new Error(
+          `Behaviour gate failed; a review report cannot override it: ${JSON.stringify(redact(run.behavior.findings.slice(0, 20), this.secrets))}`,
+        ),
+        { code: 'behavior_failed' },
+      );
+  }
   async checks(run, signal) {
     run.architectureChecks = null;
     validateCommandTimeouts(run.config.commands);
@@ -141,17 +249,21 @@ export class EngineVerification extends EngineExecution {
           outputPath: evidence.path,
           outputHash: evidence.sha256,
         });
+        const comparison = compareWithBaseline(run.baseline?.status === 'complete' ? run.baseline : null, results);
+        if (comparison) run.checks.comparison = comparison;
         this.save(run);
-        if (result.code !== 0)
-          throw Object.assign(
-            new Error(
-              `Проверка ${kind} не пройдена (exit ${result.code}): ${(result.stdout + result.stderr).slice(-6000)}`,
-            ),
-            { code: 'check_failed' },
-          );
+        if (result.code !== 0) throw failedCheck(run, kind, result, comparison);
       }
     if (!run.config.commands.test.length) throw new Error('Не настроена команда проверки результата');
-    run.checks = { schemaVersion: 2, headSha, fingerprint, complete: true, results };
+    const comparison = compareWithBaseline(run.baseline?.status === 'complete' ? run.baseline : null, results);
+    run.checks = {
+      schemaVersion: 2,
+      headSha,
+      fingerprint,
+      complete: true,
+      results,
+      ...(comparison ? { comparison } : {}),
+    };
     this.save(run);
   }
   async verificationGates(run, signal) {
@@ -320,8 +432,10 @@ export class EngineVerification extends EngineExecution {
         run.securityChecks = null;
         run.architectureChecks = null;
         run.review = null;
+        run.behavior = null;
         this.save(run);
         await this.checks(run, signal);
+        await this.behaviorGate(run, signal);
         await this.verificationGates(run, signal);
       } catch (error) {
         if (signal?.aborted || this.store.getRun(run.id).cancelRequested)
