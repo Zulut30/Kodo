@@ -9,8 +9,8 @@
 | ① JobSpec/admission | `runtime/job-contracts.mjs`: каноничный JobSpec, таблица переходов, чистый `admission()`, `hostStatus()` | `tests/job-contracts.test.mjs`, 14 тестов |
 | ① read-only jobs CLI | `runtime/job-cli.mjs`, `kodo jobs list\|status [--json]` через `openJobReader` | `tests/job-cli.test.mjs`, 8 тестов; запуск через `node cli/index.mjs jobs` на временном `KODO_HOME` |
 | ② SQLite jobs/leases/CAS/receipts | `runtime/job-store.mjs`: таблицы `kodo_jobs`, `kodo_job_events`, `kodo_job_migrations`; CAS по `revision`; события как квитанции статуса | `tests/job-store.test.mjs`, 26 тестов |
-| ③ адаптер очереди | `runtime/job-scheduler.mjs`: `runJobQueue` с портами `execute`/`integrate`/`reconcile` и паузой старта | `tests/job-scheduler.test.mjs`, 23 теста |
-| ③ wiring Engine | `runtime/engine-jobs.mjs`: при `"scheduler": "durable"` узлы плана исполняются через очередь `run:<runId>:<хэш плана>`; `takeOver` в хранилище | `tests/engine-jobs.test.mjs`, 18 тестов на настоящем Engine с fake provider |
+| ③ адаптер очереди | `runtime/job-scheduler.mjs`: `runJobQueue` с портами `execute`/`integrate`/`reconcile` и паузой старта | `tests/job-scheduler.test.mjs`, 25 тестов |
+| ③ wiring Engine | `runtime/engine-jobs.mjs`: при `"scheduler": "durable"` узлы плана исполняются через очередь `run:<runId>:<хэш плана>`; `takeOver` в хранилище | `tests/engine-jobs.test.mjs`, 19 тестов на настоящем Engine с fake provider |
 | ④ concurrency/recovery fixtures | fake providers с барьером на 1/2/4/8 слотов; четыре процесса на одной базе; настоящая цепочка Git + SQLite | `tests/job-concurrency.test.mjs` (1), `tests/job-git-chain.test.mjs` (2) |
 
 Решения и отклонённые альтернативы — [ADR-0009](../decisions/0009-durable-jobs.md), руководство — [JOBS](../JOBS.md).
@@ -70,6 +70,22 @@
 | Read-only отчёт мог создать `-shm` при осиротевшем WAL (не подтверждено сценарием) | Отчёт отказывается работать, пока базу не восстановит писатель |
 
 Слабые тесты из ревью закрыты частично: добавлены сбой при двух исполнителях, потеря аренды, замена плана, удержание до интеграции. Не добавлены: смешанный набор параллельных и непараллельных узлов, отмена через `cancelRequested`, сбой между сохранением узла и записью результата задания.
+
+## Третье независимое ревью: итоговый head
+
+Итоговая версия этапа прошла ещё одно read-only ревью: **PASS**, blocker и major нет. Все семь исправлений второго ревью подтверждены. Мелкие замечания исправлены:
+
+| Замечание | Исправление |
+| --- | --- |
+| Узел, уже завершивший сессию до входа в исполнение, обходил шлюз: следующий узел мог стартовать до его merge | Такие узлы интегрируются при входе, до запуска очереди; тест с остановкой между сессией и merge |
+| Сбой хранилища при ожидающем в шлюзе узле приводил к зависанию очереди (внесено исправлением второго ревью) | `runJobQueue` сообщает о фатальной остановке (`onFatal`), мост будит ожидающих |
+| Потеря аренды во время интеграции не приводилась к `lease_lost` | Приводится так же, как при исполнении |
+| Задание `integrating` в очереди заменённого плана оставалось незавершённым | Записывается как несостоявшаяся интеграция и отменяется |
+| `handBack` без паузы мог зациклить очередь | После возврата вызов больше ничего не запускает; тест |
+| Тестовый крючок `jobTiming` мог переопределить любые опции | Берутся только `ttlMs` и `heartbeatMs` |
+| Тест полагался на фиксированную задержку | Ждёт записанного состояния задания |
+
+CI на первом head этого PR показал ещё одну проблему теста: «сбой после merge» на настоящем Git использовал аренду 50 мс и на медленной машине CI терял её во время исполнения. Тест переведён на `takeOver` без коротких аренд и ожиданий.
 
 ## Что не сделано
 

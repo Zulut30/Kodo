@@ -325,6 +325,7 @@ test('After the first failure no other node starts a session, even one the queue
 });
 
 test('A running node finishes its attempt after a failure elsewhere but starts no further repair attempt', async t => {
+  let store;
   const twoStarted = Promise.withResolvers(),
     oneFailed = Promise.withResolvers();
   const { fx, services, probe } = await independent(t, {
@@ -337,12 +338,17 @@ test('A running node finishes its attempt after a failure elsewhere but starts n
       }
       twoStarted.resolve();
       await oneFailed.promise;
-      await delay(300); // The Engine has recorded the failure of the other node by now.
+      // Wait until the queue has recorded the failure of the other node, not for a fixed time.
+      for (let waited = 0; waited < 500; waited++) {
+        const [one] = openJobStore({ store }).list(store.db.prepare('SELECT queue FROM kodo_jobs LIMIT 1').get().queue);
+        if (one.state === 'waiting_quota') break;
+        await delay(20);
+      }
       return incomplete;
     },
   });
-  const store = fx.openStore(),
-    engine = new Engine({ store, ...services });
+  store = fx.openStore();
+  const engine = new Engine({ store, ...services });
   const result = await engine.run((await engine.create('Two files', { project: fx.project })).id);
   assert.deepEqual([result.state, result.error.code], ['waiting_limits', 'quota']);
   assert.deepEqual(probe.started.toSorted(), ['one', 'two'], 'the second node got one attempt, not three');
@@ -437,4 +443,37 @@ test('Replacing the plan cancels the unfinished jobs of the old queue', async t 
       .map(job => [job.key, job.state, job.reason]),
     [['one', 'cancelled', 'plan_replaced']],
   );
+});
+
+test('A node whose session finished but was not merged is integrated before any other node starts', async t => {
+  const { fx, services, probe } = await independent(t, {
+    parallel: false,
+    onWorker: async (id, call) => {
+      if (id === 'two')
+        assert.equal(await read(path.join(call.cwd, 'out/one.txt')), 'one\n', 'the first node is already merged');
+    },
+  });
+  const first = fx.openStore(),
+    engine = new Engine({ store: first, ...services });
+  // The process dies after the session of the first node and before its merge.
+  engine.integrateNode = async () => {
+    throw new Error('process died before the merge');
+  };
+  const run = await engine.create('Two files', { project: fx.project });
+  const broken = await engine.run(run.id);
+  assert.deepEqual([broken.state, broken.nodes.one.status], ['blocked', 'completed']);
+  assert.deepEqual(probe.started, ['one']);
+  fx.closeStore(first);
+
+  const restarted = new Engine({ store: fx.openStore(), ...services });
+  // A slow merge: without the early integration the second node would start from the old base.
+  const integrate = restarted.integrateNode.bind(restarted);
+  restarted.integrateNode = async (...args) => {
+    await delay(400);
+    return integrate(...args);
+  };
+  const result = await restarted.run(run.id);
+  assert.equal(result.state, 'succeeded', result.error?.message);
+  assert.deepEqual(probe.started, ['one', 'two'], 'the finished session is not repeated');
+  assert.equal(merges(result, 'one'), 1);
 });

@@ -441,3 +441,33 @@ test('A port may hand a job back without a verdict: no attempt is spent and noth
   // The order after the hand-back is the queue's (the bypassed job aged); only the set of executions is fixed.
   assert.deepEqual(probe.executed.toSorted(), ['a', 'a', 'b']);
 });
+
+test('A port that hands back without pausing cannot spin the queue', async t => {
+  const { jobs, probe, run } = fixture(t);
+  jobs.enqueue(Q, [spec('a'), spec('b')]);
+  const summary = await run(
+    {
+      execute: async () => {
+        throw Object.assign(new Error('not now'), { handBack: true });
+      },
+    },
+    { limits: { workers: 1, pools: {} } },
+  );
+  assert.equal(summary.status, 'stalled');
+  assert.deepEqual(probe.executed, ['a'], 'after a hand-back this call starts nothing more');
+  assert.equal(jobs.events(jobs.list(Q)[0].id).filter(event => event.type === 'released').length, 1);
+});
+
+test('A store failure stops the queue once and tells the owner of the ports', async t => {
+  const { jobs, run } = fixture(t);
+  jobs.enqueue(Q, [spec('a')]);
+  const fatal = [];
+  const broken = {
+    ...jobs,
+    beginIntegration: () => {
+      throw Object.assign(new Error('database is locked'), { code: 'SQLITE_BUSY' });
+    },
+  };
+  await assert.rejects(run({}, { jobs: broken, onFatal: error => fatal.push(error.code) }), /database is locked/);
+  assert.deepEqual(fatal, ['SQLITE_BUSY'], 'reported exactly once');
+});

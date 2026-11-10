@@ -97,12 +97,14 @@ test('Real Git chain: a crash after the merge is reconciled without a second mer
       throw new Error('process killed after merge');
     },
   };
-  await assert.rejects(run(jobs, { ...crashing, ttlMs: 50, heartbeatMs: 3_600_000 }), /process killed/);
+  await assert.rejects(run(jobs, crashing), /process killed/);
   assert.deepEqual(merges(), ['integrate a']);
   assert.equal(jobs.list(Q)[0].state, 'integrating');
-  await new Promise(resolve => setTimeout(resolve, 120));
-  // A new process (a second connection) finds the merge on main and only records it.
-  const summary = await run(open(), { owner: 'coordinator-2' });
+  // A new process (a second connection) takes the queue over, finds the merge on main and only records it.
+  // No short lease and no waiting: a real clock on a slow machine must not decide this test.
+  const successor = open();
+  successor.takeOver(Q);
+  const summary = await run(successor, { owner: 'coordinator-2' });
   assert.equal(summary.status, 'integrated');
   assert.deepEqual(merges().sort(), ['integrate a', 'integrate c'], 'a was merged exactly once');
   assert.ok(

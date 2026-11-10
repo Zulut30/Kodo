@@ -17,7 +17,8 @@
  * @property {(job: import('./job-store.mjs').Job, context: { signal: AbortSignal }) => Promise<Record<string, any> | void>} execute
  *   Run one job in isolation and return its result. Reject with `code: 'quota'`
  *   (optional `retryAt`, `checkpoint`) to pause, `retryable: false` to fail for good, or
- *   `handBack: true` to return the job to the queue without a verdict or a spent attempt.
+ *   `handBack: true` to return the job to the queue without a verdict or a spent attempt;
+ *   after a hand-back this call starts no further job, so a port cannot spin the queue.
  * @property {(job: import('./job-store.mjs').Job, context: { signal: AbortSignal, confirmOwnership: () => void }) => Promise<Record<string, any> | void>} integrate
  *   Integrate one recorded result and return a receipt. Call `confirmOwnership()`
  *   immediately before the irreversible step: it throws once the lease is gone.
@@ -25,6 +26,8 @@
  * @property {(job: import('./job-store.mjs').Job) => Promise<{ integrated: boolean, receipt?: Record<string, any> }>} [reconcile]
  *   Decide whether an interrupted integration landed.
  * @property {AbortSignal} [signal] Stop: running jobs are handed back, nothing is cancelled durably.
+ * @property {(error: Error) => void} [onFatal] Called once when the queue stops dispatching for good
+ *   (a broken port, or an integration whose outcome is unknown), before running work drains.
  * @property {() => boolean} [paused] While it returns true no new job starts; running jobs finish and results still integrate.
  * @property {number} [ttlMs]
  * @property {number} [heartbeatMs]
@@ -40,6 +43,16 @@ const rejected = error => ['job_payload_invalid', 'job_secret_redaction_required
 function retryTime(error, now) {
   const parsed = typeof error.retryAt === 'number' ? error.retryAt : Date.parse(error.retryAt);
   return Number.isSafeInteger(parsed) && parsed > now ? parsed : now + 60000;
+}
+
+/** Record a worker result; an unusable one is this job's failure, not a reason to stop the queue. */
+function recordResult(jobs, job, token, result) {
+  try {
+    jobs.complete(job.id, token, result ?? {});
+  } catch (error) {
+    if (!rejected(error)) throw error;
+    jobs.fail(job.id, token, { reason: `result_rejected:${error.code}`, retryable: false });
+  }
 }
 
 /** Honest end state of a queue once this process has nothing left to do. */
@@ -130,6 +143,7 @@ export async function runJobQueue(options) {
   const leases = new Map();
   let executing = 0,
     integrating = false,
+    draining = false,
     fatal,
     wake,
     waiting = [];
@@ -138,29 +152,32 @@ export async function runJobQueue(options) {
     wake = undefined;
     resolve?.();
   };
+  /** The first fatal error wins; the caller is told once so it can release whatever waits on this queue. */
+  const stopFor = error => {
+    if (fatal) return;
+    fatal = error;
+    try {
+      options.onFatal?.(error);
+    } catch {
+      /* The original error is the one to report. */
+    }
+  };
   /** A store report from a worker that no longer owns its job is dropped, never trusted. */
   const report = operation => {
     try {
       operation();
     } catch (error) {
-      if (!leaseLost(error)) fatal ??= error;
+      if (!leaseLost(error)) stopFor(error);
     }
   };
   const guard = leaseGuard({ jobs, leases, ttlMs, heartbeatMs, now, signal });
 
-  function succeeded(job, token, result) {
-    try {
-      jobs.complete(job.id, token, result ?? {});
-    } catch (error) {
-      if (!rejected(error)) throw error;
-      // An unusable result is this job's failure, not a reason to stop the queue.
-      jobs.fail(job.id, token, { reason: `result_rejected:${error.code}`, retryable: false });
-    }
-  }
-
   function failed(job, token, error) {
     if (signal?.aborted) return jobs.release(job.id, token, { reason: 'stopped' });
-    if (error?.handBack === true) return jobs.release(job.id, token, { reason: 'handed_back' });
+    if (error?.handBack === true) {
+      draining = true;
+      return jobs.release(job.id, token, { reason: 'handed_back' });
+    }
     if (error?.code !== 'quota')
       return jobs.fail(job.id, token, { reason: error?.message, retryable: error?.retryable !== false });
     const pause = extra => jobs.waitQuota(job.id, token, { retryAt: retryTime(error, now()), ...extra });
@@ -178,7 +195,7 @@ export async function runJobQueue(options) {
     Promise.resolve()
       .then(() => execute(job, { signal: lease.signal }))
       .then(
-        result => report(() => succeeded(job, token, result)),
+        result => report(() => recordResult(jobs, job, token, result)),
         error => report(() => failed(job, token, error)),
       )
       .finally(() => {
@@ -233,7 +250,7 @@ export async function runJobQueue(options) {
         integrating = true;
         integrateOne(slot)
           .catch(error => {
-            if (!leaseLost(error)) fatal ??= error;
+            if (!leaseLost(error)) stopFor(error);
           })
           .finally(() => {
             integrating = false;
@@ -241,7 +258,7 @@ export async function runJobQueue(options) {
           });
       }
     }
-    while (!options.paused?.() && executing < limits.workers) {
+    while (!draining && !options.paused?.() && executing < limits.workers) {
       renewLate();
       const claimed = jobs.claim(queue, { owner, ttlMs, limits, hosts, worker });
       waiting = claimed.waiting;
@@ -258,7 +275,7 @@ export async function runJobQueue(options) {
         try {
           dispatch();
         } catch (error) {
-          fatal = error;
+          stopFor(error);
         }
       }
       if (!executing && !integrating) {

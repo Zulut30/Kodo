@@ -74,6 +74,10 @@ function prepareQueue(engine, run) {
   for (const other of jobs.queues().filter(name => name.startsWith(`run:${run.id}:`) && name !== queue)) {
     // A replaced plan: its unfinished jobs will never run and must not look alive.
     jobs.takeOver(other);
+    // An integration of the old plan cannot be cancelled in flight. The Engine refuses to replace
+    // a plan with an integrated node, so nothing of it landed: record the absence, then cancel.
+    for (let slot; (slot = jobs.beginIntegration(other, { owner: `engine:${run.id}` }));)
+      jobs.abortIntegration(slot.job.id, slot.token, { reason: 'plan_replaced', retry: false });
     for (const job of jobs.list(other))
       if (!['integrated', 'cancelled'].includes(job.state)) jobs.cancel(job.id, { reason: 'plan_replaced' });
   }
@@ -111,6 +115,14 @@ export async function executeDurableTasks(engine, run, signal) {
   // A node its repair budget already stopped is the blocker of this run. Report it,
   // exactly as `performNode` does, before any other node may spend a session.
   for (const task of run.plan.tasks) if (run.nodes[task.id]?.stopped) await engine.performNode(run, task, signal);
+  // A node whose session finished but whose result is not merged yet (a stop or a crash in
+  // between) is integrated first, as the legacy dispatcher does for a pending merge. No other
+  // node may start from a base without it. `integrateNode` is idempotent.
+  for (const task of run.plan.tasks)
+    if (run.nodes[task.id]?.status === 'completed') {
+      engine.checkCancelled(run, signal);
+      await engine.integrateNode(run, task, signal);
+    }
   const { jobs, queue } = prepareQueue(engine, run);
   engine.log(run, 'jobs_queue', { queue, workers: run.config.concurrency });
   const stop = new AbortController(),
@@ -138,8 +150,8 @@ export async function executeDurableTasks(engine, run, signal) {
   const handBack = () => Object.assign(new Error('The queue is draining after its first failure'), { handBack: true });
   /** A job lease lost without a requested cancel is a lost lease, not a cancelled run. */
   const leaseLoss = (error, context) =>
-    error?.code === 'cancelled' &&
-    context.signal.aborted &&
+    (error?.code === 'job_lease_lost' ||
+      ((error?.code === 'cancelled' || error?.name === 'AbortError') && context.signal.aborted)) &&
     !stop.signal.aborted &&
     !engine.store.getRun(run.id).cancelRequested
       ? Object.assign(new Error('Аренда задания потеряна: исполнение узла остановлено'), { code: 'lease_lost' })
@@ -182,9 +194,9 @@ export async function executeDurableTasks(engine, run, signal) {
         context.confirmOwnership();
       } catch (error) {
         // Nothing was merged yet: the recorded result stays for the next cycle.
-        failed(error);
+        const failure = failed(leaseLoss(error, context));
         halt();
-        throw Object.assign(error, { integrated: false });
+        throw Object.assign(failure, { integrated: false });
       }
       try {
         if (run.nodes[task.id]?.status === 'completed') await engine.integrateNode(run, task, context.signal);
@@ -195,7 +207,7 @@ export async function executeDurableTasks(engine, run, signal) {
           });
       } catch (error) {
         // The outcome of the merge is unknown to the queue: stop, keep ownership for reconciliation.
-        throw failed(error);
+        throw failed(leaseLoss(error, context));
       }
       return { node: task.id, headSha: run.nodes[task.id].headSha };
     } finally {
@@ -221,8 +233,11 @@ export async function executeDurableTasks(engine, run, signal) {
           ? { integrated: true, receipt: { node: job.key, headSha: node.headSha } }
           : { integrated: false };
       },
+      // A store failure stops the queue without calling a port: wake the nodes waiting on the gate.
+      onFatal: failed,
       // Test harness only: production uses the queue defaults.
-      ...engine.jobTiming,
+      ...(engine.jobTiming?.ttlMs ? { ttlMs: engine.jobTiming.ttlMs } : {}),
+      ...(engine.jobTiming?.heartbeatMs ? { heartbeatMs: engine.jobTiming.heartbeatMs } : {}),
     });
   } catch (error) {
     throw first ?? error;
