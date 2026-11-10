@@ -212,9 +212,11 @@ export function resolveBlocker(blockers, { at, outcome }) {
 export async function unchanged(cwd, baseSha) {
   await execute('git', ['add', '-A'], { cwd });
   // Exit 0: no difference. Exit 1: a difference. Anything else is an error, and an error is not "unchanged".
-  const result = await execute('git', ['diff', '--cached', '--quiet', '--no-ext-diff', baseSha, '--'], {
-    cwd,
-    allowFailure: true,
-  });
+  // A moved submodule pointer is a difference whatever `diff.ignoreSubmodules` says.
+  const result = await execute(
+    'git',
+    ['diff', '--cached', '--quiet', '--no-ext-diff', '--ignore-submodules=none', baseSha, '--'],
+    { cwd, allowFailure: true },
+  );
   return result.code === 0;
 }
