@@ -8,6 +8,7 @@ import { execute } from './command.mjs';
 import { git, makeWorktree, changedFiles, commitChanges } from './workspace.mjs';
 import { taskContract } from './task-context.mjs';
 import { runReadyQueue } from './task-scheduler.mjs';
+import { executeDurableTasks } from './engine-jobs.mjs';
 import { EnginePlanning } from './engine-planning.mjs';
 import { contentHash, evidencePrompt, lstatSafe } from './engine-core.mjs';
 
@@ -370,6 +371,7 @@ export class EngineExecution extends EnginePlanning {
     this.checkCancelled(run, signal);
     if (run.pendingMerge)
       throw Object.assign(new Error('Не восстановлена незавершённая интеграция'), { code: 'merge_state' });
+    if (run.config.scheduler === 'durable') return executeDurableTasks(this, run, signal);
     await runReadyQueue({
       tasks: run.plan.tasks,
       limit: run.config.concurrency,

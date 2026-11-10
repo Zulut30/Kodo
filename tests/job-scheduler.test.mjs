@@ -397,3 +397,25 @@ test('An empty or misspelled queue is reported as empty, not integrated', async 
   const { run } = fixture(t);
   assert.deepEqual(await run({}), { status: 'empty', counts: {} });
 });
+
+test('A paused queue starts nothing new but still finishes and integrates running work', async t => {
+  const { jobs, probe, run } = fixture(t);
+  jobs.enqueue(Q, [spec('a'), spec('b'), spec('c')]);
+  let paused = false;
+  const summary = await run(
+    {
+      execute: async job => {
+        if (job.key === 'a') paused = true;
+        await delay(20);
+      },
+    },
+    { limits: { workers: 1, pools: {} }, paused: () => paused },
+  );
+  assert.deepEqual(probe.executed, ['a'], 'no job starts after the pause');
+  assert.deepEqual(probe.integrated, ['a'], 'the running job still integrates');
+  assert.equal(summary.status, 'stalled');
+  assert.deepEqual(summary.counts, { integrated: 1, queued: 2 });
+  paused = false;
+  assert.equal((await run()).status, 'integrated');
+  assert.deepEqual(probe.executed, ['a', 'b', 'c']);
+});

@@ -1,6 +1,6 @@
 # Этап 07: надёжные jobs и управляемая параллельность
 
-Статус на 2026-11-10: **IN PROGRESS, не принят.** Работа лежит локально в ветке `kodo/07-durable-jobs` поверх `quality/plan-stage1`. Ветка не запушена, PR нет, CI на ней не запускался.
+Статус на 2026-11-10: **реализация завершена, кандидат на приёмку.** Ветка `kodo/07-durable-jobs`. Проверки замороженного head, ревью и CI перечислены в описании PR этапа: этот файл их не дублирует, чтобы не менять проверяемый commit.
 
 ## Что сделано
 
@@ -8,8 +8,9 @@
 | --- | --- | --- |
 | ① JobSpec/admission | `runtime/job-contracts.mjs`: каноничный JobSpec, таблица переходов, чистый `admission()`, `hostStatus()` | `tests/job-contracts.test.mjs`, 14 тестов |
 | ① read-only jobs CLI | `runtime/job-cli.mjs`, `kodo jobs list\|status [--json]` через `openJobReader` | `tests/job-cli.test.mjs`, 8 тестов; запуск через `node cli/index.mjs jobs` на временном `KODO_HOME` |
-| ② SQLite jobs/leases/CAS/receipts | `runtime/job-store.mjs`: таблицы `kodo_jobs`, `kodo_job_events`, `kodo_job_migrations`; CAS по `revision`; события как квитанции статуса | `tests/job-store.test.mjs`, 24 теста |
-| ③ адаптер очереди | `runtime/job-scheduler.mjs`: `runJobQueue` с портами `execute`/`integrate`/`reconcile` | `tests/job-scheduler.test.mjs`, 21 тест |
+| ② SQLite jobs/leases/CAS/receipts | `runtime/job-store.mjs`: таблицы `kodo_jobs`, `kodo_job_events`, `kodo_job_migrations`; CAS по `revision`; события как квитанции статуса | `tests/job-store.test.mjs`, 25 тестов |
+| ③ адаптер очереди | `runtime/job-scheduler.mjs`: `runJobQueue` с портами `execute`/`integrate`/`reconcile` и паузой старта | `tests/job-scheduler.test.mjs`, 22 теста |
+| ③ wiring Engine | `runtime/engine-jobs.mjs`: при `"scheduler": "durable"` узлы плана исполняются через очередь `run:<runId>:<хэш плана>`; `takeOver` в хранилище | `tests/engine-jobs.test.mjs`, 12 тестов на настоящем Engine с fake provider |
 | ④ concurrency/recovery fixtures | fake providers с барьером на 1/2/4/8 слотов; четыре процесса на одной базе; настоящая цепочка Git + SQLite | `tests/job-concurrency.test.mjs` (1), `tests/job-git-chain.test.mjs` (2) |
 
 Решения и отклонённые альтернативы — [ADR-0009](../decisions/0009-durable-jobs.md), руководство — [JOBS](../JOBS.md).
@@ -46,16 +47,25 @@
 
 Остаточный риск из ревью: окно двойной интеграции при зависании координатора дольше TTL аренды нельзя закрыть без fencing на стороне Git. Оно описано в [JOBS](../JOBS.md) и [ADR-0009](../decisions/0009-durable-jobs.md).
 
+## Подключение Engine
+
+Подключение сделано на уровне Engine, а не Project Director. Причина: настоящая параллельность в Kodo сегодня существует между узлами плана внутри Run, с отдельными worktree и merge координатором. Director ведёт одну Attempt за вызов, и каждая Attempt — это Run.
+
+Путь включается явно ключом `"scheduler": "durable"`; без него работает прежний `runReadyQueue`, и ни один существующий тест не меняет поведение. Правила прежнего диспетчера сохранены: лимит `concurrency`, запрет параллельности из плана и от Jev, остановка стартов после первого сбоя, бюджет ремонтов, пауза по квоте, отмена и `--retry-failed`. Проверено тестами: порядок зависимостей, перекрытие двух независимых узлов, сериализация общего файла, квота с соблюдением `retryAt`, исчерпанный бюджет, остановка с продолжением в новом процессе и сбой сразу после merge без повторного merge.
+
+Устойчивость тестов подключения проверена 4 мутациями: без паузы стартов, без `takeOver` и без запрета параллельности тесты падают. Четвёртая (повтор остановленного узла при обычном `resume`) эквивалентна по поведению: Engine сам отказывает остановленному узлу без сессии.
+
 ## Что не сделано
 
-- **Wiring.** Project Director и Engine не ставят задания в очередь; Director по-прежнему ведёт один активный Attempt. Это главный оставшийся шаг этапа и единственное место, где меняется существующее поведение.
-- **Общий gate этапа.** Security gates, повторное ревью итогового head после wiring, CI Windows/Linux, установленный CLI smoke и PR. Локальный `npm run check` выполняется для текущего head, но замороженным кандидатом он станет только после wiring.
-- **Анализ Gemini и оценка Jev** перед этапом в этой сессии не выполнялись. Контракты заморожены по [NEXT-STAGES](NEXT-STAGES.md) и исходному сценарию 07.
-- **Реальный нативный пилот** подписочных клиентов по ограниченному бюджету.
+- **Включение по умолчанию.** `durable` остаётся opt-in до нативного пилота; решение записано в [ADR-0009](../decisions/0009-durable-jobs.md).
+- **Параллельные Attempt в Project Director.** Для них нужен merge расходящихся head разных Run; сложный batch merge отложен по [NEXT-STAGES](NEXT-STAGES.md).
+- **Анализ Gemini и оценка Jev** перед этапом не выполнялись: в этой среде нет настроенного Kodo runtime с провайдерами. Контракты заморожены по [NEXT-STAGES](NEXT-STAGES.md) и исходному сценарию 07.
+- **Реальный нативный пилот** подписочных клиентов не запускался. Все свидетельства этапа — offline: fake providers, настоящие Git и SQLite.
+- **Adaptive concurrency** по CPU/RAM/диску/CI отложена по [MVP-SCOPE](MVP-SCOPE.md).
 
 ## Ограничения
 
 - Fixture с временем (`8 × 40 мс`, 1 слот против 4) показывает сокращение wall time только на управляемой нагрузке. Об ускорении реальных задач она ничего не говорит.
-- Adaptive concurrency по CPU/RAM/диску/CI отложена по [MVP-SCOPE](MVP-SCOPE.md): лимиты задаются явно, 1–8.
+- Лимиты задаются явно: 1–8 workers у очереди, 1–5 у Engine (`concurrency`).
 - Хранилище не может запретить внешний merge. Единственность координатора проекта обеспечивает аренда `project:<id>` из этапа06.
 - Адаптеров `t3`/`orca` нет: такие задания получают `blocked: host_unavailable:<id>`.

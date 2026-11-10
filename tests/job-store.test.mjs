@@ -520,3 +520,34 @@ test('A reader on a pre-jobs database adds no tables', t => {
     .map(row => row.name);
   assert.ok(!names.some(name => name.startsWith('kodo_job')), names.join(','));
 });
+
+test('A new queue owner voids stale leases at once without spending attempts or repeating recorded work', t => {
+  const { jobs } = fixture(t);
+  jobs.enqueue(Q, [spec('a'), spec('b'), spec('c')]);
+  const first = claim(jobs),
+    second = claim(jobs),
+    third = claim(jobs);
+  jobs.complete(first.job.id, first.token, { headSha: 'a' });
+  const crashed = jobs.beginIntegration(Q, { owner: 'coordinator-1' });
+  jobs.complete(second.job.id, second.token, { headSha: 'b' });
+  assert.equal(jobs.beginIntegration(Q, { owner: 'coordinator-2' }), null, 'a live integration lease is respected');
+
+  jobs.takeOver(Q);
+  assert.deepEqual(
+    jobs.list(Q).map(job => [job.key, job.state, job.attempt, job.reason]),
+    [
+      ['a', 'integrating', 1, null],
+      ['b', 'verifying', 1, null],
+      ['c', 'queued', 0, 'owner_replaced'],
+    ],
+    'only the running job returns to the queue, without a spent attempt',
+  );
+  code(() => jobs.complete(third.job.id, third.token, { headSha: 'late' }), 'job_lease_lost');
+  assert.deepEqual(jobs.heartbeat(third.job.id, third.token), { ok: false, reason: 'lease_lost' });
+  const recovery = jobs.beginIntegration(Q, { owner: 'coordinator-2' });
+  assert.deepEqual([recovery.job.key, recovery.recovery], ['a', true], 'the orphaned integration is reconciled first');
+  code(() => jobs.finishIntegration(crashed.job.id, crashed.token, { commit: 'x' }), 'job_lease_lost');
+  jobs.takeOver(Q);
+  assert.equal(jobs.events(recovery.job.id).filter(event => event.type === 'integration_orphaned').length, 2);
+  code(() => jobs.takeOver('not a queue'), 'job_queue_invalid');
+});

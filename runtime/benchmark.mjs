@@ -131,6 +131,7 @@ async function metadata() {
     'runtime/engine-core.mjs',
     'runtime/engine-planning.mjs',
     'runtime/engine-execution.mjs',
+    'runtime/engine-jobs.mjs',
     'runtime/engine-verification.mjs',
     'runtime/modes.mjs',
     'runtime/providers.mjs',

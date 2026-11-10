@@ -652,6 +652,29 @@ const events = (ctx, id) =>
 const recover = (ctx, queue, hosts) => transaction(ctx, () => sweep(ctx, queueName(queue), hosts));
 
 /**
+ * Hand a whole queue to a new coordinator that already holds an outer exclusive
+ * lease on it (for an Engine run, the Run lease). Leases of the previous owner
+ * are void at once instead of after their TTL: a running job returns to the
+ * queue without spending an attempt, and an integration in flight becomes
+ * recoverable, so the next `beginIntegration` returns it with `recovery: true`.
+ * Never call this without that outer lease: it is what excludes a live owner.
+ * @param {JobContext} ctx
+ * @param {string} queue
+ */
+function takeOver(ctx, queue) {
+  queueName(queue);
+  return transaction(ctx, () => {
+    for (const row of rowsOf(ctx, queue)) {
+      if (row.state === 'running') {
+        const patch = { state: 'queued', attempt: Math.max(0, row.attempt - 1), reason: 'owner_replaced' };
+        update(ctx, row, { ...patch, ...noLease }, 'released');
+      } else if (row.state === 'integrating' && row.lease_expires > 0)
+        update(ctx, row, { lease_expires: 0 }, 'integration_orphaned');
+    }
+  });
+}
+
+/**
  * Open the durable job repository on an existing legacy Store.
  * @param {{ store: { db: any, secrets?: Record<string, string> }, now?: () => number }} options
  */
@@ -680,6 +703,7 @@ export function openJobStore({ store, now = Date.now }) {
     cancel: bind(cancel),
     retry: bind(retry),
     recover: bind(recover),
+    takeOver: bind(takeOver),
     get: bind(get),
     list: bind(list),
     queues: bind(queues),

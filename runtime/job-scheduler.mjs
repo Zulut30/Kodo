@@ -24,6 +24,7 @@
  * @property {(job: import('./job-store.mjs').Job) => Promise<{ integrated: boolean, receipt?: Record<string, any> }>} [reconcile]
  *   Decide whether an interrupted integration landed.
  * @property {AbortSignal} [signal] Stop: running jobs are handed back, nothing is cancelled durably.
+ * @property {() => boolean} [paused] While it returns true no new job starts; running jobs finish and results still integrate.
  * @property {number} [ttlMs]
  * @property {number} [heartbeatMs]
  * @property {() => number} [now]
@@ -238,7 +239,7 @@ export async function runJobQueue(options) {
           });
       }
     }
-    while (executing < limits.workers) {
+    while (!options.paused?.() && executing < limits.workers) {
       renewLate();
       const claimed = jobs.claim(queue, { owner, ttlMs, limits, hosts, worker });
       waiting = claimed.waiting;
