@@ -826,6 +826,8 @@ test('Scanning stays linear on input built to make a pattern rescan the file', a
     'src/attrs_test.rs': `#[test]\nfn kept() {}\n${'#[allow(unused)]\n'.repeat(size / 17)}`,
     'src/test/java/ManyTest.java': `class ManyTest {\n  @Test\n  void kept() {}\n}\n${'@Ignore'.repeat(size / 7)}`,
     'src/test/java/DenseTest.java': `class DenseTest {\n${'  @Disabled @A @Test void same() {}\n'.repeat(size / 34)}}\n`,
+    'src/test/java/QuotesTest.java': `class QuotesTest {\n  @Test\n  void kept() {}\n  String s = ${'\\"'.repeat(size / 2)};\n}\n`,
+    'src/test/kotlin/ApostrophesTest.kt': `class ApostrophesTest {\n  @Test fun kept() {}\n}\n${"'\\".repeat(size / 2)}\n`,
   };
   const repo = repository(t, files);
   const head = repo.change(Object.fromEntries(Object.entries(files).map(([name, text]) => [name, `${text}\n`])));
@@ -982,5 +984,29 @@ test('Annotations and marks are read with their strings and their place', async 
       ),
     });
     assert.deepEqual(await weakened(head), []);
+  });
+  await t.test('java: a block comment between the annotations, a quote in a character literal', async s => {
+    const quoted = java.replace('class TotalTest {\n', "class TotalTest {\n    char quote = '\"';\n");
+    const repo = repository(s, { 'src/test/java/TotalTest.java': quoted });
+    const head = repo.change({
+      'src/test/java/TotalTest.java': quoted.replace(
+        '    @Test\n',
+        '    @Disabled\n    /* flaky; see {the} (issue) */\n    @Test\n',
+      ),
+    });
+    assert.deepEqual(await weakened(head), ['test_skipped:src/test/java/TotalTest.java']);
+  });
+  await t.test('pytestmark under a class header that spans lines', async s => {
+    const wide = classed.replace('class TestTotal:\n', 'class TestTotal(\n        Base,\n        Mixin):\n');
+    const repo = repository(s, { 'tests/test_classed.py': wide });
+    const head = repo.change({
+      'tests/test_classed.py': wide.replace(
+        '        Mixin):\n',
+        '        Mixin):\n    pytestmark = pytest.mark.skip\n\n',
+      ),
+    });
+    const { findings } = await testWeakening(head);
+    assert.deepEqual(rules(findings), ['test_skipped:tests/test_classed.py']);
+    assert.match(findings[0].detail, /switched off: "test_total", "test_empty"$/);
   });
 });

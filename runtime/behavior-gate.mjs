@@ -543,7 +543,7 @@ function pythonCases(source) {
     const text = raw.trim();
     if (!text) continue;
     if (pending > 0) {
-      // A decorator or a `pytestmark` list that continues over several lines.
+      // A decorator, a class header or a `pytestmark` list that continues over several lines.
       pending += brackets(text);
       if (mark) {
         mark.text += ` ${text}`;
@@ -562,8 +562,10 @@ function pythonCases(source) {
     }
     const skipped = decorators.some(line => pySkip.test(line)) || classes.some(item => item.skipped);
     const named = /^(?:async\s+)?def\s+(test\w*)\s*\(/.exec(text);
-    if (/^class\s/.test(text)) classes.push({ indent, skipped, from: cases.length });
-    else if (named) cases.push({ name: named[1], skipped });
+    if (/^class\s/.test(text)) {
+      classes.push({ indent, skipped, from: cases.length });
+      pending = brackets(text);
+    } else if (named) cases.push({ name: named[1], skipped });
     else if (/^pytestmark\s*(?::[^=]*)?=/.test(text)) {
       mark = { text, indent };
       pending = brackets(text);
@@ -601,18 +603,60 @@ function rustCases(source) {
 }
 
 /**
+ * Java and Kotlin source as code only: string and character literals are
+ * emptied, comments are removed. One pass, so the cost is linear whatever the
+ * file holds.
+ * @param {string} source
+ */
+function scanJava(source) {
+  const length = source.length;
+  let code = '',
+    index = 0;
+  while (index < length) {
+    const char = source[index],
+      next = source[index + 1];
+    if (char === '/' && (next === '/' || next === '*')) {
+      index = commentEnd(source, index);
+      code += ' ';
+    } else if (char === '"' && source.startsWith('"""', index)) {
+      // A text block or a raw string: it may span lines.
+      const end = source.indexOf('"""', index + 3);
+      index = end < 0 ? length : end + 3;
+      code += '""';
+    } else if (char === '"') {
+      const end = quoteEnd(source, index);
+      index = source[end] === '"' ? end + 1 : end;
+      code += '""';
+    } else if (char === "'") {
+      // A character literal is a few characters long ('a', '\n', '\u0041'). The look-ahead is
+      // bounded, so a file of apostrophes costs no more than its length; anything else stays as it is.
+      let end = index + (next === '\\' ? 3 : 2);
+      while (end <= index + 8 && end < length && source[end] !== "'" && source[end] !== '\n') end++;
+      const literal = end <= index + 8 && source[end] === "'";
+      index = literal ? end + 1 : index + 1;
+      code += literal ? "''" : char;
+    } else {
+      code += char;
+      index++;
+    }
+  }
+  return code;
+}
+
+/**
  * `@Disabled` with its arguments, then only annotations and modifiers up to
  * `class` or `object`. Every repetition is bounded: the scan stays linear.
  */
 const javaClassOff =
-  /@(?:Disabled|Ignore)\b(?:\s*\([^()\n]{0,300}\))?(?:\s*@[\w.]+(?:\s*\([^()\n]{0,300}\))?|\s+(?:public|protected|private|internal|abstract|final|open|static|sealed|data|inner)){0,20}\s+(?:class|object)\b/;
-/** The annotations that stand directly before a position, with only white space between them. */
-const javaOwn = /(?:@[\w.]+(?:\s*\([^()\n]{0,300}\))?\s*){0,20}$/;
+  /@(?:Disabled|Ignore)\b(?:\s*\([^()]{0,300}\))?(?:\s*@[\w.]+(?:\s*\([^()]{0,300}\))?|\s+(?:public|protected|private|internal|abstract|final|open|static|sealed|data|inner)){0,20}\s+(?:class|object)\b/;
+/** The annotations and modifiers that stand directly before a position, with only white space between them. */
+const javaOwn =
+  /(?:(?:@[\w.]+(?:\s*\([^()]{0,300}\))?|public|protected|private|internal|abstract|final|open|static|suspend|override)\s*){0,20}$/;
 
 /** Java and Kotlin tests. `@Disabled` on a class is read as covering every test of the file. */
 function javaCases(source) {
-  // String contents and line comments are not code: a reason may hold `;`, a brace or the word `class`.
-  const code = source.replace(/"(?:[^"\\\n]|\\.)*"/g, '""').replace(/\/\/[^\n]*/g, '');
+  // String contents and comments are not code: a reason may hold `;`, a brace or the word `class`.
+  const code = scanJava(source);
   const classOff = javaClassOff.test(code);
   const own = index => javaOwn.exec(code.slice(Math.max(0, index - 400), index))[0];
   return [
