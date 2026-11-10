@@ -47,6 +47,9 @@ test('A short task naming only existing tracked style files is a fast path', asy
     requested: 'quick',
   });
   assert.deepEqual(two.files, ['src/styles/button.css', 'src/styles/theme.scss']);
+  // Sentence punctuation and quotes around a path are not part of it.
+  const quoted = await classifyLocalTask({ cwd, task: 'Darken the hover state. File: "src/styles/button.css".' });
+  assert.deepEqual(quoted.files, ['src/styles/button.css']);
 });
 
 test('Every doubt returns the ordinary route with its reason', async t => {
@@ -68,7 +71,19 @@ test('Every doubt returns the ordinary route with its reason', async t => {
     [{ task: `Make ${button} blue as described in docs/design.md` }, 'non_style_path'],
     [{ task: `Make ${button} match Node.js branding` }, 'non_style_path'],
     [{ task: `Recolour ${button} src/styles/theme.scss src/styles/a.css src/styles/b.css` }, 'too_many_files'],
-    [{ task: 'Make .config/hidden.css blue' }, 'path_hidden'],
+    [{ task: 'Make .config/hidden.css blue' }, 'non_style_path'],
+    // Anything that looks like another file is doubt, whatever its shape.
+    [{ task: `Make ${button} blue and add DEBUG=1 to .env` }, 'non_style_path'],
+    [{ task: `Make ${button} blue and fix обработчик.js` }, 'non_style_path'],
+    [{ task: `Make ${button} blue, unpack icons.7z` }, 'non_style_path'],
+    [{ task: `Make ${button} blue per app.properties` }, 'non_style_path'],
+    [{ task: `Make ${button} blue and restart src/server` }, 'non_style_path'],
+    [{ task: `Make ${button} blue as in v1.2` }, 'non_style_path'],
+    // Risk words are matched inside longer words too.
+    [{ task: `Style the oauth button in ${button}` }, 'risk_marker'],
+    [{ task: `Recolour ${button} before the redeploy` }, 'risk_marker'],
+    [{ task: `Покрась кнопку «платёж» в ${button}` }, 'risk_marker'],
+    [{ task: `Покрась кнопку базы данных в ${button}` }, 'risk_marker'],
     [{ task: 'Make src/styles/untracked.css blue' }, 'path_untracked'],
     [{ task: 'Make src/styles/missing.css blue' }, 'path_untracked'],
     [{ task: 'Make src/styles/huge.css blue' }, 'file_too_large'],

@@ -1,7 +1,7 @@
 import path from 'node:path';
 import { readFile } from 'node:fs/promises';
 import { redact, secretFile } from './security.mjs';
-import { validate, planSchema, routingSchema, scopesOverlap } from './contracts.mjs';
+import { validate, validatePlan, planSchema, routingSchema, scopesOverlap } from './contracts.mjs';
 import { git, makeWorktree, collectFiles } from './workspace.mjs';
 import { maxTaskContractBytes } from './task-context.mjs';
 import { assessTask, resolveMode } from './modes.mjs';
@@ -172,12 +172,22 @@ export class EnginePlanning extends EngineCore {
             // Restored if the plan leaves the proof and the ordinary route takes over.
             budgets: Object.fromEntries(budgetKeys.map(key => [key, run.config[key] ?? null])),
           };
+          // No assessment was requested, so the receipt carries none of the fields of an
+          // unavailable one (`fallback`, `code`, `assessmentReason`).
+          const {
+            fallback: _fallback,
+            code: _code,
+            assessmentReason: _assessmentReason,
+            ...mode
+          } = resolveMode({
+            requested: 'quick',
+            config: run.config,
+            concurrencyExplicit: run.requestedConcurrency != null,
+          });
           run.executionMode = {
-            ...resolveMode({
-              requested: 'quick',
-              config: run.config,
-              concurrencyExplicit: run.requestedConcurrency != null,
-            }),
+            ...mode,
+            assessment: 'not_requested',
+            requests: 0,
             requested: run.requestedMode ?? null,
             source: 'fast-path',
             reason: 'Deterministic local proof: the task names only existing tracked style files',
@@ -229,15 +239,17 @@ export class EnginePlanning extends EngineCore {
     await this.policy(run, 'plan');
     if (planFile) {
       const candidate = JSON.parse(await readFile(planFile, 'utf8'));
-      await this.fastPathGuard(run, candidate, signal);
-      this.validateModePlan(run, candidate, {
-        legacy: Boolean(run.plan && contentHash(candidate) === contentHash(run.plan)),
-      });
+      // A broken or forbidden plan is refused before it can change the mode of the run.
+      validatePlan(candidate);
       if (
         Object.values(run.nodes).some(node => node.status === 'integrated') &&
         contentHash(candidate) !== contentHash(run.plan)
       )
         throw new Error('Нельзя заменить план после интеграции задач');
+      await this.fastPathGuard(run, candidate, signal);
+      this.validateModePlan(run, candidate, {
+        legacy: Boolean(run.plan && contentHash(candidate) === contentHash(run.plan)),
+      });
       run.plan = candidate;
       run.planSource = 'host';
       this.save(run);

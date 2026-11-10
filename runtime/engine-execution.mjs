@@ -251,7 +251,18 @@ export class EngineExecution extends EnginePlanning {
         if (
           signal?.aborted ||
           this.store.getRun(run.id).cancelRequested ||
-          ['quota', 'auth', 'cancelled', 'lease_lost', 'unavailable', 'evidence_integrity'].includes(error.code)
+          // A budget refusal is the user's explicit limit, not a defect of the node: no repair, no research.
+          [
+            'quota',
+            'auth',
+            'cancelled',
+            'lease_lost',
+            'unavailable',
+            'evidence_integrity',
+            'budget',
+            'context_budget',
+            'context_manifest_invalid',
+          ].includes(error.code)
         ) {
           node.attempt--;
           node.resumeRequired = true;

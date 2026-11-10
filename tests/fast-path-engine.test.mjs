@@ -54,6 +54,12 @@ test('A proven style-only task skips Jev, Gemini and research and still gets an 
     ['quick', 'fast-path', null],
   );
   assert.deepEqual(result.fastPath.files, [css]);
+  // The receipt does not pretend that an assessment was tried and was unavailable.
+  assert.deepEqual(
+    [result.executionMode.assessment, result.executionMode.requests, result.executionMode.fallback],
+    ['not_requested', 0, undefined],
+  );
+  assert.equal(result.executionMode.assessmentReason, undefined);
   assert.equal(result.research.requests, 0);
   assert.equal(result.analysis.kind, 'local');
   assert.equal(await readFile(path.join(result.cwd, css), 'utf8'), '.button { color: blue; }\n');
@@ -160,4 +166,40 @@ test('Every session leaves a manifest bound to its contract and head; a context 
   const refused = await tight.engine.run((await tight.engine.create(cssTask, { project: tight.project })).id);
   assert.deepEqual([refused.state, refused.error.code], ['blocked', 'context_budget']);
   assert.equal(tight.sessions.length, 0, 'nothing was sent in a shortened form');
+});
+
+test('A session cap that refuses the worker stops the run as a budget stop, without repair or research', async t => {
+  // Standard mode: a node failure would normally trigger research and another routed attempt.
+  const fx = await styled(t, { config: { budgets: { sessions: 1 }, repairRounds: 3, researchBudget: 5 } });
+  const run = await fx.engine.create(cssTask, { project: fx.project, mode: 'standard' });
+  const result = await fx.engine.run(run.id);
+  assert.deepEqual([result.state, result.error.code], ['blocked', 'budget']);
+  assert.equal(result.executionMode.selected, 'standard');
+  assert.deepEqual(
+    result.sessionAttempts.map(attempt => attempt.stage),
+    ['plan'],
+    'the worker session was refused before it started',
+  );
+  const node = Object.values(result.nodes)[0];
+  assert.deepEqual([node.attempt, node.stopped, node.error], [0, undefined, undefined], 'no attempt was spent');
+  const research = fx.calls.filter(call => call === 'research').length;
+  const again = await fx.engine.run(run.id, { retryFailed: true });
+  assert.deepEqual([again.state, again.error.code], ['blocked', 'budget']);
+  assert.equal(fx.calls.filter(call => call === 'research').length, research, 'the refusal starts no research');
+  assert.equal(fx.sessions.length, 1);
+});
+
+test('A broken or forbidden host plan is refused without revoking the fast path', async t => {
+  const fx = await styled(t);
+  const run = await fx.engine.create(cssTask, { project: fx.project });
+  const planFile = path.join(fx.root, 'plan.json');
+  await writeFile(planFile, JSON.stringify({ summary: 'No tasks', tasks: [] }));
+  const refused = await fx.engine.run(run.id, { planFile });
+  assert.equal(refused.state, 'blocked');
+  assert.deepEqual(
+    [refused.executionMode.source, refused.fastPath.revoked],
+    ['fast-path', undefined],
+    'an invalid plan cannot widen the run',
+  );
+  assert.ok(!fx.calls.includes('assessment'));
 });

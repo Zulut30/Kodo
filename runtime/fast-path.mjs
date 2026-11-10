@@ -12,16 +12,29 @@ export const FAST_PATH_VERSION = 1;
 export const STYLE_EXTENSIONS = Object.freeze(['.css', '.scss', '.sass', '.less', '.styl', '.pcss']);
 export const FAST_PATH_LIMITS = Object.freeze({ taskBytes: 800, files: 3, fileBytes: 65536 });
 
-/** Anything shaped like `name.ext` or `dir/name.ext`, wherever it stands in the text. */
-const pathToken = /[\w.-]+(?:\/[\w.-]+)*\.[A-Za-z][A-Za-z0-9]{0,7}(?![\w/])/g;
+/** A style file named plainly: ASCII segments, no hidden segment, a style extension. */
+const stylePath = /^[A-Za-z0-9_-][\w.-]*(?:\/[A-Za-z0-9_-][\w.-]*)*\.(?:css|scss|sass|less|styl|pcss)$/i;
 /** Words that mean behaviour, data or delivery rather than appearance. Doubt, not proof. */
 const riskMarkers = [
-  /\b(?:auth\w*|log-?in|passw\w*|secret\w*|token\w*|credential\w*|security|payment\w*|billing)\b/i,
-  /\b(?:migrat\w*|deploy\w*|releas\w*|publish\w*|delet\w*|remov\w*|install\w*|upgrad\w*|dependenc\w*)\b/i,
-  /\b(?:script\w*|javascript|typescript|html|api|endpoint\w*|backend|database|refactor\w*|renam\w*)\b/i,
-  /безопасн|парол|секрет|токен|оплат|платеж|миграц|депло|релиз|публик|удал|установ|обнов|зависимост/i,
-  /скрипт|бэкенд|база данных|рефактор|переимен/i,
+  /auth|log-?in|passw|secret|token|credential|security|payment|billing/i,
+  /migrat|deploy|releas|publish|delet|remov|install|upgrad|dependenc/i,
+  /script|javascript|typescript|backend|database|refactor|renam|endpoint/i,
+  /\b(?:html|api)\b/i,
+  /безопасн|парол|секрет|токен|оплат|плат[её]ж|миграц|депло|релиз|публик|удал|установ|обнов|зависимост/i,
+  /скрипт|бэкенд|баз\S* данн|рефактор|переимен/i,
 ];
+
+/**
+ * Words of the task that look like a file reference: anything with a slash,
+ * or with a dot that is not sentence punctuation. `.env`, `обработчик.js`,
+ * `a.7z`, `src/server` and `v1.2` all count; each must then be a style path.
+ */
+function pathLike(task) {
+  return task
+    .split(/[\s"'`()[\]{}<>,]+/)
+    .map(word => word.replace(/[.,;:!?]+$/, ''))
+    .filter(word => word.includes('/') || word.includes('.'));
+}
 
 /** @typedef {{ fastPath: boolean, reason: string, files?: string[] }} LocalTaskDecision `files` is set when `fastPath` is true. */
 
@@ -41,15 +54,17 @@ export async function classifyLocalTask({ cwd, task, requested }) {
   if (/:\/\/|\bwww\./i.test(task)) return doubt('url');
   if (/[\\]|\.\.\/|(?:^|\s)[~/]/.test(task)) return doubt('path_not_relative');
   if (riskMarkers.some(marker => marker.test(task))) return doubt('risk_marker');
-  const named = [...new Set(task.match(pathToken) || [])];
+  const named = [...new Set(pathLike(task))];
   if (!named.length) return doubt('no_paths');
-  if (named.some(name => !STYLE_EXTENSIONS.includes(path.posix.extname(name).toLowerCase())))
-    return doubt('non_style_path');
+  if (named.some(name => !stylePath.test(name))) return doubt('non_style_path');
   if (named.length > FAST_PATH_LIMITS.files) return doubt('too_many_files');
   for (const name of named) {
-    if (name.split('/').some(part => part.startsWith('.') || part === '')) return doubt('path_hidden');
-    const tracked = await execute('git', ['ls-files', '--error-unmatch', '--', name], { cwd, allowFailure: true });
-    if (tracked.code !== 0) return doubt('path_untracked');
+    // The index entry must be a regular file: mode 120000 is a symbolic link even where the
+    // working tree shows it as a plain file, 160000 is a submodule.
+    const tracked = await execute('git', ['ls-files', '-s', '--', name], { cwd, allowFailure: true });
+    const entries = tracked.code === 0 ? tracked.stdout.split('\n').filter(Boolean) : [];
+    if (entries.length !== 1) return doubt('path_untracked');
+    if (!/^100(?:644|755) /.test(entries[0])) return doubt('path_not_file');
     let info;
     try {
       info = await lstat(path.join(cwd, name));
