@@ -6,10 +6,37 @@ import { validateCommandTimeouts } from './config.mjs';
 import { planSchema } from './contracts.mjs';
 import { commitChanges } from './workspace.mjs';
 import { writeProgress } from './progress.mjs';
+import { recordBlocker, resetWatchdog, resolveBlocker } from './watchdog.mjs';
 import { normalizeArchitectureConfig } from './architecture-gate.mjs';
 import { EngineVerification } from './engine-verification.mjs';
 
 /** Public engine: the durable run loop over the layered stages. */
+/** Why the run stopped now, with the facts and evidence the next session needs. */
+function currentBlocker(run, error) {
+  // The stop error names its own place and reason. The saved controller assessment is not
+  // used: with two nodes stopping together it may belong to the other one.
+  const scope = typeof error.scope === 'string' ? error.scope : 'run';
+  return recordBlocker(run.blocker, {
+    code: typeof error.reason === 'string' ? error.reason : run.error.code,
+    message: run.error.message,
+    scope,
+    at: new Date().toISOString(),
+    // A verification stop belongs to the commit that was checked. After a repair it is newer than
+    // the last accepted commit, which is what `run.headSha` still names.
+    headSha: (scope === 'verification' ? run.checks?.headSha : null) || run.headSha || null,
+    reasons: [run.error.code, error.classification, run.behavior?.passed === false ? 'behavior_failed' : null].filter(
+      Boolean,
+    ),
+    // Check and oracle output explains a verification stop only.
+    evidence:
+      scope === 'verification'
+        ? [
+            ...(run.checks?.results || []).map(row => ({ sha256: row.outputHash, kind: 'check' })),
+            ...(run.behavior?.oracles || []).map(row => ({ sha256: row.outputHash, kind: 'oracle' })),
+          ].filter(item => typeof item.sha256 === 'string')
+        : [],
+  });
+}
 export class Engine extends EngineVerification {
   // oxlint-disable-next-line max-lines-per-function, complexity -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
   async run(id, { prepare = false, planFile, signal, resumeCancelled = false, retryFailed = false } = {}) {
@@ -21,6 +48,8 @@ export class Engine extends EngineVerification {
     if (run.state === 'succeeded' || (run.state === 'cancelled' && !resumeCancelled)) return run;
     const token = this.store.acquireLease(`run:${id}`, id);
     if (!token) throw new Error('Этот запуск уже исполняется');
+    // The saved error describes the previous attempt: from here on it is history, not the current blocker.
+    run.blocker = resolveBlocker(run.blocker, { at: new Date().toISOString(), outcome: 'resumed' });
     if (resumeCancelled) {
       this.store.updateRun(id, { cancelRequested: false, state: 'resuming' });
       delete run.cancelRequested;
@@ -53,6 +82,7 @@ export class Engine extends EngineVerification {
           ].slice(-20),
         };
       delete run.controllerAssessment;
+      run.watchdog = resetWatchdog(run.watchdog);
       this.save(run);
       this.log(run, 'retry_requested');
     }
@@ -105,6 +135,8 @@ export class Engine extends EngineVerification {
       if (run.verification?.stopped)
         throw Object.assign(new Error('Verification repair cycle stopped; use --retry-failed for a new cycle'), {
           code: 'blocked',
+          scope: 'verification',
+          reason: run.verification.stopped,
         });
       // Recover a completed external merge before requiring native clients.
       // A lost delivery receipt must not rediscover models or replay analysis.
@@ -250,6 +282,7 @@ export class Engine extends EngineVerification {
       if (!run.release?.published) this.checkCancelled(run, signal);
       run.state = 'succeeded';
       run.error = null;
+      run.blocker = resolveBlocker(run.blocker, { at: new Date().toISOString(), outcome: 'succeeded' });
       this.save(run);
       this.log(run, 'succeeded', { headSha: run.headSha, pr: run.delivery?.pr, release: run.release });
       await this.policy(run, 'complete');
@@ -274,6 +307,7 @@ export class Engine extends EngineVerification {
         message: redact(error.message, this.secrets),
         ...(error.retryAt ? { retryAt: error.retryAt } : {}),
       };
+      if (['blocked', 'waiting_limits'].includes(run.state)) run.blocker = currentBlocker(run, error);
       this.save(run);
       this.log(run, run.state, run.error);
       return run;

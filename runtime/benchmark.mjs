@@ -135,6 +135,7 @@ async function metadata() {
     'runtime/fast-path.mjs',
     'runtime/context-manifest.mjs',
     'runtime/behavior-gate.mjs',
+    'runtime/watchdog.mjs',
     'runtime/engine-verification.mjs',
     'runtime/modes.mjs',
     'runtime/providers.mjs',

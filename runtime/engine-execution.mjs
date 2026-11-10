@@ -9,6 +9,7 @@ import { git, makeWorktree, changedFiles, commitChanges } from './workspace.mjs'
 import { taskContract } from './task-context.mjs';
 import { runReadyQueue } from './task-scheduler.mjs';
 import { executeDurableTasks } from './engine-jobs.mjs';
+import { normalizeWatchdogConfig, unchanged } from './watchdog.mjs';
 import { EnginePlanning } from './engine-planning.mjs';
 import { contentHash, evidencePrompt, lstatSafe } from './engine-core.mjs';
 
@@ -178,6 +179,8 @@ export class EngineExecution extends EnginePlanning {
       }
       throw Object.assign(new Error(`Исчерпаны попытки ${task.id}: ${node.error || 'требуется устранить блокер'}`), {
         code: 'blocked',
+        scope: task.id,
+        reason: node.stopped,
       });
     }
     while (node.attempt < run.config.repairRounds) {
@@ -241,6 +244,8 @@ export class EngineExecution extends EnginePlanning {
         node.result = validate(resultSchema, result.output);
         if (!node.result.complete) throw new Error(`Исполнитель не завершил задачу: ${node.result.summary}`);
         node.changedFiles = await this.checkScope(node.cwd, node.baseSha, task.writePaths);
+        if (normalizeWatchdogConfig(run.config.watchdog).rejectUnchanged && (await unchanged(node.cwd, node.baseSha)))
+          throw new Error('Узел ничего не изменил: его рабочее дерево совпадает с базой');
         node.headSha = await commitChanges(node.cwd, `Kodo ${task.id}: ${run.task.slice(0, 100)}`);
         node.status = 'completed';
         delete node.error;
@@ -283,7 +288,11 @@ export class EngineExecution extends EnginePlanning {
           node.stopped = node.attempt >= run.config.repairRounds ? 'repair_budget_exhausted' : 'no_progress';
           node.status = 'blocked';
           this.assess(run, { scope: task.id, attempts: node.attempt, reason: node.stopped, problem: node.error });
-          throw Object.assign(new Error(`Нет прогресса в ${task.id}: ${node.error}`), { code: 'blocked' });
+          throw Object.assign(new Error(`Нет прогресса в ${task.id}: ${node.error}`), {
+            code: 'blocked',
+            scope: task.id,
+            reason: node.stopped,
+          });
         }
         await this.moreResearch(run, node.error, signal);
         delete node.routing;

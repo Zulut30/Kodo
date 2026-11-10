@@ -70,6 +70,7 @@ async function pins() {
     'fast-path.mjs',
     'context-manifest.mjs',
     'behavior-gate.mjs',
+    'watchdog.mjs',
     'engine-verification.mjs',
     'security.mjs',
     'toolchains.mjs',

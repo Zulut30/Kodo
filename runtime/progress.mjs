@@ -9,6 +9,50 @@ const short = (value, max = 240) =>
         .replace(/[\r\n\0]/g, ' ')
         .slice(0, max)
     : '';
+/** The current blocker, earlier ones and the watchdog state. An older error is never shown as current. */
+function blockerLines(run) {
+  const lines = [];
+  const blocker = run.blocker;
+  if (blocker?.current) {
+    const current = blocker.current;
+    lines.push(
+      // The latest wording first: an earlier text must not pass for the present failure.
+      `Current blocker: ${short(current.code, 60)} [${short(current.scope, 60)}] ${short(current.lastMessage ?? current.message, 600)}`,
+      `Seen ${short(current.occurrences, 6)} time(s): first ${short(current.firstSeen, 40)}, last ${short(current.lastSeen, 40)}; commit ${short(current.headSha, 64)}`,
+    );
+    // A repeated stop may only say that the run stays stopped; the first report names what failed.
+    if (current.lastMessage && current.lastMessage !== current.message)
+      lines.push(`First reported as: ${short(current.message, 600)}`);
+    for (const hypothesis of (current.hypotheses || []).slice(0, 4))
+      lines.push(`- Hypothesis: ${short(hypothesis, 240)}`);
+    if (current.evidence?.length)
+      lines.push(
+        `Evidence: ${current.evidence
+          .slice(0, 6)
+          .map(item => `${short(item.kind || 'evidence', 20)} ${short(item.sha256, 64)}`)
+          .join(', ')}`,
+      );
+  } else if (run.error)
+    // After a resume the saved error is the previous attempt's, not what blocks the run now.
+    lines.push(
+      `${run.state === 'cancelled' ? 'Stopped' : !blocker ? 'Pending blocker' : 'Last error (previous attempt, not the current blocker)'}: ${short(run.error.code, 60)} ${short(run.error.message, 600)}`,
+    );
+  if (blocker?.history?.length) {
+    lines.push(`Earlier blockers: ${blocker.history.length}`);
+    for (const item of blocker.history.slice(-3))
+      lines.push(
+        `- ${short(item.outcome, 20)} ${short(item.endedAt, 40)}: ${short(item.code, 60)} [${short(item.scope, 60)}] ${short(item.message, 160)}`,
+      );
+  }
+  // The counter is shown only where a limit is configured or has stopped the run.
+  if (run.watchdog && (run.watchdog.stopped || run.config?.watchdog?.stalledRounds))
+    lines.push(
+      `Watchdog: ${short(run.watchdog.stalled, 4)} round(s) without verified progress${
+        run.watchdog.stopped ? `; stopped at limit ${short(run.watchdog.stopped.limit, 4)}` : ''
+      }`,
+    );
+  return lines;
+}
 export function buildProgress(run) {
   const nodes = Object.entries(run.nodes || {});
   const lines = [
@@ -43,7 +87,7 @@ export function buildProgress(run) {
     lines.push(
       `Controller: ${short(run.controllerAssessment.reason, 100)}; ${short(run.controllerAssessment.summary, 600)}`,
     );
-  if (run.error) lines.push(`Pending blocker: ${short(run.error.code, 60)} ${short(run.error.message, 600)}`);
+  lines.push(...blockerLines(run));
   // UTF-8 can use four bytes per JS character; this bound stays below 64 KiB.
   return redact(lines.join('\n').slice(0, 16000)) + '\n';
 }

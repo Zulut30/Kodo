@@ -5,6 +5,7 @@ import { normalizeSecurityConfig } from './security-gates.mjs';
 import { normalizeArchitectureConfig } from './architecture-gate.mjs';
 import { normalizeMode } from './modes.mjs';
 import { normalizeVerificationConfig } from './behavior-gate.mjs';
+import { normalizeWatchdogConfig } from './watchdog.mjs';
 // Read-time provenance only: Engine persists the explicit choice on a new run.
 // The default 2 must not become an explicit override of quick's default 1.
 export const configuredConcurrency = Symbol('configuredConcurrency');
@@ -102,6 +103,7 @@ export async function readConfig(project, overrides = {}) {
   normalizeBudgets(/** @type {any} */ (config).budgets);
   // Validated only: defaults are applied where the block is read, so saved configs keep their shape.
   normalizeVerificationConfig(/** @type {any} */ (config).verification);
+  normalizeWatchdogConfig(/** @type {any} */ (config).watchdog);
   normalizeMode(config.executionMode);
   if (
     config.maxTasks !== undefined &&
