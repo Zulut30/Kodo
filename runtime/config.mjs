@@ -78,6 +78,10 @@ export async function readConfig(project, overrides = {}) {
     !Array.isArray(config.checks)
   )
     throw new Error('Некорректная конфигурация Kodo');
+  // Optional: absent means the legacy in-run dispatcher.
+  const scheduler = /** @type {any} */ (config).scheduler;
+  if (scheduler !== undefined && !['legacy', 'durable'].includes(scheduler))
+    throw new Error('Некорректная конфигурация Kodo: scheduler must be "legacy" or "durable"');
   normalizeMode(config.executionMode);
   if (
     config.maxTasks !== undefined &&
