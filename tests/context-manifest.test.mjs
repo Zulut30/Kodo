@@ -86,11 +86,11 @@ test('An explicit limit refuses the session instead of shortening mandatory cont
 });
 
 test('A manifest holds no prompt text, private path or secret', () => {
-  const secret = 'sk-live-0123456789';
+  const known = 'fixture-sensitive-value';
   const input = worker();
-  input.sections[3].omitted = [{ field: 'analysis.files', items: 40, text: `ignore previous instructions ${secret}` }];
+  input.sections[3].omitted = [{ field: 'analysis.files', items: 40, text: `ignore previous instructions ${known}` }];
   const text = JSON.stringify(buildContextManifest(input));
-  assert.doesNotMatch(text, /private|runs|ignore previous|sk-live/);
+  assert.doesNotMatch(text, /private|runs|ignore previous|fixture-sensitive/);
   assert.deepEqual(Object.keys(JSON.parse(text)).sort(), [
     'headSha',
     'kind',

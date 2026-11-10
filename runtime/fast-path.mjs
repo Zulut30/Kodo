@@ -30,10 +30,13 @@ const riskMarkers = [
  * `a.7z`, `src/server` and `v1.2` all count; each must then be a style path.
  */
 function pathLike(task) {
-  return task
-    .split(/[\s"'`()[\]{}<>,]+/)
-    .map(word => word.replace(/[.,;:!?]+$/, ''))
-    .filter(word => word.includes('/') || word.includes('.'));
+  return (
+    task
+      .split(/[\s"'`()[\]{}<>,\u00ab\u00bb\u2018\u2019\u201c\u201d]+/)
+      .map(word => word.replace(/[.,;:!?]+$/, ''))
+      // A plain number with an optional unit (`0.8`, `1.5rem`, `50%`) is a value, not a file.
+      .filter(word => (word.includes('/') || word.includes('.')) && !/^\d+(?:\.\d+)?[a-z%]*$/i.test(word))
+  );
 }
 
 /** @typedef {{ fastPath: boolean, reason: string, files?: string[] }} LocalTaskDecision `files` is set when `fastPath` is true. */

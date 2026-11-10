@@ -31,6 +31,13 @@ function fixture(t) {
   git('add', '.');
   git('commit', '-m', 'Fixture');
   writeFileSync(path.join(cwd, 'src/styles/untracked.css', ''), 'u {}\n');
+  // A tracked symbolic link and a directory, both with a style name.
+  const blob = spawnSync('git', ['hash-object', '-w', '--stdin'], { cwd, input: 'button.css', encoding: 'utf8' });
+  git('update-index', '--add', '--cacheinfo', `120000,${blob.stdout.trim()},src/styles/link.css`);
+  writeFileSync(path.join(cwd, 'src/styles/link.css'), 'a {}\n');
+  mkdirSync(path.join(cwd, 'src/styles/folder.css'));
+  writeFileSync(path.join(cwd, 'src/styles/folder.css/inner.txt'), 'x\n');
+  git('add', 'src/styles/folder.css/inner.txt');
   return cwd;
 }
 
@@ -47,6 +54,13 @@ test('A short task naming only existing tracked style files is a fast path', asy
     requested: 'quick',
   });
   assert.deepEqual(two.files, ['src/styles/button.css', 'src/styles/theme.scss']);
+  // Numbers with units and typographic quotes do not look like other files.
+  for (const task of [
+    'Set opacity to 0.8 and padding to 1.5rem in src/styles/button.css',
+    'Use rgba(0,0,0,0.5) for the shadow in \u00absrc/styles/button.css\u00bb',
+    'Make the button 50% wider: \u201csrc/styles/button.css\u201d',
+  ])
+    assert.deepEqual((await classifyLocalTask({ cwd, task })).files, ['src/styles/button.css'], task);
   // Sentence punctuation and quotes around a path are not part of it.
   const quoted = await classifyLocalTask({ cwd, task: 'Darken the hover state. File: "src/styles/button.css".' });
   assert.deepEqual(quoted.files, ['src/styles/button.css']);
@@ -87,6 +101,11 @@ test('Every doubt returns the ordinary route with its reason', async t => {
     [{ task: 'Make src/styles/untracked.css blue' }, 'path_untracked'],
     [{ task: 'Make src/styles/missing.css blue' }, 'path_untracked'],
     [{ task: 'Make src/styles/huge.css blue' }, 'file_too_large'],
+    // The index entry is a symbolic link even where the working tree shows a plain file.
+    [{ task: 'Make src/styles/link.css blue' }, 'path_not_file'],
+    [{ task: 'Make src/styles/folder.css blue' }, 'path_not_file'],
+    // A class selector is indistinguishable from a dot-file and stays doubt.
+    [{ task: `Make .button blue in ${button}` }, 'non_style_path'],
   ];
   for (const [input, reason] of cases)
     assert.deepEqual(await classifyLocalTask({ cwd, ...input }), { fastPath: false, reason }, JSON.stringify(input));

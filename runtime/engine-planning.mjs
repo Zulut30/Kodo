@@ -289,11 +289,17 @@ export class EnginePlanning extends EngineCore {
     this.save(run);
   }
   planInstructions(run) {
+    // The fast path was proven for named files only: a plan that writes anything else revokes it.
+    const proven =
+      run.executionMode.source === 'fast-path'
+        ? ` This run was admitted for a style-only change: writePaths must be exactly these files and nothing else: ${JSON.stringify(run.fastPath.files)}. Do not add test or documentation files; state their checks as acceptance of the same task.`
+        : '';
     return (
       `Execution mode ${run.executionMode.selected}; at most ${run.executionMode.profile.maxTasks} tasks. Keep each mandatory node contract below ${maxTaskContractBytes} UTF-8 bytes; decompose oversized contracts without losing criteria. Prefer small cohesive deliverables and early scoped tests; a tiny change needs no artificial split. ` +
       (run.executionMode.selected === 'quick'
         ? 'Use a single developer task with tests and documentation as scoped acceptance in the same deliverable. Do not create unconditional separate tester or documenter tasks. Actual configured tests, build, UI/security gates and fresh independent review remain mandatory.'
-        : 'Split substantial work into small cohesive module deliverables with explicit interfaces and narrow non-overlapping write scopes. Define shared interface contracts before parallel implementation. Mark independent prepared nodes parallel=true; add only real dependencies, and let module tests and documentation start as their own prerequisites finish rather than waiting for all implementation. Avoid one giant developer task and unnecessary global dependency chains. Create separate tester or documenter tasks only where requirements need independent deliverables. Each worker receives its own scoped context, acceptance and dependency outcomes. Actual configured tests, build, UI/security gates and fresh independent review remain mandatory.')
+        : 'Split substantial work into small cohesive module deliverables with explicit interfaces and narrow non-overlapping write scopes. Define shared interface contracts before parallel implementation. Mark independent prepared nodes parallel=true; add only real dependencies, and let module tests and documentation start as their own prerequisites finish rather than waiting for all implementation. Avoid one giant developer task and unnecessary global dependency chains. Create separate tester or documenter tasks only where requirements need independent deliverables. Each worker receives its own scoped context, acceptance and dependency outcomes. Actual configured tests, build, UI/security gates and fresh independent review remain mandatory.') +
+      proven
     );
   }
   async route(run, task, state, signal) {

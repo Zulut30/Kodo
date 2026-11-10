@@ -84,7 +84,7 @@ kodo run "<локальная задача>" --client codex --mode quick --model
 - Автоматический `deep`: хотя бы один выбор high complexity, high risk или cross-cutting scope. Для этого условия отдельный порог 0.75 не применяется.
 - Остальные валидные оценки дают `standard`. При отсутствии ключа, недоступном Jev или некорректном ответе сохраняется явный fallback `standard` с причиной и неизвестными измерениями оценки; явный режим всё равно побеждает. Другой модельный API для классификации не подключается.
 
-`run.executionMode` содержит `requested`, `selected`, `source`, `reason`, эффективный `profile` и квитанцию оценки. `source` различает `explicit`, `jev`, `fallback`; старые запуски могут иметь `compatibility`. Выбор записывается событием `mode_selected`.
+`run.executionMode` содержит `requested`, `selected`, `source`, `reason`, эффективный `profile` и квитанцию оценки. `source` различает `explicit`, `jev`, `fallback`, `fast-path`; старые запуски могут иметь `compatibility`. Выбор записывается событием `mode_selected`.
 
 | Профиль | `gemini` | `researchBudget` | `maxTasks` | `repairRounds` | `concurrency` |
 | --- | --- | --- | --- | --- | --- |

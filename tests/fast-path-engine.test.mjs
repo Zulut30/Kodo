@@ -64,6 +64,11 @@ test('A proven style-only task skips Jev, Gemini and research and still gets an 
   assert.equal(result.analysis.kind, 'local');
   assert.equal(await readFile(path.join(result.cwd, css), 'utf8'), '.button { color: blue; }\n');
   assert.equal(result.review.passed, true, 'the review gate is not skipped');
+  // The planner is told the boundary of the proof, so an honest plan does not revoke it.
+  assert.match(
+    fx.sessions[0].prompt,
+    /writePaths must be exactly these files and nothing else: \["styles\/button\.css"\]/,
+  );
 });
 
 test('Doubt takes the ordinary route: a non-style path, a risk word or an explicit wider mode', async t => {
@@ -136,9 +141,9 @@ test('Budgets are optional, bounded and reject unknown keys', async t => {
 });
 
 test('Every session leaves a manifest bound to its contract and head; a context limit refuses, never cuts', async t => {
-  const secret = 'kodo-fixture-secret-0001';
+  const known = 'fixture-sensitive-value';
   const fx = await styled(t);
-  fx.engine.secrets = { FIXTURE_TOKEN: secret };
+  fx.engine.secrets = { FIXTURE_KEY: known };
   const run = await fx.engine.create(cssTask, { project: fx.project });
   const result = await fx.engine.run(run.id);
   assert.equal(result.state, 'succeeded', result.error?.message);
@@ -149,7 +154,7 @@ test('Every session leaves a manifest bound to its contract and head; a context 
     assert.match(attempt.manifestSha256, /^[0-9a-f]{64}$/);
     assert.equal(manifest.totalBytes, attempt.metrics.promptBytes, `${attempt.stage}: sizes add up to the prompt`);
     assert.equal(manifest.limitBytes, null);
-    assert.doesNotMatch(JSON.stringify(manifest), new RegExp(`${secret}|Make the button|state`));
+    assert.doesNotMatch(JSON.stringify(manifest), new RegExp(`${known}|Make the button|state`));
   }
   const worker = result.sessionAttempts.find(attempt => attempt.stage === 'developer');
   const { manifest } = worker;
