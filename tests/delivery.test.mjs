@@ -2460,4 +2460,30 @@ test('A journal that cannot record an intent stops the remote effect before it s
   };
   await assert.rejects(deliver(ctx), /database is locked/);
   assert.equal(ctx.state.merges, 0, 'no merge without a durable intent');
+  assert.equal(ctx.leases.size, 0, 'the merge queue is released');
+});
+
+test('A merge command stopped by a local timeout with the PR still open stays uncertain', async t => {
+  const ctx = await fixture(t),
+    runner = ctx.exec;
+  // The request may already have left: an open PR right now does not prove the merge will not land.
+  ctx.exec = async (command, args, options) => {
+    if (command === 'gh' && args[0] === 'pr' && args[1] === 'merge')
+      throw Object.assign(new Error('gh timed out'), { code: 'timeout' });
+    return runner(command, args, options);
+  };
+  await assert.rejects(deliver(ctx), { code: 'timeout' });
+  assert.deepEqual(operations(ctx), { pr: 'confirmed', merge: 'uncertain' });
+  assert.equal(ctx.leases.size, 0);
+});
+
+test('A PR already merged when the branch is listed is recorded as reconciled without a merge command', async t => {
+  const ctx = await fixture(t);
+  // An earlier process created and merged the PR; this run has no saved receipt of either.
+  ctx.state.pr = { number: 7, url: 'https://github.com/test/kodo/pull/7', state: 'MERGED' };
+  const receipt = await deliver(ctx);
+  assert.equal(receipt.mergeCommit, ctx.run.headSha);
+  assert.deepEqual([ctx.state.creates, ctx.state.merges], [0, 0], 'nothing was created or merged again');
+  assert.deepEqual(operations(ctx), { pr: 'reconciled', merge: 'reconciled' });
+  assert.equal(ctx.leases.size, 0);
 });

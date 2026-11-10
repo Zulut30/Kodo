@@ -509,8 +509,10 @@ export async function releasePackage(options) {
       await writeFile(notes, content);
     }
     return await ctx.irreversible(async () => {
-      // Nothing is changed for a release that is already published: no intent for it.
-      if (!existing) await operationIntent(ctx, 'release', { tag, commit: candidate, sha256: checksum });
+      // A published release with all its assets is only read: no intent for it. Publishing a
+      // draft or uploading a missing asset changes the remote and is announced first.
+      const complete = ['SHA256SUMS', filename].every(name => existingInfo?.assets?.some(asset => asset.name === name));
+      if (!existing || !complete) await operationIntent(ctx, 'release', { tag, commit: candidate, sha256: checksum });
       let publishedHere = false;
       if (existingInfo) {
         // A process can die after creating the release but before uploading every

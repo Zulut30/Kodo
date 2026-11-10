@@ -11,8 +11,9 @@ export const DELIVERY_OPERATIONS = Object.freeze(['pr', 'merge', 'release']);
 /**
  * `confirmed`: this call performed the effect and it is visible (a PR is confirmed by the URL the
  * command returned; a merge and a release by reading the remote state back).
- * `reconciled`: found by read-back alone; this call did not perform it.
- * `absent`: the command failed and read-back shows the effect did not happen.
+ * `reconciled`: established by read-back alone: the command of this call failed after the remote
+ * accepted it, or an earlier process performed the effect.
+ * `absent`: the remote refused the command and read-back shows the effect did not happen.
  * Anything less certain has no outcome and stays `uncertain`.
  */
 const outcomes = new Set(['confirmed', 'reconciled', 'absent']);
