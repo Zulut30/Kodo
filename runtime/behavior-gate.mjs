@@ -249,7 +249,8 @@ function lastToken() {
       last = char;
       gap = false;
     },
-    regexAllowed: () => last === '' || '(,=:[!&|?{};+-*%<>~^'.includes(last) || (!dotted && regexKeywords.has(word)),
+    // Not after `<`: there a slash closes a JSX tag far more often than it opens a regex literal.
+    regexAllowed: () => last === '' || '(,=:[!&|?{};+-*%>~^'.includes(last) || (!dotted && regexKeywords.has(word)),
   };
 }
 
@@ -445,7 +446,8 @@ function jsCases(source) {
     cases = [],
     off = []; // [start, end] of the groups that are switched off: in source order, never nested
   let dynamic = 0,
-    onlys = 0;
+    onlys = 0,
+    bodySkips = 0;
   const inside = index => off.length > 0 && index < off[off.length - 1][1];
   for (const match of code.matchAll(jsCall)) {
     const modifiers = match[3]
@@ -477,8 +479,11 @@ function jsCases(source) {
         const end = callEnd(code, from);
         off.push([match.index, end < 0 ? code.length : end]);
       }
-    } else if (name[1] === undefined) dynamic++;
-    else
+    } else if (name[1] === undefined) {
+      // `test.skip(condition, 'why')` inside a body (Playwright) is a skip call, not a case.
+      if (skipped) bodySkips++;
+      else dynamic++;
+    } else
       cases.push({
         name: unescapeQuotes(strings[Number(name[1])]),
         skipped: skipped || only || inside(match.index),
@@ -492,7 +497,7 @@ function jsCases(source) {
       skipped: skipOption.test(match[2]) || (range < off.length && off[range][0] <= match.index),
     });
   }
-  return { code, cases, dynamic, onlys };
+  return { code, cases, dynamic, onlys, bodySkips };
 }
 
 const pySkip = /^@(?:[\w.]*\.)?(?:skip\w*|xfail|expectedFailure)\b/i;
@@ -500,7 +505,8 @@ const brackets = text => count(text, /[([{]/g) - count(text, /[)\]}]/g);
 
 /**
  * Python cases, read line by line. A skip decorator on a class covers the
- * tests in it; a module-level `pytestmark` with a skip covers the whole file.
+ * tests in it. `pytestmark` with a skip covers the whole file at module level
+ * and the tests that follow it inside a class; it may be a list over several lines.
  * @param {string} source
  */
 function pythonCases(source) {
@@ -509,13 +515,25 @@ function pythonCases(source) {
     classes = [];
   let decorators = [],
     pending = 0,
+    mark = null,
     moduleSkip = false;
+  const applyMark = () => {
+    if (/\b(?:skip\w*|xfail)\b/i.test(mark.text)) {
+      if (mark.indent === 0) moduleSkip = true;
+      else if (classes.length) classes[classes.length - 1].skipped = true;
+    }
+    mark = null;
+  };
   for (const raw of code.split('\n')) {
     const text = raw.trim();
     if (!text) continue;
     if (pending > 0) {
-      // A decorator that continues over several lines.
+      // A decorator or a `pytestmark` list that continues over several lines.
       pending += brackets(text);
+      if (mark) {
+        mark.text += ` ${text}`;
+        if (pending <= 0) applyMark();
+      }
       continue;
     }
     const indent = raw.length - raw.trimStart().length;
@@ -529,7 +547,11 @@ function pythonCases(source) {
     const named = /^(?:async\s+)?def\s+(test\w*)\s*\(/.exec(text);
     if (/^class\s/.test(text)) classes.push({ indent, skipped });
     else if (named) cases.push({ name: named[1], skipped });
-    else if (indent === 0 && /^pytestmark\s*=.*\b(?:skip\w*|xfail)\b/i.test(text)) moduleSkip = true;
+    else if (/^pytestmark\s*(?::[^=]*)?=/.test(text)) {
+      mark = { text, indent };
+      pending = brackets(text);
+      if (pending <= 0) applyMark();
+    }
     decorators = [];
   }
   return { code, cases: moduleSkip ? cases.map(item => ({ ...item, skipped: true })) : cases };
@@ -561,15 +583,24 @@ function rustCases(source) {
   return cases;
 }
 
+/** `@Disabled` with its arguments, then only annotations and modifiers up to `class` or `object`. */
+const javaClassOff =
+  /@(?:Disabled|Ignore)\b(?:\s*\([^)\n]{0,300}\))?(?:\s*@\w+(?:\s*\([^)\n]{0,300}\))?|\s+(?:public|protected|private|internal|abstract|final|open|static|sealed|data|inner))*\s+(?:class|object)\b/;
+
 /** Java and Kotlin tests. `@Disabled` on a class is read as covering every test of the file. */
 function javaCases(source) {
-  const classOff = /@(?:Disabled|Ignore)\b[^;{}]{0,300}\b(?:class|object)\b/.test(source);
+  const classOff = javaClassOff.test(source);
+  // What stands between the previous statement or block and `@Test`: the annotations of this method.
+  const own = index =>
+    source
+      .slice(Math.max(0, index - 300), index)
+      .split(/[;{}]/)
+      .pop();
   return [
     ...source.matchAll(/@(?:Test|ParameterizedTest|RepeatedTest)\b([\s\S]{0,300}?)\b(?:void|fun)\s+(\w+)\s*\(/g),
   ].map(match => ({
     name: match[2],
-    skipped:
-      classOff || /@(?:Disabled|Ignore)\b/.test(source.slice(Math.max(0, match.index - 160), match.index) + match[1]),
+    skipped: classOff || /@(?:Disabled|Ignore)\b/.test(own(match.index) + match[1]),
   }));
 }
 
@@ -599,10 +630,12 @@ function casesOf(file, source) {
     onlys: parsed.onlys ?? 0,
     assertions: count(code, /\bassert\w*|\bexpect\s*\(/g),
     // Skips called from inside a test body; they cannot be tied to one case without a parser.
-    bodySkips: count(
-      code,
-      /(?<![\w$])(?:t|this|ctx|context)\s*\.\s*(?:skip|todo)\s*\(|\bpytest\.skip\s*\(|\bself\.skipTest\s*\(|\bt\.Skip(?:f|Now)?\(/g,
-    ),
+    bodySkips:
+      (parsed.bodySkips ?? 0) +
+      count(
+        code,
+        /(?<![\w$])(?:t|this|ctx|context)\s*\.\s*(?:skip|todo)\s*\(|\bpytest\.skip\s*\(|\bself\.skipTest\s*\(|\bt\.Skip(?:f|Now)?\(/g,
+      ),
   };
 }
 

@@ -834,3 +834,78 @@ test('Scanning stays linear on input built to make a pattern rescan the file', a
   // Each of these took tens of seconds with a pattern that rescans; linear work is far under a second.
   assert.ok(elapsed < 10000, `scanned in ${Math.round(elapsed)} ms`);
 });
+
+test('A skipped newcomer does not switch its neighbours off; list and class marks are read', async t => {
+  await t.test('a new skipped group with JSX before existing cases', async s => {
+    const view = `${header}describe('math', () => {\n  test('adds', () => assert.equal(1 + 1, 2));\n});\n`;
+    const repo = repository(s, { 'tests/view.test.tsx': view });
+    const head = repo.change({
+      'tests/view.test.tsx': view.replace(
+        "describe('math'",
+        "describe.skip('wip', () => {\n  test('fresh', () => {\n    render(<App>hi</App>);\n  });\n});\ndescribe('math'",
+      ),
+    });
+    assert.deepEqual(await weakened(head), []);
+  });
+  const conditional =
+    header +
+    "test('opens', async ({ page, browserName }) => {\n  test.skip(browserName === 'firefox', 'flaky');\n  assert.ok(page);\n});\n";
+  const plain = conditional.replace("  test.skip(browserName === 'firefox', 'flaky');\n", '');
+  await t.test('a conditional skip removed from a test body', async s => {
+    const repo = repository(s, { 'tests/page.test.mjs': conditional });
+    assert.deepEqual(await weakened(repo.change({ 'tests/page.test.mjs': plain })), []);
+  });
+  await t.test('a conditional skip added to a test body', async s => {
+    const repo = repository(s, { 'tests/page.test.mjs': plain });
+    const { findings } = await testWeakening(repo.change({ 'tests/page.test.mjs': conditional }));
+    assert.deepEqual(rules(findings), ['test_skipped:tests/page.test.mjs']);
+    assert.match(findings[0].detail, /skip calls inside existing tests 0 -> 1/);
+  });
+  await t.test('pytestmark as a list over several lines', async s => {
+    const marked =
+      'import pytest\n\npytestmark = [\n    pytest.mark.slow,\n]\n\n\ndef test_total():\n    assert True\n';
+    const repo = repository(s, { 'tests/test_marked.py': marked });
+    const head = repo.change({
+      'tests/test_marked.py': marked.replace(
+        '    pytest.mark.slow,\n',
+        '    pytest.mark.slow,\n    pytest.mark.skip(reason="later"),\n',
+      ),
+    });
+    assert.deepEqual(await weakened(head), ['test_skipped:tests/test_marked.py']);
+    const touched = repo.change({ 'tests/test_marked.py': marked.replace('assert True', 'assert 1 == 1') });
+    assert.deepEqual(await weakened(touched), [], 'a mark without a skip switches nothing off');
+  });
+  await t.test('pytestmark inside a class', async s => {
+    const classed =
+      'import pytest\n\n\nclass TestTotal:\n    def test_total(self):\n        assert True\n\n\ndef test_free():\n    assert True\n';
+    const repo = repository(s, { 'tests/test_classed.py': classed });
+    const head = repo.change({
+      'tests/test_classed.py': classed.replace(
+        'class TestTotal:\n',
+        'class TestTotal:\n    pytestmark = pytest.mark.skip\n\n',
+      ),
+    });
+    const { findings } = await testWeakening(head);
+    assert.deepEqual(rules(findings), ['test_skipped:tests/test_classed.py']);
+    assert.match(findings[0].detail, /switched off: "test_total"$/);
+  });
+  await t.test('java: @Disabled on a new method beside an existing one', async s => {
+    const java =
+      'import org.junit.jupiter.api.Test;\n\nclass TotalTest {\n    @Test\n    void subtracts() {\n        assertEquals(1, 2 - 1);\n    }\n}\n';
+    const repo = repository(s, { 'src/test/java/TotalTest.java': java });
+    const head = repo.change({
+      'src/test/java/TotalTest.java': java.replace(
+        '    @Test\n    void subtracts',
+        '    @Disabled("waiting for the new class loader")\n    @Test\n    void fresh() {}\n\n    @Test\n    void subtracts',
+      ),
+    });
+    assert.deepEqual(await weakened(head), []);
+    const disabled = repo.change({
+      'src/test/java/TotalTest.java': java.replace(
+        '    @Test\n    void subtracts',
+        '    @Disabled\n    @Test\n    void subtracts',
+      ),
+    });
+    assert.deepEqual(await weakened(disabled), ['test_skipped:src/test/java/TotalTest.java']);
+  });
+});
