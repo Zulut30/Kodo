@@ -824,6 +824,8 @@ test('Scanning stays linear on input built to make a pattern rescan the file', a
     'tests/slashes.test.mjs': `${header}${one('kept')}const value = 1${' / 2'.repeat(size / 4)};\n`,
     'tests/test_decorated.py': `def test_kept():\n    assert True\n\n\n${'@decorator\n'.repeat(size / 11)}`,
     'src/attrs_test.rs': `#[test]\nfn kept() {}\n${'#[allow(unused)]\n'.repeat(size / 17)}`,
+    'src/test/java/ManyTest.java': `class ManyTest {\n  @Test\n  void kept() {}\n}\n${'@Ignore'.repeat(size / 7)}`,
+    'src/test/java/DenseTest.java': `class DenseTest {\n${'  @Disabled @A @Test void same() {}\n'.repeat(size / 34)}}\n`,
   };
   const repo = repository(t, files);
   const head = repo.change(Object.fromEntries(Object.entries(files).map(([name, text]) => [name, `${text}\n`])));
@@ -907,5 +909,78 @@ test('A skipped newcomer does not switch its neighbours off; list and class mark
       ),
     });
     assert.deepEqual(await weakened(disabled), ['test_skipped:src/test/java/TotalTest.java']);
+  });
+});
+
+test('Annotations and marks are read with their strings and their place', async t => {
+  const java =
+    'import org.junit.jupiter.api.Test;\n\nclass TotalTest {\n    @Test\n    void subtracts() {\n        assertEquals(1, 2 - 1);\n    }\n}\n';
+  for (const [name, change] of [
+    [
+      'java: a reason with a semicolon, braces and parentheses on a method',
+      text => text.replace('    @Test\n', '    @Disabled("flaky; fix {later} (see JIRA-1)")\n    @Test\n'),
+    ],
+    [
+      'java: a reason with parentheses and a comment on a class',
+      text =>
+        text.replace('class TotalTest', '@Disabled("flaky (see JIRA-1)") // until the class is ready\nclass TotalTest'),
+    ],
+  ])
+    await t.test(name, async s => {
+      const repo = repository(s, { 'src/test/java/TotalTest.java': java });
+      const head = repo.change({ 'src/test/java/TotalTest.java': change(java) });
+      assert.deepEqual(await weakened(head), ['test_skipped:src/test/java/TotalTest.java']);
+    });
+  await t.test('kotlin: a disabled newcomer with an expression body', async s => {
+    const kotlin = 'class TotalTest {\n    @Test fun subtracts() = assertEquals(1, 2 - 1)\n}\n';
+    const repo = repository(s, { 'src/test/kotlin/TotalTest.kt': kotlin });
+    const head = repo.change({
+      'src/test/kotlin/TotalTest.kt': kotlin.replace(
+        '    @Test fun subtracts',
+        '    @Disabled("wip") @Test fun fresh() = assertEquals(1, 1)\n    @Test fun subtracts',
+      ),
+    });
+    assert.deepEqual(await weakened(head), []);
+  });
+  await t.test('a new skipped group with a self-closing JSX tag', async s => {
+    const view = `${header}describe('math', () => {\n  test('adds', () => assert.equal(1 + 1, 2));\n});\n`;
+    const repo = repository(s, { 'tests/view.test.tsx': view });
+    const head = repo.change({
+      'tests/view.test.tsx': view.replace(
+        "describe('math'",
+        "describe.skip('wip', () => {\n  test('fresh', () => {\n    render(<App user={user} />);\n  });\n});\ndescribe('math'",
+      ),
+    });
+    assert.deepEqual(await weakened(head), []);
+  });
+  const opens = `${header}test('opens', async ({ page, isMobile }) => {\n  assert.ok(page);\n});\n`;
+  for (const call of ['test.fixme();', "test.skip(!isMobile, 'desktop only');"])
+    await t.test(`a skip call without a name: ${call}`, async s => {
+      const repo = repository(s, { 'tests/page.test.mjs': opens });
+      const head = repo.change({
+        'tests/page.test.mjs': opens.replace('  assert.ok(page);', `  ${call}\n  assert.ok(page);`),
+      });
+      const { findings } = await testWeakening(head);
+      assert.deepEqual(rules(findings), ['test_skipped:tests/page.test.mjs']);
+      assert.match(findings[0].detail, /skip calls inside existing tests 0 -> 1/);
+    });
+  const classed =
+    'import pytest\n\n\nclass TestTotal:\n    def test_total(self):\n        assert True\n\n    def test_empty(self):\n        assert True\n';
+  await t.test('pytestmark at the end of a class body covers the tests above it', async s => {
+    const repo = repository(s, { 'tests/test_classed.py': classed });
+    const head = repo.change({ 'tests/test_classed.py': `${classed}\n    pytestmark = pytest.mark.skip\n` });
+    const { findings } = await testWeakening(head);
+    assert.deepEqual(rules(findings), ['test_skipped:tests/test_classed.py']);
+    assert.match(findings[0].detail, /switched off: "test_total", "test_empty"$/);
+  });
+  await t.test('a variable named pytestmark inside a method marks nothing', async s => {
+    const repo = repository(s, { 'tests/test_classed.py': classed });
+    const head = repo.change({
+      'tests/test_classed.py': classed.replace(
+        '    def test_total(self):\n',
+        '    def test_total(self):\n        pytestmark = compute(skip_list)\n',
+      ),
+    });
+    assert.deepEqual(await weakened(head), []);
   });
 });

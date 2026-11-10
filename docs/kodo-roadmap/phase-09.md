@@ -6,7 +6,7 @@
 
 | Scope из [плана](NEXT-STAGES.md) | Реализация | Проверка |
 | --- | --- | --- |
-| ① policy/head/config identity | `runtime/behavior-gate.mjs`: `classifyChange`, `qualityPolicy`, квитанция с head, базой и хэшем конфигурации, `isCurrentBehaviorReceipt` | `tests/behavior-gate.test.mjs`, 20 тестов (83 с подтестами) |
+| ① policy/head/config identity | `runtime/behavior-gate.mjs`: `classifyChange`, `qualityPolicy`, квитанция с head, базой и хэшем конфигурации, `isCurrentBehaviorReceipt` | `tests/behavior-gate.test.mjs`, 21 тест (92 с подтестами) |
 | ② behavioural/negative fixtures | Защита тестов (`testWeakening`) и оракулы проекта с защищёнными путями | `tests/behavior-gate.test.mjs`; `tests/behavior-engine.test.mjs`, 6 тестов (13 с подтестами) |
 | ③ baseline + repair wiring | `Engine.baseline` до первой правки, `compareWithBaseline`, шаг `behaviorGate` в цикле проверки и ремонта | `tests/behavior-engine.test.mjs` |
 
@@ -77,6 +77,8 @@
 - `pytestmark` списком на нескольких строках, с аннотацией типа и внутри класса не давал находки.
 
 Остальные замечания записаны как границы в `docs/VERIFICATION.md`.
+
+Ревью этих исправлений: FAIL по одной причине. Новое выражение для `@Disabled` над классом было квадратичным: 47 секунд на враждебном входе в 256 КБ. Повторения ограничены, вход добавлен в тест линейности. Заодно исправлено: строки и строчные комментарии в Java и Kotlin не считаются кодом (причина пропуска с `;`, скобками или словом `class` больше не скрывает аннотацию); `} />` в JSX не открывает регулярное выражение; вызов пропуска без имени (`test.fixme()`, `test.skip(!условие, …)`) считается вызовом пропуска; `pytestmark` в теле класса покрывает весь класс, а одноимённая переменная в методе — ничего.
 
 ## Изменённое существующее поведение
 

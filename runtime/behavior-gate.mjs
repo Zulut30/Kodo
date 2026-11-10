@@ -250,7 +250,11 @@ function lastToken() {
       gap = false;
     },
     // Not after `<`: there a slash closes a JSX tag far more often than it opens a regex literal.
-    regexAllowed: () => last === '' || '(,=:[!&|?{};+-*%>~^'.includes(last) || (!dotted && regexKeywords.has(word)),
+    // Nor in `} />`: that ends a JSX tag whose last attribute is an expression.
+    regexAllowed: next =>
+      last === '' ||
+      ('(,=:[!&|?{};+-*%>~^'.includes(last) && !(last === '}' && next === '>')) ||
+      (!dotted && regexKeywords.has(word)),
   };
 }
 
@@ -319,7 +323,7 @@ function templateEnd(source, start) {
       index = quoteEnd(source, index) + 1;
       seen.literal();
     } else if (char === '/' && (next === '/' || next === '*')) index = commentEnd(source, index);
-    else if (char === '/' && seen.regexAllowed()) {
+    else if (char === '/' && seen.regexAllowed(next)) {
       index = regexEnd(source, index) + 1;
       seen.literal();
     } else {
@@ -363,7 +367,7 @@ function scanJs(source) {
       if (next === '*') code += ' ';
     } else if (char === '"' || char === "'") index = literal(index, quoteEnd(source, index));
     else if (char === '`') index = literal(index, templateEnd(source, index));
-    else if (char === '/' && seen.regexAllowed()) index = literal(index, regexEnd(source, index));
+    else if (char === '/' && seen.regexAllowed(next)) index = literal(index, regexEnd(source, index));
     else {
       code += char;
       seen.code(char);
@@ -470,9 +474,14 @@ function jsCases(source) {
     }
     jsName.lastIndex = from;
     const name = jsName.exec(code);
-    if (!name) continue;
+    const switchedOff = match[1] === 'x' || modifiers.some(modifier => jsSkips.has(modifier));
+    if (!name) {
+      // `test.fixme()` or `test.skip(!isMobile, 'why')` inside a body (Playwright): a skip call without a name.
+      if (switchedOff && !group) bodySkips++;
+      continue;
+    }
     const only = modifiers.includes('only'),
-      skipped = match[1] === 'x' || modifiers.some(modifier => jsSkips.has(modifier)) || skipOption.test(name[2] ?? '');
+      skipped = switchedOff || skipOption.test(name[2] ?? '');
     if (only) onlys++;
     if (group) {
       if (skipped && !inside(match.index)) {
@@ -506,7 +515,8 @@ const brackets = text => count(text, /[([{]/g) - count(text, /[)\]}]/g);
 /**
  * Python cases, read line by line. A skip decorator on a class covers the
  * tests in it. `pytestmark` with a skip covers the whole file at module level
- * and the tests that follow it inside a class; it may be a list over several lines.
+ * and the whole class when it stands directly in a class body; it may be a
+ * list over several lines.
  * @param {string} source
  */
 function pythonCases(source) {
@@ -519,8 +529,13 @@ function pythonCases(source) {
     moduleSkip = false;
   const applyMark = () => {
     if (/\b(?:skip\w*|xfail)\b/i.test(mark.text)) {
+      const owner = classes[classes.length - 1];
       if (mark.indent === 0) moduleSkip = true;
-      else if (classes.length) classes[classes.length - 1].skipped = true;
+      else if (owner && owner.body === mark.indent) {
+        // Directly in a class body: the mark covers the class, also the tests above the line.
+        owner.skipped = true;
+        for (let index = owner.from; index < cases.length; index++) cases[index].skipped = true;
+      }
     }
     mark = null;
   };
@@ -538,6 +553,8 @@ function pythonCases(source) {
     }
     const indent = raw.length - raw.trimStart().length;
     while (classes.length && classes[classes.length - 1].indent >= indent) classes.pop();
+    const inner = classes[classes.length - 1];
+    if (inner && inner.body === undefined) inner.body = indent;
     if (text.startsWith('@')) {
       decorators.push(text);
       pending = brackets(text);
@@ -545,7 +562,7 @@ function pythonCases(source) {
     }
     const skipped = decorators.some(line => pySkip.test(line)) || classes.some(item => item.skipped);
     const named = /^(?:async\s+)?def\s+(test\w*)\s*\(/.exec(text);
-    if (/^class\s/.test(text)) classes.push({ indent, skipped });
+    if (/^class\s/.test(text)) classes.push({ indent, skipped, from: cases.length });
     else if (named) cases.push({ name: named[1], skipped });
     else if (/^pytestmark\s*(?::[^=]*)?=/.test(text)) {
       mark = { text, indent };
@@ -583,21 +600,23 @@ function rustCases(source) {
   return cases;
 }
 
-/** `@Disabled` with its arguments, then only annotations and modifiers up to `class` or `object`. */
+/**
+ * `@Disabled` with its arguments, then only annotations and modifiers up to
+ * `class` or `object`. Every repetition is bounded: the scan stays linear.
+ */
 const javaClassOff =
-  /@(?:Disabled|Ignore)\b(?:\s*\([^)\n]{0,300}\))?(?:\s*@\w+(?:\s*\([^)\n]{0,300}\))?|\s+(?:public|protected|private|internal|abstract|final|open|static|sealed|data|inner))*\s+(?:class|object)\b/;
+  /@(?:Disabled|Ignore)\b(?:\s*\([^()\n]{0,300}\))?(?:\s*@[\w.]+(?:\s*\([^()\n]{0,300}\))?|\s+(?:public|protected|private|internal|abstract|final|open|static|sealed|data|inner)){0,20}\s+(?:class|object)\b/;
+/** The annotations that stand directly before a position, with only white space between them. */
+const javaOwn = /(?:@[\w.]+(?:\s*\([^()\n]{0,300}\))?\s*){0,20}$/;
 
 /** Java and Kotlin tests. `@Disabled` on a class is read as covering every test of the file. */
 function javaCases(source) {
-  const classOff = javaClassOff.test(source);
-  // What stands between the previous statement or block and `@Test`: the annotations of this method.
-  const own = index =>
-    source
-      .slice(Math.max(0, index - 300), index)
-      .split(/[;{}]/)
-      .pop();
+  // String contents and line comments are not code: a reason may hold `;`, a brace or the word `class`.
+  const code = source.replace(/"(?:[^"\\\n]|\\.)*"/g, '""').replace(/\/\/[^\n]*/g, '');
+  const classOff = javaClassOff.test(code);
+  const own = index => javaOwn.exec(code.slice(Math.max(0, index - 400), index))[0];
   return [
-    ...source.matchAll(/@(?:Test|ParameterizedTest|RepeatedTest)\b([\s\S]{0,300}?)\b(?:void|fun)\s+(\w+)\s*\(/g),
+    ...code.matchAll(/@(?:Test|ParameterizedTest|RepeatedTest)\b([\s\S]{0,300}?)\b(?:void|fun)\s+(\w+)\s*\(/g),
   ].map(match => ({
     name: match[2],
     skipped: classOff || /@(?:Disabled|Ignore)\b/.test(own(match.index) + match[1]),
