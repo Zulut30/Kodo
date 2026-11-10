@@ -146,15 +146,15 @@ test('A stalled node does not stop an independent one, and the blocker names the
   assert.match(result.blocker.current.code, /^(no_progress|repair_budget_exhausted)$/);
 });
 
-test('A cosmetic change cannot complete a code node when the watchdog rejects it', async t => {
-  const emptyLines = '\n\n',
-    comment = '// reviewed: the value looks right\n',
-    reject = { watchdog: { rejectCosmetic: true } };
+test('A node that changed nothing cannot complete when the watchdog rejects it', async t => {
+  const comment = '// reviewed: the value looks right\n',
+    reject = { watchdog: { rejectUnchanged: true } };
   for (const [name, config, role, text, state] of [
-    ['rejected', reject, 'developer', emptyLines, 'blocked'],
-    ['a comment is not judged: a tool may read it', reject, 'developer', comment, 'succeeded'],
-    ['documentation is not checked', reject, 'documenter', emptyLines, 'succeeded'],
-    ['not rejected unless configured', {}, 'developer', emptyLines, 'succeeded'],
+    ['rejected', reject, 'developer', '', 'blocked'],
+    ['documentation is held to the same rule', reject, 'documenter', '', 'blocked'],
+    ['a comment is a change: a tool may read it', reject, 'developer', comment, 'succeeded'],
+    ['an empty line is a change: a formatter may report it', reject, 'developer', '\n', 'succeeded'],
+    ['not rejected unless configured', {}, 'developer', '', 'succeeded'],
   ])
     await t.test(name, async subtest => {
       const fx = await fixture(subtest, {
@@ -164,7 +164,7 @@ test('A cosmetic change cannot complete a code node when the watchdog rejects it
       const services = fakeServices({
         plan: { summary: 'One change', tasks: [node('change', role, ['src/**'])] },
         onWorker: async call => {
-          await appendFile(path.join(call.cwd, 'src/value.mjs'), text);
+          if (text) await appendFile(path.join(call.cwd, 'src/value.mjs'), text);
           return done;
         },
       });
@@ -172,7 +172,7 @@ test('A cosmetic change cannot complete a code node when the watchdog rejects it
       const result = await engine.run((await engine.create('Change the value', { project: fx.project })).id);
       assert.equal(result.state, state, result.error?.message);
       if (state === 'blocked') {
-        assert.match(result.nodes.change.error, /Только косметические изменения/);
+        assert.match(result.nodes.change.error, /Узел ничего не изменил/);
         assert.equal(services.calls.review.length, 0, 'nothing was accepted or reviewed');
         assert.equal(result.blocker.current.scope, 'change');
       } else assert.equal(result.blocker?.current ?? null, null);
@@ -181,7 +181,7 @@ test('A cosmetic change cannot complete a code node when the watchdog rejects it
 
 test('A real fix after an explicit retry cycle succeeds and leaves no current blocker', async t => {
   const fx = await fixture(t, {
-    config: { repairRounds: 3, researchBudget: 0, watchdog: { stalledRounds: 1, rejectCosmetic: true } },
+    config: { repairRounds: 3, researchBudget: 0, watchdog: { stalledRounds: 1, rejectUnchanged: true } },
     testScript:
       "import { value } from './src/value.mjs';\nif (value !== 3) { console.error('value is ' + value + ' at ' + process.hrtime.bigint()); process.exit(1); }\n",
   });

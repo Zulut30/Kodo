@@ -1,17 +1,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { buildProgress } from '../runtime/progress.mjs';
 import {
-  cosmeticOnly,
   normalizeWatchdogConfig,
   observeRun,
   recordBlocker,
   resetWatchdog,
   resolveBlocker,
+  unchanged,
   verifiedProgress,
   watchdogStep,
 } from '../runtime/watchdog.mjs';
@@ -244,8 +244,8 @@ test('The recovery summary shows the current blocker and never presents an older
   );
 });
 
-test('Only a certain cosmetic change is cosmetic; whatever cannot be judged safely is real work', async t => {
-  const cwd = mkdtempSync(path.join(os.tmpdir(), 'kodo-cosmetic-'));
+test('A node is unchanged only when its staged tree equals the base; any difference is work', async t => {
+  const cwd = mkdtempSync(path.join(os.tmpdir(), 'kodo-unchanged-'));
   t.after(() => rmSync(cwd, { recursive: true, force: true }));
   const git = (...args) => {
     const result = spawnSync('git', args, { cwd, encoding: 'utf8', windowsHide: true });
@@ -254,36 +254,16 @@ test('Only a certain cosmetic change is cosmetic; whatever cannot be judged safe
   };
   const files = {
     'math.mjs': 'export function add(a, b) {\n  // sum\n  return a + b;\n}\n',
-    'spaced.mjs': 'export const first = 1;\n\nexport const second = 2;\n',
-    'crlf.mjs': 'export const first = 1;\r\nexport const second = 2;\r\n',
-    'counter.mjs': 'export class Counter {\n  #count = 0;\n  *each() {\n    yield this.#count;\n  }\n}\n',
-    'template.mjs': 'export const prompt = `\n// Role: reviewer\nBe strict.\n`;\n',
-    'area.mjs': 'export const area = (width, height) =>\n  width\n  * height;\n',
-    'toggle.mjs': 'export function start() {}\n/*\nstart();\n*/\n',
-    'application.js': '//= require cart\nstart();\n',
-    // The long path segment looks like a credential to output redaction.
-    'src/task-management-service/handler.mjs': 'export const limit = 1;\n',
-    'view.tsx': 'export const View = () => (\n  <p>\n    // shown to the user\n  </p>\n);\n',
-    'total.py':
-      'def total(items):\n    result = 0\n    for item in items:\n        result += item\n        return result\n',
-    'prompt.py': 'PROMPT = """\n# Role\nBe strict.\n"""\n',
-    'continued.py': 'TOTAL = 1 + \\\n    2\n',
-    'run.sh': '#!/bin/sh\n# start\nnode app.mjs \\\n  --port 80\n',
-    'deploy.yml': 'steps:\n  # build first\n  - run: build\n',
-    'theme.css': '/* palette */\n* { box-sizing: border-box; }\n',
-    'query.sql': '-- totals\nSELECT 1;\n',
-    'pointer.c': 'void set(int *ptr) {\n  *ptr = 1;\n}\n',
-    'blob.mjs': 'export const data = "\u0000\u0001";\n',
-    // A name whose "extension" is a property of every object.
-    'data.constructor': 'value\n',
+    'spaced.mjs': 'export const first = 1;\n\n\nexport const second = 2;\n',
+    'cli.js': "\n#!/usr/bin/env node\nconsole.log('ok');\n",
+    // One byte outside UTF-8: read as text, both versions would look the same.
+    'label.js': Buffer.from("export const label = 'café';\n", 'latin1'),
   };
-  for (const [name, content] of Object.entries(files)) {
-    mkdirSync(path.dirname(path.join(cwd, name)), { recursive: true });
-    writeFileSync(path.join(cwd, name), content);
-  }
+  const write = (name, content) => writeFileSync(path.join(cwd, name), content);
+  for (const [name, content] of Object.entries(files)) write(name, content);
   git('init', '-b', 'main');
-  git('config', 'user.name', 'Cosmetic Test');
-  git('config', 'user.email', 'cosmetic@example.invalid');
+  git('config', 'user.name', 'Unchanged Test');
+  git('config', 'user.email', 'unchanged@example.invalid');
   git('config', 'core.autocrlf', 'false');
   git('add', '.');
   git('commit', '-m', 'Base');
@@ -292,99 +272,43 @@ test('Only a certain cosmetic change is cosmetic; whatever cannot be judged safe
     git('reset', '-q', '--hard', base);
     git('clean', '-qfd');
   };
-  assert.equal(await cosmeticOnly(cwd, base), true, 'no change at all');
-  const edit = (name, change) => [name, files[name], change];
-  const emptyLine = text => `${text}\n`;
-  for (const [label, [name, content, change], expected] of [
-    // Certainly cosmetic: only empty lines differ.
-    ['js empty lines added', edit('math.mjs', text => `\n${text.replace('  return', '\n  return')}\n`), true],
-    ['js empty line removed', edit('spaced.mjs', text => text.replace('\n\n', '\n')), true],
-    ['python empty line', edit('total.py', text => text.replace('result = 0\n', 'result = 0\n\n')), true],
-    ['empty line in a CRLF file', edit('crlf.mjs', text => text.replace('1;\r\n', '1;\r\n\r\n')), true],
-    // Real behaviour.
-    ['behaviour', edit('math.mjs', text => text.replace('a + b', 'a - b')), false],
-    ['empty line plus behaviour', edit('math.mjs', text => `\n${text.replace('a + b', 'b + a')}`), false],
-    ['python indentation', edit('total.py', text => text.replace('        return', '    return')), false],
-    ['js indentation', edit('math.mjs', text => text.replace('  return', '      return')), false],
-    ['private field', edit('counter.mjs', text => text.replace('#count = 0', '#count = 1')), false],
-    ['generator', edit('counter.mjs', text => text.replace('*each() {', '*every() {')), false],
-    ['operator at line start', edit('area.mjs', text => text.replace('* height', '* (height + 1)')), false],
-    ['decrement removed', edit('math.mjs', text => text.replace('  return a + b;', '  -- a;\n  return a + b;')), false],
+  assert.equal(await unchanged(cwd, base), true, 'no change at all');
+  write('math.mjs', files['math.mjs']);
+  assert.equal(await unchanged(cwd, base), true, 'a file rewritten with the same content');
+  const edit = (name, change) => () => write(name, change(files[name]));
+  for (const [label, change] of [
+    ['behaviour', edit('math.mjs', text => text.replace('a + b', 'a - b'))],
+    ['a comment a security scanner reads', edit('math.mjs', text => text.replace('// sum', '// nosemgrep: audit'))],
+    ['a comment that only explains', edit('math.mjs', text => `// analysis: looks correct\n${text}`)],
+    ['an empty line a formatter reports', edit('spaced.mjs', text => text.replace('\n\n\n', '\n\n'))],
+    ['an empty line before a hashbang', edit('cli.js', text => text.slice(1))],
+    ['a byte outside UTF-8', () => write('label.js', Buffer.from("export const label = 'cafè';\n", 'latin1'))],
+    ['trailing spaces', edit('math.mjs', text => text.replace('a + b;', 'a + b;   '))],
+    ['line ends', edit('math.mjs', text => text.replaceAll('\n', '\r\n'))],
+    ['a new empty file', () => write('__init__.py', '')],
+    ['a rename', () => git('mv', 'math.mjs', 'sum.mjs')],
+    ['a deleted file', () => git('rm', '-q', 'cli.js')],
     [
-      'redacted-looking path',
-      edit('src/task-management-service/handler.mjs', text => text.replace('= 1', '= 2')),
-      false,
+      // Both ways of recording an executable bit: the index where Git ignores file modes, the file elsewhere.
+      'a mode change',
+      () => {
+        git('update-index', '--chmod=+x', 'math.mjs');
+        chmodSync(path.join(cwd, 'math.mjs'), 0o755);
+      },
     ],
-    // Comments are never judged: a tool may read them.
-    ['js line comment added', edit('math.mjs', text => `// analysis: looks correct\n${text}`), false],
-    ['js line comment reworded', edit('math.mjs', text => text.replace('// sum', '// the sum of both')), false],
-    ['python line comment', edit('total.py', text => `# reviewed\n${text}`), false],
-    ['block comment', edit('math.mjs', text => `/*\n * notes\n */\n${text}`), false],
-    ['uncommenting a block', edit('toggle.mjs', text => text.replace('/*\n', '').replace('*/\n', '')), false],
-    [
-      'lint suppression',
-      edit('math.mjs', text => text.replace('// sum', '// eslint-disable-next-line no-undef')),
-      false,
-    ],
-    [
-      'security scanner suppression',
-      edit('math.mjs', text => text.replace('// sum', '// nosemgrep: javascript.lang.security.audit')),
-      false,
-    ],
-    ['type checker directive', edit('total.py', text => `# pyright: basic\n${text}`), false],
-    [
-      'bundler directive',
-      edit('application.js', text => text.replace('cart\n', 'cart\n//= require payments\n')),
-      false,
-    ],
-    // An empty line that is, or may be, content.
-    ['empty line in a template literal', edit('template.mjs', text => text.replace('strict.\n', 'strict.\n\n')), false],
-    ['empty line in a python string', edit('prompt.py', text => text.replace('strict.\n', 'strict.\n\n')), false],
-    ['empty line after a continued line', edit('continued.py', text => text.replace('\\\n', '\\\n\n')), false],
-    ['empty line beside a template literal', edit('template.mjs', emptyLine), false],
-    ['empty line in a file with a NUL', edit('blob.mjs', emptyLine), false],
-    // Whitespace that is not an empty line.
-    ['trailing spaces', edit('math.mjs', text => text.replace('a + b;', 'a + b;   ')), false],
-    ['whitespace-only line', edit('math.mjs', text => text.replace('  // sum\n', '  // sum\n   \n')), false],
-    ['line endings', edit('math.mjs', text => text.replaceAll('\n', '\r\n')), false],
-    ['final line end removed', edit('math.mjs', text => text.slice(0, -1)), false],
-    // File types that are never judged.
-    ['empty line in jsx', edit('view.tsx', emptyLine), false],
-    ['empty line in css', edit('theme.css', emptyLine), false],
-    ['empty line in yaml', edit('deploy.yml', emptyLine), false],
-    ['empty line in shell', edit('run.sh', emptyLine), false],
-    ['empty line in sql', edit('query.sql', emptyLine), false],
-    ['empty line in c', edit('pointer.c', emptyLine), false],
-    ['empty line in a file named like an object property', edit('data.constructor', emptyLine), false],
   ]) {
-    writeFileSync(path.join(cwd, name), change(content));
-    assert.equal(await cosmeticOnly(cwd, base), expected, label);
+    change();
+    assert.equal(await unchanged(cwd, base), false, label);
     reset();
   }
-  writeFileSync(path.join(cwd, 'new.mjs'), 'export const value = 1;\n');
-  assert.equal(await cosmeticOnly(cwd, base), false, 'a new file with code');
-  reset();
-  writeFileSync(path.join(cwd, '__init__.py'), '');
-  assert.equal(await cosmeticOnly(cwd, base), false, 'a new empty file is a real change');
-  reset();
-  git('mv', 'math.mjs', 'sum.mjs');
-  assert.equal(await cosmeticOnly(cwd, base), false, 'a rename');
-  reset();
-  git('rm', '-q', 'pointer.c');
-  assert.equal(await cosmeticOnly(cwd, base), false, 'a deleted file');
-  reset();
-  // Both ways of recording an executable bit: the index where Git ignores file modes, the file elsewhere.
-  git('update-index', '--chmod=+x', 'math.mjs');
-  chmodSync(path.join(cwd, 'math.mjs'), 0o755);
-  assert.equal(await cosmeticOnly(cwd, base), false, 'a mode change');
-  reset();
+  assert.equal(await unchanged(cwd, '0'.repeat(40)), false, 'a base that cannot be read is not "unchanged"');
 });
 
 test('The watchdog block is optional, bounded and strict about keys', () => {
-  assert.deepEqual(normalizeWatchdogConfig(), { stalledRounds: null, rejectCosmetic: false });
-  assert.deepEqual(normalizeWatchdogConfig({ stalledRounds: 2, rejectCosmetic: true }), {
+  assert.deepEqual(normalizeWatchdogConfig(), { stalledRounds: null, rejectUnchanged: false });
+  assert.deepEqual(normalizeWatchdogConfig({ stalledRounds: 2, rejectUnchanged: true }), {
     stalledRounds: 2,
-    rejectCosmetic: true,
+    rejectUnchanged: true,
   });
   assert.equal(normalizeWatchdogConfig({ stalledRounds: null }).stalledRounds, null);
   for (const bad of [
@@ -393,7 +317,8 @@ test('The watchdog block is optional, bounded and strict about keys', () => {
     { stalledRounds: 0 },
     { stalledRounds: 6 },
     { stalledRounds: 1.5 },
-    { rejectCosmetic: 1 },
+    { rejectUnchanged: 1 },
+    { rejectCosmetic: true },
     { rounds: 2 },
   ])
     assert.throws(

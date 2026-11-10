@@ -17,7 +17,7 @@ const hash = value => createHash('sha256').update(value).digest('hex');
 /**
  * @typedef {object} WatchdogConfig
  * @property {number | null} stalledRounds Consecutive repair rounds without verified progress before the run stops; null disables the rule.
- * @property {boolean} rejectCosmetic A code or test node that changed nothing but empty lines is not complete.
+ * @property {boolean} rejectUnchanged A node that changed nothing is not complete.
  */
 
 /**
@@ -28,12 +28,12 @@ export function normalizeWatchdogConfig(value = undefined) {
   const input = /** @type {Record<string, any>} */ (value === undefined ? {} : value);
   const invalid = () => Object.assign(new Error('Некорректная конфигурация Kodo: watchdog'), { code: 'configuration' });
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw invalid();
-  for (const key of Object.keys(input)) if (!['stalledRounds', 'rejectCosmetic'].includes(key)) throw invalid();
+  for (const key of Object.keys(input)) if (!['stalledRounds', 'rejectUnchanged'].includes(key)) throw invalid();
   const rounds = input.stalledRounds;
   if (rounds !== undefined && rounds !== null && !(Number.isSafeInteger(rounds) && rounds >= 1 && rounds <= 5))
     throw invalid();
-  if (input.rejectCosmetic !== undefined && typeof input.rejectCosmetic !== 'boolean') throw invalid();
-  return { stalledRounds: rounds ?? null, rejectCosmetic: input.rejectCosmetic ?? false };
+  if (input.rejectUnchanged !== undefined && typeof input.rejectUnchanged !== 'boolean') throw invalid();
+  return { stalledRounds: rounds ?? null, rejectUnchanged: input.rejectUnchanged ?? false };
 }
 
 /**
@@ -198,69 +198,23 @@ export function resolveBlocker(blockers, { at, outcome }) {
 }
 
 /**
- * Files in which an empty line is certainly not content: plain JS/TS and Python. A file is still
- * not judged when it has a construct that carries text over a line end: a template literal
- * (backtick), a triple-quoted string, or a line continued with a backslash.
- */
-const blankSafe = new Map([['py', /"""|'''|\\\r?\n/]]);
-for (const ext of 'js mjs cjs ts mts cts'.split(' ')) blankSafe.set(ext, /`|\\\r?\n/);
-const MAX_COSMETIC_FILES = 20;
-const MAX_COSMETIC_BYTES = 1048576;
-const withoutEmptyLines = text =>
-  text
-    .split('\n')
-    .filter(line => line !== '' && line !== '\r')
-    .join('\n');
-
-/** Git output as it is: a redacted path or line would no longer be the path or the line. */
-const gitRaw = async (cwd, args) =>
-  (await execute('git', ['--literal-pathspecs', ...args], { cwd, rawOutput: true, allowFailure: true })).stdout;
-
-/** One side of a file when it can be judged, otherwise null. The size is read first: a large blob is never loaded. */
-async function judgedContent(cwd, revision, unsafe) {
-  const size = Number((await gitRaw(cwd, ['cat-file', '-s', revision])).trim());
-  if (!(size > 0 && size <= MAX_COSMETIC_BYTES)) return null;
-  const content = await gitRaw(cwd, ['show', revision]);
-  return !content || content.includes('\0') || unsafe.test(content) ? null : content;
-}
-
-/**
- * True only when the staged change against `baseSha` is certainly cosmetic:
- * nothing changed, or the modified files differ only by empty lines, in files
- * where an empty line cannot be content. Everything else counts as real work,
- * and that includes whatever this function cannot judge: comments (a comment
- * may be a directive that a linter, a type checker, a bundler or a security
- * scanner reads), added, deleted or renamed files, mode changes, binary files,
- * indentation, trailing whitespace, line ends, other file types.
- * It may miss a cosmetic change; it must not call real work cosmetic.
+ * True only when the node changed nothing: the staged tree equals `baseSha`.
+ *
+ * Nothing narrower is judged. Whether a change is "only cosmetic" cannot be
+ * told from its text: a comment may be a directive that a linter, a type
+ * checker, a bundler or a security scanner reads; an empty line changes what a
+ * formatter reports and where a hashbang or an encoding declaration stands; a
+ * byte outside UTF-8 is lost when a diff is read as text. Such a change is
+ * work, and the checks and the review judge it.
  * @param {string} cwd
  * @param {string} baseSha
  */
-export async function cosmeticOnly(cwd, baseSha) {
+export async function unchanged(cwd, baseSha) {
   await execute('git', ['add', '-A'], { cwd });
-  try {
-    const base = ['diff', '--cached', '--no-color', '--no-ext-diff', '--no-renames'];
-    const status = (await gitRaw(cwd, [...base, '--name-status', '-z', baseSha, '--'])).split('\0').filter(Boolean);
-    if (!status.length) return true;
-    const files = [];
-    for (let index = 0; index < status.length; index += 2) {
-      if (status[index] !== 'M') return false;
-      files.push(status[index + 1]);
-    }
-    if (files.length > MAX_COSMETIC_FILES) return false;
-    if (/^ mode change /m.test(await gitRaw(cwd, [...base, '--summary', baseSha, '--']))) return false;
-    for (const file of files) {
-      const unsafe = blankSafe.get(file.slice(file.lastIndexOf('.') + 1).toLowerCase());
-      if (!unsafe) return false;
-      const before = await judgedContent(cwd, `${baseSha}:${file}`, unsafe),
-        after = await judgedContent(cwd, `:${file}`, unsafe);
-      if (before === null || after === null) return false;
-      if (before.endsWith('\n') !== after.endsWith('\n')) return false;
-      if (withoutEmptyLines(before) !== withoutEmptyLines(after)) return false;
-    }
-    return true;
-  } catch {
-    // What could not be judged is real work.
-    return false;
-  }
+  // Exit 0: no difference. Exit 1: a difference. Anything else is an error, and an error is not "unchanged".
+  const result = await execute('git', ['diff', '--cached', '--quiet', '--no-ext-diff', baseSha, '--'], {
+    cwd,
+    allowFailure: true,
+  });
+  return result.code === 0;
 }

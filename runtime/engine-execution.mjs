@@ -9,7 +9,7 @@ import { git, makeWorktree, changedFiles, commitChanges } from './workspace.mjs'
 import { taskContract } from './task-context.mjs';
 import { runReadyQueue } from './task-scheduler.mjs';
 import { executeDurableTasks } from './engine-jobs.mjs';
-import { cosmeticOnly, normalizeWatchdogConfig } from './watchdog.mjs';
+import { normalizeWatchdogConfig, unchanged } from './watchdog.mjs';
 import { EnginePlanning } from './engine-planning.mjs';
 import { contentHash, evidencePrompt, lstatSafe } from './engine-core.mjs';
 
@@ -244,12 +244,8 @@ export class EngineExecution extends EnginePlanning {
         node.result = validate(resultSchema, result.output);
         if (!node.result.complete) throw new Error(`Исполнитель не завершил задачу: ${node.result.summary}`);
         node.changedFiles = await this.checkScope(node.cwd, node.baseSha, task.writePaths);
-        if (
-          task.role !== 'documenter' &&
-          normalizeWatchdogConfig(run.config.watchdog).rejectCosmetic &&
-          (await cosmeticOnly(node.cwd, node.baseSha))
-        )
-          throw new Error('Только косметические изменения: узел не изменил ничего, кроме пустых строк');
+        if (normalizeWatchdogConfig(run.config.watchdog).rejectUnchanged && (await unchanged(node.cwd, node.baseSha)))
+          throw new Error('Узел ничего не изменил: его рабочее дерево совпадает с базой');
         node.headSha = await commitChanges(node.cwd, `Kodo ${task.id}: ${run.task.slice(0, 100)}`);
         node.status = 'completed';
         delete node.error;
