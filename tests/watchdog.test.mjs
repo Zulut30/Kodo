@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { buildProgress } from '../runtime/progress.mjs';
@@ -254,22 +254,28 @@ test('Only a certain cosmetic change is cosmetic; whatever cannot be judged safe
   };
   const files = {
     'math.mjs': 'export function add(a, b) {\n  // sum\n  return a + b;\n}\n',
+    'spaced.mjs': 'export const first = 1;\n\nexport const second = 2;\n',
+    'crlf.mjs': 'export const first = 1;\r\nexport const second = 2;\r\n',
     'counter.mjs': 'export class Counter {\n  #count = 0;\n  *each() {\n    yield this.#count;\n  }\n}\n',
     'template.mjs': 'export const prompt = `\n// Role: reviewer\nBe strict.\n`;\n',
     'area.mjs': 'export const area = (width, height) =>\n  width\n  * height;\n',
     'toggle.mjs': 'export function start() {}\n/*\nstart();\n*/\n',
+    'application.js': '//= require cart\nstart();\n',
     // The long path segment looks like a credential to output redaction.
     'src/task-management-service/handler.mjs': 'export const limit = 1;\n',
     'view.tsx': 'export const View = () => (\n  <p>\n    // shown to the user\n  </p>\n);\n',
     'total.py':
       'def total(items):\n    result = 0\n    for item in items:\n        result += item\n        return result\n',
     'prompt.py': 'PROMPT = """\n# Role\nBe strict.\n"""\n',
+    'continued.py': 'TOTAL = 1 + \\\n    2\n',
     'run.sh': '#!/bin/sh\n# start\nnode app.mjs \\\n  --port 80\n',
     'deploy.yml': 'steps:\n  # build first\n  - run: build\n',
     'theme.css': '/* palette */\n* { box-sizing: border-box; }\n',
     'query.sql': '-- totals\nSELECT 1;\n',
     'pointer.c': 'void set(int *ptr) {\n  *ptr = 1;\n}\n',
     'blob.mjs': 'export const data = "\u0000\u0001";\n',
+    // A name whose "extension" is a property of every object.
+    'data.constructor': 'value\n',
   };
   for (const [name, content] of Object.entries(files)) {
     mkdirSync(path.dirname(path.join(cwd, name)), { recursive: true });
@@ -288,15 +294,16 @@ test('Only a certain cosmetic change is cosmetic; whatever cannot be judged safe
   };
   assert.equal(await cosmeticOnly(cwd, base), true, 'no change at all');
   const edit = (name, change) => [name, files[name], change];
+  const emptyLine = text => `${text}\n`;
   for (const [label, [name, content, change], expected] of [
-    // Certainly cosmetic.
-    ['js line comment added', edit('math.mjs', text => `// analysis: looks correct\n${text}`), true],
-    ['js line comment reworded', edit('math.mjs', text => text.replace('// sum', '// the sum of both')), true],
-    ['js empty lines', edit('math.mjs', text => `\n${text}\n`), true],
-    ['python line comment', edit('total.py', text => `# reviewed\n${text}`), true],
+    // Certainly cosmetic: only empty lines differ.
+    ['js empty lines added', edit('math.mjs', text => `\n${text.replace('  return', '\n  return')}\n`), true],
+    ['js empty line removed', edit('spaced.mjs', text => text.replace('\n\n', '\n')), true],
+    ['python empty line', edit('total.py', text => text.replace('result = 0\n', 'result = 0\n\n')), true],
+    ['empty line in a CRLF file', edit('crlf.mjs', text => text.replace('1;\r\n', '1;\r\n\r\n')), true],
     // Real behaviour.
     ['behaviour', edit('math.mjs', text => text.replace('a + b', 'a - b')), false],
-    ['comment plus behaviour', edit('math.mjs', text => `// fix\n${text.replace('a + b', 'b + a')}`), false],
+    ['empty line plus behaviour', edit('math.mjs', text => `\n${text.replace('a + b', 'b + a')}`), false],
     ['python indentation', edit('total.py', text => text.replace('        return', '    return')), false],
     ['js indentation', edit('math.mjs', text => text.replace('  return', '      return')), false],
     ['private field', edit('counter.mjs', text => text.replace('#count = 0', '#count = 1')), false],
@@ -308,41 +315,47 @@ test('Only a certain cosmetic change is cosmetic; whatever cannot be judged safe
       edit('src/task-management-service/handler.mjs', text => text.replace('= 1', '= 2')),
       false,
     ],
-    // Comment-looking text that is not a comment, or that a tool reads.
-    [
-      'comment-like line in a template literal',
-      edit('template.mjs', text => text.replace('Role: reviewer', 'Role: author')),
-      false,
-    ],
-    ['comment added to a file with a template literal', edit('template.mjs', text => `// note\n${text}`), false],
-    ['comment-like line in a python string', edit('prompt.py', text => text.replace('# Role', '# Persona')), false],
-    ['jsx text', edit('view.tsx', text => text.replace('// shown to the user', '// shown to everyone')), false],
-    ['uncommenting a block', edit('toggle.mjs', text => text.replace('/*\n', '').replace('*/\n', '')), false],
+    // Comments are never judged: a tool may read them.
+    ['js line comment added', edit('math.mjs', text => `// analysis: looks correct\n${text}`), false],
+    ['js line comment reworded', edit('math.mjs', text => text.replace('// sum', '// the sum of both')), false],
+    ['python line comment', edit('total.py', text => `# reviewed\n${text}`), false],
     ['block comment', edit('math.mjs', text => `/*\n * notes\n */\n${text}`), false],
+    ['uncommenting a block', edit('toggle.mjs', text => text.replace('/*\n', '').replace('*/\n', '')), false],
     [
-      'code after a block comment',
-      edit('math.mjs', text => text.replace('  return a + b;', '  /* note */ return a - b;')),
-      false,
-    ],
-    [
-      'suppression directive',
+      'lint suppression',
       edit('math.mjs', text => text.replace('// sum', '// eslint-disable-next-line no-undef')),
       false,
     ],
-    ['type directive', edit('math.mjs', text => text.replace('// sum', '// @ts-expect-error')), false],
-    ['python type directive', edit('total.py', text => `# type: ignore\n${text}`), false],
+    [
+      'security scanner suppression',
+      edit('math.mjs', text => text.replace('// sum', '// nosemgrep: javascript.lang.security.audit')),
+      false,
+    ],
+    ['type checker directive', edit('total.py', text => `# pyright: basic\n${text}`), false],
+    [
+      'bundler directive',
+      edit('application.js', text => text.replace('cart\n', 'cart\n//= require payments\n')),
+      false,
+    ],
+    // An empty line that is, or may be, content.
+    ['empty line in a template literal', edit('template.mjs', text => text.replace('strict.\n', 'strict.\n\n')), false],
+    ['empty line in a python string', edit('prompt.py', text => text.replace('strict.\n', 'strict.\n\n')), false],
+    ['empty line after a continued line', edit('continued.py', text => text.replace('\\\n', '\\\n\n')), false],
+    ['empty line beside a template literal', edit('template.mjs', emptyLine), false],
+    ['empty line in a file with a NUL', edit('blob.mjs', emptyLine), false],
+    // Whitespace that is not an empty line.
     ['trailing spaces', edit('math.mjs', text => text.replace('a + b;', 'a + b;   ')), false],
     ['whitespace-only line', edit('math.mjs', text => text.replace('  // sum\n', '  // sum\n   \n')), false],
     ['line endings', edit('math.mjs', text => text.replaceAll('\n', '\r\n')), false],
+    ['final line end removed', edit('math.mjs', text => text.slice(0, -1)), false],
     // File types that are never judged.
-    ['css universal selector', edit('theme.css', text => text.replace('border-box', 'content-box')), false],
-    ['css comment', edit('theme.css', text => text.replace('palette', 'colours')), false],
-    ['yaml comment', edit('deploy.yml', text => text.replace('# build first', '# build before test')), false],
-    ['shell comment', edit('run.sh', text => text.replace('# start', '# launch')), false],
-    ['shebang', edit('run.sh', text => text.replace('#!/bin/sh', '#!/bin/bash')), false],
-    ['sql comment', edit('query.sql', text => text.replace('-- totals', '-- sums')), false],
-    ['c pointer write', edit('pointer.c', text => text.replace('*ptr = 1;', '*ptr = 2;')), false],
-    ['binary content', edit('blob.mjs', text => text.replace('\u0001', '\u0002')), false],
+    ['empty line in jsx', edit('view.tsx', emptyLine), false],
+    ['empty line in css', edit('theme.css', emptyLine), false],
+    ['empty line in yaml', edit('deploy.yml', emptyLine), false],
+    ['empty line in shell', edit('run.sh', emptyLine), false],
+    ['empty line in sql', edit('query.sql', emptyLine), false],
+    ['empty line in c', edit('pointer.c', emptyLine), false],
+    ['empty line in a file named like an object property', edit('data.constructor', emptyLine), false],
   ]) {
     writeFileSync(path.join(cwd, name), change(content));
     assert.equal(await cosmeticOnly(cwd, base), expected, label);
@@ -354,18 +367,17 @@ test('Only a certain cosmetic change is cosmetic; whatever cannot be judged safe
   writeFileSync(path.join(cwd, '__init__.py'), '');
   assert.equal(await cosmeticOnly(cwd, base), false, 'a new empty file is a real change');
   reset();
-  writeFileSync(path.join(cwd, 'notes.mjs'), '// only a note\n');
-  assert.equal(await cosmeticOnly(cwd, base), false, 'an added file is never judged cosmetic');
-  reset();
   git('mv', 'math.mjs', 'sum.mjs');
   assert.equal(await cosmeticOnly(cwd, base), false, 'a rename');
   reset();
   git('rm', '-q', 'pointer.c');
   assert.equal(await cosmeticOnly(cwd, base), false, 'a deleted file');
   reset();
+  // Both ways of recording an executable bit: the index where Git ignores file modes, the file elsewhere.
   git('update-index', '--chmod=+x', 'math.mjs');
+  chmodSync(path.join(cwd, 'math.mjs'), 0o755);
   assert.equal(await cosmeticOnly(cwd, base), false, 'a mode change');
-  git('update-index', '--chmod=-x', 'math.mjs');
+  reset();
 });
 
 test('The watchdog block is optional, bounded and strict about keys', () => {

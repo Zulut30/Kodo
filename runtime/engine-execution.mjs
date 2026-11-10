@@ -249,7 +249,7 @@ export class EngineExecution extends EnginePlanning {
           normalizeWatchdogConfig(run.config.watchdog).rejectCosmetic &&
           (await cosmeticOnly(node.cwd, node.baseSha))
         )
-          throw new Error('Только косметические изменения: по существу не изменилась ни одна строка кода или теста');
+          throw new Error('Только косметические изменения: узел не изменил ничего, кроме пустых строк');
         node.headSha = await commitChanges(node.cwd, `Kodo ${task.id}: ${run.task.slice(0, 100)}`);
         node.status = 'completed';
         delete node.error;

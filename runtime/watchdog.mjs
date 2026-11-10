@@ -17,7 +17,7 @@ const hash = value => createHash('sha256').update(value).digest('hex');
 /**
  * @typedef {object} WatchdogConfig
  * @property {number | null} stalledRounds Consecutive repair rounds without verified progress before the run stops; null disables the rule.
- * @property {boolean} rejectCosmetic A code or test node that changed only comments and whitespace is not complete.
+ * @property {boolean} rejectCosmetic A code or test node that changed nothing but empty lines is not complete.
  */
 
 /**
@@ -198,73 +198,69 @@ export function resolveBlocker(blockers, { at, outcome }) {
 }
 
 /**
- * The only files judged: plain JS/TS and Python. A line comment there is a comment unless the file
- * has a construct in which a line starting with the marker can be text: a template literal
- * (backtick) in JS/TS, a triple-quoted string in Python. JSX, shell, YAML, CSS and every other
- * type are never judged: block comments, heredocs and block scalars need a parser.
+ * Files in which an empty line is certainly not content: plain JS/TS and Python. A file is still
+ * not judged when it has a construct that carries text over a line end: a template literal
+ * (backtick), a triple-quoted string, or a line continued with a backslash.
  */
-const judged = {
-  ...Object.fromEntries('js mjs cjs ts mts cts'.split(' ').map(ext => [ext, { comment: /^\s*\/\/(.*)$/, text: /`/ }])),
-  py: { comment: /^\s*#(.*)$/, text: /"""|'''/ },
-};
-/** Comments that tools read: suppressions, build tags, source maps, encodings, shebangs, doc tests. */
-const directive =
-  /^\s*(?:[@#!/]|[\w.-]+-(?:ignore|disable|enable|expect|lint)\b|(?:eslint|oxlint|prettier|istanbul|c8|v8|jest|vitest|stryker|biome|deno|jshint|tslint|webpack|sourceMappingURL|noqa|pragma|pylint|mypy|type|fmt|isort|flake8|ruff|coding|frozen_string_literal)\b)/i;
+const blankSafe = new Map([['py', /"""|'''|\\\r?\n/]]);
+for (const ext of 'js mjs cjs ts mts cts'.split(' ')) blankSafe.set(ext, /`|\\\r?\n/);
 const MAX_COSMETIC_FILES = 20;
 const MAX_COSMETIC_BYTES = 1048576;
+const withoutEmptyLines = text =>
+  text
+    .split('\n')
+    .filter(line => line !== '' && line !== '\r')
+    .join('\n');
 
 /** Git output as it is: a redacted path or line would no longer be the path or the line. */
 const gitRaw = async (cwd, args) =>
   (await execute('git', ['--literal-pathspecs', ...args], { cwd, rawOutput: true, allowFailure: true })).stdout;
 
+/** One side of a file when it can be judged, otherwise null. The size is read first: a large blob is never loaded. */
+async function judgedContent(cwd, revision, unsafe) {
+  const size = Number((await gitRaw(cwd, ['cat-file', '-s', revision])).trim());
+  if (!(size > 0 && size <= MAX_COSMETIC_BYTES)) return null;
+  const content = await gitRaw(cwd, ['show', revision]);
+  return !content || content.includes('\0') || unsafe.test(content) ? null : content;
+}
+
 /**
  * True only when the staged change against `baseSha` is certainly cosmetic:
- * nothing changed, or every changed line of every modified file is blank or a
- * plain line comment in a file where that judgement is safe. Everything else
- * counts as real work, and that includes whatever this function cannot judge:
- * added, deleted or renamed files, mode changes, binary files, indentation and
- * trailing whitespace, other file types, block comments, tool directives.
+ * nothing changed, or the modified files differ only by empty lines, in files
+ * where an empty line cannot be content. Everything else counts as real work,
+ * and that includes whatever this function cannot judge: comments (a comment
+ * may be a directive that a linter, a type checker, a bundler or a security
+ * scanner reads), added, deleted or renamed files, mode changes, binary files,
+ * indentation, trailing whitespace, line ends, other file types.
  * It may miss a cosmetic change; it must not call real work cosmetic.
  * @param {string} cwd
  * @param {string} baseSha
  */
 export async function cosmeticOnly(cwd, baseSha) {
   await execute('git', ['add', '-A'], { cwd });
-  const base = ['diff', '--cached', '--no-color', '--no-ext-diff', '--no-renames'];
-  const status = (await gitRaw(cwd, [...base, '--name-status', '-z', baseSha, '--'])).split('\0').filter(Boolean);
-  if (!status.length) return true;
-  const files = [];
-  for (let index = 0; index < status.length; index += 2) {
-    if (status[index] !== 'M') return false;
-    files.push(status[index + 1]);
-  }
-  if (files.length > MAX_COSMETIC_FILES) return false;
-  if (/^ mode change /m.test(await gitRaw(cwd, [...base, '--summary', baseSha, '--']))) return false;
-  for (const file of files) {
-    const syntax = judged[file.slice(file.lastIndexOf('.') + 1).toLowerCase()];
-    if (!syntax) return false;
-    // Both sides of the file must be free of constructs that can hold comment-looking text.
-    for (const revision of [`${baseSha}:${file}`, `:${file}`]) {
-      const content = await gitRaw(cwd, ['show', revision]);
-      if (!content || Buffer.byteLength(content) > MAX_COSMETIC_BYTES || content.includes('\0')) return false;
-      if (syntax.text.test(content)) return false;
+  try {
+    const base = ['diff', '--cached', '--no-color', '--no-ext-diff', '--no-renames'];
+    const status = (await gitRaw(cwd, [...base, '--name-status', '-z', baseSha, '--'])).split('\0').filter(Boolean);
+    if (!status.length) return true;
+    const files = [];
+    for (let index = 0; index < status.length; index += 2) {
+      if (status[index] !== 'M') return false;
+      files.push(status[index + 1]);
     }
-    const diff = await gitRaw(cwd, [...base, '-U0', baseSha, '--', file]);
-    const hunks = diff.indexOf('\n@@');
-    if (hunks < 0) return false; // Listed as modified but no text hunk: binary or unreadable.
-    const changed = diff
-      .slice(hunks + 1)
-      .split('\n')
-      .filter(line => line.startsWith('+') || line.startsWith('-'))
-      .map(line => line.slice(1));
-    for (const line of changed) {
-      if (!line.trim()) {
-        if (line !== '') return false; // Whitespace on a line may matter; an empty line does not.
-        continue;
-      }
-      const comment = syntax.comment.exec(line);
-      if (!comment || directive.test(comment[1])) return false;
+    if (files.length > MAX_COSMETIC_FILES) return false;
+    if (/^ mode change /m.test(await gitRaw(cwd, [...base, '--summary', baseSha, '--']))) return false;
+    for (const file of files) {
+      const unsafe = blankSafe.get(file.slice(file.lastIndexOf('.') + 1).toLowerCase());
+      if (!unsafe) return false;
+      const before = await judgedContent(cwd, `${baseSha}:${file}`, unsafe),
+        after = await judgedContent(cwd, `:${file}`, unsafe);
+      if (before === null || after === null) return false;
+      if (before.endsWith('\n') !== after.endsWith('\n')) return false;
+      if (withoutEmptyLines(before) !== withoutEmptyLines(after)) return false;
     }
+    return true;
+  } catch {
+    // What could not be judged is real work.
+    return false;
   }
-  return true;
 }

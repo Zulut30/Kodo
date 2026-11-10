@@ -20,6 +20,9 @@ function blockerLines(run) {
       `Current blocker: ${short(current.code, 60)} [${short(current.scope, 60)}] ${short(current.lastMessage ?? current.message, 600)}`,
       `Seen ${short(current.occurrences, 6)} time(s): first ${short(current.firstSeen, 40)}, last ${short(current.lastSeen, 40)}; commit ${short(current.headSha, 64)}`,
     );
+    // A repeated stop may only say that the run stays stopped; the first report names what failed.
+    if (current.lastMessage && current.lastMessage !== current.message)
+      lines.push(`First reported as: ${short(current.message, 600)}`);
     for (const hypothesis of (current.hypotheses || []).slice(0, 4))
       lines.push(`- Hypothesis: ${short(hypothesis, 240)}`);
     if (current.evidence?.length)

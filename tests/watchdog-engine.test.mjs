@@ -73,7 +73,9 @@ test('Rounds that only produce new output and commits stop at the stalled limit,
   assert.equal(again.blocker.current.firstSeen, blocker.firstSeen);
   assert.match(again.blocker.current.message, /Проверка test не пройдена/, 'the original failure text is kept');
   assert.deepEqual(again.blocker.history, []);
-  assert.match(await progress(again), /Seen 2 time\(s\)/);
+  const repeated = await progress(again);
+  assert.match(repeated, /Seen 2 time\(s\)/);
+  assert.match(repeated, /Проверка test не пройдена/, 'a repeated stop still names what failed');
 });
 
 test('Without a configured limit the existing repair budget alone decides', async t => {
@@ -145,12 +147,14 @@ test('A stalled node does not stop an independent one, and the blocker names the
 });
 
 test('A cosmetic change cannot complete a code node when the watchdog rejects it', async t => {
-  const cosmetic = async call =>
-    appendFile(path.join(call.cwd, 'src/value.mjs'), '// reviewed: the value looks right\n');
-  for (const [name, config, role, state] of [
-    ['rejected', { watchdog: { rejectCosmetic: true } }, 'developer', 'blocked'],
-    ['documentation may be comments', { watchdog: { rejectCosmetic: true } }, 'documenter', 'succeeded'],
-    ['not rejected unless configured', {}, 'developer', 'succeeded'],
+  const emptyLines = '\n\n',
+    comment = '// reviewed: the value looks right\n',
+    reject = { watchdog: { rejectCosmetic: true } };
+  for (const [name, config, role, text, state] of [
+    ['rejected', reject, 'developer', emptyLines, 'blocked'],
+    ['a comment is not judged: a tool may read it', reject, 'developer', comment, 'succeeded'],
+    ['documentation is not checked', reject, 'documenter', emptyLines, 'succeeded'],
+    ['not rejected unless configured', {}, 'developer', emptyLines, 'succeeded'],
   ])
     await t.test(name, async subtest => {
       const fx = await fixture(subtest, {
@@ -160,7 +164,7 @@ test('A cosmetic change cannot complete a code node when the watchdog rejects it
       const services = fakeServices({
         plan: { summary: 'One change', tasks: [node('change', role, ['src/**'])] },
         onWorker: async call => {
-          await cosmetic(call);
+          await appendFile(path.join(call.cwd, 'src/value.mjs'), text);
           return done;
         },
       });
