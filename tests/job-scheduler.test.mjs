@@ -419,3 +419,25 @@ test('A paused queue starts nothing new but still finishes and integrates runnin
   assert.equal((await run()).status, 'integrated');
   assert.deepEqual(probe.executed, ['a', 'b', 'c']);
 });
+
+test('A port may hand a job back without a verdict: no attempt is spent and nothing is failed', async t => {
+  const { jobs, probe, run } = fixture(t);
+  jobs.enqueue(Q, [spec('a', { retry: { maxAttempts: 1 } }), spec('b')]);
+  let draining = true;
+  const summary = await run(
+    {
+      execute: async job => {
+        if (job.key === 'a' && draining) throw Object.assign(new Error('not now'), { handBack: true });
+      },
+    },
+    { limits: { workers: 1, pools: {} }, paused: () => probe.executed.length > 0 && draining },
+  );
+  assert.equal(summary.status, 'stalled');
+  const [a] = jobs.list(Q);
+  assert.deepEqual([a.state, a.attempt, a.reason], ['queued', 0, 'handed_back']);
+  assert.deepEqual(probe.integrated, []);
+  draining = false;
+  assert.equal((await run()).status, 'integrated', 'the single attempt of the job was not consumed');
+  // The order after the hand-back is the queue's (the bypassed job aged); only the set of executions is fixed.
+  assert.deepEqual(probe.executed.toSorted(), ['a', 'a', 'b']);
+});

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { Store } from '../runtime/store.mjs';
@@ -550,4 +550,17 @@ test('A new queue owner voids stale leases at once without spending attempts or 
   jobs.takeOver(Q);
   assert.equal(jobs.events(recovery.job.id).filter(event => event.type === 'integration_orphaned').length, 2);
   code(() => jobs.takeOver('not a queue'), 'job_queue_invalid');
+});
+
+test('A reader refuses WAL frames without their shared-memory file instead of creating sidecars', t => {
+  const home = mkdtempSync(path.join(os.tmpdir(), 'kodo-jobs-orphan-'));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const store = new Store(home);
+  openJobStore({ store }).enqueue(Q, [spec('a')]);
+  store.close();
+  // A writer died: frames are left in the WAL and the shared-memory file is gone.
+  writeFileSync(path.join(home, 'state.sqlite-wal'), Buffer.alloc(4096, 1));
+  rmSync(path.join(home, 'state.sqlite-shm'), { force: true });
+  code(() => openJobReader({ home }), 'job_recovery_required');
+  assert.equal(existsSync(path.join(home, 'state.sqlite-shm')), false, 'a report creates no sidecar file');
 });

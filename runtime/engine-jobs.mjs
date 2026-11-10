@@ -20,35 +20,49 @@ const automatic = /^(?:dependency|host_unavailable):/;
 export const jobQueueFor = run => `run:${run.id}:${contentHash(run.plan.tasks).slice(0, 12)}`;
 
 /**
- * Fair reader/writer gate. A node that the plan or the router marked as not
- * parallel runs alone, exactly as the legacy dispatcher guarantees.
+ * Fair reader/writer gate with the meaning of `busy` in the legacy dispatcher.
+ * A node holds it from the start of an attempt until its result is integrated.
+ * A node that the plan or the router marked as not parallel holds it alone, so
+ * the next node always starts from the integrated result. `stop()` wakes every
+ * waiter with `null`: after the first failure nothing new may start.
  */
 function soloGate() {
   const waiting = [];
   let shared = 0,
-    solo = false;
+    solo = false,
+    stopped = false;
   const admit = () => {
     while (waiting.length) {
       const next = waiting[0];
-      if (solo || (next.alone && shared)) return;
+      if (!stopped && (solo || (next.alone && shared))) return;
       waiting.shift();
+      if (stopped) {
+        next.enter(null);
+        continue;
+      }
       if (next.alone) solo = true;
       else shared++;
-      next.enter();
+      let held = true;
+      next.enter(() => {
+        if (!held) return;
+        held = false;
+        if (next.alone) solo = false;
+        else shared--;
+        admit();
+      });
     }
   };
-  return async (alone, action) => {
-    await new Promise(enter => {
-      waiting.push({ alone, enter: () => enter(undefined) });
+  return {
+    /** @returns {Promise<(() => void) | null>} A release function, or null once the gate was stopped. */
+    enter: alone =>
+      new Promise(enter => {
+        waiting.push({ alone, enter });
+        admit();
+      }),
+    stop() {
+      stopped = true;
       admit();
-    });
-    try {
-      return await action();
-    } finally {
-      if (alone) solo = false;
-      else shared--;
-      admit();
-    }
+    },
   };
 }
 
@@ -56,6 +70,13 @@ function soloGate() {
 function prepareQueue(engine, run) {
   const jobs = openJobStore({ store: engine.store });
   const queue = jobQueueFor(run);
+  // The Run lease is exclusive, so any job lease left in a queue of this run is stale.
+  for (const other of jobs.queues().filter(name => name.startsWith(`run:${run.id}:`) && name !== queue)) {
+    // A replaced plan: its unfinished jobs will never run and must not look alive.
+    jobs.takeOver(other);
+    for (const job of jobs.list(other))
+      if (!['integrated', 'cancelled'].includes(job.state)) jobs.cancel(job.id, { reason: 'plan_replaced' });
+  }
   jobs.enqueue(
     queue,
     run.plan.tasks.map(task => ({
@@ -68,13 +89,11 @@ function prepareQueue(engine, run) {
       payload: { runId: run.id },
     })),
   );
-  // The Run lease is exclusive, so any job lease left in this queue is stale.
   jobs.takeOver(queue);
   for (const job of jobs.list(queue)) {
     const manual =
       ['failed', 'cancelled'].includes(job.state) || (job.state === 'blocked' && !automatic.test(job.reason ?? ''));
-    // A node stopped by its repair budget stays stopped until an explicit retry cycle resets it.
-    if (manual && !run.nodes[job.key]?.stopped) jobs.retry(job.id);
+    if (manual) jobs.retry(job.id);
   }
   return { jobs, queue };
 }
@@ -89,47 +108,99 @@ function prepareQueue(engine, run) {
  */
 export async function executeDurableTasks(engine, run, signal) {
   const tasks = new Map(run.plan.tasks.map(task => [task.id, task]));
+  // A node its repair budget already stopped is the blocker of this run. Report it,
+  // exactly as `performNode` does, before any other node may spend a session.
+  for (const task of run.plan.tasks) if (run.nodes[task.id]?.stopped) await engine.performNode(run, task, signal);
   const { jobs, queue } = prepareQueue(engine, run);
   engine.log(run, 'jobs_queue', { queue, workers: run.config.concurrency });
   const stop = new AbortController(),
-    halt = () => stop.abort();
+    gate = soloGate(),
+    /** Gate holds by node id: from the start of an attempt until the node is integrated. */
+    holds = new Map();
+  const letGo = id => {
+    holds.get(id)?.();
+    holds.delete(id);
+  };
+  // A stop must also wake nodes waiting for the gate: its holders may never be integrated now.
+  const halt = () => {
+    stop.abort();
+    gate.stop();
+  };
   signal?.addEventListener('abort', halt, { once: true });
   if (signal?.aborted) halt();
-  const gate = soloGate();
-  /** The first failure of this cycle. After it nothing new starts; running work drains. */
+  /** The first failure of this cycle. After it no session starts; the running attempt and recorded results drain. */
   let first;
+  const failed = error => {
+    first ??= error;
+    gate.stop();
+    return error;
+  };
+  const handBack = () => Object.assign(new Error('The queue is draining after its first failure'), { handBack: true });
+  /** A job lease lost without a requested cancel is a lost lease, not a cancelled run. */
+  const leaseLoss = (error, context) =>
+    error?.code === 'cancelled' &&
+    context.signal.aborted &&
+    !stop.signal.aborted &&
+    !engine.store.getRun(run.id).cancelRequested
+      ? Object.assign(new Error('Аренда задания потеряна: исполнение узла остановлено'), { code: 'lease_lost' })
+      : error;
 
   async function execute(job, context) {
     const task = tasks.get(job.key),
       node = (run.nodes[task.id] ||= { id: task.id, attempt: 0, status: 'pending' });
     try {
       while (!done(node)) {
+        // After a failure elsewhere a node starts no session, not even its own next repair attempt.
+        if (first) throw handBack();
         engine.checkCancelled(run, context.signal);
         const exhausted = node.stopped || node.attempt >= run.config.repairRounds;
         if (!exhausted && !node.routing) await engine.route(run, task, node, context.signal);
-        const alone = !(task.parallel && node.routing?.parallel);
-        await gate(alone, () => engine.performNode(run, task, context.signal));
+        const release = await gate.enter(!(task.parallel && node.routing?.parallel));
+        if (!release || first) {
+          release?.();
+          throw handBack();
+        }
+        holds.set(task.id, release);
+        await engine.performNode(run, task, context.signal);
+        // A failed attempt frees the gate; routing, and with it the right to run alongside others, is decided again.
+        if (!done(node)) letGo(task.id);
       }
       return { node: task.id, headSha: node.headSha };
     } catch (error) {
-      first ??= error;
-      throw error;
+      // Record the failure before the gate is freed: a waiting node must wake to a stopped queue.
+      const failure = error.handBack ? error : failed(leaseLoss(error, context));
+      letGo(task.id);
+      throw failure;
     }
   }
 
   async function integrate(job, context) {
     const task = tasks.get(job.key);
     try {
-      engine.checkCancelled(run, context.signal);
-      context.confirmOwnership();
-    } catch (error) {
-      // Nothing was merged yet: the recorded result stays for the next cycle.
-      first ??= error;
-      halt();
-      throw Object.assign(error, { integrated: false });
+      try {
+        engine.checkCancelled(run, context.signal);
+        context.confirmOwnership();
+      } catch (error) {
+        // Nothing was merged yet: the recorded result stays for the next cycle.
+        failed(error);
+        halt();
+        throw Object.assign(error, { integrated: false });
+      }
+      try {
+        if (run.nodes[task.id]?.status === 'completed') await engine.integrateNode(run, task, context.signal);
+        // A job must never get ahead of its node.
+        if (run.nodes[task.id]?.status !== 'integrated')
+          throw Object.assign(new Error(`Узел ${task.id} не интегрирован, задание не может быть завершено`), {
+            code: 'merge_state',
+          });
+      } catch (error) {
+        // The outcome of the merge is unknown to the queue: stop, keep ownership for reconciliation.
+        throw failed(error);
+      }
+      return { node: task.id, headSha: run.nodes[task.id].headSha };
+    } finally {
+      letGo(task.id);
     }
-    if (run.nodes[task.id].status === 'completed') await engine.integrateNode(run, task, context.signal);
-    return { node: task.id, headSha: run.nodes[task.id].headSha };
   }
 
   let summary;
@@ -150,18 +221,20 @@ export async function executeDurableTasks(engine, run, signal) {
           ? { integrated: true, receipt: { node: job.key, headSha: node.headSha } }
           : { integrated: false };
       },
+      // Test harness only: production uses the queue defaults.
+      ...engine.jobTiming,
     });
   } catch (error) {
     throw first ?? error;
   } finally {
     signal?.removeEventListener('abort', halt);
+    gate.stop();
   }
   engine.log(run, 'jobs_summary', { queue, status: summary.status, counts: summary.counts });
-  if (summary.status === 'integrated') return;
+  if (summary.status === 'integrated' && run.plan.tasks.every(task => run.nodes[task.id]?.status === 'integrated'))
+    return;
   engine.checkCancelled(run, signal);
   if (first) throw first;
-  // Nothing failed in this cycle: report the saved blocker exactly as the legacy path does.
-  for (const task of run.plan.tasks) if (run.nodes[task.id]?.stopped) await engine.performNode(run, task, signal);
   if (summary.status === 'waiting_quota')
     throw Object.assign(new Error('Лимит провайдера: задания ждут квоту'), {
       code: 'quota',

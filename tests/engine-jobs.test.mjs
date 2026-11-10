@@ -303,3 +303,138 @@ test('A crash right after a merge is reconciled on restart instead of merging ag
     .map(event => event.type);
   assert.ok(events.includes('integration_orphaned') && events.includes('integration_recovery'), events.join());
 });
+
+const incomplete = { sessionId: 'stuck', output: { summary: 'cannot finish', checks: [], complete: false } };
+
+test('After the first failure no other node starts a session, even one the queue already admitted', async t => {
+  // Two workers claim both nodes at once; neither may run alongside the other.
+  const { fx, services, probe } = await independent(t, {
+    parallel: false,
+    onWorker: id => (id === 'one' ? incomplete : undefined),
+  });
+  const store = fx.openStore(),
+    engine = new Engine({ store, ...services });
+  const run = await engine.create('Two files', { project: fx.project });
+  const result = await engine.run(run.id);
+  assert.equal(result.state, 'blocked');
+  assert.deepEqual(probe.started, ['one'], 'the waiting node was handed back, never started');
+  const after = states(store, result);
+  assert.match(after.one, /^failed:/);
+  assert.equal(after.two, 'queued:handed_back');
+  assert.equal(openJobStore({ store }).list(jobQueueFor(result))[1].attempt, 0, 'handing back spends no attempt');
+});
+
+test('A running node finishes its attempt after a failure elsewhere but starts no further repair attempt', async t => {
+  const twoStarted = Promise.withResolvers(),
+    oneFailed = Promise.withResolvers();
+  const { fx, services, probe } = await independent(t, {
+    config: { repairRounds: 3 },
+    onWorker: async id => {
+      if (id === 'one') {
+        await twoStarted.promise;
+        oneFailed.resolve();
+        throw Object.assign(new Error('fixture quota'), { code: 'quota' });
+      }
+      twoStarted.resolve();
+      await oneFailed.promise;
+      await delay(300); // The Engine has recorded the failure of the other node by now.
+      return incomplete;
+    },
+  });
+  const store = fx.openStore(),
+    engine = new Engine({ store, ...services });
+  const result = await engine.run((await engine.create('Two files', { project: fx.project })).id);
+  assert.deepEqual([result.state, result.error.code], ['waiting_limits', 'quota']);
+  assert.deepEqual(probe.started.toSorted(), ['one', 'two'], 'the second node got one attempt, not three');
+  assert.deepEqual([result.nodes.two.attempt, result.nodes.two.stopped], [1, undefined], 'its repair budget is intact');
+  assert.equal(states(store, result).two, 'queued:handed_back');
+});
+
+test('A node marked not parallel holds the queue until it is integrated: the next node starts from its result', async t => {
+  const { fx, services, probe } = await independent(t, {
+    parallel: false,
+    onWorker: async (id, call) => {
+      if (id === 'two')
+        assert.equal(await read(path.join(call.cwd, 'out/one.txt')), 'one\n', 'the first node is already merged');
+    },
+  });
+  const engine = new Engine({ store: fx.openStore(), ...services });
+  // A slow merge: a node that only waited for the first session to end would start from the old base.
+  const integrate = engine.integrateNode.bind(engine);
+  engine.integrateNode = async (...args) => {
+    await delay(400);
+    return integrate(...args);
+  };
+  const result = await engine.run((await engine.create('Two files', { project: fx.project })).id);
+  assert.equal(result.state, 'succeeded', result.error?.message);
+  assert.deepEqual(probe.started, ['one', 'two']);
+});
+
+test('A lost job lease stops the node as a lost lease, never as a cancelled run', async t => {
+  let store;
+  const { fx, services } = await independent(t, {
+    ids: ['one'],
+    onWorker: async (id, call) => {
+      store.db.prepare("UPDATE kodo_jobs SET lease_token='stolen' WHERE key='one'").run();
+      for (let waited = 0; waited < 200 && !call.signal.aborted; waited++) await delay(20);
+      assert.equal(call.signal.aborted, true, 'the session was told to stop');
+      throw Object.assign(new Error('session aborted'), { code: 'cancelled' });
+    },
+  });
+  store = fx.openStore();
+  const engine = new Engine({ store, ...services });
+  engine.jobTiming = { ttlMs: 1000, heartbeatMs: 30 };
+  const result = await engine.run((await engine.create('One file', { project: fx.project })).id);
+  assert.deepEqual([result.state, result.error.code], ['blocked', 'lease_lost']);
+  assert.deepEqual([result.nodes.one.status, result.nodes.one.attempt], ['pending', 0], 'the attempt is not spent');
+});
+
+test('A plain resume with a stopped node spends nothing on independent nodes', async t => {
+  let broken = true;
+  const { fx, services, probe } = await independent(t, {
+    ids: ['stuck', 'free'],
+    config: { concurrency: 1 },
+    onWorker: id => (id === 'stuck' && broken ? incomplete : undefined),
+  });
+  const engine = new Engine({ store: fx.openStore(), ...services });
+  const run = await engine.create('Two files', { project: fx.project });
+  assert.equal((await engine.run(run.id)).state, 'blocked');
+  assert.deepEqual(probe.started, ['stuck']);
+  const again = await engine.run(run.id);
+  assert.deepEqual([again.state, again.error.code], ['blocked', 'blocked']);
+  assert.deepEqual(probe.started, ['stuck'], 'the known blocker is reported before any session');
+  broken = false;
+  const result = await engine.run(run.id, { retryFailed: true });
+  assert.equal(result.state, 'succeeded', result.error?.message);
+  assert.deepEqual(probe.started.toSorted(), ['free', 'stuck', 'stuck']);
+});
+
+test('Replacing the plan cancels the unfinished jobs of the old queue', async t => {
+  let broken = true;
+  const { fx, services } = await independent(t, {
+    ids: ['one'],
+    onWorker: () => (broken ? incomplete : undefined),
+  });
+  const store = fx.openStore(),
+    engine = new Engine({ store, ...services });
+  const run = await engine.create('Files', { project: fx.project });
+  const blocked = await engine.run(run.id);
+  assert.equal(blocked.state, 'blocked');
+  const oldQueue = jobQueueFor(blocked);
+  const planFile = path.join(fx.directory, 'plan.json');
+  await writeFile(
+    planFile,
+    JSON.stringify({ summary: 'Another file.', tasks: [node('two', 'developer', ['out/two.txt'])] }),
+  );
+  broken = false;
+  const result = await engine.run(run.id, { planFile, retryFailed: true });
+  assert.equal(result.state, 'succeeded', result.error?.message);
+  assert.notEqual(jobQueueFor(result), oldQueue);
+  assert.deepEqual(states(store, result), { two: 'integrated' });
+  assert.deepEqual(
+    openJobStore({ store })
+      .list(oldQueue)
+      .map(job => [job.key, job.state, job.reason]),
+    [['one', 'cancelled', 'plan_replaced']],
+  );
+});

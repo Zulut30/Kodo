@@ -718,9 +718,14 @@ function readOnlyDatabase(home) {
   const filename = path.join(home, 'state.sqlite');
   if (!statSync(filename, { throwIfNoEntry: false })?.isFile()) return null;
   let db;
+  const wal = statSync(`${filename}-wal`, { throwIfNoEntry: false }),
+    shared = statSync(`${filename}-shm`, { throwIfNoEntry: false });
+  // WAL frames without the shared-memory file need a writer to recover them. A
+  // read-only open would create the missing sidecar, so a report refuses instead.
+  requireValue(!wal?.size || shared?.isFile(), 'recovery_required', 'the state database needs writer recovery');
   // A cleanly closed WAL database has no sidecars and plain READONLY would
   // create them. Without pending WAL frames an immutable open reads the file as is.
-  if (statSync(`${filename}-wal`, { throwIfNoEntry: false })?.size) db = new DatabaseSync(filename, { readOnly: true });
+  if (wal?.size) db = new DatabaseSync(filename, { readOnly: true });
   else {
     const uri = pathToFileURL(path.resolve(filename));
     uri.searchParams.set('mode', 'ro');

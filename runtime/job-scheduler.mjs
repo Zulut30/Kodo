@@ -16,7 +16,8 @@
  * @property {{ capabilities?: string[], tools?: string[] }} [worker]
  * @property {(job: import('./job-store.mjs').Job, context: { signal: AbortSignal }) => Promise<Record<string, any> | void>} execute
  *   Run one job in isolation and return its result. Reject with `code: 'quota'`
- *   (optional `retryAt`, `checkpoint`) to pause, or `retryable: false` to fail for good.
+ *   (optional `retryAt`, `checkpoint`) to pause, `retryable: false` to fail for good, or
+ *   `handBack: true` to return the job to the queue without a verdict or a spent attempt.
  * @property {(job: import('./job-store.mjs').Job, context: { signal: AbortSignal, confirmOwnership: () => void }) => Promise<Record<string, any> | void>} integrate
  *   Integrate one recorded result and return a receipt. Call `confirmOwnership()`
  *   immediately before the irreversible step: it throws once the lease is gone.
@@ -159,6 +160,7 @@ export async function runJobQueue(options) {
 
   function failed(job, token, error) {
     if (signal?.aborted) return jobs.release(job.id, token, { reason: 'stopped' });
+    if (error?.handBack === true) return jobs.release(job.id, token, { reason: 'handed_back' });
     if (error?.code !== 'quota')
       return jobs.fail(job.id, token, { reason: error?.message, retryable: error?.retryable !== false });
     const pause = extra => jobs.waitQuota(job.id, token, { retryAt: retryTime(error, now()), ...extra });
