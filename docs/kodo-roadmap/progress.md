@@ -14,7 +14,7 @@ MVP Project Director реализован. Фактическая приёмка
 | 06 Project Director | **MERGED**, [PR15](https://github.com/Zulut30/Kodo/pull/15) merged `ca7afa1` 2026-11-05 | [Phase06](phase-06.md), [Windows evidence](../archive/WINDOWS-TEST-SPEED.md); статус приёмки и checks — в PR15 |
 | 07 Swarm | **CANDIDATE**, ветка `kodo/07-durable-jobs`: контракты, SQLite-хранилище, планировщик, read-only `kodo jobs`, fixtures 1/2/4/8, реальная Git-цепочка и opt-in подключение Engine (`scheduler: durable`) | [Phase07](phase-07.md); приёмка — после CI и merge PR этапа |
 | 08 Context/budget | **CANDIDATE**, ветка `kodo/08-context-budget`: ContextManifest каждой сессии, детерминированный быстрый путь для правок стилей, сохраняемые лимиты `budgets.sessions`/`budgets.contextBytes`; адаптеры T3/Orca и TokenEconomizer не сделаны | [Phase08](phase-08.md); приёмка — после CI и merge PR этапа |
-| 09 Verification/evolution | NOT STARTED | После08: independent oracles/risk policy |
+| 09 Verification/evolution | **CANDIDATE**, ветка `kodo/09-behavior-gate`: behaviour gate перед ревью (защита тестов, оракулы проекта, политика по типу изменения), необязательный базовый прогон; OpenCodeReview и Evolution Gate не сделаны | [Phase09](phase-09.md); приёмка — после CI и merge PR этапа |
 | 10 Progress/maintenance | NOT STARTED | После09: watchdog/acceptance progress |
 | 11 Merge/release | NOT STARTED | После10: immutable queue/recovery/smoke |
 | 12 Observability | NOT STARTED; benchmark campaigns отложены пользователем | После11: реальные operational metrics/JSON; неизвестные метрики null |

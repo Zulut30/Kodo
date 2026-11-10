@@ -149,6 +149,7 @@ export class Engine extends EngineVerification {
       await this.assertProjectPlan(run);
       if (!run.delivery?.mergeCommit) {
         if (!run.completed.implementation) {
+          await this.baseline(run, signal);
           await this.executeTasks(run, signal);
           run.completed.implementation = true;
           this.save(run);
