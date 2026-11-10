@@ -1010,3 +1010,29 @@ test('Annotations and marks are read with their strings and their place', async 
     assert.match(findings[0].detail, /switched off: "test_total", "test_empty"$/);
   });
 });
+
+test('The file that lost a case is the one reported, also when another file has a case of that name', async t => {
+  const works = `${header}${one('works')}`;
+  const repo = repository(t, { 'tests/a.test.mjs': works, 'tests/z.test.mjs': works });
+  // `tests/a.test.mjs` is deleted; `tests/z.test.mjs` keeps its own case and only gains a comment.
+  const head = repo.change({ 'tests/z.test.mjs': `${works}// touched\n` }, ['tests/a.test.mjs']);
+  const refused = await runBehaviorGate({
+    ...head,
+    config: { verification: { testRemovalAllowed: ['tests/z.test.mjs'] } },
+  });
+  assert.deepEqual(
+    rules(refused.findings),
+    ['test_deleted:tests/a.test.mjs'],
+    'a permission for another file does not cover it',
+  );
+  assert.deepEqual(refused.allowed, []);
+  const permitted = await runBehaviorGate({
+    ...head,
+    config: { verification: { testRemovalAllowed: ['tests/a.test.mjs'] } },
+  });
+  assert.equal(permitted.passed, true);
+  assert.deepEqual(rules(permitted.allowed), ['test_deleted:tests/a.test.mjs']);
+  // A real move is still a move: the case leaves one file and appears in a new one.
+  const moved = repo.change({ 'tests/b.test.mjs': works });
+  assert.deepEqual(await weakened(moved), [], 'the deleted case is found in the new file');
+});

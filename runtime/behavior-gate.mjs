@@ -838,15 +838,21 @@ export async function testWeakening({ cwd, baseSha, headSha, allowed = [] }) {
         unchecked.push({ file: to, reason: after.reason });
     }
   }
-  // Every base case must still exist somewhere among the changed test files.
-  const remaining = tally(head);
-  for (const entry of base) {
-    const removed = [];
-    for (const { name } of entry.cases) {
-      const left = remaining.get(name) ?? 0;
-      if (left > 0) remaining.set(name, left - 1);
-      else removed.push(name);
-    }
+  // Every base case must still exist among the changed test files. A case is first looked for
+  // in its own file, and only what is missing there can have moved: with the same name in two
+  // files, the file that lost the case is the one reported, and the one a permission must name.
+  const pools = new Map(head.map(entry => [entry.file, tally([entry])]));
+  const take = (pool, name) => {
+    const left = pool?.get(name) ?? 0;
+    if (left > 0) pool.set(name, left - 1);
+    return left > 0;
+  };
+  const missing = base.map(entry =>
+    entry.cases.map(item => item.name).filter(name => !take(pools.get(entry.at), name)),
+  );
+  const moved = name => [...pools.values()].some(pool => take(pool, name));
+  for (const [index, entry] of base.entries()) {
+    const removed = missing[index].filter(name => !moved(name));
     if (removed.length)
       report(
         entry.gone
