@@ -38,7 +38,6 @@ async function styled(t, options = {}) {
   };
   return fx;
 }
-const manifestOf = async attempt => JSON.parse(await readFile(attempt.manifest.path, 'utf8')).value;
 
 test('A proven style-only task skips Jev, Gemini and research and still gets an independent review', async t => {
   const fx = await styled(t);
@@ -139,14 +138,15 @@ test('Every session leaves a manifest bound to its contract and head; a context 
   assert.equal(result.state, 'succeeded', result.error?.message);
   assert.equal(result.sessionAttempts.length, 3);
   for (const attempt of result.sessionAttempts) {
-    const manifest = await manifestOf(attempt);
+    const { manifest } = attempt;
     assert.equal(manifest.kind, 'context-manifest');
+    assert.match(attempt.manifestSha256, /^[0-9a-f]{64}$/);
     assert.equal(manifest.totalBytes, attempt.metrics.promptBytes, `${attempt.stage}: sizes add up to the prompt`);
     assert.equal(manifest.limitBytes, null);
     assert.doesNotMatch(JSON.stringify(manifest), new RegExp(`${secret}|Make the button|state`));
   }
   const worker = result.sessionAttempts.find(attempt => attempt.stage === 'developer');
-  const manifest = await manifestOf(worker);
+  const { manifest } = worker;
   const contract = worker.evidence.find(item => path.basename(item.path).startsWith('node-contract-'));
   assert.equal(manifest.mandatory.contract.sha256, contract.sha256);
   const context = manifest.sections.find(section => section.name === 'task-context');

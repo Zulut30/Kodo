@@ -6,7 +6,7 @@
 
 | Scope из [плана](NEXT-STAGES.md) | Реализация | Проверка |
 | --- | --- | --- |
-| ① manifest/invalidation | `runtime/context-manifest.mjs`: `buildContextManifest`, `manifestFreshness`; Engine сохраняет манифест каждой сессии как evidence | `tests/context-manifest.test.mjs`, 6 тестов; `tests/fast-path-engine.test.mjs` |
+| ① manifest/invalidation | `runtime/context-manifest.mjs`: `buildContextManifest`, `manifestFreshness`; Engine сохраняет манифест каждой сессии в её записи в Run | `tests/context-manifest.test.mjs`, 6 тестов; `tests/fast-path-engine.test.mjs` |
 | ② fast path | `runtime/fast-path.mjs`: `classifyLocalTask`, `fastPathAllowsPlan`; выбор режима и сверка плана в `engine-planning.mjs` | `tests/fast-path.test.mjs`, 3 теста (19 случаев сомнения); `tests/fast-path-engine.test.mjs` |
 | ② persisted budget admission | `budgets.sessions` и `budgets.contextBytes` в конфигурации; проверка в `Engine.session`; Project retry не расширяет лимиты | `tests/fast-path-engine.test.mjs`, `tests/project-director.test.mjs` |
 
@@ -27,7 +27,7 @@
 ## Изменённое существующее поведение
 
 - Задача, называющая только существующие файлы стилей, больше не вызывает оценку Jev. Один существующий тест (`tests/mode-engine.test.mjs`, выбор `quick` по оценке) проверял именно такой текст; в его задачу добавлено упоминание `README.md`, чтобы он по-прежнему проверял обычный маршрут.
-- В `run.sessionAttempts[]` появилось поле `manifest`, в каталоге evidence — файлы `context-manifest-*.json`.
+- В `run.sessionAttempts[]` появились поля `manifest` и `manifestSha256`.
 - Без ключа `budgets` лимитов нет.
 
 ## Что не сделано

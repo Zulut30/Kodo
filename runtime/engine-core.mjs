@@ -801,7 +801,6 @@ try {
           };
           const env = await this.executionEnvironment(run, request.cwd, tools);
           for (const reference of references) await this.assertEvidence(reference);
-          const manifestReference = await this.persistEvidence(run, 'context-manifest', manifest);
           this.checkCancelled(run, controller.signal);
           // Persisted admission: the cap counts every started session of this run,
           // across resume, retry cycles and parallel workers. It is checked and
@@ -816,7 +815,10 @@ try {
             model: request.model,
             status: 'started',
             evidence: references,
-            manifest: manifestReference,
+            // Kept with the attempt, not as another evidence file: preparing the protected
+            // evidence directory once per session would cost more than the session setup itself.
+            manifest,
+            manifestSha256: contentHash(manifest),
             metrics: {
               ...localBytes,
               durationMs: null,

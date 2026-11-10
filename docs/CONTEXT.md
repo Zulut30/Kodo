@@ -27,7 +27,7 @@
 }
 ```
 
-Манифест сохраняется как evidence `context-manifest-<sha256>.json`, ссылка на него лежит в `run.sessionAttempts[].manifest`. `totalBytes` равен `metrics.promptBytes` той же сессии.
+Манифест хранится вместе с записью сессии: `run.sessionAttempts[].manifest`, его SHA-256 — в `manifestSha256`. Отдельным файлом evidence он не сохраняется: подготовка защищённого каталога evidence на каждую сессию стоила бы дороже самой подготовки сессии. `totalBytes` равен `metrics.promptBytes` той же сессии.
 
 Правила:
 
