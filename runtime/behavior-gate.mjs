@@ -18,7 +18,6 @@ import { execute } from './command.mjs';
 import { workerEnvironment } from './security.mjs';
 
 export const BEHAVIOR_GATE_VERSION = 1;
-const MAX_FILE_BYTES = 1048576;
 const hash = value => createHash('sha256').update(value).digest('hex');
 
 /** @returns {never} */
@@ -28,10 +27,19 @@ function invalid(message) {
   });
 }
 
+const relativeScope = scope =>
+  typeof scope === 'string' &&
+  Boolean(scope) &&
+  !scope.includes('\\') &&
+  !scope.startsWith('/') &&
+  !scope.includes(':') &&
+  !scope.split('/').includes('..');
+
 /**
  * @typedef {object} VerificationConfig
  * @property {boolean} baseline Run the check commands on the base commit before any edit.
- * @property {boolean} testProtection Refuse deleted, skipped or weakened tests.
+ * @property {boolean} testProtection Refuse deleted and skipped tests.
+ * @property {string[]} testRemovalAllowed Test paths (globs) this run may delete or reduce: an explicit, narrow exception.
  * @property {boolean} strictGates A gate the policy needs but the project disabled fails the gate.
  * @property {{ id: string, command: string, args: string[], timeoutMs?: number, protect: string[] }[]} oracles
  */
@@ -43,10 +51,13 @@ function invalid(message) {
 export function normalizeVerificationConfig(value = undefined) {
   const input = /** @type {Record<string, any>} */ (value === undefined ? {} : value);
   if (!input || typeof input !== 'object' || Array.isArray(input)) invalid('an object is expected');
-  const known = ['baseline', 'testProtection', 'strictGates', 'oracles'];
+  const known = ['baseline', 'testProtection', 'testRemovalAllowed', 'strictGates', 'oracles'];
   for (const key of Object.keys(input)) if (!known.includes(key)) invalid(`unknown key ${key}`);
   for (const key of ['baseline', 'testProtection', 'strictGates'])
     if (input[key] !== undefined && typeof input[key] !== 'boolean') invalid(`${key} must be boolean`);
+  const allowed = input.testRemovalAllowed ?? [];
+  if (!Array.isArray(allowed) || allowed.length > 64 || allowed.some(scope => !relativeScope(scope)))
+    invalid('testRemovalAllowed must be a short list of repository-relative paths');
   const oracles = input.oracles ?? [];
   if (!Array.isArray(oracles) || oracles.length > 8) invalid('oracles must be a list of at most 8');
   const ids = new Set();
@@ -92,6 +103,7 @@ export function normalizeVerificationConfig(value = undefined) {
   return {
     baseline: input.baseline ?? false,
     testProtection: input.testProtection ?? true,
+    testRemovalAllowed: [...allowed],
     strictGates: input.strictGates ?? false,
     oracles: normalized,
   };
@@ -104,14 +116,18 @@ export const verificationConfigHash = config =>
 const changeTypes = [
   [
     'ci',
-    /(^|\/)\.github\/(?:workflows|actions)\/|(^|\/)\.gitlab-ci\.yml$|(^|\/)azure-pipelines\.yml$|(^|\/)Jenkinsfile$/i,
+    /(^|\/)\.github\/(?:workflows|actions)\/|(^|\/)\.gitlab-ci\.yml$|(^|\/)azure-pipelines\.yml$|(^|\/)Jenkinsfile$|(^|\/)\.circleci\/|(^|\/)Dockerfile[^/]*$|(^|\/)docker-compose[^/]*\.ya?ml$|\.tf$/i,
   ],
   [
     'release',
     /(^|\/)(?:CHANGELOG[^/]*|\.releaserc[^/]*|release[^/]*\.(?:json|ya?ml|[cm]?js))$|(^|\/)scripts\/release/i,
   ],
   ['schema', /(^|\/)(?:migrations?|schema|prisma|db)\/|\.sql$|(^|\/)schema\.[a-z]+$/i],
-  ['security', /(^|\/)(?:auth\w*|security|crypto\w*|permissions?|secrets?|oauth\w*|session\w*|acl)(?:\/|\.|-|_)/i],
+  [
+    'security',
+    // Whole words only: `AUTHORS.md` and `src/author.ts` are not authentication.
+    /(^|\/)(?:auth|authn|authz|authentication|authorization|oauth\d?|login|security|crypto|cryptography|permissions?|secrets?|sessions?|acl)(?:\/|\.|-|_|$)/i,
+  ],
   [
     'api',
     /(^|\/)(?:api|routes?|controllers?|handlers?|graphql|proto)\/|\.(?:proto|graphql)$|openapi[^/]*\.(?:ya?ml|json)$/i,
@@ -121,10 +137,14 @@ const changeTypes = [
     /(^|\/)(?:tests?|__tests__|spec)\/|\.(?:test|spec)\.[cm]?[jt]sx?$|_test\.(?:go|py|rs)$|(^|\/)test_[^/]+\.py$/i,
   ],
   ['style', /\.(?:css|scss|sass|less|styl|pcss)$/i],
-  ['content', /\.(?:md|mdx|txt|rst|adoc)$|(^|\/)(?:docs?|LICENSE[^/]*)(?:\/|$)/i],
+  // By extension only: a script under docs/ is code.
+  [
+    'content',
+    /\.(?:md|mdx|rst|adoc)$|(^|\/)LICENSE[^/]*$|(^|\/)(?!CMakeLists\.txt$|requirements[^/]*\.txt$)[^/]+\.txt$/i,
+  ],
   [
     'config',
-    /(^|\/)(?:package(?:-lock)?\.json|pnpm-lock\.yaml|yarn\.lock|Cargo\.(?:toml|lock)|go\.(?:mod|sum)|pyproject\.toml|requirements[^/]*\.txt|kodo\.config\.json|tsconfig[^/]*\.json|\.[a-z]+rc(?:\.[a-z]+)?)$/i,
+    /(^|\/)(?:package(?:-lock)?\.json|pnpm-lock\.yaml|yarn\.lock|Cargo\.(?:toml|lock)|go\.(?:mod|sum)|pyproject\.toml|requirements[^/]*\.txt|CMakeLists\.txt|Makefile|kodo\.config\.json|tsconfig[^/]*\.json|\.[a-z]+rc(?:\.[a-z]+)?)$/i,
   ],
 ];
 const isTestFile = file => changeTypes.find(([type]) => type === 'tests')[1].test(file);
@@ -182,19 +202,45 @@ export function qualityPolicy({ types, config, verification }) {
   };
 }
 
+/** Files larger than this are not inspected; the receipt says so. */
+const MAX_INSPECTED_BYTES = 262144;
 const markers = {
-  // A skipped or focused test is still a case; `skips` counts the modifier separately.
+  // A test case, not `regex.test(` and not a `describe` group. Linear: no nested quantifiers.
   cases:
-    /\b(?:test|it|describe|suite)\s*(?:\.\s*\w+\b[^(\n]*)?\(|\bdef\s+test_\w+|#\[(?:\w+::)?test\]|\bfunc\s+Test\w+\s*\(|@Test\b/g,
+    /(?<![.\w$])(?:test|it)(?:\s*\.\s*\w+){0,3}\s*[(`]|\bdef\s+test_\w+|#\[(?:\w+::)?test\]|\bfunc\s+Test\w+\s*\(|@Test\b/g,
+  // Explicit ways to keep a test from running.
   skips:
-    /\b(?:test|it|describe|suite)\s*\.\s*(?:skip|todo|only)\b|\bx(?:it|describe|test)\s*\(|@pytest\.mark\.(?:skip|xfail)|#\[ignore\]|\bt\.Skip(?:f|Now)?\(|@(?:Disabled|Ignore)\b|\{\s*(?:skip|todo)\s*:\s*(?:true|['"`])/g,
+    /(?<![.\w$])(?:test|it|describe|suite)\s*\.\s*(?:skip|todo|only)\b|(?<![.\w$])x(?:it|describe|test)\s*\(|\b(?:t|this|ctx|context)\.(?:skip|todo)\s*\(|\b(?:skip|todo)\s*:\s*(?!false\b)[^\s,}]|@pytest\.mark\.(?:skip|xfail)|pytest\.skip\s*\(|@(?:unittest\.)?skip\w*|#\[ignore\b|\bt\.Skip(?:f|Now)?\(|@(?:Disabled|Ignore)\b/g,
   assertions: /\bassert\w*|\bexpect\s*\(|\.should\b|\brequire\.\w+\(/g,
 };
 const count = (text, pattern) => (text.match(pattern) || []).length;
+const hashComments = /\.(?:py|rb|sh|bash|zsh|ya?ml|toml)$/i;
+/**
+ * Remove comments, so a commented-out test is a removed test. Not string-aware:
+ * `//` after a colon (a URL) is kept; this is a counter, not a parser.
+ */
+function withoutComments(file, text) {
+  return hashComments.test(file)
+    ? text.replace(/(^|\s)#.*$/gm, '$1')
+    : text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
+}
 
-async function show(cwd, revision, file) {
-  const result = await execute('git', ['show', `${revision}:${file}`], { cwd, allowFailure: true });
-  return result.code === 0 && Buffer.byteLength(result.stdout) <= MAX_FILE_BYTES ? result.stdout : null;
+/** Marker counts of one revision of a file, or a reason why it was not inspected. Never throws. */
+async function inspect(cwd, revision, file) {
+  let result;
+  try {
+    result = await execute('git', ['show', `${revision}:${file}`], { cwd, allowFailure: true });
+  } catch {
+    return { reason: 'unreadable' };
+  }
+  if (result.code !== 0) return { reason: 'unreadable' };
+  if (Buffer.byteLength(result.stdout) > MAX_INSPECTED_BYTES) return { reason: 'too_large' };
+  const text = withoutComments(file, result.stdout);
+  return {
+    cases: count(text, markers.cases),
+    skips: count(text, markers.skips),
+    assertions: count(text, markers.assertions),
+  };
 }
 
 /** Changed files between base and head as `{ status, from, to }`, renames followed. */
@@ -213,50 +259,110 @@ async function changes(cwd, baseSha, headSha) {
 }
 
 /**
- * Tests that existed on the base and were deleted, skipped, focused or weakened.
- * Heuristic by design: it counts test-case, skip and assertion markers.
+ * Tests that existed on the base and were deleted, removed or switched off.
+ *
+ * A heuristic over marker counts, tuned to refuse the unambiguous cases and to
+ * let honest test work through: cases are counted across all changed test
+ * files, so moving or splitting tests is not a removal; fewer assertions is
+ * only a warning. It cannot see semantic weakening (an early `return`,
+ * `assert.ok(true)`); that stays with checks, oracles and review.
  * @param {{ cwd: string, baseSha: string, headSha: string }} input
+ * @returns {Promise<{ findings: { rule: string, file: string, detail: string }[],
+ *   warnings: { rule: string, file: string | null, detail: string }[], unchecked: { file: string, reason: string }[] }>}
  */
 export async function testWeakening({ cwd, baseSha, headSha }) {
-  const findings = [];
+  const rows = [],
+    unchecked = [];
   for (const { status, from, to } of await changes(cwd, baseSha, headSha)) {
-    if (status === 'A' || status === 'C' || !isTestFile(from)) continue;
-    const before = await show(cwd, baseSha, from);
-    if (before === null) continue;
-    const cases = count(before, markers.cases);
-    if (!cases) continue; // A helper or fixture, not a test.
-    if (status === 'D') {
-      findings.push({ rule: 'test_deleted', file: from, detail: `${cases} test cases removed with the file` });
-      continue;
-    }
-    const after = await show(cwd, headSha, to);
-    if (after === null) continue;
-    const now = {
-      cases: count(after, markers.cases),
-      skips: count(after, markers.skips),
-      assertions: count(after, markers.assertions),
-    };
-    const was = { skips: count(before, markers.skips), assertions: count(before, markers.assertions) };
-    if (now.cases < cases)
-      findings.push({ rule: 'tests_removed', file: to, detail: `test cases ${cases} -> ${now.cases}` });
-    if (now.skips > was.skips)
-      findings.push({ rule: 'test_skipped', file: to, detail: `skip/only/todo markers ${was.skips} -> ${now.skips}` });
-    // Fewer assertions with the same cases is weakening. With more cases it is a refactor;
-    // with fewer, `tests_removed` already says so.
-    if (now.assertions < was.assertions && now.cases === cases)
-      findings.push({
-        rule: 'assertions_removed',
-        file: to,
-        detail: `assertions ${was.assertions} -> ${now.assertions}`,
-      });
+    // A renamed test that no longer looks like a test to any runner is a removed test.
+    const before = status !== 'A' && status !== 'C' && isTestFile(from) ? await inspect(cwd, baseSha, from) : null;
+    const after = status !== 'D' && isTestFile(to) ? await inspect(cwd, headSha, to) : null;
+    for (const [side, file] of [
+      [before, from],
+      [after, to],
+    ])
+      if (side?.reason) unchecked.push({ file, reason: side.reason });
+    if (before?.reason || after?.reason) continue;
+    if (before || after) rows.push({ status, from, to, before, after });
   }
-  return findings;
+  const sum = (side, field) => rows.reduce((total, row) => total + (row[side]?.[field] ?? 0), 0);
+  const removedOverall = sum('after', 'cases') < sum('before', 'cases');
+  const findings = [],
+    warnings = [];
+  for (const { status, from, to, before, after } of rows) {
+    if (!before?.cases) continue; // New, or a helper or fixture without test cases.
+    const file = after ? to : from;
+    const now = after ?? { cases: 0, skips: 0, assertions: 0 };
+    // Fewer cases here and no fewer overall is a move or a split, not a removal.
+    if (removedOverall && now.cases < before.cases)
+      findings.push(
+        after
+          ? { rule: 'tests_removed', file, detail: `test cases ${before.cases} -> ${now.cases}` }
+          : {
+              rule: 'test_deleted',
+              file: from,
+              detail:
+                status === 'D'
+                  ? `${before.cases} test cases removed with the file`
+                  : `renamed to ${to}, which no test runner picks up`,
+            },
+      );
+    if (now.skips > before.skips)
+      findings.push({ rule: 'test_skipped', file, detail: `skip/only/todo markers ${before.skips} -> ${now.skips}` });
+  }
+  if (sum('after', 'assertions') < sum('before', 'assertions') && sum('after', 'cases') <= sum('before', 'cases'))
+    warnings.push({
+      rule: 'assertions_removed',
+      file: null,
+      detail: `assertions ${sum('before', 'assertions')} -> ${sum('after', 'assertions')} across changed tests`,
+    });
+  return { findings, warnings, unchecked };
+}
+
+/** Findings a repair session cannot fix: only a person can change the configuration. */
+const unrepairable = new Set(['required_gate_disabled']);
+
+/** Run one oracle; a crash or a timeout is a failure with its own evidence. */
+async function runOracle(oracle, { cwd, signal, secrets, runner, persist }) {
+  let exitCode = null,
+    reason,
+    output;
+  try {
+    const result = await runner(oracle.command, oracle.args, {
+      cwd,
+      signal,
+      env: workerEnvironment(),
+      secrets,
+      timeoutMs: oracle.timeoutMs,
+      allowFailure: true,
+    });
+    exitCode = result.code;
+    output = (result.stdout + result.stderr).slice(-24000);
+  } catch (error) {
+    if (signal?.aborted || error.code === 'cancelled') throw error;
+    // An oracle that did not finish proves nothing: it is a failure, not a pass.
+    reason = ['timeout', 'ENOENT', 'EACCES', 'EPERM'].includes(error.code) ? error.code : 'execution_failed';
+    output = `not completed: ${reason}`;
+  }
+  const evidence = persist
+    ? await persist('oracle', { id: oracle.id, command: oracle.command, args: oracle.args, exitCode, output })
+    : null;
+  return {
+    receipt: {
+      id: oracle.id,
+      status: exitCode === 0 ? 'passed' : 'failed',
+      ...(reason ? { reason } : {}),
+      exitCode,
+      ...(evidence ? { outputPath: evidence.path, outputHash: evidence.sha256 } : {}),
+    },
+    detail: reason ? `${oracle.id}: ${reason}` : `${oracle.id} exit ${exitCode}: ${output.slice(-2000)}`,
+  };
 }
 
 /**
  * Run the behaviour gate on a clean checkout of `headSha`.
  * @param {{ cwd: string, headSha: string, baseSha: string, config: Record<string, any>, signal?: AbortSignal,
- *   secrets?: Record<string, string>, runner?: typeof execute,
+ *   secrets?: Record<string, string>, runner?: typeof execute, isClean?: () => Promise<boolean>,
  *   persist?: (kind: string, value: any) => Promise<{ sha256: string, path: string }> }} input
  */
 export async function runBehaviorGate({
@@ -267,13 +373,17 @@ export async function runBehaviorGate({
   signal,
   secrets = {},
   runner = execute,
+  isClean,
   persist,
 }) {
   const verification = normalizeVerificationConfig(config.verification);
   const rows = await changes(cwd, baseSha, headSha);
   const paths = [...new Set(rows.flatMap(row => [row.from, row.to]))].sort();
   const policy = qualityPolicy({ types: classifyChange(paths), config, verification });
-  const findings = [];
+  const findings = [],
+    allowed = [],
+    warnings = [],
+    unchecked = [];
   if (verification.strictGates)
     for (const gap of policy.gaps)
       findings.push({
@@ -281,7 +391,14 @@ export async function runBehaviorGate({
         file: null,
         detail: `${gap.gate} gate is required for this change`,
       });
-  if (verification.testProtection) findings.push(...(await testWeakening({ cwd, baseSha, headSha })));
+  if (verification.testProtection) {
+    const tests = await testWeakening({ cwd, baseSha, headSha });
+    warnings.push(...tests.warnings);
+    unchecked.push(...tests.unchecked);
+    // The run was explicitly allowed to remove these tests; the receipt still shows that it did.
+    for (const finding of tests.findings)
+      (ownsPath(verification.testRemovalAllowed, finding.file) ? allowed : findings).push(finding);
+  }
   const oracles = [];
   for (const oracle of verification.oracles) {
     // An implementation may not edit the oracle that judges it.
@@ -292,46 +409,14 @@ export async function runBehaviorGate({
       oracles.push({ id: oracle.id, status: 'not_run', reason: 'oracle_modified', exitCode: null });
       continue;
     }
-    let result;
-    try {
-      result = await runner(oracle.command, oracle.args, {
-        cwd,
-        signal,
-        env: workerEnvironment(),
-        secrets,
-        timeoutMs: oracle.timeoutMs,
-        allowFailure: true,
-      });
-    } catch (error) {
-      if (signal?.aborted || error.code === 'cancelled') throw error;
-      // A crashed or timed-out oracle proves nothing: it is a failure, not a pass.
-      const reason = ['timeout', 'ENOENT', 'EACCES', 'EPERM'].includes(error.code) ? error.code : 'execution_failed';
-      oracles.push({ id: oracle.id, status: 'failed', reason, exitCode: null });
-      findings.push({ rule: 'oracle_failed', file: null, detail: `${oracle.id}: ${reason}` });
-      continue;
+    const { receipt, detail } = await runOracle(oracle, { cwd, signal, secrets, runner, persist });
+    oracles.push(receipt);
+    if (receipt.status !== 'passed') findings.push({ rule: 'oracle_failed', file: null, detail });
+    // An oracle observes; one that changes the checked tree invalidates everything after it.
+    if (isClean && !(await isClean())) {
+      findings.push({ rule: 'oracle_dirty_worktree', file: null, detail: `${oracle.id} changed the checked worktree` });
+      break;
     }
-    const output = (result.stdout + result.stderr).slice(-24000);
-    const evidence = persist
-      ? await persist('oracle', {
-          id: oracle.id,
-          command: oracle.command,
-          args: oracle.args,
-          exitCode: result.code,
-          output,
-        })
-      : null;
-    oracles.push({
-      id: oracle.id,
-      status: result.code === 0 ? 'passed' : 'failed',
-      exitCode: result.code,
-      ...(evidence ? { outputPath: evidence.path, outputHash: evidence.sha256 } : {}),
-    });
-    if (result.code !== 0)
-      findings.push({
-        rule: 'oracle_failed',
-        file: null,
-        detail: `${oracle.id} exit ${result.code}: ${output.slice(-2000)}`,
-      });
   }
   return {
     schemaVersion: BEHAVIOR_GATE_VERSION,
@@ -340,8 +425,13 @@ export async function runBehaviorGate({
     configHash: verificationConfigHash(config.verification),
     status: findings.length ? 'failed' : 'passed',
     passed: findings.length === 0,
+    // Nothing a repair session could change: the run stops for a person instead of spending sessions.
+    repairable: findings.some(finding => !unrepairable.has(finding.rule)),
     policy,
     findings,
+    allowed,
+    warnings,
+    unchecked,
     oracles,
   };
 }
@@ -379,15 +469,17 @@ export function compareWithBaseline(baseline, results) {
     const base = before.get(key(row));
     const failed = row.exitCode !== 0,
       failedBefore = base ? base.exitCode !== 0 : null;
-    const classification = !base
-      ? 'no_baseline'
-      : failed
-        ? failedBefore
-          ? 'pre_existing'
-          : 'regression'
-        : failedBefore
-          ? 'fixed'
-          : 'unchanged';
+    // A baseline command that did not finish says nothing about the base.
+    const classification =
+      !base || base.exitCode === null
+        ? 'no_baseline'
+        : failed
+          ? failedBefore
+            ? 'pre_existing'
+            : 'regression'
+          : failedBefore
+            ? 'fixed'
+            : 'unchanged';
     return {
       kind: row.kind,
       command: row.command,

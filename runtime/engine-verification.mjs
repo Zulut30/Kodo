@@ -17,6 +17,10 @@ import { EngineExecution } from './engine-execution.mjs';
 import { contentHash, packSessionEvidence, evidencePrompt } from './engine-core.mjs';
 
 /** Checks, verification gates, review and repair stages. */
+/** The baseline, while it still describes the base of the run: a synchronized base makes it stale. */
+const currentBaseline = run =>
+  run.baseline?.status === 'complete' && run.baseline.headSha === run.baseSha ? run.baseline : null;
+
 /** The error of a failed check. Labelled against the baseline when one exists; still a failure. */
 function failedCheck(run, kind, result, comparison) {
   // Old defects are never ignored automatically: the label only tells which failure the change introduced.
@@ -108,6 +112,7 @@ export class EngineVerification extends EngineExecution {
       signal,
       secrets: this.secrets,
       persist: (kind, value) => this.persistEvidence(run, kind, value, { headSha }),
+      isClean: async () => (await inspectCurrentSource({ project: run.cwd, headSha })) === 'clean',
     });
     this.save(run);
     if ((await inspectCurrentSource({ project: run.cwd, headSha })) !== 'clean')
@@ -117,7 +122,8 @@ export class EngineVerification extends EngineExecution {
         new Error(
           `Behaviour gate failed; a review report cannot override it: ${JSON.stringify(redact(run.behavior.findings.slice(0, 20), this.secrets))}`,
         ),
-        { code: 'behavior_failed' },
+        // Only a person can fix a finding such as a required gate that the project disabled.
+        { code: run.behavior.repairable ? 'behavior_failed' : 'behavior_blocked' },
       );
   }
   async checks(run, signal) {
@@ -249,13 +255,13 @@ export class EngineVerification extends EngineExecution {
           outputPath: evidence.path,
           outputHash: evidence.sha256,
         });
-        const comparison = compareWithBaseline(run.baseline?.status === 'complete' ? run.baseline : null, results);
+        const comparison = compareWithBaseline(currentBaseline(run), results);
         if (comparison) run.checks.comparison = comparison;
         this.save(run);
         if (result.code !== 0) throw failedCheck(run, kind, result, comparison);
       }
     if (!run.config.commands.test.length) throw new Error('Не настроена команда проверки результата');
-    const comparison = compareWithBaseline(run.baseline?.status === 'complete' ? run.baseline : null, results);
+    const comparison = compareWithBaseline(currentBaseline(run), results);
     run.checks = {
       schemaVersion: 2,
       headSha,
@@ -440,7 +446,8 @@ export class EngineVerification extends EngineExecution {
       } catch (error) {
         if (signal?.aborted || this.store.getRun(run.id).cancelRequested)
           throw Object.assign(new Error('Запуск отменён'), { code: 'cancelled' });
-        if (['cancelled', 'quota', 'auth', 'lease_lost', 'evidence_integrity'].includes(error.code)) throw error;
+        if (['cancelled', 'quota', 'auth', 'lease_lost', 'evidence_integrity', 'behavior_blocked'].includes(error.code))
+          throw error;
         checkError = error;
       }
       const headSha = await git(run.cwd, ['rev-parse', 'HEAD']);

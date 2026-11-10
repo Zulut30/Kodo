@@ -225,14 +225,19 @@ test('A style change records the disabled UI gate as a gap; strictGates turns th
     ['strict', { strictGates: true }, 'blocked'],
   ])
     await t.test(name, async subtest => {
-      const { engine, run } = await project(subtest, {
+      const { services, engine, run } = await project(subtest, {
         files: { 'styles/app.css': 'a { color: red; }\n' },
-        config: { verification, repairRounds: 1 },
+        config: { verification, repairRounds: 3 },
         scopes: ['styles/app.css'],
         onWorker: call => write(call.cwd, 'styles/app.css', 'a { color: blue; }\n'),
       });
       const result = await engine.run(run.id);
       assert.equal(result.state, state, result.error?.message);
+      if (state === 'blocked') {
+        // Nobody but a person can enable a gate: no repair session is spent on it.
+        assert.equal(result.error.code, 'behavior_blocked');
+        assert.equal(services.calls.worker.filter(isRepair).length, 0);
+      }
       assert.deepEqual(result.behavior.policy, {
         risk: 'low',
         types: ['style'],
