@@ -602,13 +602,31 @@ function rustCases(source) {
   return cases;
 }
 
+/** Where the code continues after the block comment that opens at `index`. Kotlin comments nest. */
+function blockCommentEnd(source, index, nested) {
+  if (!nested) return commentEnd(source, index);
+  let depth = 0,
+    at = index;
+  while (at < source.length) {
+    if (source[at] === '/' && source[at + 1] === '*') {
+      depth++;
+      at += 2;
+    } else if (source[at] === '*' && source[at + 1] === '/') {
+      depth--;
+      at += 2;
+      if (depth === 0) return at;
+    } else at++;
+  }
+  return source.length;
+}
+
 /**
  * Java and Kotlin source as code only: string and character literals are
- * emptied, comments are removed. One pass, so the cost is linear whatever the
- * file holds.
+ * emptied, comments are removed. One pass over the text.
  * @param {string} source
+ * @param {boolean} kotlin Block comments nest.
  */
-function scanJava(source) {
+function scanJava(source, kotlin) {
   const length = source.length;
   let code = '',
     index = 0;
@@ -616,7 +634,7 @@ function scanJava(source) {
     const char = source[index],
       next = source[index + 1];
     if (char === '/' && (next === '/' || next === '*')) {
-      index = commentEnd(source, index);
+      index = next === '*' ? blockCommentEnd(source, index, kotlin) : commentEnd(source, index);
       code += ' ';
     } else if (char === '"' && source.startsWith('"""', index)) {
       // A text block or a raw string: it may span lines.
@@ -628,7 +646,7 @@ function scanJava(source) {
       index = source[end] === '"' ? end + 1 : end;
       code += '""';
     } else if (char === "'") {
-      // A character literal is a few characters long ('a', '\n', '\u0041'). The look-ahead is
+      // A character literal is a few characters long ('a', '\n', 'A'). The look-ahead is
       // bounded, so a file of apostrophes costs no more than its length; anything else stays as it is.
       let end = index + (next === '\\' ? 3 : 2);
       while (end <= index + 8 && end < length && source[end] !== "'" && source[end] !== '\n') end++;
@@ -643,28 +661,103 @@ function scanJava(source) {
   return code;
 }
 
-/**
- * `@Disabled` with its arguments, then only annotations and modifiers up to
- * `class` or `object`. Every repetition is bounded: the scan stays linear.
- */
-const javaClassOff =
-  /@(?:Disabled|Ignore)\b(?:\s*\([^()]{0,300}\))?(?:\s*@[\w.]+(?:\s*\([^()]{0,300}\))?|\s+(?:public|protected|private|internal|abstract|final|open|static|sealed|data|inner)){0,20}\s+(?:class|object)\b/;
-/** The annotations and modifiers that stand directly before a position, with only white space between them. */
-const javaOwn =
-  /(?:(?:@[\w.]+(?:\s*\([^()]{0,300}\))?|public|protected|private|internal|abstract|final|open|static|suspend|override)\s*){0,20}$/;
+const javaTests = new Set(['Test', 'ParameterizedTest', 'RepeatedTest']);
+const javaOffs = new Set(['Disabled', 'Ignore']);
+const isWord = char => char !== undefined && /[\w$]/.test(char);
+const isSpace = char => char !== undefined && /\s/.test(char);
+/** How far a name in backticks or a `<…>` list is looked for: both are short. */
+const JAVA_LOOKAHEAD = 200;
 
-/** Java and Kotlin tests. `@Disabled` on a class is read as covering every test of the file. */
-function javaCases(source) {
-  // String contents and comments are not code: a reason may hold `;`, a brace or the word `class`.
-  const code = scanJava(source);
-  const classOff = javaClassOff.test(code);
-  const own = index => javaOwn.exec(code.slice(Math.max(0, index - 400), index))[0];
-  return [
-    ...code.matchAll(/@(?:Test|ParameterizedTest|RepeatedTest)\b([\s\S]{0,300}?)\b(?:void|fun)\s+(\w+)\s*\(/g),
-  ].map(match => ({
-    name: match[2],
-    skipped: classOff || /@(?:Disabled|Ignore)\b/.test(own(match.index) + match[1]),
-  }));
+/**
+ * Java and Kotlin tests, read token by token in one pass; no pattern is
+ * matched against the text, so there is nothing to backtrack over.
+ *
+ * The annotations seen since the last `;`, `{`, `}` or declaration belong to
+ * the next `void name(` or `fun name(`: with `@Test` it is a case, with
+ * `@Disabled` or `@Ignore` a switched-off one. The same annotations before
+ * `class` or `object` are read as covering every test of the file.
+ * @param {string} source
+ * @param {boolean} kotlin
+ */
+function javaCases(source, kotlin) {
+  const code = scanJava(source, kotlin),
+    length = code.length,
+    cases = [];
+  let test = false,
+    off = false,
+    classOff = false,
+    last = '',
+    index = 0;
+  const forget = () => {
+    test = false;
+    off = false;
+  };
+  const afterSpace = at => {
+    while (isSpace(code[at])) at++;
+    return at;
+  };
+  const wordEnd = at => {
+    while (isWord(code[at])) at++;
+    return at;
+  };
+  /** The name that follows `void` or `fun`, with the position after it: `[name, at]`. */
+  const nameAt = from => {
+    let at = afterSpace(from);
+    if (code[at] === '<') {
+      // Type parameters: `fun <T> name(`.
+      const stop = Math.min(length, at + JAVA_LOOKAHEAD);
+      while (at < stop && code[at] !== '>') at++;
+      at = afterSpace(at + 1);
+    }
+    if (code[at] === '`') {
+      const stop = Math.min(length, at + JAVA_LOOKAHEAD);
+      let end = at + 1;
+      while (end < stop && code[end] !== '`' && code[end] !== '\n') end++;
+      return code[end] === '`' ? [code.slice(at + 1, end), end + 1] : ['', at + 1];
+    }
+    const end = wordEnd(at);
+    return [code.slice(at, end), Math.max(end, at)];
+  };
+  while (index < length) {
+    const char = code[index];
+    if (char === '@') {
+      // A qualified name or a Kotlin use-site target (`@field:Disabled`): the last part names the annotation.
+      let end = wordEnd(index + 1);
+      while ((code[end] === '.' || code[end] === ':') && isWord(code[end + 1])) end = wordEnd(end + 1);
+      let start = end;
+      while (start > index + 1 && isWord(code[start - 1])) start--;
+      const name = code.slice(start, end);
+      if (javaTests.has(name)) test = true;
+      else if (javaOffs.has(name)) off = true;
+      // Its arguments are not code of the class: skipped whole, whatever they hold.
+      const open = afterSpace(end);
+      if (code[open] === '(') {
+        const close = callEnd(code, open + 1);
+        index = close < 0 ? length : close + 1;
+      } else index = end;
+      last = '@';
+    } else if (isWord(char)) {
+      const end = wordEnd(index),
+        word = code.slice(index, end);
+      index = end;
+      if (word === 'void' || word === 'fun') {
+        const [name, at] = nameAt(end);
+        if (test && name && code[afterSpace(at)] === '(') cases.push({ name, skipped: off });
+        index = at;
+        forget();
+      } else if ((word === 'class' || word === 'object') && last !== '.' && last !== ':') {
+        if (off) classOff = true;
+        forget();
+      } else if (word === 'val' || word === 'var') forget();
+      // Modifiers, return types and other words between the annotations and the declaration keep them.
+      last = 'w';
+    } else {
+      if (char === ';' || char === '{' || char === '}') forget();
+      if (!isSpace(char)) last = char;
+      index++;
+    }
+  }
+  return classOff ? cases.map(item => ({ ...item, skipped: true })) : cases;
 }
 
 /**
@@ -684,7 +777,7 @@ function casesOf(file, source) {
     parsed = {
       cases: [...source.matchAll(/^func\s+(Test\w+)\s*\(/gm)].map(match => ({ name: match[1], skipped: false })),
     };
-  else if (language === 'java') parsed = { cases: javaCases(source) };
+  else if (language === 'java') parsed = { cases: javaCases(source, file.toLowerCase().endsWith('.kt')) };
   else return null;
   const code = parsed.code ?? source;
   return {

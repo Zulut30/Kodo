@@ -828,6 +828,8 @@ test('Scanning stays linear on input built to make a pattern rescan the file', a
     'src/test/java/DenseTest.java': `class DenseTest {\n${'  @Disabled @A @Test void same() {}\n'.repeat(size / 34)}}\n`,
     'src/test/java/QuotesTest.java': `class QuotesTest {\n  @Test\n  void kept() {}\n  String s = ${'\\"'.repeat(size / 2)};\n}\n`,
     'src/test/kotlin/ApostrophesTest.kt': `class ApostrophesTest {\n  @Test fun kept() {}\n}\n${"'\\".repeat(size / 2)}\n`,
+    'src/test/java/SplitTest.java': `class SplitTest {\n${`${'@xopenopenopen'.repeat(28)};\n  @Test void same() {}\n`.repeat(size / 420)}}\n`,
+    'src/test/java/DottedTest.java': `class DottedTest {\n${`${'@x.open'.repeat(56)};\n  @Test void same() {}\n`.repeat(size / 420)}}\n`,
   };
   const repo = repository(t, files);
   const head = repo.change(Object.fromEntries(Object.entries(files).map(([name, text]) => [name, `${text}\n`])));
@@ -1008,6 +1010,31 @@ test('Annotations and marks are read with their strings and their place', async 
     const { findings } = await testWeakening(head);
     assert.deepEqual(rules(findings), ['test_skipped:tests/test_classed.py']);
     assert.match(findings[0].detail, /switched off: "test_total", "test_empty"$/);
+  });
+  await t.test('kotlin: a name in backticks, a nested comment, an annotation with nested arguments', async s => {
+    const kotlin =
+      'class TotalTest {\n    @Test\n    @Timeout(value = seconds(5))\n    fun `adds two numbers`() = assertEquals(2, 1 + 1)\n\n' +
+      '    /* kept /* for later */ @Test fun old() {} */\n    @Test fun subtracts() = assertEquals(1, 2 - 1)\n}\n';
+    const repo = repository(s, { 'src/test/kotlin/TotalTest.kt': kotlin });
+    const head = repo.change({
+      'src/test/kotlin/TotalTest.kt': kotlin.replace(
+        '    @Test\n    @Timeout',
+        '    @Disabled\n    @Test\n    @Timeout',
+      ),
+    });
+    const { findings } = await testWeakening(head);
+    assert.deepEqual(rules(findings), ['test_skipped:src/test/kotlin/TotalTest.kt']);
+    assert.match(findings[0].detail, /switched off: "adds two numbers"$/);
+    const removed = repo.change({
+      'src/test/kotlin/TotalTest.kt': kotlin.replace(/ {4}@Test fun subtracts[^\n]*\n/, ''),
+    });
+    const gone = await testWeakening(removed);
+    assert.deepEqual(rules(gone.findings), ['tests_removed:src/test/kotlin/TotalTest.kt']);
+    assert.match(
+      gone.findings[0].detail,
+      /test cases removed: "subtracts"$/,
+      'the commented-out test was never a case',
+    );
   });
 });
 
