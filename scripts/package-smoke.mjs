@@ -21,14 +21,34 @@ async function smoke() {
     const env = workerEnvironment();
     const npmOptions = ['--userconfig', userConfig, '--cache', path.join(scratch, 'npm-cache')];
     const expected = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8'));
-    const packed = await execute('npm', ['pack', '--ignore-scripts', '--json', '--pack-destination', scratch, ...npmOptions], { cwd: root, env });
+    const packed = await execute(
+      'npm',
+      ['pack', '--ignore-scripts', '--json', '--pack-destination', scratch, ...npmOptions],
+      { cwd: root, env },
+    );
     const packages = JSON.parse(packed.stdout);
     assert.equal(packages.length, 1, 'pack must produce exactly one Kodo archive');
     const archiveName = packages[0].filename;
     assert.equal(path.basename(archiveName), archiveName, 'pack archive must stay in the temporary directory');
     const archive = path.join(scratch, archiveName);
-    const sha256 = createHash('sha256').update(await readFile(archive)).digest('hex');
-    await execute('npm', ['install', '--prefix', prefix, '--ignore-scripts', '--no-audit', '--no-fund', '--package-lock=false', archive, ...npmOptions], { cwd: scratch, env });
+    const sha256 = createHash('sha256')
+      .update(await readFile(archive))
+      .digest('hex');
+    await execute(
+      'npm',
+      [
+        'install',
+        '--prefix',
+        prefix,
+        '--ignore-scripts',
+        '--no-audit',
+        '--no-fund',
+        '--package-lock=false',
+        archive,
+        ...npmOptions,
+      ],
+      { cwd: scratch, env },
+    );
 
     const installedRoot = path.join(prefix, 'node_modules', ...expected.name.split('/'));
     const installed = JSON.parse(await readFile(path.join(installedRoot, 'package.json'), 'utf8'));
@@ -36,7 +56,10 @@ async function smoke() {
     assert.equal(installed.version, expected.version);
     const bin = path.resolve(installedRoot, installed.bin.kodo);
     const relativeBin = path.relative(installedRoot, bin);
-    assert.ok(relativeBin && !relativeBin.startsWith(`..${path.sep}`) && !path.isAbsolute(relativeBin), 'installed bin must belong to the package');
+    assert.ok(
+      relativeBin && !relativeBin.startsWith(`..${path.sep}`) && !path.isAbsolute(relativeBin),
+      'installed bin must belong to the package',
+    );
     assert.equal((await lstat(bin)).isFile(), true, 'installed package bin must be a regular file');
     const launcher = path.join(prefix, 'node_modules', '.bin', process.platform === 'win32' ? 'kodo.cmd' : 'kodo');
     await access(launcher);
@@ -55,19 +78,34 @@ async function smoke() {
     const policy = await import(pathToFileURL(path.join(installedRoot, 'runtime', 'skill-policy.mjs')).href);
     const { lock } = await policy.verifyDefaultSkillPins();
     const ids = new Set(catalog.map(component => component.id));
-    for (const id of [...policy.defaultSkillIds, 'skills/kodo-build-feature']) assert.ok(ids.has(id), `installed catalog missing ${id}`);
+    for (const id of [...policy.defaultSkillIds, 'skills/kodo-build-feature'])
+      assert.ok(ids.has(id), `installed catalog missing ${id}`);
     assert.equal(lock.components.length, 13);
-    console.log(JSON.stringify({
-      package: installed.name,
-      version: installed.version,
-      archive: archiveName,
-      sha256,
-      components: catalog.length,
-      defaultSkills: lock.components.length,
-      upstreamFiles: lock.components.reduce((count, component) => count + component.files.length, 0),
-      checks: ['npm pack', 'isolated install --ignore-scripts', 'installed package bin and launcher', 'installed CLI help', 'installed CLI validate --json', 'installed CLI list --json', 'installed default skill pins'],
-      passed: true
-    }, null, 2));
+    console.log(
+      JSON.stringify(
+        {
+          package: installed.name,
+          version: installed.version,
+          archive: archiveName,
+          sha256,
+          components: catalog.length,
+          defaultSkills: lock.components.length,
+          upstreamFiles: lock.components.reduce((count, component) => count + component.files.length, 0),
+          checks: [
+            'npm pack',
+            'isolated install --ignore-scripts',
+            'installed package bin and launcher',
+            'installed CLI help',
+            'installed CLI validate --json',
+            'installed CLI list --json',
+            'installed default skill pins',
+          ],
+          passed: true,
+        },
+        null,
+        2,
+      ),
+    );
   } finally {
     const resolved = await realpath(scratch);
     assert.equal(path.dirname(resolved), temporaryRoot, 'cleanup must remain directly inside the temporary directory');

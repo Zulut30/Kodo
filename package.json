@@ -13,8 +13,14 @@
   "scripts": {
     "start": "node cli/index.mjs",
     "validate": "node cli/index.mjs validate",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "lint": "oxlint --deny-warnings --report-unused-disable-directives .",
+    "typecheck": "node scripts/typecheck.mjs",
     "test": "node scripts/run-tests.mjs",
-    "check": "npm run validate && npm test"
+    "test:fast": "node scripts/run-tests.mjs --fast",
+    "test:coverage": "node scripts/run-tests.mjs --coverage",
+    "check": "npm run validate && npm run format:check && npm run lint && npm run typecheck && npm test"
   },
   "files": [
     "cli",
@@ -35,7 +41,13 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.32.2",
     "acorn": "8.15.0",
-    "ajv": "^8.17.1",
-    "smol-toml": "^1.9.1"
+    "ajv": "8.20.0",
+    "smol-toml": "1.9.1"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "oxlint": "1.91.0",
+    "prettier": "3.9.10",
+    "typescript": "7.0.2"
   }
 }

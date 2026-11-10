@@ -56,7 +56,7 @@ JSON, Git porcelain, `-z`/NUL, протоколы и любые данные д�
 
 Automatic8 отозван после полного локального check source `e69797cc…`: 20-минутный timeout и Director37 PASS/1 CANCELLED (`testTimeoutFailure`, исходный pause deadline60s). Подвыборка тех же30 cases на `6dfedcad…` дала при4 180896ms, при8 113540ms, оба30/30 PASS, но не доказала безопасность default. Восстановлен исходный default4 barrier; удалены только новые obsolete selector tests. Regression с mock high resources и настоящими PID дала RED `8 !== 4` → GREEN; explicit8 PID barrier/диапазон1–8 сохранены. Discovery/порядок, старые assertions/timeouts, frozen oracles, общий deadline, native capacity5, saved mode/model/budgets и gates прежние.
 
-Dev CLI добавляет core Git в PATH runner/children только после same-install native canonical file checks и bounded совпадающих `--version`/`--exec-path` probes. Custom/ранний symlink/неизвестный launcher, ошибки и mismatch дают неизменённый fallback. Global PATH/auth/config и runtime gitBoundary прежние; helper не поставляется в пакете. Один неизменённый pause case: 255 Git заняли25.722s из31.351s; тот же core —255 Git17.050s из23.071s, обаPASS. Это startup hot path observation, не whole-suite/model benchmark; полный текущий check и fresh gates/review/CI выполняет Root. [Контракт и scoped evidence](WINDOWS-TEST-SPEED.md).
+Dev CLI добавляет core Git в PATH runner/children только после same-install native canonical file checks и bounded совпадающих `--version`/`--exec-path` probes. Custom/ранний symlink/неизвестный launcher, ошибки и mismatch дают неизменённый fallback. Global PATH/auth/config и runtime gitBoundary прежние; helper не поставляется в пакете. Один неизменённый pause case: 255 Git заняли25.722s из31.351s; тот же core —255 Git17.050s из23.071s, обаPASS. Это startup hot path observation, не whole-suite/model benchmark; полный текущий check и fresh gates/review/CI выполняет Root. [Контракт и scoped evidence](archive/WINDOWS-TEST-SPEED.md).
 
 Ниже — исторический контекст пробы этапа05, а не текущий результат ресурсной коррекции06. Та проба с безусловным потолком8 была отменена после неуспешного полного прогона; причинность потолка не установлена.
 
@@ -89,12 +89,12 @@ rows и пробрасывает исходную ошибку. `runCi` испо
 для очищенных 4096-byte UTF-8 tails, оставаясь blocked/incomplete. Отсутствие
 вывода/exit не становится PASS. Пределы capture/deadlines, file concurrency4,
 native capacity5, mode/model и меньшие сохранённые бюджеты не расширены.
-[Точные поля, единицы лимитов, pins и scoped evidence](WINDOWS-TEST-SPEED.md).
+[Точные поля, единицы лимитов, pins и scoped evidence](archive/WINDOWS-TEST-SPEED.md).
 
 По сообщению Root, frozen composite на clean code `0ee548b…` до docs прошёл
 23/23, 0 fail/skip/cancel, 36995.3723 ms, Node24.19/Windows; source/head не изменились.
 Это PRE-DOCS scoped component proof, не полный/current-future-HEAD reuse или общий
-PASS. Точная receipt и TAP hash — в [Windows evidence](WINDOWS-TEST-SPEED.md).
+PASS. Точная receipt и TAP hash — в [Windows evidence](archive/WINDOWS-TEST-SPEED.md).
 Сопоставимый AFTER одного cost case ещё ожидается от Root после H/native boundary;
 нового замера ускорения нет. Полный check, Windows/Linux CI,
 fresh enabled security и final independent review остаются pending; UI disabled
@@ -104,7 +104,7 @@ fresh enabled security и final independent review остаются pending; UI 
 
 ## Что измерено локально
 
-Квитанция `efficiency-measurements.json` от 3 ноября 2026 года: одинаковые сохранённые входы, одинаковые project/root paths для policy, фактические UTF-8 длины, `modelsCalled:0`. Это отдельные части начального контекста/вывода. Исторический inline baseline plan/review не включает новые метаданные; он не равен `contextOriginalBytes` нового runtime. Приватные источники и границы проверок перечислены в [VALIDATION](VALIDATION.md#контекст-очередь-и-rtk).
+Квитанция `efficiency-measurements.json` от 3 ноября 2026 года: одинаковые сохранённые входы, одинаковые project/root paths для policy, фактические UTF-8 длины, `modelsCalled:0`. Это отдельные части начального контекста/вывода. Исторический inline baseline plan/review не включает новые метаданные; он не равен `contextOriginalBytes` нового runtime. Приватные источники и границы проверок перечислены в [VALIDATION](archive/VALIDATION.md#контекст-очередь-и-rtk).
 
 | Часть | До, байт | После, байт | Сокращение |
 | --- | ---: | ---: | ---: |

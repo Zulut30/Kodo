@@ -1,8 +1,12 @@
 const sets = ['milestones', 'epics', 'tasks', 'currentAttempts', 'riskApprovals'];
 const accepted = status => status === 'accepted' || status === 'released';
-const compareId = (a, b) => a < b ? -1 : a > b ? 1 : 0;
-const invalid = () => Object.assign(new Error('Invalid project horizon input or pure contract ports'), { code: 'invalid_project_horizon' });
-const timestamp = value => typeof value === 'string' && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{3})?Z$/.test(value) && Number.isFinite(Date.parse(value));
+const compareId = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+const invalid = () =>
+  Object.assign(new Error('Invalid project horizon input or pure contract ports'), { code: 'invalid_project_horizon' });
+const timestamp = value =>
+  typeof value === 'string' &&
+  /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{3})?Z$/.test(value) &&
+  Number.isFinite(Date.parse(value));
 const synchronous = value => {
   if (value && typeof value.then === 'function') throw invalid();
   return value;
@@ -20,13 +24,21 @@ const synchronous = value => {
  * All ports are synchronous pure A contracts, explicitly injected so importing
  * the planner never loads absent siblings or introduces default I/O.
  */
+// oxlint-disable-next-line max-lines-per-function, complexity -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
 export function planProjectHorizon(input, ports) {
   const contracts = ports?.contracts;
-  if (!Array.isArray(ports?.knownValues) || ports.knownValues.some(value => typeof value !== 'string')
-    || !['assertDirectorSafe', 'normalizeDirectorRecord', 'buildDirectorTaskInput'].every(key => typeof contracts?.[key] === 'function')) throw invalid();
+  if (
+    !Array.isArray(ports?.knownValues) ||
+    ports.knownValues.some(value => typeof value !== 'string') ||
+    !['assertDirectorSafe', 'normalizeDirectorRecord', 'buildDirectorTaskInput'].every(
+      key => typeof contracts?.[key] === 'function',
+    )
+  )
+    throw invalid();
   const options = { knownValues: ports.knownValues };
   synchronous(contracts.assertDirectorSafe(input, options));
-  if (!input || !Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > 24 || !timestamp(input.now)) throw invalid();
+  if (!input || !Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > 24 || !timestamp(input.now))
+    throw invalid();
   let snapshot, snapshotFailure;
   try {
     snapshot = synchronous(contracts.normalizeDirectorRecord('snapshot', input.snapshot, options));
@@ -38,20 +50,49 @@ export function planProjectHorizon(input, ports) {
     snapshot = input.snapshot;
     snapshotFailure = 'snapshot_invalid:project_revision';
   }
-  if (!snapshot || snapshot.schemaVersion !== 1 || !snapshot.project || !Number.isSafeInteger(snapshot.revision)
-    || snapshot.revision < 1 || sets.some(key => !Array.isArray(snapshot[key])) || snapshot.tasks.length > 1000) throw invalid();
+  if (
+    !snapshot ||
+    snapshot.schemaVersion !== 1 ||
+    !snapshot.project ||
+    !Number.isSafeInteger(snapshot.revision) ||
+    snapshot.revision < 1 ||
+    sets.some(key => !Array.isArray(snapshot[key])) ||
+    snapshot.tasks.length > 1000
+  )
+    throw invalid();
   const { project, tasks } = snapshot;
   const byId = new Map();
   for (const task of tasks) {
-    if (!task || typeof task.id !== 'string' || !task.id || byId.has(task.id) || !Array.isArray(task.dependsOn)
-      || !Number.isSafeInteger(task.estimatedEffort) || task.estimatedEffort < 1
-      || !Number.isInteger(task.priority) || task.priority < 0 || task.priority > 100
-      || !Number.isInteger(task.userValue) || task.userValue < 0 || task.userValue > 5
-      || !Number.isInteger(task.risk) || task.risk < 0 || task.risk > 5) throw invalid();
+    if (
+      !task ||
+      typeof task.id !== 'string' ||
+      !task.id ||
+      byId.has(task.id) ||
+      !Array.isArray(task.dependsOn) ||
+      !Number.isSafeInteger(task.estimatedEffort) ||
+      task.estimatedEffort < 1 ||
+      !Number.isInteger(task.priority) ||
+      task.priority < 0 ||
+      task.priority > 100 ||
+      !Number.isInteger(task.userValue) ||
+      task.userValue < 0 ||
+      task.userValue > 5 ||
+      !Number.isInteger(task.risk) ||
+      task.risk < 0 ||
+      task.risk > 5
+    )
+      throw invalid();
     byId.set(task.id, task);
   }
-  const result = { schemaVersion: 1, projectId: project.projectId, revision: snapshot.revision,
-    taskIds: [], blocked: [], order: [], dryRun: true };
+  const result = {
+    schemaVersion: 1,
+    projectId: project.projectId,
+    revision: snapshot.revision,
+    taskIds: [],
+    blocked: [],
+    order: [],
+    dryRun: true,
+  };
   const finish = () => {
     synchronous(contracts.assertDirectorSafe(result, options));
     return result;
@@ -66,19 +107,35 @@ export function planProjectHorizon(input, ports) {
   for (const key of sets) {
     const count = snapshot.completeness?.[key];
     // A coherent declaration of truncation is not a complete planning input.
-    if (count?.complete === false && Number.isSafeInteger(count.total) && Number.isSafeInteger(count.returned)
-      && count.returned === snapshot[key].length && count.total > count.returned) throw invalid();
-    if (!count || count.complete !== true || !Number.isSafeInteger(count.total) || !Number.isSafeInteger(count.returned)
-      || count.total !== count.returned || count.returned !== snapshot[key].length) globalReasons.push('snapshot_incomplete:' + key);
+    if (
+      count?.complete === false &&
+      Number.isSafeInteger(count.total) &&
+      Number.isSafeInteger(count.returned) &&
+      count.returned === snapshot[key].length &&
+      count.total > count.returned
+    )
+      throw invalid();
+    if (
+      !count ||
+      count.complete !== true ||
+      !Number.isSafeInteger(count.total) ||
+      !Number.isSafeInteger(count.returned) ||
+      count.total !== count.returned ||
+      count.returned !== snapshot[key].length
+    )
+      globalReasons.push('snapshot_incomplete:' + key);
   }
   if (snapshot.revision !== project.revision) globalReasons.push('snapshot_revision_mismatch');
   const milestones = new Map(snapshot.milestones.map(value => [value.id, value]));
   const epics = new Map(snapshot.epics.map(value => [value.id, value]));
-  if (milestones.size !== snapshot.milestones.length || epics.size !== snapshot.epics.length) globalReasons.push('snapshot_duplicate_parent');
+  if (milestones.size !== snapshot.milestones.length || epics.size !== snapshot.epics.length)
+    globalReasons.push('snapshot_duplicate_parent');
   for (const key of ['milestones', 'epics', 'tasks', 'currentAttempts', 'riskApprovals']) {
-    if (snapshot[key].some(value => value.projectId !== project.projectId)) globalReasons.push('snapshot_project_mismatch');
+    if (snapshot[key].some(value => value.projectId !== project.projectId))
+      globalReasons.push('snapshot_project_mismatch');
   }
-  for (const epic of epics.values()) if (!milestones.has(epic.milestoneId)) globalReasons.push('milestone_missing:' + epic.milestoneId);
+  for (const epic of epics.values())
+    if (!milestones.has(epic.milestoneId)) globalReasons.push('milestone_missing:' + epic.milestoneId);
   for (const task of tasks) if (!epics.has(task.epicId)) globalReasons.push('epic_missing:' + task.epicId);
   if (globalReasons.length) return allBlocked(globalReasons);
 
@@ -102,13 +159,17 @@ export function planProjectHorizon(input, ports) {
     }
   }
   if (topological.length !== tasks.length) return allBlocked(['dependency_cycle']);
-  const path = new Map(), unaccepted = new Map();
+  const path = new Map(),
+    unaccepted = new Map();
   for (const id of topological) {
     // Retain one stable witness of an unsatisfied transitive prerequisite.
-    const witnesses = byId.get(id).dependsOn.flatMap(parent => [
-      ...(!accepted(byId.get(parent).status) ? [parent] : []),
-      ...(unaccepted.has(parent) ? [unaccepted.get(parent)] : [])
-    ]).sort(compareId);
+    const witnesses = byId
+      .get(id)
+      .dependsOn.flatMap(parent => [
+        ...(!accepted(byId.get(parent).status) ? [parent] : []),
+        ...(unaccepted.has(parent) ? [unaccepted.get(parent)] : []),
+      ])
+      .sort(compareId);
     if (witnesses.length) unaccepted.set(id, witnesses[0]);
   }
   for (const id of [...topological].reverse()) {
@@ -117,16 +178,29 @@ export function planProjectHorizon(input, ports) {
     // Individual efforts are safe integers; a whole path can exceed that range.
     path.set(id, (accepted(byId.get(id).status) ? 0n : BigInt(byId.get(id).estimatedEffort)) + downstream);
   }
-  const ranked = [...tasks].sort((a, b) => compareId(path.get(b.id), path.get(a.id))
-    || b.priority - a.priority || b.userValue - a.userValue || b.risk - a.risk
-    || a.estimatedEffort - b.estimatedEffort || compareId(a.id, b.id));
+  const ranked = [...tasks].sort(
+    (a, b) =>
+      compareId(path.get(b.id), path.get(a.id)) ||
+      b.priority - a.priority ||
+      b.userValue - a.userValue ||
+      b.risk - a.risk ||
+      a.estimatedEffort - b.estimatedEffort ||
+      compareId(a.id, b.id),
+  );
   result.order = ranked.map(task => task.id);
   if (!Array.isArray(input.availability) || input.availability.length > 1000) throw invalid();
   const availability = new Map();
   for (const row of input.availability) {
-    if (!row || Object.keys(row).sort().join(',') !== 'available,interfacesVerified,reason,taskId'
-      || !byId.has(row.taskId) || availability.has(row.taskId) || typeof row.available !== 'boolean'
-      || typeof row.interfacesVerified !== 'boolean' || !(row.reason === null || typeof row.reason === 'string')) throw invalid();
+    if (
+      !row ||
+      Object.keys(row).sort().join(',') !== 'available,interfacesVerified,reason,taskId' ||
+      !byId.has(row.taskId) ||
+      availability.has(row.taskId) ||
+      typeof row.available !== 'boolean' ||
+      typeof row.interfacesVerified !== 'boolean' ||
+      !(row.reason === null || typeof row.reason === 'string')
+    )
+      throw invalid();
     availability.set(row.taskId, row);
   }
   const attempts = new Map();
@@ -142,15 +216,25 @@ export function planProjectHorizon(input, ports) {
   for (const task of ranked) {
     const reasons = [];
     if (project.paused) reasons.push('project_paused');
-    if (!['proposed', 'ready', 'running', 'verifying', 'integrated'].includes(project.status)) reasons.push('project_' + project.status);
-    const epic = epics.get(task.epicId), milestone = milestones.get(epic.milestoneId);
-    if (['blocked', 'failed', 'cancelled', 'accepted', 'released'].includes(epic.status)) reasons.push('epic_' + epic.status);
-    if (['blocked', 'failed', 'cancelled', 'accepted', 'released'].includes(milestone.status)) reasons.push('milestone_' + milestone.status);
+    if (!['proposed', 'ready', 'running', 'verifying', 'integrated'].includes(project.status))
+      reasons.push('project_' + project.status);
+    const epic = epics.get(task.epicId),
+      milestone = milestones.get(epic.milestoneId);
+    if (['blocked', 'failed', 'cancelled', 'accepted', 'released'].includes(epic.status))
+      reasons.push('epic_' + epic.status);
+    if (['blocked', 'failed', 'cancelled', 'accepted', 'released'].includes(milestone.status))
+      reasons.push('milestone_' + milestone.status);
     if (!['proposed', 'ready'].includes(task.status)) reasons.push('task_' + task.status);
     if (unaccepted.has(task.id)) reasons.push('dependency_not_accepted:' + unaccepted.get(task.id));
     const attempt = attempts.get(task.id);
-    if (attempt) reasons.push(attempt.taskRevision !== task.revision ? 'attempt_revision_mismatch'
-      : ['blocked', 'failed', 'cancelled'].includes(attempt.status) ? 'retry_required' : 'attempt_exists');
+    if (attempt)
+      reasons.push(
+        attempt.taskRevision !== task.revision
+          ? 'attempt_revision_mismatch'
+          : ['blocked', 'failed', 'cancelled'].includes(attempt.status)
+            ? 'retry_required'
+            : 'attempt_exists',
+      );
     // No required interfaces is valid; availability must still verify that set.
     if (!Array.isArray(task.interfaceRefs)) reasons.push('interfaces_missing');
     const row = availability.get(task.id);
@@ -161,9 +245,16 @@ export function planProjectHorizon(input, ports) {
     }
     if (task.riskApprovalRequired) {
       const approval = approvals.get(task.id);
-      if (!approval || approval.projectId !== project.projectId || approval.taskRevision !== task.revision
-        || !timestamp(approval.approvedAt) || Date.parse(approval.approvedAt) > Date.parse(input.now)
-        || !approval.actor?.trim() || !approval.reason?.trim()) reasons.push('risk_approval_required');
+      if (
+        !approval ||
+        approval.projectId !== project.projectId ||
+        approval.taskRevision !== task.revision ||
+        !timestamp(approval.approvedAt) ||
+        Date.parse(approval.approvedAt) > Date.parse(input.now) ||
+        !approval.actor?.trim() ||
+        !approval.reason?.trim()
+      )
+        reasons.push('risk_approval_required');
     }
     if (reasons.length === 0) {
       try {
@@ -173,7 +264,8 @@ export function planProjectHorizon(input, ports) {
         // projection includes immutable project context, never just Task fields.
         if (Buffer.byteLength(text, 'utf8') > 12000) reasons.push('split_required');
       } catch (error) {
-        if (['project_task_too_large', 'task_contract_too_large', 'split_required'].includes(error?.code)) reasons.push('split_required');
+        if (['project_task_too_large', 'task_contract_too_large', 'split_required'].includes(error?.code))
+          reasons.push('split_required');
         else throw error;
       }
     }

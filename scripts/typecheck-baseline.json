@@ -1,0 +1,806 @@
+[
+  {
+    "file": "runtime/architecture-cli.mjs",
+    "code": "TS2353",
+    "message": "Object literal may only specify known properties, and 'env' does not exist in type '{ allowFailure?: boolean; maxOutputBytes?: number; secrets?: {}; timeoutMs?: number; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/architecture-policy.mjs",
+    "code": "TS2339",
+    "message": "Property 'code' does not exist on type 'Error'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/benchmark.mjs",
+    "code": "TS2739",
+    "message": "Type '{ command: string; args: string[]; env: { [k: string]: string; }; timeoutMs: number; }' is missing the following properties from type '{ args?: any[]; command: any; cwd: any; env?: ProcessEnv; input?: string; maxOutputBytes?: number; onLine: any; signal: any; timeoutMs?: number; }': cwd, onLine, signal",
+    "count": 1
+  },
+  {
+    "file": "runtime/benchmark.mjs",
+    "code": "TS2810",
+    "message": "Expected 1 argument, but got 0. 'new Promise()' needs a JSDoc hint to produce a 'resolve' that can be called without arguments.",
+    "count": 1
+  },
+  {
+    "file": "runtime/ci-cli.mjs",
+    "code": "TS2353",
+    "message": "Object literal may only specify known properties, and 'headSha' does not exist in type '{ cwd?: string; runner?: (command: string, args?: string[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: CommandOptions) => Promise<CommandResult>; secrets?: {}; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/ci-profiler.mjs",
+    "code": "TS2339",
+    "message": "Property 'command' does not exist on type '{ args?: undefined[]; cwd?: string; env?: ProcessEnv; evidenceDir?: string; redactions?: {}; timeoutMs?: number; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/ci-profiler.mjs",
+    "code": "TS2339",
+    "message": "Property 'phase' does not exist on type '{ args?: undefined[]; cwd?: string; env?: ProcessEnv; evidenceDir?: string; redactions?: {}; timeoutMs?: number; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/ci-profiler.mjs",
+    "code": "TS2339",
+    "message": "Property 'signal' does not exist on type '{ args?: undefined[]; cwd?: string; env?: ProcessEnv; evidenceDir?: string; redactions?: {}; timeoutMs?: number; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/ci-profiler.mjs",
+    "code": "TS2339",
+    "message": "Property 'tier' does not exist on type '{ args?: undefined[]; cwd?: string; env?: ProcessEnv; evidenceDir?: string; redactions?: {}; timeoutMs?: number; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/ci-profiler.mjs",
+    "code": "TS2353",
+    "message": "Object literal may only specify known properties, and 'cwd' does not exist in type '{ allowFailure?: boolean; maxOutputBytes?: number; secrets?: {}; timeoutMs?: number; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/ci-profiler.mjs",
+    "code": "TS2353",
+    "message": "Object literal may only specify known properties, and 'env' does not exist in type '{ allowFailure?: boolean; maxOutputBytes?: number; secrets?: {}; timeoutMs?: number; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/cli.mjs",
+    "code": "TS2345",
+    "message": "Argument of type 'SQLOutputValue' is not assignable to parameter of type 'string'.\nType 'number' is not assignable to type 'string'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/cli.mjs",
+    "code": "TS2353",
+    "message": "Object literal may only specify known properties, and 'headSha' does not exist in type '{ cwd?: string; runner?: (command: string, args?: string[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: CommandOptions) => Promise<CommandResult>; secrets?: {}; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/cli.mjs",
+    "code": "TS2353",
+    "message": "Object literal may only specify known properties, and 'planFile' does not exist in type '{ prepare?: boolean; resumeCancelled?: boolean; retryFailed?: boolean; }'.",
+    "count": 2
+  },
+  {
+    "file": "runtime/config.mjs",
+    "code": "TS2339",
+    "message": "Property 'executionMode' does not exist on type '{ schemaVersion: number; repository: any; baseBranch: string; client: string; primaryModel: any; concurrency: number; repairRounds: number; researchBudget: number; uiVerification: { enabled: any; cases: any[]; autoInstall: any; maxSteps: any; timeoutMs: any; }; ... 5 more ...; delivery: any; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/config.mjs",
+    "code": "TS2339",
+    "message": "Property 'maxTasks' does not exist on type '{ schemaVersion: number; repository: any; baseBranch: string; client: string; primaryModel: any; concurrency: number; repairRounds: number; researchBudget: number; uiVerification: { enabled: any; cases: any[]; autoInstall: any; maxSteps: any; timeoutMs: any; }; ... 5 more ...; delivery: any; }'.",
+    "count": 4
+  },
+  {
+    "file": "runtime/context-pack.mjs",
+    "code": "TS2339",
+    "message": "Property 'analysis' does not exist on type '{}'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/context-pack.mjs",
+    "code": "TS2339",
+    "message": "Property 'analysisPath' does not exist on type '{}'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/context-pack.mjs",
+    "code": "TS2339",
+    "message": "Property 'baseSha' does not exist on type '{}'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/context-pack.mjs",
+    "code": "TS2339",
+    "message": "Property 'changedPaths' does not exist on type '{}'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/context-pack.mjs",
+    "code": "TS2339",
+    "message": "Property 'checks' does not exist on type '{}'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/context-pack.mjs",
+    "code": "TS2339",
+    "message": "Property 'diff' does not exist on type '{}'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/context-pack.mjs",
+    "code": "TS2339",
+    "message": "Property 'diffStat' does not exist on type '{}'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/context-pack.mjs",
+    "code": "TS2339",
+    "message": "Property 'evidencePaths' does not exist on type '{}'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/context-pack.mjs",
+    "code": "TS2339",
+    "message": "Property 'headSha' does not exist on type '{}'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/context-pack.mjs",
+    "code": "TS2339",
+    "message": "Property 'plan' does not exist on type '{}'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/context-pack.mjs",
+    "code": "TS2339",
+    "message": "Property 'research' does not exist on type '{}'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/context-pack.mjs",
+    "code": "TS2339",
+    "message": "Property 'researchPath' does not exist on type '{}'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/contracts.mjs",
+    "code": "TS2351",
+    "message": "This expression is not constructable.\nType 'typeof import(\"<root>/node_modules/ajv/dist/ajv\")' has no construct signatures.",
+    "count": 1
+  },
+  {
+    "file": "runtime/delivery-process.mjs",
+    "code": "TS2339",
+    "message": "Property 'cwd' does not exist on type '{ allowFailure?: boolean; maxOutputBytes?: number; secrets?: {}; timeoutMs?: number; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/delivery-process.mjs",
+    "code": "TS2339",
+    "message": "Property 'env' does not exist on type '{ allowFailure?: boolean; maxOutputBytes?: number; secrets?: {}; timeoutMs?: number; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/delivery-process.mjs",
+    "code": "TS2339",
+    "message": "Property 'signal' does not exist on type '{ allowFailure?: boolean; maxOutputBytes?: number; secrets?: {}; timeoutMs?: number; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/delivery-process.mjs",
+    "code": "TS2538",
+    "message": "Type 'symbol' cannot be used as an index type.",
+    "count": 4
+  },
+  {
+    "file": "runtime/delivery-process.mjs",
+    "code": "TS2810",
+    "message": "Expected 1 argument, but got 0. 'new Promise()' needs a JSDoc hint to produce a 'resolve' that can be called without arguments.",
+    "count": 1
+  },
+  {
+    "file": "runtime/delivery-release.mjs",
+    "code": "TS2741",
+    "message": "Property 'expectedSha' is missing in type '{ tag: string; }' but required in type '{ expectedSha: any; tag: any; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/engine-core.mjs",
+    "code": "TS2339",
+    "message": "Property 'binding' does not exist on type '{}'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/engine-core.mjs",
+    "code": "TS2339",
+    "message": "Property 'executionMode' does not exist on type '{ schemaVersion: number; repository: any; baseBranch: string; client: string; primaryModel: any; concurrency: number; repairRounds: number; researchBudget: number; uiVerification: { enabled: any; cases: any[]; autoInstall: any; maxSteps: any; timeoutMs: any; }; ... 5 more ...; delivery: any; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/engine-core.mjs",
+    "code": "TS2339",
+    "message": "Property 'gates' does not exist on type '{ secrets?: {}; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/engine-core.mjs",
+    "code": "TS2339",
+    "message": "Property 'installRun' does not exist on type '{}'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/engine-core.mjs",
+    "code": "TS2339",
+    "message": "Property 'nodeContext' does not exist on type '{ secrets?: {}; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/engine-core.mjs",
+    "code": "TS2339",
+    "message": "Property 'store' does not exist on type '{ delivery?: { deliver: (options: any) => Promise<any>; releasePackage: (options: any) => Promise<any>; prepareReleaseVersion: (options: any) => Promise<{ version: any; changed: boolean; files: any[]; }>; reconcileDelivery: (options: any) => Promise<...>; }; ... 6 more ...; tools?: {}; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/engine-core.mjs",
+    "code": "TS2353",
+    "message": "Object literal may only specify known properties, and 'contractPath' does not exist in type '{ secrets?: {}; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/engine-core.mjs",
+    "code": "TS2353",
+    "message": "Object literal may only specify known properties, and 'project' does not exist in type '{ root?: string; task?: string; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/engine-core.mjs",
+    "code": "TS2538",
+    "message": "Type 'unique symbol' cannot be used as an index type.",
+    "count": 1
+  },
+  {
+    "file": "runtime/engine-core.mjs",
+    "code": "TS2554",
+    "message": "Expected 0 arguments, but got 1.",
+    "count": 1
+  },
+  {
+    "file": "runtime/engine-core.mjs",
+    "code": "TS2739",
+    "message": "Type '{ project: any; snapshotCwd: any; ownedCwds: any[]; task: any; }' is missing the following properties from type '{ contextPath?: any; now: any; ownedCwds: any; project: any; snapshotCwd?: any; subject: any; task?: string; }': now, subject",
+    "count": 1
+  },
+  {
+    "file": "runtime/engine-core.mjs",
+    "code": "TS2810",
+    "message": "Expected 1 argument, but got 0. 'new Promise()' needs a JSDoc hint to produce a 'resolve' that can be called without arguments.",
+    "count": 1
+  },
+  {
+    "file": "runtime/engine-execution.mjs",
+    "code": "TS2339",
+    "message": "Property 'stderr' does not exist on type 'CommandResult | { code: number; }'.\nProperty 'stderr' does not exist on type '{ code: number; }'.",
+    "count": 2
+  },
+  {
+    "file": "runtime/engine-execution.mjs",
+    "code": "TS2353",
+    "message": "Object literal may only specify known properties, and 'nodeContext' does not exist in type '{ secrets?: {}; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/engine-planning.mjs",
+    "code": "TS2339",
+    "message": "Property 'assessTask' does not exist on type 'typeof import(\"<root>/runtime/providers\")'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/engine-planning.mjs",
+    "code": "TS2353",
+    "message": "Object literal may only specify known properties, and 'signal' does not exist in type '{ task: string; models: any[]; node: any; attempt?: number; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/engine-verification.mjs",
+    "code": "TS2353",
+    "message": "Object literal may only specify known properties, and 'gates' does not exist in type '{ secrets?: {}; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/engine.mjs",
+    "code": "TS2339",
+    "message": "Property 'planFile' does not exist on type '{ prepare?: boolean; resumeCancelled?: boolean; retryFailed?: boolean; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/engine.mjs",
+    "code": "TS2339",
+    "message": "Property 'signal' does not exist on type '{ prepare?: boolean; resumeCancelled?: boolean; retryFailed?: boolean; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/engine.mjs",
+    "code": "TS2353",
+    "message": "Object literal may only specify known properties, and 'store' does not exist in type '{ delivery?: { deliver: (options: any) => Promise<any>; releasePackage: (options: any) => Promise<any>; prepareReleaseVersion: (options: any) => Promise<{ version: any; changed: boolean; files: any[]; }>; reconcileDelivery: (options: any) => Promise<...>; }; ... 6 more ...; tools?: {}; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/knowledge-cli.mjs",
+    "code": "TS2353",
+    "message": "Object literal may only specify known properties, and 'evaluation' does not exist in type '{ maxBytes?: number; task?: string; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/knowledge-context.mjs",
+    "code": "TS2339",
+    "message": "Property 'evaluation' does not exist on type '{ maxBytes?: number; task?: string; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/knowledge-refresh.mjs",
+    "code": "TS2353",
+    "message": "Object literal may only specify known properties, and 'store' does not exist in type '{ delivery?: { deliver: (options: any) => Promise<any>; releasePackage: (options: any) => Promise<any>; prepareReleaseVersion: (options: any) => Promise<{ version: any; changed: boolean; files: any[]; }>; reconcileDelivery: (options: any) => Promise<...>; }; ... 6 more ...; tools?: {}; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/metrics.mjs",
+    "code": "TS2339",
+    "message": "Property 'durationMs' does not exist on type '{}'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/metrics.mjs",
+    "code": "TS2339",
+    "message": "Property 'usage' does not exist on type '{}'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/process.mjs",
+    "code": "TS2339",
+    "message": "Property 'code' does not exist on type 'Error'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/project-cli.mjs",
+    "code": "TS2353",
+    "message": "Object literal may only specify known properties, and 'repo' does not exist in type '{ clock?: () => string; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/project-cli.mjs",
+    "code": "TS2365",
+    "message": "Operator '<' cannot be applied to types 'number' and 'string | number | boolean'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/project-cli.mjs",
+    "code": "TS2365",
+    "message": "Operator '>' cannot be applied to types 'number' and 'string | number | boolean'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/project-contracts.mjs",
+    "code": "TS2739",
+    "message": "Type '{ [k: string]: any; }' is missing the following properties from type '{ epics: any; milestones: any; tasks: any; }': epics, milestones, tasks",
+    "count": 2
+  },
+  {
+    "file": "runtime/project-director.mjs",
+    "code": "TS2339",
+    "message": "Property 'contracts' does not exist on type '{}'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/project-director.mjs",
+    "code": "TS2339",
+    "message": "Property 'engine' does not exist on type '{ clock?: () => string; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/project-director.mjs",
+    "code": "TS2339",
+    "message": "Property 'engine' does not exist on type '{}'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/project-director.mjs",
+    "code": "TS2339",
+    "message": "Property 'evaluator' does not exist on type '{ clock?: () => string; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/project-director.mjs",
+    "code": "TS2339",
+    "message": "Property 'evaluator' does not exist on type '{}'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/project-director.mjs",
+    "code": "TS2339",
+    "message": "Property 'planner' does not exist on type '{ clock?: () => string; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/project-director.mjs",
+    "code": "TS2339",
+    "message": "Property 'repo' does not exist on type '{ clock?: () => string; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/project-director.mjs",
+    "code": "TS2339",
+    "message": "Property 'store' does not exist on type '{}'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/project-store.mjs",
+    "code": "TS2339",
+    "message": "Property 'authorizeTransition' does not exist on type '{}'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/project-store.mjs",
+    "code": "TS2339",
+    "message": "Property 'contracts' does not exist on type '{}'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/project-store.mjs",
+    "code": "TS2339",
+    "message": "Property 'store' does not exist on type '{}'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/providers.mjs",
+    "code": "TS2339",
+    "message": "Property 'metrics' does not exist on type 'Error'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/providers.mjs",
+    "code": "TS2351",
+    "message": "This expression is not constructable.\nType 'typeof import(\"<root>/node_modules/ajv/dist/ajv\")' has no construct signatures.",
+    "count": 1
+  },
+  {
+    "file": "runtime/providers.mjs",
+    "code": "TS2810",
+    "message": "Expected 1 argument, but got 0. 'new Promise()' needs a JSDoc hint to produce a 'resolve' that can be called without arguments.",
+    "count": 1
+  },
+  {
+    "file": "runtime/quality-runner.mjs",
+    "code": "TS2339",
+    "message": "Property 'project' does not exist on type '{ nativeResolve?: (id: any) => Promise<{ command: string; args: any[]; env: {}; binaryHash: string; }>; resolve?: (id: string, { home, project, platform, arch }?: ToolLocationOptions & { platform?: Platform; arch?: Architecture; }) => Promise<...>; runner?: (command: any, args: any, { cwd, signal, timeoutMs, allowFa...'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/quality-runner.mjs",
+    "code": "TS2339",
+    "message": "Property 'ready' does not exist on type 'ToolStatus | { command: string; args: any[]; env: {}; binaryHash: string; }'.\nProperty 'ready' does not exist on type '{ command: string; args: any[]; env: {}; binaryHash: string; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/quality-runner.mjs",
+    "code": "TS2339",
+    "message": "Property 'status' does not exist on type 'ToolStatus | { command: string; args: any[]; env: {}; binaryHash: string; }'.\nProperty 'status' does not exist on type '{ command: string; args: any[]; env: {}; binaryHash: string; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/quality-runner.mjs",
+    "code": "TS2339",
+    "message": "Property 'toolHome' does not exist on type '{ nativeResolve?: (id: any) => Promise<{ command: string; args: any[]; env: {}; binaryHash: string; }>; resolve?: (id: string, { home, project, platform, arch }?: ToolLocationOptions & { platform?: Platform; arch?: Architecture; }) => Promise<...>; runner?: (command: any, args: any, { cwd, signal, timeoutMs, allowFa...'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/quality-runner.mjs",
+    "code": "TS2345",
+    "message": "Argument of type 'NonSharedBuffer' is not assignable to parameter of type 'string'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/quality-runner.mjs",
+    "code": "TS2353",
+    "message": "Object literal may only specify known properties, and 'cwd' does not exist in type '{ allowFailure?: boolean; maxOutputBytes?: number; secrets?: {}; timeoutMs?: number; }'.",
+    "count": 3
+  },
+  {
+    "file": "runtime/quality-runner.mjs",
+    "code": "TS2551",
+    "message": "Property 'actualChangedPaths' does not exist on type '{ schemaVersion: number; project: string; languages: string[]; frameworks: any[]; profiles: any[]; files: any[]; sourceHash: string; config: { enabled: boolean; strictness: string; mode: string; tools: {}; baseline: any[]; ... 5 more ...; maxOutputBytes: number; }; ... 6 more ...; checks: any[]; }'. Did you mean 'changedPaths'?",
+    "count": 1
+  },
+  {
+    "file": "runtime/quality.mjs",
+    "code": "TS2339",
+    "message": "Property 'dialect' does not exist on type '{ enabled: boolean; strictness: string; mode: string; tools: {}; baseline: any[]; capabilities: { [k: string]: boolean; }; checks: any[]; changedPaths: any; affectedPaths: any[]; timeoutMs: number; maxOutputBytes: number; }'.",
+    "count": 7
+  },
+  {
+    "file": "runtime/research.mjs",
+    "code": "TS2339",
+    "message": "Property 'html' does not exist on type '{ source: string; key: string; url: () => string; headers: () => { Authorization: string; }; } | { source: string; key: string; html: boolean; url: () => string; headers: () => {}; }'.\nProperty 'html' does not exist on type '{ source: string; key: string; url: () => string; headers: () => { Authorization: string; }; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/security-gates.mjs",
+    "code": "TS2339",
+    "message": "Property 'artifacts' does not exist on type '{ cwd?: string; runner?: (command: string, args?: string[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: CommandOptions) => Promise<CommandResult>; secrets?: {}; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/security-gates.mjs",
+    "code": "TS2339",
+    "message": "Property 'config' does not exist on type '{ cwd?: string; runner?: (command: string, args?: string[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: CommandOptions) => Promise<CommandResult>; secrets?: {}; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/security-gates.mjs",
+    "code": "TS2339",
+    "message": "Property 'config' does not exist on type '{}'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/security-gates.mjs",
+    "code": "TS2339",
+    "message": "Property 'headSha' does not exist on type '{ cwd?: string; runner?: (command: string, args?: string[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: CommandOptions) => Promise<CommandResult>; secrets?: {}; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/security-gates.mjs",
+    "code": "TS2339",
+    "message": "Property 'headSha' does not exist on type '{}'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/security-gates.mjs",
+    "code": "TS2339",
+    "message": "Property 'previous' does not exist on type '{ cwd?: string; runner?: (command: string, args?: string[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: CommandOptions) => Promise<CommandResult>; secrets?: {}; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/security-gates.mjs",
+    "code": "TS2339",
+    "message": "Property 'signal' does not exist on type '{ cwd?: string; runner?: (command: string, args?: string[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: CommandOptions) => Promise<CommandResult>; secrets?: {}; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/security-gates.mjs",
+    "code": "TS2339",
+    "message": "Property 'toolHome' does not exist on type '{ cwd?: string; runner?: (command: string, args?: string[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: CommandOptions) => Promise<CommandResult>; secrets?: {}; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/security-gates.mjs",
+    "code": "TS2345",
+    "message": "Argument of type 'NonSharedBuffer' is not assignable to parameter of type 'string'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/security.mjs",
+    "code": "TS2339",
+    "message": "Property 'code' does not exist on type 'Error'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/skill-policy.mjs",
+    "code": "TS2339",
+    "message": "Property 'project' does not exist on type '{ root?: string; task?: string; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/skill-policy.mjs",
+    "code": "TS2339",
+    "message": "Property 'run' does not exist on type '{ root?: string; task?: string; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/skill-policy.mjs",
+    "code": "TS2339",
+    "message": "Property 'stage' does not exist on type '{ root?: string; task?: string; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/store.mjs",
+    "code": "TS2339",
+    "message": "Property 'domain' does not exist on type '{ history?: boolean; limit?: number; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/store.mjs",
+    "code": "TS2339",
+    "message": "Property 'subject' does not exist on type '{ history?: boolean; limit?: number; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/store.mjs",
+    "code": "TS2339",
+    "message": "Property 'type' does not exist on type '{ data: any; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/store.mjs",
+    "code": "TS2345",
+    "message": "Argument of type 'SQLOutputValue' is not assignable to parameter of type 'number'.\nType 'string' is not assignable to type 'number'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/store.mjs",
+    "code": "TS2345",
+    "message": "Argument of type 'SQLOutputValue' is not assignable to parameter of type 'string'.\nType 'number' is not assignable to type 'string'.",
+    "count": 4
+  },
+  {
+    "file": "runtime/store.mjs",
+    "code": "TS2365",
+    "message": "Operator '<' cannot be applied to types 'SQLOutputValue' and 'number'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/task-context.mjs",
+    "code": "TS2339",
+    "message": "Property 'contractPath' does not exist on type '{ secrets?: {}; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/ui-browser.mjs",
+    "code": "TS2339",
+    "message": "Property 'cwd' does not exist on type '{}'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/ui-browser.mjs",
+    "code": "TS2339",
+    "message": "Property 'env' does not exist on type '{}'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/ui-browser.mjs",
+    "code": "TS2339",
+    "message": "Property 'GEMINI_API_KEY' does not exist on type '{}'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/ui-browser.mjs",
+    "code": "TS2339",
+    "message": "Property 'signal' does not exist on type '{ timeoutMs?: number; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/ui-browser.mjs",
+    "code": "TS2339",
+    "message": "Property 'signal' does not exist on type '{}'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/ui-browser.mjs",
+    "code": "TS2339",
+    "message": "Property 'TYPESAFE_API_KEY' does not exist on type '{}'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/ui-browser.mjs",
+    "code": "TS2353",
+    "message": "Object literal may only specify known properties, and 'signal' does not exist in type '{ timeoutMs?: number; }'.",
+    "count": 2
+  },
+  {
+    "file": "runtime/ui-browser.mjs",
+    "code": "TS2741",
+    "message": "Property 'connect' is missing in type '{ case: any; config: any; tool: any; evidenceDir: any; signal: any; browser: any; }' but required in type '{ browser: any; case: any; config: any; connect: any; evidenceDir: any; signal: any; tool: any; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/ui-verification.mjs",
+    "code": "TS2339",
+    "message": "Property 'artifacts' does not exist on type '{ cwd?: string; runner?: (command: string, args?: string[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: CommandOptions) => Promise<CommandResult>; secrets?: {}; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/ui-verification.mjs",
+    "code": "TS2339",
+    "message": "Property 'caseRunner' does not exist on type '{ cwd?: string; runner?: (command: string, args?: string[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: CommandOptions) => Promise<CommandResult>; secrets?: {}; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/ui-verification.mjs",
+    "code": "TS2339",
+    "message": "Property 'config' does not exist on type '{ cwd?: string; runner?: (command: string, args?: string[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: CommandOptions) => Promise<CommandResult>; secrets?: {}; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/ui-verification.mjs",
+    "code": "TS2339",
+    "message": "Property 'config' does not exist on type '{}'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/ui-verification.mjs",
+    "code": "TS2339",
+    "message": "Property 'headSha' does not exist on type '{ cwd?: string; runner?: (command: string, args?: string[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: CommandOptions) => Promise<CommandResult>; secrets?: {}; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/ui-verification.mjs",
+    "code": "TS2339",
+    "message": "Property 'headSha' does not exist on type '{}'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/ui-verification.mjs",
+    "code": "TS2339",
+    "message": "Property 'previous' does not exist on type '{ cwd?: string; runner?: (command: string, args?: string[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: CommandOptions) => Promise<CommandResult>; secrets?: {}; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/ui-verification.mjs",
+    "code": "TS2339",
+    "message": "Property 'signal' does not exist on type '{ cwd?: string; runner?: (command: string, args?: string[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: CommandOptions) => Promise<CommandResult>; secrets?: {}; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/ui-verification.mjs",
+    "code": "TS2339",
+    "message": "Property 'toolHome' does not exist on type '{ cwd?: string; runner?: (command: string, args?: string[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: CommandOptions) => Promise<CommandResult>; secrets?: {}; }'.",
+    "count": 1
+  },
+  {
+    "file": "runtime/ui-verification.mjs",
+    "code": "TS2345",
+    "message": "Argument of type 'NonSharedBuffer' is not assignable to parameter of type 'string'.",
+    "count": 1
+  },
+  {
+    "file": "scripts/ci-profiler.mjs",
+    "code": "TS2353",
+    "message": "Object literal may only specify known properties, and 'command' does not exist in type '{ args?: any[]; cwd?: string; env?: ProcessEnv; evidenceDir?: string; redactions?: {}; timeoutMs?: number; }'.",
+    "count": 1
+  },
+  {
+    "file": "scripts/run-tests.mjs",
+    "code": "TS2339",
+    "message": "Property 'failureType' does not exist on type 'Error'.",
+    "count": 1
+  },
+  {
+    "file": "scripts/run-tests.mjs",
+    "code": "TS2339",
+    "message": "Property 'signal' does not exist on type '{ concurrency?: number; coverage?: boolean; cwd?: string; paths?: undefined[]; }'.",
+    "count": 1
+  },
+  {
+    "file": "scripts/run-tests.mjs",
+    "code": "TS2339",
+    "message": "Property 'testNamePatterns' does not exist on type '{ concurrency?: number; coverage?: boolean; cwd?: string; paths?: undefined[]; }'.",
+    "count": 1
+  },
+  {
+    "file": "scripts/run-tests.mjs",
+    "code": "TS2353",
+    "message": "Object literal may only specify known properties, and 'signal' does not exist in type '{ concurrency?: number; coverage?: boolean; cwd?: string; paths?: any[]; }'.",
+    "count": 1
+  },
+  {
+    "file": "scripts/ui-smoke.mjs",
+    "code": "TS2339",
+    "message": "Property 'port' does not exist on type 'string | AddressInfo'.\nProperty 'port' does not exist on type 'string'.",
+    "count": 1
+  },
+  {
+    "file": "scripts/ui-smoke.mjs",
+    "code": "TS2353",
+    "message": "Object literal may only specify known properties, and 'headSha' does not exist in type '{ cwd?: string; runner?: (command: string, args?: string[], { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput, }?: CommandOptions) => Promise<CommandResult>; secrets?: {}; }'.",
+    "count": 1
+  },
+  {
+    "file": "scripts/ui-smoke.mjs",
+    "code": "TS2769",
+    "message": "No overload matches this call.\nThe last overload gave the following error.\nArgument of type 'string' is not assignable to parameter of type 'number'.",
+    "count": 1
+  }
+]

@@ -1,0 +1,392 @@
+{
+  "configured failed": {
+    "verdict": {
+      "findings": [
+        {
+          "file": "a.js",
+          "ruleId": "r1",
+          "line": 2,
+          "severity": "error",
+          "fingerprint": "47fecd17ab3466aa4a5b5e40c7be10e8d9976d9f46b479bf9a3cdaf8b403990e"
+        }
+      ],
+      "clean": false
+    }
+  },
+  "configured passed": {
+    "verdict": {
+      "findings": [],
+      "clean": true
+    }
+  },
+  "configured status contradicts findings": {
+    "error": {
+      "code": "invalid_output",
+      "message": "Quality: incomplete or malformed quality tool output"
+    }
+  },
+  "configured scanned set differs": {
+    "error": {
+      "code": "invalid_output",
+      "message": "Quality: incomplete or malformed quality tool output"
+    }
+  },
+  "oxlint finding": {
+    "verdict": {
+      "findings": [
+        {
+          "file": "a.js",
+          "ruleId": "eslint(no-undef)",
+          "line": 3,
+          "severity": "error",
+          "fingerprint": "b97f7a35f3c31ffad49aaa46a6ffb130c7f49ad77f38000018f52d6364ae1bbf"
+        }
+      ],
+      "clean": false
+    }
+  },
+  "oxlint clean": {
+    "verdict": {
+      "findings": [],
+      "clean": true
+    }
+  },
+  "oxlint stderr": {
+    "error": {
+      "code": "invalid_output",
+      "message": "Quality: incomplete or malformed quality tool output"
+    }
+  },
+  "oxlint file count": {
+    "error": {
+      "code": "invalid_output",
+      "message": "Quality: incomplete or malformed quality tool output"
+    }
+  },
+  "stylelint finding": {
+    "verdict": {
+      "findings": [
+        {
+          "file": "a.css",
+          "ruleId": "color-no-invalid-hex",
+          "line": 1,
+          "severity": "error",
+          "fingerprint": "6bd440d58294faae078620be20087afd6310c598f496eb1704c728c4af8098a7"
+        }
+      ],
+      "clean": false
+    }
+  },
+  "stylelint clean": {
+    "verdict": {
+      "findings": [],
+      "clean": true
+    }
+  },
+  "stylelint report on stderr": {
+    "verdict": {
+      "findings": [],
+      "clean": true
+    }
+  },
+  "stylelint parse error": {
+    "error": {
+      "code": "invalid_output",
+      "message": "Quality: incomplete or malformed quality tool output"
+    }
+  },
+  "html-validate finding": {
+    "verdict": {
+      "findings": [
+        {
+          "file": "index.html",
+          "ruleId": "wcag/h37",
+          "line": 1,
+          "severity": "error",
+          "fingerprint": "7b8bcb44a84e4aff9dcc53531cda16ca42f50cde18ec098210519b2c3a420714"
+        }
+      ],
+      "clean": false
+    }
+  },
+  "html-validate counts mismatch": {
+    "error": {
+      "code": "invalid_output",
+      "message": "Quality: incomplete or malformed quality tool output"
+    }
+  },
+  "sqlfluff finding": {
+    "verdict": {
+      "findings": [
+        {
+          "file": "q.sql",
+          "ruleId": "LT01",
+          "line": 2,
+          "severity": "error",
+          "fingerprint": "246177787a3bc36bb36b727ddbf9ef8da59b7147d26229b3627cefadf6f7c0cd"
+        }
+      ],
+      "clean": false
+    }
+  },
+  "sqlfluff duplicate file": {
+    "error": {
+      "code": "invalid_output",
+      "message": "Quality: incomplete or malformed quality tool output"
+    }
+  },
+  "gofmt unformatted": {
+    "verdict": {
+      "findings": [
+        {
+          "file": "main.go",
+          "ruleId": "format",
+          "line": 1,
+          "severity": "error",
+          "fingerprint": "4a62fd0703a6858231b0797b51f428ab7581c55161d046b8bd4ed0400fb1a0fc"
+        }
+      ],
+      "clean": false
+    }
+  },
+  "gofmt clean": {
+    "verdict": {
+      "findings": [],
+      "clean": true
+    }
+  },
+  "gofmt stderr": {
+    "error": {
+      "code": "invalid_output",
+      "message": "Quality: incomplete or malformed quality tool output"
+    }
+  },
+  "oxfmt clean": {
+    "verdict": {
+      "findings": [],
+      "clean": true
+    }
+  },
+  "oxfmt dirty": {
+    "verdict": {
+      "findings": [],
+      "clean": false
+    }
+  },
+  "oxfmt wrong count": {
+    "error": {
+      "code": "invalid_output",
+      "message": "Quality: incomplete or malformed quality tool output"
+    }
+  },
+  "typescript clean": {
+    "verdict": {
+      "findings": [],
+      "clean": true
+    }
+  },
+  "typescript errors": {
+    "verdict": {
+      "findings": [],
+      "clean": false
+    }
+  },
+  "typescript unexplained failure": {
+    "error": {
+      "code": "invalid_output",
+      "message": "Quality: incomplete or malformed quality tool output"
+    }
+  },
+  "rustfmt clean": {
+    "verdict": {
+      "findings": [],
+      "clean": true
+    }
+  },
+  "rustfmt diff": {
+    "verdict": {
+      "findings": [],
+      "clean": false
+    }
+  },
+  "rustfmt noise": {
+    "error": {
+      "code": "invalid_output",
+      "message": "Quality: incomplete or malformed quality tool output"
+    }
+  },
+  "cargo finding": {
+    "verdict": {
+      "findings": [
+        {
+          "file": "src/main.rs",
+          "ruleId": "E0425",
+          "line": 3,
+          "severity": "error",
+          "fingerprint": "a651439a5452b2af72aece5278146a0abb0ca1db19c37494398c0683be96b09b"
+        }
+      ],
+      "clean": false
+    }
+  },
+  "cargo clean": {
+    "verdict": {
+      "findings": [],
+      "clean": true
+    }
+  },
+  "cargo unknown stderr": {
+    "error": {
+      "code": "invalid_output",
+      "message": "Quality: incomplete or malformed quality tool output"
+    }
+  },
+  "cargo exit zero without success": {
+    "error": {
+      "code": "invalid_output",
+      "message": "Quality: incomplete or malformed quality tool output"
+    }
+  },
+  "go clean": {
+    "verdict": {
+      "findings": [],
+      "clean": true
+    }
+  },
+  "go failure": {
+    "verdict": {
+      "findings": [],
+      "clean": false
+    }
+  },
+  "dotnet typecheck clean": {
+    "verdict": {
+      "findings": [],
+      "clean": true
+    }
+  },
+  "dotnet typecheck failed": {
+    "verdict": {
+      "findings": [],
+      "clean": false
+    }
+  },
+  "dotnet format clean": {
+    "verdict": {
+      "findings": [],
+      "clean": true
+    }
+  },
+  "dotnet format dirty": {
+    "verdict": {
+      "findings": [],
+      "clean": false
+    }
+  },
+  "php clean": {
+    "verdict": {
+      "findings": [],
+      "clean": true
+    }
+  },
+  "php parse error": {
+    "verdict": {
+      "findings": [],
+      "clean": false
+    }
+  },
+  "phpcs finding": {
+    "verdict": {
+      "findings": [
+        {
+          "file": "main.php",
+          "ruleId": "PSR12.Files.EndFileNewline",
+          "line": 1,
+          "severity": "error",
+          "fingerprint": "a9f0eca5394b86e1747371b35cee86382f4d0f1beb5b8d988868cb52b4f85d95"
+        }
+      ],
+      "clean": false
+    }
+  },
+  "phpcs clean": {
+    "verdict": {
+      "findings": [],
+      "clean": true
+    }
+  },
+  "phpcs totals mismatch": {
+    "error": {
+      "code": "invalid_output",
+      "message": "Quality: incomplete or malformed quality tool output"
+    }
+  },
+  "phpstan finding": {
+    "verdict": {
+      "findings": [
+        {
+          "file": "main.php",
+          "ruleId": "variable.undefined",
+          "line": 4,
+          "severity": "error",
+          "fingerprint": "3bcf544412355a262ce0b242abf981380ff47ebbca453c9a88440df7385e80c0"
+        }
+      ],
+      "clean": false
+    }
+  },
+  "phpstan clean": {
+    "verdict": {
+      "findings": [],
+      "clean": true
+    }
+  },
+  "phpstan general error": {
+    "error": {
+      "code": "invalid_output",
+      "message": "Quality: incomplete or malformed quality tool output"
+    }
+  },
+  "go unexplained output": {
+    "error": {
+      "code": "invalid_output",
+      "message": "Quality: incomplete or malformed quality tool output"
+    }
+  },
+  "dotnet typecheck noise": {
+    "error": {
+      "code": "invalid_output",
+      "message": "Quality: incomplete or malformed quality tool output"
+    }
+  },
+  "dotnet format noise": {
+    "error": {
+      "code": "invalid_output",
+      "message": "Quality: incomplete or malformed quality tool output"
+    }
+  },
+  "php unexplained output": {
+    "error": {
+      "code": "invalid_output",
+      "message": "Quality: incomplete or malformed quality tool output"
+    }
+  },
+  "unknown tool": {
+    "error": {
+      "code": "invalid_output",
+      "message": "Quality: incomplete or malformed quality tool output"
+    }
+  },
+  "truncated output": {
+    "error": {
+      "code": "invalid_output",
+      "message": "Quality: incomplete or malformed quality tool output"
+    }
+  },
+  "finding outside the check": {
+    "error": {
+      "code": "invalid_output",
+      "message": "Quality: incomplete or malformed quality tool output"
+    }
+  }
+}

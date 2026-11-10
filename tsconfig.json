@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+    "target": "es2024",
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "allowJs": true,
+    "checkJs": true,
+    "noEmit": true,
+    "strict": false,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "types": ["node"]
+  },
+  "include": ["adapters/**/*.mjs", "cli/**/*.mjs", "runtime/**/*.mjs", "scripts/**/*.mjs"],
+  "exclude": ["node_modules", "**/fixtures/**"]
+}

@@ -24,66 +24,131 @@ try {
   $others=@($file.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]) | Where-Object {$_.AccessControlType -eq 'Allow' -and $_.IdentityReference.Value -notin @($user,'S-1-5-18')}).Count -gt 0
   @{owner=$kind;protected=$file.AreAccessRulesProtected;otherAllows=$others;parentSddl=$parent.Sddl;fileSddl=$file.Sddl} | ConvertTo-Json -Compress
 } catch { [Console]::Out.Write('{"state":"unavailable"}') }`;
-  const result = JSON.parse(execFileSync(path.join(process.env.SystemRoot || 'C:\\Windows', 'System32/WindowsPowerShell/v1.0/powershell.exe'),
-    ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
-    { input: JSON.stringify({ file, parent }), encoding: 'utf8', windowsHide: true }));
-  if (result.parentSddl) { result.parentHash = hash(result.parentSddl); delete result.parentSddl; }
-  if (result.fileSddl) { result.fileHash = hash(result.fileSddl); delete result.fileSddl; }
+  const result = JSON.parse(
+    execFileSync(
+      path.join(process.env.SystemRoot || 'C:\\Windows', 'System32/WindowsPowerShell/v1.0/powershell.exe'),
+      [
+        '-NoLogo',
+        '-NoProfile',
+        '-NonInteractive',
+        '-EncodedCommand',
+        Buffer.from(script, 'utf16le').toString('base64'),
+      ],
+      { input: JSON.stringify({ file, parent }), encoding: 'utf8', windowsHide: true },
+    ),
+  );
+  if (result.parentSddl) {
+    result.parentHash = hash(result.parentSddl);
+    delete result.parentSddl;
+  }
+  if (result.fileSddl) {
+    result.fileHash = hash(result.fileSddl);
+    delete result.fileSddl;
+  }
   return result;
 }
 async function fixture(t) {
   // Cache reuse requires a canonical project, even when TEMP is an 8.3 alias.
-  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'kodo-cache-'))), project = path.join(root, 'project'), home = path.join(root, 'private');
-  const { mkdir } = await import('node:fs/promises'); await mkdir(project);
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'kodo-cache-'))),
+    project = path.join(root, 'project'),
+    home = path.join(root, 'private');
+  const { mkdir } = await import('node:fs/promises');
+  await mkdir(project);
   t.after(() => rm(root, { recursive: true, force: true }));
-  git(project, 'init', '-q'); git(project, 'config', 'user.email', 'fixture@example.invalid'); git(project, 'config', 'user.name', 'Fixture');
+  git(project, 'init', '-q');
+  git(project, 'config', 'user.email', 'fixture@example.invalid');
+  git(project, 'config', 'user.name', 'Fixture');
   await writeFile(path.join(project, 'value.mjs'), 'export const value = 1;');
-  git(project, 'add', '-A'); git(project, 'commit', '-qm', 'fixture');
-  const headSha = git(project, 'rev-parse', 'HEAD'), plan = await planAffected({ project, headSha, baseSha: headSha });
-  const input = { project, headSha, sourceHash: plan.sourceHash, dependencyHash: plan.dependencyHash, lockHash: hash('[]'),
-    runtimeVersions: { node: process.versions.node, v8: process.versions.v8, modules: process.versions.modules }, toolVersions: { node: process.versions.node },
-    platform: process.platform, arch: process.arch, command: process.execPath, args: ['--test'], envHash: hash('{}'), gateConfig: {}, kind: 'test' };
-  const evidence = path.join(root, 'output.txt'); await writeFile(evidence, 'tests passed\n');
-  const fingerprint = cacheFingerprint(input), receipt = { kind: 'test', status: 'passed', exitCode: 0, complete: true, headSha,
-    command: input.command, args: input.args, evidence: [{ path: evidence, bytes: 13, sha256: hash('tests passed\n') }] };
+  git(project, 'add', '-A');
+  git(project, 'commit', '-qm', 'fixture');
+  const headSha = git(project, 'rev-parse', 'HEAD'),
+    plan = await planAffected({ project, headSha, baseSha: headSha });
+  const input = {
+    project,
+    headSha,
+    sourceHash: plan.sourceHash,
+    dependencyHash: plan.dependencyHash,
+    lockHash: hash('[]'),
+    runtimeVersions: { node: process.versions.node, v8: process.versions.v8, modules: process.versions.modules },
+    toolVersions: { node: process.versions.node },
+    platform: process.platform,
+    arch: process.arch,
+    command: process.execPath,
+    args: ['--test'],
+    envHash: hash('{}'),
+    gateConfig: {},
+    kind: 'test',
+  };
+  const evidence = path.join(root, 'output.txt');
+  await writeFile(evidence, 'tests passed\n');
+  const fingerprint = cacheFingerprint(input),
+    receipt = {
+      kind: 'test',
+      status: 'passed',
+      exitCode: 0,
+      complete: true,
+      headSha,
+      command: input.command,
+      args: input.args,
+      evidence: [{ path: evidence, bytes: 13, sha256: hash('tests passed\n') }],
+    };
   return { root, project, home, headSha, input, fingerprint, receipt };
 }
 
 test('Command cache first run misses and exact successful complete private receipt can be reused', async t => {
-  const fx = await fixture(t); assert.equal(await readCheckCache(fx), null);
+  const fx = await fixture(t);
+  assert.equal(await readCheckCache(fx), null);
   assert.equal(await writeCheckCache(fx), true);
   const result = await readCheckCache(fx);
-  assert.ok(result, process.platform === 'win32' ? JSON.stringify(windowsCacheAccess(path.join(fx.home, 'ci-check-cache-v1', fx.fingerprint + '.json'), fx.home)) : 'canonical receipt must remain reusable');
-  assert.equal(result.exitCode, 0); assert.equal(result.headSha, fx.headSha);
-  assert.equal(result.trust, 'private-local'); assert.equal(result.complete, true);
+  assert.ok(
+    result,
+    process.platform === 'win32'
+      ? JSON.stringify(windowsCacheAccess(path.join(fx.home, 'ci-check-cache-v1', fx.fingerprint + '.json'), fx.home))
+      : 'canonical receipt must remain reusable',
+  );
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.headSha, fx.headSha);
+  assert.equal(result.trust, 'private-local');
+  assert.equal(result.complete, true);
 });
 
-test('Command cache keeps real Windows aliases as misses while canonical receipts remain reusable', { skip: process.platform !== 'win32' }, async t => {
-  const fx = await fixture(t);
-  assert.equal(fx.project, await realpath(fx.project));
-  assert.equal(await writeCheckCache(fx), true);
-  assert.equal((await readCheckCache(fx)).exitCode, 0);
-  const aliases = new Set([path.join(fx.root, 'PROJECT'), path.join(os.tmpdir(), path.basename(fx.root), 'project')]);
-  aliases.delete(fx.project);
-  for (const alias of aliases) {
-    assert.notEqual(alias, fx.project); assert.equal(await realpath(alias), fx.project);
-    t.diagnostic(JSON.stringify({ alias, physical: fx.project }));
-    // Even a valid stored canonical receipt must miss with an alias caller.
-    assert.equal(await readCheckCache({ ...fx, project: alias }), null);
-    const input = { ...fx.input, project: alias }, fingerprint = cacheFingerprint(input);
-    assert.notEqual(fingerprint, fx.fingerprint);
-    const aliased = { ...fx, project: alias, input, fingerprint };
-    assert.equal(await writeCheckCache(aliased), false);
-    assert.equal(await readCheckCache(aliased), null);
-  }
-  assert.equal((await readCheckCache(fx)).exitCode, 0);
-});
+test(
+  'Command cache keeps real Windows aliases as misses while canonical receipts remain reusable',
+  { skip: process.platform !== 'win32' },
+  async t => {
+    const fx = await fixture(t);
+    assert.equal(fx.project, await realpath(fx.project));
+    assert.equal(await writeCheckCache(fx), true);
+    assert.equal((await readCheckCache(fx)).exitCode, 0);
+    const aliases = new Set([path.join(fx.root, 'PROJECT'), path.join(os.tmpdir(), path.basename(fx.root), 'project')]);
+    aliases.delete(fx.project);
+    for (const alias of aliases) {
+      assert.notEqual(alias, fx.project);
+      assert.equal(await realpath(alias), fx.project);
+      t.diagnostic(JSON.stringify({ alias, physical: fx.project }));
+      // Even a valid stored canonical receipt must miss with an alias caller.
+      assert.equal(await readCheckCache({ ...fx, project: alias }), null);
+      const input = { ...fx.input, project: alias },
+        fingerprint = cacheFingerprint(input);
+      assert.notEqual(fingerprint, fx.fingerprint);
+      const aliased = { ...fx, project: alias, input, fingerprint };
+      assert.equal(await writeCheckCache(aliased), false);
+      assert.equal(await readCheckCache(aliased), null);
+    }
+    assert.equal((await readCheckCache(fx)).exitCode, 0);
+  },
+);
 
 test('Command cache requires freshly supplied complete context on every read', async t => {
-  const fx = await fixture(t); assert.equal(await writeCheckCache(fx), true);
+  const fx = await fixture(t);
+  assert.equal(await writeCheckCache(fx), true);
   const { input, ...withoutContext } = fx;
   assert.equal(await readCheckCache(withoutContext), null);
-  for (const patch of [{ envHash: hash('new-env') }, { toolVersions: { node: 'different' } }, { gateConfig: { required: true } }]) {
+  for (const patch of [
+    { envHash: hash('new-env') },
+    { toolVersions: { node: 'different' } },
+    { gateConfig: { required: true } },
+  ]) {
     assert.equal(await readCheckCache({ ...fx, input: { ...input, ...patch } }), null);
   }
   assert.equal((await readCheckCache(fx)).exitCode, 0);
@@ -91,20 +156,56 @@ test('Command cache requires freshly supplied complete context on every read', a
 
 test('Command cache fingerprints invalidate source dependency lock HEAD runtime tools arguments environment and gates', async t => {
   const fx = await fixture(t);
-  for (const patch of [{ sourceHash: hash('source') }, { dependencyHash: hash('dep') }, { lockHash: hash('lock') }, { headSha: 'a'.repeat(40) },
-    { runtimeVersions: { ...fx.input.runtimeVersions, node: '0.0.0' } }, { toolVersions: { node: '0.0.0' } }, { platform: 'other' }, { arch: 'other' },
-    { args: ['--test', 'different.test.mjs'] }, { envHash: hash('env') }, { gateConfig: { security: true } }]) {
-    const changed = cacheFingerprint({ ...fx.input, ...patch }); assert.notEqual(changed, fx.fingerprint); assert.equal(await readCheckCache({ ...fx, fingerprint: changed }), null);
+  for (const patch of [
+    { sourceHash: hash('source') },
+    { dependencyHash: hash('dep') },
+    { lockHash: hash('lock') },
+    { headSha: 'a'.repeat(40) },
+    { runtimeVersions: { ...fx.input.runtimeVersions, node: '0.0.0' } },
+    { toolVersions: { node: '0.0.0' } },
+    { platform: 'other' },
+    { arch: 'other' },
+    { args: ['--test', 'different.test.mjs'] },
+    { envHash: hash('env') },
+    { gateConfig: { security: true } },
+  ]) {
+    const changed = cacheFingerprint({ ...fx.input, ...patch });
+    assert.notEqual(changed, fx.fingerprint);
+    assert.equal(await readCheckCache({ ...fx, fingerprint: changed }), null);
   }
-  const reordered = Object.fromEntries(Object.entries(fx.input).reverse()); assert.equal(cacheFingerprint(reordered), fx.fingerprint);
-  for (const key of ['sourceHash', 'dependencyHash', 'lockHash', 'runtimeVersions', 'toolVersions', 'args', 'envHash', 'gateConfig', 'headSha']) {
-    const missing = { ...fx.input }; delete missing[key]; assert.throws(() => cacheFingerprint(missing), /fingerprint/i);
+  const reordered = Object.fromEntries(Object.entries(fx.input).reverse());
+  assert.equal(cacheFingerprint(reordered), fx.fingerprint);
+  for (const key of [
+    'sourceHash',
+    'dependencyHash',
+    'lockHash',
+    'runtimeVersions',
+    'toolVersions',
+    'args',
+    'envHash',
+    'gateConfig',
+    'headSha',
+  ]) {
+    const missing = { ...fx.input };
+    delete missing[key];
+    assert.throws(() => cacheFingerprint(missing), /fingerprint/i);
   }
 });
 
 test('Command cache rejects failures missing evidence gates unknown and public trust', async t => {
   const fx = await fixture(t);
-  for (const patch of [{ exitCode: 1 }, { status: 'unknown' }, { complete: false }, { evidence: [] }, { kind: 'ui' }, { kind: 'security' }, { kind: 'unknown' }, { trust: 'public' }, { headSha: 'a'.repeat(40) }, { args: ['different'] }]) {
+  for (const patch of [
+    { exitCode: 1 },
+    { status: 'unknown' },
+    { complete: false },
+    { evidence: [] },
+    { kind: 'ui' },
+    { kind: 'security' },
+    { kind: 'unknown' },
+    { trust: 'public' },
+    { headSha: 'a'.repeat(40) },
+    { args: ['different'] },
+  ]) {
     assert.equal(await writeCheckCache({ ...fx, receipt: { ...fx.receipt, ...patch } }), false);
   }
   assert.equal(await readCheckCache(fx), null);
@@ -112,115 +213,192 @@ test('Command cache rejects failures missing evidence gates unknown and public t
 });
 
 test('Command cache detects tampered envelope missing output and changed output bytes', async t => {
-  const fx = await fixture(t); assert.equal(await writeCheckCache(fx), true);
-  const directory = path.join(fx.home, 'ci-check-cache-v1'), file = path.join(directory, (await readdir(directory)).find(name => name.endsWith('.json')));
-  const original = await readFile(file, 'utf8'), envelope = JSON.parse(original); envelope.receipt.exitCode = 9;
-  await writeFile(file, JSON.stringify(envelope)); assert.equal(await readCheckCache(fx), null);
-  await writeFile(file, original); await writeFile(fx.receipt.evidence[0].path, 'other output\n'); assert.equal(await readCheckCache(fx), null);
-  await rm(fx.receipt.evidence[0].path); assert.equal(await readCheckCache(fx), null);
+  const fx = await fixture(t);
+  assert.equal(await writeCheckCache(fx), true);
+  const directory = path.join(fx.home, 'ci-check-cache-v1'),
+    file = path.join(
+      directory,
+      (await readdir(directory)).find(name => name.endsWith('.json')),
+    );
+  const original = await readFile(file, 'utf8'),
+    envelope = JSON.parse(original);
+  envelope.receipt.exitCode = 9;
+  await writeFile(file, JSON.stringify(envelope));
+  assert.equal(await readCheckCache(fx), null);
+  await writeFile(file, original);
+  await writeFile(fx.receipt.evidence[0].path, 'other output\n');
+  assert.equal(await readCheckCache(fx), null);
+  await rm(fx.receipt.evidence[0].path);
+  assert.equal(await readCheckCache(fx), null);
 });
 
 test('Command cache dirty tree wrong current HEAD runtime and forged hashes cannot pass', async t => {
-  const fx = await fixture(t); assert.equal(await writeCheckCache(fx), true);
-  await writeFile(path.join(fx.project, 'value.mjs'), 'export const value = 2;'); assert.equal(await readCheckCache(fx), null); assert.equal(await writeCheckCache(fx), false);
-  git(fx.project, 'add', '-A'); git(fx.project, 'commit', '-qm', 'new head'); assert.equal(await readCheckCache(fx), null);
+  const fx = await fixture(t);
+  assert.equal(await writeCheckCache(fx), true);
+  await writeFile(path.join(fx.project, 'value.mjs'), 'export const value = 2;');
+  assert.equal(await readCheckCache(fx), null);
+  assert.equal(await writeCheckCache(fx), false);
+  git(fx.project, 'add', '-A');
+  git(fx.project, 'commit', '-qm', 'new head');
+  assert.equal(await readCheckCache(fx), null);
   git(fx.project, 'reset', '--hard', fx.headSha);
-  for (const patch of [{ runtimeVersions: { ...fx.input.runtimeVersions, node: '0.0.0' } }, { sourceHash: hash('fake') }, { dependencyHash: hash('fake') }, { lockHash: hash('fake') }]) {
-    const input = { ...fx.input, ...patch }, fingerprint = cacheFingerprint(input); assert.equal(await writeCheckCache({ ...fx, input, fingerprint }), false);
+  for (const patch of [
+    { runtimeVersions: { ...fx.input.runtimeVersions, node: '0.0.0' } },
+    { sourceHash: hash('fake') },
+    { dependencyHash: hash('fake') },
+    { lockHash: hash('fake') },
+  ]) {
+    const input = { ...fx.input, ...patch },
+      fingerprint = cacheFingerprint(input);
+    assert.equal(await writeCheckCache({ ...fx, input, fingerprint }), false);
   }
 });
 
 test('Command cache rechecks dirty untracked files after a successful write', async t => {
-  const fx = await fixture(t); assert.equal(await writeCheckCache(fx), true);
+  const fx = await fixture(t);
+  assert.equal(await writeCheckCache(fx), true);
   await writeFile(path.join(fx.project, 'surprise.mjs'), 'export const surprise = true;');
-  assert.equal(await readCheckCache(fx), null); assert.equal(await writeCheckCache(fx), false);
+  assert.equal(await readCheckCache(fx), null);
+  assert.equal(await writeCheckCache(fx), false);
 });
 
 test('Command cache rejects repository storage symlink home hardlinked output and public envelopes', async t => {
   const fx = await fixture(t);
   assert.equal(await writeCheckCache({ ...fx, home: path.join(fx.project, 'cache') }), false);
-  const alias = path.join(fx.root, 'alias'); await symlink(fx.root, alias, process.platform === 'win32' ? 'junction' : 'dir');
+  const alias = path.join(fx.root, 'alias');
+  await symlink(fx.root, alias, process.platform === 'win32' ? 'junction' : 'dir');
   assert.equal(await writeCheckCache({ ...fx, home: path.join(alias, 'private') }), false);
-  await link(fx.receipt.evidence[0].path, path.join(fx.root, 'hardlink')); assert.equal(await writeCheckCache(fx), false);
-  await rm(path.join(fx.root, 'hardlink')); assert.equal(await writeCheckCache(fx), true);
-  const file = path.join(fx.home, 'ci-check-cache-v1', fx.fingerprint + '.json'); const envelope = JSON.parse(await readFile(file, 'utf8'));
-  envelope.trust = 'public'; await writeFile(file, JSON.stringify(envelope)); assert.equal(await readCheckCache(fx), null);
+  await link(fx.receipt.evidence[0].path, path.join(fx.root, 'hardlink'));
+  assert.equal(await writeCheckCache(fx), false);
+  await rm(path.join(fx.root, 'hardlink'));
+  assert.equal(await writeCheckCache(fx), true);
+  const file = path.join(fx.home, 'ci-check-cache-v1', fx.fingerprint + '.json');
+  const envelope = JSON.parse(await readFile(file, 'utf8'));
+  envelope.trust = 'public';
+  await writeFile(file, JSON.stringify(envelope));
+  assert.equal(await readCheckCache(fx), null);
 });
 
 test('Command cache refuses receipt permissions widened after a successful write', async t => {
-  const fx = await fixture(t); assert.equal(await writeCheckCache(fx), true);
+  const fx = await fixture(t);
+  assert.equal(await writeCheckCache(fx), true);
   const file = path.join(fx.home, 'ci-check-cache-v1', fx.fingerprint + '.json');
-  if (process.platform === 'win32') execFileSync('icacls.exe', [file, '/grant', '*S-1-1-0:R'], { windowsHide: true, stdio: 'pipe' });
+  if (process.platform === 'win32')
+    execFileSync('icacls.exe', [file, '/grant', '*S-1-1-0:R'], { windowsHide: true, stdio: 'pipe' });
   else await chmod(file, 0o644);
   assert.equal(await readCheckCache(fx), null);
 });
 
-for (const flag of ['--assume-unchanged', '--skip-worktree']) test(`Command cache misses tracked bytes hidden by ${flag}`, async t => {
-  const fx = await fixture(t); assert.equal(await writeCheckCache(fx), true);
-  assert.equal((await readCheckCache(fx)).exitCode, 0, 'clean canonical positive control');
-  const before = await readFile(path.join(fx.project, 'value.mjs'));
-  git(fx.project, 'update-index', flag, 'value.mjs');
-  await writeFile(path.join(fx.project, 'value.mjs'), 'export const value = 9;');
-  assert.equal(git(fx.project, 'status', '--porcelain=v1', '--untracked-files=all'), '', 'real Git hides the modification');
-  assert.notDeepEqual(await readFile(path.join(fx.project, 'value.mjs')), before);
-  assert.equal(git(fx.project, 'rev-parse', 'HEAD'), fx.headSha);
-  const plan = await planAffected({ project: fx.project, headSha: fx.headSha });
-  assert.equal(plan.sourceHash, fx.input.sourceHash); assert.equal(plan.dependencyHash, fx.input.dependencyHash);
-  const previous = await readCheckCache(fx), written = await writeCheckCache(fx);
-  assert.equal(previous, null, 'hidden edits invalidate a previously reusable PASS');
-  assert.equal(written, false, 'hidden edits cannot publish a new PASS');
-});
+for (const flag of ['--assume-unchanged', '--skip-worktree'])
+  test(`Command cache misses tracked bytes hidden by ${flag}`, async t => {
+    const fx = await fixture(t);
+    assert.equal(await writeCheckCache(fx), true);
+    assert.equal((await readCheckCache(fx)).exitCode, 0, 'clean canonical positive control');
+    const before = await readFile(path.join(fx.project, 'value.mjs'));
+    git(fx.project, 'update-index', flag, 'value.mjs');
+    await writeFile(path.join(fx.project, 'value.mjs'), 'export const value = 9;');
+    assert.equal(
+      git(fx.project, 'status', '--porcelain=v1', '--untracked-files=all'),
+      '',
+      'real Git hides the modification',
+    );
+    assert.notDeepEqual(await readFile(path.join(fx.project, 'value.mjs')), before);
+    assert.equal(git(fx.project, 'rev-parse', 'HEAD'), fx.headSha);
+    const plan = await planAffected({ project: fx.project, headSha: fx.headSha });
+    assert.equal(plan.sourceHash, fx.input.sourceHash);
+    assert.equal(plan.dependencyHash, fx.input.dependencyHash);
+    const previous = await readCheckCache(fx),
+      written = await writeCheckCache(fx);
+    assert.equal(previous, null, 'hidden edits invalidate a previously reusable PASS');
+    assert.equal(written, false, 'hidden edits cannot publish a new PASS');
+  });
 
 test('Command cache refuses opaque runtime dependencies even when Git hides ignored input changes', async t => {
   const fx = await fixture(t);
   await writeFile(path.join(fx.project, '.gitignore'), 'ignored-input.txt\n');
-  await writeFile(path.join(fx.project, 'value.mjs'), "import {readFileSync} from 'node:fs'; process.stdout.write(readFileSync('ignored-input.txt', 'utf8'));\n");
-  git(fx.project, 'add', '-A'); git(fx.project, 'commit', '-qm', 'opaque dependency');
-  const headSha = git(fx.project, 'rev-parse', 'HEAD'), plan = await planAffected({ project: fx.project, headSha });
-  assert.equal(plan.fallback, true); assert.ok(plan.reasons.includes('runtime-dependency:value.mjs:fs'));
-  const input = { ...fx.input, headSha, sourceHash: plan.sourceHash, dependencyHash: plan.dependencyHash, args: ['value.mjs'] };
-  const candidate = { ...fx, headSha, input, fingerprint: cacheFingerprint(input), receipt: { ...fx.receipt, headSha, args: input.args } };
+  await writeFile(
+    path.join(fx.project, 'value.mjs'),
+    "import {readFileSync} from 'node:fs'; process.stdout.write(readFileSync('ignored-input.txt', 'utf8'));\n",
+  );
+  git(fx.project, 'add', '-A');
+  git(fx.project, 'commit', '-qm', 'opaque dependency');
+  const headSha = git(fx.project, 'rev-parse', 'HEAD'),
+    plan = await planAffected({ project: fx.project, headSha });
+  assert.equal(plan.fallback, true);
+  assert.ok(plan.reasons.includes('runtime-dependency:value.mjs:fs'));
+  const input = {
+    ...fx.input,
+    headSha,
+    sourceHash: plan.sourceHash,
+    dependencyHash: plan.dependencyHash,
+    args: ['value.mjs'],
+  };
+  const candidate = {
+    ...fx,
+    headSha,
+    input,
+    fingerprint: cacheFingerprint(input),
+    receipt: { ...fx.receipt, headSha, args: input.args },
+  };
   await writeFile(path.join(fx.project, 'ignored-input.txt'), 'first input\n');
-  const run = () => execFileSync(process.execPath, input.args, { cwd: fx.project, encoding: 'utf8', windowsHide: true });
-  const before = run(); assert.equal(before, 'first input\n');
+  const run = () =>
+    execFileSync(process.execPath, input.args, { cwd: fx.project, encoding: 'utf8', windowsHide: true });
+  const before = run();
+  assert.equal(before, 'first input\n');
   await writeFile(fx.receipt.evidence[0].path, before);
-  candidate.receipt.evidence = [{ path: fx.receipt.evidence[0].path, bytes: Buffer.byteLength(before), sha256: hash(before) }];
+  candidate.receipt.evidence = [
+    { path: fx.receipt.evidence[0].path, bytes: Buffer.byteLength(before), sha256: hash(before) },
+  ];
   const written = await writeCheckCache(candidate);
   await writeFile(path.join(fx.project, 'ignored-input.txt'), 'second input\n');
   assert.equal(run(), 'second input\n', 'real execution depends on ignored bytes');
   assert.equal(git(fx.project, 'status', '--porcelain=v1', '--untracked-files=all'), '');
   const after = await planAffected({ project: fx.project, headSha });
-  assert.equal(after.sourceHash, plan.sourceHash); assert.equal(after.dependencyHash, plan.dependencyHash);
+  assert.equal(after.sourceHash, plan.sourceHash);
+  assert.equal(after.dependencyHash, plan.dependencyHash);
   const reused = await readCheckCache(candidate);
   assert.equal(written, false, 'an uncertain graph cannot store reusable PASS');
   assert.equal(reused, null, 'an uncertain graph cannot reuse stale PASS');
 });
 
 test('Command cache misses unknown tracked source scope after a previously reusable PASS', async t => {
-  const fx = await fixture(t); assert.equal(await writeCheckCache(fx), true);
+  const fx = await fixture(t);
+  assert.equal(await writeCheckCache(fx), true);
   assert.equal((await readCheckCache(fx)).exitCode, 0);
   git(fx.project, 'update-index', '--skip-worktree', 'value.mjs');
   await link(path.join(fx.project, 'value.mjs'), path.join(fx.root, 'source-hardlink'));
   assert.equal(git(fx.project, 'status', '--porcelain=v1', '--untracked-files=all'), '');
   const plan = await planAffected({ project: fx.project, headSha: fx.headSha });
   assert.ok(plan.reasons.includes('unknown-source'));
-  assert.equal(await readCheckCache(fx), null); assert.equal(await writeCheckCache(fx), false);
+  assert.equal(await readCheckCache(fx), null);
+  assert.equal(await writeCheckCache(fx), false);
 });
 
-test('Command cache explicitly owns and protects new Windows receipts without repairing widened reads', { skip: process.platform !== 'win32' }, async t => {
-  const fx = await fixture(t), existing = windowsCacheAccess(fx.receipt.evidence[0].path, fx.root);
-  assert.equal(await writeCheckCache(fx), true);
-  assert.deepEqual(windowsCacheAccess(fx.receipt.evidence[0].path, fx.root), existing, 'write must preserve the existing parent and evidence ACLs');
-  const file = path.join(fx.home, 'ci-check-cache-v1', fx.fingerprint + '.json');
-  const before = windowsCacheAccess(file, fx.home);
-  t.diagnostic(JSON.stringify({ stage: 'after-write', ...before }));
-  assert.equal(before.owner, 'current-user'); assert.equal(before.otherAllows, false);
-  assert.equal(before.protected, true, 'new cache-owned files must receive explicit protected ACLs');
-  assert.equal((await readCheckCache(fx)).exitCode, 0);
-  execFileSync('icacls.exe', [file, '/grant', '*S-1-1-0:R'], { windowsHide: true, stdio: 'pipe' });
-  const widened = windowsCacheAccess(file, fx.home); assert.equal(widened.otherAllows, true);
-  assert.equal(await readCheckCache(fx), null);
-  const after = windowsCacheAccess(file, fx.home);
-  assert.deepEqual(after, widened, 'read must not repair the receipt or its parent');
-  assert.equal(after.parentHash, before.parentHash);
-});
+test(
+  'Command cache explicitly owns and protects new Windows receipts without repairing widened reads',
+  { skip: process.platform !== 'win32' },
+  async t => {
+    const fx = await fixture(t),
+      existing = windowsCacheAccess(fx.receipt.evidence[0].path, fx.root);
+    assert.equal(await writeCheckCache(fx), true);
+    assert.deepEqual(
+      windowsCacheAccess(fx.receipt.evidence[0].path, fx.root),
+      existing,
+      'write must preserve the existing parent and evidence ACLs',
+    );
+    const file = path.join(fx.home, 'ci-check-cache-v1', fx.fingerprint + '.json');
+    const before = windowsCacheAccess(file, fx.home);
+    t.diagnostic(JSON.stringify({ stage: 'after-write', ...before }));
+    assert.equal(before.owner, 'current-user');
+    assert.equal(before.otherAllows, false);
+    assert.equal(before.protected, true, 'new cache-owned files must receive explicit protected ACLs');
+    assert.equal((await readCheckCache(fx)).exitCode, 0);
+    execFileSync('icacls.exe', [file, '/grant', '*S-1-1-0:R'], { windowsHide: true, stdio: 'pipe' });
+    const widened = windowsCacheAccess(file, fx.home);
+    assert.equal(widened.otherAllows, true);
+    assert.equal(await readCheckCache(fx), null);
+    const after = windowsCacheAccess(file, fx.home);
+    assert.deepEqual(after, widened, 'read must not repair the receipt or its parent');
+    assert.equal(after.parentHash, before.parentHash);
+  },
+);
