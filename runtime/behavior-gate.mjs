@@ -216,75 +216,156 @@ const languages = {
 const languageOf = file => languages[file.slice(file.lastIndexOf('.') + 1).toLowerCase()];
 /** A file that names itself a test, whatever its language. */
 const namedTest = /\.(?:test|spec)\.[^/]+$|_test\.[^/]+$|(^|\/)test_[^/]+$/i;
-const regexAfterWord = /(?:^|[^\w$.])(?:return|typeof|case|in|of|delete|void|throw|new|else|do|await|yield)$/;
+const regexKeywords = new Set('return typeof case in of delete void throw new else do await yield'.split(' '));
+
+/**
+ * Remembers the last code token, to tell a regex literal from a division.
+ * Constant work per character, so a scan stays linear in the file size.
+ */
+function lastToken() {
+  let last = '',
+    word = '',
+    dotted = false,
+    gap = false;
+  return {
+    literal() {
+      last = MARK;
+      word = '';
+      gap = false;
+    },
+    code(char) {
+      if (/\s/.test(char)) {
+        gap = true;
+        return;
+      }
+      if (/[\w$]/.test(char)) {
+        if (gap || !word) {
+          dotted = last === '.';
+          word = '';
+        }
+        // No keyword is this long; a longer word only has to stay a non-keyword.
+        if (word.length < 12) word += char;
+      } else word = '';
+      last = char;
+      gap = false;
+    },
+    regexAllowed: () => last === '' || '(,=:[!&|?{};+-*%<>~^'.includes(last) || (!dotted && regexKeywords.has(word)),
+  };
+}
+
+/** Index of the quote that closes the string opened at `start`, or of the end of its line. */
+function quoteEnd(source, start) {
+  const quote = source[start];
+  let end = start + 1;
+  while (end < source.length && source[end] !== quote && source[end] !== '\n') end += source[end] === '\\' ? 2 : 1;
+  return end;
+}
+
+/** Index of the slash that closes the regex literal opened at `start`, or of the end of its line. */
+function regexEnd(source, start) {
+  let end = start + 1,
+    inClass = false;
+  for (; end < source.length && source[end] !== '\n'; end++) {
+    const inner = source[end];
+    if (inner === '\\') end++;
+    else if (inner === '[') inClass = true;
+    else if (inner === ']') inClass = false;
+    else if (inner === '/' && !inClass) break;
+  }
+  return end;
+}
+
+/** Where the code continues after the comment that opens at `index`. */
+function commentEnd(source, index) {
+  const line = source[index + 1] === '/';
+  const end = source.indexOf(line ? '\n' : '*/', index + 2);
+  if (end < 0) return source.length;
+  return line ? end : end + 2;
+}
+
+/**
+ * Index of the backtick that closes the template literal opened at `start`.
+ * Inside `${…}` the text is code again: its strings, comments, regex literals
+ * and nested templates are stepped over, so a brace or a backtick inside them
+ * closes nothing.
+ */
+function templateEnd(source, start) {
+  const length = source.length,
+    depths = [], // brace depth of every open `${`, innermost last
+    seen = lastToken();
+  // Open templates. The scan is in template text while there are fewer open `${` than templates.
+  let open = 1,
+    index = start + 1;
+  while (index < length) {
+    const char = source[index],
+      next = source[index + 1];
+    if (depths.length < open) {
+      if (char === '\\') index += 2;
+      else if (char === '`') {
+        open--;
+        if (open === 0) return index;
+        seen.literal();
+        index++;
+      } else if (char === '$' && next === '{') {
+        depths.push(0);
+        seen.code('{');
+        index += 2;
+      } else index++;
+    } else if (char === '`') {
+      open++;
+      index++;
+    } else if (char === '"' || char === "'") {
+      index = quoteEnd(source, index) + 1;
+      seen.literal();
+    } else if (char === '/' && (next === '/' || next === '*')) index = commentEnd(source, index);
+    else if (char === '/' && seen.regexAllowed()) {
+      index = regexEnd(source, index) + 1;
+      seen.literal();
+    } else {
+      if (char === '{') depths[depths.length - 1] += 1;
+      else if (char === '}') {
+        if (depths[depths.length - 1] === 0) depths.pop();
+        else depths[depths.length - 1] -= 1;
+      }
+      seen.code(char);
+      index++;
+    }
+  }
+  return length;
+}
 
 /**
  * JS/TS source as code only: comments are removed and every string, template
  * and regex literal becomes a numbered placeholder. So a `/*` inside a string
  * opens no comment, a commented-out test is gone, and test code quoted inside
  * a string (a fixture) is not a test. A scanner, not a parser: enough to find
- * calls and their first argument.
+ * calls, their first argument and where a call ends.
  * @param {string} source
  */
 function scanJs(source) {
   const strings = [],
-    length = source.length;
+    length = source.length,
+    seen = lastToken();
   let code = '',
-    last = '',
     index = 0;
-  const literal = text => {
-    strings.push(text);
-    last = MARK;
-    return `${MARK}${strings.length - 1}${MARK}`;
+  const literal = (start, end) => {
+    strings.push(source.slice(start + 1, end));
+    seen.literal();
+    code += `${MARK}${strings.length - 1}${MARK}`;
+    return end + 1;
   };
   while (index < length) {
     const char = source[index],
       next = source[index + 1];
-    if (char === '/' && next === '/') {
-      while (index < length && source[index] !== '\n') index++;
-    } else if (char === '/' && next === '*') {
-      const end = source.indexOf('*/', index + 2);
-      index = end < 0 ? length : end + 2;
-      code += ' ';
-    } else if (char === '"' || char === "'") {
-      let end = index + 1;
-      while (end < length && source[end] !== char && source[end] !== '\n') end += source[end] === '\\' ? 2 : 1;
-      code += literal(source.slice(index + 1, end));
-      index = end + 1;
-    } else if (char === '`') {
-      let end = index + 1,
-        depth = 0;
-      for (; end < length; end++) {
-        const inner = source[end];
-        if (inner === '\\') end++;
-        else if (inner === '`' && depth === 0) break;
-        else if (inner === '$' && source[end + 1] === '{') {
-          depth++;
-          end++;
-        } else if (inner === '{' && depth > 0) depth++;
-        else if (inner === '}' && depth > 0) depth--;
-      }
-      code += literal(source.slice(index + 1, end));
-      index = end + 1;
-    } else if (
-      char === '/' &&
-      (last === '' || '(,=:[!&|?{};+-*%<>~^'.includes(last) || regexAfterWord.test(code.trimEnd()))
-    ) {
-      // A regex literal: it may hold quotes and slashes that are not code.
-      let end = index + 1,
-        inClass = false;
-      for (; end < length && source[end] !== '\n'; end++) {
-        const inner = source[end];
-        if (inner === '\\') end++;
-        else if (inner === '[') inClass = true;
-        else if (inner === ']') inClass = false;
-        else if (inner === '/' && !inClass) break;
-      }
-      code += literal(source.slice(index + 1, end));
-      index = end + 1;
-    } else {
+    if (char === '/' && (next === '/' || next === '*')) {
+      index = commentEnd(source, index);
+      if (next === '*') code += ' ';
+    } else if (char === '"' || char === "'") index = literal(index, quoteEnd(source, index));
+    else if (char === '`') index = literal(index, templateEnd(source, index));
+    else if (char === '/' && seen.regexAllowed()) index = literal(index, regexEnd(source, index));
+    else {
       code += char;
-      if (!/\s/.test(char)) last = char;
+      seen.code(char);
       index++;
     }
   }
@@ -316,72 +397,206 @@ function scanPython(source) {
   return code;
 }
 
-/** Call modifiers that still make a test case; anything else (`describe`, `step`, hooks) is not one. */
+/** Call modifiers that still make a test case or a group; anything else (`each`, `step`, hooks) is not one. */
 const jsModifiers = new Set(
   'skip only todo fixme fails failing concurrent serial parallel sequential skipIf runIf'.split(' '),
 );
-/** Modifiers that keep the case, or every other case, from running. */
-const jsSkips = new Set('skip only todo fixme fails failing skipIf runIf'.split(' '));
-const jsCall = new RegExp(
-  `(?<![.\\w$])(x?)(test|it|specify)((?:\\s*\\.\\s*[A-Za-z]+)*)\\s*\\(\\s*(?:${MARK}(\\d+)${MARK}((?:\\s*,\\s*\\{[^{}]*\\})?)|([A-Za-z_$]))`,
+/** Modifiers that keep the case, or every case of the group, from running. */
+const jsSkips = new Set('skip todo fixme fails failing skipIf runIf'.split(' '));
+const jsGroups = new Set(['describe', 'suite', 'context']);
+/** A case or a group up to its opening parenthesis. Every repetition is bounded: the scan stays linear. */
+const jsCall = /(?<![.\w$])(x?)(test|it|specify|describe|suite|context)((?:\s*\.\s*[A-Za-z]+){0,4})\s*\(/g;
+const jsOpen = /\s*\(/y;
+/** The first argument: a literal name with an optional options object, or the start of an expression. */
+const jsName = new RegExp(`\\s*(?:${MARK}(\\d+)${MARK}((?:\\s*,\\s*\\{[^{}]{0,2000}\\})?)|([A-Za-z_$]))`, 'y');
+const jsSubtest = new RegExp(
+  `(?<![\\w$])t\\s*\\.\\s*test\\s*\\(\\s*${MARK}(\\d+)${MARK}((?:\\s*,\\s*\\{[^{}]{0,2000}\\})?)`,
   'g',
 );
-const jsSubtest = new RegExp(`(?<![\\w$])t\\s*\\.\\s*test\\s*\\(\\s*${MARK}(\\d+)${MARK}`, 'g');
-const skipOption = new RegExp(`\\b(?:skip|todo)\\s*:\\s*(?!false\\b)[^\\s,}]`);
+/** `skip: <anything but false>`, `todo: …`, or the shorthand `{ skip }`. */
+const skipOption = /\b(?:skip|todo)\s*(?:[,}]|:\s*(?!false\b)[^\s,}])/;
 const count = (text, pattern) => (text.match(pattern) || []).length;
+/** `'it\'s'` and `"it's"` are the same name. */
+const unescapeQuotes = name => name.replace(/\\(['"`])/g, '$1');
+
+/** Index of the `)` that closes the call whose arguments start at `from`, or -1 within `limit` characters. */
+function callEnd(code, from, limit = code.length) {
+  const stop = Math.min(code.length, from + limit);
+  let depth = 1;
+  for (let index = from; index < stop; index++) {
+    if (code[index] === '(') depth++;
+    else if (code[index] === ')') {
+      depth--;
+      if (depth === 0) return index;
+    }
+  }
+  return -1;
+}
+
+/**
+ * JS/TS cases. A case is switched off by its own modifier or options, or by a
+ * group around it (`describe.skip`, `xdescribe`, `describe('…', { skip: true })`,
+ * Playwright `test.describe.skip`). `.only` on a case or a group is counted:
+ * it stops the other tests of the file.
+ * @param {string} source
+ */
+function jsCases(source) {
+  const { code, strings } = scanJs(source),
+    cases = [],
+    off = []; // [start, end] of the groups that are switched off: in source order, never nested
+  let dynamic = 0,
+    onlys = 0;
+  const inside = index => off.length > 0 && index < off[off.length - 1][1];
+  for (const match of code.matchAll(jsCall)) {
+    const modifiers = match[3]
+      .split('.')
+      .map(part => part.trim())
+      .filter(Boolean);
+    let group = jsGroups.has(match[2]);
+    if (!group && modifiers[0] === 'describe') {
+      group = true;
+      modifiers.shift();
+    }
+    if (modifiers.some(modifier => !jsModifiers.has(modifier))) continue;
+    let from = match.index + match[0].length;
+    if (['skipIf', 'runIf'].includes(modifiers[modifiers.length - 1])) {
+      // `test.skipIf(condition)('name', …)`: the name is in the second call.
+      const end = callEnd(code, from, 2000);
+      jsOpen.lastIndex = end + 1;
+      if (end < 0 || !jsOpen.test(code)) continue;
+      from = jsOpen.lastIndex;
+    }
+    jsName.lastIndex = from;
+    const name = jsName.exec(code);
+    if (!name) continue;
+    const only = modifiers.includes('only'),
+      skipped = match[1] === 'x' || modifiers.some(modifier => jsSkips.has(modifier)) || skipOption.test(name[2] ?? '');
+    if (only) onlys++;
+    if (group) {
+      if (skipped && !inside(match.index)) {
+        const end = callEnd(code, from);
+        off.push([match.index, end < 0 ? code.length : end]);
+      }
+    } else if (name[1] === undefined) dynamic++;
+    else
+      cases.push({
+        name: unescapeQuotes(strings[Number(name[1])]),
+        skipped: skipped || only || inside(match.index),
+      });
+  }
+  let range = 0;
+  for (const match of code.matchAll(jsSubtest)) {
+    while (range < off.length && off[range][1] < match.index) range++;
+    cases.push({
+      name: unescapeQuotes(strings[Number(match[1])]),
+      skipped: skipOption.test(match[2]) || (range < off.length && off[range][0] <= match.index),
+    });
+  }
+  return { code, cases, dynamic, onlys };
+}
+
+const pySkip = /^@(?:[\w.]*\.)?(?:skip\w*|xfail|expectedFailure)\b/i;
+const brackets = text => count(text, /[([{]/g) - count(text, /[)\]}]/g);
+
+/**
+ * Python cases, read line by line. A skip decorator on a class covers the
+ * tests in it; a module-level `pytestmark` with a skip covers the whole file.
+ * @param {string} source
+ */
+function pythonCases(source) {
+  const code = scanPython(source),
+    cases = [],
+    classes = [];
+  let decorators = [],
+    pending = 0,
+    moduleSkip = false;
+  for (const raw of code.split('\n')) {
+    const text = raw.trim();
+    if (!text) continue;
+    if (pending > 0) {
+      // A decorator that continues over several lines.
+      pending += brackets(text);
+      continue;
+    }
+    const indent = raw.length - raw.trimStart().length;
+    while (classes.length && classes[classes.length - 1].indent >= indent) classes.pop();
+    if (text.startsWith('@')) {
+      decorators.push(text);
+      pending = brackets(text);
+      continue;
+    }
+    const skipped = decorators.some(line => pySkip.test(line)) || classes.some(item => item.skipped);
+    const named = /^(?:async\s+)?def\s+(test\w*)\s*\(/.exec(text);
+    if (/^class\s/.test(text)) classes.push({ indent, skipped });
+    else if (named) cases.push({ name: named[1], skipped });
+    else if (indent === 0 && /^pytestmark\s*=.*\b(?:skip\w*|xfail)\b/i.test(text)) moduleSkip = true;
+    decorators = [];
+  }
+  return { code, cases: moduleSkip ? cases.map(item => ({ ...item, skipped: true })) : cases };
+}
+
+const rustAttribute = /\s*#\[[^\]\n]*\]/y;
+const rustFn = /\s*(?:pub(?:\([^)\n]*\))?\s+)?(?:(?:async|unsafe|const)\s+)*fn\s+(\w+)/y;
+
+/** Rust tests by line: attributes, also over several lines and with comments between, then the function. */
+function rustCases(source) {
+  const cases = [];
+  let attributes = '';
+  for (const line of source.split('\n')) {
+    const text = line.trim();
+    if (!text || text.startsWith('//')) continue;
+    let at = 0;
+    rustAttribute.lastIndex = 0;
+    for (let found = rustAttribute.exec(line); found; found = rustAttribute.exec(line)) {
+      attributes += found[0];
+      at = rustAttribute.lastIndex;
+    }
+    // Attributes only: the function is on a later line.
+    if (at > 0 && !line.slice(at).trim()) continue;
+    rustFn.lastIndex = at;
+    const named = rustFn.exec(line);
+    if (named && /\btest\b/.test(attributes)) cases.push({ name: named[1], skipped: /\bignore\b/.test(attributes) });
+    attributes = '';
+  }
+  return cases;
+}
+
+/** Java and Kotlin tests. `@Disabled` on a class is read as covering every test of the file. */
+function javaCases(source) {
+  const classOff = /@(?:Disabled|Ignore)\b[^;{}]{0,300}\b(?:class|object)\b/.test(source);
+  return [
+    ...source.matchAll(/@(?:Test|ParameterizedTest|RepeatedTest)\b([\s\S]{0,300}?)\b(?:void|fun)\s+(\w+)\s*\(/g),
+  ].map(match => ({
+    name: match[2],
+    skipped:
+      classOff || /@(?:Disabled|Ignore)\b/.test(source.slice(Math.max(0, match.index - 160), match.index) + match[1]),
+  }));
+}
 
 /**
  * The test cases of one file: `{ name, skipped }` for each case named by a
- * literal, and the number of cases named by an expression. Null for a language
- * this gate does not read.
+ * literal, the number of cases named by an expression and of `.only` calls.
+ * Null for a language this gate does not read.
  * @param {string} file
  * @param {string} source
  */
 function casesOf(file, source) {
-  const cases = [];
-  let dynamic = 0,
-    code = source;
   const language = languageOf(file);
-  if (language === 'js') {
-    const scanned = scanJs(source);
-    code = scanned.code;
-    for (const match of code.matchAll(jsCall)) {
-      const modifiers = match[3]
-        .split('.')
-        .map(part => part.trim())
-        .filter(Boolean);
-      if (modifiers.some(modifier => !jsModifiers.has(modifier))) continue;
-      if (match[4] === undefined) dynamic++;
-      else
-        cases.push({
-          name: scanned.strings[Number(match[4])],
-          skipped:
-            match[1] === 'x' || modifiers.some(modifier => jsSkips.has(modifier)) || skipOption.test(match[5] || ''),
-        });
-    }
-    for (const match of code.matchAll(jsSubtest))
-      cases.push({ name: scanned.strings[Number(match[1])], skipped: false });
-  } else if (language === 'py') {
-    code = scanPython(source);
-    for (const match of code.matchAll(/((?:^[ \t]*@.*\n)*)^[ \t]*(?:async[ \t]+)?def[ \t]+(test\w*)[ \t]*\(/gm))
-      cases.push({ name: match[2], skipped: /@(?:[\w.]*\.)?(?:skip\w*|xfail)\b/i.test(match[1]) });
-  } else if (language === 'rs') {
-    for (const match of source.matchAll(/((?:#\[[^\]\n]*\]\s*)+)(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+(\w+)/g))
-      if (/\btest\b/.test(match[1])) cases.push({ name: match[2], skipped: /\bignore\b/.test(match[1]) });
-  } else if (language === 'go') {
-    for (const match of source.matchAll(/^func\s+(Test\w+)\s*\(/gm)) cases.push({ name: match[1], skipped: false });
-  } else if (language === 'java') {
-    for (const match of source.matchAll(
-      /@(?:Test|ParameterizedTest|RepeatedTest)\b([\s\S]{0,300}?)\b(?:void|fun)\s+(\w+)\s*\(/g,
-    ))
-      cases.push({
-        name: match[2],
-        skipped: /@(?:Disabled|Ignore)\b/.test(source.slice(Math.max(0, match.index - 160), match.index) + match[1]),
-      });
-  } else return null;
+  let parsed;
+  if (language === 'js') parsed = jsCases(source);
+  else if (language === 'py') parsed = pythonCases(source);
+  else if (language === 'rs') parsed = { cases: rustCases(source) };
+  else if (language === 'go')
+    parsed = {
+      cases: [...source.matchAll(/^func\s+(Test\w+)\s*\(/gm)].map(match => ({ name: match[1], skipped: false })),
+    };
+  else if (language === 'java') parsed = { cases: javaCases(source) };
+  else return null;
+  const code = parsed.code ?? source;
   return {
-    cases,
-    dynamic,
+    cases: parsed.cases,
+    dynamic: parsed.dynamic ?? 0,
+    onlys: parsed.onlys ?? 0,
     assertions: count(code, /\bassert\w*|\bexpect\s*\(/g),
     // Skips called from inside a test body; they cannot be tied to one case without a parser.
     bodySkips: count(
@@ -425,6 +640,59 @@ const listNames = names =>
     .map(name => JSON.stringify(String(name).slice(0, 80)))
     .join(', ')}${names.length > 5 ? `, and ${names.length - 5} more` : ''}`;
 
+/** How many cases carry each name, over the given files. */
+function tally(entries, pick = _item => true) {
+  const names = new Map();
+  for (const entry of entries)
+    for (const item of entry.cases) if (pick(item)) names.set(item.name, (names.get(item.name) ?? 0) + 1);
+  return names;
+}
+
+/** `test_skipped` findings: cases switched off, `.only` added, skip calls added inside existing tests. */
+function skipFindings(base, head) {
+  const found = [];
+  // A case that ran on the base and runs in fewer places now, with a switched-off copy here. A new
+  // case born skipped is not weakening, and neither is a skipped namesake of a case that still runs.
+  const known = tally(base),
+    activeBefore = tally(base, item => !item.skipped),
+    activeAfter = tally(head, item => !item.skipped);
+  for (const entry of head) {
+    const names = [...new Set(entry.cases.filter(item => item.skipped).map(item => item.name))].filter(
+      name => (activeAfter.get(name) ?? 0) < (activeBefore.get(name) ?? 0),
+    );
+    if (names.length)
+      found.push({ rule: 'test_skipped', file: entry.file, detail: `switched off: ${listNames(names)}` });
+  }
+  const sameFile = new Map(base.filter(entry => !entry.gone).map(entry => [entry.at, entry]));
+  // `.only` on a case or a group stops the other tests of the file. A file of new tests only is left alone.
+  for (const entry of head) {
+    const before = sameFile.get(entry.file)?.onlys ?? 0;
+    if (
+      entry.onlys > before &&
+      entry.cases.some(item => known.has(item.name)) &&
+      !found.some(item => item.rule === 'test_skipped' && item.file === entry.file)
+    )
+      found.push({
+        rule: 'test_skipped',
+        file: entry.file,
+        detail: `focused with .only ${before} -> ${entry.onlys}: the other tests of the file stop running`,
+      });
+  }
+  // A skip call added to a file that gained no case was added to an existing test.
+  for (const entry of head) {
+    const before = sameFile.get(entry.file);
+    if (!before || entry.bodySkips <= before.bodySkips || entry.dynamic > before.dynamic) continue;
+    const names = new Set(before.cases.map(item => item.name));
+    if (entry.cases.every(item => names.has(item.name)))
+      found.push({
+        rule: 'test_skipped',
+        file: entry.file,
+        detail: `skip calls inside existing tests ${before.bodySkips} -> ${entry.bodySkips}`,
+      });
+  }
+  return found;
+}
+
 /**
  * Tests that existed on the base and were removed or switched off.
  *
@@ -432,8 +700,11 @@ const listNames = names =>
  * to another file, or a file that was split or renamed, is still there; a case
  * whose name is gone is removed, whatever was added in its place. Comments and
  * string contents are not code, so a commented-out test is a removed one. A
- * case that gains a skip (`.skip`, `.only`, `.todo`, `xit`, an options object
- * with `skip:`, a skip decorator or attribute) is switched off.
+ * case that ran on the base and no longer does is switched off: by its own
+ * skip (`.skip`, `.only`, `.todo`, `xit`, an options object with `skip:`, a
+ * decorator or attribute) or by one on its group, class or module
+ * (`describe.skip`, `xdescribe`, a decorator on a class, `pytestmark`).
+ * `.only` added to a file with existing tests stops the others.
  *
  * What it cannot see is in the docs: a body emptied under the same name, an
  * early `return`, a skip called inside the body, a renamed case (reported as
@@ -471,12 +742,6 @@ export async function testWeakening({ cwd, baseSha, headSha, allowed = [] }) {
         unchecked.push({ file: to, reason: after.reason });
     }
   }
-  const tally = (entries, pick = _item => true) => {
-    const names = new Map();
-    for (const entry of entries)
-      for (const item of entry.cases) if (pick(item)) names.set(item.name, (names.get(item.name) ?? 0) + 1);
-    return names;
-  };
   // Every base case must still exist somewhere among the changed test files.
   const remaining = tally(head);
   for (const entry of base) {
@@ -511,30 +776,7 @@ export async function testWeakening({ cwd, baseSha, headSha, allowed = [] }) {
       detail: `cases named by an expression: ${dynamic(base)} -> ${dynamic(head)} across changed tests`,
     });
   }
-  // An existing case that gained a skip. A new case that is born skipped is not weakening.
-  const known = tally(base),
-    skippedBefore = tally(base, item => item.skipped);
-  for (const entry of head) {
-    const names = [...new Set(entry.cases.filter(item => item.skipped).map(item => item.name))].filter(
-      name =>
-        known.has(name) &&
-        tally([entry], item => item.skipped && item.name === name).get(name) > (skippedBefore.get(name) ?? 0),
-    );
-    if (names.length) report({ rule: 'test_skipped', file: entry.file, detail: `switched off: ${listNames(names)}` });
-  }
-  // A skip call added to a file that gained no case was added to an existing test.
-  const sameFile = new Map(base.filter(entry => !entry.gone).map(entry => [entry.at, entry]));
-  for (const entry of head) {
-    const before = sameFile.get(entry.file);
-    if (!before || entry.bodySkips <= before.bodySkips || entry.dynamic > before.dynamic) continue;
-    const names = new Set(before.cases.map(item => item.name));
-    if (entry.cases.every(item => names.has(item.name)))
-      report({
-        rule: 'test_skipped',
-        file: entry.file,
-        detail: `skip calls inside existing tests ${before.bodySkips} -> ${entry.bodySkips}`,
-      });
-  }
+  skipFindings(base, head).forEach(report);
   const total = (entries, field) =>
     entries.reduce((sum, entry) => sum + (field ? entry[field] : entry.cases.length), 0);
   if (total(head, 'assertions') < total(base, 'assertions') && total(head) <= total(base))

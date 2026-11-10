@@ -644,3 +644,193 @@ test('Template names with interpolation, regex literals and nested quotes do not
   });
   assert.match((await testWeakening(renamedTemplate)).findings[0].detail, /"hidden by \$\{flag\}"/);
 });
+
+const grouped =
+  "import { describe, test } from 'node:test';\nimport assert from 'node:assert/strict';\n" +
+  "describe('math', () => {\n  test('adds', () => assert.equal(1 + 1, 2));\n  test('subtracts', () => assert.equal(2 - 1, 1));\n});\n" +
+  "describe('other', () => {\n  test('multiplies', () => assert.equal(2 * 2, 4));\n});\n";
+
+test('A skip on a group switches off the cases under it; .only stops the rest of the file', async t => {
+  const math = /switched off: "adds", "subtracts"$/;
+  const forms = [
+    ['describe.skip', text => text.replace("describe('math'", "describe.skip('math'"), math],
+    ['xdescribe', text => text.replace("describe('math'", "xdescribe('math'"), math],
+    ['describe.todo', text => text.replace("describe('math'", "describe.todo('math'"), math],
+    [
+      'describe with a skip option',
+      text => text.replace("describe('math', () =>", "describe('math', { skip: true }, () =>"),
+      math,
+    ],
+    ['Playwright test.describe.skip', text => text.replace("describe('math'", "test.describe.skip('math'"), math],
+    ['describe.skipIf', text => text.replace("describe('math'", "describe.skipIf(process.env.CI)('math'"), math],
+    [
+      'a new skipped group around an existing one',
+      text =>
+        `${text.replace("describe('other', () => {", "describe.skip('wip', () => {\ndescribe('other', () => {")}});\n`,
+      /switched off: "multiplies"$/,
+    ],
+    [
+      'describe.only on a sibling group',
+      text => text.replace("describe('other'", "describe.only('other'"),
+      /focused with \.only 0 -> 1/,
+    ],
+    [
+      'Playwright test.describe.only',
+      text => text.replace("describe('other'", "test.describe.only('other'"),
+      /focused with \.only 0 -> 1/,
+    ],
+  ];
+  for (const [name, change, detail] of forms)
+    await t.test(name, async s => {
+      const repo = repository(s, { 'tests/grouped.test.mjs': grouped });
+      const { findings } = await testWeakening(repo.change({ 'tests/grouped.test.mjs': change(grouped) }));
+      assert.deepEqual(rules(findings), ['test_skipped:tests/grouped.test.mjs']);
+      assert.match(findings[0].detail, detail);
+    });
+  await t.test('a subtest and a case with the shorthand option', async s => {
+    const parent =
+      header +
+      "const skip = true;\ntest('parent', async t => {\n  await t.test('sub', () => assert.ok(skip));\n});\n" +
+      one('plain');
+    const repo = repository(s, { 'tests/parent.test.mjs': parent });
+    const head = repo.change({
+      'tests/parent.test.mjs': parent
+        .replace("t.test('sub', () =>", "t.test('sub', { skip: true }, () =>")
+        .replace("test('plain', () =>", "test('plain', { skip }, () =>"),
+    });
+    const { findings } = await testWeakening(head);
+    assert.deepEqual(rules(findings), ['test_skipped:tests/parent.test.mjs']);
+    assert.match(findings[0].detail, /switched off: "plain", "sub"$/);
+  });
+});
+
+test('Honest work around skips passes: enabling a test, a namesake todo, new skipped or focused tests', async t => {
+  const honest = [
+    [
+      'a conditional skip removed',
+      grouped.replace("test('adds'", "test.skipIf(process.platform === 'win32')('adds'"),
+      grouped,
+    ],
+    ['a skipped group enabled', grouped.replace("describe('math'", "describe.skip('math'"), grouped],
+    ['a todo with the name of a running case', grouped, `${grouped}test.todo('adds');\n`],
+    [
+      'a quote style change',
+      `${header}test('it\\'s fine', () => assert.ok(true));\n`,
+      `${header}test("it's fine", () => assert.ok(true));\n`,
+    ],
+    [
+      'a new skipped group of new cases',
+      grouped,
+      `${grouped}describe.skip('later', () => {\n  test('divides', () => assert.equal(4 / 2, 2));\n});\n`,
+    ],
+    [
+      'a group that was already skipped',
+      grouped.replace("describe('math'", "describe.skip('math'"),
+      `${grouped.replace("describe('math'", "describe.skip('math'")}\n// touched\n`,
+    ],
+  ];
+  for (const [name, before, after] of honest)
+    await t.test(name, async s => {
+      const repo = repository(s, { 'tests/grouped.test.mjs': before });
+      assert.deepEqual(await weakened(repo.change({ 'tests/grouped.test.mjs': after })), []);
+    });
+  await t.test('.only in a file of new tests only', async s => {
+    const repo = repository(s);
+    const head = repo.change({ 'tests/new.test.mjs': `${header}test.only('fresh', () => assert.ok(true));\n` });
+    assert.deepEqual(await weakened(head), [], 'no existing test of that file stops running');
+  });
+});
+
+test('Python, Rust and Java: a skip on a class or a module, long decorators, comments between', async t => {
+  const python =
+    'import unittest\nimport pytest\n\n\nclass TestTotal(unittest.TestCase):\n' +
+    '    def test_total(self):\n        self.assertEqual(total([1]), 1)\n\n' +
+    '    def test_empty(self):\n        self.assertEqual(total([]), 0)\n\n\n' +
+    '@pytest.mark.parametrize(\n    "value",\n    [1, 2],\n)\ndef test_param(value):\n    assert value\n';
+  const forms = [
+    [
+      'a decorator on a class',
+      text => text.replace('class TestTotal', '@unittest.skip("later")\nclass TestTotal'),
+      /switched off: "test_total", "test_empty"$/,
+    ],
+    [
+      'a module-level pytestmark',
+      text => text.replace('\n\nclass', '\npytestmark = pytest.mark.skip(reason="later")\n\nclass'),
+      /switched off: "test_total", "test_empty", "test_param"$/,
+    ],
+    [
+      'a skip above a decorator that spans lines',
+      text => text.replace('@pytest.mark.parametrize(', '@pytest.mark.skip\n@pytest.mark.parametrize('),
+      /switched off: "test_param"$/,
+    ],
+    [
+      'a decorator in a file with CRLF line ends',
+      text =>
+        text.replace('    def test_empty', '    @unittest.skip("later")\n    def test_empty').replaceAll('\n', '\r\n'),
+      /switched off: "test_empty"$/,
+    ],
+  ];
+  for (const [name, change, detail] of forms)
+    await t.test(name, async s => {
+      const repo = repository(s, { 'tests/test_total.py': python });
+      const { findings } = await testWeakening(repo.change({ 'tests/test_total.py': change(python) }));
+      assert.deepEqual(rules(findings), ['test_skipped:tests/test_total.py']);
+      assert.match(findings[0].detail, detail);
+    });
+  await t.test('an edit of the body under a long decorator is honest work', async s => {
+    const repo = repository(s, { 'tests/test_total.py': python });
+    const head = repo.change({ 'tests/test_total.py': python.replace('assert value\n', 'assert value > 0\n') });
+    assert.deepEqual(await weakened(head), []);
+  });
+  await t.test('rust: a comment between the attribute and the function', async s => {
+    const rust = '#[test]\n// explains the case\nfn adds() {\n    assert_eq!(1 + 1, 2);\n}\n';
+    const repo = repository(s, { 'src/lib_test.rs': rust });
+    const head = repo.change({ 'src/lib_test.rs': rust.replace('#[test]\n', '#[test]\n#[ignore]\n') });
+    assert.deepEqual(await weakened(head), ['test_skipped:src/lib_test.rs']);
+    const removed = repo.change({ 'src/lib_test.rs': '// nothing left\n' });
+    assert.deepEqual(await weakened(removed), ['tests_removed:src/lib_test.rs']);
+  });
+  await t.test('java: @Disabled on the class', async s => {
+    const java =
+      'import org.junit.jupiter.api.Test;\n\nclass TotalTest {\n    @Test\n    void addsUp() {\n        assertEquals(2, 1 + 1);\n    }\n}\n';
+    const repo = repository(s, { 'src/test/java/TotalTest.java': java });
+    const head = repo.change({
+      'src/test/java/TotalTest.java': java.replace('class TotalTest', '@Disabled("later")\nclass TotalTest'),
+    });
+    assert.deepEqual(await weakened(head), ['test_skipped:src/test/java/TotalTest.java']);
+  });
+});
+
+test('Code inside a template expression does not derail the scanner', async t => {
+  const tricky =
+    header +
+    "const brace = c => `${c === '{' ? 1 : 2}`;\n" +
+    "const nested = `a ${`b ${'`'} c`} d`;\n" +
+    "const cleaned = value => `${value.replace(/[`}]/g, '')}`;\n" +
+    'const commented = `${1 /* } ` */ + 1}`;\n' +
+    one('first after') +
+    one('second after');
+  const repo = repository(t, { 'tests/tricky.test.mjs': tricky });
+  assert.deepEqual(await weakened(repo.change({ 'tests/tricky.test.mjs': `${tricky}\n// touched\n` })), []);
+  const removed = repo.change({ 'tests/tricky.test.mjs': tricky.replace(one('second after'), '') });
+  const { findings } = await testWeakening(removed);
+  assert.deepEqual(rules(findings), ['tests_removed:tests/tricky.test.mjs']);
+  assert.match(findings[0].detail, /test cases removed: "second after"$/);
+});
+
+test('Scanning stays linear on input built to make a pattern rescan the file', async t => {
+  const size = 200000;
+  const files = {
+    'tests/slashes.test.mjs': `${header}${one('kept')}const value = 1${' / 2'.repeat(size / 4)};\n`,
+    'tests/test_decorated.py': `def test_kept():\n    assert True\n\n\n${'@decorator\n'.repeat(size / 11)}`,
+    'src/attrs_test.rs': `#[test]\nfn kept() {}\n${'#[allow(unused)]\n'.repeat(size / 17)}`,
+  };
+  const repo = repository(t, files);
+  const head = repo.change(Object.fromEntries(Object.entries(files).map(([name, text]) => [name, `${text}\n`])));
+  const started = performance.now();
+  const result = await testWeakening(head);
+  const elapsed = performance.now() - started;
+  assert.deepEqual([result.findings, result.unchecked], [[], []]);
+  // Each of these took tens of seconds with a pattern that rescans; linear work is far under a second.
+  assert.ok(elapsed < 10000, `scanned in ${Math.round(elapsed)} ms`);
+});
