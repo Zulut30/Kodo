@@ -56,7 +56,9 @@ test('Rounds that only produce new output and commits stop at the stalled limit,
     ['check'],
     'the failing check output is referenced for the next session',
   );
-  assert.equal(blocker.headSha, result.headSha);
+  // The blocker names the repaired commit that failed the checks, not the last accepted one.
+  assert.equal(blocker.headSha, result.checks.headSha);
+  assert.notEqual(blocker.headSha, result.headSha);
   const summary = await progress(result);
   assert.match(summary, /Current blocker: no_verified_progress \[verification\]/);
   assert.match(summary, /Watchdog: 2 round\(s\) without verified progress; stopped at limit 2/);

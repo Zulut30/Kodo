@@ -21,7 +21,9 @@ function currentBlocker(run, error) {
     message: run.error.message,
     scope,
     at: new Date().toISOString(),
-    headSha: run.headSha || null,
+    // A verification stop belongs to the commit that was checked. After a repair it is newer than
+    // the last accepted commit, which is what `run.headSha` still names.
+    headSha: (scope === 'verification' ? run.checks?.headSha : null) || run.headSha || null,
     reasons: [run.error.code, error.classification, run.behavior?.passed === false ? 'behavior_failed' : null].filter(
       Boolean,
     ),
