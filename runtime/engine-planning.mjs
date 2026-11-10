@@ -5,9 +5,11 @@ import { validate, planSchema, routingSchema, scopesOverlap } from './contracts.
 import { git, makeWorktree, collectFiles } from './workspace.mjs';
 import { maxTaskContractBytes } from './task-context.mjs';
 import { assessTask, resolveMode } from './modes.mjs';
+import { FAST_PATH_VERSION, classifyLocalTask, fastPathAllowsPlan } from './fast-path.mjs';
 import { EngineCore, contentHash, defaultModel, evidencePrompt, lstatSafe } from './engine-core.mjs';
 
 /** Assessment, research, planning and routing stages. */
+const budgetKeys = ['researchBudget', 'repairRounds', 'concurrency', 'maxTasks'];
 export class EnginePlanning extends EngineCore {
   async preparePlanningContext(run) {
     const before = `${await this.policy(run, 'plan')}\n${this.planInstructions(run)}`;
@@ -86,6 +88,53 @@ export class EnginePlanning extends EngineCore {
       contextTruncated,
     };
   }
+  /** The ordinary route: one Jev assessment, then quick, standard or deep. */
+  async assessedMode(run, context, signal) {
+    let assessment;
+    try {
+      assessment = await this.logical(run, 'assessment', () =>
+        (this.provider.assessTask || assessTask)(
+          { task: run.task, files: context.files, signal },
+          { secrets: this.secrets },
+        ),
+      );
+    } catch (error) {
+      if (signal?.aborted || error.name === 'AbortError' || error.code === 'cancelled')
+        throw Object.assign(new Error('Запуск отменён'), { code: 'cancelled' });
+      assessment = { fallback: true, code: error.code || 'unavailable' };
+    }
+    // A large unrelated project map is normal. Only missing/truncated
+    // task-focused evidence prevents automatic quick selection.
+    if (assessment?.fallback === false && context.contextTruncated)
+      assessment = { ...assessment, contextTruncated: true };
+    // Missing provenance belongs to legacy runs: retain their original
+    // profile clamp and saved lower budgets rather than widening on resume.
+    return resolveMode({
+      requested: run.requestedMode ?? undefined,
+      assessment,
+      config: run.config,
+      concurrencyExplicit: run.requestedConcurrency != null,
+    });
+  }
+  /**
+   * A fast-path plan must stay inside the files the proof named. Otherwise the
+   * proof no longer covers the work: restore the saved budgets and take the
+   * ordinary route. Returns true when the mode was re-resolved.
+   */
+  async fastPathGuard(run, candidate, signal) {
+    if (run.executionMode?.source !== 'fast-path' || fastPathAllowsPlan(candidate, run.fastPath.files)) return false;
+    for (const key of budgetKeys) {
+      if (run.fastPath.budgets[key] === null) delete run.config[key];
+      else run.config[key] = run.fastPath.budgets[key];
+    }
+    run.fastPath = { ...run.fastPath, revoked: 'plan_outside_proof' };
+    delete run.executionMode;
+    delete run.completed.analysis;
+    this.log(run, 'fast_path_revoked', { reason: run.fastPath.revoked });
+    this.save(run);
+    await this.prepare(run, signal);
+    return true;
+  }
   async prepare(run, signal) {
     await makeWorktree(run.project, run.cwd, run.branch, run.baseSha);
     let bundle;
@@ -111,33 +160,30 @@ export class EnginePlanning extends EngineCore {
         bundle = await collectFiles(run.cwd, run.task, this.secrets);
         const context = await this.assessmentContext(run, bundle);
         run.modeContext = context.summary;
-        let assessment;
-        try {
-          assessment = await this.logical(run, 'assessment', () =>
-            (this.provider.assessTask || assessTask)(
-              { task: run.task, files: context.files, signal },
-              { secrets: this.secrets },
-            ),
-          );
-        } catch (error) {
-          if (signal?.aborted || error.name === 'AbortError' || error.code === 'cancelled')
-            throw Object.assign(new Error('Запуск отменён'), { code: 'cancelled' });
-          assessment = { fallback: true, code: error.code || 'unavailable' };
-        }
-        // A large unrelated project map is normal. Only missing/truncated
-        // task-focused evidence prevents automatic quick selection.
-        if (assessment?.fallback === false && context.contextTruncated)
-          assessment = { ...assessment, contextTruncated: true };
-        // Missing provenance belongs to legacy runs: retain their original
-        // profile clamp and saved lower budgets rather than widening on resume.
-        run.executionMode = resolveMode({
-          requested: run.requestedMode ?? undefined,
-          assessment,
-          config: run.config,
-          concurrencyExplicit: run.requestedConcurrency != null,
-        });
-        for (const key of ['researchBudget', 'repairRounds', 'concurrency', 'maxTasks'])
-          run.config[key] = run.executionMode.profile[key];
+        // A local proof needs no model. Any doubt takes the ordinary route below.
+        const local = run.fastPath?.revoked
+          ? { fastPath: false, reason: 'revoked' }
+          : await classifyLocalTask({ cwd: run.cwd, task: run.task, requested: run.requestedMode });
+        if (local.fastPath) {
+          run.fastPath = {
+            version: FAST_PATH_VERSION,
+            files: local.files,
+            reason: local.reason,
+            // Restored if the plan leaves the proof and the ordinary route takes over.
+            budgets: Object.fromEntries(budgetKeys.map(key => [key, run.config[key] ?? null])),
+          };
+          run.executionMode = {
+            ...resolveMode({
+              requested: 'quick',
+              config: run.config,
+              concurrencyExplicit: run.requestedConcurrency != null,
+            }),
+            requested: run.requestedMode ?? null,
+            source: 'fast-path',
+            reason: 'Deterministic local proof: the task names only existing tracked style files',
+          };
+        } else run.executionMode = await this.assessedMode(run, context, signal);
+        for (const key of budgetKeys) run.config[key] = run.executionMode.profile[key];
       }
       this.save(run);
       this.log(run, 'mode_selected', run.executionMode);
@@ -183,6 +229,7 @@ export class EnginePlanning extends EngineCore {
     await this.policy(run, 'plan');
     if (planFile) {
       const candidate = JSON.parse(await readFile(planFile, 'utf8'));
+      await this.fastPathGuard(run, candidate, signal);
       this.validateModePlan(run, candidate, {
         legacy: Boolean(run.plan && contentHash(candidate) === contentHash(run.plan)),
       });
@@ -222,6 +269,8 @@ export class EnginePlanning extends EngineCore {
       },
       signal,
     );
+    // One wasted planner session at most: the ordinary route plans again under its own mode.
+    if (await this.fastPathGuard(run, result.output, signal)) return this.plan(run, undefined, signal);
     run.plan = this.validateModePlan(run, result.output);
     run.planSource = 'cli';
     run.plannerSession = result.sessionId;

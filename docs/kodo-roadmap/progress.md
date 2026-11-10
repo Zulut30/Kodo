@@ -13,7 +13,7 @@ MVP Project Director реализован. Фактическая приёмка
 | 05 Research knowledge | **ACCEPTED**, [PR14](https://github.com/Zulut30/Kodo/pull/14) MERGED `72215c8`; source `a126ffc`: local1433/1427 PASS/6 SKIP/0 FAIL, security/review passed | [CI41967085286](https://github.com/Zulut30/Kodo/actions/runs/41967085286) обе ОС success, installed CLI smoke passed, archive SHA-256 `0b1f0a60b060808e306974611effa71883ab034d39866275d0408bbd3b8021a5`; CI counts неизвестны. [Checkpoint/история/границы05](phase-05.md). Восемь valid audit stages по13 skills — recorded-instructions; UI/architecture disabled neutral. Нет нового release/deploy |
 | 06 Project Director | **MERGED**, [PR15](https://github.com/Zulut30/Kodo/pull/15) merged `ca7afa1` 2026-11-05 | [Phase06](phase-06.md), [Windows evidence](../archive/WINDOWS-TEST-SPEED.md); статус приёмки и checks — в PR15 |
 | 07 Swarm | **CANDIDATE**, ветка `kodo/07-durable-jobs`: контракты, SQLite-хранилище, планировщик, read-only `kodo jobs`, fixtures 1/2/4/8, реальная Git-цепочка и opt-in подключение Engine (`scheduler: durable`) | [Phase07](phase-07.md); приёмка — после CI и merge PR этапа |
-| 08 Context/budget | NOT STARTED | После07: deterministic fast path |
+| 08 Context/budget | **CANDIDATE**, ветка `kodo/08-context-budget`: ContextManifest каждой сессии, детерминированный быстрый путь для правок стилей, сохраняемые лимиты `budgets.sessions`/`budgets.contextBytes`; адаптеры T3/Orca и TokenEconomizer не сделаны | [Phase08](phase-08.md); приёмка — после CI и merge PR этапа |
 | 09 Verification/evolution | NOT STARTED | После08: independent oracles/risk policy |
 | 10 Progress/maintenance | NOT STARTED | После09: watchdog/acceptance progress |
 | 11 Merge/release | NOT STARTED | После10: immutable queue/recovery/smoke |

@@ -18,6 +18,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { Store } from './store.mjs';
 import { redact, workerEnvironment, worktreeHome, stateHome } from './security.mjs';
 import { readConfig, configuredConcurrency, normalizeConcurrency } from './config.mjs';
+import { buildContextManifest } from './context-manifest.mjs';
 import { validatePlan } from './contracts.mjs';
 import { execute, resolveCommand } from './command.mjs';
 import { git, inspectProject } from './workspace.mjs';
@@ -97,6 +98,29 @@ function renderSessionPrompt(request, secrets) {
     parts.gateContext +
     redact(parts.after, secrets)
   );
+}
+/** Sizes of the rendered prompt parts, for the session's ContextManifest. Their sum is the rendered size. */
+function promptSections(request, secrets) {
+  const parts = evidencePrompts.get(request.prompt);
+  if (!parts) return [{ name: 'prompt', bytes: measureContext(redact(request.prompt, secrets)), mandatory: true }];
+  const { evidence } = parts;
+  return [
+    {
+      name: 'instructions',
+      bytes: measureContext(redact(parts.before, secrets)) + measureContext(redact(parts.after, secrets)),
+      mandatory: true,
+    },
+    ...(parts.context ? [{ name: 'task-context', bytes: measureContext(parts.context), mandatory: true }] : []),
+    {
+      name: 'evidence',
+      bytes: measureContext(evidence.text),
+      mandatory: false,
+      originalBytes: evidence.originalBytes,
+      truncated: evidence.truncated === true,
+      omitted: evidence.omitted,
+    },
+    ...(parts.gateContext ? [{ name: 'gates', bytes: measureContext(parts.gateContext), mandatory: true }] : []),
+  ];
 }
 async function lstatSafe(filename) {
   try {
@@ -751,6 +775,23 @@ try {
           );
           const rendered = renderSessionPrompt(request, this.secrets);
           const knowledge = await this.nativeKnowledge(run, request.cwd, node, identity);
+          const references = [...(request.contextMetrics?.references || []), ...knowledge.references];
+          // Sizes and hashes only: the manifest never holds prompt text.
+          const manifest = buildContextManifest({
+            runId: run.id,
+            stage,
+            node: node?.id ?? null,
+            headSha: run.headSha || run.baseSha || null,
+            limitBytes: run.config.budgets?.contextBytes ?? null,
+            sections: [
+              { name: 'guidance', bytes: measureContext(guidance), mandatory: true },
+              ...promptSections(request, this.secrets),
+              ...(knowledge.text
+                ? [{ name: 'knowledge', bytes: measureContext(knowledge.text), mandatory: false }]
+                : []),
+            ],
+            references,
+          });
           request = { ...request, prompt: guidance + rendered + knowledge.text };
           localBytes = {
             promptBytes: measureContext(request.prompt),
@@ -759,9 +800,15 @@ try {
             ...knowledge.metrics,
           };
           const env = await this.executionEnvironment(run, request.cwd, tools);
-          const references = [...(request.contextMetrics?.references || []), ...knowledge.references];
           for (const reference of references) await this.assertEvidence(reference);
+          const manifestReference = await this.persistEvidence(run, 'context-manifest', manifest);
           this.checkCancelled(run, controller.signal);
+          // Persisted admission: the cap counts every started session of this run,
+          // across resume, retry cycles and parallel workers. It is checked and
+          // recorded in one synchronous step.
+          const sessionCap = run.config.budgets?.sessions ?? null;
+          if (sessionCap !== null && (run.sessionAttempts?.length ?? 0) >= sessionCap)
+            throw Object.assign(new Error(`Исчерпан лимит сессий запуска: ${sessionCap}`), { code: 'budget' });
           attempt = {
             stage,
             node: node?.id ?? null,
@@ -769,6 +816,7 @@ try {
             model: request.model,
             status: 'started',
             evidence: references,
+            manifest: manifestReference,
             metrics: {
               ...localBytes,
               durationMs: null,

@@ -98,7 +98,7 @@ test('Malformed or unavailable assessment records honest standard fallback and a
   assert.deepEqual(fx.calls, ['assessment']);
 });
 
-test('Automatic quick for a named local CSS change ignores unrelated project size without hiding focused truncation', async t => {
+test('Automatic quick by assessment for a named local change ignores unrelated project size without hiding focused truncation', async t => {
   const fx = await fixture(t);
   await mkdir(path.join(fx.project, 'src'));
   await mkdir(path.join(fx.project, 'unrelated'));
@@ -119,9 +119,14 @@ test('Automatic quick for a named local CSS change ignores unrelated project siz
     map = request.files;
     return original(request);
   };
-  const run = await fx.engine.create('Change src/button.css button color from blue to red preserving focus', {
-    project: fx.project,
-  });
+  // Naming a non-style file is doubt for the deterministic fast path (stage 08),
+  // so this task takes the ordinary assessed route this test is about.
+  const run = await fx.engine.create(
+    'Change src/button.css button color from blue to red preserving focus per README.md',
+    {
+      project: fx.project,
+    },
+  );
   const result = await fx.engine.run(run.id, { prepare: true });
   assert.equal(result.state, 'awaiting_plan');
   assert.equal(result.executionMode.selected, 'quick');

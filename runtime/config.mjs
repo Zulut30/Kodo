@@ -12,6 +12,22 @@ export function normalizeConcurrency(value) {
     throw new TypeError('Некорректная конфигурация Kodo: invalid concurrency, expected an integer from 1 to 5');
   return value;
 }
+const budgetLimits = { sessions: [1, 1000], contextBytes: [4096, 4194304] };
+/**
+ * Optional explicit caps of one run. Absent means no cap; a cap is persisted
+ * with the run and never widens on resume.
+ * @param {unknown} value
+ */
+export function normalizeBudgets(value) {
+  if (value === undefined) return undefined;
+  const invalid = () => new Error('Некорректная конфигурация Kodo: budgets');
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw invalid();
+  for (const [key, limit] of Object.entries(value)) {
+    const range = budgetLimits[key];
+    if (!range || !Number.isSafeInteger(limit) || limit < range[0] || limit > range[1]) throw invalid();
+  }
+  return value;
+}
 export const defaults = {
   schemaVersion: 1,
   repository: null,
@@ -82,6 +98,7 @@ export async function readConfig(project, overrides = {}) {
   const scheduler = /** @type {any} */ (config).scheduler;
   if (scheduler !== undefined && !['legacy', 'durable'].includes(scheduler))
     throw new Error('Некорректная конфигурация Kodo: scheduler must be "legacy" or "durable"');
+  normalizeBudgets(/** @type {any} */ (config).budgets);
   normalizeMode(config.executionMode);
   if (
     config.maxTasks !== undefined &&

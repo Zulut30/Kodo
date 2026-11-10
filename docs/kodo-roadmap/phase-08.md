@@ -1,0 +1,46 @@
+# Этап 08: контекст, бюджеты и быстрый путь
+
+Статус на 2026-11-10: **реализация завершена, кандидат на приёмку.** Ветка `kodo/08-context-budget` поверх этапа 07. Проверки замороженного head, ревью и CI перечислены в описании PR этапа.
+
+## Что сделано
+
+| Scope из [плана](NEXT-STAGES.md) | Реализация | Проверка |
+| --- | --- | --- |
+| ① manifest/invalidation | `runtime/context-manifest.mjs`: `buildContextManifest`, `manifestFreshness`; Engine сохраняет манифест каждой сессии как evidence | `tests/context-manifest.test.mjs`, 6 тестов; `tests/fast-path-engine.test.mjs` |
+| ② fast path | `runtime/fast-path.mjs`: `classifyLocalTask`, `fastPathAllowsPlan`; выбор режима и сверка плана в `engine-planning.mjs` | `tests/fast-path.test.mjs`, 3 теста (19 случаев сомнения); `tests/fast-path-engine.test.mjs` |
+| ② persisted budget admission | `budgets.sessions` и `budgets.contextBytes` в конфигурации; проверка в `Engine.session`; Project retry не расширяет лимиты | `tests/fast-path-engine.test.mjs`, `tests/project-director.test.mjs` |
+
+Руководство — [CONTEXT](../CONTEXT.md), решения — [ADR-0010](../decisions/0010-context-manifest-fast-path-budgets.md).
+
+## Соответствие приёмке MVP
+
+| Требование | Чем подтверждено |
+| --- | --- |
+| Обязательный текст переживает truncation | Манифест с сокращённой обязательной секцией не строится; сессия с task-context без контракта отклоняется; полное описание задачи доходит до исполнителя |
+| Отрицательные проверки: injection, invalidation, secret | В манифесте нет текста prompt и секретов (тест с секретом в Engine); изменённый или пропавший evidence даёт `invalidated`, сдвиг head — `stale` |
+| Доказанно локальная CSS-задача обходится без Gemini/Jev/research | На настоящем Engine вызовы провайдера: только план, исполнитель и ревью; `research.requests` равно 0 |
+| Сомнение возвращает обычный маршрут | 19 случаев сомнения в классификаторе; на Engine — путь вне стилей, слово-маркер и явный `standard`; план вне доказательства отзывает быстрый путь и восстанавливает бюджеты |
+| High-risk задача не теряет проверки | Быстрый путь не отключает проверки, gates и ревью; слово-маркер и явный широкий режим его не допускают |
+| Resume и параллельность не расширяют caps | Лимит сессий сохраняется в Run: `resume` и `--retry-failed` не запускают новую сессию; Project retry сохраняет прежние лимиты |
+| Usage отсутствует → null | Не менялось: `tests/metrics.test.mjs` |
+
+## Изменённое существующее поведение
+
+- Задача, называющая только существующие файлы стилей, больше не вызывает оценку Jev. Один существующий тест (`tests/mode-engine.test.mjs`, выбор `quick` по оценке) проверял именно такой текст; в его задачу добавлено упоминание `README.md`, чтобы он по-прежнему проверял обычный маршрут.
+- В `run.sessionAttempts[]` появилось поле `manifest`, в каталоге evidence — файлы `context-manifest-*.json`.
+- Без ключа `budgets` лимитов нет.
+
+## Что не сделано
+
+- **Адаптеры T3 Code и Orca** (scopes ③ и ④ плана). В репозитории нет описания их официальных интерфейсов; задания с `host: t3|orca` по-прежнему получают `host_unavailable`.
+- **Перенос TokenEconomizer** (scope ⑤). Подготовленного кода в репозитории нет.
+- **Interface cards** модулей и выбор контекста по AST/графу зависимостей.
+- **Лимиты на Project и Milestone**, learned routing моделей.
+- **Ограниченный host/utility pilot** и любые измерения токенов. Экономия не измерялась и не заявляется.
+- **Анализ Gemini и оценка Jev** перед этапом не выполнялись: в этой среде нет настроенного Kodo runtime с провайдерами.
+
+## Ограничения
+
+- Быстрый путь покрывает только стили и только задачи, называющие файлы явно.
+- Список слов-маркеров не распознаёт риск, описанный другими словами.
+- Все свидетельства этапа — offline: fake providers, настоящие Git и SQLite.
