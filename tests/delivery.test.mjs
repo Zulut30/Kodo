@@ -2387,7 +2387,7 @@ test('A timeout after the release assets were uploaded completes the same draft 
   const release = await releasePackage({ ...ctx, mergeCommit: delivered.mergeCommit });
   assert.equal(validateReceipt(release), true, JSON.stringify(validateReceipt.errors));
   assert.deepEqual([ctx.state.releaseCreates, ctx.state.uploads, ctx.state.publishes], [1, 0, 1]);
-  assert.equal(operations(ctx).release, 'reconciled');
+  assert.equal(operations(ctx).release, 'confirmed', 'this call made the release public');
   assert.equal(release.sha256, digest(await readFile(path.join(ctx.assets, release.artifact))));
   assert.equal(release.smoke.artifactSha256, release.sha256, 'the smoke ran on the bytes the receipt publishes');
   assert.equal(ctx.leases.size, 0);
@@ -2400,6 +2400,64 @@ test('A recovered published release re-runs the installed smoke on the downloade
   assert.equal(operations(ctx).release, 'confirmed');
   const resumed = await releasePackage({ ...ctx, mergeCommit: delivered.mergeCommit });
   assert.equal(resumed.smoke.artifactSha256, release.sha256);
-  assert.equal(operations(ctx).release, 'reconciled');
+  assert.equal(operations(ctx).release, 'confirmed', 'a later read-back does not rewrite who published');
+  assert.equal(
+    ctx.events.filter(event => event.data?.operation === 'release' && event.data.phase === 'intent').length,
+    1,
+  );
   assert.equal(ctx.state.publishes, 1);
+});
+
+test('A merge command that returns while the PR is still open is not recorded as absent', async t => {
+  const ctx = await fixture(t),
+    runner = ctx.exec;
+  // A merge queue: the command is accepted, the PR is not merged yet.
+  ctx.exec = async (command, args, options) =>
+    command === 'gh' && args[0] === 'pr' && args[1] === 'merge'
+      ? { stdout: '', stderr: '', code: 0 }
+      : runner(command, args, options);
+  await assert.rejects(deliver(ctx), { code: 'merge_pending' });
+  assert.deepEqual(operations(ctx), { pr: 'confirmed', merge: 'uncertain' });
+  assert.deepEqual(uncertainOperations(ctx.events), ['merge'], 'the next delivery must read the PR back first');
+});
+
+test('A failed merge command with an unmerged PR is recorded as absent', async t => {
+  const ctx = await fixture(t),
+    runner = ctx.exec;
+  ctx.exec = async (command, args, options) => {
+    if (command === 'gh' && args[0] === 'pr' && args[1] === 'merge')
+      throw Object.assign(new Error('merge refused by the remote'), { code: 'command_failed' });
+    return runner(command, args, options);
+  };
+  await assert.rejects(deliver(ctx), /merge refused/);
+  assert.equal(ctx.state.merges, 0);
+  assert.deepEqual(operations(ctx), { pr: 'confirmed', merge: 'absent' });
+  assert.deepEqual(uncertainOperations(ctx.events), []);
+});
+
+test('A journal that cannot record an outcome never fails a delivery that already happened', async t => {
+  const ctx = await fixture(t),
+    record = ctx.store.event;
+  ctx.store.event = (id, type, data) => {
+    if (type === 'delivery.operation' && data.phase === 'outcome') throw new Error('database is locked');
+    return record(id, type, data);
+  };
+  const receipt = await deliver(ctx);
+  assert.equal(receipt.mergeCommit, ctx.run.headSha);
+  assert.equal(ctx.run.delivery.mergeCommit, ctx.run.headSha, 'the receipt is saved');
+  assert.equal(ctx.state.merges, 1);
+  assert.deepEqual(uncertainOperations(ctx.events), ['pr', 'merge'], 'the journal honestly stays uncertain');
+  assert.equal(ctx.leases.size, 0);
+});
+
+test('A journal that cannot record an intent stops the remote effect before it starts', async t => {
+  const ctx = await fixture(t),
+    record = ctx.store.event;
+  ctx.store.event = (id, type, data) => {
+    if (type === 'delivery.operation' && data.operation === 'merge' && data.phase === 'intent')
+      throw new Error('database is locked');
+    return record(id, type, data);
+  };
+  await assert.rejects(deliver(ctx), /database is locked/);
+  assert.equal(ctx.state.merges, 0, 'no merge without a durable intent');
 });

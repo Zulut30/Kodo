@@ -8,7 +8,13 @@
 
 export const OPERATION_EVENT = 'delivery.operation';
 export const DELIVERY_OPERATIONS = Object.freeze(['pr', 'merge', 'release']);
-/** `confirmed`: the effect returned and was read back. `reconciled`: found by read-back alone. `absent`: read-back shows it did not happen. */
+/**
+ * `confirmed`: this call performed the effect and it is visible (a PR is confirmed by the URL the
+ * command returned; a merge and a release by reading the remote state back).
+ * `reconciled`: found by read-back alone; this call did not perform it.
+ * `absent`: the command failed and read-back shows the effect did not happen.
+ * Anything less certain has no outcome and stays `uncertain`.
+ */
 const outcomes = new Set(['confirmed', 'reconciled', 'absent']);
 
 /**
@@ -22,14 +28,21 @@ export async function operationIntent(ctx, operation, data = {}) {
 }
 
 /**
- * Record what reading the remote state back showed.
+ * Record what reading the remote state back showed. The journal observes:
+ * a failure to write an outcome never fails a delivery whose remote effect and
+ * saved receipt already exist. (An intent is different: it must be durable
+ * before the effect, so its failure does stop the effect.)
  * @param {{ event: (type: string, data: object) => any }} ctx
  * @param {'pr' | 'merge' | 'release'} operation
  * @param {'confirmed' | 'reconciled' | 'absent'} status
  * @param {Record<string, any>} [data]
  */
 export async function operationOutcome(ctx, operation, status, data = {}) {
-  await ctx.event(OPERATION_EVENT, { ...data, operation, phase: 'outcome', status });
+  try {
+    await ctx.event(OPERATION_EVENT, { ...data, operation, phase: 'outcome', status });
+  } catch {
+    /* The operation stays `uncertain` in the journal; the next delivery reads the remote state anyway. */
+  }
 }
 
 /**
@@ -53,7 +66,9 @@ export function deliveryOperations(events) {
         outcomeAt: null,
         details,
       });
-    else if (phase === 'outcome' && outcomes.has(status))
+    else if (phase === 'outcome' && outcomes.has(status)) {
+      // A later read-back of an effect this run itself confirmed does not turn it into `reconciled`.
+      if (previous?.status === 'confirmed' && status === 'reconciled') continue;
       state.set(operation, {
         operation,
         status,
@@ -62,6 +77,7 @@ export function deliveryOperations(events) {
         outcomeAt: event.time ?? null,
         details: { ...previous?.details, ...details },
       });
+    }
   }
   return DELIVERY_OPERATIONS.filter(operation => state.has(operation)).map(operation => state.get(operation));
 }

@@ -126,3 +126,26 @@ test('The recovery summary names an uncertain remote operation and the deploymen
   assert.match(summary, /Deployment: not_configured/);
   assert.match(summary, /- Hypothesis: A remote delivery operation was started and not confirmed/);
 });
+
+test('A later read-back does not turn an effect this run confirmed into a reconciled one', async () => {
+  const ctx = journal();
+  await operationIntent(ctx, 'merge', { pr: 7 });
+  await operationOutcome(ctx, 'merge', 'confirmed', { pr: 7, mergeCommit: 'b'.repeat(40) });
+  await operationOutcome(ctx, 'merge', 'reconciled', { pr: 7, mergeCommit: 'b'.repeat(40) });
+  assert.deepEqual(state(ctx.events), { merge: 'confirmed' });
+  assert.equal(deliveryOperations(ctx.events)[0].outcomeAt, 1001, 'the confirming read-back is the one recorded');
+  // A new attempt is a new intent; what settles it is recorded as it is.
+  await operationIntent(ctx, 'merge', { pr: 7 });
+  await operationOutcome(ctx, 'merge', 'reconciled', { pr: 7 });
+  assert.deepEqual(state(ctx.events), { merge: 'reconciled' });
+});
+
+test('An outcome that cannot be written is swallowed; an intent that cannot be written is not', async () => {
+  const broken = {
+    event: async () => {
+      throw new Error('database is locked');
+    },
+  };
+  await operationOutcome(broken, 'merge', 'confirmed');
+  await assert.rejects(operationIntent(broken, 'merge'), /database is locked/);
+});

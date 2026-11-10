@@ -509,7 +509,9 @@ export async function releasePackage(options) {
       await writeFile(notes, content);
     }
     return await ctx.irreversible(async () => {
-      await operationIntent(ctx, 'release', { tag, commit: candidate, sha256: checksum });
+      // Nothing is changed for a release that is already published: no intent for it.
+      if (!existing) await operationIntent(ctx, 'release', { tag, commit: candidate, sha256: checksum });
+      let publishedHere = false;
       if (existingInfo) {
         // A process can die after creating the release but before uploading every
         // asset. Upload only absent names; never replace an existing asset.
@@ -573,6 +575,7 @@ export async function releasePackage(options) {
           ['release', 'edit', tag, '--repo', ctx.repository, '--draft=false', '--latest=false', '--target', candidate],
           { ignoreAbort: true },
         );
+        publishedHere = true;
       }
       const published = await verifyPublishedArtifact(
         ctx,
@@ -592,8 +595,8 @@ export async function releasePackage(options) {
       };
       await ctx.save({ delivery: { ...ctx.run.delivery, mergeCommit: candidate, release: receipt } });
       await ctx.event('delivery.released', receipt);
-      // `existingInfo` is a release found on the remote: publication was completed, not started, by this call.
-      await operationOutcome(ctx, 'release', existingInfo ? 'reconciled' : 'confirmed', {
+      // Publication is the operation: `confirmed` when this call made the release public.
+      await operationOutcome(ctx, 'release', publishedHere ? 'confirmed' : 'reconciled', {
         tag,
         commit: candidate,
         sha256: checksum,

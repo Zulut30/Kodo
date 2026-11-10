@@ -263,6 +263,7 @@ export async function deliver(options) {
     const merged = await getPr(ctx, pr.number);
     const receipt = mergedReceipt(ctx, merged, saved, saved.reviewedHead || head);
     await ctx.save({ delivery: receipt });
+    await operationOutcome(ctx, 'merge', 'reconciled', { pr: receipt.pr.number, mergeCommit: receipt.mergeCommit });
     return receipt;
   }
   await ctx.command('gh', [
@@ -335,7 +336,11 @@ export async function deliver(options) {
       }
       const merged = await getPr(ctx, pr.number);
       if (merged.state !== 'MERGED' || !merged.mergeCommit?.oid) {
-        await operationOutcome(ctx, 'merge', 'absent', { pr: pr.number, head });
+        // Only a failed command with an unmerged PR refutes the merge. A command that returned
+        // while the PR is still open (a merge queue), or a merged PR without its commit yet, is
+        // not refuted: no outcome is written and the operation stays uncertain.
+        if (mergeError && merged.state !== 'MERGED')
+          await operationOutcome(ctx, 'merge', 'absent', { pr: pr.number, head });
         if ((await fetchBase(ctx)) !== ctx.run.baseSha)
           throw fail('stale_base', 'Target branch changed while merging; synchronize and retry');
         if (mergeError) throw mergeError;
