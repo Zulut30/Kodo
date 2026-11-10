@@ -14,6 +14,7 @@ import {
   runBehaviorGate,
 } from './behavior-gate.mjs';
 import { EngineExecution } from './engine-execution.mjs';
+import { normalizeWatchdogConfig, observeRun, watchdogStep } from './watchdog.mjs';
 import { contentHash, packSessionEvidence, evidencePrompt } from './engine-core.mjs';
 
 /** Checks, verification gates, review and repair stages. */
@@ -588,8 +589,19 @@ export class EngineVerification extends EngineExecution {
       const repeated = cycle.lastFailure === signature;
       cycle.attempt = attempt + 1;
       cycle.lastFailure = signature;
-      if (repeated || cycle.attempt >= run.config.repairRounds) {
-        cycle.stopped = cycle.attempt >= run.config.repairRounds ? 'repair_budget_exhausted' : 'no_progress';
+      // Different output every round is not progress: only an accepted criterion that changed is.
+      run.watchdog = watchdogStep(run.watchdog, {
+        key: `verification:${cycle.cycle || 1}:${attempt}`,
+        observation: observeRun(run),
+        limit: normalizeWatchdogConfig(run.config.watchdog).stalledRounds,
+      });
+      if (repeated || cycle.attempt >= run.config.repairRounds || run.watchdog.stopped) {
+        cycle.stopped =
+          cycle.attempt >= run.config.repairRounds
+            ? 'repair_budget_exhausted'
+            : repeated
+              ? 'no_progress'
+              : 'no_verified_progress';
         this.assess(run, { scope: 'verification', attempts: cycle.attempt, reason: cycle.stopped, problem });
         throw Object.assign(new Error(`Проверки не пройдены: ${problem}`), { code: 'blocked' });
       }

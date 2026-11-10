@@ -6,10 +6,29 @@ import { validateCommandTimeouts } from './config.mjs';
 import { planSchema } from './contracts.mjs';
 import { commitChanges } from './workspace.mjs';
 import { writeProgress } from './progress.mjs';
+import { recordBlocker, resetWatchdog, resolveBlocker } from './watchdog.mjs';
 import { normalizeArchitectureConfig } from './architecture-gate.mjs';
 import { EngineVerification } from './engine-verification.mjs';
 
 /** Public engine: the durable run loop over the layered stages. */
+/** Why the run stopped now, with the facts and evidence the next session needs. */
+function currentBlocker(run, error) {
+  const assessed = error.code === 'blocked' ? run.controllerAssessment : null;
+  return recordBlocker(run.blocker, {
+    code: assessed?.reason || run.error.code,
+    message: run.error.message,
+    scope: assessed?.scope || 'run',
+    at: new Date().toISOString(),
+    headSha: run.headSha || null,
+    reasons: [run.error.code, error.classification, run.behavior?.passed === false ? 'behavior_failed' : null].filter(
+      Boolean,
+    ),
+    evidence: [
+      ...(run.checks?.results || []).map(row => ({ sha256: row.outputHash, kind: 'check' })),
+      ...(run.behavior?.oracles || []).map(row => ({ sha256: row.outputHash, kind: 'oracle' })),
+    ].filter(item => typeof item.sha256 === 'string'),
+  });
+}
 export class Engine extends EngineVerification {
   // oxlint-disable-next-line max-lines-per-function, complexity -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
   async run(id, { prepare = false, planFile, signal, resumeCancelled = false, retryFailed = false } = {}) {
@@ -21,6 +40,8 @@ export class Engine extends EngineVerification {
     if (run.state === 'succeeded' || (run.state === 'cancelled' && !resumeCancelled)) return run;
     const token = this.store.acquireLease(`run:${id}`, id);
     if (!token) throw new Error('Этот запуск уже исполняется');
+    // The saved error describes the previous attempt: from here on it is history, not the current blocker.
+    run.blocker = resolveBlocker(run.blocker, { at: new Date().toISOString(), outcome: 'resumed' });
     if (resumeCancelled) {
       this.store.updateRun(id, { cancelRequested: false, state: 'resuming' });
       delete run.cancelRequested;
@@ -53,6 +74,7 @@ export class Engine extends EngineVerification {
           ].slice(-20),
         };
       delete run.controllerAssessment;
+      run.watchdog = resetWatchdog(run.watchdog);
       this.save(run);
       this.log(run, 'retry_requested');
     }
@@ -250,6 +272,7 @@ export class Engine extends EngineVerification {
       if (!run.release?.published) this.checkCancelled(run, signal);
       run.state = 'succeeded';
       run.error = null;
+      run.blocker = resolveBlocker(run.blocker, { at: new Date().toISOString(), outcome: 'succeeded' });
       this.save(run);
       this.log(run, 'succeeded', { headSha: run.headSha, pr: run.delivery?.pr, release: run.release });
       await this.policy(run, 'complete');
@@ -274,6 +297,7 @@ export class Engine extends EngineVerification {
         message: redact(error.message, this.secrets),
         ...(error.retryAt ? { retryAt: error.retryAt } : {}),
       };
+      if (['blocked', 'waiting_limits'].includes(run.state)) run.blocker = currentBlocker(run, error);
       this.save(run);
       this.log(run, run.state, run.error);
       return run;
