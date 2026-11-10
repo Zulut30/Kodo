@@ -7,6 +7,7 @@ import { planSchema } from './contracts.mjs';
 import { commitChanges } from './workspace.mjs';
 import { writeProgress } from './progress.mjs';
 import { recordBlocker, resetWatchdog, resolveBlocker } from './watchdog.mjs';
+import { deliveryOperations, deploymentStatus } from './delivery-operations.mjs';
 import { normalizeArchitectureConfig } from './architecture-gate.mjs';
 import { EngineVerification } from './engine-verification.mjs';
 
@@ -24,9 +25,12 @@ function currentBlocker(run, error) {
     // A verification stop belongs to the commit that was checked. After a repair it is newer than
     // the last accepted commit, which is what `run.headSha` still names.
     headSha: (scope === 'verification' ? run.checks?.headSha : null) || run.headSha || null,
-    reasons: [run.error.code, error.classification, run.behavior?.passed === false ? 'behavior_failed' : null].filter(
-      Boolean,
-    ),
+    reasons: [
+      run.error.code,
+      error.classification,
+      run.behavior?.passed === false ? 'behavior_failed' : null,
+      (run.deliveryOperations || []).some(item => item.status === 'uncertain') ? 'delivery_uncertain' : null,
+    ].filter(Boolean),
     // Check and oracle output explains a verification stop only.
     evidence:
       scope === 'verification'
@@ -38,6 +42,19 @@ function currentBlocker(run, error) {
   });
 }
 export class Engine extends EngineVerification {
+  /**
+   * What the delivery journal and the deployment configuration say, for status and the recovery
+   * summary. Observational: a failure to read the journal never changes the outcome of the run.
+   */
+  deliverySummary(run) {
+    if (!run.config?.delivery?.enabled) return;
+    try {
+      run.deliveryOperations = deliveryOperations(this.store.events(run.id));
+      run.deployment = deploymentStatus(run.config);
+    } catch {
+      /* The saved receipts stay authoritative. */
+    }
+  }
   // oxlint-disable-next-line max-lines-per-function, complexity -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
   async run(id, { prepare = false, planFile, signal, resumeCancelled = false, retryFailed = false } = {}) {
     const run = this.store.getRun(id);
@@ -283,6 +300,7 @@ export class Engine extends EngineVerification {
       run.state = 'succeeded';
       run.error = null;
       run.blocker = resolveBlocker(run.blocker, { at: new Date().toISOString(), outcome: 'succeeded' });
+      this.deliverySummary(run);
       this.save(run);
       this.log(run, 'succeeded', { headSha: run.headSha, pr: run.delivery?.pr, release: run.release });
       await this.policy(run, 'complete');
@@ -307,6 +325,7 @@ export class Engine extends EngineVerification {
         message: redact(error.message, this.secrets),
         ...(error.retryAt ? { retryAt: error.retryAt } : {}),
       };
+      this.deliverySummary(run);
       if (['blocked', 'waiting_limits'].includes(run.state)) run.blocker = currentBlocker(run, error);
       this.save(run);
       this.log(run, run.state, run.error);

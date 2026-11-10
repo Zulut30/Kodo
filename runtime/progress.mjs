@@ -83,6 +83,17 @@ export function buildProgress(run) {
     `Delivery: ${run.delivery?.mergeCommit ? `merged ${short(run.delivery.mergeCommit, 64)}` : run.delivery?.pr ? `PR ${short(run.delivery.pr.number, 20)}` : 'pending'}`,
     `Release: ${run.release?.published === true ? 'published' : 'pending'} ${short(run.release?.version, 40)}`,
   );
+  if (run.deliveryOperations?.length)
+    lines.push(
+      `Delivery operations: ${run.deliveryOperations
+        .slice(0, 6)
+        .map(
+          item =>
+            `${short(item.operation, 20)} ${short(item.status, 20)}${item.status === 'uncertain' ? ' (read back before retry)' : ''}`,
+        )
+        .join('; ')}`,
+    );
+  if (run.deployment) lines.push(`Deployment: ${short(run.deployment.status, 40)}`);
   if (run.controllerAssessment)
     lines.push(
       `Controller: ${short(run.controllerAssessment.reason, 100)}; ${short(run.controllerAssessment.summary, 600)}`,

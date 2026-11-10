@@ -136,6 +136,8 @@ const hints = {
   budget: 'The explicit session cap of this run is reached; a wider budget requires a new run.',
   context_budget: 'A session context exceeded the explicit limit; mandatory context is never shortened to fit.',
   quota: 'The provider subscription limit was reached; the saved session resumes after the retry time.',
+  delivery_uncertain:
+    'A remote delivery operation was started and not confirmed; the next delivery reads the remote state back before any retry.',
 };
 
 /**
