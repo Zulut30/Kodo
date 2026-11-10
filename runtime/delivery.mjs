@@ -336,7 +336,7 @@ export async function deliver(options) {
       }
       const merged = await getPr(ctx, pr.number);
       if (merged.state !== 'MERGED' || !merged.mergeCommit?.oid) {
-        // Only a command the remote refused, with an unmerged PR, refutes the merge. A command
+        // Only a command that exited with an error, with an unmerged PR, refutes the merge. A command
         // that returned while the PR is still open (a merge queue), a merged PR without its
         // commit yet, or a command stopped by a local timeout after the request left, is not
         // refuted: no outcome is written and the operation stays uncertain.

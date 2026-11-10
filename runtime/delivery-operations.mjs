@@ -13,7 +13,9 @@ export const DELIVERY_OPERATIONS = Object.freeze(['pr', 'merge', 'release']);
  * command returned; a merge and a release by reading the remote state back).
  * `reconciled`: established by read-back alone: the command of this call failed after the remote
  * accepted it, or an earlier process performed the effect.
- * `absent`: the remote refused the command and read-back shows the effect did not happen.
+ * `absent`: the command exited with an error and read-back shows the effect did not happen.
+ * (An error exit is usually a refusal; a network failure inside the client looks the same, so
+ * `absent` is a statement about the read-back, and the next delivery reads the remote again.)
  * Anything less certain has no outcome and stays `uncertain`.
  */
 const outcomes = new Set(['confirmed', 'reconciled', 'absent']);

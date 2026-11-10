@@ -1898,6 +1898,9 @@ test('Release reconciliation skips newer drafts and uploads absent assets withou
     (await readFile(path.join(ctx.assets, 'SHA256SUMS'), 'utf8')).trim(),
     `${release.sha256}  ${release.artifact}`,
   );
+  // Uploading the missing asset changes the remote, so it is announced: a second intent, after the first publication.
+  const intents = ctx.events.filter(event => event.data?.operation === 'release' && event.data.phase === 'intent');
+  assert.equal(intents.length, 2);
   assert.equal(ctx.leases.size, 0);
 });
 
