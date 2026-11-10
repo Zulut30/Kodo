@@ -7,7 +7,7 @@
 | Scope из [плана](NEXT-STAGES.md) | Реализация | Проверка |
 | --- | --- | --- |
 | ① manifest/invalidation | `runtime/context-manifest.mjs`: `buildContextManifest`, `manifestFreshness`; Engine сохраняет манифест каждой сессии в её записи в Run | `tests/context-manifest.test.mjs`, 6 тестов; `tests/fast-path-engine.test.mjs` |
-| ② fast path | `runtime/fast-path.mjs`: `classifyLocalTask`, `fastPathAllowsPlan`; выбор режима и сверка плана в `engine-planning.mjs` | `tests/fast-path.test.mjs`, 3 теста (32 случая сомнения); `tests/fast-path-engine.test.mjs` |
+| ② fast path | `runtime/fast-path.mjs`: `classifyLocalTask`, `fastPathAllowsPlan`; выбор режима и сверка плана в `engine-planning.mjs` | `tests/fast-path.test.mjs`, 3 теста (34 случая сомнения); `tests/fast-path-engine.test.mjs` |
 | ② persisted budget admission | `budgets.sessions` и `budgets.contextBytes` в конфигурации; проверка в `Engine.session`; Project retry не расширяет лимиты | `tests/fast-path-engine.test.mjs`, `tests/project-director.test.mjs` |
 
 Руководство — [CONTEXT](../CONTEXT.md), решения — [ADR-0010](../decisions/0010-context-manifest-fast-path-budgets.md).
@@ -19,7 +19,7 @@
 | Обязательный текст переживает truncation | Манифест с сокращённой обязательной секцией не строится; сессия с task-context без контракта отклоняется; полное описание задачи доходит до исполнителя |
 | Отрицательные проверки: injection, invalidation, secret | В манифесте нет текста prompt и секретов (тест с секретом в Engine); изменённый или пропавший evidence даёт `invalidated`, сдвиг head — `stale` |
 | Доказанно локальная CSS-задача обходится без Gemini/Jev/research | На настоящем Engine вызовы провайдера: только план, исполнитель и ревью; `research.requests` равно 0 |
-| Сомнение возвращает обычный маршрут | 32 случая сомнения в классификаторе; на Engine — путь вне стилей, слово-маркер и явный `standard`; план вне доказательства отзывает быстрый путь и восстанавливает бюджеты |
+| Сомнение возвращает обычный маршрут | 34 случая сомнения в классификаторе; на Engine — путь вне стилей, слово-маркер и явный `standard`; план вне доказательства отзывает быстрый путь и восстанавливает бюджеты |
 | High-risk задача не теряет проверки | Быстрый путь не отключает проверки, gates и ревью; слово-маркер и явный широкий режим его не допускают |
 | Resume и параллельность не расширяют caps | Лимит сессий сохраняется в Run: `resume` и `--retry-failed` не запускают новую сессию; Project retry сохраняет прежние лимиты |
 | Usage отсутствует → null | Не менялось: `tests/metrics.test.mjs` |
@@ -45,6 +45,8 @@
 - планировщику быстрого пути называют разрешённые файлы, чтобы честный план не отзывал доказательство;
 - добавлены тесты на символическую ссылку в индексе Git и на каталог с именем стиля;
 - документы уточнены: `context_budget` упаковщика, значение `source: fast-path`.
+
+Ревью дельты: **PASS**; его замечание исправлено: числом считается только значение без единицы или с единицей CSS. Автоматическое ревью Codex в PR указало, что слишком большой контракт узла в файле плана отзывал быстрый путь до отказа; размер контракта теперь проверяется до сверки.
 
 Не исправлено: исчерпанный лимит сессий проверяется только в момент сессии, поэтому повтор заведомо обречённого запуска заново выполняет подготовку (записано в руководстве).
 

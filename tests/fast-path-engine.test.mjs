@@ -207,4 +207,16 @@ test('A broken or forbidden host plan is refused without revoking the fast path'
     'an invalid plan cannot widen the run',
   );
   assert.ok(!fx.calls.includes('assessment'));
+  // A plan outside the proof whose node contract is too large is refused the same way.
+  await writeFile(
+    planFile,
+    JSON.stringify({
+      summary: 'Oversized',
+      tasks: [{ ...task('code'), description: 'x'.repeat(13000), writePaths: ['value.mjs'] }],
+    }),
+  );
+  const oversized = await fx.engine.run(run.id, { planFile });
+  assert.deepEqual([oversized.state, oversized.error.code], ['blocked', 'task_contract_too_large']);
+  assert.deepEqual([oversized.executionMode.source, oversized.fastPath.revoked], ['fast-path', undefined]);
+  assert.ok(!fx.calls.includes('assessment'), 'no assessment, analysis or research was spent on it');
 });

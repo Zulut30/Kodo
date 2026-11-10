@@ -24,6 +24,8 @@ const riskMarkers = [
   /скрипт|бэкенд|баз\S* данн|рефактор|переимен/i,
 ];
 
+const cssNumber = /^\d+(?:\.\d+)?(?:px|rem|em|ex|ch|vh|vw|vmin|vmax|pt|pc|cm|mm|in|s|ms|deg|rad|turn|fr|dpi|x|%)?$/i;
+
 /**
  * Words of the task that look like a file reference: anything with a slash,
  * or with a dot that is not sentence punctuation. `.env`, `обработчик.js`,
@@ -34,8 +36,9 @@ function pathLike(task) {
     task
       .split(/[\s"'`()[\]{}<>,\u00ab\u00bb\u2018\u2019\u201c\u201d]+/)
       .map(word => word.replace(/[.,;:!?]+$/, ''))
-      // A plain number with an optional unit (`0.8`, `1.5rem`, `50%`) is a value, not a file.
-      .filter(word => (word.includes('/') || word.includes('.')) && !/^\d+(?:\.\d+)?[a-z%]*$/i.test(word))
+      // A plain number with an optional CSS unit (`0.8`, `1.5rem`, `50%`) is a value, not a file.
+      // Any other suffix (`2.7z`, `1.0a`) still looks like a file.
+      .filter(word => (word.includes('/') || word.includes('.')) && !cssNumber.test(word))
   );
 }
 

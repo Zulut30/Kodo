@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { redact, secretFile } from './security.mjs';
 import { validate, validatePlan, planSchema, routingSchema, scopesOverlap } from './contracts.mjs';
 import { git, makeWorktree, collectFiles } from './workspace.mjs';
-import { maxTaskContractBytes } from './task-context.mjs';
+import { maxTaskContractBytes, validateTaskContract } from './task-context.mjs';
 import { assessTask, resolveMode } from './modes.mjs';
 import { FAST_PATH_VERSION, classifyLocalTask, fastPathAllowsPlan } from './fast-path.mjs';
 import { EngineCore, contentHash, defaultModel, evidencePrompt, lstatSafe } from './engine-core.mjs';
@@ -239,17 +239,18 @@ export class EnginePlanning extends EngineCore {
     await this.policy(run, 'plan');
     if (planFile) {
       const candidate = JSON.parse(await readFile(planFile, 'utf8'));
-      // A broken or forbidden plan is refused before it can change the mode of the run.
+      // A broken, oversized or forbidden plan is refused before it can change the mode of the run.
+      // Only the task count depends on the mode; it is checked after the mode is settled.
+      const legacy = Boolean(run.plan && contentHash(candidate) === contentHash(run.plan));
       validatePlan(candidate);
+      if (!legacy) candidate.tasks.forEach(validateTaskContract);
       if (
         Object.values(run.nodes).some(node => node.status === 'integrated') &&
         contentHash(candidate) !== contentHash(run.plan)
       )
         throw new Error('Нельзя заменить план после интеграции задач');
       await this.fastPathGuard(run, candidate, signal);
-      this.validateModePlan(run, candidate, {
-        legacy: Boolean(run.plan && contentHash(candidate) === contentHash(run.plan)),
-      });
+      this.validateModePlan(run, candidate, { legacy });
       run.plan = candidate;
       run.planSource = 'host';
       this.save(run);

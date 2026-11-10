@@ -104,6 +104,9 @@ test('Every doubt returns the ordinary route with its reason', async t => {
     // The index entry is a symbolic link even where the working tree shows a plain file.
     [{ task: 'Make src/styles/link.css blue' }, 'path_not_file'],
     [{ task: 'Make src/styles/folder.css blue' }, 'path_not_file'],
+    // A number with a suffix that is not a CSS unit still looks like a file.
+    [{ task: `Make ${button} blue and unpack 2.7z` }, 'non_style_path'],
+    [{ task: `Make ${button} blue as in 1.0a` }, 'non_style_path'],
     // A class selector is indistinguishable from a dot-file and stays doubt.
     [{ task: `Make .button blue in ${button}` }, 'non_style_path'],
   ];
