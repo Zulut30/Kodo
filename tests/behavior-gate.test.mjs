@@ -1059,7 +1059,18 @@ test('The file that lost a case is the one reported, also when another file has 
   });
   assert.equal(permitted.passed, true);
   assert.deepEqual(rules(permitted.allowed), ['test_deleted:tests/a.test.mjs']);
-  // A real move is still a move: the case leaves one file and appears in a new one.
-  const moved = repo.change({ 'tests/b.test.mjs': works });
+  // A real move is still a move: the case leaves one file and appears in a new one. The new file
+  // differs enough from the deleted one for Git not to pair them as a rename.
+  const others = Array.from({ length: 8 }, (_, index) => one(`other ${index}`)).join('');
+  const moved = repo.change({ 'tests/b.test.mjs': `${header}${others}${one('works')}` });
   assert.deepEqual(await weakened(moved), [], 'the deleted case is found in the new file');
+  const status = repo.git('diff', '--name-status', '-M', `${moved.baseSha}...${moved.headSha}`);
+  assert.match(status, /^D\ttests\/a\.test\.mjs$/m, 'the move is not a rename for Git');
+  // In Java `fun` is an ordinary name: it does not hide the tests after it.
+  const java =
+    'class FunTest {\n  @Test void first() { int fun = 1; if (fun < 2) { run(); } }\n  @Test void second() {}\n  @Test void third() {}\n}\n';
+  const javaRepo = repository(t, { 'src/test/java/FunTest.java': java });
+  const javaHead = javaRepo.change({ 'src/test/java/FunTest.java': java.replace('  @Test void third() {}\n', '') });
+  const gone = await testWeakening(javaHead);
+  assert.match(gone.findings[0].detail, /test cases removed: "third"$/, 'second and third were read as cases');
 });

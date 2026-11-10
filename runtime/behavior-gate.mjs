@@ -740,7 +740,8 @@ function javaCases(source, kotlin) {
       const end = wordEnd(index),
         word = code.slice(index, end);
       index = end;
-      if (word === 'void' || word === 'fun') {
+      // `fun` declares a function only in Kotlin; in Java it is an ordinary name.
+      if (word === 'void' || (kotlin && word === 'fun')) {
         const [name, at] = nameAt(end);
         if (test && name && code[afterSpace(at)] === '(') cases.push({ name, skipped: off });
         index = at;
@@ -943,7 +944,12 @@ export async function testWeakening({ cwd, baseSha, headSha, allowed = [] }) {
   const missing = base.map(entry =>
     entry.cases.map(item => item.name).filter(name => !take(pools.get(entry.at), name)),
   );
-  const moved = name => [...pools.values()].some(pool => take(pool, name));
+  // After every file has claimed its own cases it no longer matters which file a moved case went
+  // to: what is left is counted once, so the cost does not grow with the number of files.
+  const left = new Map();
+  for (const pool of pools.values())
+    for (const [name, number] of pool) if (number > 0) left.set(name, (left.get(name) ?? 0) + number);
+  const moved = name => take(left, name);
   for (const [index, entry] of base.entries()) {
     const removed = missing[index].filter(name => !moved(name));
     if (removed.length)
