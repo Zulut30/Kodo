@@ -776,7 +776,7 @@ test('CI stopped commands expose bounded sanitized tails and allowlisted metadat
         let calls = 0;
         const throws = async options => {
           calls++;
-          assert.equal(options.timeoutMs, 1200000);
+          assert.equal(options.timeoutMs, 2400000);
           for (const name of Object.keys(secrets)) assert.equal(options.env[name], undefined);
           throw Object.assign(new Error('private infrastructure message'), {
             code,
