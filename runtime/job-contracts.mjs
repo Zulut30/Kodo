@@ -67,6 +67,15 @@ export const JOB_ROLES = Object.freeze([
   'reviewer',
 ]);
 export const JOB_HOSTS = Object.freeze(['native', 't3', 'orca']);
+/** Hosts whose external chats pull their work: the job runs there, never in the native Engine. */
+export const PULL_HOSTS = Object.freeze(['t3', 'orca']);
+/**
+ * @param {unknown} id
+ * @returns {boolean}
+ */
+export function isPullHost(id) {
+  return typeof id === 'string' && PULL_HOSTS.includes(id);
+}
 /** After this many lost claims a ready job reserves its scopes. */
 export const STARVATION_BYPASSES = 8;
 export const MAX_JOB_BYTES = 65536;

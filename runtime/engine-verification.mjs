@@ -16,6 +16,7 @@ import {
 import { EngineExecution } from './engine-execution.mjs';
 import { normalizeWatchdogConfig, observeRun, watchdogStep } from './watchdog.mjs';
 import { contentHash, packSessionEvidence, evidencePrompt } from './engine-core.mjs';
+import { TASK_FAST_PROFILE, runFastChecks } from './task-fast-checks.mjs';
 
 /** Checks, verification gates, review and repair stages. */
 /** The baseline, while it still describes the base of the run: a synchronized base makes it stale. */
@@ -148,6 +149,8 @@ export class EngineVerification extends EngineExecution {
     if (
       run.config.commands.test.length &&
       run.checks?.schemaVersion === 2 &&
+      // A profiled receipt (task-fast) never stands in for the full checks, whatever else it claims.
+      run.checks.profile === undefined &&
       run.checks.complete === true &&
       run.checks.headSha === headSha &&
       run.checks.fingerprint === fingerprint &&
@@ -273,6 +276,13 @@ export class EngineVerification extends EngineExecution {
     };
     this.save(run);
   }
+  /** The task-fast profile: affected checks only (see runtime/task-fast-checks.mjs). */
+  async fastChecks(run, signal) {
+    run.architectureChecks = null;
+    run.state = 'testing';
+    this.save(run);
+    await runFastChecks({ engine: this, run, signal });
+  }
   async verificationGates(run, signal) {
     const headSha = await git(run.cwd, ['rev-parse', 'HEAD']);
     const clean = async () => {
@@ -375,7 +385,8 @@ export class EngineVerification extends EngineExecution {
     this.checkCancelled(run, signal);
     if (!pending.complete) {
       if (!pending.researched) {
-        await this.moreResearch(run, pending.problem, signal);
+        // The task-fast profile repairs from the confirmed failure alone, without new research.
+        if (run.verificationProfile !== TASK_FAST_PROFILE) await this.moreResearch(run, pending.problem, signal);
         pending.researched = true;
         this.save(run);
       }
@@ -430,6 +441,7 @@ export class EngineVerification extends EngineExecution {
         reason: cycle.stopped,
       });
     }
+    const fast = run.verificationProfile === TASK_FAST_PROFILE;
     while (cycle.attempt < run.config.repairRounds) {
       // A failed round reserves its repair durably. Interruptions resume that
       // repair before a new round can interpret the same HEAD as no progress.
@@ -443,9 +455,10 @@ export class EngineVerification extends EngineExecution {
         run.review = null;
         run.behavior = null;
         this.save(run);
-        await this.checks(run, signal);
+        if (fast) await this.fastChecks(run, signal);
+        else await this.checks(run, signal);
         await this.behaviorGate(run, signal);
-        await this.verificationGates(run, signal);
+        if (!fast) await this.verificationGates(run, signal);
       } catch (error) {
         if (signal?.aborted || this.store.getRun(run.id).cancelRequested)
           throw Object.assign(new Error('Запуск отменён'), { code: 'cancelled' });
@@ -454,6 +467,13 @@ export class EngineVerification extends EngineExecution {
         checkError = error;
       }
       const headSha = await git(run.cwd, ['rev-parse', 'HEAD']);
+      if (!checkError && fast) {
+        // A task-fast head is accepted by its checks and the behaviour gate; the epic gate run reviews it.
+        run.headSha = headSha;
+        run.review = null;
+        this.save(run);
+        return;
+      }
       let review;
       if (!checkError) {
         run.state = 'reviewing';

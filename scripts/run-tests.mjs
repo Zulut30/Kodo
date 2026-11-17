@@ -41,6 +41,11 @@ const priority = [
   'tests/ci-cli.test.mjs', // 62405.4714 ms; retained lighter priority
   'tests/project-director-oracle.test.mjs', // 22760.5585 ms; retained lighter priority
   'tests/architecture-acceptance.test.mjs', // 17840.1058 ms; retained lighter priority
+  // Two-level wave verification: sums of case durations from one local Windows run of the
+  // four new files in parallel (Node 24.19.0), not a receipt and no speed claim.
+  'tests/task-fast-checks.test.mjs', // ~167000 ms
+  'tests/wave-verifier.test.mjs', // ~72000 ms
+  'tests/engine-fast-profile.test.mjs', // ~38000 ms
 ];
 
 // `npm run test:fast`: unit-level files measured at a few seconds each on
@@ -61,6 +66,7 @@ export const fastTests = [
   'tests/fast-path.test.mjs',
   'tests/job-cli.test.mjs',
   'tests/job-contracts.test.mjs',
+  'tests/job-pull-hosts.test.mjs',
   'tests/job-store.test.mjs',
   'tests/knowledge-claims.test.mjs',
   'tests/knowledge-context.test.mjs',
