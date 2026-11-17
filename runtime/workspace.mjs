@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { readFile, lstat, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { execute } from './command.mjs';
-import { secretFile, redact } from './security.mjs';
+import { secretFile, redact, stateHome, worktreeHome } from './security.mjs';
 export async function git(cwd, args, options = {}) {
   return (await execute('git', args, { cwd, ...options })).stdout.trim();
 }
@@ -14,6 +14,20 @@ export async function diffHash(cwd, baseSha, headSha = 'HEAD') {
       ).stdout.trimEnd(),
     )
     .digest('hex');
+}
+// Private run worktrees never live in the user's checkout. An explicit
+// KODO_WORKTREE_HOME wins; a state home inside Git keeps worktrees beside its
+// temporary artifact home; the default state home uses the default worktree home.
+/** @param {{ storeHome: string, stateInGit?: boolean, artifactHome?: string }} options */
+export function worktreeHomeFor({ storeHome, stateInGit = false, artifactHome }) {
+  return (
+    process.env.KODO_WORKTREE_HOME ||
+    (stateInGit
+      ? `${artifactHome}-worktrees`
+      : path.resolve(storeHome) === stateHome()
+        ? worktreeHome()
+        : `${storeHome}-worktrees`)
+  );
 }
 export async function inspectProject(project) {
   const root = await git(project, ['rev-parse', '--show-toplevel']);
