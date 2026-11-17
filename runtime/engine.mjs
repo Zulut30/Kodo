@@ -13,7 +13,7 @@ import { EngineVerification } from './engine-verification.mjs';
 
 /** Public engine: the durable run loop over the layered stages. */
 /** Why the run stopped now, with the facts and evidence the next session needs. */
-function currentBlocker(run, error) {
+export function currentBlocker(run, error) {
   // The stop error names its own place and reason. The saved controller assessment is not
   // used: with two nodes stopping together it may belong to the other one.
   const scope = typeof error.scope === 'string' ? error.scope : 'run';
@@ -55,9 +55,39 @@ export class Engine extends EngineVerification {
       /* The saved receipts stay authoritative. */
     }
   }
+  /** Discover the subscription models this run may use and settle its primary model. */
+  async selectModels(run) {
+    run.models = (
+      await this.logical(run, 'discovery', () =>
+        this.provider.discoverProviders(
+          {
+            client: run.client,
+            providers: run.fixedModel ? 'current' : run.providers,
+            primaryModel: run.config.primaryModel,
+          },
+          { secrets: this.secrets, config: run.config },
+        ),
+      )
+    ).filter(
+      item =>
+        item.available !== false &&
+        (run.providers === 'both' || item.client === run.client) &&
+        run.config.models[item.client]?.includes(item.model) &&
+        (!run.fixedModel || (item.client === run.fixedModel.client && item.model === run.fixedModel.model)),
+    );
+    if (!run.models.length) throw Object.assign(new Error('Нет доступных моделей по подписке'), { code: 'auth' });
+    this.primary(run);
+    this.save(run);
+    return run.models;
+  }
   // oxlint-disable-next-line max-lines-per-function, complexity -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
   async run(id, { prepare = false, planFile, signal, resumeCancelled = false, retryFailed = false } = {}) {
     const run = this.store.getRun(id);
+    // An external chat or an epic gate run is executed elsewhere: refuse before taking any lease.
+    if (run.executor?.kind === 'external' || run.directorBinding?.kind === 'gate')
+      throw Object.assign(new Error('Этот запуск исполняется не Engine: внешний исполнитель или гейт эпика'), {
+        code: 'project_run_not_native',
+      });
     writeProgress(run, {
       home: run.artifacts ? path.resolve(run.artifacts, '../..') : this.store.home,
       secrets: this.secrets,
@@ -171,29 +201,7 @@ export class Engine extends EngineVerification {
           this.save(run);
         }
       }
-      if (!run.delivery?.mergeCommit) {
-        run.models = (
-          await this.logical(run, 'discovery', () =>
-            this.provider.discoverProviders(
-              {
-                client: run.client,
-                providers: run.fixedModel ? 'current' : run.providers,
-                primaryModel: run.config.primaryModel,
-              },
-              { secrets: this.secrets, config: run.config },
-            ),
-          )
-        ).filter(
-          item =>
-            item.available !== false &&
-            (run.providers === 'both' || item.client === run.client) &&
-            run.config.models[item.client]?.includes(item.model) &&
-            (!run.fixedModel || (item.client === run.fixedModel.client && item.model === run.fixedModel.model)),
-        );
-        if (!run.models.length) throw Object.assign(new Error('Нет доступных моделей по подписке'), { code: 'auth' });
-        this.primary(run);
-        this.save(run);
-      }
+      if (!run.delivery?.mergeCommit) await this.selectModels(run);
       await this.plan(run, planFile, signal);
       await this.assertProjectPlan(run);
       if (!run.delivery?.mergeCommit) {

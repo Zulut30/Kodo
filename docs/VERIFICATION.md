@@ -156,10 +156,84 @@
 
 `isCurrentBehaviorReceipt` принимает квитанцию только для того же head, той же базы и той же конфигурации. Каждый раунд проверки строит её заново.
 
+## Профили task-fast и gate run
+
+Большой «волновой» проект проверяется на двух уровнях. Мелкая задача проходит быстрый профиль `task-fast`; полная проверка (все команды, behaviour gate, UI/security/architecture, одно независимое ревью всего diff и `commands.smoke`) выполняется один раз на границе эпика, в отдельном gate run.
+
+```
+задача:  быстрые проверки затронутого → behaviour gate
+гейт:    test + build → behaviour gate → UI / security / architecture → ревью всего diff эпика → smoke
+```
+
+Поля Run:
+
+| Поле | Смысл |
+| --- | --- |
+| `verificationProfile: 'task-fast'` | Быстрый профиль. Нет поля — прежняя проверка без изменений |
+| `fastChecks: { timeoutMs }` | Жёсткий таймаут каждой быстрой команды, по умолчанию 120000 мс |
+| `executor: { kind: 'external', host: 't3' \| 'orca' }` | Задачу делает внешний чат, не Engine |
+| `directorBinding.kind: 'gate'` | Gate run эпика |
+
+### task-fast
+
+План строится как L1 у `kodo ci` (`runtime/task-fast-checks.mjs`, `planFastChecks`): `node --check` каждого затронутого JS-файла и `node --test` затронутых тест-файлов по графу `planAffected`. Полный `commands.test` выполняется вместо узкого плана, если:
+
+| Причина | Когда |
+| --- | --- |
+| причины графа (`config-change:…`, `package-change:…`, `unknown-file-or-config:…`, `dirty-worktree` и др.) | Граф не может сузить набор тестов |
+| `graph-error` | Граф не построен |
+| `no-affected-tests` | Изменение не затронуло ни одного теста |
+| `runner-not-node-test` | `commands.test` — не `node --test` |
+| `runner-multiple-commands`, `runner-not-configured` | Команд проверки не одна |
+| `runner-options` | У `node --test` есть опция без `=` или glob в пути: сузить без потери смысла нельзя |
+
+Позиционный путь у `node --test` (например, `tests/unit`) ограничивает узкий набор этим каталогом; опции вида `--name=value` сохраняются. Сборка (`commands.build`), гейты и ревью в этом профиле не выполняются.
+
+Квитанция `run.checks`:
+
+```json
+{
+  "schemaVersion": 2,
+  "profile": "task-fast",
+  "headSha": "…",
+  "fingerprint": "…",
+  "plan": { "changed": ["src/a.mjs"], "affected": ["src/a.mjs", "tests/a.test.mjs"], "testFiles": ["tests/a.test.mjs"], "fallback": false, "reasons": [] },
+  "complete": true,
+  "results": [{ "kind": "test", "command": "…/node", "args": ["--test", "tests/a.test.mjs"], "exitCode": 0, "durationMs": 812, "evidence": { "path": "…", "sha256": "…", "bytes": 1234, "headSha": "…" } }]
+}
+```
+
+- Каждая команда ограничена `fastChecks.timeoutMs`; превышение — сбой `fast_check_timeout` с сохранённым выводом. Заданный у команды меньший `timeoutMs` сохраняется.
+- Вывод каждой команды — evidence `fast-check-<sha256>.json`.
+- Повторное использование: только при `fallback: false` и чистом дереве, через приватный кэш `ci-cache` (`home` = каталог хранилища), для команды `node --test`. Строка из кэша помечена `cached: true` и ссылается на исходный полный вывод. Проверки синтаксиса дешёвые и выполняются всегда.
+- Дочерний runner не наследует `NODE_TEST_CONTEXT`: иначе вложенный `node --test` пропускает все файлы и завершается с кодом 0.
+- Квитанция `task-fast` никогда не заменяет полную. Её `fingerprint` вычисляется в своём домене, evidence имеет kind `fast-check`, а строки — другую форму. Повторное использование полной квитанции в `verify()` отвергает любую квитанцию с `profile`; проверка Run директором проекта отвергает её по `fingerprint`, а подделанную — по kind журнала.
+
+`verify()` для Run с `verificationProfile: 'task-fast'` выполняет быстрые проверки и behaviour gate. При успехе `run.headSha` — проверенный head, `run.review = null`. Сбой чинится прежним циклом в пределах `repairRounds`, но без дополнительного исследования перед ремонтом.
+
+### Внешние задачи
+
+`Engine.run()` до взятия lease отказывает Run с `executor.kind === 'external'` или `directorBinding.kind === 'gate'` кодом `project_run_not_native`. Задачу внешнего чата проверяет `verifyTaskFastOnce({ engine, run })` (`runtime/wave-verifier.mjs`): один проход быстрых проверок и behaviour gate под lease `run:<id>`, без ремонта. Результат `{ passed, headSha, checks, behavior }` или `{ passed: false, code, message, … }`; при успехе записывается `run.headSha`. Хосты внешних чатов — `PULL_HOSTS = ['t3', 'orca']` (`isPullHost`) в `runtime/job-contracts.mjs`.
+
+### Gate run
+
+`createGateRunDraft({ engine, project, gate, tasks, input, installGateRun })` строит черновик Run гейта и передаёт его порту установки (по умолчанию `engine.store.installGateRun`):
+
+- id — `gate.runId`, собственный worktree на ветке `kodo/<gate.runId>` от `gate.headSha`; база Run — `gate.baseSha`, доставка выключена;
+- план — покрытые задачи гейта с их `writePaths`, узлы `integrated` на своих `mergeCommit`, `completed.implementation`;
+- режим исполнения — `input.mode`, иначе режим проекта, иначе `standard`; бюджеты из профиля режима;
+- `config.watchdog` — `project.execution.watchdog`, иначе `{ stalledRounds: 2, rejectUnchanged: true }`;
+- `directorBinding = { schemaVersion: 1, kind: 'gate', projectId, gateId, number, runId, baseSha, headSha, mergesHash }`, где `mergesHash` (`gateMergesHash`) — SHA-256 JSON-массива `{ taskId, attemptId, runId, mergeCommit }` в порядке слияний.
+
+Гейт отклоняется с `gate_invalid`, если слияние ссылается на задачу вне `tasks`, база или какое-либо слияние не входит в `gate.headSha`, проект другой или `runId` недопустим.
+
+`runEpicGate({ engine, run, signal })` под lease `run:<id>` выбирает модели (`selectModels`), выполняет полный `verify()` и затем `commands.smoke` на проверенном head. Ремонт ограничен объединением `writePaths` покрытых задач. Результат smoke — `run.smoke = { schemaVersion: 1, headSha, configured, complete, results }`; без настроенных команд `configured: false, complete: true`. Итог — `succeeded` или `blocked` с текущим блокером (`smoke_failed`, `no_verified_progress` и др.). Сторож по умолчанию останавливает гейт после двух раундов ремонта подряд без прогресса.
+
 ## Проверка
 
 ```powershell
 node scripts/run-tests.mjs tests/behavior-gate.test.mjs tests/behavior-engine.test.mjs
+node scripts/run-tests.mjs tests/task-fast-checks.test.mjs tests/engine-fast-profile.test.mjs tests/wave-verifier.test.mjs tests/job-pull-hosts.test.mjs
 ```
 
 Проверки offline: fake providers, настоящие Git и SQLite, установленный Git как эталон оракула.

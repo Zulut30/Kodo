@@ -73,6 +73,8 @@ async function pins() {
     'behavior-gate.mjs',
     'watchdog.mjs',
     'engine-verification.mjs',
+    'task-fast-checks.mjs',
+    'wave-verifier.mjs',
     'security.mjs',
     'toolchains.mjs',
     'progress.mjs',

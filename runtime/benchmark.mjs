@@ -137,6 +137,7 @@ async function metadata() {
     'runtime/behavior-gate.mjs',
     'runtime/watchdog.mjs',
     'runtime/engine-verification.mjs',
+    'runtime/task-fast-checks.mjs',
     'runtime/modes.mjs',
     'runtime/providers.mjs',
     'runtime/metrics.mjs',
