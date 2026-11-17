@@ -185,8 +185,19 @@ export async function openProjectStore({ store, contracts, authorizeTransition }
     snapshot: (...args) => snapshot(ctx, ...args),
     history: (...args) => history(ctx, ...args),
     installRun: (...args) => installRun(ctx, ...args),
+    installGateRun: (...args) => installGateRun(ctx, ...args),
   };
 }
+
+// Wave ports are optional at open so legacy injected contracts keep working;
+// every wave operation requires them explicitly.
+function port(ctx, name) {
+  requireValue(typeof ctx.contracts[name] === 'function', 'contracts_invalid');
+  return ctx.contracts[name];
+}
+
+const isWave = (ctx, project) =>
+  typeof ctx.contracts.isWaveProject === 'function' && ctx.contracts.isWaveProject(project) === true;
 
 function refreshValidationContext(ctx) {
   if (isDeepStrictEqual(ctx.validationSecrets, ctx.store.secrets || {})) return;
@@ -376,6 +387,21 @@ function readSnapshot(ctx, projectId) {
       return value;
     },
   );
+  // Wave gates are read in the same transaction; legacy snapshots have no key.
+  const gates = isWave(ctx, project)
+    ? {
+        gates: readSet(
+          'gates',
+          "SELECT id,body FROM kodo_project_records WHERE project_id=? AND kind='gate' ORDER BY json_extract(body,'$.number'),id",
+          [projectId],
+          row => {
+            const gate = decode(ctx, 'gate', row.body);
+            requireValue(gate.projectId === projectId && gate.id === row.id, 'database_corrupt');
+            return gate;
+          },
+        ),
+      }
+    : {};
   const value = {
     schemaVersion: 1,
     project,
@@ -384,6 +410,7 @@ function readSnapshot(ctx, projectId) {
     currentAttempts,
     riskApprovals,
     completeness,
+    ...gates,
   };
   // Counts, relational columns and bodies are still read/checked in this SQL
   // transaction. Only an exact aggregate may reuse its pure validation result.
@@ -685,6 +712,121 @@ function applyTransition(ctx, { action, projectId, now }, change) {
   else if (change.kind !== 'project') put(ctx, change.kind, change.record);
 }
 
+// Reopen a closed wave project with one new milestone. The project moves to
+// running without a lifecycle transition; its closed-state proof moves to
+// `reopened` so old and new project refs never bind ambiguously. Closed
+// children stay untouched and the new records start proposed.
+function applyAppendMilestone(ctx, { action, project, projectId, now }, change) {
+  const s = readSnapshot(ctx, projectId);
+  complete(ctx, s);
+  port(ctx, 'assertProjectReopen')({ snapshot: s, action });
+  for (const [kind, records] of [
+    ['milestone', [action.milestone]],
+    ['epic', action.epics],
+    ['task', action.tasks],
+  ])
+    for (const record of records) put(ctx, kind, { ...record, ...metadata(ctx, projectId, now) }, true);
+  change.kind = 'project';
+  change.previous = project;
+  change.record = {
+    ...project,
+    status: 'running',
+    evidence: [],
+    mappings: [],
+    reopened: [
+      ...(project.reopened ?? []),
+      {
+        status: project.status,
+        revision: project.revision,
+        reopenedAt: now,
+        evidence: project.evidence,
+        mappings: project.mappings,
+      },
+    ],
+  };
+}
+
+// Tasks covered by the widest container of a valid epic ⊂ milestone ⊂ project chain.
+function gateTasks(ctx, s, containers) {
+  for (const [index, item] of containers.entries()) {
+    const next = containers[index + 1];
+    if (item.kind === 'project') {
+      requireValue(
+        item.id === s.project.projectId && !['accepted', 'released'].includes(s.project.status),
+        'gate_invalid',
+      );
+      continue;
+    }
+    const record = (item.kind === 'epic' ? s.epics : s.milestones).find(row => row.id === item.id);
+    requireValue(record && !['accepted', 'released'].includes(record.status), 'gate_invalid');
+    if (item.kind === 'epic' && next) requireValue(record.milestoneId === next.id, 'gate_invalid');
+  }
+  const widest = containers.at(-1);
+  if (widest.kind === 'project') return s.tasks;
+  if (widest.kind === 'epic') return s.tasks.filter(task => task.epicId === widest.id);
+  const epics = new Set(s.epics.filter(epic => epic.milestoneId === widest.id).map(epic => epic.id));
+  return s.tasks.filter(task => epics.has(task.epicId));
+}
+
+// Merges cover exactly the gate's tasks, each integrated|accepted at its current attempt.
+function assertGateMerges(ctx, s, containers, merges) {
+  const tasks = gateTasks(ctx, s, containers);
+  const covered = new Map(tasks.map(task => [task.id, task]));
+  requireValue(merges.length === covered.size, 'gate_invalid');
+  for (const merge of merges) {
+    const task = covered.get(merge.taskId),
+      attempt = s.currentAttempts.find(item => item.taskId === merge.taskId);
+    requireValue(
+      task &&
+        ['integrated', 'accepted'].includes(task.status) &&
+        attempt?.id === merge.attemptId &&
+        attempt.runId === merge.runId,
+      'gate_invalid',
+    );
+  }
+}
+
+function latestGate(s, first) {
+  return s.gates
+    .filter(gate => gate.containers[0].kind === first.kind && gate.containers[0].id === first.id)
+    .reduce((latest, gate) => (!latest || gate.number > latest.number ? gate : latest), null);
+}
+
+function runState(ctx, runId) {
+  try {
+    return ctx.store.getRun(runId)?.state ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function applyReserveGate(ctx, { action, project, projectId, now }, change) {
+  requireValue(isWave(ctx, project), 'gate_unsupported');
+  control(ctx, project);
+  const s = readSnapshot(ctx, projectId);
+  complete(ctx, s);
+  assertGateMerges(ctx, s, action.containers, action.merges);
+  const latest = latestGate(s, action.containers[0]);
+  // A new gate for the same narrowest container is only a retry of a settled failure.
+  if (latest) requireValue(action.retry && retryStates.has(runState(ctx, latest.runId)), 'gate_exists');
+  change.kind = 'gate';
+  change.record = {
+    schemaVersion: 1,
+    id: randomUUID(),
+    projectId,
+    number: s.gates.reduce((max, gate) => Math.max(max, gate.number), 0) + 1,
+    containers: action.containers,
+    runId: randomUUID(),
+    baseSha: action.baseSha,
+    headSha: action.headSha,
+    merges: action.merges,
+    installed: false,
+    createdAt: now,
+    updatedAt: now,
+  };
+  put(ctx, 'gate', change.record, true);
+}
+
 const operations = {
   setPaused: applySetPaused,
   insert: applyRecordEdit,
@@ -692,6 +834,8 @@ const operations = {
   approveRisk: applyRiskApproval,
   reserveAttempt: applyReserveAttempt,
   transition: applyTransition,
+  appendMilestone: applyAppendMilestone,
+  reserveGate: applyReserveGate,
 };
 
 async function apply(ctx, input) {
@@ -811,7 +955,6 @@ async function installRun(ctx, input) {
   );
   const binding = normalize(ctx, 'installBinding', input.binding),
     runDraft = structuredClone(input.runDraft);
-  // oxlint-disable-next-line complexity -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
   return transaction(ctx.db, 'BEGIN IMMEDIATE', () => {
     const s = readSnapshot(ctx, binding.projectId);
     complete(ctx, s);
@@ -842,13 +985,7 @@ async function installRun(ctx, input) {
       .get(attempt.id).installed;
     if (row) {
       requireValue(installed === 1, 'binding_conflict');
-      let saved;
-      try {
-        saved = JSON.parse(row.body);
-        safe(ctx, saved);
-      } catch {
-        fail('database_corrupt');
-      }
+      const saved = savedRun(ctx, row);
       requireValue(
         saved.id === binding.runId &&
           identity(saved.project) === s.project.projectKey &&
@@ -862,46 +999,119 @@ async function installRun(ctx, input) {
     }
     requireValue(installed === 0 && attempt.status === 'reserved', 'binding_conflict');
     control(ctx, s.project);
-    requireValue(
-      runDraft.state === 'created' &&
-        typeof runDraft.createdAt === 'string' &&
-        Number.isFinite(Date.parse(runDraft.createdAt)) &&
-        runDraft.config &&
-        typeof runDraft.config === 'object' &&
-        !Array.isArray(runDraft.config) &&
-        typeof runDraft.client === 'string' &&
-        ['current', 'both'].includes(runDraft.providers) &&
-        typeof runDraft.baseSha === 'string' &&
-        /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(runDraft.baseSha) &&
-        runDraft.snapshot &&
-        typeof runDraft.snapshot === 'object' &&
-        !Array.isArray(runDraft.snapshot) &&
-        (runDraft.requestedMode === null || typeof runDraft.requestedMode === 'string') &&
-        Array.isArray(runDraft.sessionAttempts) &&
-        runDraft.sessionAttempts.length === 0 &&
-        Array.isArray(runDraft.coordinatorOperations) &&
-        runDraft.coordinatorOperations.length === 0 &&
-        runDraft.completed &&
-        !Array.isArray(runDraft.completed) &&
-        Object.keys(runDraft.completed).length === 0 &&
-        runDraft.nodes &&
-        !Array.isArray(runDraft.nodes) &&
-        Object.keys(runDraft.nodes).length === 0 &&
-        typeof runDraft.artifacts === 'string' &&
-        path.isAbsolute(runDraft.artifacts) &&
-        typeof runDraft.worktreeRoot === 'string' &&
-        path.isAbsolute(runDraft.worktreeRoot) &&
-        typeof runDraft.cwd === 'string' &&
-        path.isAbsolute(runDraft.cwd) &&
-        typeof runDraft.branch === 'string' &&
-        runDraft.branch.length > 0,
-      'run_draft_invalid',
-    );
+    requireValue(validRunDraft(runDraft), 'run_draft_invalid');
     safe(ctx, runDraft);
     const saved = ctx.store.createRun(runDraft);
     requireValue(saved && typeof saved.then !== 'function' && isDeepStrictEqual(saved, runDraft), 'run_draft_invalid');
     ctx.db.prepare('UPDATE kodo_project_attempts SET installed=1 WHERE id=?').run(attempt.id);
     put(ctx, 'project', { ...s.project, revision: s.revision + 1, updatedAt: new Date().toISOString() });
+    return saved;
+  });
+}
+
+function savedRun(ctx, row) {
+  let saved;
+  try {
+    saved = JSON.parse(row.body);
+    safe(ctx, saved);
+  } catch {
+    fail('database_corrupt');
+  }
+  return saved;
+}
+
+// Shape of a fresh legacy Run draft, shared by task and gate installs.
+function validRunDraft(runDraft) {
+  return (
+    runDraft.state === 'created' &&
+    typeof runDraft.createdAt === 'string' &&
+    Number.isFinite(Date.parse(runDraft.createdAt)) &&
+    runDraft.config &&
+    typeof runDraft.config === 'object' &&
+    !Array.isArray(runDraft.config) &&
+    typeof runDraft.client === 'string' &&
+    ['current', 'both'].includes(runDraft.providers) &&
+    typeof runDraft.baseSha === 'string' &&
+    /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(runDraft.baseSha) &&
+    runDraft.snapshot &&
+    typeof runDraft.snapshot === 'object' &&
+    !Array.isArray(runDraft.snapshot) &&
+    (runDraft.requestedMode === null || typeof runDraft.requestedMode === 'string') &&
+    Array.isArray(runDraft.sessionAttempts) &&
+    runDraft.sessionAttempts.length === 0 &&
+    Array.isArray(runDraft.coordinatorOperations) &&
+    runDraft.coordinatorOperations.length === 0 &&
+    runDraft.completed &&
+    !Array.isArray(runDraft.completed) &&
+    Object.keys(runDraft.completed).length === 0 &&
+    runDraft.nodes &&
+    !Array.isArray(runDraft.nodes) &&
+    Object.keys(runDraft.nodes).length === 0 &&
+    typeof runDraft.artifacts === 'string' &&
+    path.isAbsolute(runDraft.artifacts) &&
+    typeof runDraft.worktreeRoot === 'string' &&
+    path.isAbsolute(runDraft.worktreeRoot) &&
+    typeof runDraft.cwd === 'string' &&
+    path.isAbsolute(runDraft.cwd) &&
+    typeof runDraft.branch === 'string' &&
+    runDraft.branch.length > 0
+  );
+}
+
+/** Atomically bind a reserved wave gate to its legacy Run. The binding must
+ * equal gateBindingFor(gate) byte for byte and the draft task must equal
+ * buildGateInput; a repeat after install returns the stored Run. */
+async function installGateRun(ctx, input) {
+  safe(ctx, input);
+  requireValue(
+    input && Object.keys(input).length === 2 && Object.hasOwn(input, 'binding') && Object.hasOwn(input, 'runDraft'),
+    'record_invalid',
+  );
+  const bindingFor = port(ctx, 'gateBindingFor'),
+    gateInput = port(ctx, 'buildGateInput');
+  const binding = normalize(ctx, 'gateBinding', input.binding),
+    runDraft = structuredClone(input.runDraft);
+  const bound = value =>
+    bytes(ctx, 'gateBinding', normalize(ctx, 'gateBinding', value)).equals(bytes(ctx, 'gateBinding', binding));
+  return transaction(ctx.db, 'BEGIN IMMEDIATE', () => {
+    const s = readSnapshot(ctx, binding.projectId);
+    complete(ctx, s);
+    requireValue(isWave(ctx, s.project), 'gate_unsupported');
+    const gate = s.gates.find(item => item.id === binding.gateId);
+    requireValue(gate && bound(bindingFor(gate, ctx.options)), 'binding_conflict');
+    const tasks = gate.merges.map(merge => s.tasks.find(task => task.id === merge.taskId));
+    requireValue(tasks.every(Boolean), 'binding_conflict');
+    requireValue(
+      runDraft.id === binding.runId &&
+        identity(runDraft.project) === s.project.projectKey &&
+        runDraft.task === gateInput({ project: s.project, gate, tasks }, ctx.options) &&
+        bound(runDraft.directorBinding),
+      'binding_conflict',
+    );
+    const row = ctx.db.prepare('SELECT body FROM runs WHERE id=?').get(binding.runId);
+    if (row) {
+      requireValue(gate.installed, 'binding_conflict');
+      const saved = savedRun(ctx, row);
+      requireValue(
+        saved.id === binding.runId &&
+          identity(saved.project) === s.project.projectKey &&
+          saved.task === runDraft.task &&
+          bound(saved.directorBinding),
+        'binding_conflict',
+      );
+      return saved;
+    }
+    // Fresh install: still the latest gate for its container, with current merges.
+    requireValue(!gate.installed && latestGate(s, gate.containers[0])?.id === gate.id, 'binding_conflict');
+    assertGateMerges(ctx, s, gate.containers, gate.merges);
+    control(ctx, s.project);
+    requireValue(validRunDraft(runDraft), 'run_draft_invalid');
+    safe(ctx, runDraft);
+    const saved = ctx.store.createRun(runDraft);
+    requireValue(saved && typeof saved.then !== 'function' && isDeepStrictEqual(saved, runDraft), 'run_draft_invalid');
+    const now = new Date().toISOString();
+    put(ctx, 'gate', { ...gate, installed: true, updatedAt: now });
+    put(ctx, 'project', { ...s.project, revision: s.revision + 1, updatedAt: now });
     return saved;
   });
 }

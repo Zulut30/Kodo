@@ -48,8 +48,23 @@ export function buildProjectProgress(snapshot) {
       }; unknown ${unknown}`,
     );
   }
+  // Wave projects only: legacy snapshots have no gates key and no gates line.
+  if (snapshot && Object.hasOwn(snapshot, 'gates')) lines.push(...gateLines(snapshot));
   lines.push(
     'Evidence: unknown until trusted validation; disabled gates: neutral; blocked or incomplete sets cannot establish acceptance.',
   );
   return lines.join('\n') + '\n';
+}
+
+function gateLines(snapshot) {
+  const rows = Array.isArray(snapshot.gates) ? snapshot.gates : null;
+  const count = snapshot.completeness?.gates;
+  const coherent =
+    rows && Number.isSafeInteger(count?.total) && count.total >= rows.length && count.returned === rows.length;
+  const complete = coherent && count.complete === true && count.total === rows.length;
+  const installed = rows ? rows.filter(row => row?.installed === true).length : undefined;
+  return [
+    `gates: returned ${integer(rows?.length)} / total ${integer(coherent ? count.total : undefined)}; completeness: ${complete ? 'complete' : 'unknown (blocked)'}`,
+    `  installed ${integer(installed)}; reserved ${integer(rows ? rows.length - installed : undefined)}`,
+  ];
 }
