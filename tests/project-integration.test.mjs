@@ -13,6 +13,7 @@ import {
   waveFrontier,
   mergeTask,
   mergeBackGate,
+  gateRepairInScope,
 } from '../runtime/project-integration.mjs';
 
 configureGitTestEnvironment();
@@ -335,22 +336,92 @@ test('An integration branch without a worktree is attached again without resetti
   assert.deepEqual(await f.user(), user);
 });
 
-test('A gate head merges back by fast-forward when possible and by a merge commit otherwise', async t => {
+test('A gate head fast-forwards from an unchanged gate head and merges its repairs after other merges', async t => {
   const f = await fixture(t);
   const integration = await ensureIntegration({ root: f.root, projectId, worktreeHome: f.worktreeHome });
-  const gate = await f.taskHead('gate-one', integration.head, { 'gate.txt': 'gate\n' });
-  assert.equal(await mergeBackGate({ worktree: integration.worktree, gateHead: gate }), gate);
-  assert.equal(await mergeBackGate({ worktree: integration.worktree, gateHead: gate }), gate);
-  const laterGate = await f.taskHead('gate-two', gate, { 'gate.txt': 'gate two\n' });
-  const task = await f.taskHead('first', gate, { 'first.txt': 'first\n' });
+  const worktree = integration.worktree;
+  // The gate started at the integration head; its repair committed on top of it.
+  const repaired = await f.taskHead('gate-one', integration.head, { 'gate.txt': 'gate\n' });
+  assert.equal(await mergeBackGate({ worktree, expectedHead: integration.head, gateHead: repaired }), repaired);
+  assert.equal(await mergeBackGate({ worktree, expectedHead: integration.head, gateHead: repaired }), repaired);
+  // A second gate started at `repaired`; meanwhile another task merge advanced the branch.
+  const laterGate = await f.taskHead('gate-two', repaired, { 'gate.txt': 'gate two\n' });
+  const task = await f.taskHead('first', repaired, { 'first.txt': 'first\n' });
   const merged = await mergeTask({
-    worktree: integration.worktree,
+    worktree,
     taskId: 'first',
     taskHead: task,
     writePaths: ['first.txt'],
     savePending: async () => {},
   });
-  const head = await mergeBackGate({ worktree: integration.worktree, gateHead: laterGate });
-  assert.deepEqual(await parents(integration.worktree, head), [merged.mergeCommit, laterGate]);
-  assert.equal(await git(integration.worktree, ['rev-parse', 'HEAD']), head);
+  const head = await mergeBackGate({ worktree, expectedHead: repaired, gateHead: laterGate });
+  assert.deepEqual(await parents(worktree, head), [merged.mergeCommit, laterGate]);
+  assert.equal(await git(worktree, ['rev-parse', 'HEAD']), head);
+  // The verified head must descend from the gate head, which the branch must still contain.
+  const unrelated = await f.taskHead('gate-three', integration.head, { 'other.txt': 'other\n' });
+  await code(mergeBackGate({ worktree, expectedHead: head, gateHead: unrelated }), 'project_integration_invalid');
+  await code(mergeBackGate({ worktree, gateHead: laterGate }), 'project_integration_invalid');
+  const foreignBase = await f.taskHead('gate-four', unrelated, { 'other.txt': 'four\n' });
+  await code(
+    mergeBackGate({ worktree, expectedHead: unrelated, gateHead: foreignBase }),
+    'project_integration_invalid',
+  );
+  assert.equal(await git(worktree, ['rev-parse', 'HEAD']), head, 'a refused merge-back never moves the branch');
+});
+
+test('A gate repair is in scope only as a descendant of the gate head inside the covered write paths', async t => {
+  const f = await fixture(t);
+  const integration = await ensureIntegration({ root: f.root, projectId, worktreeHome: f.worktreeHome });
+  const start = integration.head,
+    worktree = integration.worktree;
+  const scoped = await f.taskHead('repair', start, { 'first.txt': 'repaired\n' });
+  const escaped = await f.taskHead('repair-out', start, { 'other.txt': 'escaped\n' });
+  assert.equal(await gateRepairInScope({ worktree, from: start, to: start, writePaths: ['first.txt'] }), true);
+  assert.equal(await gateRepairInScope({ worktree, from: start, to: scoped, writePaths: ['first.txt'] }), true);
+  assert.equal(await gateRepairInScope({ worktree, from: start, to: escaped, writePaths: ['first.txt'] }), false);
+  assert.equal(await gateRepairInScope({ worktree, from: scoped, to: escaped, writePaths: ['other.txt'] }), false);
+  await code(gateRepairInScope({ worktree, from: start, to: scoped, writePaths: [] }), 'project_integration_invalid');
+});
+
+test('A retry after a crash before the merge commit aborts only its own interrupted merge', async t => {
+  const f = await fixture(t);
+  const integration = await ensureIntegration({ root: f.root, projectId, worktreeHome: f.worktreeHome });
+  const worktree = integration.worktree;
+  const mergeHead = async () =>
+    (
+      await execute('git', ['rev-parse', '-q', '--verify', 'MERGE_HEAD'], { cwd: worktree, allowFailure: true })
+    ).stdout.trim();
+  const first = await f.taskHead('first', integration.head, { 'first.txt': 'first\n' });
+  // The coordinator saved `before`, Git staged the merge, and the process died before the commit.
+  const pending = { before: integration.head };
+  await git(worktree, ['merge', '--no-ff', '--no-commit', first]);
+  assert.equal(await mergeHead(), first);
+  assert.notEqual(await git(worktree, ['status', '--porcelain=v1']), '');
+  const merged = await mergeTask({
+    worktree,
+    taskId: 'first',
+    taskHead: first,
+    writePaths: ['first.txt'],
+    savePending: async () => {},
+    pending,
+  });
+  assert.deepEqual(await parents(worktree, merged.mergeCommit), [integration.head, first]);
+  assert.equal(merged.before, integration.head);
+  assert.equal(await mergeHead(), '');
+  assert.equal(await git(worktree, ['status', '--porcelain=v1', '--untracked-files=all']), '');
+  // An interrupted merge of another head, or without a saved `before`, is someone else's: refused, kept.
+  const second = await f.taskHead('second', merged.mergeCommit, { 'second.txt': 'second\n' });
+  const foreign = await f.taskHead('foreign', merged.mergeCommit, { 'foreign.txt': 'foreign\n' });
+  await git(worktree, ['merge', '--no-ff', '--no-commit', foreign]);
+  const input = {
+    worktree,
+    taskId: 'second',
+    taskHead: second,
+    writePaths: ['second.txt'],
+    savePending: async () => {},
+  };
+  await code(mergeTask({ ...input, pending: { before: merged.mergeCommit } }), 'project_integration_worktree_invalid');
+  await code(mergeTask(input), 'project_integration_worktree_invalid');
+  await code(mergeTask({ ...input, pending: { before: 'not-a-sha' } }), 'project_integration_invalid');
+  assert.equal(await mergeHead(), foreign, 'a foreign merge is never aborted');
 });

@@ -746,20 +746,29 @@ function applyAppendMilestone(ctx, { action, project, projectId, now }, change) 
   };
 }
 
+const closedStates = new Set(['accepted', 'released']);
+const containerChildren = (s, item) =>
+  item.kind === 'project' ? s.milestones : s.epics.filter(epic => epic.milestoneId === item.id);
+
 // Tasks covered by the widest container of a valid epic ⊂ milestone ⊂ project chain.
+// A milestone or project joins the chain only when every child outside the chain
+// is already accepted: one gate never verifies a sibling it does not merge.
 function gateTasks(ctx, s, containers) {
   for (const [index, item] of containers.entries()) {
-    const next = containers[index + 1];
-    if (item.kind === 'project') {
+    const next = containers[index + 1],
+      inner = containers[index - 1];
+    if (item.kind === 'project')
+      requireValue(item.id === s.project.projectId && !closedStates.has(s.project.status), 'gate_invalid');
+    else {
+      const record = (item.kind === 'epic' ? s.epics : s.milestones).find(row => row.id === item.id);
+      requireValue(record && !closedStates.has(record.status), 'gate_invalid');
+      if (item.kind === 'epic' && next) requireValue(record.milestoneId === next.id, 'gate_invalid');
+    }
+    if (item.kind !== 'epic')
       requireValue(
-        item.id === s.project.projectId && !['accepted', 'released'].includes(s.project.status),
+        containerChildren(s, item).every(child => child.id === inner?.id || closedStates.has(child.status)),
         'gate_invalid',
       );
-      continue;
-    }
-    const record = (item.kind === 'epic' ? s.epics : s.milestones).find(row => row.id === item.id);
-    requireValue(record && !['accepted', 'released'].includes(record.status), 'gate_invalid');
-    if (item.kind === 'epic' && next) requireValue(record.milestoneId === next.id, 'gate_invalid');
   }
   const widest = containers.at(-1);
   if (widest.kind === 'project') return s.tasks;
@@ -768,7 +777,9 @@ function gateTasks(ctx, s, containers) {
   return s.tasks.filter(task => epics.has(task.epicId));
 }
 
-// Merges cover exactly the gate's tasks, each integrated|accepted at its current attempt.
+// Merges cover exactly the gate's tasks, each integrated|accepted at its current
+// attempt, and each mergeCommit is the one the attempt's own Run recorded for
+// its verified head (never a caller-chosen older commit).
 function assertGateMerges(ctx, s, containers, merges) {
   const tasks = gateTasks(ctx, s, containers);
   const covered = new Map(tasks.map(task => [task.id, task]));
@@ -783,6 +794,15 @@ function assertGateMerges(ctx, s, containers, merges) {
         attempt.runId === merge.runId,
       'gate_invalid',
     );
+    const run = storedRun(ctx, merge.runId),
+      integration = run?.integration;
+    requireValue(
+      integration?.status === 'merged' &&
+        integration.mergeCommit === merge.mergeCommit &&
+        typeof run.headSha === 'string' &&
+        integration.mergedHead === run.headSha,
+      'gate_invalid',
+    );
   }
 }
 
@@ -792,13 +812,14 @@ function latestGate(s, first) {
     .reduce((latest, gate) => (!latest || gate.number > latest.number ? gate : latest), null);
 }
 
-function runState(ctx, runId) {
+function storedRun(ctx, runId) {
   try {
-    return ctx.store.getRun(runId)?.state ?? null;
+    return ctx.store.getRun(runId) ?? null;
   } catch {
     return null;
   }
 }
+const runState = (ctx, runId) => storedRun(ctx, runId)?.state ?? null;
 
 function applyReserveGate(ctx, { action, project, projectId, now }, change) {
   requireValue(isWave(ctx, project), 'gate_unsupported');
@@ -1020,7 +1041,7 @@ function savedRun(ctx, row) {
   return saved;
 }
 
-// Shape of a fresh legacy Run draft, shared by task and gate installs.
+// Shape of a fresh legacy Run draft; gate drafts extend it (validGateRunDraft).
 function validRunDraft(runDraft) {
   return (
     runDraft.state === 'created' &&
@@ -1055,6 +1076,44 @@ function validRunDraft(runDraft) {
     path.isAbsolute(runDraft.cwd) &&
     typeof runDraft.branch === 'string' &&
     runDraft.branch.length > 0
+  );
+}
+
+const nodeOf = merge => ({
+  id: merge.taskId,
+  attempt: 0,
+  status: 'integrated',
+  headSha: merge.mergeCommit,
+  sourceRunId: merge.runId,
+  attemptId: merge.attemptId,
+});
+
+// Shape of a fresh gate Run draft: the legacy draft fields, but it starts on the
+// gate head with exactly the covered tasks planned and integrated at their
+// recorded merge commits, and it runs the full (unprofiled) verification.
+function validGateRunDraft(runDraft, gate, tasks) {
+  const { completed, nodes, plan, ...rest } = runDraft;
+  return Boolean(
+    validRunDraft({ ...rest, completed: {}, nodes: {} }) &&
+    runDraft.baseSha === gate.baseSha &&
+    runDraft.headSha === gate.headSha &&
+    runDraft.verificationProfile === undefined &&
+    runDraft.executor === undefined &&
+    runDraft.config.delivery?.enabled !== true &&
+    isDeepStrictEqual(completed, { implementation: true }) &&
+    Array.isArray(plan?.tasks) &&
+    plan.tasks.length === gate.merges.length &&
+    nodes &&
+    typeof nodes === 'object' &&
+    !Array.isArray(nodes) &&
+    Object.keys(nodes).length === gate.merges.length &&
+    gate.merges.every(
+      (merge, index) =>
+        plan.tasks[index]?.id === merge.taskId &&
+        isDeepStrictEqual(plan.tasks[index].writePaths, tasks[index].writePaths) &&
+        isDeepStrictEqual(plan.tasks[index].dependsOn, []) &&
+        isDeepStrictEqual(nodes[merge.taskId], nodeOf(merge)),
+    ),
   );
 }
 
@@ -1105,7 +1164,7 @@ async function installGateRun(ctx, input) {
     requireValue(!gate.installed && latestGate(s, gate.containers[0])?.id === gate.id, 'binding_conflict');
     assertGateMerges(ctx, s, gate.containers, gate.merges);
     control(ctx, s.project);
-    requireValue(validRunDraft(runDraft), 'run_draft_invalid');
+    requireValue(validGateRunDraft(runDraft, gate, tasks), 'run_draft_invalid');
     safe(ctx, runDraft);
     const saved = ctx.store.createRun(runDraft);
     requireValue(saved && typeof saved.then !== 'function' && isDeepStrictEqual(saved, runDraft), 'run_draft_invalid');

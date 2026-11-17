@@ -185,9 +185,14 @@
 | `no-affected-tests` | Изменение не затронуло ни одного теста |
 | `runner-not-node-test` | `commands.test` — не `node --test` |
 | `runner-multiple-commands`, `runner-not-configured` | Команд проверки не одна |
+| `runner-selection` | У `node --test` есть опция отбора тестов (`--test-shard`, `--test-name-pattern`, `--test-skip-pattern`, `--test-only`): после сужения она может не оставить ни одного теста |
+| `runner-reporter` | У `node --test` задан `--test-reporter` или `--test-reporter-destination`: итог прогона нельзя посчитать |
 | `runner-options` | У `node --test` есть опция без `=` или glob в пути: сузить без потери смысла нельзя |
+| `no-tests-executed` | Узкий прогон завершился с кодом 0, но не выполнил ни одного теста (итог `tests − skipped` ≤ 0 или итога нет) |
 
 Позиционный путь у `node --test` (например, `tests/unit`) ограничивает узкий набор этим каталогом; опции вида `--name=value` сохраняются. Сборка (`commands.build`), гейты и ревью в этом профиле не выполняются.
+
+После узкого `node --test` Kodo считает фактически выполненные тесты по итогу репортёра (`ℹ tests N`/`ℹ skipped N` или TAP `# tests N`/`# skipped N`, `executedTests`) и пишет число в строку (`tests`). Ноль или отсутствие итога не дают зелёной квитанции и не попадают в кэш: квитанция пересоздаётся с `fallback: true, reasons: ['no-tests-executed']` и полным `commands.test`, в журнал Run пишется событие `fast_checks_no_tests`.
 
 Квитанция `run.checks`:
 
@@ -205,9 +210,9 @@
 
 - Каждая команда ограничена `fastChecks.timeoutMs`; превышение — сбой `fast_check_timeout` с сохранённым выводом. Заданный у команды меньший `timeoutMs` сохраняется.
 - Вывод каждой команды — evidence `fast-check-<sha256>.json`.
-- Повторное использование: только при `fallback: false` и чистом дереве, через приватный кэш `ci-cache` (`home` = каталог хранилища), для команды `node --test`. Строка из кэша помечена `cached: true` и ссылается на исходный полный вывод. Проверки синтаксиса дешёвые и выполняются всегда.
+- Повторное использование: только при `fallback: false` и чистом дереве, через приватный кэш `ci-cache` (`home` = каталог хранилища), для команды `node --test`, выполнившей хотя бы один тест (ключ кэша содержит `executedTests: true`, старые записи не совпадают). Строка из кэша помечена `cached: true` и ссылается на исходный полный вывод. Проверки синтаксиса дешёвые и выполняются всегда.
 - Дочерний runner не наследует `NODE_TEST_CONTEXT`: иначе вложенный `node --test` пропускает все файлы и завершается с кодом 0.
-- Квитанция `task-fast` никогда не заменяет полную. Её `fingerprint` вычисляется в своём домене, evidence имеет kind `fast-check`, а строки — другую форму. Повторное использование полной квитанции в `verify()` отвергает любую квитанцию с `profile`; проверка Run директором проекта отвергает её по `fingerprint`, а подделанную — по kind журнала.
+- Квитанция `task-fast` никогда не заменяет полную. Её `fingerprint` вычисляется в своём домене, evidence имеет kind `fast-check`, а строки — другую форму. Все полные валидаторы отвергают любую профилированную квитанцию (ключ `profile` с любым значением) и Run с `verificationProfile`, даже с полными журналами и legacy-fingerprint: повторное использование в `verify()`, `validateRun` директора проекта и `checksCurrent` в `project-evidence`.
 
 `verify()` для Run с `verificationProfile: 'task-fast'` выполняет быстрые проверки и behaviour gate. При успехе `run.headSha` — проверенный head, `run.review = null`. Сбой чинится прежним циклом в пределах `repairRounds`, но без дополнительного исследования перед ремонтом.
 
@@ -217,17 +222,18 @@
 
 ### Gate run
 
-`createGateRunDraft({ engine, project, gate, tasks, input, installGateRun })` строит черновик Run гейта и передаёт его порту установки (по умолчанию `engine.store.installGateRun`):
+`createGateRunDraft({ engine, project, gate, tasks, input, installGateRun, withLease?, leaseHeld? })` строит черновик Run гейта и устанавливает его вызовом `installGateRun({ binding: gateBindingFor(gate), runDraft })` — порт проектного хранилища (`projectStore.installGateRun`, у `engine.store` установщика нет; без порта — `gate_install_unavailable`). `project` и `tasks` — записи снапшота; `input` — опции Run `client`, `model`, `providers`, `mode`, `concurrency`. Черновик:
 
-- id — `gate.runId`, собственный worktree на ветке `kodo/<gate.runId>` от `gate.headSha`; база Run — `gate.baseSha`, доставка выключена;
-- план — покрытые задачи гейта с их `writePaths`, узлы `integrated` на своих `mergeCommit`, `completed.implementation`;
+- `task = buildGateInput({ project, gate, tasks: покрытые задачи в порядке merges })` — те же байты, что сверяет Store;
+- id — `gate.runId`, собственный worktree на ветке `kodo/<gate.runId>` от `gate.headSha`; база Run — `gate.baseSha`, `headSha = gate.headSha`, доставка выключена;
+- план — покрытые задачи гейта с их `writePaths`, узлы `integrated` на своих `mergeCommit`, `completed = { implementation: true }` (форма, которую проверяет Store);
 - режим исполнения — `input.mode`, иначе режим проекта, иначе `standard`; бюджеты из профиля режима;
 - `config.watchdog` — `project.execution.watchdog`, иначе `{ stalledRounds: 2, rejectUnchanged: true }`;
-- `directorBinding = { schemaVersion: 1, kind: 'gate', projectId, gateId, number, runId, baseSha, headSha, mergesHash }`, где `mergesHash` (`gateMergesHash`) — SHA-256 JSON-массива `{ taskId, attemptId, runId, mergeCommit }` в порядке слияний.
+- `directorBinding = gateBindingFor(gate) = { schemaVersion: 1, kind: 'gate', projectId, gateId, number, runId, baseSha, headSha, mergesHash }`, где `mergesHash` (`gateMergesHash`) — SHA-256 JSON-массива `{ taskId, attemptId, runId, mergeCommit }` в порядке слияний.
 
-Гейт отклоняется с `gate_invalid`, если слияние ссылается на задачу вне `tasks`, база или какое-либо слияние не входит в `gate.headSha`, проект другой или `runId` недопустим.
+До установки Git проверяет: база и каждый `mergeCommit` входят в `gate.headSha`; у каждого `mergeCommit` ровно два родителя и второй — голова попытки (`headSha` Run задачи, чей `run.integration` записал этот `mergeCommit` с `mergedHead = run.headSha`). Нарушение — `gate_invalid` (также задача вне `tasks`, другой проект, недопустимый `runId`). `gate.headSha` должен быть головой `refs/heads/kodo/project/<projectId>` в `project.root`, иначе `gate_head_stale`. Вызывающий держит lease `project-integration:<projectId>`: либо передаёт `withLease(work)` — проверка головы и установка выполняются внутри него, — либо `leaseHeld: true`; иначе `gate_lease_required`. Повтор после сбоя возвращает уже установленный Run.
 
-`runEpicGate({ engine, run, signal })` под lease `run:<id>` выбирает модели (`selectModels`), выполняет полный `verify()` и затем `commands.smoke` на проверенном head. Ремонт ограничен объединением `writePaths` покрытых задач. Результат smoke — `run.smoke = { schemaVersion: 1, headSha, configured, complete, results }`; без настроенных команд `configured: false, complete: true`. Итог — `succeeded` или `blocked` с текущим блокером (`smoke_failed`, `no_verified_progress` и др.). Сторож по умолчанию останавливает гейт после двух раундов ремонта подряд без прогресса.
+`runEpicGate({ engine, run, signal })` под lease `run:<id>` выбирает модели (`selectModels`), выполняет полный `verify()` и затем `commands.smoke` на проверенном head. Ремонт ограничен объединением `writePaths` покрытых задач. Binding хранит исходный `gate.headSha`; ремонт может сдвинуть проверенный `run.headSha` на потомка. Перед smoke `gateRepairInScope` проверяет, что `run.headSha` — потомок `gate.headSha` и меняет только `writePaths` покрытых задач, иначе блокер `gate_scope`. Квитанции (checks, ревью, behaviour, гейты, smoke) относятся к итоговому `run.headSha`; приёмка — по нему (см. [PROJECTS.md](PROJECTS.md), правило голов), возврат в ветку — `mergeBackGate({ worktree, expectedHead: gate.headSha, gateHead: run.headSha })`. Результат smoke — `run.smoke = { schemaVersion: 1, headSha, configured, complete, results }`, строка на каждую команду с журналом `smoke`; без настроенных команд `configured: false, complete: true, results: []`. Итог — `succeeded` или `blocked` с текущим блокером (`smoke_failed`, `gate_scope`, `no_verified_progress` и др.). Сторож по умолчанию останавливает гейт после двух раундов ремонта подряд без прогресса.
 
 ## Проверка
 

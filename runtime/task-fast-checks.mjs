@@ -48,9 +48,15 @@ export function fastCheckTimeout(run) {
   return value;
 }
 
+// Options that change which tests run: narrowed, they may run none at all.
+const selectionOption = /^--(?:test-shard|test-name-pattern|test-skip-pattern|test-only)(?:=|$)/;
+// Options that change the summary the narrowed run is counted by.
+const reporterOption = /^--test-reporter(?:-destination)?(?:=|$)/;
+
 /**
  * Only Node's own test runner can be narrowed to the affected files. Its options must
- * survive the narrowing (`--name=value` only); a positional path limits which test files run.
+ * survive the narrowing (`--name=value` only, none that selects tests or changes the
+ * reporter); a positional path limits which test files run.
  * @param {{ command: string, args?: string[] }[]} commands
  */
 function nodeTestRunner(commands) {
@@ -61,6 +67,8 @@ function nodeTestRunner(commands) {
   const flags = [],
     scopes = [];
   for (const arg of args) {
+    if (selectionOption.test(arg)) return { reason: 'runner-selection' };
+    if (reporterOption.test(arg)) return { reason: 'runner-reporter' };
     if (arg === '--test' || /^--[a-z][a-z0-9-]*=/.test(arg)) flags.push(arg);
     else if (arg.startsWith('-') || /[*?[\]{}]/.test(arg)) return { reason: 'runner-options' };
     else {
@@ -85,6 +93,27 @@ async function syntaxTargets(cwd, files) {
   return targets;
 }
 
+const fullCommands = (configured, timeoutMs) =>
+  configured.map(({ command, args = [], timeoutMs: own }) => ({
+    kind: 'test',
+    command,
+    args: [...args],
+    timeoutMs: Math.min(own ?? timeoutMs, timeoutMs),
+  }));
+
+/**
+ * Tests a `node --test` run actually executed, from its summary (spec `ℹ` or TAP `#`
+ * lines): tests minus skipped. `null` when the output has no summary.
+ * @param {string} output
+ * @returns {number | null}
+ */
+export function executedTests(output) {
+  const counts = {};
+  for (const [, name, value] of String(output).matchAll(/^(?:ℹ|#) (tests|skipped) (\d+)\s*$/gmu))
+    counts[name] = Number(value);
+  return counts.tests === undefined ? null : counts.tests - (counts.skipped ?? 0);
+}
+
 /**
  * The fast plan for one head, with the reasons for any full fallback.
  * @param {{ run: any, cwd?: string, baseSha?: string, headSha: string }} input
@@ -106,12 +135,7 @@ export async function planFastChecks({ run, cwd = run.cwd, baseSha = run.baseSha
   if (!reasons.length && !tests.length) reasons.push('no-affected-tests');
   const fallback = reasons.length > 0;
   const commands = fallback
-    ? configured.map(({ command, args = [], timeoutMs: own }) => ({
-        kind: 'test',
-        command,
-        args: [...args],
-        timeoutMs: Math.min(own ?? timeoutMs, timeoutMs),
-      }))
+    ? fullCommands(configured, timeoutMs)
     : [
         ...(await syntaxTargets(cwd, graph.affectedFiles)).map(file => ({
           kind: 'syntax',
@@ -215,8 +239,11 @@ async function cachedRow(engine, base, input, headSha) {
   };
 }
 
-/** One command of the plan: a cached receipt, or its execution with persisted evidence. */
-async function runStep({ engine, run, step, headSha, env, cache, signal }) {
+/**
+ * One command of the plan: a cached receipt, or its execution with persisted evidence.
+ * A `counted` (narrowed) test step passes only when it executed at least one test.
+ */
+async function runStep({ engine, run, step, headSha, env, cache, counted, signal }) {
   const base = { kind: step.kind, command: step.command, args: step.args };
   const input =
     cache && step.kind === 'test'
@@ -225,7 +252,8 @@ async function runStep({ engine, run, step, headSha, env, cache, signal }) {
           kind: 'test',
           command: step.command,
           args: step.args,
-          gateConfig: { profile: TASK_FAST_PROFILE, timeoutMs: step.timeoutMs },
+          // `executedTests`: only runs that executed a test are cached (older entries never match).
+          gateConfig: { profile: TASK_FAST_PROFILE, timeoutMs: step.timeoutMs, executedTests: true },
         }
       : null;
   const hit = input && (await cachedRow(engine, base, input, headSha));
@@ -263,6 +291,7 @@ async function runStep({ engine, run, step, headSha, env, cache, signal }) {
     // A stopped command keeps its own error; a finished one cannot pass without its log.
     if (!error) throw persistError;
   }
+  /** @type {Record<string, any>} */
   const row = {
     ...base,
     exitCode,
@@ -296,6 +325,11 @@ async function runStep({ engine, run, step, headSha, env, cache, signal }) {
         'check_failed',
       ),
     };
+  if (counted) {
+    // Exit 0 after running nothing is not a pass: never cache or accept it.
+    row.tests = executedTests(`${value.stdout}\n${value.stderr}`);
+    if (!(row.tests > 0)) return { row, noTests: true };
+  }
   if (input)
     await writeCheckCache({
       home: engine.store.home,
@@ -323,13 +357,41 @@ async function runStep({ engine, run, step, headSha, env, cache, signal }) {
  * @param {{ engine: any, run: any, signal?: AbortSignal }} input
  */
 export async function runFastChecks({ engine, run, signal }) {
-  fastCheckTimeout(run);
+  const timeoutMs = fastCheckTimeout(run);
   validateCommandTimeouts(run.config.commands);
   await engine.setup(run.cwd, run, signal);
   const headSha = await git(run.cwd, ['rev-parse', 'HEAD']);
   await assertClean(run.cwd, headSha, 'Проверка commit требует чистого integration worktree');
-  const plan = await planFastChecks({ run, cwd: run.cwd, baseSha: run.baseSha, headSha });
+  let plan = await planFastChecks({ run, cwd: run.cwd, baseSha: run.baseSha, headSha });
   if (!plan.commands.length) throw new Error('Не настроена команда проверки результата');
+  let outcome = await executePlan({ engine, run, plan, headSha, signal });
+  if (outcome.noTests) {
+    // The narrowed run executed no test: run the configured commands.test in full instead.
+    engine.log(run, 'fast_checks_no_tests', { headSha, testFiles: plan.testFiles.length });
+    plan = {
+      ...plan,
+      affected: [],
+      testFiles: [],
+      fallback: true,
+      reasons: ['no-tests-executed'],
+      commands: fullCommands(run.config.commands.test || [], timeoutMs),
+    };
+    if (!plan.commands.length) throw new Error('Не настроена команда проверки результата');
+    outcome = await executePlan({ engine, run, plan, headSha, signal });
+  }
+  run.checks.complete = true;
+  engine.save(run);
+  engine.log(run, 'fast_checks', {
+    headSha,
+    fallback: plan.fallback,
+    commands: outcome.results.length,
+    cached: outcome.results.filter(row => row.cached).length,
+  });
+  return run.checks;
+}
+
+/** Record a fresh, incomplete receipt for the plan and execute its commands in order. */
+async function executePlan({ engine, run, plan, headSha, signal }) {
   const results = [];
   run.checks = {
     schemaVersion: 2,
@@ -365,18 +427,12 @@ export async function runFastChecks({ engine, run, signal }) {
   const cache = plan.fallback ? null : await cacheContext(run, plan, headSha, env);
   for (const step of plan.commands) {
     engine.checkCancelled(run, signal);
-    const { row, error } = await runStep({ engine, run, step, headSha, env, cache, signal });
+    const counted = !plan.fallback && step.kind === 'test';
+    const { row, error, noTests } = await runStep({ engine, run, step, headSha, env, cache, counted, signal });
     results.push(row);
     engine.save(run);
     if (error) throw error;
+    if (noTests) return { results, noTests: true };
   }
-  run.checks.complete = true;
-  engine.save(run);
-  engine.log(run, 'fast_checks', {
-    headSha,
-    fallback: plan.fallback,
-    commands: results.length,
-    cached: results.filter(row => row.cached).length,
-  });
-  return run.checks;
+  return { results, noTests: false };
 }

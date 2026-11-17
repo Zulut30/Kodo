@@ -88,22 +88,23 @@ export async function ensureIntegration({ root, projectId, worktreeHome }) {
   return { branch, worktree, head: await git(worktree, ['rev-parse', '--verify', 'HEAD^{commit}']) };
 }
 
-// Only a clean linked worktree on an integration branch may be merged into or
-// reset. This guard keeps `reset --hard` away from the user's main checkout.
-async function assertIntegrationWorktree(worktree) {
+// Only a linked worktree on an integration branch may be merged into or reset.
+// This guard keeps `merge --abort` and `reset --hard` away from the user's main checkout.
+async function integrationWorktree(worktree) {
   if (typeof worktree !== 'string' || !path.isAbsolute(worktree)) fail('integration_worktree_invalid');
   const [gitDir, commonDir] = (
     await git(worktree, ['rev-parse', '--path-format=absolute', '--git-dir', '--git-common-dir'])
   ).split(/\r?\n/);
   const branch = await git(worktree, ['branch', '--show-current']);
-  if (
-    !gitDir ||
-    !commonDir ||
-    (await canonical(gitDir)) === (await canonical(commonDir)) ||
-    !branch.startsWith(prefix) ||
-    (await git(worktree, ['status', '--porcelain=v1', '--untracked-files=all']))
-  )
+  if (!gitDir || !commonDir || (await canonical(gitDir)) === (await canonical(commonDir)) || !branch.startsWith(prefix))
     fail('integration_worktree_invalid');
+  return branch;
+}
+
+// ...and it must also be clean.
+async function assertIntegrationWorktree(worktree) {
+  const branch = await integrationWorktree(worktree);
+  if (await git(worktree, ['status', '--porcelain=v1', '--untracked-files=all'])) fail('integration_worktree_invalid');
   return branch;
 }
 
@@ -167,14 +168,30 @@ async function verifiedMerge(worktree, before, taskHead, writePaths, commit = 'H
   );
 }
 
+// A crash after savePending but before the merge commit leaves MERGE_HEAD and a
+// changed index. Only our own interrupted merge (HEAD = the saved `before`,
+// MERGE_HEAD = this task head) is aborted; any other state is refused later.
+async function abandonInterruptedMerge(worktree, pending, taskHead) {
+  const mergeHead = await execute('git', ['rev-parse', '--verify', '--quiet', 'MERGE_HEAD'], {
+    cwd: worktree,
+    allowFailure: true,
+  });
+  if (mergeHead.code !== 0) return;
+  await integrationWorktree(worktree);
+  if (!pending || mergeHead.stdout.trim() !== taskHead || (await headOf(worktree)) !== pending.before) return;
+  await abortMerge(worktree, pending.before);
+}
+
 /**
+ * `pending` is the value an earlier attempt passed to `savePending` (null when none was saved).
  * @param {{
  *   worktree: string, taskId: string, taskHead: string, writePaths: string[],
  *   savePending: (pending: { before: string }) => unknown,
+ *   pending?: { before: string } | null,
  *   withLease?: <T>(work: () => Promise<T>) => Promise<T>,
  * }} options
  */
-export async function mergeTask({ worktree, taskId, taskHead, writePaths, savePending, withLease }) {
+export async function mergeTask({ worktree, taskId, taskHead, writePaths, savePending, pending = null, withLease }) {
   if (
     !slug(taskId) ||
     !sha(taskHead) ||
@@ -182,10 +199,12 @@ export async function mergeTask({ worktree, taskId, taskHead, writePaths, savePe
     !writePaths.length ||
     writePaths.some(scope => typeof scope !== 'string' || !scope) ||
     typeof savePending !== 'function' ||
+    (pending !== null && !sha(pending?.before)) ||
     (withLease !== undefined && typeof withLease !== 'function')
   )
     fail('integration_invalid');
   const merge = async () => {
+    await abandonInterruptedMerge(worktree, pending, taskHead);
     const branch = await assertIntegrationWorktree(worktree);
     await assertCommit(worktree, taskHead);
     const head = await headOf(worktree);
@@ -218,17 +237,52 @@ export async function mergeTask({ worktree, taskId, taskHead, writePaths, savePe
   return withLease ? withLease(merge) : merge();
 }
 
-// Bring a gate run's verified head back to the integration branch.
-/** @param {{ worktree: string, gateHead: string }} options */
-export async function mergeBackGate({ worktree, gateHead }) {
-  if (!sha(gateHead)) fail('integration_invalid');
+/**
+ * Whether `to` (a gate Run's verified head) descends from `from` (the gate head)
+ * and changes only files inside `writePaths` (the covered tasks' write paths).
+ * @param {{ worktree: string, from: string, to: string, writePaths: string[] }} options
+ */
+export async function gateRepairInScope({ worktree, from, to, writePaths }) {
+  if (
+    !sha(from) ||
+    !sha(to) ||
+    !Array.isArray(writePaths) ||
+    !writePaths.length ||
+    writePaths.some(scope => typeof scope !== 'string' || !scope)
+  )
+    fail('integration_invalid');
+  if (!(await ancestor(worktree, from, to))) return false;
+  const changed = (await git(worktree, ['diff', '--no-renames', '--name-only', '-z', from, to]))
+    .split('\0')
+    .filter(Boolean);
+  return changed.every(name => ownsPath(writePaths, name));
+}
+
+/**
+ * Bring a gate Run's verified head back to the integration branch. `expectedHead`
+ * is the gate head (`gate.headSha`, the branch head the gate started from) and
+ * `gateHead` the verified head (`run.headSha`), its descendant. While the branch
+ * still points at `expectedHead` it fast-forwards to the verified head; when other
+ * merges advanced it, the repair commits are merged `--no-ff`. Epic acceptance
+ * belongs to the verified gate head; project acceptance additionally requires a
+ * gate whose verified head equals the branch head at acceptance time.
+ * The caller holds lease `project-integration:<projectId>`.
+ * @param {{ worktree: string, expectedHead: string, gateHead: string }} options
+ */
+export async function mergeBackGate({ worktree, expectedHead, gateHead }) {
+  if (!sha(gateHead) || !sha(expectedHead)) fail('integration_invalid');
   await assertIntegrationWorktree(worktree);
   await assertCommit(worktree, gateHead);
+  await assertCommit(worktree, expectedHead);
+  if (!(await ancestor(worktree, expectedHead, gateHead))) fail('integration_invalid');
   const before = await headOf(worktree);
   if (await ancestor(worktree, gateHead, before)) return before;
-  const args = (await ancestor(worktree, before, gateHead))
-    ? ['merge', '--ff-only', gateHead]
-    : ['merge', '--no-ff', '--no-edit', '-m', 'Kodo: integrate gate', gateHead];
+  // The branch is never rewritten: it must still contain the gate head.
+  if (!(await ancestor(worktree, expectedHead, before))) fail('integration_invalid');
+  const args =
+    before === expectedHead
+      ? ['merge', '--ff-only', gateHead]
+      : ['merge', '--no-ff', '--no-edit', '-m', 'Kodo: integrate gate repairs', gateHead];
   if ((await execute('git', args, { cwd: worktree, allowFailure: true })).code !== 0) {
     await abortMerge(worktree, before);
     fail('integration_conflict');

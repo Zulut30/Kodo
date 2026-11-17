@@ -174,6 +174,8 @@ const mergeOf = (attempt, mergeCommit = '4'.repeat(40)) => ({
   runId: attempt.runId,
   mergeCommit,
 });
+// A gate Run draft of the shape createGateRunDraft builds: the covered tasks are
+// planned and integrated at their merge commits; the Run starts on the gate head.
 function gateDraft(repo, projectId, gate) {
   const s = repo.snapshot(projectId);
   const tasks = gate.merges.map(m => s.tasks.find(t => t.id === m.taskId));
@@ -183,12 +185,38 @@ function gateDraft(repo, projectId, gate) {
     task: contracts.buildGateInput({ project: s.project, gate, tasks }, options),
     createdAt: '2026-11-17T12:00:00.000Z',
     state: 'created',
-    completed: {},
-    nodes: {},
-    config: { client: 'codex' },
+    completed: { implementation: true },
+    nodes: Object.fromEntries(
+      gate.merges.map(m => [
+        m.taskId,
+        {
+          id: m.taskId,
+          attempt: 0,
+          status: 'integrated',
+          headSha: m.mergeCommit,
+          sourceRunId: m.runId,
+          attemptId: m.attemptId,
+        },
+      ]),
+    ),
+    plan: {
+      summary: 'Gate over the covered tasks',
+      tasks: tasks.map(t => ({
+        id: t.id,
+        role: 'developer',
+        description: t.description,
+        dependsOn: [],
+        writePaths: [...t.writePaths],
+        acceptance: ['works'],
+        parallel: false,
+      })),
+    },
+    planSource: 'gate',
+    config: { client: 'codex', delivery: { enabled: false } },
     client: 'codex',
     providers: 'current',
-    baseSha: gate.headSha,
+    baseSha: gate.baseSha,
+    headSha: gate.headSha,
     snapshot: { root: s.project.root, head: gate.headSha },
     requestedMode: 'quick',
     sessionAttempts: [],
@@ -197,7 +225,6 @@ function gateDraft(repo, projectId, gate) {
     worktreeRoot: path.join(s.project.root, 'fake-worktrees'),
     cwd: path.join(s.project.root, 'fake-worktrees', 'integration'),
     branch: 'kodo/wave-gate',
-    verificationProfile: 'task-fast',
     directorBinding: contracts.gateBindingFor(gate, options),
   };
 }
@@ -428,12 +455,29 @@ test('appendMilestone is refused while attempts are unsettled or the project is 
   assert.equal(rows(f.store, pid).includes('milestone:m2'), false);
 });
 
+// The task Run of an attempt records its merge into the integration branch.
+function recordMerge(store, attempt, mergeCommit, headSha = 'b'.repeat(40)) {
+  store.createRun({
+    id: attempt.runId,
+    headSha,
+    integration: {
+      branch: 'kodo/project/x',
+      before: '0'.repeat(40),
+      mergeCommit,
+      mergedHead: headSha,
+      status: 'merged',
+    },
+  });
+}
+
 test('reserveGate validates scope, merges and retries; installGateRun binds exactly one Run', async t => {
   const f = await fixture(t);
   const pid = await f.create(waveSpec(f.root()));
   const a = await f.integrate(pid, 'a');
   // Wave dependency rule in the store: an integrated prerequisite unlocks ready.
   const b = await f.integrate(pid, 'b');
+  recordMerge(f.store, a, '4'.repeat(40));
+  recordMerge(f.store, b, '5'.repeat(40), 'c'.repeat(40));
   const containers = [
     { kind: 'epic', id: 'e' },
     { kind: 'milestone', id: 'm' },
@@ -507,14 +551,41 @@ test('reserveGate validates scope, merges and retries; installGateRun binds exac
       code: 'project_binding_conflict',
     },
   );
-  await assert.rejects(f.repo.installGateRun({ binding, runDraft: { ...runDraft, state: 'running' } }), {
-    code: 'project_run_draft_invalid',
-  });
+  // The gate draft has its own shape: covered plan, integrated nodes, the full verification.
+  const [firstNode] = Object.values(runDraft.nodes);
+  for (const [label, draft] of [
+    ['running state', { ...runDraft, state: 'running' }],
+    ['task-fast profile', { ...runDraft, verificationProfile: 'task-fast' }],
+    ['external executor', { ...runDraft, executor: { kind: 'external', host: 't3' } }],
+    ['empty nodes', { ...runDraft, nodes: {} }],
+    ['empty completed', { ...runDraft, completed: {} }],
+    ['stale node head', { ...runDraft, nodes: { ...runDraft.nodes, a: { ...firstNode, headSha: '7'.repeat(40) } } }],
+    ['missing plan', { ...runDraft, plan: { summary: 'none', tasks: [] } }],
+    [
+      'other write paths',
+      {
+        ...runDraft,
+        plan: {
+          ...runDraft.plan,
+          tasks: [{ ...runDraft.plan.tasks[0], writePaths: ['README.md'] }, runDraft.plan.tasks[1]],
+        },
+      },
+    ],
+    ['other head', { ...runDraft, headSha: '9'.repeat(40) }],
+    ['other base', { ...runDraft, baseSha: '9'.repeat(40) }],
+    ['delivery', { ...runDraft, config: { ...runDraft.config, delivery: { enabled: true } } }],
+  ])
+    await assert.rejects(
+      f.repo.installGateRun({ binding, runDraft: draft }),
+      { code: 'project_run_draft_invalid' },
+      label,
+    );
   await assert.rejects(f.repo.installGateRun({ binding, runDraft, extra: true }), { code: 'project_record_invalid' });
   const installedRevision = f.repo.snapshot(pid).revision;
   const saved = await f.repo.installGateRun({ binding, runDraft });
   assert.equal(saved.id, gate.runId);
-  assert.equal(saved.verificationProfile, 'task-fast');
+  assert.equal(saved.verificationProfile, undefined);
+  assert.deepEqual(saved.completed, { implementation: true });
   assert.deepEqual(saved.directorBinding, binding);
   const afterInstall = f.repo.snapshot(pid);
   assert.equal(afterInstall.revision, installedRevision + 1);
@@ -546,7 +617,91 @@ test('reserveGate validates scope, merges and retries; installGateRun binds exac
   const replayed = await f.repo.installGateRun({ binding, runDraft });
   assert.deepEqual([replayed.id, replayed.state], [gate.runId, 'failed']);
 
-  // Gates for a narrower container are independent of the project-wide chain.
-  const milestoneGate = await f.run(pid, reserve({ containers: [{ kind: 'milestone', id: 'm' }] }));
-  assert.equal(f.repo.snapshot(pid).gates.find(g => g.id === milestoneGate.entity.id).number, 3);
+  // A milestone-first gate needs every epic of the milestone accepted.
+  await assert.rejects(f.run(pid, reserve({ containers: [{ kind: 'milestone', id: 'm' }] })), {
+    code: 'project_gate_invalid',
+  });
+});
+
+test('reserveGate binds only the merge commits the attempts recorded for their verified heads', async t => {
+  const f = await fixture(t);
+  const pid = await f.create(waveSpec(f.root()));
+  const a = await f.integrate(pid, 'a');
+  const b = await f.integrate(pid, 'b');
+  const reserve = merges => ({
+    op: 'reserveGate',
+    containers: [{ kind: 'epic', id: 'e' }],
+    baseSha: '1'.repeat(40),
+    headSha: '3'.repeat(40),
+    merges,
+    retry: false,
+  });
+  // Without a task Run recording the merge nothing can be bound.
+  await assert.rejects(f.run(pid, reserve([mergeOf(a), mergeOf(b, '5'.repeat(40))])), {
+    code: 'project_gate_invalid',
+  });
+  recordMerge(f.store, a, '4'.repeat(40));
+  recordMerge(f.store, b, '5'.repeat(40), 'c'.repeat(40));
+  const before = f.repo.snapshot(pid).revision;
+  // An older (or any other) commit than the recorded merge of the current attempt is refused.
+  await assert.rejects(f.run(pid, reserve([mergeOf(a, '7'.repeat(40)), mergeOf(b, '5'.repeat(40))])), {
+    code: 'project_gate_invalid',
+  });
+  const recorded = f.store.getRun(b.runId);
+  for (const integration of [
+    { ...recorded.integration, status: 'pending' },
+    { ...recorded.integration, mergedHead: 'd'.repeat(40) },
+  ]) {
+    f.store.updateRun(b.runId, { integration });
+    await assert.rejects(f.run(pid, reserve([mergeOf(a), mergeOf(b, '5'.repeat(40))])), {
+      code: 'project_gate_invalid',
+    });
+  }
+  assert.equal(f.repo.snapshot(pid).revision, before);
+  f.store.updateRun(b.runId, { integration: recorded.integration });
+  await f.run(pid, reserve([mergeOf(a), mergeOf(b, '5'.repeat(40))]));
+  assert.equal(f.repo.snapshot(pid).gates.length, 1);
+});
+
+test('A milestone joins a gate chain only when its other epics are already accepted', async t => {
+  const f = await fixture(t);
+  const pid = await f.create({
+    ...waveSpec(f.root(), [taskSpec('a'), taskSpec('c', { epicId: 'e2' })]),
+    epics: [epicSpec('e'), epicSpec('e2')],
+  });
+  const a = await f.integrate(pid, 'a');
+  const c = await f.integrate(pid, 'c');
+  recordMerge(f.store, a, '4'.repeat(40));
+  recordMerge(f.store, c, '5'.repeat(40), 'c'.repeat(40));
+  const merges = [mergeOf(a), mergeOf(c, '5'.repeat(40))];
+  const reserve = (containers, gateMerges = merges) => ({
+    op: 'reserveGate',
+    containers,
+    baseSha: '1'.repeat(40),
+    headSha: '3'.repeat(40),
+    merges: gateMerges,
+    retry: false,
+  });
+  const epic = id => ({ kind: 'epic', id }),
+    milestone = { kind: 'milestone', id: 'm' },
+    project = { kind: 'project', id: pid };
+  // Neither sibling may pull the shared milestone (or the project) into its gate while the other is open.
+  for (const containers of [
+    [epic('e'), milestone],
+    [epic('e2'), milestone],
+    [epic('e'), milestone, project],
+    [milestone],
+    [milestone, project],
+  ])
+    await assert.rejects(f.run(pid, reserve(containers)), { code: 'project_gate_invalid' }, JSON.stringify(containers));
+  assert.equal(f.repo.snapshot(pid).gates.length, 0);
+  // Once e2 is accepted, e's gate may verify the milestone and the project too.
+  await f.accept(pid, 'c');
+  await f.drive(pid, 'epic', 'e2', f.forward);
+  await assert.rejects(f.run(pid, reserve([epic('e2'), milestone])), { code: 'project_gate_invalid' });
+  await f.run(pid, reserve([epic('e'), milestone, project]));
+  assert.deepEqual(
+    f.repo.snapshot(pid).gates.map(gate => gate.containers),
+    [[epic('e'), milestone, project]],
+  );
 });

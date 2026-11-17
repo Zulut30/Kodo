@@ -19,7 +19,8 @@ import { resolveMode } from './modes.mjs';
 import { normalizeWatchdogConfig, resolveBlocker } from './watchdog.mjs';
 import { currentBlocker } from './engine.mjs';
 import { runFastChecks } from './task-fast-checks.mjs';
-import { gateBindingFor } from './project-contracts.mjs';
+import { buildGateInput, gateBindingFor } from './project-contracts.mjs';
+import { gateRepairInScope, integrationBranch } from './project-integration.mjs';
 
 /** The watchdog of a wave gate when the project sets none. */
 export const GATE_WATCHDOG = Object.freeze({ stalledRounds: 2, rejectUnchanged: true });
@@ -41,18 +42,46 @@ export function gateMergesHash(merges) {
   return createHash('sha256').update(JSON.stringify(rows)).digest('hex');
 }
 
+const contains = async (cwd, commit, head) =>
+  (await execute('git', ['merge-base', '--is-ancestor', commit, head], { cwd, allowFailure: true })).code === 0;
+
+/** The head the task's own Run recorded for this merge; its merge commit's second parent must be that head. */
+async function assertMergeOfAttempt(engine, root, merge) {
+  let run = null;
+  try {
+    run = engine.store.getRun(merge.runId);
+  } catch {
+    /* A missing task Run is reported below. */
+  }
+  const integration = run?.integration;
+  if (
+    integration?.status !== 'merged' ||
+    integration.mergeCommit !== merge.mergeCommit ||
+    !shaPattern.test(run.headSha) ||
+    integration.mergedHead !== run.headSha
+  )
+    throw invalid(`merge ${merge.taskId} is not the recorded integration of its attempt`);
+  const parents = await execute('git', ['rev-list', '--parents', '-n', '1', merge.mergeCommit], {
+    cwd: root,
+    allowFailure: true,
+  });
+  const [, , second, ...extra] = parents.code === 0 ? parents.stdout.trim().split(' ') : [];
+  if (second !== run.headSha || extra.length)
+    throw invalid(`merge ${merge.taskId} does not merge the head of its attempt`);
+}
+
 /** The covered tasks of a gate, in merge order; the gate head must contain its base and every merge. */
-async function coveredTasks({ project, gate, tasks }) {
+async function coveredTasks({ engine, project, gate, tasks }) {
   if (!gate || typeof gate !== 'object' || gate.schemaVersion !== 1) throw invalid('schemaVersion');
   if (!nonEmpty(gate.id) || !nonEmpty(gate.projectId)) throw invalid('id');
   if (!nonEmpty(gate.runId) || !runIdPattern.test(gate.runId)) throw invalid('runId');
   if (!Number.isSafeInteger(gate.number) || gate.number < 1) throw invalid('number');
   if (!shaPattern.test(gate.baseSha) || !shaPattern.test(gate.headSha)) throw invalid('baseSha/headSha');
   if (!project || !nonEmpty(project.root)) throw invalid('project.root');
-  if (project.projectId !== undefined && project.projectId !== gate.projectId) throw invalid('projectId');
+  if (project.projectId !== gate.projectId) throw invalid('projectId');
   if (!Array.isArray(gate.merges) || !gate.merges.length || !Array.isArray(tasks)) throw invalid('merges');
   const byId = new Map(tasks.map(task => [task?.id, task]));
-  const covered = new Map();
+  const covered = [];
   for (const merge of gate.merges) {
     const task = byId.get(merge?.taskId);
     if (
@@ -65,18 +94,24 @@ async function coveredTasks({ project, gate, tasks }) {
       !task.writePaths.every(nonEmpty)
     )
       throw invalid(`merge ${String(merge?.taskId).slice(0, 80)}`);
-    // A retried task keeps its latest merge.
-    covered.delete(task.id);
-    covered.set(task.id, { task, merge });
+    covered.push({ task, merge });
   }
-  for (const commit of [gate.baseSha, ...gate.merges.map(merge => merge.mergeCommit)]) {
-    const contained = await execute('git', ['merge-base', '--is-ancestor', commit, gate.headSha], {
-      cwd: project.root,
-      allowFailure: true,
-    });
-    if (contained.code !== 0) throw invalid(`${commit.slice(0, 12)} is not contained in the gate head`);
-  }
-  return [...covered.values()];
+  for (const commit of [gate.baseSha, ...gate.merges.map(merge => merge.mergeCommit)])
+    if (!(await contains(project.root, commit, gate.headSha)))
+      throw invalid(`${commit.slice(0, 12)} is not contained in the gate head`);
+  for (const merge of gate.merges) await assertMergeOfAttempt(engine, project.root, merge);
+  return covered;
+}
+
+/** The gate head must still be the head of the project integration branch (under its lease). */
+async function assertIntegrationHead(project, gate) {
+  const found = await execute(
+    'git',
+    ['rev-parse', '--verify', '--quiet', `refs/heads/${integrationBranch(gate.projectId)}^{commit}`],
+    { cwd: project.root, allowFailure: true },
+  );
+  if (found.code !== 0 || found.stdout.trim() !== gate.headSha)
+    throw fail('Голова интеграционной ветки проекта не равна head гейта', 'gate_head_stale');
 }
 
 const acceptance = task => {
@@ -85,27 +120,48 @@ const acceptance = task => {
 };
 
 /**
- * Build the gate Run draft and install it through the store port.
- * `input`: optional `task` text and the Run options `client`, `model`, `providers`, `mode`, `concurrency`.
- * The port defaults to `engine.store.installGateRun(draft)`; its result is returned.
+ * Build the gate Run draft and install it through the project store:
+ * `installGateRun({ binding: gateBindingFor(gate), runDraft })` (e.g. `projectStore.installGateRun`).
+ * `project` and `tasks` are the stored records of the snapshot; `runDraft.task` is
+ * `buildGateInput({ project, gate, tasks: covered tasks in merge order })`.
+ * `input`: the Run options `client`, `model`, `providers`, `mode`, `concurrency`.
+ * The caller serializes integration: pass `withLease` (runs the head check and the install
+ * inside lease `project-integration:<projectId>`) or `leaseHeld: true` when it already holds it.
  * @param {{
  *   engine: any, project: any, gate: any, tasks: any[],
- *   input?: { task?: string, client?: string, model?: string, providers?: string, mode?: string, concurrency?: number },
- *   installGateRun?: (draft: any) => any,
+ *   input?: { client?: string, model?: string, providers?: string, mode?: string, concurrency?: number },
+ *   installGateRun: (input: { binding: any, runDraft: any }) => any,
+ *   withLease?: <T>(work: () => Promise<T>) => Promise<T>, leaseHeld?: boolean,
  * }} options
  */
-export async function createGateRunDraft({ engine, project, gate, tasks, input = {}, installGateRun }) {
-  const install =
-    installGateRun ??
-    (typeof engine.store.installGateRun === 'function' ? draft => engine.store.installGateRun(draft) : null);
-  if (typeof install !== 'function') throw fail('Не задан порт установки gate run', 'gate_install_unavailable');
-  const covered = await coveredTasks({ project, gate, tasks });
+export async function createGateRunDraft({
+  engine,
+  project,
+  gate,
+  tasks,
+  input = {},
+  installGateRun,
+  withLease,
+  leaseHeld = false,
+}) {
+  if (typeof installGateRun !== 'function') throw fail('Не задан порт установки gate run', 'gate_install_unavailable');
+  if (withLease !== undefined && typeof withLease !== 'function') throw invalid('withLease');
+  if (withLease === undefined && leaseHeld !== true)
+    throw fail('Черновик гейта требует lease project-integration проекта', 'gate_lease_required');
+  const work = async () => {
+    const covered = await coveredTasks({ engine, project, gate, tasks });
+    await assertIntegrationHead(project, gate);
+    const runDraft = await gateDraft({ engine, project, gate, covered, input });
+    return await installGateRun({ binding: gateBindingFor(gate), runDraft });
+  };
+  return withLease ? await withLease(work) : await work();
+}
+
+async function gateDraft({ engine, project, gate, covered, input }) {
   const ids = covered.map(({ task }) => task.id);
-  const text =
-    input.task ??
-    `Epic gate ${gate.number}: verify the integrated result of tasks ${ids.join(', ')} ` +
-      `(base ${gate.baseSha.slice(0, 12)}, head ${gate.headSha.slice(0, 12)}). ` +
-      'Repair only confirmed failures inside the write paths of these tasks.';
+  const knownValues = Object.values(engine.secrets || {}).filter(value => typeof value === 'string');
+  // Single source of truth with the store: installGateRun compares these bytes.
+  const text = buildGateInput({ project, gate, tasks: covered.map(({ task }) => task) }, { knownValues });
   const options = Object.fromEntries(passThrough.filter(key => input[key] !== undefined).map(key => [key, input[key]]));
   // The gate never delivers: the coordinator merges and publishes.
   const prepared = await engine.prepareRun(
@@ -129,7 +185,6 @@ export async function createGateRunDraft({ engine, project, gate, tasks, input =
     id: gate.runId,
     createdAt: new Date().toISOString(),
     state: 'created',
-    // Single source of truth with the store: installGateRun compares these bytes.
     directorBinding: gateBindingFor(gate),
     executionMode,
     plan: {
@@ -163,7 +218,7 @@ export async function createGateRunDraft({ engine, project, gate, tasks, input =
     research: { items: [], requests: 0, errors: [], cache: [] },
   };
   await engine.initializeRun(draft);
-  return await install(draft);
+  return draft;
 }
 
 /** Hold `run:<id>` like Engine.run(): heartbeat, cancellation requests and the caller's signal. */
@@ -322,6 +377,18 @@ export async function runEpicGate({ engine, run: input, signal }) {
       engine.checkCancelled(run, leased);
       await engine.selectModels(run);
       await engine.verify(run, leased);
+      // Repairs may move the verified head past the gate head, but only by
+      // descendants that change the covered tasks' write paths.
+      const writePaths = run.plan.tasks.flatMap(task => task.writePaths);
+      if (
+        !(await gateRepairInScope({
+          worktree: run.cwd,
+          from: run.directorBinding.headSha,
+          to: run.headSha,
+          writePaths,
+        }))
+      )
+        throw fail('Проверенный head гейта не продолжает head гейта в пределах writePaths задач', 'gate_scope');
       await runSmoke(engine, run, leased);
       engine.checkCancelled(run, leased);
       run.state = 'succeeded';

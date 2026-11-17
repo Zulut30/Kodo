@@ -8,8 +8,11 @@ const [R1, R2, G1, G2] = ['2', '4', '6', '8'].map(
   d => `${d.repeat(8)}-${d.repeat(4)}-4${d.repeat(3)}-8${d.repeat(3)}-${d.repeat(12)}`,
 );
 const [A1, A2] = ['3', '5'].map(d => `${d.repeat(8)}-${d.repeat(4)}-4${d.repeat(3)}-8${d.repeat(3)}-${d.repeat(12)}`);
-const [base, head1, head2, merge1, merge2, gateHead] = ['0', '1', '2', '3', '4', '9'].map(d => d.repeat(40));
+const [base, head1, head2, merge1, merge2, gateHead, repairedHead] = ['0', '1', '2', '3', '4', '9', '7'].map(d =>
+  d.repeat(40),
+);
 const command = { command: 'node', args: ['--test'], timeoutMs: 1000 };
+const smokeCommand = { command: 'node', args: ['smoke.mjs'] };
 const criterion = id => ({ id, text: 'Observable result', evidenceKinds: ['acceptance'] });
 const digest = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const contracts = {
@@ -42,7 +45,7 @@ const ref = (kind, runId, headSha) => ({
   sha256: (++serial).toString(16).padStart(64, '0'),
 });
 const config = {
-  commands: { test: [command], build: [] },
+  commands: { test: [command], build: [], smoke: [smokeCommand] },
   uiVerification: { enabled: false },
   security: { enabled: true },
   architecture: { enabled: false },
@@ -105,12 +108,14 @@ function gateFor(id, runId, number, containers, merges) {
   };
 }
 
-function gateRun(gate) {
+// A finished gate Run; `headSha` is its verified head (the gate head, or a repaired descendant).
+function gateRun(gate, headSha = gate.headSha) {
+  const log = { path: 'C:/isolated-evidence/smoke.json', sha256: 'e'.repeat(64), bytes: 10, headSha };
   return {
     id: gate.runId,
     project: 'C:/isolated-project',
     state: 'succeeded',
-    headSha: gate.headSha,
+    headSha,
     baseSha: gate.baseSha,
     directorBinding: contracts.gateBindingFor(gate),
     plan: { tasks: [{ id: 'gate' }] },
@@ -119,17 +124,26 @@ function gateRun(gate) {
     checks: {
       schemaVersion: 2,
       complete: true,
-      headSha: gate.headSha,
+      headSha,
       results: [{ kind: 'test', command, exitCode: 0 }],
     },
-    review: { passed: true, headSha: gate.headSha },
-    securityChecks: { status: 'passed', passed: true, headSha: gate.headSha },
+    review: { passed: true, headSha },
+    behavior: {
+      schemaVersion: BEHAVIOR_GATE_VERSION,
+      headSha,
+      baseSha: gate.baseSha,
+      configHash: verificationConfigHash(undefined),
+      status: 'passed',
+      passed: true,
+      findings: [],
+    },
+    securityChecks: { status: 'passed', passed: true, headSha },
     smoke: {
       schemaVersion: 1,
-      headSha: gate.headSha,
+      headSha,
       configured: true,
       complete: true,
-      results: [{ command, exitCode: 0 }],
+      results: [{ ...smokeCommand, exitCode: 0, evidence: log, outputPath: log.path, outputHash: log.sha256 }],
     },
   };
 }
@@ -242,13 +256,23 @@ function gateProof(run, criterionId) {
     mappings: [{ criterionId, refs: [evidence[0].sha256], actor: 'reviewer', reason: 'Gate verified the result' }],
   };
 }
-async function evaluate(f, { command, run = null, gate }) {
+async function evaluate(f, { command, run = null, gate, integrationHead }) {
   const { evaluateWaveTransition } = await import('../runtime/project-wave-evidence.mjs');
-  return evaluateWaveTransition({ command, snapshot: counts(f.snapshot), run, gate }, f.ports);
+  return evaluateWaveTransition(
+    { command, snapshot: counts(f.snapshot), run, gate, ...(integrationHead ? { integrationHead } : {}) },
+    f.ports,
+  );
 }
-async function accept(f, kind, id, criterionId, { gate = f.gate, run = gateRun(gate), proof } = {}) {
+// The integration head defaults to the gate's verified head (the project head rule holds).
+async function accept(
+  f,
+  kind,
+  id,
+  criterionId,
+  { gate = f.gate, run = gateRun(gate), proof, integrationHead = run?.headSha } = {},
+) {
   const { evidence, mappings } = proof ?? gateProof(run, criterionId);
-  return evaluate(f, { command: transition(f, kind, id, 'accepted', evidence, mappings), run, gate });
+  return evaluate(f, { command: transition(f, kind, id, 'accepted', evidence, mappings), run, gate, integrationHead });
 }
 const setStatus = (f, kind, id, status) => {
   f.snapshot[kind].find(row => row.id === id || row.taskId === id).status = status;
@@ -544,4 +568,167 @@ test('A container advances through integrated only behind all of its children', 
   assert.deepEqual(blocked.blockers, ['container_progress_unverified']);
   const released = await evaluate(f, { command: transition(f, 'task', 'first', 'released') });
   assert.deepEqual(released.blockers, ['unsupported_evidence_transition']);
+});
+
+// Review F1: acceptance requires every mandatory gate proof, exactly.
+const gateWith = mutate => f => {
+  const run = gateRun(f.gate);
+  mutate(run, f);
+  return accept(f, 'task', 'first', 'first-done', { run });
+};
+for (const [name, act, blocker] of [
+  [
+    'an uninstalled gate',
+    f => {
+      f.gate.installed = false;
+      return accept(f, 'task', 'first', 'first-done');
+    },
+    'wave_gate_missing',
+  ],
+  ['an unfinished gate run', gateWith(run => (run.state = 'verifying')), 'wave_gate_proof_missing'],
+  ['a gate run without a behaviour receipt', gateWith(run => delete run.behavior), 'wave_gate_proof_missing'],
+  ['a behaviour receipt of another head', gateWith(run => (run.behavior.headSha = head1)), 'wave_gate_proof_missing'],
+  ['a failed behaviour receipt', gateWith(run => (run.behavior.passed = false)), 'wave_gate_proof_missing'],
+  [
+    'an empty smoke receipt while smoke commands are configured',
+    gateWith(run => Object.assign(run.smoke, { configured: false, results: [] })),
+    'wave_gate_proof_missing',
+  ],
+  [
+    'a configured smoke receipt without configured commands',
+    gateWith(run => (run.config.commands.smoke = [])),
+    'wave_gate_proof_missing',
+  ],
+  [
+    'a smoke result for another command',
+    gateWith(run => (run.smoke.results[0].args = ['other.mjs'])),
+    'wave_gate_proof_missing',
+  ],
+  [
+    'a missing smoke result',
+    gateWith(run => run.config.commands.smoke.push({ command: 'node', args: ['second.mjs'] })),
+    'wave_gate_proof_missing',
+  ],
+  ['a smoke result without its log', gateWith(run => delete run.smoke.results[0].evidence), 'wave_gate_proof_missing'],
+  [
+    'a smoke log of another head',
+    gateWith(run => (run.smoke.results[0].evidence.headSha = head1)),
+    'wave_gate_proof_missing',
+  ],
+  ['a failed smoke command', gateWith(run => (run.smoke.results[0].exitCode = 1)), 'wave_gate_proof_missing'],
+])
+  test(`Wave acceptance requires the mandatory gate proof: rejects ${name}`, async () => {
+    const f = fixture();
+    const result = await act(f);
+    assert.ok(!result.eligibleStates.includes('accepted'));
+    assert.deepEqual(result.blockers, [blocker]);
+  });
+
+test('A gate without configured smoke commands is accepted with an empty, unconfigured smoke receipt', async () => {
+  const f = fixture();
+  const run = gateRun(f.gate);
+  run.config.commands.smoke = [];
+  Object.assign(run.smoke, { configured: false, results: [] });
+  const result = await accept(f, 'task', 'first', 'first-done', { run });
+  assert.deepEqual(result.blockers, []);
+  assert.ok(result.eligibleStates.includes('accepted'));
+});
+
+test('A repaired gate run is accepted on its verified head, never on the original gate head', async () => {
+  const f = fixture();
+  const repaired = gateRun(f.gate, repairedHead);
+  assert.equal(repaired.directorBinding.headSha, gateHead, 'the binding keeps the gate head');
+  const accepted = await accept(f, 'task', 'first', 'first-done', { run: repaired });
+  assert.deepEqual(accepted.blockers, []);
+  assert.ok(accepted.eligibleStates.includes('accepted'));
+  // Refs and receipts of the gate head do not prove the repaired head.
+  const stale = await accept(f, 'task', 'first', 'first-done', {
+    run: repaired,
+    proof: gateProof(gateRun(f.gate), 'first-done'),
+  });
+  assert.deepEqual(stale.blockers, ['wave_gate_proof_missing']);
+  for (const field of ['checks', 'review', 'behavior', 'smoke']) {
+    const run = gateRun(f.gate, repairedHead);
+    run[field].headSha = gateHead;
+    const result = await accept(f, 'task', 'first', 'first-done', { run, proof: gateProof(repaired, 'first-done') });
+    assert.deepEqual(result.blockers, ['wave_gate_proof_missing'], field);
+  }
+});
+
+test('The project is accepted only by a gate whose verified head is the integration head', async () => {
+  const f = fixture();
+  for (const id of ['first', 'second']) setStatus(f, 'tasks', id, 'accepted');
+  setStatus(f, 'epics', 'epic', 'accepted');
+  setStatus(f, 'milestones', 'milestone', 'accepted');
+  const repaired = gateRun(f.gate, repairedHead);
+  for (const integrationHead of [gateHead, merge2, null]) {
+    const result = await accept(f, 'project', P, 'project-done', { run: repaired, integrationHead });
+    assert.deepEqual(result.blockers, ['wave_project_head_mismatch'], String(integrationHead));
+  }
+  const merged = await accept(f, 'project', P, 'project-done', { run: repaired, integrationHead: repairedHead });
+  assert.deepEqual(merged.blockers, []);
+  assert.ok(merged.eligibleStates.includes('accepted'));
+  // An epic is accepted on its verified gate head whatever the branch head is now.
+  setStatus(f, 'epics', 'epic', 'integrated');
+  const epic = await accept(f, 'epic', 'epic', 'epic-done', { run: repaired, integrationHead: merge2 });
+  assert.deepEqual(epic.blockers, []);
+});
+
+test('A sibling epic gate sharing the milestone supersedes the gate only for the milestone', async () => {
+  const f = fixture();
+  // A second epic of the same milestone with its own integrated task and gate [other, milestone].
+  const [A3, R3, G3] = ['a', 'b', 'c'].map(
+    d => `${d.repeat(8)}-${d.repeat(4)}-4${d.repeat(3)}-8${d.repeat(3)}-${d.repeat(12)}`,
+  );
+  f.snapshot.epics.push({
+    id: 'other',
+    projectId: P,
+    milestoneId: 'milestone',
+    status: 'integrated',
+    acceptance: [criterion('other-done')],
+    evidence: [],
+    mappings: [],
+  });
+  f.snapshot.tasks.push({
+    ...structuredClone(f.snapshot.tasks[0]),
+    id: 'third',
+    epicId: 'other',
+    acceptance: [criterion('third-done')],
+  });
+  f.snapshot.currentAttempts.push({
+    ...structuredClone(f.snapshot.currentAttempts[0]),
+    id: A3,
+    taskId: 'third',
+    runId: R3,
+  });
+  f.gate.containers = [
+    { kind: 'epic', id: 'epic' },
+    { kind: 'milestone', id: 'milestone' },
+  ];
+  const sibling = gateFor(
+    G3,
+    G3,
+    2,
+    [
+      { kind: 'epic', id: 'other' },
+      { kind: 'milestone', id: 'milestone' },
+    ],
+    [{ taskId: 'third', attemptId: A3, runId: R3, mergeCommit: merge2 }],
+  );
+  f.snapshot.gates.push(sibling);
+  // The newer sibling gate does not replace the first gate for its own epic and tasks.
+  for (const [kind, id] of [
+    ['task', 'first'],
+    ['attempt', A1],
+  ])
+    assert.deepEqual((await accept(f, kind, id, 'first-done')).blockers, [], kind);
+  for (const id of ['first', 'second']) setStatus(f, 'tasks', id, 'accepted');
+  assert.deepEqual((await accept(f, 'epic', 'epic', 'epic-done')).blockers, []);
+  // For the shared milestone only the newest gate containing it counts.
+  setStatus(f, 'epics', 'epic', 'accepted');
+  setStatus(f, 'tasks', 'third', 'accepted');
+  setStatus(f, 'epics', 'other', 'accepted');
+  assert.deepEqual((await accept(f, 'milestone', 'milestone', 'milestone-done')).blockers, ['wave_gate_superseded']);
+  const newest = await accept(f, 'milestone', 'milestone', 'milestone-done', { gate: sibling });
+  assert.deepEqual(newest.blockers, []);
 });

@@ -165,12 +165,16 @@ function containerProgress({ snapshot, action, record }) {
   return result(eligible, eligible.includes(action.to) ? [] : ['container_progress_unverified']);
 }
 
+// The binding keeps the gate head; repairs may move run.headSha to a verified
+// descendant (checked with Git by the trusted validateRun port). Every receipt
+// below is about that verified head.
 function boundGate(gate, run, gates, snapshot, contracts) {
   if (!gate || !run || typeof contracts.gateBindingFor !== 'function') return false;
   const stored = gates.find(row => row.id === gate.id);
   return (
     isDeepStrictEqual(stored, gate) &&
     gate.schemaVersion === 1 &&
+    gate.installed === true &&
     gate.projectId === snapshot.project.projectId &&
     Number.isSafeInteger(gate.number) &&
     Array.isArray(gate.containers) &&
@@ -179,21 +183,30 @@ function boundGate(gate, run, gates, snapshot, contracts) {
     gate.runId === run.id &&
     sha(gate.baseSha) &&
     sha(gate.headSha) &&
-    run.headSha === gate.headSha &&
+    sha(run.headSha) &&
     run.baseSha === gate.baseSha &&
     // Byte-for-byte: the same schema-order binding the gate run was installed with.
     JSON.stringify(run.directorBinding) === JSON.stringify(contracts.gateBindingFor(gate))
   );
 }
 
-// A later (or equally numbered) gate sharing any container replaces this one.
-function superseded(gate, gates) {
-  const own = new Set(gate.containers.map(containerKey));
-  return gates.some(
-    other =>
-      other.id !== gate.id &&
-      !(other.number < gate.number) &&
-      (other.containers || []).some(container => own.has(containerKey(container))),
+// The container whose acceptance this transition decides: a task's epic or the container itself.
+function decidedContainer(snapshot, action, record) {
+  if (!['attempt', 'task'].includes(action.kind)) return { kind: action.kind, id: action.id };
+  const taskId = action.kind === 'attempt' ? record.taskId : record.id;
+  const task = snapshot.tasks.find(row => row.id === taskId);
+  return task ? { kind: 'epic', id: task.epicId } : null;
+}
+
+// A gate is superseded for container C only by a later gate that also contains C;
+// a gate of a sibling epic sharing the milestone never replaces it for its own epic.
+function superseded(gate, gates, container) {
+  const key = containerKey(container);
+  const contains = row => (row.containers || []).some(item => containerKey(item) === key);
+  return (
+    Boolean(container) &&
+    contains(gate) &&
+    gates.some(other => other.id !== gate.id && !(other.number < gate.number) && contains(other))
   );
 }
 
@@ -208,28 +221,47 @@ function mergesCurrent(gate, snapshot) {
   });
 }
 
+// `configured` iff commands.smoke is non-empty; one passing row with its own
+// log on the verified head for every configured command, in order.
 function smokeComplete(run) {
-  const smoke = run.smoke;
+  const smoke = run.smoke,
+    commands = run.config?.commands?.smoke ?? [];
   if (
+    !Array.isArray(commands) ||
     smoke?.schemaVersion !== 1 ||
     smoke.headSha !== run.headSha ||
     smoke.complete !== true ||
+    smoke.configured !== commands.length > 0 ||
     !Array.isArray(smoke.results) ||
-    smoke.results.some(row => row?.exitCode !== 0)
+    smoke.results.length !== commands.length
   )
     return false;
-  if (smoke.configured === false) return smoke.results.length === 0;
-  if (Array.isArray(smoke.configured)) return smoke.configured.length === smoke.results.length;
-  return smoke.configured === true && smoke.results.length > 0;
+  return commands.every((command, index) => {
+    const row = smoke.results[index],
+      log = row?.evidence;
+    return (
+      row?.exitCode === 0 &&
+      row.command === command?.command &&
+      isDeepStrictEqual(row.args, command.args ?? []) &&
+      typeof log?.path === 'string' &&
+      /^[a-f0-9]{64}$/.test(log.sha256) &&
+      log.headSha === run.headSha &&
+      row.outputPath === log.path &&
+      row.outputHash === log.sha256
+    );
+  });
 }
 
 function gateRunCurrent(run) {
   return (
-    run.verificationProfile !== 'task-fast' &&
-    run.checks?.profile !== 'task-fast' &&
+    run.state === 'succeeded' &&
+    run.verificationProfile === undefined &&
+    run.checks != null &&
+    !Object.hasOwn(run.checks, 'profile') &&
     integrated(run) &&
     run.review?.passed === true &&
     run.review.headSha === run.headSha &&
+    isCurrentBehaviorReceipt(run.behavior, { headSha: run.headSha, baseSha: run.baseSha, config: run.config }) &&
     gatesCurrent(run) &&
     smokeComplete(run)
   );
@@ -299,6 +331,10 @@ async function acceptContainer(context, gate, run) {
   )
     return blocked(record, 'wave_merges_mismatch');
   if (!children.every(child => settled.has(child.status))) return blocked(record, 'children_not_accepted');
+  // The finished product is always verified as a whole: the project is accepted
+  // only by a gate whose verified head is the integration branch head now.
+  if (action.kind === 'project' && context.input.integrationHead !== run.headSha)
+    return blocked(record, 'wave_project_head_mismatch');
   return gateAcceptance(context, run, action.kind === 'project' ? record.definitionOfDone : record.acceptance);
 }
 
@@ -310,14 +346,17 @@ async function acceptByGate(context) {
     structuredClone(input.gate ?? gates.find(row => row.id === run?.directorBinding?.gateId) ?? null),
   );
   if (!boundGate(gate, run, gates, snapshot, contracts)) return blocked(record, 'wave_gate_missing');
-  if (superseded(gate, gates)) return blocked(record, 'wave_gate_superseded');
+  if (superseded(gate, gates, decidedContainer(snapshot, action, record)))
+    return blocked(record, 'wave_gate_superseded');
   return ['attempt', 'task'].includes(action.kind)
     ? acceptTask(context, gate, run)
     : acceptContainer(context, gate, run);
 }
 
 // Same input/ports and result shape as evaluateProjectTransition, plus the
-// optional gate record. Legacy (non-wave) snapshots authorize nothing here.
+// optional gate record and `integrationHead` (the integration branch head the
+// trusted caller read; required for project acceptance). Legacy (non-wave)
+// snapshots authorize nothing here.
 export async function evaluateWaveTransition(input, ports = {}) {
   let record;
   try {

@@ -7,6 +7,7 @@ import { execute } from './command.mjs';
 import { inspectCurrentSource } from './ci-graph.mjs';
 import { readConfig, validateCommandTimeouts } from './config.mjs';
 import { resolveMode } from './modes.mjs';
+import { gateRepairInScope, integrationBranch } from './project-integration.mjs';
 
 const fail = code => {
   throw Object.assign(new Error(`Project ${code}`), { code: `project_${code}` });
@@ -92,11 +93,8 @@ function observation(run, kind) {
   if (kind === 'contract') return { directorBinding: run.directorBinding, task: run.task };
   return run[kind];
 }
-// oxlint-disable-next-line complexity -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
-async function validateRun({ store, engine, contracts, snapshot, run, publication = false }) {
-  const options = { knownValues: known(engine) };
-  contracts.assertDirectorSafe(run, options);
-  requireValue(isDeepStrictEqual(run, store.getRun(run.id)), 'run_changed');
+// The task Run of the current attempt, bound to the frozen task contract.
+function assertAttemptBinding({ contracts, snapshot, run, options }) {
   const attempt = snapshot.currentAttempts.find(row => row.runId === run.id),
     task = snapshot.tasks.find(row => row.id === attempt?.taskId);
   requireValue(
@@ -108,6 +106,19 @@ async function validateRun({ store, engine, contracts, snapshot, run, publicatio
       run.task === contracts.buildDirectorTaskInput({ project: snapshot.project, task }, options),
     'binding_invalid',
   );
+}
+async function validateRun({ store, engine, contracts, snapshot, run, publication = false }) {
+  const options = { knownValues: known(engine) };
+  contracts.assertDirectorSafe(run, options);
+  requireValue(isDeepStrictEqual(run, store.getRun(run.id)), 'run_changed');
+  assertAttemptBinding({ contracts, snapshot, run, options });
+  await assertRunSource(snapshot, run);
+  await assertFullReceipts(engine, run);
+  if (publication) await assertPublication(engine, run);
+  requireValue((await inspectCurrentSource({ project: run.cwd, headSha: run.headSha })) === 'clean', 'head_changed');
+}
+// Same root, same verification config, an unstopped Run and a clean verified head.
+async function assertRunSource(snapshot, run) {
   requireValue((await canonical(run.project)) === snapshot.project.projectKey, 'root_changed');
   for (const root of new Set([run.project, run.cwd])) {
     const current = await readConfig(root, { client: run.client });
@@ -129,6 +140,9 @@ async function validateRun({ store, engine, contracts, snapshot, run, publicatio
     'run_blocked',
   );
   requireValue((await inspectCurrentSource({ project: run.cwd, headSha: run.headSha })) === 'clean', 'head_changed');
+}
+// Full checks with their logs, the independent review and every enabled gate on the verified head.
+async function assertFullReceipts(engine, run) {
   validateCommandTimeouts(run.config.commands);
   const expected = ['test', 'build'].flatMap(kind => run.config.commands[kind].map(command => ({ kind, command })));
   const fingerprint = hash({
@@ -139,6 +153,9 @@ async function validateRun({ store, engine, contracts, snapshot, run, publicatio
   requireValue(
     run.config.commands.test.length &&
       run.checks?.schemaVersion === 2 &&
+      // A profiled receipt (task-fast) never stands in for the full checks, even with full logs.
+      !Object.hasOwn(run.checks, 'profile') &&
+      run.verificationProfile === undefined &&
       run.checks.complete === true &&
       run.checks.headSha === run.headSha &&
       run.checks.fingerprint === fingerprint &&
@@ -191,33 +208,135 @@ async function validateRun({ store, engine, contracts, snapshot, run, publicatio
         'gate_stale',
       );
   }
-  if (publication) {
+}
+async function assertPublication(engine, run) {
+  requireValue(
+    run.config.delivery?.enabled &&
+      run.delivery?.mergeCommit &&
+      run.delivery.reviewedHead === run.headSha &&
+      typeof engine.delivery?.reconcileDelivery === 'function',
+    'publication_unverified',
+  );
+  const reconciled = await engine.delivery.reconcileDelivery({
+    run: structuredClone(run),
+    config: run.config,
+    cwd: run.cwd,
+    secrets: engine.secrets || {},
+  });
+  requireValue(
+    reconciled?.mergeCommit === run.delivery.mergeCommit && reconciled.reviewedHead === run.headSha,
+    'publication_unverified',
+  );
+  requireValue(
+    run.release?.published === true &&
+      run.release.commit === reconciled.mergeCommit &&
+      run.delivery.release &&
+      isDeepStrictEqual(run.delivery.release, run.release),
+    'publication_unverified',
+  );
+}
+
+// Each journal of a receipt row exists, is intact, belongs to the verified head and
+// records exactly that passing command.
+async function assertLogs(engine, run, rows, kind) {
+  for (const row of rows) {
+    await engine.assertEvidence({ path: row.outputPath, sha256: row.outputHash, headSha: run.headSha });
+    const log = JSON.parse(await readFile(row.outputPath, 'utf8'));
     requireValue(
-      run.config.delivery?.enabled &&
-        run.delivery?.mergeCommit &&
-        run.delivery.reviewedHead === run.headSha &&
-        typeof engine.delivery?.reconcileDelivery === 'function',
-      'publication_unverified',
+      log.kind === kind &&
+        log.value.exitCode === 0 &&
+        isDeepStrictEqual(log.value.command, row.command) &&
+        isDeepStrictEqual(log.value.args ?? [], row.args ?? []),
+      'checks_stale',
     );
-    const reconciled = await engine.delivery.reconcileDelivery({
-      run: structuredClone(run),
-      config: run.config,
-      cwd: run.cwd,
-      secrets: engine.secrets || {},
-    });
+  }
+}
+
+// Wave Runs: a task Run carries the task-fast receipt; a gate Run is bound to its
+// gate record, carries the full receipts and smoke logs, and its verified head
+// descends from the gate head inside the covered tasks' write paths.
+async function validateWaveRun({ store, engine, contracts, snapshot, run, gate }) {
+  const options = { knownValues: known(engine) };
+  contracts.assertDirectorSafe(run, options);
+  requireValue(isDeepStrictEqual(run, store.getRun(run.id)), 'run_changed');
+  if (!gate) {
+    assertAttemptBinding({ contracts, snapshot, run, options });
+    await assertRunSource(snapshot, run);
+    requireValue(run.checks?.profile === 'task-fast' && Array.isArray(run.checks.results), 'checks_stale');
+    await assertLogs(engine, run, run.checks.results, 'fast-check');
+  } else {
+    const tasks = gate.merges.map(merge => snapshot.tasks.find(row => row.id === merge.taskId));
     requireValue(
-      reconciled?.mergeCommit === run.delivery.mergeCommit && reconciled.reviewedHead === run.headSha,
-      'publication_unverified',
+      tasks.every(Boolean) &&
+        JSON.stringify(run.directorBinding) === JSON.stringify(contracts.gateBindingFor(gate, options)) &&
+        run.task === contracts.buildGateInput({ project: snapshot.project, gate, tasks }, options),
+      'binding_invalid',
     );
+    await assertRunSource(snapshot, run);
+    await assertFullReceipts(engine, run);
+    requireValue(Array.isArray(run.smoke?.results), 'smoke_stale');
+    await assertLogs(engine, run, run.smoke.results, 'smoke');
+    const writePaths = tasks.flatMap(task => task.writePaths);
     requireValue(
-      run.release?.published === true &&
-        run.release.commit === reconciled.mergeCommit &&
-        run.delivery.release &&
-        isDeepStrictEqual(run.delivery.release, run.release),
-      'publication_unverified',
+      await gateRepairInScope({ worktree: run.cwd, from: gate.headSha, to: run.headSha, writePaths }),
+      'gate_scope',
     );
   }
   requireValue((await inspectCurrentSource({ project: run.cwd, headSha: run.headSha })) === 'clean', 'head_changed');
+}
+
+async function integrationHeadOf(project) {
+  const found = await execute(
+    'git',
+    ['rev-parse', '--verify', '--quiet', `refs/heads/${integrationBranch(project.projectId)}^{commit}`],
+    { cwd: project.root, allowFailure: true },
+  );
+  return found.code === 0 ? found.stdout.trim() : null;
+}
+
+// The Run a wave transition is decided by: the task Run of the current attempt
+// for ready..integrated, the one gate Run named by the evidence for accepted.
+async function waveInput(store, snapshot, action) {
+  if (action.to === 'accepted') {
+    const ids = new Set(action.evidence.map(ref => ref.runId).filter(Boolean));
+    const gates = snapshot.gates.filter(gate => ids.has(gate.runId));
+    requireValue(gates.length === 1, 'binding_invalid');
+    const run = storedRun(store, gates[0].runId);
+    requireValue(run, 'binding_invalid');
+    const integrationHead = action.kind === 'project' ? await integrationHeadOf(snapshot.project) : undefined;
+    return { run, gate: gates[0], integrationHead };
+  }
+  if (!['attempt', 'task'].includes(action.kind) || action.to === 'ready') return { run: null };
+  const attempts = snapshot.currentAttempts.filter(row =>
+    action.kind === 'attempt' ? row.id === action.id : row.taskId === action.id,
+  );
+  requireValue(attempts.length === 1, 'binding_invalid');
+  const run = storedRun(store, attempts[0].runId);
+  requireValue(run, 'binding_invalid');
+  return { run };
+}
+
+async function authorizeWave({ store, engine, A, evaluator, command, snapshot, options }) {
+  const action = command.action;
+  const { run, gate, integrationHead } = await waveInput(store, snapshot, action);
+  const evaluate =
+    evaluator?.evaluateWaveTransition ?? (await import('./project-wave-evidence.mjs')).evaluateWaveTransition;
+  const result = await evaluate(
+    {
+      command,
+      snapshot,
+      run,
+      ...(gate ? { gate } : {}),
+      ...(integrationHead !== undefined ? { integrationHead } : {}),
+    },
+    {
+      contracts: A,
+      knownValues: options.knownValues,
+      verifyRef: ref => verifyRef(engine, ref, run, !['task', 'attempt'].includes(action.kind)),
+      validateRun: value => validateWaveRun({ store, engine, contracts: A, snapshot, run: value, gate }),
+    },
+  );
+  requireValue(result?.eligibleStates?.includes(action.to), 'transition_blocked');
 }
 
 // Installed only by explicit Project composition. Store remains the CAS owner;
@@ -238,6 +357,9 @@ export function createProjectTransitionAuthorizer({ store, engine, contracts, ev
         command.expectedRevision === snapshot.revision,
       'revision_conflict',
     );
+    // Wave projects never reach the legacy evaluator: their acceptance belongs to gate Runs.
+    if (A.isWaveProject?.(snapshot.project) === true)
+      return authorizeWave({ store, engine, A, evaluator, command, snapshot, options });
     let run = null;
     if (!(action.kind === 'task' && action.to === 'ready')) {
       const ids = new Set(action.evidence.map(ref => ref.runId).filter(Boolean));
@@ -484,6 +606,7 @@ async function retrySettings(ctx, snapshot, previous) {
 // oxlint-disable-next-line max-lines-per-function -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
 async function foreground(ctx, id, options = {}) {
   let snapshot = await snapshotFor(ctx, id);
+  await refuseWave(snapshot);
   if (snapshot.project.status === 'released') return { status: 'succeeded', projectStatus: 'released' };
   control(snapshot);
   const token = ctx.store.acquireLease(`project:${id}`, randomUUID(), { ttlMs: 60000, limit: 1 });
@@ -931,8 +1054,15 @@ async function pause(ctx, id, options = {}) {
   return apply(ctx, snapshot, { op: 'setPaused', paused: options.paused ?? true }, options);
 }
 
+// Wave projects run through the wave drain (next stage), never through this
+// one-task foreground loop, whose acceptance comes from the task's own Run.
+async function refuseWave(snapshot) {
+  if ((await contractsFor()).isWaveProject(snapshot.project) === true) fail('wave_drain_required');
+}
+
 async function resume(ctx, id, options = {}) {
   const snapshot = await snapshotFor(ctx, id);
+  await refuseWave(snapshot);
   requireValue(!['cancelled', 'failed'].includes(snapshot.project.status), 'control_blocked');
   if (snapshot.project.paused) await apply(ctx, snapshot, { op: 'setPaused', paused: false }, optionsFor(ctx, options));
   return foreground(ctx, id, options);

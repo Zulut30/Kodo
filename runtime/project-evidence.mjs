@@ -140,6 +140,9 @@ function checksCurrent(run) {
   const receipt = run.checks;
   return (
     receipt?.schemaVersion === 2 &&
+    // A profiled receipt (task-fast) never stands in for the full checks.
+    !Object.hasOwn(receipt, 'profile') &&
+    run.verificationProfile === undefined &&
     receipt.complete === true &&
     receipt.headSha === run.headSha &&
     Array.isArray(receipt.results) &&

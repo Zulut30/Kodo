@@ -13,7 +13,7 @@ import * as A from '../runtime/project-contracts.mjs';
 import * as D from '../runtime/project-evidence.mjs';
 import { openProjectStore } from '../runtime/project-store.mjs';
 import { createProjectDirector, createProjectTransitionAuthorizer } from '../runtime/project-director.mjs';
-import { TASK_FAST_PROFILE, planFastChecks, runFastChecks } from '../runtime/task-fast-checks.mjs';
+import { TASK_FAST_PROFILE, executedTests, planFastChecks, runFastChecks } from '../runtime/task-fast-checks.mjs';
 import { fixture, git } from './helpers/engine-fixture.mjs';
 
 const nodeTest = { command: process.execPath, args: ['--test'] };
@@ -232,7 +232,7 @@ test('Legacy Engine check reuse rejects task-fast and forged task-fast receipts'
 });
 
 /** The project director fixture, reduced to one trusted task (see tests/project-director.test.mjs). */
-async function directorFixture(t) {
+async function directorFixture(t, { wave = false } = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'kodo-fast-director-'));
   const root = path.join(directory, 'repo'),
     home = path.join(directory, 'state'),
@@ -349,6 +349,7 @@ async function directorFixture(t) {
             riskApprovalRequired: false,
           },
         ],
+        ...(wave ? { execution: { cadence: 'wave', integration: 'branch' } } : {}),
       },
     }),
   );
@@ -359,43 +360,46 @@ async function directorFixture(t) {
   return { store, engine, repo, id, c, authorizer, director: createProjectDirector({ repo, engine }) };
 }
 
+// A fully checked and independently reviewed task Run, as the legacy Engine leaves it.
+const verifiedRunner = f => async runId => {
+  const run = f.store.getRun(runId);
+  await makeWorktree(run.project, run.cwd, run.branch, run.baseSha);
+  await writeFile(path.join(run.cwd, 'first.txt'), 'accepted dependency\n');
+  await git(run.cwd, 'add', 'first.txt');
+  await git(run.cwd, 'commit', '-m', 'Owned first');
+  run.headSha = git(run.cwd, 'rev-parse', 'HEAD');
+  run.plan = {
+    summary: 'One scoped fixture change',
+    tasks: [
+      {
+        id: 'implementation',
+        role: 'developer',
+        description: 'Owned file',
+        writePaths: ['first.txt'],
+        dependsOn: [],
+        acceptance: ['Independent file check passes'],
+        parallel: false,
+      },
+    ],
+  };
+  run.nodes = { implementation: { status: 'integrated' } };
+  run.completed.implementation = true;
+  await f.engine.checks(run);
+  run.review = {
+    passed: true,
+    findings: [],
+    sessionId: 'owned-independent-review',
+    headSha: run.headSha,
+    diffHash: await diffHash(run.cwd, run.baseSha),
+  };
+  run.state = 'succeeded';
+  f.engine.save(run);
+  return run;
+};
+
 test('Project director acceptance rejects task-fast and forged task-fast receipts', async t => {
   const f = await directorFixture(t);
-  f.engine.run = async runId => {
-    const run = f.store.getRun(runId);
-    await makeWorktree(run.project, run.cwd, run.branch, run.baseSha);
-    await writeFile(path.join(run.cwd, 'first.txt'), 'accepted dependency\n');
-    await git(run.cwd, 'add', 'first.txt');
-    await git(run.cwd, 'commit', '-m', 'Owned first');
-    run.headSha = git(run.cwd, 'rev-parse', 'HEAD');
-    run.plan = {
-      summary: 'One scoped fixture change',
-      tasks: [
-        {
-          id: 'implementation',
-          role: 'developer',
-          description: 'Owned file',
-          writePaths: ['first.txt'],
-          dependsOn: [],
-          acceptance: ['Independent file check passes'],
-          parallel: false,
-        },
-      ],
-    };
-    run.nodes = { implementation: { status: 'integrated' } };
-    run.completed.implementation = true;
-    await f.engine.checks(run);
-    run.review = {
-      passed: true,
-      findings: [],
-      sessionId: 'owned-independent-review',
-      headSha: run.headSha,
-      diffHash: await diffHash(run.cwd, run.baseSha),
-    };
-    run.state = 'succeeded';
-    f.engine.save(run);
-    return run;
-  };
+  f.engine.run = verifiedRunner(f);
   await f.director.run(f.id);
   const snapshot = f.repo.snapshot(f.id),
     stored = f.store.getRun(snapshot.currentAttempts[0].runId);
@@ -440,4 +444,181 @@ test('Project director acceptance rejects task-fast and forged task-fast receipt
   stored.state = 'succeeded';
   f.engine.save(stored);
   await f.authorizer({ command, snapshot });
+});
+
+test('Full validators reject a profiled receipt even with full logs and the legacy fingerprint', async t => {
+  const f = await directorFixture(t);
+  f.engine.run = verifiedRunner(f);
+  await f.director.run(f.id);
+  const snapshot = f.repo.snapshot(f.id),
+    full = f.store.getRun(snapshot.currentAttempts[0].runId);
+  snapshot.tasks[0].status = 'integrated';
+  snapshot.currentAttempts[0].status = 'integrated';
+  const command = f.c(snapshot, {
+    op: 'transition',
+    kind: 'task',
+    id: 'first',
+    to: 'accepted',
+    evidence: snapshot.tasks[0].evidence,
+    mappings: snapshot.tasks[0].mappings,
+  });
+  const evaluate = run =>
+    D.evaluateProjectTransition(
+      { command, snapshot, run },
+      { contracts: A, knownValues: [], verifyRef: async () => {}, validateRun: async () => {} },
+    );
+  await f.authorizer({ command, snapshot });
+  assert.ok((await evaluate(full)).eligibleStates.includes('accepted'), 'the unprofiled full receipt still accepts');
+  for (const [label, profiled] of [
+    ['task-fast marker', { ...full, checks: { ...full.checks, profile: 'task-fast' } }],
+    ['any marker', { ...full, checks: { ...full.checks, profile: null } }],
+    ['profiled Run', { ...full, verificationProfile: 'task-fast' }],
+  ]) {
+    // The pure evaluator alone already refuses it...
+    assert.ok(!(await evaluate(profiled)).eligibleStates.includes('accepted'), label);
+    // ...and so does the trusted validateRun of the production authorizer.
+    f.store.updateRun(full.id, profiled);
+    await assert.rejects(() => f.authorizer({ command, snapshot }), { code: 'project_transition_blocked' }, label);
+  }
+});
+
+test('A wave project is never run by the legacy director nor accepted by its own task Run', async t => {
+  const f = await directorFixture(t, { wave: true });
+  f.engine.run = verifiedRunner(f);
+  await assert.rejects(() => f.director.run(f.id), { code: 'project_wave_drain_required' });
+  await f.director.pause(f.id);
+  await assert.rejects(() => f.director.resume(f.id), { code: 'project_wave_drain_required' });
+  let snapshot = f.repo.snapshot(f.id);
+  assert.equal(snapshot.project.paused, true, 'resume leaves a paused wave project paused');
+  assert.equal(snapshot.currentAttempts.length, 0, 'no task Run was started');
+  await f.repo.apply(f.c(snapshot, { op: 'setPaused', paused: false }));
+
+  // The review scenario: a fully checked and reviewed task Run of its own, no gate at all.
+  snapshot = f.repo.snapshot(f.id);
+  await f.repo.apply(f.c(snapshot, { op: 'reserveAttempt', taskId: 'first', retryFailed: false }));
+  snapshot = f.repo.snapshot(f.id);
+  const [attempt] = snapshot.currentAttempts,
+    [task] = snapshot.tasks;
+  const reserved = await f.engine.createReserved(
+    A.buildDirectorTaskInput({ project: snapshot.project, task }, { knownValues: [] }),
+    { project: snapshot.project.root, providers: 'current' },
+    {
+      binding: {
+        schemaVersion: 1,
+        projectId: attempt.projectId,
+        taskId: attempt.taskId,
+        taskRevision: attempt.taskRevision,
+        attemptId: attempt.id,
+        runId: attempt.runId,
+        contractHash: attempt.contractHash,
+      },
+      installRun: f.repo.installRun,
+    },
+  );
+  const run = await verifiedRunner(f)(reserved.id);
+  const refs = [];
+  for (const [kind, value] of [
+    ['acceptance', { directorBinding: run.directorBinding, task: run.task, checks: run.checks, review: run.review }],
+    ['contract', { directorBinding: run.directorBinding, task: run.task }],
+    ['checks', run.checks],
+    ['review', run.review],
+  ]) {
+    const ref = await f.engine.persistEvidence(run, `project-${kind}`, value, { headSha: run.headSha });
+    refs.push({ kind, runId: run.id, headSha: run.headSha, path: ref.path, sha256: ref.sha256 });
+  }
+  snapshot = f.repo.snapshot(f.id);
+  assert.equal(snapshot.gates.length, 0);
+  snapshot.tasks[0].status = 'integrated';
+  snapshot.currentAttempts[0].status = 'integrated';
+  const evidence = [...task.interfaceRefs, ...refs];
+  const command = f.c(snapshot, {
+    op: 'transition',
+    kind: 'task',
+    id: 'first',
+    to: 'accepted',
+    evidence,
+    mappings: [
+      {
+        criterionId: 'first-proof',
+        refs: [refs[0].sha256],
+        actor: 'project-director',
+        reason: 'Exact frozen task passed required checks and independent review',
+      },
+    ],
+  });
+  const legacy = await D.evaluateProjectTransition(
+    { command, snapshot, run: f.store.getRun(run.id) },
+    { contracts: A, knownValues: [], verifyRef: async () => {}, validateRun: async () => {} },
+  );
+  assert.ok(legacy.eligibleStates.includes('accepted'), 'the legacy evaluator would accept this proof');
+  // The production authorizer routes the wave project to the wave evaluator: no gate, no acceptance.
+  await assert.rejects(
+    () => f.authorizer({ command, snapshot }),
+    error => ['project_binding_invalid', 'project_transition_blocked'].includes(error.code),
+  );
+  // The full receipt of a task Run is not task-fast proof either: not even integrated.
+  snapshot.tasks[0].status = 'verifying';
+  snapshot.currentAttempts[0].status = 'verifying';
+  const integrated = f.c(snapshot, {
+    op: 'transition',
+    kind: 'task',
+    id: 'first',
+    to: 'integrated',
+    evidence,
+    mappings: [],
+  });
+  await assert.rejects(() => f.authorizer({ command: integrated, snapshot }), { code: 'project_transition_blocked' });
+});
+
+test('executedTests counts executed tests from the spec or TAP summary', () => {
+  assert.equal(executedTests('ℹ tests 3\nℹ suites 0\nℹ pass 1\nℹ fail 0\nℹ skipped 1\nℹ todo 1\n'), 2);
+  assert.equal(executedTests('# tests 4\n# pass 4\n# skipped 0\n'), 4);
+  assert.equal(executedTests('ℹ tests 0\nℹ pass 0\nℹ skipped 0\n'), 0);
+  assert.equal(executedTests('ok 1 - a\n'), null);
+});
+
+test('Task-fast checks never keep a green receipt for a narrowed run that executed no test', async t => {
+  const { store, engine, run, commit } = await workspace(t);
+  const headSha = await commit({
+    'tests/a.test.mjs': "import test from 'node:test';\ntest.skip('a is skipped', () => {});\n",
+  });
+  // Options that select tests (or change the summary) are never narrowed.
+  for (const [args, reason] of [
+    [['--test', '--test-shard=2/2'], 'runner-selection'],
+    [['--test', '--test-name-pattern=a is'], 'runner-selection'],
+    [['--test', '--test-skip-pattern=a is'], 'runner-selection'],
+    [['--test', '--test-only'], 'runner-selection'],
+    [['--test', '--test-reporter=dot'], 'runner-reporter'],
+    [['--test', '--test-reporter-destination=stdout'], 'runner-reporter'],
+  ]) {
+    const custom = {
+      ...run,
+      config: { ...run.config, commands: { ...run.config.commands, test: [{ command: process.execPath, args }] } },
+    };
+    const plan = await planFastChecks({ run: custom, cwd: run.cwd, baseSha: run.baseSha, headSha });
+    assert.equal(plan.fallback, true, args.join(' '));
+    assert.ok(plan.reasons.includes(reason), JSON.stringify(plan.reasons));
+    assert.deepEqual(
+      plan.commands.map(row => row.args),
+      [args],
+    );
+  }
+  // The affected test file only skips: the narrowed run executes nothing, so the full suite runs.
+  const checks = await runFastChecks({ engine, run });
+  assert.equal(checks.complete, true);
+  assert.equal(checks.plan.fallback, true);
+  assert.deepEqual(checks.plan.reasons, ['no-tests-executed']);
+  assert.deepEqual(
+    checks.results.map(row => [row.kind, row.args, row.exitCode]),
+    [['test', ['--test'], 0]],
+  );
+  assert.match((await log(checks.results[0])).value.stdout, /b is two/, 'the full configured suite ran');
+  assert.ok(store.events(run.id).some(row => row.type === 'fast_checks_no_tests'));
+  // A narrowed run that executed tests records how many it executed.
+  await commit({
+    'tests/a.test.mjs': testSource('a', [...aCases, ['a is finite', 'assert.ok(Number.isFinite(a))']]),
+  });
+  const narrowed = await runFastChecks({ engine, run });
+  assert.equal(narrowed.plan.fallback, false, JSON.stringify(narrowed.plan.reasons));
+  assert.equal(narrowed.results.find(row => row.kind === 'test').tests, 3);
 });
