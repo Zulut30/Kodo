@@ -5,7 +5,13 @@ import { cp, link, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, wri
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { DEFAULT_EXECUTION, compileBlueprint, lintFactorySpec, readBlueprint } from '../runtime/project-blueprint.mjs';
+import {
+  DEFAULT_EXECUTION,
+  bindInterfaceEvidence,
+  compileBlueprint,
+  lintFactorySpec,
+  readBlueprint,
+} from '../runtime/project-blueprint.mjs';
 import { normalizeProjectSpec } from '../runtime/project-contracts.mjs';
 
 const fixtures = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures', 'blueprint');
@@ -77,9 +83,8 @@ test('valid blueprint compiles into a strict ProjectSpec with wave execution and
     path: path.join(dir, 'interfaces', 'storage.md'),
     sha256: result.interfaces.find(item => item.module === 'storage').sha256,
   });
-  // The compiled spec minus `execution` is accepted by the strict parser as is.
-  const { execution: _execution, ...strict } = result.spec;
-  assert.deepEqual(normalizeProjectSpec(strict, { knownValues: [] }), strict);
+  // The compiled spec, `execution` included, is accepted by the strict parser as is.
+  assert.deepEqual(normalizeProjectSpec(result.spec, { knownValues: [] }), result.spec);
   assert.deepEqual(await tree(root), before, 'compile writes nothing');
   const again = await compileBlueprint(root);
   assert.deepEqual(again, result, 'deterministic');
@@ -267,6 +272,94 @@ test('execution defaults to wave/branch and rejects other values', async t => {
       ),
       ['blueprint_execution_invalid'],
     );
+});
+
+test('execution goes through the strict ProjectSpec parser: watchdog is kept, an invalid one is rejected', async t => {
+  const watchdog = { stalledRounds: 2, rejectUnchanged: true };
+  const kept = await blueprint(t, {
+    mutate(spec) {
+      spec.execution = { cadence: 'wave', integration: 'branch', watchdog };
+    },
+  });
+  const result = await compileBlueprint(kept.root);
+  assert.deepEqual(result.findings, []);
+  assert.deepEqual(result.spec.execution, { cadence: 'wave', integration: 'branch', watchdog });
+  assert.deepEqual(normalizeProjectSpec(result.spec, { knownValues: [] }), result.spec);
+  const partial = await blueprint(t, {
+    mutate(spec) {
+      spec.execution = { cadence: 'wave' };
+    },
+  });
+  assert.deepEqual((await compileBlueprint(partial.root)).spec.execution, DEFAULT_EXECUTION);
+  const broken = await blueprint(t, {
+    mutate(spec) {
+      spec.execution = { cadence: 'wave', integration: 'branch', watchdog: { stalledRounds: 9 } };
+    },
+  });
+  const brokenResult = await compileBlueprint(broken.root);
+  assert.deepEqual(codes(brokenResult), ['blueprint_spec_invalid']);
+  assert.match(brokenResult.findings[0].message, /project_/);
+});
+
+test('compile accepts an explicit spec file next to the blueprint documents', async t => {
+  const { root, dir } = await blueprint(t);
+  const spec = JSON.parse(await readFile(path.join(dir, 'spec.json'), 'utf8'));
+  spec.title = 'Заметки из отдельного файла';
+  const other = path.join(await temp(t, 'kodo-spec-file-'), 'notes.json');
+  await writeFile(other, JSON.stringify(spec));
+  const result = await compileBlueprint(root, { specFile: other });
+  assert.deepEqual(result.findings, []);
+  assert.equal(result.spec.title, 'Заметки из отдельного файла');
+  assert.equal(task(result.spec, 'scaffold').interfaceRefs[0].path, path.join(dir, 'interfaces', 'storage.md'));
+  assert.deepEqual(codes(await compileBlueprint(root, { specFile: path.join(dir, 'absent.json') })), [
+    'blueprint_missing',
+  ]);
+});
+
+test('bindInterfaceEvidence turns blueprint interfaces into immutable evidence refs', async t => {
+  const { root, dir } = await blueprint(t);
+  const compiled = await compileBlueprint(root);
+  const stored = [];
+  const persist = async value => {
+    const text = JSON.stringify(value);
+    stored.push(value);
+    return {
+      path: path.join(root, '..', `interface-${stored.length}.json`),
+      sha256: createHash('sha256').update(text).digest('hex'),
+    };
+  };
+  const bound = await bindInterfaceEvidence(compiled, { persist });
+  assert.equal(bound.ok, true);
+  assert.deepEqual(
+    stored.map(value => [value.module, value.source]),
+    [
+      ['api', 'interfaces/api.md'],
+      ['storage', 'interfaces/storage.md'],
+      ['web', 'interfaces/web.md'],
+    ],
+  );
+  const storage = stored.find(value => value.module === 'storage');
+  assert.equal(storage.text, await readFile(path.join(dir, 'interfaces', 'storage.md'), 'utf8'));
+  assert.equal(storage.sha256, compiled.interfaces.find(item => item.module === 'storage').sha256);
+  const evidence = bound.interfaces.find(item => item.module === 'storage');
+  assert.deepEqual(task(bound.spec, 'storage-module').interfaceRefs, [
+    { kind: 'interface', runId: null, headSha: null, path: evidence.path, sha256: evidence.sha256 },
+  ]);
+  for (const item of bound.spec.tasks)
+    for (const ref of item.interfaceRefs) assert.ok(bound.interfaces.some(row => row.sha256 === ref.sha256));
+  assert.deepEqual(normalizeProjectSpec(bound.spec, { knownValues: [] }), bound.spec);
+  assert.equal(task(compiled.spec, 'storage-module').interfaceRefs[0].path, path.join(dir, 'interfaces', 'storage.md'));
+
+  // The interface changed between compile and binding: nothing is persisted.
+  await writeFile(path.join(dir, 'interfaces', 'web.md'), '# Изменённый интерфейс\n');
+  stored.length = 0;
+  const stale = await bindInterfaceEvidence(compiled, { persist });
+  assert.equal(stale.ok, false);
+  assert.deepEqual(codes(stale), ['blueprint_interface_stale']);
+  assert.deepEqual(stored, []);
+  await assert.rejects(bindInterfaceEvidence({ ...compiled, ok: false }, { persist }), {
+    code: 'blueprint_not_compiled',
+  });
 });
 
 test('roles, strict schema and root binding are enforced', async t => {

@@ -146,26 +146,33 @@ async function readInterfaces(directory) {
 }
 
 /** Read PROJECT.md, spec.json and interfaces/*.md from <root>/.kodo/blueprint.
- * Rejects links, hard links, special files, oversized or non-UTF-8 content. */
-export async function readBlueprint(root) {
+ * `specFile` replaces spec.json by another file (same limits and link rules).
+ * Rejects links, hard links, special files, oversized or non-UTF-8 content.
+ * @param {string} root
+ * @param {{ specFile?: string }} [options] */
+export async function readBlueprint(root, { specFile } = {}) {
   const real = await projectRoot(root);
   const directory = path.join(real, '.kodo', 'blueprint');
   await safeDirectory(path.join(real, '.kodo'), true);
   await safeDirectory(directory, true);
   if (!inside(real, await realpath(directory))) throw failure('blueprint_unsafe_path', 'Чертёж вне каталога проекта');
   const project = await readBoundedFile(path.join(directory, 'PROJECT.md'), BLUEPRINT_LIMITS.project);
-  const spec = await readBoundedFile(path.join(directory, 'spec.json'), BLUEPRINT_LIMITS.spec);
+  if (specFile !== undefined && (typeof specFile !== 'string' || !specFile))
+    throw failure('blueprint_missing', 'Не указан файл spec');
+  const specPath = specFile === undefined ? path.join(directory, 'spec.json') : path.resolve(specFile);
+  const spec = await readBoundedFile(specPath, BLUEPRINT_LIMITS.spec);
+  const specName = path.basename(specPath);
   let value;
   try {
     value = JSON.parse(spec.text);
   } catch {
-    throw failure('blueprint_invalid_json', 'spec.json не является JSON');
+    throw failure('blueprint_invalid_json', `${specName} не является JSON`);
   }
   return {
     root: real,
     dir: directory,
     project: { path: 'PROJECT.md', sha256: project.sha256, bytes: project.bytes, text: project.text },
-    spec: { path: 'spec.json', sha256: spec.sha256, bytes: spec.bytes, value },
+    spec: { path: specFile === undefined ? 'spec.json' : specName, sha256: spec.sha256, bytes: spec.bytes, value },
     interfaces: await readInterfaces(directory),
   };
 }
@@ -248,24 +255,25 @@ function sectionFindings(markdown) {
 
 // ---- ProjectSpec normalization and graph ------------------------------------
 
+// The factory runs only wave/branch. Missing cadence/integration default to it;
+// other fields (watchdog) are checked by the strict ProjectSpec parser itself.
 function executionOf(spec) {
   if (!Object.hasOwn(spec, 'execution')) return { execution: { ...DEFAULT_EXECUTION }, findings: [] };
   const raw = spec.execution;
   const valid =
     isPlain(raw) &&
-    Object.keys(raw).every(key => ['cadence', 'integration'].includes(key)) &&
+    Object.keys(raw).every(key => ['cadence', 'integration', 'watchdog'].includes(key)) &&
     (raw.cadence ?? 'wave') === 'wave' &&
     (raw.integration ?? 'branch') === 'branch';
+  if (valid) return { execution: { ...DEFAULT_EXECUTION, ...raw }, findings: [] };
   return {
     execution: { ...DEFAULT_EXECUTION },
-    findings: valid
-      ? []
-      : [
-          finding(
-            'blueprint_execution_invalid',
-            'execution поддерживает только { cadence: "wave", integration: "branch" }',
-          ),
-        ],
+    findings: [
+      finding(
+        'blueprint_execution_invalid',
+        'execution поддерживает только { cadence: "wave", integration: "branch" }',
+      ),
+    ],
   };
 }
 
@@ -274,8 +282,8 @@ function errorCode(error) {
   throw error;
 }
 
-// normalizeProjectSpec does not know `execution` yet: normalize the spec without
-// it and attach the checked factory value to the result.
+// The spec is normalized as is, `execution` included; an invalid execution is
+// reported and replaced by the default so the remaining rules still run.
 function normalizeFactory(spec, { contracts, knownValues }) {
   if (!isPlain(spec))
     return {
@@ -283,10 +291,8 @@ function normalizeFactory(spec, { contracts, knownValues }) {
       findings: [finding('blueprint_spec_invalid', 'spec.json должен быть объектом ProjectSpec v1')],
     };
   const { execution, findings } = executionOf(spec);
-  const { execution: _ignored, ...rest } = spec;
   try {
-    const normalized = contracts.normalizeProjectSpec(rest, { knownValues });
-    return { spec: { ...normalized, execution }, findings };
+    return { spec: contracts.normalizeProjectSpec({ ...spec, execution }, { knownValues }), findings };
   } catch (error) {
     const code = errorCode(error);
     findings.push(
@@ -579,11 +585,13 @@ async function resolveSource({ root, spec, interfaces }) {
 
 /** Read, resolve and lint the blueprint. Returns the compiled ProjectSpec
  * (with execution) even when findings exist; ok is the only acceptance signal.
- * Nothing is written to disk. */
-export async function compileBlueprint(root, { contracts = projectContracts, knownValues = [] } = {}) {
+ * `specFile` optionally replaces .kodo/blueprint/spec.json. Nothing is written to disk.
+ * @param {string} root
+ * @param {{ contracts?: typeof projectContracts, knownValues?: string[], specFile?: string }} [options] */
+export async function compileBlueprint(root, { contracts = projectContracts, knownValues = [], specFile } = {}) {
   let blueprint;
   try {
-    blueprint = await readBlueprint(root);
+    blueprint = await readBlueprint(root, { specFile });
   } catch (error) {
     if (typeof error?.code === 'string' && error.code.startsWith('blueprint_'))
       return { ok: false, spec: null, interfaces: [], findings: [finding(error.code, error.message)] };
@@ -598,4 +606,70 @@ export async function compileBlueprint(root, { contracts = projectContracts, kno
   });
   const findings = [...source.findings, ...analysis.findings];
   return { ok: findings.length === 0, spec: analysis.spec, interfaces: blueprint.interfaces, findings };
+}
+
+// ---- Interface evidence --------------------------------------------------------
+
+/** Freeze every interface of a compiled blueprint as an immutable evidence
+ * envelope and point task interfaceRefs at it, so Project Director can verify
+ * them (engine.assertEvidence). `persist(value)` is the caller's port, e.g.
+ * engine.persistEvidence(owner, 'interface', value, { headSha: null }), and
+ * returns { path, sha256 }. Files are re-read first: a change since compile
+ * yields blueprint_interface_stale and nothing is persisted.
+ * Returns { ok, spec, interfaces: [{ module, source, path, sha256 }], findings }.
+ * @param {Record<string, any>} compiled
+ * @param {{ persist?: (value: Record<string, any>) => Promise<{ path: string, sha256: string }> }} [options] */
+export async function bindInterfaceEvidence(compiled, { persist } = {}) {
+  if (!compiled?.ok || !isPlain(compiled.spec) || !Array.isArray(compiled.interfaces))
+    throw failure('blueprint_not_compiled', 'Привязать интерфейсы можно только у принятого чертежа');
+  if (typeof persist !== 'function') throw failure('blueprint_persist_invalid', 'Нужен порт persist');
+  const root = compiled.spec.root;
+  const directory = path.join(root, '.kodo', 'blueprint');
+  const fold = windowsLike(root) ? value => value.toLowerCase() : value => value;
+  const used = new Set(
+    compiled.spec.tasks.flatMap(task => task.interfaceRefs.map(ref => interfaceModule(ref.path, root))),
+  );
+  const values = [],
+    stale = [];
+  for (const item of compiled.interfaces.filter(entry => used.has(entry.module))) {
+    let file;
+    try {
+      file = await readBoundedFile(path.join(directory, ...item.path.split('/')), BLUEPRINT_LIMITS.interface);
+    } catch (error) {
+      if (!String(error?.code).startsWith('blueprint_')) throw error;
+      file = null;
+    }
+    if (!file || file.sha256 !== item.sha256) stale.push(item.module);
+    else
+      values.push({
+        schemaVersion: 1,
+        module: item.module,
+        source: item.path,
+        sha256: item.sha256,
+        bytes: file.bytes,
+        text: file.text,
+      });
+  }
+  if (stale.length) {
+    const ids = compiled.spec.tasks
+      .filter(task => task.interfaceRefs.some(ref => stale.includes(interfaceModule(ref.path, root))))
+      .map(task => task.id);
+    const message = 'Интерфейсы изменились после проверки чертежа; повторите apply-spec';
+    return { ok: false, spec: null, interfaces: [], findings: [finding('blueprint_interface_stale', message, ids)] };
+  }
+  const interfaces = [];
+  for (const value of values) {
+    const evidence = await persist(value);
+    interfaces.push({ module: value.module, source: value.source, path: evidence.path, sha256: evidence.sha256 });
+  }
+  const byModule = new Map(interfaces.map(item => [item.module, item]));
+  const spec = structuredClone(compiled.spec);
+  for (const task of spec.tasks)
+    task.interfaceRefs = task.interfaceRefs.map(ref => {
+      const evidence = byModule.get(interfaceModule(ref.path, root));
+      if (!evidence || fold(slashed(ref.path)) !== fold(`${slashed(directory)}/${evidence.source}`))
+        throw failure('blueprint_not_compiled', 'interfaceRefs не указывают на интерфейсы чертежа');
+      return { kind: 'interface', runId: null, headSha: null, path: evidence.path, sha256: evidence.sha256 };
+    });
+  return { ok: true, spec, interfaces, findings: [] };
 }

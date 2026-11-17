@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { compileBlueprint } from '../runtime/project-blueprint.mjs';
 import {
   generateBlueprint,
+  generateMilestone,
   lintMilestone,
   prepareBootstrap,
   prepareExtend,
@@ -385,6 +386,82 @@ test('prepareExtend builds a module map from the snapshot without rescanning cod
   });
   await assert.rejects(prepareExtend({ snapshot: { ...snapshot, revision: 2 }, prompt: 'x', root, home }), {
     code: 'bootstrap_snapshot_invalid',
+  });
+});
+
+test('generateMilestone runs one read-only session and writes its milestone outside the repository', async t => {
+  const { root, snapshot } = await project(t, { 'storage-module': 'accepted' });
+  const home = await temp(t, 'kodo-home-');
+  const before = await tree(root);
+  const proposed = {
+    calls: [],
+    async runSession(request) {
+      this.calls.push(request);
+      return {
+        sessionId: 'fake-extend',
+        model: 'fake-model',
+        output: { status: 'proposed', summary: 'Майлстоун поиска', milestone: JSON.stringify(milestoneFile()) },
+      };
+    },
+  };
+  const result = await generateMilestone({
+    provider: proposed,
+    client: 'claude-code',
+    snapshot,
+    prompt: 'Добавить поиск',
+    root,
+    home,
+    now: AT,
+  });
+  assert.equal(proposed.calls.length, 1);
+  const [request] = proposed.calls;
+  assert.equal(request.client, 'claude-code');
+  assert.equal(request.readOnly, true);
+  assert.equal(request.cwd, root);
+  assert.match(request.prompt, /=== templates\/milestone\.json ===/);
+  assert.deepEqual(request.schema.required, ['status', 'summary', 'milestone']);
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.findings, []);
+  assert.equal(result.file, path.join(result.dir, 'milestone.json'));
+  assert.deepEqual(await readMilestoneFile(result.file), milestoneFile());
+  assert.deepEqual(result.session, {
+    sessionId: 'fake-extend',
+    model: 'fake-model',
+    status: 'proposed',
+    summary: 'Майлстоун поиска',
+  });
+  assert.deepEqual(await tree(root), before, 'the repository is unchanged');
+
+  const blocked = {
+    async runSession() {
+      return { output: { status: 'blocked', summary: 'Неясно', milestone: '' } };
+    },
+  };
+  const blockedResult = await generateMilestone({
+    provider: blocked,
+    client: 'codex',
+    snapshot,
+    prompt: 'x',
+    root,
+    home,
+  });
+  assert.deepEqual(codes(blockedResult), ['milestone_session_blocked']);
+  assert.equal(blockedResult.file, null);
+  const garbage = { runSession: async () => ({ output: 'не JSON' }) };
+  assert.deepEqual(
+    codes(await generateMilestone({ provider: garbage, client: 'codex', snapshot, prompt: 'x', root, home })),
+    ['milestone_session_output'],
+  );
+  const failing = {
+    runSession: async () => {
+      throw Object.assign(new Error('subscription unavailable'), { code: 'unavailable' });
+    },
+  };
+  await assert.rejects(generateMilestone({ provider: failing, client: 'codex', snapshot, prompt: 'x', root, home }), {
+    code: 'unavailable',
+  });
+  await assert.rejects(generateMilestone({ provider: failing, client: 'api', snapshot, prompt: 'x', root, home }), {
+    code: 'bootstrap_client_invalid',
   });
 });
 

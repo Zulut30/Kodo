@@ -76,6 +76,8 @@ function human(report) {
  * Ports belong to the coordinator/test harness, never to decoded CLI data.
  */
 export async function projectCli(argv, ports = {}) {
+  if (['bootstrap', 'apply-spec', 'extend', 'append-milestone'].includes(argv?.[0]))
+    return (await import('./project-cli-blueprint.mjs')).projectBlueprintCli(argv, ports);
   let options,
     store,
     ownedStore = false,
