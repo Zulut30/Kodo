@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { Engine } from '../runtime/engine.mjs';
 import { makeWorktree } from '../runtime/workspace.mjs';
 import { createGateRunDraft, gateMergesHash, runEpicGate, verifyTaskFastOnce } from '../runtime/wave-verifier.mjs';
+import { gateBindingFor } from '../runtime/project-contracts.mjs';
 import { fixture, fakeServices, git } from './helpers/engine-fixture.mjs';
 
 const done = { sessionId: 'worker', output: { summary: 'done', checks: [], complete: true } };
@@ -50,7 +51,7 @@ async function epic(t, { testScript = 'process.exit(0);\n', onWorker } = {}) {
     now = new Date().toISOString();
   const gate = (overrides = {}) => ({
     schemaVersion: 1,
-    id: 'gate-epic-1',
+    id: randomUUID(),
     projectId,
     number: 1,
     containers: [{ kind: 'epic', id: 'epic' }],
@@ -118,6 +119,7 @@ test('Gate run draft covers the merged tasks on its own branch and is installed 
     headSha: gate.headSha,
     mergesHash: gateMergesHash(gate.merges),
   });
+  assert.deepEqual(draft.directorBinding, gateBindingFor(gate));
   assert.match(draft.directorBinding.mergesHash, /^[a-f0-9]{64}$/);
   assert.notEqual(gateMergesHash(gate.merges), gateMergesHash([...gate.merges].reverse()));
   assert.equal(draft.baseSha, gate.baseSha);

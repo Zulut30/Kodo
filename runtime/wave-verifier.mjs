@@ -19,6 +19,7 @@ import { resolveMode } from './modes.mjs';
 import { normalizeWatchdogConfig, resolveBlocker } from './watchdog.mjs';
 import { currentBlocker } from './engine.mjs';
 import { runFastChecks } from './task-fast-checks.mjs';
+import { gateBindingFor } from './project-contracts.mjs';
 
 /** The watchdog of a wave gate when the project sets none. */
 export const GATE_WATCHDOG = Object.freeze({ stalledRounds: 2, rejectUnchanged: true });
@@ -128,17 +129,8 @@ export async function createGateRunDraft({ engine, project, gate, tasks, input =
     id: gate.runId,
     createdAt: new Date().toISOString(),
     state: 'created',
-    directorBinding: {
-      schemaVersion: 1,
-      kind: 'gate',
-      projectId: gate.projectId,
-      gateId: gate.id,
-      number: gate.number,
-      runId: gate.runId,
-      baseSha: gate.baseSha,
-      headSha: gate.headSha,
-      mergesHash: gateMergesHash(gate.merges),
-    },
+    // Single source of truth with the store: installGateRun compares these bytes.
+    directorBinding: gateBindingFor(gate),
     executionMode,
     plan: {
       summary: `Epic gate ${gate.number} over ${ids.length} integrated tasks`,
