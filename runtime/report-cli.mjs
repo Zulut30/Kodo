@@ -98,7 +98,7 @@ const projectTables = ['records', 'attempts', 'current', 'approvals', 'commands'
  * requires the row first, and its database port reports no file location, so
  * the migrator's write branch stops at its location check before any write.
  */
-async function projectRepository(state, secrets) {
+async function projectRepository(state) {
   if (!['kodo_project_migrations', ...projectTables].every(name => state.tables.has(name))) fail('report_not_found');
   const version = state.db.prepare('SELECT version FROM kodo_project_migrations ORDER BY version DESC LIMIT 1').get();
   if (version?.version !== 1) fail('report_unavailable');
@@ -122,7 +122,7 @@ async function projectRepository(state, secrets) {
 }
 
 async function projectReport(state, projectId, secrets, now) {
-  const repo = await projectRepository(state, secrets);
+  const repo = await projectRepository(state);
   const snapshot = repo.snapshot(projectId);
   const attempts = state.db
     .prepare('SELECT task_id,number,run_id FROM kodo_project_attempts WHERE project_id=? ORDER BY task_id,number')
