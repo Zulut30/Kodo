@@ -16,12 +16,12 @@ import {
 import { createHash, randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { Store } from './store.mjs';
-import { redact, workerEnvironment, worktreeHome, stateHome } from './security.mjs';
+import { redact, workerEnvironment } from './security.mjs';
 import { readConfig, configuredConcurrency, normalizeConcurrency } from './config.mjs';
 import { buildContextManifest } from './context-manifest.mjs';
 import { validatePlan } from './contracts.mjs';
 import { execute, resolveCommand } from './command.mjs';
-import { git, inspectProject } from './workspace.mjs';
+import { git, inspectProject, worktreeHomeFor } from './workspace.mjs';
 import * as providers from './providers.mjs';
 import { research } from './research.mjs';
 import { deliver, releasePackage, prepareReleaseVersion, reconcileDelivery } from './delivery.mjs';
@@ -500,13 +500,7 @@ try {
       ? await mkdtemp(path.join(await realpath(os.tmpdir()), 'kodo-artifacts-'))
       : this.store.home;
     run.artifacts = path.join(artifactHome, 'runs', run.id);
-    const workerHome =
-      process.env.KODO_WORKTREE_HOME ||
-      (stateInGit
-        ? `${artifactHome}-worktrees`
-        : path.resolve(this.store.home) === stateHome()
-          ? worktreeHome()
-          : `${this.store.home}-worktrees`);
+    const workerHome = worktreeHomeFor({ storeHome: this.store.home, stateInGit, artifactHome });
     run.worktreeRoot = path.join(path.resolve(workerHome), run.id);
     run.cwd = path.join(run.worktreeRoot, 'integration');
     run.branch = `kodo/${run.id}`;

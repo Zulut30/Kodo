@@ -75,6 +75,7 @@ export const fastTests = [
   'tests/project-planner.test.mjs',
   'tests/project-progress.test.mjs',
   'tests/project-wave-contracts.test.mjs',
+  'tests/project-wave-evidence.test.mjs',
   'tests/project-wave-planner.test.mjs',
   'tests/project-wave-store.test.mjs',
   'tests/providers.test.mjs',
