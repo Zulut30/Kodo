@@ -392,7 +392,8 @@ test('check results expose only the kind and the executable name, never paths or
   const report = buildRunReport(run, finishedEvents(), { now: NOW });
   assert.deepEqual(report.checks.runs, [
     { kind: 'test', executable: 'node', durationMs: null, exitCode: 0 },
-    { kind: 'lint', executable: 'lint.cmd', durationMs: null, exitCode: 1 },
+    // An unquoted legacy path followed by more text is ambiguous: no name is guessed.
+    { kind: 'lint', executable: null, durationMs: null, exitCode: 1 },
     { kind: 'build', executable: null, durationMs: null, exitCode: 0 },
   ]);
   const text = JSON.stringify(report);
@@ -889,6 +890,7 @@ test('a legacy command string yields a whole executable name or null, and usage 
         '"C:/Private Account/bin/"lint.cmd --arg',
         'C:/Pri"vate/lint.cmd',
         '/usr/local/bin/node --test',
+        'C:\Customer Label.exe',
         'npm test',
         { command: 'C:/Private Account/bin/build.cmd', args: [] },
       ].map(command => ({ kind: 'test', command, exitCode: 0 })),
@@ -897,11 +899,11 @@ test('a legacy command string yields a whole executable name or null, and usage 
   const report = buildRunReport(run, finishedEvents(), { now: NOW });
   assert.deepEqual(
     report.checks.runs.map(row => row.executable),
-    ['lint.cmd', 'test-runner', null, null, null, null, 'node', 'npm', 'build.cmd'],
+    ['lint.cmd', 'test-runner', null, null, null, null, null, null, 'npm', 'build.cmd'],
   );
   assert.equal(report.usage.usage.semantics, null);
   const text = JSON.stringify(report);
-  for (const value of ['Private', 'Account', 'My Tools', 'private-semantics', 'owner'])
+  for (const value of ['Private', 'Account', 'Customer', 'My Tools', 'private-semantics', 'owner'])
     assert.ok(!text.includes(value), value);
   const known = buildRunReport(finishedRun(), finishedEvents(), { now: NOW });
   assert.equal(known.usage.usage.semantics, 'input-includes-cached');
@@ -950,4 +952,45 @@ test('a started check without a result stays in the denominator and failed round
   assert.equal(repaired.checks.unclosed, 0);
   assert.ok(!repaired.provenance.notes.includes('check_unclosed'));
   assert.ok(!JSON.stringify(repaired).includes('private check output'));
+});
+
+test('a gap in the attempt numbers makes the project waits incomplete; the measured part stays apart', () => {
+  const runs = {
+    r2: finishedRun({ id: 'r2' }),
+  };
+  const events = {
+    r2: [
+      event(1, 'created', T0),
+      event(2, 'delivery.checks_waiting', T0 + 1000),
+      event(3, 'delivery.checks_waiting', T0 + 1015),
+      event(4, 'succeeded', T0 + 9000),
+    ],
+  };
+  // The current attempt is number 2, but the row of attempt 1 is missing from the history.
+  const snapshot = projectSnapshot([task('t1', 'accepted')], [attempt('t1', 2, 'r2', 'accepted')]);
+  const report = buildProjectReport(snapshot, runs, events, { now: NOW });
+  for (const wait of Object.values(report.totals.waits)) {
+    assert.equal(wait.complete, false);
+    assert.equal(wait.waitMs, null);
+  }
+  assert.equal(report.totals.waits.ci.measuredMs, 15);
+});
+
+test('checks of a round closed by repair_required are closed, not unclosed, after the receipt reset', () => {
+  const testCommand = { kind: 'test', command: { command: 'npm', args: ['test'] } };
+  // Engine cleared run.checks on the repair commit; the next round has not started yet.
+  const report = buildRunReport(
+    finishedRun({ state: 'running', checks: null }),
+    [
+      event(1, 'created', T0),
+      event(2, 'check_started', T0 + 1000, testCommand),
+      event(3, 'repair_required', T0 + 2000, { attempt: 0, problem: 'private' }),
+      event(4, 'session', T0 + 3000, { type: 'turn' }),
+    ],
+    { now: NOW },
+  );
+  assert.equal(report.checks.unclosed, 0);
+  assert.ok(!report.provenance.notes.includes('check_unclosed'));
+  const stage = report.timing.stages.verification;
+  assert.deepEqual([stage.durationMs, stage.known, stage.total], [null, 0, 1]);
 });

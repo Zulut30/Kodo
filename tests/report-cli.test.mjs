@@ -755,3 +755,40 @@ test('redaction keys are read from the store and a legacy file without writing e
   assert.equal(existsSync(nowhere), false);
   assert.deepEqual(inventory(dir), before, 'no file is created, migrated, removed or changed');
 });
+
+test('a credential equal to a report field name never renames a schema field in JSON or text', async t => {
+  const f = await fixture(t);
+  // Values longer than five characters are redacted; keys are the report's fixed vocabulary.
+  const ports = { home: f.home, secrets: { A: 'provenance', B: 'timing', C: 'executions' } };
+  const json = await reportCli([f.runId, '--json'], ports);
+  assert.equal(json.exitCode, 0, json.output);
+  assert.ok(json.report.provenance && json.report.timing && json.report.checks, 'schema fields keep their names');
+  assert.equal(typeof json.report.timing.wallMs, 'number');
+  const human = await reportCli([f.runId], ports);
+  assert.equal(human.exitCode, 0, human.output);
+  assert.match(human.output, new RegExp(f.runId));
+});
+
+test(
+  'on POSIX a backslash name inside the state home is inside it: no copy is placed there',
+  { skip: process.platform === 'win32' && 'a backslash is a separator on Windows' },
+  async t => {
+    const f = await fixture(t);
+    const keys = path.join(f.dir, 'credentials');
+    mkdirSync(keys, { recursive: true });
+    // `..\scratch` is one ordinary directory name on POSIX, inside KODO_HOME.
+    const inside = path.join(f.home, '..\scratch');
+    mkdirSync(inside);
+    await withWriter(f, async () => {
+      const { exitCode, report } = await reportCli([f.runId, '--json'], {
+        home: f.home,
+        secrets: {},
+        temporaryRoot: inside,
+        credentialHome: keys,
+      });
+      assert.equal(exitCode, 2);
+      assert.deepEqual(report, { schemaVersion: 1, kind: 'error', status: 'blocked', code: 'report_unavailable' });
+      assert.deepEqual(readdirSync(inside), [], 'no snapshot directory is created inside the state home');
+    });
+  },
+);

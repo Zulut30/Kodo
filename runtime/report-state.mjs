@@ -74,7 +74,8 @@ function canonical(target) {
 }
 const contains = (outer, inner) => {
   const relative = path.relative(outer, inner);
-  return relative === '' || (relative.split(/[\\/]/)[0] !== '..' && !path.isAbsolute(relative));
+  // Only the platform separator splits a path: on POSIX `..\x` is one name inside `outer`.
+  return relative === '' || (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
 };
 
 /**

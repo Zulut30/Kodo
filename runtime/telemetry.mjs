@@ -156,21 +156,28 @@ function deliveryAttempts(events) {
 function checkExecutions(run, events) {
   const rows = list(run.checks?.results).filter(record);
   const rounds = [];
-  let streak = false;
+  let streak = false,
+    closed = false;
   for (const event of events) {
     if (event.type === 'check_started') {
       if (!streak) rounds.push([]);
       rounds.at(-1).push(event);
-    }
+      closed = false;
+    } else if (event.type === 'repair_required' && rounds.length) closed = true;
     streak = event.type === 'check_started';
   }
-  const unclosed = (rounds.at(-1) ?? []).slice(rows.length);
+  // After repair_required the round has ended and Engine resets the receipt on the
+  // repair commit: its checks without a row are closed with an unknown duration.
+  const last = rounds.at(-1) ?? [];
+  const unclosed = closed ? [] : last.slice(rows.length);
+  const reset = closed ? last.slice(rows.length) : [];
   const samples = [
     ...rounds
       .slice(0, -1)
       .flat()
       .map(() => null),
     ...rows.map(row => duration(row.durationMs)),
+    ...reset.map(() => null),
     ...unclosed.map(() => null),
   ];
   return { rows, unclosed, samples };
@@ -305,8 +312,8 @@ function programToken(command) {
   }
   const [first, ...rest] = text.split(/\s+/);
   if (/["']/.test(first)) return null;
-  // An unquoted path followed by more path text may be one path with a space: its name is never guessed.
-  if (separator.test(first) && rest.some(part => separator.test(part))) return null;
+  // An unquoted path followed by more text may be one path with a space (`C:\Customer Label.exe`): never guessed.
+  if (separator.test(first) && rest.length) return null;
   return first;
 }
 
@@ -603,11 +610,12 @@ function attemptRow(item, report) {
  * a known wait: an attempt without observations (`waitMs: null`) is unknown, not
  * 0. What was measured anyway is summed apart in `measuredMs`, never in `waitMs`.
  */
-function waitTotals(reports) {
+function waitTotals(reports, expected = reports.length) {
   return Object.fromEntries(
     Object.entries(waitKinds).map(([key, pick]) => {
       const found = reports.filter(Boolean).map(pick);
-      const all = found.length === reports.length;
+      // An attempt number without a saved row (a gap) is as unknown as a row without a Run.
+      const all = found.length === reports.length && reports.length >= expected;
       const complete = all && found.every(wait => wait.waitMs !== null);
       return [
         key,
@@ -686,7 +694,10 @@ function projectTotals(rows, runs, attemptReports) {
     usage: null,
     // Sum over the sessions of the Runs that were found; complete only when `usage` is not null.
     observedUsage: usageOf(runs.flatMap(run => list(run.sessionAttempts))),
-    waits: waitTotals(attemptReports),
+    waits: waitTotals(
+      attemptReports,
+      rows.reduce((sum, row) => sum + row.attempts, 0),
+    ),
   };
 }
 

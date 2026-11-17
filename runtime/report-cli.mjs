@@ -10,6 +10,20 @@
 import { buildRunReport, buildProjectReport } from './telemetry.mjs';
 import { readRedactionSecrets, readReportState } from './report-state.mjs';
 
+/**
+ * Redact every string value; keys stay. Report keys are a fixed vocabulary, so a
+ * credential that happens to equal a field name never renames a schema field.
+ * Values match by the same policy as security.redact (longer than five characters).
+ */
+const redactValues = (value, secrets, redact) =>
+  typeof value === 'string'
+    ? redact(value, secrets)
+    : Array.isArray(value)
+      ? value.map(item => redactValues(item, secrets, redact))
+      : value && typeof value === 'object'
+        ? Object.fromEntries(Object.entries(value).map(([key, item]) => [key, redactValues(item, secrets, redact)]))
+        : value;
+
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const fail = code => {
   throw Object.assign(new Error(code), { code });
@@ -239,7 +253,7 @@ export async function reportCli(argv, ports = {}) {
       credentialHome: ports.credentialHome || security.credentialRoot(),
       removeDirectory: ports.removeDirectory,
     });
-    report = security.redact(report, secrets);
+    report = redactValues(report, secrets, security.redact);
   } catch (error) {
     const code =
       phase === 'arguments'
