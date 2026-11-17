@@ -1,7 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, readdir, realpath, rm, writeFile } from 'node:fs/promises';
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { spawnSync } from 'node:child_process';
@@ -14,7 +23,7 @@ import { openProjectStore } from '../runtime/project-store.mjs';
 import * as contracts from '../runtime/project-contracts.mjs';
 import { workerEnvironment } from '../runtime/security.mjs';
 import { reportCli } from '../runtime/report-cli.mjs';
-import { readRedactionSecrets, readReportState, STATE_ATTEMPTS } from '../runtime/report-state.mjs';
+import { readRedactionSecrets, readReportState, REMOVE_ATTEMPTS, STATE_ATTEMPTS } from '../runtime/report-state.mjs';
 import { projectCli } from '../runtime/project-cli.mjs';
 
 const cli = fileURLToPath(new URL('../cli/index.mjs', import.meta.url));
@@ -252,6 +261,8 @@ test('report reads a saved Run and its jobs strictly read-only', async t => {
   assert.ok(!output.includes(SECRET), 'saved values matching credentials are redacted');
   // A check is its kind and executable name: no path and no argument value is printed.
   assert.deepEqual(report.checks.runs, [{ kind: 'test', executable: 'node', durationMs: null, exitCode: 0 }]);
+  // Without pending WAL frames the live main file is read immutable, in one attempt.
+  assert.deepEqual(report.provenance.snapshot, { method: 'immutable', attempts: 1 });
 
   const human = await reportCli([f.runId], ports);
   assert.equal(human.exitCode, 0);
@@ -494,6 +505,7 @@ test('a writer closing between the state probe and the open changes no state fil
   }
   assert.equal(open.exitCode, 0, open.output);
   assert.equal(open.report.checks.executions, 2, 'committed WAL frames are read from a private copy');
+  assert.deepEqual(open.report.provenance.snapshot, { method: 'wal-copy', attempts: 1 });
   assert.equal(raced.exitCode, 0, raced.output);
   assert.equal(raced.report.checks.executions, 2);
   assert.deepEqual(inventory(f.home), expected, 'no -wal or -shm appears after the writer closed');
@@ -559,9 +571,11 @@ test('a state that changes during every copy is refused after bounded attempts',
 test('a read that raced a checkpoint of the main file is read again', async t => {
   const f = await fixture(t);
   const database = path.join(f.home, 'state.sqlite');
-  const seen = [];
+  const seen = [],
+    snapshots = [];
   const counts = await readReportState(f.home, state => {
     seen.push(state.db.prepare('SELECT COUNT(*) AS n FROM events').get().n);
+    snapshots.push(state.snapshot);
     if (seen.length === 1) {
       // A writer commits and, closing, checkpoints into the main file while it is read.
       const writer = new DatabaseSync(database);
@@ -574,6 +588,115 @@ test('a read that raced a checkpoint of the main file is read again', async t =>
   });
   assert.equal(seen.length, 2, 'the first read is discarded');
   assert.equal(counts, seen[0] + 1, 'the second read sees the checkpointed row');
+  assert.deepEqual(snapshots.at(-1), { method: 'immutable', attempts: 2 });
+});
+
+/** Run `body` while a writer keeps its last commit in the WAL (with its shared-memory index). */
+async function withWriter(f, body) {
+  const writer = new Store(f.home, {});
+  try {
+    writer.event(f.runId, 'check_started', { kind: 'test', command: { command: 'node', args: [] } });
+    assert.ok(statSync(path.join(f.home, 'state.sqlite-wal')).size > 0);
+    return await body();
+  } finally {
+    writer.close();
+  }
+}
+
+test('an unfinished WAL tail is ignored: the report reads the last whole commit from a private copy', async t => {
+  const f = await fixture(t);
+  const temporaryRoot = path.join(f.dir, 'snapshots');
+  mkdirSync(temporaryRoot);
+  await withWriter(f, async () => {
+    // A frame that was never fully written: SQLite ignores it for every reader, and so does the copy.
+    appendFileSync(path.join(f.home, 'state.sqlite-wal'), Buffer.alloc(1000, 0x5a));
+    const live = inventory(f.home);
+    const { exitCode, report, output } = await reportCli([f.runId, '--json'], {
+      home: f.home,
+      secrets: {},
+      temporaryRoot,
+    });
+    assert.equal(exitCode, 0, output);
+    assert.equal(report.checks.executions, 2, 'the last whole commit is read');
+    assert.deepEqual(report.provenance.snapshot, { method: 'wal-copy', attempts: 1 });
+    assert.deepEqual(inventory(f.home), live, 'the live files, with their tail, are not changed');
+  });
+  assert.deepEqual(readdirSync(temporaryRoot), []);
+});
+
+test('a temporary root inside or around the state or credential home is refused before any copy', async t => {
+  const f = await fixture(t);
+  const keys = path.join(f.dir, 'credentials'),
+    keysTemp = path.join(keys, 'tmp'),
+    outer = path.join(f.dir, 'outer');
+  for (const item of [keysTemp, outer]) mkdirSync(item, { recursive: true });
+  await withWriter(f, async () => {
+    const around = inventory(f.dir);
+    for (const [temporaryRoot, credentialHome] of [
+      [f.home, keys], // TEMP=KODO_HOME: a copy would land in the state home.
+      [keysTemp, keys], // Inside the credential home.
+      [outer, path.join(outer, 'keys')], // Around a (not yet created) credential home.
+      [f.dir, keys], // Around the state home.
+    ]) {
+      const { exitCode, report } = await reportCli([f.runId, '--json'], {
+        home: f.home,
+        secrets: {},
+        temporaryRoot,
+        credentialHome,
+      });
+      assert.equal(exitCode, 2, temporaryRoot);
+      assert.deepEqual(report, { schemaVersion: 1, kind: 'error', status: 'blocked', code: 'report_unavailable' });
+      assert.deepEqual(inventory(f.dir), around, 'no snapshot directory is created anywhere');
+    }
+    const allowed = path.join(f.dir, 'snapshots');
+    mkdirSync(allowed);
+    const ok = await reportCli([f.runId, '--json'], {
+      home: f.home,
+      secrets: {},
+      temporaryRoot: allowed,
+      credentialHome: keys,
+    });
+    assert.equal(ok.exitCode, 0, ok.output);
+    assert.equal(ok.report.provenance.snapshot.method, 'wal-copy');
+    assert.deepEqual(readdirSync(allowed), []);
+  });
+});
+
+test('a private copy held by a transient lock is removed after bounded retries', async t => {
+  const f = await fixture(t);
+  const temporaryRoot = path.join(f.dir, 'snapshots');
+  mkdirSync(temporaryRoot);
+  const locked = code => Object.assign(new Error('locked'), { code });
+  let calls = 0;
+  const [flaky, stuck] = await withWriter(f, async () => [
+    await reportCli([f.runId, '--json'], {
+      home: f.home,
+      secrets: {},
+      temporaryRoot,
+      // Windows keeps a handle open for a moment after SQLite closed the copy.
+      removeDirectory: (directory, options) => {
+        calls++;
+        if (calls <= 2) throw locked(calls === 1 ? 'EPERM' : 'EBUSY');
+        rmSync(directory, options);
+      },
+    }),
+    await reportCli([f.runId, '--json'], {
+      home: f.home,
+      secrets: {},
+      temporaryRoot,
+      removeDirectory: () => {
+        calls++;
+        throw locked('EPERM');
+      },
+    }),
+  ]);
+  assert.equal(flaky.exitCode, 0, flaky.output);
+  assert.equal(flaky.report.provenance.snapshot.method, 'wal-copy');
+  // A copy that cannot be removed is never left behind silently: the report fails closed.
+  assert.equal(stuck.exitCode, 2);
+  assert.equal(stuck.report.code, 'report_unavailable');
+  assert.equal(calls, 3 + REMOVE_ATTEMPTS);
+  assert.equal(readdirSync(temporaryRoot).length, 1, 'only the copy whose removal kept failing remains');
 });
 
 test('redaction keys are read from the store and a legacy file without writing either', async t => {

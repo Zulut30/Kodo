@@ -110,7 +110,7 @@ test('run report: wall time from the saved creation to the terminal event, stage
   assert.deepEqual([stages.review.durationMs, stages.review.sessions], [2000, 1]);
   // Check durations are not saved by the Engine: verification stays unknown, never 0.
   assert.equal(stages.verification.durationMs, null);
-  assert.match(stages.verification.source, /check-results/);
+  assert.match(stages.verification.source, /check-executions/);
   assert.equal(report.generatedAt, undefined);
   assert.equal(report.provenance.source, 'kodo-state');
   assert.equal(report.provenance.generatedAt, iso(NOW));
@@ -242,7 +242,7 @@ test('queue waits come from job state receipts; an open wait makes the total unk
   assert.ok(open.provenance.notes.includes('queue_wait_open'));
   const none = buildRunReport(run, finishedEvents(), { now: NOW });
   assert.deepEqual(pick(none.queue), { jobs: 0, waitMs: null, known: 0, total: 0, source: null });
-  assert.deepEqual(none.queue.delivery, { waitMs: null, polls: 0, known: 0, total: 0, source: null });
+  assert.deepEqual(none.queue.delivery, { waitMs: null, measuredMs: null, polls: 0, known: 0, total: 0, source: null });
 });
 
 test('verification rounds, repairs, CI waits, failures, blocker and watchdog come from saved receipts', () => {
@@ -312,10 +312,20 @@ test('verification rounds, repairs, CI waits, failures, blocker and watchdog com
     { kind: 'build', executable: 'npm', durationMs: null, exitCode: null },
   ]);
   assert.deepEqual([report.checks.executions, report.checks.reused], [3, 1]);
-  assert.deepEqual(report.checks.ci, { waitMs: 16_000, polls: 2, known: 1, total: 1, source: 'delivery-events' });
+  // The poll that saw the checks ready is not saved: the wait has no end, only a measured part.
+  assert.deepEqual(report.checks.ci, {
+    waitMs: null,
+    measuredMs: 10_000,
+    polls: 2,
+    known: 0,
+    total: 1,
+    source: 'delivery-events',
+  });
   assert.equal(report.timing.finishedAt, iso(T0 + 30_000));
   assert.deepEqual(report.failures, [
     { code: 'node_failed', scope: 'node:b', at: iso(T0 + 1000) },
+    { code: 'repair_required', scope: 'verification', at: iso(T0 + 3000) },
+    { code: 'repair_required', scope: 'verification', at: iso(T0 + 5000) },
     { code: 'command_failed', scope: 'delivery', at: iso(T0 + 27_000) },
     { code: 'blocked', scope: 'run', at: iso(T0 + 30_000) },
     { code: 'timeout', scope: 'check:build', at: null },
@@ -348,7 +358,14 @@ test('an open CI wait and malformed codes stay explicit', () => {
     event(3, 'delivery.checks_waiting', T0 + 1000),
   ];
   const report = buildRunReport(run, events, { now: NOW });
-  assert.deepEqual(report.checks.ci, { waitMs: null, polls: 1, known: 0, total: 1, source: 'delivery-events' });
+  assert.deepEqual(report.checks.ci, {
+    waitMs: null,
+    measuredMs: 0,
+    polls: 1,
+    known: 0,
+    total: 1,
+    source: 'delivery-events',
+  });
   assert.ok(report.provenance.notes.includes('ci_wait_open'));
   assert.deepEqual(report.failures[0], { code: 'node_failed', scope: 'node:unknown', at: iso(T0 + 500) });
 });
@@ -413,8 +430,17 @@ test('mirrored delivery and release events never close a CI or delivery queue wa
     event(14, 'succeeded', T0 + 30_000),
   ];
   const report = buildRunReport(finishedRun(), events, { now: NOW });
-  assert.deepEqual(report.checks.ci, { waitMs: 16_000, polls: 2, known: 1, total: 1, source: 'delivery-events' });
-  assert.deepEqual(report.queue.delivery, { waitMs: 9000, polls: 2, known: 1, total: 1, source: 'delivery-events' });
+  // Copies neither split a streak of polls nor end it.
+  const window = (measuredMs, polls) => ({
+    waitMs: null,
+    measuredMs,
+    polls,
+    known: 0,
+    total: 1,
+    source: 'delivery-events',
+  });
+  assert.deepEqual(report.checks.ci, window(10_000, 2));
+  assert.deepEqual(report.queue.delivery, window(5000, 2));
   assert.deepEqual([report.timing.stages.delivery.durationMs, report.timing.stages.delivery.operations], [2000, 1]);
   // Polls followed only by their copies have no confirmed end: the wait stays open.
   const open = buildRunReport(
@@ -426,7 +452,7 @@ test('mirrored delivery and release events never close a CI or delivery queue wa
     ],
     { now: NOW },
   );
-  assert.deepEqual(open.checks.ci, { waitMs: null, polls: 1, known: 0, total: 1, source: 'delivery-events' });
+  assert.deepEqual(open.checks.ci, window(0, 1));
   assert.ok(open.provenance.notes.includes('ci_wait_open'));
 });
 
@@ -682,7 +708,7 @@ test('project report keeps queue and CI waits and the failure codes of every att
   );
   const all = [attempt('t1', 1, 'r1', 'blocked'), ...snapshot.currentAttempts];
   const report = buildProjectReport(snapshot, runs, events, { now: NOW, attempts: all, jobEvents });
-  const wait = (waitMs, known, total) => ({ waitMs, known, total });
+  const wait = (waitMs, measuredMs, known, total) => ({ waitMs, measuredMs, known, total });
   assert.deepEqual(report.attempts, [
     {
       taskId: 't1',
@@ -690,7 +716,8 @@ test('project report keeps queue and CI waits and the failure codes of every att
       runId: 'r1',
       state: 'blocked',
       wallMs: 30_000,
-      waits: { queue: wait(3000, 1, 1), deliveryQueue: wait(null, 0, 0), ci: wait(20_000, 1, 1) },
+      // The CI wait has no saved end: unknown, with its measured part apart.
+      waits: { queue: wait(3000, 3000, 1, 1), deliveryQueue: wait(null, null, 0, 0), ci: wait(null, 10_000, 0, 1) },
       failures: [{ code: 'checks_failed', scope: 'run', at: iso(T0 + 30_000) }],
     },
     {
@@ -699,7 +726,7 @@ test('project report keeps queue and CI waits and the failure codes of every att
       runId: 'r2',
       state: 'succeeded',
       wallMs: 5000,
-      waits: { queue: wait(1000, 1, 1), deliveryQueue: wait(null, 0, 0), ci: wait(null, 0, 0) },
+      waits: { queue: wait(1000, 1000, 1, 1), deliveryQueue: wait(null, null, 0, 0), ci: wait(null, null, 0, 0) },
       failures: [],
     },
     // Without a saved Run nothing about the attempt is known: null, never 0 or [].
@@ -709,14 +736,18 @@ test('project report keeps queue and CI waits and the failure codes of every att
       runId: 'r-missing',
       state: null,
       wallMs: null,
-      waits: { queue: wait(null, 0, null), deliveryQueue: wait(null, 0, null), ci: wait(null, 0, null) },
+      waits: {
+        queue: wait(null, null, 0, null),
+        deliveryQueue: wait(null, null, 0, null),
+        ci: wait(null, null, 0, null),
+      },
       failures: null,
     },
   ]);
   assert.deepEqual(report.totals.waits, {
-    queue: { waitMs: null, known: 2, total: null, complete: false },
-    deliveryQueue: { waitMs: null, known: 0, total: null, complete: false },
-    ci: { waitMs: null, known: 1, total: null, complete: false },
+    queue: { waitMs: null, measuredMs: 4000, known: 2, total: null, complete: false },
+    deliveryQueue: { waitMs: null, measuredMs: null, known: 0, total: null, complete: false },
+    ci: { waitMs: null, measuredMs: 10_000, known: 0, total: null, complete: false },
   });
   const settled = buildProjectReport(
     projectSnapshot([task('t1', 'accepted')], [attempt('t1', 2, 'r2', 'accepted')]),
@@ -724,10 +755,11 @@ test('project report keeps queue and CI waits and the failure codes of every att
     events,
     { now: NOW, attempts: all.slice(0, 2), jobEvents },
   );
+  // Only the job queue waits have explicit ends; an attempt without observations is unknown, not 0.
   assert.deepEqual(settled.totals.waits, {
-    queue: { waitMs: 4000, known: 2, total: 2, complete: true },
-    deliveryQueue: { waitMs: null, known: 0, total: 0, complete: true },
-    ci: { waitMs: 20_000, known: 1, total: 1, complete: true },
+    queue: { waitMs: 4000, measuredMs: 4000, known: 2, total: 2, complete: true },
+    deliveryQueue: { waitMs: null, measuredMs: null, known: 0, total: 0, complete: false },
+    ci: { waitMs: null, measuredMs: 10_000, known: 0, total: 1, complete: false },
   });
   assert.ok(!JSON.stringify(report).includes('private'));
 });
@@ -751,4 +783,171 @@ test('reports are pure: same input and clock give the same report', () => {
   assert.deepEqual(buildRunReport(run, events, { now: NOW }), buildRunReport(run, events, { now: NOW }));
   assert.throws(() => buildRunReport(null, [], { now: NOW }), TypeError);
   assert.throws(() => buildProjectReport(null, {}, {}, { now: NOW }), TypeError);
+});
+
+test('CI and delivery queue waits end only at a saved boundary; lease and fetch time is never CI time', () => {
+  // awaitChecks saves a poll only while checks are pending; the poll that saw them ready is not
+  // saved. What follows (lease polls, fetch, the merge intent) is not part of the CI wait.
+  const events = [
+    event(1, 'created', T0),
+    event(2, 'delivery.checks_waiting', T0 + 10_000, { checks: {} }),
+    event(3, 'delivery.checks_waiting', T0 + 20_000, { checks: {} }),
+    event(4, 'delivery.queue_waiting', T0 + 50_000, { queue: 'merge:o/r:main' }),
+    event(5, 'delivery.queue_waiting', T0 + 55_000, { queue: 'merge:o/r:main' }),
+    // The release lease is another wait, even with no other event in between.
+    event(6, 'delivery.queue_waiting', T0 + 70_000, { queue: 'release:o/r:main' }),
+    event(7, 'delivery.queue_waiting', T0 + 72_000, { queue: 'release:o/r:main' }),
+    event(8, 'delivery.operation', T0 + 200_000, { operation: 'merge', phase: 'intent' }),
+    event(9, 'delivery.operation', T0 + 201_000, { operation: 'merge', phase: 'outcome', status: 'confirmed' }),
+    event(10, 'succeeded', T0 + 210_000),
+  ];
+  const report = buildRunReport(finishedRun(), events, { now: NOW });
+  assert.deepEqual(report.checks.ci, {
+    waitMs: null,
+    measuredMs: 10_000,
+    polls: 2,
+    known: 0,
+    total: 1,
+    source: 'delivery-events',
+  });
+  assert.deepEqual(report.queue.delivery, {
+    waitMs: null,
+    measuredMs: 7000,
+    polls: 4,
+    known: 0,
+    total: 2,
+    source: 'delivery-events',
+  });
+  for (const note of ['ci_wait_open', 'delivery_queue_wait_open']) assert.ok(report.provenance.notes.includes(note));
+  assert.equal(report.provenance.complete, false);
+});
+
+test('project waits are complete only when every attempt has a known wait; measured parts stay apart', () => {
+  const job = (jobId, seq, state, at) => ({ jobId, seq, type: 'state', data: { state }, time: iso(T0 + at) });
+  const runs = { r1: finishedRun({ id: 'r1' }), r2: finishedRun({ id: 'r2' }) };
+  const events = {
+    r1: [event(1, 'created', T0), event(2, 'succeeded', T0 + 9000)],
+    r2: [
+      event(1, 'created', T0),
+      event(2, 'delivery.checks_waiting', T0 + 1000),
+      event(3, 'delivery.checks_waiting', T0 + 4000),
+      event(4, 'succeeded', T0 + 9000),
+    ],
+  };
+  // r1 has a closed job wait, r2 has no job receipts at all: its queue wait is unknown, not 0.
+  const jobEvents = { r1: [job('j1', 1, 'queued', 0), job('j1', 2, 'running', 2500)] };
+  const snapshot = projectSnapshot(
+    [task('t1', 'accepted'), task('t2', 'accepted')],
+    [attempt('t1', 1, 'r1', 'accepted'), attempt('t2', 1, 'r2', 'accepted')],
+  );
+  const report = buildProjectReport(snapshot, runs, events, { now: NOW, jobEvents });
+  assert.deepEqual(report.totals.waits, {
+    queue: { waitMs: null, measuredMs: 2500, known: 1, total: 1, complete: false },
+    deliveryQueue: { waitMs: null, measuredMs: null, known: 0, total: 0, complete: false },
+    ci: { waitMs: null, measuredMs: 3000, known: 0, total: 1, complete: false },
+  });
+  assert.deepEqual(report.attempts[1].waits.ci, { waitMs: null, measuredMs: 3000, known: 0, total: 1 });
+});
+
+test('a Run continued without its earlier history has no usage total, only the observed usage', () => {
+  const continued = finishedRun({ id: 'r1', metrics: { historyComplete: false } });
+  const run = buildRunReport(continued, finishedEvents(), { now: NOW });
+  assert.equal(run.usage, null);
+  assert.equal(run.observedUsage.sessions, 3);
+  assert.equal(run.observedUsage.usage.totalTokens, 360);
+  assert.deepEqual(run.context, { originalBytes: null, sentBytes: null });
+  assert.ok(run.provenance.notes.includes('history_incomplete'));
+  assert.equal(run.provenance.complete, false);
+  assert.equal(buildRunReport(finishedRun(), finishedEvents(), { now: NOW }).usage.usage.totalTokens, 360);
+
+  const project = buildProjectReport(
+    projectSnapshot([task('t1', 'accepted')], [attempt('t1', 1, 'r1', 'accepted')]),
+    { r1: continued },
+    { r1: finishedEvents() },
+    { now: NOW },
+  );
+  assert.equal(project.completeness.runs.complete, true);
+  assert.equal(project.totals.sessions, 3);
+  assert.equal(project.totals.usage, null);
+  assert.equal(project.totals.observedUsage.usage.totalTokens, 360);
+  assert.ok(project.provenance.notes.includes('history_incomplete'));
+});
+
+test('a legacy command string yields a whole executable name or null, and usage semantics a known value', () => {
+  const run = finishedRun({
+    sessionAttempts: [
+      session('developer', 'completed', measured(100, { ...usage(1, 1), semantics: '/home/owner/private-semantics' })),
+    ],
+    checks: {
+      schemaVersion: 2,
+      complete: true,
+      results: [
+        '"C:/Private Account/bin/lint.cmd" --arg',
+        "'/opt/My Tools/bin/test-runner' --flag",
+        'C:/Private Account/bin/lint.cmd --arg',
+        '"C:/Private Account/bin/lint.cmd',
+        '"C:/Private Account/bin/"lint.cmd --arg',
+        'C:/Pri"vate/lint.cmd',
+        '/usr/local/bin/node --test',
+        'npm test',
+        { command: 'C:/Private Account/bin/build.cmd', args: [] },
+      ].map(command => ({ kind: 'test', command, exitCode: 0 })),
+    },
+  });
+  const report = buildRunReport(run, finishedEvents(), { now: NOW });
+  assert.deepEqual(
+    report.checks.runs.map(row => row.executable),
+    ['lint.cmd', 'test-runner', null, null, null, null, 'node', 'npm', 'build.cmd'],
+  );
+  assert.equal(report.usage.usage.semantics, null);
+  const text = JSON.stringify(report);
+  for (const value of ['Private', 'Account', 'My Tools', 'private-semantics', 'owner'])
+    assert.ok(!text.includes(value), value);
+  const known = buildRunReport(finishedRun(), finishedEvents(), { now: NOW });
+  assert.equal(known.usage.usage.semantics, 'input-includes-cached');
+});
+
+test('a started check without a result stays in the denominator and failed rounds stay in the failures', () => {
+  const testCommand = { kind: 'test', command: { command: 'npm', args: ['test'] } };
+  const buildCommand = { kind: 'build', command: { command: 'npm', args: ['run', 'build'] } };
+  // The build command ran and changed the worktree: the Run stopped before its result was saved.
+  const dirty = finishedRun({
+    state: 'blocked',
+    checks: { schemaVersion: 2, complete: false, results: [{ ...testCommand, exitCode: 0 }] },
+  });
+  const report = buildRunReport(
+    dirty,
+    [
+      event(1, 'created', T0),
+      event(2, 'check_started', T0 + 1000, testCommand),
+      event(3, 'check_started', T0 + 2000, buildCommand),
+      event(4, 'blocked', T0 + 9000, { code: 'dirty_worktree', message: 'private' }),
+    ],
+    { now: NOW },
+  );
+  const { verification } = report.timing.stages;
+  assert.deepEqual([verification.durationMs, verification.known, verification.total], [null, 0, 2]);
+  assert.deepEqual([report.checks.executions, report.checks.unclosed, report.checks.total], [2, 1, 2]);
+  assert.ok(report.provenance.notes.includes('check_unclosed'));
+  assert.equal(report.provenance.complete, false);
+
+  // A failed round, repaired, then a passing round: the failure stays visible after the repair.
+  const repaired = buildRunReport(
+    finishedRun({ checks: { schemaVersion: 2, complete: true, results: [{ ...testCommand, exitCode: 0 }] } }),
+    [
+      event(1, 'created', T0),
+      event(2, 'check_started', T0 + 1000, testCommand),
+      event(3, 'repair_required', T0 + 2000, { attempt: 0, problem: 'private check output' }),
+      event(4, 'session', T0 + 3000, { type: 'turn' }),
+      event(5, 'check_started', T0 + 4000, testCommand),
+      event(6, 'succeeded', T0 + 9000),
+    ],
+    { now: NOW },
+  );
+  assert.deepEqual(repaired.failures, [{ code: 'repair_required', scope: 'verification', at: iso(T0 + 2000) }]);
+  const stage = repaired.timing.stages.verification;
+  assert.deepEqual([stage.known, stage.total], [0, 2]);
+  assert.equal(repaired.checks.unclosed, 0);
+  assert.ok(!repaired.provenance.notes.includes('check_unclosed'));
+  assert.ok(!JSON.stringify(repaired).includes('private check output'));
 });

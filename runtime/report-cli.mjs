@@ -136,8 +136,11 @@ const caveat = 'Prompt bytes are not tokens; elapsed time is not pure LLM latenc
 const observations = provenance =>
   `Observations: ${provenance.complete ? 'complete' : `incomplete (${provenance.notes.join(', ')})`}`;
 
+const measuredPart = item => (item.measuredMs === null ? '' : `, measured ${time(item.measuredMs)}`);
+
 function humanRun(report) {
-  const { timing, queue, checks, attempts, usage } = report;
+  const { timing, queue, checks, attempts, usage, observedUsage } = report;
+  const tokens = observedUsage.completeness.usage.totalTokens;
   return [
     `Run ${report.runId} | state ${report.state} | mode ${value(report.mode)} | client ${value(report.client)}`,
     `Wall time: ${time(timing.wallMs)} (created ${value(timing.createdAt)}, finished ${timing.finishedAt ?? 'not finished'})`,
@@ -148,10 +151,10 @@ function humanRun(report) {
         ([name, stage]) =>
           `  ${name}: ${time(stage.durationMs)} (${stage.known}/${stage.total} known; ${value(stage.sessions)} sessions; ${stage.source})`,
       ),
-    `Queue wait: ${time(queue.waitMs)} (${queue.jobs} jobs, ${queue.known}/${queue.total} waits known); CI wait: ${time(checks.ci.waitMs)} (${checks.ci.polls} polls)`,
-    `Checks: ${checks.runs.length} saved results, ${checks.executions} started, ${checks.reused} reused; duration ${time(checks.totalMs)}`,
+    `Queue wait: ${time(queue.waitMs)} (${queue.jobs} jobs, ${queue.known}/${queue.total} waits known${measuredPart(queue)}); CI wait: ${time(checks.ci.waitMs)} (${checks.ci.polls} polls${measuredPart(checks.ci)})`,
+    `Checks: ${checks.runs.length} saved results, ${checks.executions} started (${checks.unclosed} without result), ${checks.reused} reused; duration ${time(checks.totalMs)}`,
     `Attempts: ${value(attempts.sessions)} sessions (failed ${value(attempts.failedSessions)}, pending ${value(attempts.pendingSessions)}); node attempts ${value(attempts.nodeAttempts)}; verification rounds ${attempts.verificationRounds}; repairs ${attempts.repairRounds}`,
-    `Usage: total tokens ${value(usage.usage.totalTokens)} (${usage.completeness.usage.totalTokens.known}/${usage.completeness.usage.totalTokens.total} sessions known); prompt bytes ${value(usage.promptBytes)}`,
+    `Usage: total tokens ${value(usage?.usage.totalTokens)} (observed ${value(observedUsage.usage.totalTokens)}, ${tokens.known}/${tokens.total} sessions known); prompt bytes ${value(usage?.promptBytes)}`,
     `Failures: ${report.failures.length ? report.failures.map(item => `${item.code}@${item.scope}`).join(', ') : 'none'}`,
     `Blocker: ${report.blocker ? `${report.blocker.code} (${report.blocker.scope}, seen ${value(report.blocker.occurrences)}x)` : 'none'}`,
     observations(report.provenance),
@@ -159,7 +162,7 @@ function humanRun(report) {
   ].join('\n');
 }
 
-const wait = item => `${time(item.waitMs)} (${item.known}/${value(item.total)} known)`;
+const wait = item => `${time(item.waitMs)} (${item.known}/${value(item.total)} known${measuredPart(item)})`;
 const failureCodes = rows =>
   rows === null ? 'unknown' : rows.length ? rows.map(item => `${item.code}@${item.scope}`).join(', ') : 'none';
 
@@ -192,23 +195,27 @@ const human = report =>
       ? humanProject(report)
       : `Report: ${report.code}`;
 
-/** Build the report from one consistent read-only view of the state. */
+/** Build the report from one consistent read-only view of the state and name that view. */
 async function buildReport(state, options, secrets) {
   const now = Date.now();
-  if (!options.runId) return projectReport(state, options.projectId, secrets, now);
-  const run = readRun(state, options.runId);
-  return buildRunReport(run, readEvents(state, options.runId), {
-    jobEvents: readJobEvents(state, options.runId),
-    now,
-  });
+  const report = options.runId
+    ? buildRunReport(readRun(state, options.runId), readEvents(state, options.runId), {
+        jobEvents: readJobEvents(state, options.runId),
+        now,
+      })
+    : await projectReport(state, options.projectId, secrets, now);
+  report.provenance.snapshot = { method: state.snapshot.method, attempts: state.snapshot.attempts };
+  return report;
 }
 
 /**
  * @param {string[]} argv
  * @param {{ home?: string, secrets?: Record<string, string>, loadSecrets?: () => Promise<Record<string, string>>,
- *   stateProbed?: () => unknown, temporaryRoot?: string }} [ports]
- *   Supplied by the coordinator or a test harness, never by decoded CLI data. `stateProbed` and
- *   `temporaryRoot` are test seams of the state snapshot (see `readReportState`).
+ *   stateProbed?: () => unknown, temporaryRoot?: string, credentialHome?: string,
+ *   removeDirectory?: (directory: string, options: { recursive: boolean, force: boolean }) => void }} [ports]
+ *   Supplied by the coordinator or a test harness, never by decoded CLI data. `stateProbed`,
+ *   `temporaryRoot`, `credentialHome` and `removeDirectory` are seams of the state snapshot
+ *   (see `readReportState`).
  */
 export async function reportCli(argv, ports = {}) {
   let options,
@@ -228,6 +235,9 @@ export async function reportCli(argv, ports = {}) {
     report = await readReportState(home, state => buildReport(state, options, secrets), {
       probed: ports.stateProbed,
       temporaryRoot: ports.temporaryRoot,
+      // A private copy is never placed inside or around the state or the credential home.
+      credentialHome: ports.credentialHome || security.credentialRoot(),
+      removeDirectory: ports.removeDirectory,
     });
     report = security.redact(report, secrets);
   } catch (error) {

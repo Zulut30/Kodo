@@ -7,6 +7,7 @@ import { spawnSync } from 'node:child_process';
 import {
   createCredentialStore,
   credentialRoot,
+  decodeCredentials,
   worktreeHome,
   secretNames,
   workerEnvironment,
@@ -63,6 +64,42 @@ async function fixture(t, overrides = {}) {
   };
   return { root, directory, legacyDirectory, calls, settings, store: createCredentialStore(settings) };
 }
+
+test('The shared read-only credential decoder accepts only the store envelope and wipes plaintext', async () => {
+  const posix = JSON.stringify({ version: 1, protection: 'file-permissions', data: { GEMINI_API_KEY: 'posix-value' } });
+  assert.deepEqual(await decodeCredentials('﻿' + posix, { platform: 'linux' }), { GEMINI_API_KEY: 'posix-value' });
+  let plaintext;
+  const decrypt = async ciphertext => {
+    assert.equal(ciphertext.toString(), 'opaque');
+    plaintext = Buffer.from(JSON.stringify({ TYPESAFE_API_KEY: 'dpapi-value' }));
+    return plaintext;
+  };
+  const windows = JSON.stringify({
+    version: 1,
+    protection: 'windows-dpapi-current-user',
+    data: Buffer.from('opaque').toString('base64'),
+  });
+  assert.deepEqual(await decodeCredentials(windows, { platform: 'win32', decrypt }), {
+    TYPESAFE_API_KEY: 'dpapi-value',
+  });
+  assert.ok(
+    plaintext.every(byte => byte === 0),
+    'decrypted bytes are wiped',
+  );
+  for (const [text, platform] of [
+    [posix, 'win32'],
+    [windows, 'linux'],
+    [JSON.stringify({ version: 2, protection: 'file-permissions', data: {} }), 'linux'],
+    [JSON.stringify({ version: 1, protection: 'windows-dpapi-current-user', data: 'not base64!' }), 'win32'],
+    [JSON.stringify({ version: 1, protection: 'file-permissions', data: { GEMINI_API_KEY: 7 } }), 'linux'],
+    ['null', 'linux'],
+  ])
+    await assert.rejects(
+      decodeCredentials(text, { platform: /** @type {NodeJS.Platform} */ (platform), decrypt }),
+      { code: 'credential_store' },
+      text,
+    );
+});
 
 test('Credential and worktree defaults are separate from state and honor explicit location overrides', () => {
   const local = path.resolve('fixture-user'),

@@ -7,6 +7,9 @@
  *   `immutable`; with them, the database and its WAL are copied into a private
  *   temporary directory, the copy is recovered and checked there and removed
  *   afterwards. A copy or a read that raced a writer is retried, then refused.
+ *   The copy reads exactly what any SQLite reader would read: an unfinished or
+ *   damaged WAL tail is ignored, as it is for the original. The temporary
+ *   directory is never inside, nor around, the state or the credential home.
  * - `readRedactionSecrets` reads existing keys (environment, the credential
  *   store and a legacy `secrets.json`) only to redact output. It creates no
  *   directory and does not migrate a legacy file.
@@ -14,14 +17,18 @@
  */
 import os from 'node:os';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
-import { copyFileSync, mkdtempSync, rmSync, statSync } from 'node:fs';
+import { copyFileSync, mkdtempSync, realpathSync, rmSync, statSync } from 'node:fs';
 import { lstat, readFile } from 'node:fs/promises';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
-import { credentialRoot, secretNames, workerEnvironment } from './security.mjs';
+import { credentialRoot, decodeCredentials, decryptWindowsCredentials, secretNames } from './security.mjs';
 
 export const STATE_ATTEMPTS = 3;
+/** Removal of a private copy is retried while Windows still holds a handle on it. */
+export const REMOVE_ATTEMPTS = 5;
+const REMOVE_DELAY_MS = 100;
+const REMOVE_RETRY_CODES = new Set(['EPERM', 'EBUSY']);
 const MAX_CREDENTIAL_BYTES = 1024 * 1024;
 const fail = code => {
   throw Object.assign(new Error(code), { code });
@@ -54,62 +61,120 @@ function openImmutable(filename) {
   }
 }
 
+/** The real path of `target`, or that of its nearest existing ancestor followed by the rest. */
+function canonical(target) {
+  const resolved = path.resolve(target);
+  try {
+    return realpathSync.native(resolved);
+  } catch (error) {
+    const parent = path.dirname(resolved);
+    if (error?.code !== 'ENOENT' || parent === resolved) throw error;
+    return path.join(canonical(parent), path.basename(resolved));
+  }
+}
+const contains = (outer, inner) => {
+  const relative = path.relative(outer, inner);
+  return relative === '' || (relative.split(/[\\/]/)[0] !== '..' && !path.isAbsolute(relative));
+};
+
 /**
- * A private copy of the database with its committed WAL frames folded in, or
- * null when the live files changed while they were copied or the copy fails
- * its integrity check. Recovery happens only inside the private directory.
+ * The real temporary root for private copies. Refused (`report_unavailable`)
+ * before any file is created when it lies inside a protected home or contains one.
  */
-function privateCopy(filename, before, temporaryRoot) {
-  const directory = mkdtempSync(path.join(temporaryRoot, 'kodo-report-snapshot-'));
+function snapshotRoot(temporaryRoot, protectedRoots) {
+  let root;
+  try {
+    root = realpathSync.native(path.resolve(temporaryRoot));
+  } catch {
+    return fail('report_unavailable');
+  }
+  for (const item of protectedRoots) {
+    const guarded = canonical(item);
+    if (contains(guarded, root) || contains(root, guarded)) fail('report_unavailable');
+  }
+  return root;
+}
+
+/**
+ * Copy the database and its WAL into `directory` and fold the committed frames
+ * into the copy. False when the live files changed while they were copied or the
+ * copy fails its integrity check. Recovery happens only inside the private directory.
+ */
+function copyInto(filename, before, directory) {
   const copy = path.join(directory, 'state.sqlite');
   try {
     copyFileSync(filename, copy);
     copyFileSync(`${filename}-wal`, `${copy}-wal`);
     const after = probe(filename);
-    if (mark(after.db) !== mark(before.db) || mark(after.wal) !== mark(before.wal)) throw new Error('changed');
+    if (mark(after.db) !== mark(before.db) || mark(after.wal) !== mark(before.wal)) return false;
     const db = new DatabaseSync(copy);
     try {
-      if (db.prepare('PRAGMA quick_check').get()?.quick_check !== 'ok') throw new Error('corrupt');
+      if (db.prepare('PRAGMA quick_check').get()?.quick_check !== 'ok') return false;
       db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
     } finally {
       db.close();
     }
-    return directory;
+    return true;
   } catch {
-    rmSync(directory, { recursive: true, force: true });
-    return null;
+    return false;
+  }
+}
+
+/** Remove a private copy; a transient Windows lock is waited out a bounded number of times. */
+async function removeCopy(directory, remove) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      remove(directory, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      // A copy that cannot be removed is never left behind silently.
+      if (!REMOVE_RETRY_CODES.has(error?.code) || attempt >= REMOVE_ATTEMPTS) fail('report_unavailable');
+      await sleep(REMOVE_DELAY_MS);
+    }
   }
 }
 
 /**
- * Run `read` against a consistent read-only view of `home/state.sqlite`.
+ * Run `read` against a consistent read-only view of `home/state.sqlite`. The view
+ * carries `snapshot: { method: 'immutable' | 'wal-copy', attempts }`.
  * @template T
  * @param {string} home
- * @param {(state: { db: DatabaseSync, tables: Set<string> }) => Promise<T> | T} read
- * @param {{ probed?: () => unknown, temporaryRoot?: string }} [options] `probed` is a test seam
- *   called after the files were inspected and before they are opened or copied.
+ * @param {(state: { db: DatabaseSync, tables: Set<string>,
+ *   snapshot?: { method: 'immutable' | 'wal-copy', attempts: number } }) => Promise<T> | T} read
+ * @param {{ probed?: () => unknown, temporaryRoot?: string, credentialHome?: string,
+ *   removeDirectory?: (directory: string, options: { recursive: boolean, force: boolean }) => void }} [options]
+ *   `probed` is a test seam called after the files were inspected and before they are opened or
+ *   copied; `removeDirectory` is the removal port of a private copy.
  * @returns {Promise<T>}
  */
-export async function readReportState(home, read, { probed, temporaryRoot = os.tmpdir() } = {}) {
+export async function readReportState(
+  home,
+  read,
+  { probed, temporaryRoot = os.tmpdir(), credentialHome = credentialRoot(), removeDirectory = rmSync } = {},
+) {
   const filename = path.join(home, 'state.sqlite');
+  let root;
   for (let attempt = 0; attempt < STATE_ATTEMPTS; attempt++) {
     const before = probe(filename);
     if (!before.db?.isFile()) fail('report_not_found');
     await probed?.();
-    const directory = before.wal?.size ? privateCopy(filename, before, temporaryRoot) : null;
-    if (before.wal?.size && !directory) continue;
+    // The temporary root is checked before the first file of a copy is created.
+    if (before.wal?.size) root ??= snapshotRoot(temporaryRoot, [home, credentialHome]);
+    const directory = before.wal?.size ? mkdtempSync(path.join(root, 'kodo-report-snapshot-')) : null;
     // A private copy cannot change. The live main file can only change by a checkpoint: read again then.
     const stable = () => directory !== null || mark(probe(filename).db) === mark(before.db);
     let state;
     try {
+      if (directory && !copyInto(filename, before, directory)) continue;
       state = openImmutable(directory ? path.join(directory, 'state.sqlite') : filename);
-      const result = await read(state);
+      const snapshot = { method: directory ? 'wal-copy' : 'immutable', attempts: attempt + 1 };
+      const result = await read({ ...state, snapshot });
       if (stable()) return result;
     } catch (error) {
       if (stable()) throw error;
     } finally {
       state?.db.close();
-      if (directory) rmSync(directory, { recursive: true, force: true });
+      if (directory) await removeCopy(directory, removeDirectory);
     }
   }
   return fail('report_unavailable');
@@ -139,88 +204,21 @@ function secretValues(value) {
 
 function parseSecrets(bytes) {
   try {
-    return secretValues(JSON.parse(bytes.toString('utf8').replace(/^\uFEFF/, '')));
+    return secretValues(JSON.parse(bytes.toString('utf8').replace(/^﻿/, '')));
   } finally {
     bytes.fill(0);
   }
 }
 
-// Decrypt only: the same envelope and entropy as the credential store in security.mjs.
-const dpapiDecryptScript = `
-$ErrorActionPreference = 'Stop'
-[Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
-[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
-try {
-  Add-Type -AssemblyName System.Security
-  $data = [Convert]::FromBase64String([Console]::In.ReadToEnd().Trim())
-  $entropy = [Text.Encoding]::UTF8.GetBytes('Kodo credentials v1')
-  $result = [Security.Cryptography.ProtectedData]::Unprotect($data, $entropy, [Security.Cryptography.DataProtectionScope]::CurrentUser)
-  [Console]::Out.Write([Convert]::ToBase64String($result))
-  exit 0
-} catch { exit 1 }
-`;
-
-/** @param {Buffer} ciphertext @returns {Promise<Buffer>} */
-function dpapiDecrypt(ciphertext) {
-  return new Promise((resolve, reject) => {
-    const executable = path.join(
-      process.env.SystemRoot || 'C:\\Windows',
-      'System32/WindowsPowerShell/v1.0/powershell.exe',
-    );
-    const script = Buffer.from(dpapiDecryptScript, 'utf16le').toString('base64');
-    const child = spawn(executable, ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', script], {
-      windowsHide: true,
-      shell: false,
-      stdio: ['pipe', 'pipe', 'ignore'],
-      env: workerEnvironment(),
-    });
-    let chunks = [],
-      size = 0,
-      finished = false;
-    const finish = failed => {
-      if (finished) return;
-      finished = true;
-      clearTimeout(timer);
-      const output = Buffer.concat(chunks);
-      for (const chunk of chunks) chunk.fill(0);
-      chunks = [];
-      const text = failed ? '' : output.toString('utf8').trim();
-      output.fill(0);
-      if (/^[A-Za-z0-9+/]+={0,2}$/.test(text)) resolve(Buffer.from(text, 'base64'));
-      else reject(Object.assign(new Error('report_unavailable'), { code: 'report_unavailable' }));
-    };
-    const timer = setTimeout(() => {
-      child.kill();
-      finish(true);
-    }, 30_000);
-    child.stdout.on('data', chunk => {
-      size += chunk.length;
-      if (finished) chunk.fill(0);
-      else if (size > MAX_CREDENTIAL_BYTES) {
-        chunk.fill(0);
-        child.kill();
-        finish(true);
-      } else chunks.push(chunk);
-    });
-    child.on('error', () => finish(true));
-    child.on('close', code => finish(code !== 0));
-    child.stdin.on('error', () => finish(true));
-    child.stdin.end(ciphertext.toString('base64'));
-  });
-}
-
+/** The credential store's envelope and DPAPI decryption are shared with `loadSecrets` (read-only part only). */
 async function storedSecrets(bytes, platform, decrypt) {
-  let envelope;
+  let text;
   try {
-    envelope = JSON.parse(bytes.toString('utf8').replace(/^\uFEFF/, ''));
+    text = bytes.toString('utf8');
   } finally {
     bytes.fill(0);
   }
-  const protection = platform === 'win32' ? 'windows-dpapi-current-user' : 'file-permissions';
-  if (envelope?.version !== 1 || envelope.protection !== protection) fail('report_unavailable');
-  if (platform !== 'win32') return secretValues(envelope.data);
-  if (typeof envelope.data !== 'string' || !/^[A-Za-z0-9+/]+={0,2}$/.test(envelope.data)) fail('report_unavailable');
-  return parseSecrets(await decrypt(Buffer.from(envelope.data, 'base64')));
+  return decodeCredentials(text, { platform, decrypt });
 }
 
 /**
@@ -239,7 +237,7 @@ export async function readRedactionSecrets({
   environment = process.env,
   platform = process.platform,
   directory = credentialRoot(environment, platform),
-  decrypt = dpapiDecrypt,
+  decrypt = decryptWindowsCredentials,
 }) {
   try {
     const legacyBytes = await boundedFile(path.join(home, 'secrets.json'));
