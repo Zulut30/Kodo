@@ -76,6 +76,13 @@ function human(report) {
  * Ports belong to the coordinator/test harness, never to decoded CLI data.
  */
 export async function projectCli(argv, ports = {}) {
+  // Read-only alias: `project report PROJECT_ID [--json]` is `report --project PROJECT_ID [--json]`.
+  if (Array.isArray(argv) && argv[0] === 'report') {
+    const { reportCli } = await import('./report-cli.mjs');
+    const rest = argv.slice(1),
+      at = rest.findIndex(arg => typeof arg === 'string' && !arg.startsWith('-'));
+    return reportCli(at < 0 ? rest : [...rest.slice(0, at), '--project', ...rest.slice(at)], ports);
+  }
   let options,
     store,
     ownedStore = false,
