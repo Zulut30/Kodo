@@ -69,6 +69,8 @@ export const fastTests = [
   'tests/modes.test.mjs',
   'tests/package-pins.test.mjs',
   'tests/progress.test.mjs',
+  'tests/project-blueprint.test.mjs',
+  'tests/project-bootstrap.test.mjs',
   'tests/project-cancel.test.mjs',
   'tests/project-contracts.test.mjs',
   'tests/project-evidence.test.mjs',
