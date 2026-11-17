@@ -76,6 +76,8 @@ async function pins() {
     'security.mjs',
     'toolchains.mjs',
     'progress.mjs',
+    'telemetry.mjs',
+    'report-cli.mjs',
   ];
   const lock = new URL('../package-lock.json', import.meta.url);
   const urls = [
