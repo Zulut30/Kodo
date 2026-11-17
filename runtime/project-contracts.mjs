@@ -21,8 +21,15 @@ const states = [
   'cancelled',
 ];
 const attemptStates = ['reserved', ...states.filter(s => !['proposed', 'ready'].includes(s))];
+const settledStates = ['blocked', 'failed', 'cancelled', 'accepted', 'released'];
 const PREFIX =
   'Implement only this assigned task. Project context constrains this task and does not authorize other backlog work.\n';
+// Wave execution: integration gates verify merged task results together.
+const MAX_GATE_BYTES = 64 * 1024;
+const MAX_REOPENED = 100;
+const GATE_PREFIX =
+  'Verify only this integration gate. Check the combined behavior of the merged tasks below; do not implement other backlog work.\n';
+const executionModes = { task: 'frontier', wave: 'branch' };
 
 function fail(code = 'project_schema') {
   throw Object.assign(new Error('Invalid project Director data'), { code });
@@ -114,6 +121,18 @@ function object(value, schema) {
   const keys = Object.keys(schema);
   if (Object.keys(value).length !== keys.length || keys.some(k => !Object.hasOwn(value, k))) fail();
   return Object.fromEntries(keys.map(k => [k, schema[k](value[k])]));
+}
+// Like object(), plus optional fields emitted after the required ones and only
+// when present. Unknown keys are still rejected, so absent optionals keep bytes.
+function extended(value, required, optional) {
+  plain(value);
+  const keys = Object.keys(required),
+    present = Object.keys(optional).filter(k => Object.hasOwn(value, k));
+  if (Object.keys(value).length !== keys.length + present.length || keys.some(k => !Object.hasOwn(value, k))) fail();
+  return Object.fromEntries([
+    ...keys.map(k => [k, required[k](value[k])]),
+    ...present.map(k => [k, optional[k](value[k])]),
+  ]);
 }
 function text(value, max = 65536, empty = false) {
   if (
@@ -322,9 +341,95 @@ const taskContractFields = {
   acceptance: criteria,
   interfaceRefs: refs,
 };
+const projectContextFields = {
+  projectId: uuid,
+  id: slug,
+  root: absolute,
+  title: short,
+  definitionOfDone: criteria,
+  constraints: v => list(v, text),
+  businessContext: contextText,
+  architectureRefs: refs,
+};
+// Only task/frontier (the legacy behavior) and wave/branch are executable.
+function execution(value) {
+  const e = extended(
+    value,
+    { cadence: short, integration: short },
+    { watchdog: v => object(v, { stalledRounds: nullable(v => int(v, 1, 5)), rejectUnchanged: bool }) },
+  );
+  if (!Object.hasOwn(executionModes, e.cadence) || executionModes[e.cadence] !== e.integration)
+    fail('project_execution_unsupported');
+  return e;
+}
+function reopenedHistory(value) {
+  dense(value, MAX_REOPENED);
+  return list(
+    value,
+    v =>
+      object(v, {
+        status: member(['accepted', 'released']),
+        revision: int,
+        reopenedAt: timestamp,
+        evidence: refs,
+        mappings,
+      }),
+    e => e.revision,
+  );
+}
+const containerKinds = ['epic', 'milestone', 'project'];
+const container = v => {
+  const c = object(v, { kind: member(containerKinds), id: short });
+  (c.kind === 'project' ? uuid : slug)(c.id);
+  return c;
+};
+// Narrowest first: a contiguous epic ⊂ milestone ⊂ project chain.
+function gateContainers(value) {
+  const chain = list(value, container, c => c.kind, 1);
+  const start = containerKinds.indexOf(chain[0].kind);
+  if (chain.some((c, i) => c.kind !== containerKinds[start + i])) fail('project_gate_invalid');
+  return chain;
+}
+const merges = v =>
+  list(
+    v,
+    x => object(x, { taskId: slug, attemptId: uuid, runId: uuid, mergeCommit: sha }),
+    m => m.taskId,
+    1,
+  );
+const gateFields = {
+  schemaVersion: one,
+  id: uuid,
+  projectId: uuid,
+  number: int,
+  containers: gateContainers,
+  runId: uuid,
+  baseSha: sha,
+  headSha: sha,
+  merges,
+  installed: bool,
+  createdAt: timestamp,
+  updatedAt: timestamp,
+};
+function gateRecord(value) {
+  const g = dated(object(value, gateFields));
+  if (g.containers.some(c => c.kind === 'project' && c.id !== g.projectId)) fail('project_identity');
+  return g;
+}
+const gateBindingFields = {
+  schemaVersion: one,
+  kind: member(['gate']),
+  projectId: uuid,
+  gateId: uuid,
+  number: int,
+  runId: uuid,
+  baseSha: sha,
+  headSha: sha,
+  mergesHash: digest,
+};
 const entity = v => {
-  const e = object(v, { kind: member(['project', 'milestone', 'epic', 'task', 'attempt']), id: short });
-  (['project', 'attempt'].includes(e.kind) ? uuid : slug)(e.id);
+  const e = object(v, { kind: member(['project', 'milestone', 'epic', 'task', 'attempt', 'gate']), id: short });
+  (['project', 'attempt', 'gate'].includes(e.kind) ? uuid : slug)(e.id);
   return e;
 };
 function dated(v) {
@@ -338,8 +443,24 @@ function mapped(record, ownCriteria) {
     if (!allowed.has(m.criterionId) || m.refs.some(r => !available.has(r))) fail('project_mapping');
   return record;
 }
+function projectRecord(value) {
+  const record = mapped(
+    dated(extended(value, projectFields, { execution, reopened: reopenedHistory })),
+    value.definitionOfDone,
+  );
+  if (!Object.hasOwn(record, 'reopened')) return record;
+  // Closed-state proof moved aside by appendMilestone; wave projects only.
+  if (!isWaveProject(record)) fail();
+  let previous = 0;
+  for (const entry of record.reopened) {
+    mapped(entry, record.definitionOfDone);
+    if (entry.revision <= previous || entry.revision >= record.revision) fail('project_revision');
+    previous = entry.revision;
+  }
+  return record;
+}
 function stored(kind, value) {
-  if (kind === 'project') return mapped(dated(object(value, projectFields)), value.definitionOfDone);
+  if (kind === 'project') return projectRecord(value);
   const fields = { milestone: milestoneFields, epic: epicFields, task: taskFields }[kind];
   const record = dated(object(value, { ...fields, ...metaFields }));
   if (kind === 'task' && record.dependsOn.includes(record.id)) fail('project_dag');
@@ -367,27 +488,31 @@ function hierarchy({ milestones, epics, tasks }, complete = { milestones: true, 
   for (const t of tasks) visit(t.id);
 }
 function projectSpec(value) {
-  const s = object(value, {
-    ...projectHeader,
-    milestones: v =>
-      list(
-        v,
-        x => object(x, milestoneFields),
-        x => x.id,
-      ),
-    epics: v =>
-      list(
-        v,
-        x => object(x, epicFields),
-        x => x.id,
-      ),
-    tasks: v =>
-      list(
-        v,
-        x => object(x, taskFields),
-        x => x.id,
-      ),
-  });
+  const s = extended(
+    value,
+    {
+      ...projectHeader,
+      milestones: v =>
+        list(
+          v,
+          x => object(x, milestoneFields),
+          x => x.id,
+        ),
+      epics: v =>
+        list(
+          v,
+          x => object(x, epicFields),
+          x => x.id,
+        ),
+      tasks: v =>
+        list(
+          v,
+          x => object(x, taskFields),
+          x => x.id,
+        ),
+    },
+    { execution },
+  );
   hierarchy(s);
   return s;
 }
@@ -396,49 +521,66 @@ function count(value) {
   if (c.returned > c.total || c.complete !== (c.returned === c.total)) fail('project_completeness');
   return c;
 }
+const snapshotSets = ['milestones', 'epics', 'tasks', 'currentAttempts', 'riskApprovals'];
+// Gate runs are distinct from each other and from current task runs.
+function gateIdentity(s) {
+  const runs = new Set(s.currentAttempts.map(a => a.runId)),
+    numbers = new Set();
+  for (const g of s.gates) {
+    if (runs.has(g.runId) || numbers.has(g.number)) fail('project_identity');
+    runs.add(g.runId);
+    numbers.add(g.number);
+  }
+}
 function snapshot(value) {
-  const s = object(value, {
-    schemaVersion: one,
-    project: v => stored('project', v),
-    revision: int,
-    milestones: v =>
-      list(
-        v,
-        x => stored('milestone', x),
-        x => x.id,
-      ),
-    epics: v =>
-      list(
-        v,
-        x => stored('epic', x),
-        x => x.id,
-      ),
-    tasks: v =>
-      list(
-        v,
-        x => stored('task', x),
-        x => x.id,
-      ),
-    currentAttempts: v =>
-      list(
-        v,
-        x => dated(object(x, attemptFields)),
-        x => x.taskId,
-      ),
-    riskApprovals: v =>
-      list(
-        v,
-        x => object(x, approvalFields),
-        x => x.taskId,
-      ),
-    completeness: v =>
-      object(
-        v,
-        Object.fromEntries(['milestones', 'epics', 'tasks', 'currentAttempts', 'riskApprovals'].map(k => [k, count])),
-      ),
-  });
+  const s = extended(
+    value,
+    {
+      schemaVersion: one,
+      project: v => stored('project', v),
+      revision: int,
+      milestones: v =>
+        list(
+          v,
+          x => stored('milestone', x),
+          x => x.id,
+        ),
+      epics: v =>
+        list(
+          v,
+          x => stored('epic', x),
+          x => x.id,
+        ),
+      tasks: v =>
+        list(
+          v,
+          x => stored('task', x),
+          x => x.id,
+        ),
+      currentAttempts: v =>
+        list(
+          v,
+          x => dated(object(x, attemptFields)),
+          x => x.taskId,
+        ),
+      riskApprovals: v =>
+        list(
+          v,
+          x => object(x, approvalFields),
+          x => x.taskId,
+        ),
+      completeness: v =>
+        extended(v, Object.fromEntries(snapshotSets.map(k => [k, count])), {
+          gates: count,
+        }),
+    },
+    { gates: v => list(v, gateRecord, g => g.id) },
+  );
+  // Wave snapshots always carry their gate set; legacy snapshots never do.
+  const wave = isWaveProject(s.project);
+  if (wave !== Object.hasOwn(s, 'gates') || wave !== Object.hasOwn(s.completeness, 'gates')) fail();
   if (s.project.revision !== s.revision) fail('project_revision');
-  for (const key of ['milestones', 'epics', 'tasks', 'currentAttempts', 'riskApprovals']) {
+  for (const key of wave ? [...snapshotSets, 'gates'] : snapshotSets) {
     if (s[key].length !== s.completeness[key].returned || s[key].some(r => r.projectId !== s.project.projectId))
       fail('project_identity');
     if (['milestones', 'epics', 'tasks'].includes(key) && s[key].some(r => r.revision > s.revision))
@@ -468,6 +610,7 @@ function snapshot(value) {
     const t = tasks.get(r.taskId);
     if ((!t && s.completeness.tasks.complete) || (t && r.taskRevision !== t.revision)) fail('project_revision');
   }
+  if (wave) gateIdentity(s);
   return s;
 }
 function action(value) {
@@ -503,6 +646,34 @@ function action(value) {
     return object(value, { op: member(['approveRisk']), taskId: slug, taskRevision: int });
   if (value.op === 'reserveAttempt')
     return object(value, { op: member(['reserveAttempt']), taskId: slug, retryFailed: bool });
+  if (value.op === 'appendMilestone')
+    return object(value, {
+      op: member(['appendMilestone']),
+      milestone: v => object(v, milestoneFields),
+      epics: v =>
+        list(
+          v,
+          x => object(x, epicFields),
+          x => x.id,
+          1,
+        ),
+      tasks: v =>
+        list(
+          v,
+          x => object(x, taskFields),
+          x => x.id,
+          1,
+        ),
+    });
+  if (value.op === 'reserveGate')
+    return object(value, {
+      op: member(['reserveGate']),
+      containers: gateContainers,
+      baseSha: sha,
+      headSha: sha,
+      merges,
+      retry: bool,
+    });
   fail();
 }
 const normalize = {
@@ -546,9 +717,13 @@ const normalize = {
       fail('project_revision');
     if (c.action.op === 'transition' && c.action.kind === 'project' && c.action.id !== c.projectId)
       fail('project_identity');
+    if (c.action.op === 'reserveGate' && c.action.containers.some(x => x.kind === 'project' && x.id !== c.projectId))
+      fail('project_identity');
     return c;
   },
   installBinding: v => object(v, bindingFields),
+  gate: gateRecord,
+  gateBinding: v => object(v, gateBindingFields),
   taskContract: v => {
     const c = object(v, taskContractFields);
     if (c.dependsOn.includes(c.taskId)) fail('project_dag');
@@ -557,20 +732,26 @@ const normalize = {
   taskRunInput: v => {
     const input = object(v, {
       schemaVersion: one,
-      projectContext: v =>
-        object(v, {
-          projectId: uuid,
-          id: slug,
-          root: absolute,
-          title: short,
-          definitionOfDone: criteria,
-          constraints: v => list(v, text),
-          businessContext: contextText,
-          architectureRefs: refs,
-        }),
+      projectContext: v => object(v, projectContextFields),
       task: v => normalize.taskContract(v),
     });
     if (input.projectContext.projectId !== input.task.projectId) fail('project_identity');
+    return input;
+  },
+  gateRunInput: v => {
+    const input = object(v, {
+      schemaVersion: one,
+      projectContext: v => object(v, projectContextFields),
+      gate: v => object(v, { containers: gateContainers, baseSha: sha, headSha: sha }),
+      tasks: v =>
+        list(
+          v,
+          x => normalize.taskContract(x),
+          t => t.taskId,
+          1,
+        ),
+    });
+    if (input.tasks.some(t => t.projectId !== input.projectContext.projectId)) fail('project_identity');
     return input;
   },
 };
@@ -593,7 +774,17 @@ export function directorBytes(kind, input, options) {
     bytes.length + (kind === 'taskRunInput' ? Buffer.byteLength(PREFIX) : 0) > MAX_TASK_BYTES
   )
     fail('project_task_too_large');
+  if (kind === 'gateRunInput' && bytes.length + Buffer.byteLength(GATE_PREFIX) > MAX_GATE_BYTES)
+    fail('project_gate_too_large');
   return bytes;
+}
+/** Wave cadence with branch integration; every other project keeps legacy semantics. */
+export function isWaveProject(project) {
+  return project?.execution?.cadence === 'wave' && project.execution.integration === 'branch';
+}
+/** Whether a prerequisite in `status` admits dependants to ready/running. */
+export function dependencySatisfied(project, status) {
+  return (isWaveProject(project) ? ['integrated', 'accepted', 'released'] : ['accepted', 'released']).includes(status);
 }
 function contract(task) {
   return {
@@ -622,7 +813,15 @@ export function buildDirectorTaskInput(input, options) {
     task: v => normalizeDirectorRecord('task', v, options),
   });
   if (project.projectId !== task.projectId) fail('project_identity');
-  const projectContext = {
+  const projectContext = contextOf(project);
+  return (
+    PREFIX +
+    directorBytes('taskRunInput', { schemaVersion: 1, projectContext, task: contract(task) }, options).toString('utf8')
+  );
+}
+// Immutable project context shared by task and gate inputs; never `execution`.
+function contextOf(project) {
+  return {
     projectId: project.projectId,
     id: project.id,
     root: project.root,
@@ -632,10 +831,95 @@ export function buildDirectorTaskInput(input, options) {
     businessContext: project.businessContext,
     architectureRefs: project.architectureRefs,
   };
-  return (
-    PREFIX +
-    directorBytes('taskRunInput', { schemaVersion: 1, projectContext, task: contract(task) }, options).toString('utf8')
+}
+/** Exact Run task text for a wave integration gate: frozen contracts of the
+ * covered tasks in `gate.merges` order. Options default to no known values. */
+export function buildGateInput(input, options = { knownValues: [] }) {
+  assertDirectorSafe(input, options);
+  const { project, gate, tasks } = object(input, {
+    project: v => normalizeDirectorRecord('project', v, options),
+    gate: v => normalizeDirectorRecord('gate', v, options),
+    tasks: v =>
+      list(
+        v,
+        x => normalizeDirectorRecord('task', x, options),
+        t => t.id,
+        1,
+      ),
+  });
+  if (!isWaveProject(project)) fail('project_gate_unsupported');
+  const byId = new Map(tasks.map(t => [t.id, t]));
+  if (
+    gate.projectId !== project.projectId ||
+    tasks.some(t => t.projectId !== project.projectId) ||
+    byId.size !== gate.merges.length ||
+    gate.merges.some(m => !byId.has(m.taskId))
+  )
+    fail('project_identity');
+  const body = {
+    schemaVersion: 1,
+    projectContext: contextOf(project),
+    gate: { containers: gate.containers, baseSha: gate.baseSha, headSha: gate.headSha },
+    tasks: gate.merges.map(m => contract(byId.get(m.taskId))),
+  };
+  return GATE_PREFIX + directorBytes('gateRunInput', body, options).toString('utf8');
+}
+/** Install binding for a gate Run; mergesHash covers the canonical merges JSON. */
+export function gateBindingFor(input, options = { knownValues: [] }) {
+  const gate = normalizeDirectorRecord('gate', input, options);
+  return normalizeDirectorRecord(
+    'gateBinding',
+    {
+      schemaVersion: 1,
+      kind: 'gate',
+      projectId: gate.projectId,
+      gateId: gate.id,
+      number: gate.number,
+      runId: gate.runId,
+      baseSha: gate.baseSha,
+      headSha: gate.headSha,
+      mergesHash: createHash('sha256').update(JSON.stringify(gate.merges)).digest('hex'),
+    },
+    options,
   );
+}
+
+/** Pure appendMilestone check: a closed wave project accepts one new milestone
+ * whose epics/tasks are new and whose dependencies are new or closed tasks. */
+export function assertProjectReopen(input) {
+  assertDirectorSafe(input, { knownValues: [] });
+  const { snapshot: s, action: a } = object(input, { snapshot, action });
+  if (a.op !== 'appendMilestone') fail();
+  const p = s.project;
+  if (
+    !isWaveProject(p) ||
+    !['accepted', 'released'].includes(p.status) ||
+    p.paused ||
+    Object.values(s.completeness).some(c => !c.complete) ||
+    s.currentAttempts.some(r => !settledStates.includes(r.status)) ||
+    (p.reopened?.length ?? 0) >= MAX_REOPENED
+  )
+    fail('project_append_blocked');
+  const taken = key => new Set(s[key].map(r => r.id));
+  const [milestones, epics, tasks] = ['milestones', 'epics', 'tasks'].map(taken);
+  if (milestones.has(a.milestone.id) || a.epics.some(e => epics.has(e.id)) || a.tasks.some(t => tasks.has(t.id)))
+    fail('project_identity_conflict');
+  const added = new Set(a.epics.map(e => e.id));
+  if (a.epics.some(e => e.milestoneId !== a.milestone.id) || a.tasks.some(t => !added.has(t.epicId)))
+    fail('project_parent_invalid');
+  const fresh = new Map(a.tasks.map(t => [t.id, t]));
+  const closed = id => s.tasks.some(d => d.id === id && ['accepted', 'released'].includes(d.status));
+  if (a.tasks.some(t => t.dependsOn.some(id => !fresh.has(id) && !closed(id)))) fail('project_dependency_invalid');
+  const state = new Map();
+  const visit = id => {
+    if (state.get(id) === 'active') fail('project_dependency_invalid');
+    if (state.has(id) || !fresh.has(id)) return;
+    state.set(id, 'active');
+    for (const dep of fresh.get(id).dependsOn) visit(dep);
+    state.set(id, 'done');
+  };
+  for (const id of fresh.keys()) visit(id);
+  if (s.tasks.length + a.tasks.length > MAX_ITEMS || s.epics.length + a.epics.length > MAX_ITEMS) fail('project_limit');
 }
 
 /** Structural lifecycle checks are NOT trusted evidence authorization. Store
@@ -701,7 +985,7 @@ export function assertProjectTransition(input) {
   if (['ready', 'running'].includes(v.to) && t) {
     if (
       !s.completeness.tasks.complete ||
-      t.dependsOn.some(id => !s.tasks.some(d => d.id === id && ['accepted', 'released'].includes(d.status)))
+      t.dependsOn.some(id => !s.tasks.some(d => d.id === id && dependencySatisfied(s.project, d.status)))
     )
       fail('project_dependency');
     if (t.riskApprovalRequired && !s.riskApprovals.some(a => a.taskId === t.id && a.taskRevision === t.revision))

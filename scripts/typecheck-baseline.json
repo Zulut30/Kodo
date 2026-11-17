@@ -386,8 +386,8 @@
   {
     "file": "runtime/project-contracts.mjs",
     "code": "TS2739",
-    "message": "Type '{ [k: string]: any; }' is missing the following properties from type '{ epics: any; milestones: any; tasks: any; }': epics, milestones, tasks",
-    "count": 2
+    "message": "Type '{ [k: string]: any; }' is missing the following properties from type '{ milestones: boolean; epics: boolean; tasks: boolean; }': milestones, epics, tasks",
+    "count": 1
   },
   {
     "file": "runtime/project-director.mjs",

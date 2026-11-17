@@ -66,6 +66,31 @@ Command: `{schemaVersion:1,commandId,projectId,expectedRevision,actor,reason,act
 
 Хранилище использует additive namespaced tables/version registry в существующем `Store.db`, без захвата `user_version` и переписывания legacy Run. Перед первой миграцией — Node24 SQLite consistent backup с WAL, затем atomic migration; резервная копия остаётся вне Git в `project-backups/migration-*`. Offline restore требует закрытых handles и защиты более новых записей. Reserve фиксирует Attempt/runId/Task revision/contractHash; install атомарно связывает полный legacy Run и binding. Повтор после crash согласует ту же reservation, не создаёт второй Run. Legacy прямые callers сохраняют прежний default I/O.
 
+## Волновой режим: данные
+
+Слой данных для больших проектов: задачи интегрируются в ветку волнами, а общий gate Run проверяет их вместе. Здесь описаны только данные и проверки Store. Исполнение волн принадлежит директору.
+
+**`execution`.** ProjectSpec и запись Project принимают необязательное `execution: {cadence, integration, watchdog?}`. Допустимы только `{task, frontier}` (эквивалент legacy) и `{wave, branch}`, иначе `project_execution_unsupported`; неизвестный ключ — `project_schema`. `watchdog: {stalledRounds: 1..5|null, rejectUnchanged}` хранится как задан. Значение wave по умолчанию `{stalledRounds:2, rejectUnchanged:true}` подставляет директор при запуске. Необязательные поля пишутся после обязательных. Проект без `execution` даёт прежние байты spec, record, snapshot, events и command; это закреплено golden-хэшами в `tests/project-wave-contracts.test.mjs` и `tests/project-wave-store.test.mjs`. `buildDirectorTaskInput` и `directorContractHash` от `execution` не зависят.
+
+**Зависимости.** `dependencySatisfied(project, status)`: для wave (`isWaveProject(project)`) — `integrated|accepted|released`, иначе — `accepted|released`. Правило используют `assertProjectTransition` (переход в ready/running) и planner (блокировка и critical path). Строки причин прежние: `dependency_not_accepted:<id>`.
+
+**`appendMilestone {milestone, epics:[1..], tasks:[1..]}`** — единственный способ добавить работу в закрытый wave-проект. Чистая проверка `assertProjectReopen({snapshot, action})` требует:
+
+- wave-проект в accepted|released, не на паузе, полный snapshot, все текущие попытки settled, иначе `project_append_blocked`;
+- только новые id, иначе `project_identity_conflict`;
+- новые эпики только под новым milestone, новые задачи только под новыми эпиками, иначе `project_parent_invalid`;
+- зависимости только на новые задачи (без циклов) или на существующие accepted|released, иначе `project_dependency_invalid`. Integrated не подходит.
+
+Store в той же `BEGIN IMMEDIATE` переводит Project в running без lifecycle transition. Evidence и mappings Project переносятся в `reopened[]`: до 100 записей `{status, revision, reopenedAt, evidence, mappings}`, только у wave-записи. Так старые и новые refs не дают неоднозначного bound Run. Закрытые дочерние записи не меняются, новые вставляются proposed. Пишется одно событие `appendMilestone`, CAS и replay работают как у прочих команд. `insert` под accepted родителем по-прежнему `project_insertion_blocked`, transition accepted→running по-прежнему запрещён.
+
+**Gate record** хранится в `kodo_project_records` с `kind:'gate'` и uuid id: `{schemaVersion, id, projectId, number, containers, runId, baseSha, headSha, merges, installed, createdAt, updatedAt}`. `containers` — непрерывная цепочка от узкого контейнера к широкому: epic ⊂ milestone ⊂ project. `merges` — 1–1000 записей `{taskId, attemptId, runId, mergeCommit}`.
+
+`reserveGate {containers, baseSha, headSha, merges, retry}` работает только для wave, иначе `project_gate_unsupported`. Цепочка должна существовать и быть открытой. `merges` покрывают ровно задачи самого широкого контейнера, каждая в integrated|accepted с текущей попыткой (`attemptId`, `runId`). Нарушение — `project_gate_invalid`. Если для `containers[0]` уже есть гейт, новый допускается только с `retry:true` и только когда Run последнего гейта blocked/failed/cancelled, иначе `project_gate_exists`. Store генерирует id и runId, `number` = максимум по проекту + 1, событие `reserveGate` имеет entity `{kind:'gate', id}`.
+
+`installGateRun({binding, runDraft})` проверяет, что `binding` байт-в-байт равен `gateBindingFor(gate)` (`{schemaVersion, kind:'gate', projectId, gateId, number, runId, baseSha, headSha, mergesHash}`, `mergesHash` — sha256 канонического JSON merges). `runDraft.task` должен совпадать с `buildGateInput({project, gate, tasks})`: префикс и JSON `{schemaVersion, projectContext, gate, tasks}` до 64 KiB, иначе `project_gate_too_large`. `runDraft.directorBinding` равен binding, остальные поля draft проверяются как в `installRun`. Свежая установка требует, чтобы гейт был последним для своего контейнера и его merges оставались текущими. Install ставит `installed` и повышает revision; повтор возвращает сохранённый Run.
+
+Snapshot wave-проекта содержит `gates` (все гейты по `number`) и `completeness.gates`, прочитанные в той же транзакции. У legacy-проекта этих ключей нет, а contracts отклоняют их несоответствие режиму. Progress добавляет строку `gates` только при наличии ключа. Миграция SQLite не менялась, её дайджест закреплён тестом.
+
 ## Lifecycle и текущие ограничения
 
 `proposed → ready → running → verifying → integrated → accepted → released`, плюс blocked/failed/cancelled; Attempt начинается с reserved. Ни текст «completed», ни `verified:true`, ни переданные `eligibleStates` не заменяют trusted authorizer. Он await-ит доказательства до write transaction; Store повторяет CAS/control/binding checks внутри неё, без await. Safety проверяет декодированные ключи и значения до hash/write/output, включая короткие known values, PEM и изменения от redaction; ошибки не раскрывают совпавший секрет.
