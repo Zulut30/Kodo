@@ -114,7 +114,9 @@ async function projectRepository(state, secrets) {
   const contracts = await import('./project-contracts.mjs');
   const { openProjectStore } = await import('./project-store.mjs');
   return openProjectStore({
-    store: { db: port, secrets, createRun: () => fail('report_unavailable') },
+    // Structural validation only: keys mask printed values after the build, so a key
+    // equal to a record field name never makes a valid snapshot unreadable.
+    store: { db: port, secrets: {}, createRun: () => fail('report_unavailable') },
     contracts,
   });
 }
@@ -202,12 +204,9 @@ function humanProject(report) {
   ].join('\n');
 }
 
-const human = report =>
-  report.kind === 'run'
-    ? humanRun(report)
-    : report.kind === 'project'
-      ? humanProject(report)
-      : `Report: ${report.code}`;
+// The view comes from the parsed arguments, never from a (possibly redacted) report value.
+const human = (report, view) =>
+  view === 'run' ? humanRun(report) : view === 'project' ? humanProject(report) : `Report: ${report.code}`;
 
 /** Build the report from one consistent read-only view of the state and name that view. */
 async function buildReport(state, options, secrets) {
@@ -266,5 +265,6 @@ export async function reportCli(argv, ports = {}) {
     report = { schemaVersion: 1, kind: 'error', status: exitCode === 1 ? 'invalid' : 'blocked', code };
   }
   const json = options?.json || (Array.isArray(argv) && argv.includes('--json'));
-  return { report, exitCode, output: json ? JSON.stringify(report, null, 2) : human(report) };
+  const view = exitCode !== 0 ? 'error' : options?.projectId ? 'project' : 'run';
+  return { report, exitCode, output: json ? JSON.stringify(report, null, 2) : human(report, view) };
 }

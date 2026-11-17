@@ -312,8 +312,9 @@ function programToken(command) {
   }
   const [first, ...rest] = text.split(/\s+/);
   if (/["']/.test(first)) return null;
-  // An unquoted path followed by more text may be one path with a space (`C:\Customer Label.exe`): never guessed.
-  if (separator.test(first) && rest.length) return null;
+  // Unquoted text with both a space and a path separator may hold one path with spaces
+  // (`C:\Customer Label.exe`, `Customer Files/tools/lint.cmd --fix`): never guessed.
+  if (rest.length && separator.test(text)) return null;
   return first;
 }
 
@@ -633,9 +634,13 @@ function waitTotals(reports, expected = reports.length) {
 
 function taskRow(task, own, current, reportOf) {
   const runs = own.map(attempt => reportOf(attempt.runId));
-  const count = Math.max(integer(current?.number) ?? 0, own.length);
-  // A reserved attempt without a saved Run, or an attempt absent from the rows, is unknown.
-  const missing = runs.some(report => report === null) || count > own.length;
+  const numbers = own.map(attempt => integer(attempt.number) ?? 0);
+  // The highest number seen in the history or the current pointer: either may be the one left.
+  const count = Math.max(integer(current?.number) ?? 0, ...numbers, own.length);
+  // A reserved attempt without a saved Run, or an attempt absent from the rows (any gap in
+  // 1..count), is unknown.
+  const missing =
+    runs.some(report => report === null) || count > own.length || numbers.some((number, index) => number !== index + 1);
   const sum = pick => (missing ? null : known(runs.map(pick)));
   return {
     row: {

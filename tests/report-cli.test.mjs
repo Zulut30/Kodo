@@ -792,3 +792,16 @@ test(
     });
   },
 );
+
+test('credentials equal to project field names mask values only: the project report stays readable', async t => {
+  const f = await fixture(t);
+  const ports = { home: f.home, secrets: { A: 'projectId', B: 'currentAttempts', C: 'project' } };
+  const json = await reportCli(['--project', f.projectId, '--json'], ports);
+  assert.equal(json.exitCode, 0, json.output);
+  assert.equal(json.report.projectId, f.projectId);
+  assert.ok(json.report.totals && json.report.completeness, 'schema fields keep their names');
+  // `kind: "project"` may be masked, the text view still follows the parsed arguments.
+  const human = await reportCli(['--project', f.projectId], ports);
+  assert.equal(human.exitCode, 0, human.output);
+  assert.match(human.output, new RegExp(`Project ${f.projectId}`));
+});

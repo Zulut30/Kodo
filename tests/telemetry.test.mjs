@@ -891,6 +891,7 @@ test('a legacy command string yields a whole executable name or null, and usage 
         'C:/Pri"vate/lint.cmd',
         '/usr/local/bin/node --test',
         'C:\Customer Label.exe',
+        'Customer Files/tools/lint.cmd --fix',
         'npm test',
         { command: 'C:/Private Account/bin/build.cmd', args: [] },
       ].map(command => ({ kind: 'test', command, exitCode: 0 })),
@@ -899,7 +900,7 @@ test('a legacy command string yields a whole executable name or null, and usage 
   const report = buildRunReport(run, finishedEvents(), { now: NOW });
   assert.deepEqual(
     report.checks.runs.map(row => row.executable),
-    ['lint.cmd', 'test-runner', null, null, null, null, null, null, 'npm', 'build.cmd'],
+    ['lint.cmd', 'test-runner', null, null, null, null, null, null, null, 'npm', 'build.cmd'],
   );
   assert.equal(report.usage.usage.semantics, null);
   const text = JSON.stringify(report);
@@ -993,4 +994,22 @@ test('checks of a round closed by repair_required are closed, not unclosed, afte
   assert.ok(!report.provenance.notes.includes('check_unclosed'));
   const stage = report.timing.stages.verification;
   assert.deepEqual([stage.durationMs, stage.known, stage.total], [null, 0, 1]);
+});
+
+test('a surviving history row above a missing one counts the gap even without a current pointer', () => {
+  const job = (seq, state, at) => ({ jobId: 'j2', seq, type: 'state', data: { state }, time: iso(T0 + at) });
+  const runs = { r2: finishedRun({ id: 'r2' }) };
+  const events = { r2: [event(1, 'created', T0), event(2, 'succeeded', T0 + 9000)] };
+  // No current pointer and no row 1: only the history row of attempt 2 survived.
+  const snapshot = projectSnapshot([task('t1', 'blocked')], []);
+  const report = buildProjectReport(snapshot, runs, events, {
+    now: NOW,
+    attempts: [attempt('t1', 2, 'r2', 'blocked')],
+    jobEvents: { r2: [job(1, 'queued', 0), job(2, 'running', 9)] },
+  });
+  assert.equal(report.tasks[0].attempts, 2);
+  assert.deepEqual(report.completeness.runs, { known: 1, total: 2, complete: false });
+  assert.equal(report.totals.waits.queue.waitMs, null);
+  assert.equal(report.totals.waits.queue.measuredMs, 9);
+  assert.equal(report.totals.waits.queue.complete, false);
 });
