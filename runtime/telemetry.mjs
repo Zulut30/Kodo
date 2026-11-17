@@ -11,7 +11,7 @@
  * ranked against each other. See docs/OBSERVABILITY.md.
  */
 import { aggregateMetrics } from './metrics.mjs';
-import { deliveryOperations } from './delivery-operations.mjs';
+import { DELIVERY_OPERATIONS, OPERATION_EVENT } from './delivery-operations.mjs';
 
 export const REPORT_SCHEMA_VERSION = 1;
 export const REPORT_STAGES = Object.freeze([
@@ -53,6 +53,7 @@ const LIMITATIONS = Object.freeze([
   'native_request_count_unavailable',
 ]);
 const MAX_FAILURES = 200;
+const deliveryOutcomes = new Set(['confirmed', 'reconciled', 'absent']);
 
 const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const list = value => (Array.isArray(value) ? value : []);
@@ -84,15 +85,49 @@ function total(samples) {
   };
 }
 
+/**
+ * The Engine stores each delivery event, then a `delivery` or `release` copy of
+ * it whose `data.type` names the original. A copy is not a new observation: it
+ * would close every wait it follows.
+ */
+const mirrored = event =>
+  (event.type === 'delivery' || event.type === 'release') && typeof event.data?.type === 'string';
+
 function ordered(events) {
   return list(events)
     .filter(record)
     .map((event, index) => ({ event, index }))
     .sort((a, b) => (integer(a.event.seq) ?? a.index) - (integer(b.event.seq) ?? b.index))
-    .map(item => item.event);
+    .map(item => item.event)
+    .filter(event => !mirrored(event));
 }
 
-function stageTimings(run, events, sessions) {
+/**
+ * Every attempt of a remote delivery effect: each journal intent starts one,
+ * the next read-back of the same operation closes it. `absent` is a failed
+ * attempt; an intent without a read-back (superseded by a retry or still open)
+ * stays `uncertain` with an unknown duration. A read-back without an open
+ * intent (a later reconciliation) changes no attempt.
+ */
+function deliveryAttempts(events) {
+  const rows = [],
+    open = new Map();
+  for (const event of events) {
+    const operation = event.data?.operation;
+    if (event.type !== OPERATION_EVENT || !DELIVERY_OPERATIONS.includes(operation)) continue;
+    if (event.data.phase === 'intent') {
+      const row = { operation, status: 'uncertain', intentAt: millis(event.time), outcomeAt: null };
+      rows.push(row);
+      open.set(operation, row);
+    } else if (event.data.phase === 'outcome' && deliveryOutcomes.has(event.data.status) && open.has(operation)) {
+      Object.assign(open.get(operation), { status: event.data.status, outcomeAt: millis(event.time) });
+      open.delete(operation);
+    }
+  }
+  return rows;
+}
+
+function stageTimings(run, deliveries, sessions) {
   const operations = Array.isArray(run.coordinatorOperations) ? run.coordinatorOperations : null;
   const stages = Object.fromEntries(
     REPORT_STAGES.map(stage => [stage, { samples: [], sessions: sessions ? 0 : null, operations: 0, sources: [] }]),
@@ -109,17 +144,20 @@ function stageTimings(run, events, sessions) {
     if (stage) add(stage, duration(attempt.metrics?.durationMs), 'session-attempts', 'sessions');
     else unmapped++;
   }
+  let openOperations = 0;
   for (const operation of operations || []) {
     const stage = stages[operationStages[operation?.kind]];
-    if (stage) add(stage, duration(operation.durationMs), 'coordinator-operations', 'operations');
+    const sample = duration(operation?.durationMs);
+    if (sample === null) openOperations++; // Started and unfinished, or saved without a duration.
+    if (stage) add(stage, sample, 'coordinator-operations', 'operations');
   }
   for (const row of list(run.checks?.results))
     add(stages.verification, duration(row?.durationMs), 'check-results', null);
   // Remote delivery effects only: intent to read-back. Local preparation and CI waits are reported elsewhere.
-  for (const item of deliveryOperations(events))
+  for (const item of deliveries)
     add(
       stages[item.operation === 'release' ? 'release' : 'delivery'],
-      interval(millis(item.intentAt), millis(item.outcomeAt)),
+      interval(item.intentAt, item.outcomeAt),
       'delivery-operation-journal',
       'operations',
     );
@@ -135,7 +173,7 @@ function stageTimings(run, events, sessions) {
       source: stage.sources.join('+') || null,
     };
   }
-  return { stages: result, unmapped };
+  return { stages: result, unmapped, openOperations };
 }
 
 /** Time each job spent queued or blocked before it left that state, from job state receipts. */
@@ -189,17 +227,18 @@ function eventWindows(events, type) {
   return { waitMs: sum.value, polls, known: sum.known, total: sum.total, source: polls ? 'delivery-events' : null };
 }
 
-function commandText(command) {
-  if (typeof command === 'string') return command.slice(0, 500);
-  if (!record(command) || typeof command.command !== 'string') return null;
-  return [command.command, ...list(command.args).filter(arg => typeof arg === 'string')].join(' ').slice(0, 500);
+/** The executable's base name only: directories and arguments can hold paths and secrets. */
+function executable(command) {
+  const program = typeof command === 'string' ? command.trim().split(/\s+/)[0] : command?.command;
+  const name = typeof program === 'string' ? program.split(/[\\/]/).pop() : null;
+  return typeof name === 'string' && /^[A-Za-z0-9][\w.-]{0,63}$/.test(name) ? name : null;
 }
 
 function checks(run, events) {
   const rows = list(run.checks?.results).filter(record);
   const runs = rows.map(row => ({
     kind: slug(row.kind),
-    command: commandText(row.command),
+    executable: executable(row.command),
     durationMs: duration(row.durationMs),
     exitCode: Number.isSafeInteger(row.exitCode) ? row.exitCode : null,
   }));
@@ -245,7 +284,7 @@ function attempts(run, events, sessions) {
   };
 }
 
-function failures(run, events, sessions, operations) {
+function failures(run, events, sessions, deliveries) {
   const rows = [];
   for (const event of events) {
     const at = iso(event.time);
@@ -260,8 +299,10 @@ function failures(run, events, sessions, operations) {
   for (const row of list(run.checks?.results))
     if (record(row) && row.exitCode !== 0)
       rows.push({ code: code(row.reason, 'check_failed'), scope: `check:${slug(row.kind)}`, at: null });
-  for (const item of operations)
-    if (item.status === 'uncertain')
+  for (const item of deliveries)
+    if (item.status === 'absent')
+      rows.push({ code: 'delivery_absent', scope: `delivery:${item.operation}`, at: iso(item.outcomeAt) });
+    else if (item.status === 'uncertain')
       rows.push({ code: 'delivery_uncertain', scope: `delivery:${item.operation}`, at: iso(item.intentAt) });
   return { rows: rows.slice(0, MAX_FAILURES), truncated: rows.length > MAX_FAILURES };
 }
@@ -329,13 +370,14 @@ function timing(run, events, stages) {
   return { createdAt: iso(created), finishedAt: iso(finished), wallMs: interval(created, finished), stages };
 }
 
-function runNotes(run, report, { sessions, unmapped, truncated }) {
+function runNotes(run, report, { sessions, unmapped, openOperations, truncated }) {
   const notes = [];
   const add = (condition, note) => condition && notes.push(note);
   add(!terminalStates.has(run.state), 'run_not_finished');
   add(terminalStates.has(run.state) && report.timing.wallMs === null, 'wall_time_unknown');
   add(!sessions, 'session_attempts_missing');
   add(!Array.isArray(run.coordinatorOperations), 'coordinator_operations_missing');
+  add(openOperations > 0, 'coordinator_operation_incomplete');
   add(run.metrics?.historyComplete === false, 'history_incomplete');
   const measured = sessions?.length > 0,
     completeness = report.usage.completeness;
@@ -369,12 +411,12 @@ export function buildRunReport(run, events, { jobEvents = [], now = null } = {})
   if (!record(run)) throw new TypeError('Run report requires a saved run object');
   const sorted = ordered(events);
   const sessions = Array.isArray(run.sessionAttempts) ? run.sessionAttempts : null;
-  const operations = deliveryOperations(sorted);
-  const { stages, unmapped } = stageTimings(run, sorted, sessions);
+  const deliveries = deliveryAttempts(sorted);
+  const { stages, unmapped, openOperations } = stageTimings(run, deliveries, sessions);
   /** @type {any} The byte fields are spread from a computed object. */
   const usage = aggregateMetrics(sessions || []);
   if (!sessions) usage.sessions = null;
-  const failed = failures(run, sorted, sessions, operations);
+  const failed = failures(run, sorted, sessions, deliveries);
   const report = {
     schemaVersion: REPORT_SCHEMA_VERSION,
     kind: 'run',
@@ -401,7 +443,12 @@ export function buildRunReport(run, events, { jobEvents = [], now = null } = {})
       limitations: [],
     },
   };
-  report.provenance.notes = runNotes(run, report, { sessions, unmapped, truncated: failed.truncated });
+  report.provenance.notes = runNotes(run, report, {
+    sessions,
+    unmapped,
+    openOperations,
+    truncated: failed.truncated,
+  });
   report.provenance.complete = report.provenance.notes.length === 0;
   report.provenance.limitations = runLimitations(report);
   return report;
@@ -422,6 +469,49 @@ const lookup = (source, id) =>
 /** Sum of known values; null when there is nothing to sum or any value is unknown. */
 const known = values => (values.length ? total(values).value : null);
 
+const waitOf = window => ({ waitMs: window.waitMs, known: window.known, total: window.total });
+const waitKinds = Object.freeze({
+  queue: report => report.queue,
+  deliveryQueue: report => report.queue.delivery,
+  ci: report => report.checks.ci,
+});
+
+/** One attempt with its own Run: waits and failure codes stay visible after a retry succeeded. */
+function attemptRow(item, report) {
+  return {
+    taskId: slug(item.taskId),
+    number: integer(item.number),
+    runId: token(item.runId),
+    state: report?.state ?? null,
+    wallMs: report?.timing.wallMs ?? null,
+    // Without a saved Run neither the waits nor how many there were are known.
+    waits: Object.fromEntries(
+      Object.entries(waitKinds).map(([key, pick]) => [
+        key,
+        report ? waitOf(pick(report)) : { waitMs: null, known: 0, total: null },
+      ]),
+    ),
+    failures: report ? report.failures : null,
+  };
+}
+
+/** Waits summed over every attempt: unknown unless each attempt has a Run and each wait is closed. */
+function waitTotals(reports) {
+  return Object.fromEntries(
+    Object.entries(waitKinds).map(([key, pick]) => {
+      const found = reports.filter(Boolean).map(pick);
+      const known = found.reduce((sum, wait) => sum + wait.known, 0),
+        observed = found.reduce((sum, wait) => sum + wait.total, 0);
+      const complete = found.length === reports.length && known === observed;
+      const waitMs =
+        complete && observed > 0
+          ? found.filter(wait => wait.total > 0).reduce((sum, wait) => sum + wait.waitMs, 0)
+          : null;
+      return [key, { waitMs, known, total: found.length === reports.length ? observed : null, complete }];
+    }),
+  );
+}
+
 function taskRow(task, own, current, reportOf) {
   const runs = own.map(attempt => reportOf(attempt.runId));
   const count = Math.max(integer(current?.number) ?? 0, own.length);
@@ -441,6 +531,7 @@ function taskRow(task, own, current, reportOf) {
       lastRunState: runs.at(-1)?.state ?? null,
     },
     last: runs.at(-1) ?? null,
+    attempts: own.map((attempt, index) => ({ row: attemptRow(attempt, runs[index]), report: runs[index] })),
   };
 }
 
@@ -463,7 +554,7 @@ function projectBlockers(snapshot, rows) {
   return blockers;
 }
 
-function projectTotals(rows, runs) {
+function projectTotals(rows, runs, attemptReports) {
   const count = statuses => rows.filter(row => statuses.includes(row.status)).length;
   const tried = rows.filter(row => row.attempts > 0);
   const wallMs = known(tried.map(row => row.wallMs));
@@ -481,7 +572,10 @@ function projectTotals(rows, runs) {
     wallMs,
     // Verification time over wall time, both summed over attempted tasks; unknown when either is.
     verificationShare: wallMs && verificationMs !== null ? Math.round((verificationMs / wallMs) * 10000) / 10000 : null,
-    usage: aggregateMetrics(runs.flatMap(run => list(run.sessionAttempts))),
+    usage: null,
+    // Sum over the sessions of the Runs that were found; complete only when `usage` is not null.
+    observedUsage: aggregateMetrics(runs.flatMap(run => list(run.sessionAttempts))),
+    waits: waitTotals(attemptReports),
   };
 }
 
@@ -502,10 +596,16 @@ function snapshotCompleteness(snapshot) {
  * @param {any} snapshot Project snapshot (`repo.snapshot`).
  * @param {Map<string, any> | Record<string, any>} runsById Saved Runs by id.
  * @param {Map<string, any[]> | Record<string, any[]>} eventsByRun Saved Run events by Run id.
- * @param {{ now?: number, attempts?: any[] }} [options] `attempts`: every attempt
- *   `{ taskId, number, runId }` of the Project; defaults to the snapshot's current attempts.
+ * @param {{ now?: number, attempts?: any[], jobEvents?: Map<string, any[]> | Record<string, any[]> }} [options]
+ *   `attempts`: every attempt `{ taskId, number, runId }` of the Project; defaults to the snapshot's
+ *   current attempts. `jobEvents`: durable job receipts by Run id (see `buildRunReport`).
  */
-export function buildProjectReport(snapshot, runsById, eventsByRun, { now = null, attempts = undefined } = {}) {
+export function buildProjectReport(
+  snapshot,
+  runsById,
+  eventsByRun,
+  { now = null, attempts = undefined, jobEvents = {} } = {},
+) {
   if (!record(snapshot) || !record(snapshot.project)) throw new TypeError('Project report requires a snapshot');
   const current = new Map(
     list(snapshot.currentAttempts)
@@ -517,7 +617,12 @@ export function buildProjectReport(snapshot, runsById, eventsByRun, { now = null
   const reportOf = runId => {
     if (!reports.has(runId)) {
       const run = typeof runId === 'string' ? lookup(runsById, runId) : undefined;
-      reports.set(runId, record(run) ? buildRunReport(run, list(lookup(eventsByRun, runId)), { now }) : null);
+      reports.set(
+        runId,
+        record(run)
+          ? buildRunReport(run, list(lookup(eventsByRun, runId)), { now, jobEvents: list(lookup(jobEvents, runId)) })
+          : null,
+      );
     }
     return reports.get(runId);
   };
@@ -533,10 +638,14 @@ export function buildProjectReport(snapshot, runsById, eventsByRun, { now = null
     );
   const found = [...reports.values()].filter(Boolean);
   const runs = [...reports.keys()].map(id => lookup(runsById, id)).filter(record);
+  const attemptRows = rows.flatMap(item => item.attempts);
   const totals = projectTotals(
     rows.map(item => item.row),
     runs,
+    attemptRows.map(item => item.report),
   );
+  // A total over an incomplete attempt history (a missing Run, an unknown session count) is unknown.
+  if (totals.sessions !== null) totals.usage = totals.observedUsage;
   const attemptsTotal = totals.attempts;
   const completeness = {
     ...snapshotCompleteness(snapshot),
@@ -565,6 +674,7 @@ export function buildProjectReport(snapshot, runsById, eventsByRun, { now = null
       tasks: countBy(snapshot.tasks),
     },
     tasks: rows.map(item => item.row),
+    attempts: attemptRows.map(item => item.row),
     totals,
     ...(Object.hasOwn(snapshot, 'gates')
       ? {

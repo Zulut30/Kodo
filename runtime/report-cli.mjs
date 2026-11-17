@@ -1,16 +1,14 @@
 /** Read-only `kodo report`: operational report of a saved Run or Project.
  *
- * Arguments are parsed strictly before credentials or state are touched. The
- * state database is opened read-only (no Store, no migration, no lease and no
- * file created), no model or provider is started, and only redacted,
- * fixed-vocabulary data is printed. Diagnostics are constant codes that never
- * echo arguments or paths. See docs/OBSERVABILITY.md.
+ * Arguments are parsed strictly before credentials or state are touched. Keys
+ * are only read for redaction (never migrated), the state database is read
+ * through one immutable snapshot (`report-state.mjs`: no Store, no migration,
+ * no lease, no sidecar and no file created or changed), no model or provider
+ * is started, and only redacted, fixed-vocabulary data is printed. Diagnostics
+ * are constant codes that never echo arguments or paths. See docs/OBSERVABILITY.md.
  */
-import path from 'node:path';
-import { statSync } from 'node:fs';
-import { pathToFileURL } from 'node:url';
-import { DatabaseSync } from 'node:sqlite';
 import { buildRunReport, buildProjectReport } from './telemetry.mjs';
+import { readRedactionSecrets, readReportState } from './report-state.mjs';
 
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const fail = code => {
@@ -34,41 +32,6 @@ function argumentsFor(argv) {
   return options;
 }
 
-/**
- * A strictly read-only connection. A cleanly closed WAL database has no sidecar
- * files and a plain read-only open would create them, so without pending WAL
- * frames the file is opened immutable. Pending frames without their shared
- * memory file need writer recovery, which a report never performs.
- */
-function openState(home) {
-  const filename = path.join(home, 'state.sqlite');
-  if (!statSync(filename, { throwIfNoEntry: false })?.isFile()) fail('report_not_found');
-  const wal = statSync(`${filename}-wal`, { throwIfNoEntry: false }),
-    shared = statSync(`${filename}-shm`, { throwIfNoEntry: false });
-  if (wal?.size && !shared?.isFile()) fail('report_unavailable');
-  let db;
-  if (wal?.size) db = new DatabaseSync(filename, { readOnly: true });
-  else {
-    const uri = pathToFileURL(path.resolve(filename));
-    uri.searchParams.set('mode', 'ro');
-    uri.searchParams.set('immutable', '1');
-    db = new DatabaseSync(uri.href, { readOnly: true });
-  }
-  try {
-    db.exec('PRAGMA query_only=ON; PRAGMA busy_timeout=5000');
-    const tables = new Set(
-      db
-        .prepare("SELECT name FROM sqlite_master WHERE type='table'")
-        .all()
-        .map(row => String(row.name)),
-    );
-    return { db, tables };
-  } catch (error) {
-    db.close();
-    throw error;
-  }
-}
-
 function readRun(state, id) {
   if (!state.tables.has('runs')) fail('report_not_found');
   const row = state.db.prepare('SELECT body FROM runs WHERE id=?').get(id);
@@ -87,56 +50,79 @@ function readEvents(state, id) {
     .map(row => ({ seq: row.seq, type: row.type, time: row.time, data: JSON.parse(String(row.data)) }));
 }
 
-/** State receipts of the durable jobs of this Run's plans (`run:<id>:<plan>` queues). */
-async function readJobEvents(home, runId) {
-  const { openJobReader } = await import('./job-store.mjs');
-  const jobs = openJobReader({ home });
-  try {
-    const rows = [];
-    for (const queue of jobs.queues().filter(name => name.startsWith(`run:${runId}:`)))
-      for (const job of jobs.list(queue))
-        for (const event of jobs.events(job.id))
-          rows.push({
-            jobId: job.id,
-            seq: event.seq,
-            type: event.type,
-            data: { state: event.data?.state },
-            time: event.time,
-          });
-    return rows;
-  } finally {
-    jobs.close();
-  }
+/**
+ * State receipts of the durable jobs of a Run's plans (`run:<id>:<plan>` queues),
+ * read from the same snapshot as the Run. No job store is opened: a second
+ * connection could see another state of the files or race a writer.
+ */
+function readJobEvents(state, runId) {
+  if (!['kodo_jobs', 'kodo_job_events', 'kodo_job_migrations'].every(name => state.tables.has(name))) return [];
+  const version = state.db.prepare('SELECT version FROM kodo_job_migrations ORDER BY version DESC LIMIT 1').get();
+  if (version?.version !== 1) fail('report_unavailable');
+  const prefix = `run:${runId}:`;
+  return state.db
+    .prepare('SELECT seq,job_id,type,data,time FROM kodo_job_events WHERE substr(queue,1,?)=? ORDER BY seq')
+    .all(prefix.length, prefix)
+    .map(row => ({
+      jobId: String(row.job_id),
+      seq: row.seq,
+      type: String(row.type),
+      data: { state: JSON.parse(String(row.data))?.state },
+      time: row.time,
+    }));
+}
+
+const projectTables = ['records', 'attempts', 'current', 'approvals', 'commands', 'events'].map(
+  name => `kodo_project_${name}`,
+);
+
+/**
+ * The Project repository validates each record exactly as `kodo project status`
+ * does, but opening it runs its migrator. The migrator only reads when a version
+ * row exists (it then verifies the digest and the tables); it writes (backup
+ * directory, backup file, DDL) only when the row is missing. A report therefore
+ * requires the row first, and its database port reports no file location, so
+ * the migrator's write branch stops at its location check before any write.
+ */
+async function projectRepository(state, secrets) {
+  if (!['kodo_project_migrations', ...projectTables].every(name => state.tables.has(name))) fail('report_not_found');
+  const version = state.db.prepare('SELECT version FROM kodo_project_migrations ORDER BY version DESC LIMIT 1').get();
+  if (version?.version !== 1) fail('report_unavailable');
+  const { db } = state;
+  const port = {
+    prepare: sql => db.prepare(sql),
+    exec: sql => db.exec(sql),
+    get isTransaction() {
+      return db.isTransaction;
+    },
+    location: () => null,
+  };
+  const contracts = await import('./project-contracts.mjs');
+  const { openProjectStore } = await import('./project-store.mjs');
+  return openProjectStore({
+    store: { db: port, secrets, createRun: () => fail('report_unavailable') },
+    contracts,
+  });
 }
 
 async function projectReport(state, projectId, secrets, now) {
-  if (
-    !['kodo_project_migrations', 'kodo_project_records', 'kodo_project_attempts'].every(name => state.tables.has(name))
-  )
-    fail('report_not_found');
-  const contracts = await import('./project-contracts.mjs');
-  const { openProjectStore } = await import('./project-store.mjs');
-  // The repository validates each record exactly as `kodo project status` does. Its Store
-  // port is this read-only connection: the migration already exists, so opening only
-  // verifies it, and the port cannot create a Run.
-  const repo = await openProjectStore({
-    store: { db: state.db, secrets, createRun: () => fail('report_unavailable') },
-    contracts,
-  });
+  const repo = await projectRepository(state, secrets);
   const snapshot = repo.snapshot(projectId);
   const attempts = state.db
     .prepare('SELECT task_id,number,run_id FROM kodo_project_attempts WHERE project_id=? ORDER BY task_id,number')
     .all(projectId)
     .map(row => ({ taskId: row.task_id, number: row.number, runId: row.run_id }));
   const runs = new Map(),
-    events = new Map();
+    events = new Map(),
+    jobEvents = new Map();
   for (const { runId } of attempts) {
     const row = state.tables.has('runs') && state.db.prepare('SELECT body FROM runs WHERE id=?').get(runId);
     if (!row) continue;
     runs.set(runId, JSON.parse(String(row.body)));
     events.set(runId, readEvents(state, runId));
+    jobEvents.set(runId, readJobEvents(state, runId));
   }
-  return buildProjectReport(snapshot, runs, events, { now, attempts });
+  return buildProjectReport(snapshot, runs, events, { now, attempts, jobEvents });
 }
 
 const time = value => {
@@ -173,15 +159,25 @@ function humanRun(report) {
   ].join('\n');
 }
 
+const wait = item => `${time(item.waitMs)} (${item.known}/${value(item.total)} known)`;
+const failureCodes = rows =>
+  rows === null ? 'unknown' : rows.length ? rows.map(item => `${item.code}@${item.scope}`).join(', ') : 'none';
+
 function humanProject(report) {
   const { totals } = report;
   return [
     `Project ${report.projectId} | status ${report.status} | revision ${value(report.revision)}`,
     `Tasks: ${totals.tasks} (accepted ${totals.accepted}, integrated ${totals.integrated}, failed ${totals.failed}, blocked ${totals.blocked}, cancelled ${totals.cancelled}, pending ${totals.pending}); attempts ${totals.attempts}; sessions ${value(totals.sessions)}`,
-    `Wall time: ${time(totals.wallMs)}; verification share: ${value(totals.verificationShare)}; total tokens ${value(totals.usage.usage.totalTokens)}`,
+    `Wall time: ${time(totals.wallMs)}; verification share: ${value(totals.verificationShare)}; total tokens ${value(totals.usage?.usage.totalTokens)} (observed ${value(totals.observedUsage.usage.totalTokens)})`,
+    `Waits: queue ${wait(totals.waits.queue)}, delivery queue ${wait(totals.waits.deliveryQueue)}, CI ${wait(totals.waits.ci)}`,
     ...report.tasks.map(
       row =>
         `  ${row.id}  ${row.status}  attempts ${row.attempts}  wall ${time(row.wallMs)}  last run ${value(row.lastRunState)}`,
+    ),
+    'Attempts:',
+    ...report.attempts.map(
+      row =>
+        `  ${row.taskId} #${value(row.number)} ${value(row.state)}: queue ${wait(row.waits.queue)}, delivery queue ${wait(row.waits.deliveryQueue)}, CI ${wait(row.waits.ci)}; failures ${failureCodes(row.failures)}`,
     ),
     `Blockers: ${report.blockers.length ? report.blockers.map(item => `${item.code}@${item.taskId ?? item.scope}`).join(', ') : 'none'}`,
     observations(report.provenance),
@@ -196,14 +192,26 @@ const human = report =>
       ? humanProject(report)
       : `Report: ${report.code}`;
 
+/** Build the report from one consistent read-only view of the state. */
+async function buildReport(state, options, secrets) {
+  const now = Date.now();
+  if (!options.runId) return projectReport(state, options.projectId, secrets, now);
+  const run = readRun(state, options.runId);
+  return buildRunReport(run, readEvents(state, options.runId), {
+    jobEvents: readJobEvents(state, options.runId),
+    now,
+  });
+}
+
 /**
  * @param {string[]} argv
- * @param {{ home?: string, secrets?: Record<string, string>, loadSecrets?: () => Promise<Record<string, string>> }} [ports]
- *   Supplied by the coordinator or a test harness, never by decoded CLI data.
+ * @param {{ home?: string, secrets?: Record<string, string>, loadSecrets?: () => Promise<Record<string, string>>,
+ *   stateProbed?: () => unknown, temporaryRoot?: string }} [ports]
+ *   Supplied by the coordinator or a test harness, never by decoded CLI data. `stateProbed` and
+ *   `temporaryRoot` are test seams of the state snapshot (see `readReportState`).
  */
 export async function reportCli(argv, ports = {}) {
   let options,
-    state,
     report,
     exitCode = 0,
     phase = 'arguments';
@@ -211,17 +219,16 @@ export async function reportCli(argv, ports = {}) {
     options = argumentsFor(argv); // No credentials or state before strict parsing.
     phase = 'state';
     const security = await import('./security.mjs');
-    const secrets = ports.secrets === undefined ? await (ports.loadSecrets || security.loadSecrets)() : ports.secrets;
     const home = ports.home || security.stateHome();
-    state = openState(home);
-    const now = Date.now();
-    if (options.runId) {
-      const run = readRun(state, options.runId);
-      report = buildRunReport(run, readEvents(state, options.runId), {
-        jobEvents: await readJobEvents(home, options.runId),
-        now,
-      });
-    } else report = await projectReport(state, options.projectId, secrets, now);
+    // Keys are read for redaction only: no credential store is created and no legacy file migrated.
+    const secrets =
+      ports.secrets === undefined
+        ? await (ports.loadSecrets || (() => readRedactionSecrets({ home })))()
+        : ports.secrets;
+    report = await readReportState(home, state => buildReport(state, options, secrets), {
+      probed: ports.stateProbed,
+      temporaryRoot: ports.temporaryRoot,
+    });
     report = security.redact(report, secrets);
   } catch (error) {
     const code =
@@ -233,8 +240,6 @@ export async function reportCli(argv, ports = {}) {
     exitCode = code === 'report_unavailable' ? 2 : 1;
     // Constant diagnostics only: never echo arguments, paths or state.
     report = { schemaVersion: 1, kind: 'error', status: exitCode === 1 ? 'invalid' : 'blocked', code };
-  } finally {
-    state?.db.close();
   }
   const json = options?.json || (Array.isArray(argv) && argv.includes('--json'));
   return { report, exitCode, output: json ? JSON.stringify(report, null, 2) : human(report) };

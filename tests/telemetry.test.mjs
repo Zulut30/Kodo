@@ -118,7 +118,7 @@ test('run report: wall time from the saved creation to the terminal event, stage
   assert.ok(report.provenance.limitations.includes('prompt_bytes_are_not_tokens'));
   assert.ok(report.provenance.limitations.includes('elapsed_is_not_llm_latency'));
   assert.ok(report.provenance.limitations.includes('check_duration_not_recorded'));
-  assert.deepEqual(report.checks.runs, [{ kind: 'test', command: 'npm test', durationMs: null, exitCode: 0 }]);
+  assert.deepEqual(report.checks.runs, [{ kind: 'test', executable: 'npm', durationMs: null, exitCode: 0 }]);
   assert.equal(report.checks.totalMs, null);
   assert.deepEqual(report.attempts, {
     sessions: 3,
@@ -308,8 +308,8 @@ test('verification rounds, repairs, CI waits, failures, blocker and watchdog com
     [4, 3, 2],
   );
   assert.deepEqual(report.checks.runs, [
-    { kind: 'test', command: 'npm test', durationMs: null, exitCode: 0 },
-    { kind: 'build', command: 'npm run build', durationMs: null, exitCode: null },
+    { kind: 'test', executable: 'npm', durationMs: null, exitCode: 0 },
+    { kind: 'build', executable: 'npm', durationMs: null, exitCode: null },
   ]);
   assert.deepEqual([report.checks.executions, report.checks.reused], [3, 1]);
   assert.deepEqual(report.checks.ci, { waitMs: 16_000, polls: 2, known: 1, total: 1, source: 'delivery-events' });
@@ -351,6 +351,135 @@ test('an open CI wait and malformed codes stay explicit', () => {
   assert.deepEqual(report.checks.ci, { waitMs: null, polls: 1, known: 0, total: 1, source: 'delivery-events' });
   assert.ok(report.provenance.notes.includes('ci_wait_open'));
   assert.deepEqual(report.failures[0], { code: 'node_failed', scope: 'node:unknown', at: iso(T0 + 500) });
+});
+
+test('check results expose only the kind and the executable name, never paths or arguments', () => {
+  const run = finishedRun({
+    checks: {
+      schemaVersion: 2,
+      complete: true,
+      results: [
+        {
+          kind: 'test',
+          command: {
+            command: '/opt/private-tools/bin/node',
+            args: ['/home/owner/private-repo/test/secret.test.mjs', '--password', 'hunter2-password-value'],
+          },
+          exitCode: 0,
+        },
+        { kind: 'lint', command: 'C:\\Users\\owner\\tools\\lint.cmd --token legacy-token-value', exitCode: 1 },
+        { kind: 'build', command: { args: ['orphan-argument-value'] }, exitCode: 0 },
+      ],
+    },
+  });
+  const report = buildRunReport(run, finishedEvents(), { now: NOW });
+  assert.deepEqual(report.checks.runs, [
+    { kind: 'test', executable: 'node', durationMs: null, exitCode: 0 },
+    { kind: 'lint', executable: 'lint.cmd', durationMs: null, exitCode: 1 },
+    { kind: 'build', executable: null, durationMs: null, exitCode: 0 },
+  ]);
+  const text = JSON.stringify(report);
+  for (const value of [
+    'private-tools',
+    'private-repo',
+    'secret.test.mjs',
+    '--password',
+    'hunter2-password-value',
+    'owner',
+    '--token',
+    'legacy-token-value',
+    'orphan-argument-value',
+  ])
+    assert.ok(!text.includes(value), value);
+});
+
+test('mirrored delivery and release events never close a CI or delivery queue wait', () => {
+  // The Engine stores each delivery event and then a `delivery`/`release` copy of it.
+  const mirror = (seq, type, at, data = {}) => event(seq, 'delivery', T0 + at, { type, ...data });
+  const events = [
+    event(1, 'created', T0),
+    event(2, 'delivery.queue_waiting', T0 + 1000, { queue: 'q' }),
+    mirror(3, 'delivery.queue_waiting', 1001, { queue: 'q' }),
+    event(4, 'delivery.queue_waiting', T0 + 6000, { queue: 'q' }),
+    mirror(5, 'delivery.queue_waiting', 6001, { queue: 'q' }),
+    event(6, 'delivery.checks_waiting', T0 + 10_000, { checks: {} }),
+    mirror(7, 'delivery.checks_waiting', 10_001),
+    event(8, 'delivery.checks_waiting', T0 + 20_000, { checks: {} }),
+    mirror(9, 'delivery.checks_waiting', 20_001),
+    event(10, 'delivery.operation', T0 + 26_000, { operation: 'merge', phase: 'intent' }),
+    mirror(11, 'delivery.operation', 26_001, { operation: 'merge', phase: 'intent' }),
+    event(12, 'delivery.operation', T0 + 28_000, { operation: 'merge', phase: 'outcome', status: 'confirmed' }),
+    mirror(13, 'delivery.operation', 28_001, { operation: 'merge', phase: 'outcome', status: 'confirmed' }),
+    event(14, 'succeeded', T0 + 30_000),
+  ];
+  const report = buildRunReport(finishedRun(), events, { now: NOW });
+  assert.deepEqual(report.checks.ci, { waitMs: 16_000, polls: 2, known: 1, total: 1, source: 'delivery-events' });
+  assert.deepEqual(report.queue.delivery, { waitMs: 9000, polls: 2, known: 1, total: 1, source: 'delivery-events' });
+  assert.deepEqual([report.timing.stages.delivery.durationMs, report.timing.stages.delivery.operations], [2000, 1]);
+  // Polls followed only by their copies have no confirmed end: the wait stays open.
+  const open = buildRunReport(
+    finishedRun({ state: 'delivering' }),
+    [
+      event(1, 'created', T0),
+      event(2, 'delivery.checks_waiting', T0 + 1000),
+      event(3, 'release', T0 + 1001, { type: 'delivery.checks_waiting' }),
+    ],
+    { now: NOW },
+  );
+  assert.deepEqual(open.checks.ci, { waitMs: null, polls: 1, known: 0, total: 1, source: 'delivery-events' });
+  assert.ok(open.provenance.notes.includes('ci_wait_open'));
+});
+
+test('every delivery attempt keeps its own intent, outcome and failure', () => {
+  const merge = (seq, at, data) => event(seq, 'delivery.operation', T0 + at, { operation: 'merge', ...data });
+  const absentThenMerged = [
+    event(1, 'created', T0),
+    merge(2, 1000, { phase: 'intent' }),
+    merge(3, 4000, { phase: 'outcome', status: 'absent' }),
+    merge(4, 10_000, { phase: 'intent' }),
+    merge(5, 12_000, { phase: 'outcome', status: 'confirmed' }),
+    event(6, 'succeeded', T0 + 20_000),
+  ];
+  const report = buildRunReport(finishedRun(), absentThenMerged, { now: NOW });
+  const pick = ({ durationMs, operations, known, total }) => ({ durationMs, operations, known, total });
+  assert.deepEqual(pick(report.timing.stages.delivery), { durationMs: 5000, operations: 2, known: 2, total: 2 });
+  assert.deepEqual(
+    report.failures.filter(item => item.scope.startsWith('delivery')),
+    [{ code: 'delivery_absent', scope: 'delivery:merge', at: iso(T0 + 4000) }],
+  );
+  assert.equal(report.provenance.complete, true, JSON.stringify(report.provenance.notes));
+
+  // An intent superseded by a retry was never read back: unknown duration, still in the denominator.
+  const retried = [
+    event(1, 'created', T0),
+    merge(2, 1000, { phase: 'intent' }),
+    merge(3, 5000, { phase: 'intent' }),
+    merge(4, 7000, { phase: 'outcome', status: 'confirmed' }),
+    // A later read-back without a new intent changes no attempt.
+    merge(5, 9000, { phase: 'outcome', status: 'reconciled' }),
+    event(6, 'succeeded', T0 + 20_000),
+  ];
+  const second = buildRunReport(finishedRun(), retried, { now: NOW });
+  assert.deepEqual(pick(second.timing.stages.delivery), { durationMs: null, operations: 2, known: 1, total: 2 });
+  assert.deepEqual(
+    second.failures.filter(item => item.scope.startsWith('delivery')),
+    [{ code: 'delivery_uncertain', scope: 'delivery:merge', at: iso(T0 + 1000) }],
+  );
+  assert.ok(second.provenance.notes.includes('delivery_operation_open'));
+});
+
+test('an unfinished coordinator operation makes the observations incomplete', () => {
+  const run = finishedRun({
+    coordinatorOperations: [
+      { kind: 'assessment', status: 'completed', durationMs: 300 },
+      { kind: 'analysis', status: 'started' },
+    ],
+  });
+  const report = buildRunReport(run, finishedEvents(), { now: NOW });
+  const { analysis } = report.timing.stages;
+  assert.deepEqual([analysis.durationMs, analysis.known, analysis.total], [null, 0, 1]);
+  assert.equal(report.provenance.complete, false);
+  assert.ok(report.provenance.notes.includes('coordinator_operation_incomplete'));
 });
 
 test('observations from different platforms are listed, never compared', () => {
@@ -469,10 +598,13 @@ test('project report: tasks in every status, retries and missing runs stay in th
     sessions: null,
     wallMs: null,
     verificationShare: null,
-    usage: report.totals.usage,
+    // ...and the usage total too: only the sum of what was observed is reported, under its own name.
+    usage: null,
+    observedUsage: report.totals.observedUsage,
+    waits: report.totals.waits,
   });
-  assert.equal(report.totals.usage.sessions, 7);
-  assert.equal(report.totals.usage.usage.totalTokens, 840);
+  assert.equal(report.totals.observedUsage.sessions, 7);
+  assert.equal(report.totals.observedUsage.usage.totalTokens, 840);
   assert.equal(report.gates, undefined);
   assert.deepEqual(report.blockers, [
     { taskId: 'broken', runId: 'r-failed', code: 'quota', scope: 'run', occurrences: 1 },
@@ -481,6 +613,123 @@ test('project report: tasks in every status, retries and missing runs stay in th
   assert.deepEqual(report.completeness.runs, { known: 3, total: 4, complete: false });
   assert.equal(report.provenance.complete, false);
   assert.ok(report.provenance.notes.includes('runs_missing'));
+});
+
+test('project usage is unknown when the attempt history is incomplete; the observed sum is named apart', () => {
+  const sixty = finishedRun({
+    id: 'r1',
+    sessionAttempts: [session('developer', 'completed', measured(900, usage(50, 10)))],
+  });
+  const snapshot = projectSnapshot([task('t1', 'running')], [attempt('t1', 2, 'r2', 'running')]);
+  const all = [attempt('t1', 1, 'r1', 'blocked'), attempt('t1', 2, 'r2', 'running')];
+  // The second attempt has no saved Run.
+  const report = buildProjectReport(snapshot, { r1: sixty }, { r1: finishedEvents() }, { now: NOW, attempts: all });
+  assert.equal(report.totals.sessions, null);
+  assert.equal(report.totals.usage, null);
+  assert.equal(report.totals.observedUsage.sessions, 1);
+  assert.equal(report.totals.observedUsage.usage.totalTokens, 60);
+  assert.equal(report.provenance.complete, false);
+  assert.ok(report.provenance.notes.includes('runs_missing'));
+
+  // A legacy Run without session receipts: the number of sessions, so the usage total, is unknown.
+  const { sessionAttempts: _s, ...legacy } = finishedRun({ id: 'r2' });
+  const both = buildProjectReport(
+    snapshot,
+    { r1: sixty, r2: legacy },
+    { r1: finishedEvents(), r2: finishedEvents() },
+    { now: NOW, attempts: all },
+  );
+  assert.equal(both.completeness.runs.complete, true);
+  assert.equal(both.totals.sessions, null);
+  assert.equal(both.totals.usage, null);
+  assert.equal(both.totals.observedUsage.usage.totalTokens, 60);
+
+  // Complete history: the total is the observed sum.
+  const complete = buildProjectReport(
+    projectSnapshot([task('t1', 'accepted')], [attempt('t1', 1, 'r1', 'accepted')]),
+    { r1: sixty },
+    { r1: finishedEvents() },
+    { now: NOW },
+  );
+  assert.equal(complete.totals.usage.usage.totalTokens, 60);
+  assert.deepEqual(complete.totals.usage, complete.totals.observedUsage);
+});
+
+test('project report keeps queue and CI waits and the failure codes of every attempt', () => {
+  const runs = {
+    r1: finishedRun({ id: 'r1', state: 'blocked' }),
+    r2: finishedRun({ id: 'r2' }),
+  };
+  const events = {
+    r1: [
+      event(1, 'created', T0),
+      event(2, 'delivery.checks_waiting', T0 + 10_000),
+      event(3, 'delivery', T0 + 10_001, { type: 'delivery.checks_waiting' }),
+      event(4, 'delivery.checks_waiting', T0 + 20_000),
+      event(5, 'delivery', T0 + 20_001, { type: 'delivery.checks_waiting' }),
+      event(6, 'blocked', T0 + 30_000, { code: 'checks_failed', message: 'private' }),
+    ],
+    r2: [event(1, 'created', T0), event(2, 'succeeded', T0 + 5000)],
+  };
+  const job = (jobId, seq, state, at) => ({ jobId, seq, type: 'state', data: { state }, time: iso(T0 + at) });
+  const jobEvents = new Map([
+    ['r1', [job('j1', 1, 'queued', 0), job('j1', 2, 'running', 3000)]],
+    ['r2', [job('j2', 3, 'queued', 0), job('j2', 4, 'running', 1000)]],
+  ]);
+  const snapshot = projectSnapshot(
+    [task('t1', 'accepted'), task('t2', 'running')],
+    [attempt('t1', 2, 'r2', 'accepted'), attempt('t2', 1, 'r-missing', 'running')],
+  );
+  const all = [attempt('t1', 1, 'r1', 'blocked'), ...snapshot.currentAttempts];
+  const report = buildProjectReport(snapshot, runs, events, { now: NOW, attempts: all, jobEvents });
+  const wait = (waitMs, known, total) => ({ waitMs, known, total });
+  assert.deepEqual(report.attempts, [
+    {
+      taskId: 't1',
+      number: 1,
+      runId: 'r1',
+      state: 'blocked',
+      wallMs: 30_000,
+      waits: { queue: wait(3000, 1, 1), deliveryQueue: wait(null, 0, 0), ci: wait(20_000, 1, 1) },
+      failures: [{ code: 'checks_failed', scope: 'run', at: iso(T0 + 30_000) }],
+    },
+    {
+      taskId: 't1',
+      number: 2,
+      runId: 'r2',
+      state: 'succeeded',
+      wallMs: 5000,
+      waits: { queue: wait(1000, 1, 1), deliveryQueue: wait(null, 0, 0), ci: wait(null, 0, 0) },
+      failures: [],
+    },
+    // Without a saved Run nothing about the attempt is known: null, never 0 or [].
+    {
+      taskId: 't2',
+      number: 1,
+      runId: 'r-missing',
+      state: null,
+      wallMs: null,
+      waits: { queue: wait(null, 0, null), deliveryQueue: wait(null, 0, null), ci: wait(null, 0, null) },
+      failures: null,
+    },
+  ]);
+  assert.deepEqual(report.totals.waits, {
+    queue: { waitMs: null, known: 2, total: null, complete: false },
+    deliveryQueue: { waitMs: null, known: 0, total: null, complete: false },
+    ci: { waitMs: null, known: 1, total: null, complete: false },
+  });
+  const settled = buildProjectReport(
+    projectSnapshot([task('t1', 'accepted')], [attempt('t1', 2, 'r2', 'accepted')]),
+    runs,
+    events,
+    { now: NOW, attempts: all.slice(0, 2), jobEvents },
+  );
+  assert.deepEqual(settled.totals.waits, {
+    queue: { waitMs: 4000, known: 2, total: 2, complete: true },
+    deliveryQueue: { waitMs: null, known: 0, total: 0, complete: true },
+    ci: { waitMs: 20_000, known: 1, total: 1, complete: true },
+  });
+  assert.ok(!JSON.stringify(report).includes('private'));
 });
 
 test('project report keeps future wave gates only when the snapshot has them', () => {

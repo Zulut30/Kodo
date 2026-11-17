@@ -1,22 +1,25 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, readdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { mkdtemp, mkdir, readdir, realpath, rm, writeFile } from 'node:fs/promises';
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { randomUUID, createHash } from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite';
 import { Store } from '../runtime/store.mjs';
 import { openJobStore } from '../runtime/job-store.mjs';
 import { openProjectStore } from '../runtime/project-store.mjs';
 import * as contracts from '../runtime/project-contracts.mjs';
 import { workerEnvironment } from '../runtime/security.mjs';
 import { reportCli } from '../runtime/report-cli.mjs';
+import { readRedactionSecrets, readReportState, STATE_ATTEMPTS } from '../runtime/report-state.mjs';
 import { projectCli } from '../runtime/project-cli.mjs';
 
 const cli = fileURLToPath(new URL('../cli/index.mjs', import.meta.url));
 const SECRET = 'report-secret-value-0123456789';
+const PASSWORD = 'check-password-value-42';
 // Observe network and native provider entry points, fail closed before any session.
 const guard =
   'data:text/javascript,' +
@@ -82,28 +85,26 @@ const attempt = (stage, status, durationMs) => ({
   metrics: metrics(durationMs),
 });
 
-/** Every file under `dir` with its size, modification time and content hash. */
-async function inventory(dir) {
+/** Every file under `dir` with its size, modification time and content hash (synchronous, so a hook can take it). */
+function inventory(dir) {
   const result = {};
-  const walk = async current => {
-    for (const entry of await readdir(current, { withFileTypes: true })) {
+  const walk = current => {
+    for (const entry of readdirSync(current, { withFileTypes: true })) {
       const file = path.join(current, entry.name);
       if (entry.isDirectory()) {
         result[path.relative(dir, file) + '/'] = 'directory';
-        await walk(file);
+        walk(file);
       } else {
-        const info = await stat(file);
+        const info = statSync(file);
         result[path.relative(dir, file)] = [
           info.size,
           info.mtimeMs,
-          createHash('sha256')
-            .update(await readFile(file))
-            .digest('hex'),
+          createHash('sha256').update(readFileSync(file)).digest('hex'),
         ];
       }
     }
   };
-  await walk(dir);
+  walk(dir);
   return result;
 }
 
@@ -133,7 +134,16 @@ async function fixture(t) {
       checks: {
         schemaVersion: 2,
         complete: true,
-        results: [{ kind: 'test', command: { command: 'node', args: ['--test', SECRET] }, exitCode: 0 }],
+        results: [
+          {
+            kind: 'test',
+            command: {
+              command: path.join(root, 'tools', 'node'),
+              args: ['--test', path.join(root, 'test', 'private.test.mjs'), '--password', PASSWORD, SECRET],
+            },
+            exitCode: 0,
+          },
+        ],
       },
     });
     store.event(runId, 'check_started', { kind: 'test', command: { command: 'node', args: ['--test'] } });
@@ -208,6 +218,9 @@ async function fixture(t) {
       },
     });
     store.event(reserved.runId, 'blocked', { code: 'quota', message: 'private stop' });
+    const attemptQueue = `run:${reserved.runId}:0123456789ab`;
+    jobs.enqueue(attemptQueue, [{ key: 'a', role: 'developer', writePaths: ['a.txt'] }]);
+    jobs.claim(attemptQueue, { owner: 'worker-1', limits: { workers: 1, pools: {} } });
     return { dir, root, home, runId, projectId, attemptRunId: reserved.runId };
   } finally {
     store.close();
@@ -237,14 +250,17 @@ test('report reads a saved Run and its jobs strictly read-only', async t => {
   assert.equal(typeof report.queue.waitMs, 'number');
   assert.ok(Number.isSafeInteger(report.timing.wallMs) && report.timing.wallMs >= 0);
   assert.ok(!output.includes(SECRET), 'saved values matching credentials are redacted');
-  assert.match(report.checks.runs[0].command, /\[REDACTED\]/);
+  // A check is its kind and executable name: no path and no argument value is printed.
+  assert.deepEqual(report.checks.runs, [{ kind: 'test', executable: 'node', durationMs: null, exitCode: 0 }]);
 
   const human = await reportCli([f.runId], ports);
   assert.equal(human.exitCode, 0);
   assert.match(human.output, new RegExp(f.runId));
   assert.match(human.output, /succeeded/);
   assert.match(human.output, /prompt bytes are not tokens/i);
-  assert.ok(!human.output.includes(SECRET));
+  for (const text of [output, human.output])
+    for (const value of [SECRET, PASSWORD, f.root, 'private.test.mjs', '--password'])
+      assert.ok(!text.includes(value), value);
 
   assert.deepEqual(await inventory(f.home), before, 'a report creates and changes nothing in the state home');
 });
@@ -267,6 +283,22 @@ test('project report and the project alias read the snapshot and attempt Runs', 
   assert.equal(report.totals.attempts, 1);
   assert.equal(report.totals.usage.sessions, 1);
   assert.deepEqual(report.completeness.runs, { known: 1, total: 1, complete: true });
+  // The attempt's durable job and its queue wait are read from the same snapshot.
+  assert.deepEqual(
+    report.attempts.map(row => [
+      row.taskId,
+      row.number,
+      row.runId,
+      row.state,
+      row.waits.queue.known,
+      row.waits.queue.total,
+    ]),
+    [['task-0', 1, f.attemptRunId, 'blocked', 1, 1]],
+  );
+  assert.deepEqual(
+    report.attempts[0].failures.map(item => `${item.code}@${item.scope}`),
+    ['quota@run', 'quota@session:developer'],
+  );
   assert.deepEqual(report.blockers, [
     { taskId: 'task-0', runId: f.attemptRunId, code: 'quota', scope: 'run', occurrences: 1 },
   ]);
@@ -281,6 +313,8 @@ test('project report and the project alias read the snapshot and attempt Runs', 
   assert.equal(human.exitCode, 0);
   assert.match(human.output, new RegExp(f.projectId));
   assert.match(human.output, /task-0/);
+  assert.match(human.output, /Waits: queue .*CI/);
+  assert.match(human.output, /task-0 #1 blocked: .*failures quota@run, quota@session:developer/);
 
   assert.deepEqual(await inventory(f.home), before);
 });
@@ -349,11 +383,10 @@ test('missing Runs, Projects and state report constant codes without paths', asy
   assert.deepEqual(await inventory(f.home), before);
 });
 
-test('kodo report runs as a process without network or provider attempts', async t => {
-  const f = await fixture(t);
+/** Run the real CLI under the offline guard with a private user profile. */
+function invokeCli(f, args) {
   const isolated = path.join(f.dir, 'empty-home');
-  await mkdir(isolated);
-  const before = await inventory(f.home);
+  mkdirSync(isolated, { recursive: true });
   const env = {
     ...workerEnvironment(),
     HOME: isolated,
@@ -363,29 +396,239 @@ test('kodo report runs as a process without network or provider attempts', async
     KODO_HOME: f.home,
     KODO_CREDENTIAL_HOME: path.join(f.dir, 'credentials'),
   };
-  const invoke = args => {
-    const result = spawnSync(process.execPath, ['--import', guard, cli, ...args], {
-      cwd: f.root,
-      env,
-      encoding: 'utf8',
-      timeout: 60000,
-      windowsHide: true,
-    });
-    assert.equal(result.error, undefined);
-    assert.match(result.stderr, /offline-attempts:0:0/);
-    return result;
-  };
-  const run = invoke(['report', f.runId, '--json']);
+  const result = spawnSync(process.execPath, ['--import', guard, cli, ...args], {
+    cwd: f.root,
+    env,
+    encoding: 'utf8',
+    timeout: 60000,
+    windowsHide: true,
+  });
+  assert.equal(result.error, undefined);
+  assert.match(result.stderr, /offline-attempts:0:0/);
+  return result;
+}
+
+test('kodo report runs as a process without network or provider attempts', async t => {
+  const f = await fixture(t);
+  mkdirSync(path.join(f.dir, 'empty-home'));
+  const before = inventory(f.dir);
+  const run = invokeCli(f, ['report', f.runId, '--json']);
   assert.equal(run.status, 0, run.stderr);
   assert.equal(JSON.parse(run.stdout).kind, 'run');
-  const project = invoke(['project', 'report', f.projectId, '--json']);
+  const project = invokeCli(f, ['project', 'report', f.projectId, '--json']);
   assert.equal(project.status, 0, project.stderr);
   assert.equal(JSON.parse(project.stdout).projectId, f.projectId);
-  const human = invoke(['report', '--project', f.projectId]);
+  const human = invokeCli(f, ['report', '--project', f.projectId]);
   assert.equal(human.status, 0, human.stderr);
   assert.match(human.stdout, /task-0/);
-  const invalid = invoke(['report', '--project', 'nope', '--json']);
+  const invalid = invokeCli(f, ['report', '--project', 'nope', '--json']);
   assert.equal(invalid.status, 1);
   assert.equal(JSON.parse(invalid.stdout).code, 'report_arguments');
-  assert.deepEqual(await inventory(f.home), before);
+  // Neither the state home nor the (absent) credential directory is created or changed.
+  assert.deepEqual(inventory(f.dir), before);
+});
+
+test('kodo report reads a legacy key file for redaction and never migrates it', async t => {
+  const f = await fixture(t);
+  const runId = randomUUID();
+  const store = new Store(f.home, {});
+  try {
+    // The saved model name equals the key: the legacy file must still redact it.
+    store.createRun({
+      id: runId,
+      project: f.root,
+      task: 'Legacy key fixture',
+      client: 'codex',
+      state: 'succeeded',
+      sessionAttempts: [{ ...attempt('developer', 'completed', 100), model: SECRET }],
+      coordinatorOperations: [],
+    });
+    store.event(runId, 'succeeded', {});
+  } finally {
+    store.close();
+  }
+  await writeFile(path.join(f.home, 'secrets.json'), JSON.stringify({ GEMINI_API_KEY: SECRET }));
+  mkdirSync(path.join(f.dir, 'empty-home'));
+  const before = inventory(f.dir);
+  const result = invokeCli(f, ['report', runId, '--json']);
+  assert.equal(result.status, 0, result.stderr);
+  assert.ok(!result.stdout.includes(SECRET));
+  assert.deepEqual(JSON.parse(result.stdout).models, [{ client: 'codex', model: '[REDACTED]', sessions: 1 }]);
+  const unknown = invokeCli(f, ['report', randomUUID(), '--json']);
+  assert.equal(JSON.parse(unknown.stdout).code, 'report_not_found');
+  // The legacy file stays byte for byte; no credential store or directory appears.
+  assert.deepEqual(inventory(f.dir), before);
+  assert.equal(existsSync(path.join(f.dir, 'credentials')), false);
+});
+
+test('a writer closing between the state probe and the open changes no state file', async t => {
+  const f = await fixture(t);
+  const temporaryRoot = path.join(f.dir, 'snapshots');
+  mkdirSync(temporaryRoot);
+  const writer = new Store(f.home, {});
+  let closed = false,
+    expected,
+    open,
+    live,
+    raced;
+  try {
+    // Pending WAL frames with the shared-memory file: the report must not open the live files.
+    writer.event(f.runId, 'check_started', { kind: 'test', command: { command: 'node', args: [] } });
+    assert.ok(statSync(path.join(f.home, 'state.sqlite-wal')).size > 0);
+    live = inventory(f.home);
+    open = await reportCli([f.runId, '--json'], { home: f.home, secrets: {}, temporaryRoot });
+    assert.deepEqual(inventory(f.home), live);
+    raced = await reportCli([f.runId, '--json'], {
+      home: f.home,
+      secrets: {},
+      temporaryRoot,
+      stateProbed: () => {
+        if (closed) return;
+        writer.close();
+        closed = true;
+        expected = inventory(f.home);
+      },
+    });
+  } finally {
+    if (!closed) writer.close();
+  }
+  assert.equal(open.exitCode, 0, open.output);
+  assert.equal(open.report.checks.executions, 2, 'committed WAL frames are read from a private copy');
+  assert.equal(raced.exitCode, 0, raced.output);
+  assert.equal(raced.report.checks.executions, 2);
+  assert.deepEqual(inventory(f.home), expected, 'no -wal or -shm appears after the writer closed');
+  assert.deepEqual(readdirSync(temporaryRoot), [], 'every private copy is removed');
+});
+
+test('the project report never runs the project migration', async t => {
+  const f = await fixture(t);
+  const database = path.join(f.home, 'state.sqlite');
+  const edit = sql => {
+    const db = new DatabaseSync(database);
+    try {
+      db.exec(sql);
+    } finally {
+      db.close();
+    }
+  };
+  // Project tables exist but the version table is empty: only a writer may migrate.
+  edit('DELETE FROM kodo_project_migrations');
+  for (const step of [
+    null,
+    `INSERT INTO kodo_project_migrations VALUES(1,'${'f'.repeat(64)}','2026-01-01T00:00:00.000Z')`,
+  ]) {
+    if (step) edit(step);
+    const before = inventory(f.home);
+    const { exitCode, report } = await reportCli(['--project', f.projectId, '--json'], { home: f.home, secrets: {} });
+    assert.equal(exitCode, 2);
+    assert.deepEqual(report, { schemaVersion: 1, kind: 'error', status: 'blocked', code: 'report_unavailable' });
+    // No new `project-backups/migration-*` copy, no DDL: the state home is unchanged.
+    assert.deepEqual(inventory(f.home), before);
+  }
+});
+
+test('a state that changes during every copy is refused after bounded attempts', async t => {
+  const f = await fixture(t);
+  const temporaryRoot = path.join(f.dir, 'snapshots');
+  mkdirSync(temporaryRoot);
+  const writer = new Store(f.home, {});
+  let probes = 0,
+    result;
+  try {
+    writer.event(f.runId, 'note', {});
+    result = await reportCli([f.runId, '--json'], {
+      home: f.home,
+      secrets: {},
+      temporaryRoot,
+      // A commit after each probe: every copy differs from the files that were inspected.
+      stateProbed: () => {
+        probes++;
+        writer.event(f.runId, 'note', {});
+      },
+    });
+  } finally {
+    writer.close();
+  }
+  const { exitCode, report } = result;
+  assert.equal(exitCode, 2);
+  assert.deepEqual(report, { schemaVersion: 1, kind: 'error', status: 'blocked', code: 'report_unavailable' });
+  assert.equal(probes, STATE_ATTEMPTS);
+  assert.deepEqual(readdirSync(temporaryRoot), []);
+});
+
+test('a read that raced a checkpoint of the main file is read again', async t => {
+  const f = await fixture(t);
+  const database = path.join(f.home, 'state.sqlite');
+  const seen = [];
+  const counts = await readReportState(f.home, state => {
+    seen.push(state.db.prepare('SELECT COUNT(*) AS n FROM events').get().n);
+    if (seen.length === 1) {
+      // A writer commits and, closing, checkpoints into the main file while it is read.
+      const writer = new DatabaseSync(database);
+      writer
+        .prepare('INSERT INTO events(run_id,type,data,time) VALUES(?,?,?,?)')
+        .run(f.runId, 'note', '{}', Date.now());
+      writer.close();
+    }
+    return seen.at(-1);
+  });
+  assert.equal(seen.length, 2, 'the first read is discarded');
+  assert.equal(counts, seen[0] + 1, 'the second read sees the checkpointed row');
+});
+
+test('redaction keys are read from the store and a legacy file without writing either', async t => {
+  const dir = await realpath(await mkdtemp(path.join(os.tmpdir(), 'kodo-report-keys-')));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const home = path.join(dir, 'state'),
+    directory = path.join(dir, 'credentials'),
+    broken = path.join(dir, 'broken');
+  for (const item of [home, directory, broken]) mkdirSync(item);
+  writeFileSync(path.join(home, 'secrets.json'), JSON.stringify({ GEMINI_API_KEY: 'legacy-key-value-1' }));
+  writeFileSync(
+    path.join(directory, 'credentials.json'),
+    JSON.stringify({ version: 1, protection: 'file-permissions', data: { GEMINI_API_KEY: 'stored-key-value-2' } }),
+  );
+  const cipher = Buffer.from('opaque-ciphertext').toString('base64');
+  writeFileSync(
+    path.join(directory, 'credentials.dpapi.json'),
+    JSON.stringify({ version: 1, protection: 'windows-dpapi-current-user', data: cipher }),
+  );
+  writeFileSync(path.join(broken, 'credentials.json'), JSON.stringify({ version: 2, data: {} }));
+  const before = inventory(dir);
+
+  const posix = await readRedactionSecrets({
+    home,
+    directory,
+    platform: 'linux',
+    environment: { KODO_SCRAPEDO_TOKEN: 'environment-token-3' },
+  });
+  assert.deepEqual(Object.values(posix).sort(), ['environment-token-3', 'legacy-key-value-1', 'stored-key-value-2']);
+  const windows = await readRedactionSecrets({
+    home,
+    directory,
+    platform: 'win32',
+    environment: {},
+    decrypt: async ciphertext => {
+      assert.equal(ciphertext.toString(), 'opaque-ciphertext');
+      return Buffer.from(JSON.stringify({ GEMINI_API_KEY: 'dpapi-key-value-4' }));
+    },
+  });
+  assert.deepEqual(Object.values(windows).sort(), ['dpapi-key-value-4', 'legacy-key-value-1']);
+  // A store that exists but cannot be read fails closed: no report without the keys it must redact.
+  const unavailable = { code: 'report_unavailable' };
+  await assert.rejects(
+    readRedactionSecrets({ home, directory, platform: 'win32', environment: {}, decrypt: async () => assert.fail() }),
+    unavailable,
+  );
+  await assert.rejects(
+    readRedactionSecrets({ home, directory: broken, platform: 'linux', environment: {} }),
+    unavailable,
+  );
+  const nowhere = path.join(dir, 'absent');
+  assert.deepEqual(
+    await readRedactionSecrets({ home: nowhere, directory: path.join(nowhere, 'keys'), environment: {} }),
+    {},
+  );
+  assert.equal(existsSync(nowhere), false);
+  assert.deepEqual(inventory(dir), before, 'no file is created, migrated, removed or changed');
 });
