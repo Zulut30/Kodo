@@ -18,8 +18,8 @@ const settled = value => ['accepted', 'released'].includes(value);
 const retryable = value => ['blocked', 'failed', 'cancelled'].includes(value);
 const stages = ['ready', 'running', 'verifying', 'integrated', 'accepted', 'released'];
 const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
-const known = engine => Object.values(engine.secrets || {}).filter(value => typeof value === 'string');
-const bindingFor = attempt => ({
+export const known = engine => Object.values(engine.secrets || {}).filter(value => typeof value === 'string');
+export const bindingFor = attempt => ({
   schemaVersion: 1,
   projectId: attempt.projectId,
   taskId: attempt.taskId,
@@ -28,7 +28,7 @@ const bindingFor = attempt => ({
   runId: attempt.runId,
   contractHash: attempt.contractHash,
 });
-const canonical = async value => {
+export const canonical = async value => {
   const root = await realpath(value);
   return process.platform === 'win32' ? root.toLowerCase() : root;
 };
@@ -49,7 +49,7 @@ function control(snapshot, allowReleased = false) {
     'control_blocked',
   );
 }
-function storedRun(store, id) {
+export function storedRun(store, id) {
   // Missing is distinguished from a corrupt/closed Store. No raw DB access.
   try {
     return store.getRun(id);
@@ -64,7 +64,7 @@ async function contractsFor(contracts) {
 async function evidenceFor(evaluator) {
   return evaluator || (await import('./project-evidence.mjs'));
 }
-async function verifyRef(engine, ref, run, container = false) {
+export async function verifyRef(engine, ref, run, container = false) {
   requireValue(typeof engine.assertEvidence === 'function');
   if (run && ref.kind !== 'interface') {
     const root = await realpath(path.join(run.artifacts, 'evidence')),
@@ -86,29 +86,14 @@ async function verifyRef(engine, ref, run, container = false) {
     );
   }
 }
-function observation(run, kind) {
+export function observation(run, kind) {
   if (kind === 'acceptance')
     return { directorBinding: run.directorBinding, task: run.task, checks: run.checks, review: run.review };
   if (kind === 'contract') return { directorBinding: run.directorBinding, task: run.task };
   return run[kind];
 }
-// oxlint-disable-next-line complexity -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
-async function validateRun({ store, engine, contracts, snapshot, run, publication = false }) {
-  const options = { knownValues: known(engine) };
-  contracts.assertDirectorSafe(run, options);
-  requireValue(isDeepStrictEqual(run, store.getRun(run.id)), 'run_changed');
-  const attempt = snapshot.currentAttempts.find(row => row.runId === run.id),
-    task = snapshot.tasks.find(row => row.id === attempt?.taskId);
-  requireValue(
-    attempt &&
-      task &&
-      isDeepStrictEqual(run.directorBinding, bindingFor(attempt)) &&
-      attempt.taskRevision === task.revision &&
-      attempt.contractHash === contracts.directorContractHash(task, options) &&
-      run.task === contracts.buildDirectorTaskInput({ project: snapshot.project, task }, options),
-    'binding_invalid',
-  );
-  requireValue((await canonical(run.project)) === snapshot.project.projectKey, 'root_changed');
+// Current config of the Run roots still matches the frozen Run config.
+export async function assertRunConfig(run) {
   for (const root of new Set([run.project, run.cwd])) {
     const current = await readConfig(root, { client: run.client });
     for (const field of [
@@ -124,11 +109,10 @@ async function validateRun({ store, engine, contracts, snapshot, run, publicatio
     if (run.fixedModel)
       requireValue(current.models[run.fixedModel.client]?.includes(run.fixedModel.model), 'model_unavailable');
   }
-  requireValue(
-    !run.cancelRequested && !['cancelled', 'blocked', 'failed', 'waiting_limits'].includes(run.state),
-    'run_blocked',
-  );
-  requireValue((await inspectCurrentSource({ project: run.cwd, headSha: run.headSha })) === 'clean', 'head_changed');
+}
+// Full checks receipt (test + build) on the Run head. A profiled receipt
+// (`task-fast`) never substitutes for it, independent of its fingerprint.
+export async function assertFullChecks(engine, run) {
   validateCommandTimeouts(run.config.commands);
   const expected = ['test', 'build'].flatMap(kind => run.config.commands[kind].map(command => ({ kind, command })));
   const fingerprint = hash({
@@ -139,6 +123,7 @@ async function validateRun({ store, engine, contracts, snapshot, run, publicatio
   requireValue(
     run.config.commands.test.length &&
       run.checks?.schemaVersion === 2 &&
+      run.checks.profile === undefined &&
       run.checks.complete === true &&
       run.checks.headSha === run.headSha &&
       run.checks.fingerprint === fingerprint &&
@@ -164,6 +149,8 @@ async function validateRun({ store, engine, contracts, snapshot, run, publicatio
         isDeepStrictEqual(log.value.command, row.command),
     );
   }
+}
+export async function assertReviewCurrent(run) {
   requireValue(
     run.review?.passed === true &&
       run.review.headSha === run.headSha &&
@@ -172,6 +159,9 @@ async function validateRun({ store, engine, contracts, snapshot, run, publicatio
       run.review.diffHash === (await diffHash(run.cwd, run.baseSha)),
     'review_stale',
   );
+}
+// Enabled UI/security/architecture gates hold a current receipt; disabled is neutral.
+export async function assertGatesCurrent(engine, run) {
   for (const [field, setting, method] of [
     ['uiVerification', 'uiVerification', 'isCurrentUIReceipt'],
     ['securityChecks', 'security', 'isCurrentSecurityReceipt'],
@@ -191,6 +181,32 @@ async function validateRun({ store, engine, contracts, snapshot, run, publicatio
         'gate_stale',
       );
   }
+}
+async function validateRun({ store, engine, contracts, snapshot, run, publication = false }) {
+  const options = { knownValues: known(engine) };
+  contracts.assertDirectorSafe(run, options);
+  requireValue(isDeepStrictEqual(run, store.getRun(run.id)), 'run_changed');
+  const attempt = snapshot.currentAttempts.find(row => row.runId === run.id),
+    task = snapshot.tasks.find(row => row.id === attempt?.taskId);
+  requireValue(
+    attempt &&
+      task &&
+      isDeepStrictEqual(run.directorBinding, bindingFor(attempt)) &&
+      attempt.taskRevision === task.revision &&
+      attempt.contractHash === contracts.directorContractHash(task, options) &&
+      run.task === contracts.buildDirectorTaskInput({ project: snapshot.project, task }, options),
+    'binding_invalid',
+  );
+  requireValue((await canonical(run.project)) === snapshot.project.projectKey, 'root_changed');
+  await assertRunConfig(run);
+  requireValue(
+    !run.cancelRequested && !['cancelled', 'blocked', 'failed', 'waiting_limits'].includes(run.state),
+    'run_blocked',
+  );
+  requireValue((await inspectCurrentSource({ project: run.cwd, headSha: run.headSha })) === 'clean', 'head_changed');
+  await assertFullChecks(engine, run);
+  await assertReviewCurrent(run);
+  await assertGatesCurrent(engine, run);
   if (publication) {
     requireValue(
       run.config.delivery?.enabled &&
@@ -238,6 +254,16 @@ export function createProjectTransitionAuthorizer({ store, engine, contracts, ev
         command.expectedRevision === snapshot.revision,
       'revision_conflict',
     );
+    // Wave cadence: a task Run proves `integrated`, only a gate Run proves `accepted`.
+    if (typeof A.isWaveProject === 'function' && A.isWaveProject(snapshot.project))
+      return (await import('./project-director-waves.mjs')).authorizeWaveTransition({
+        store,
+        engine,
+        contracts: A,
+        command,
+        snapshot,
+        knownValues: options.knownValues,
+      });
     let run = null;
     if (!(action.kind === 'task' && action.to === 'ready')) {
       const ids = new Set(action.evidence.map(ref => ref.runId).filter(Boolean));
@@ -287,6 +313,7 @@ export function createProjectDirector({
     plan: (...args) => plan(ctx, ...args),
     run: (...args) => foreground(ctx, ...args),
     resume: (...args) => resume(ctx, ...args),
+    drain: (...args) => drainProject(ctx, ...args),
     cancel: (...args) => cancel(ctx, ...args),
     pause: (...args) => pause(ctx, ...args),
     reprioritize: (...args) => reprioritize(ctx, ...args),
@@ -430,7 +457,7 @@ async function frontier(ctx, snapshot, task) {
   return selected;
 }
 
-async function priorRetryRun(ctx, snapshot, attempt) {
+export async function priorRetryRun(ctx, snapshot, attempt) {
   if (attempt.number === 1) return null;
   // Only metadata is examined. Never replay old provider/gate sessions. The
   // atomic reservation events order predecessors even across an install crash.
@@ -465,7 +492,7 @@ async function priorRetryRun(ctx, snapshot, attempt) {
   fail('retry_history_incomplete');
 }
 
-async function retrySettings(ctx, snapshot, previous) {
+export async function retrySettings(ctx, snapshot, previous) {
   if (!previous) return null;
   (await ports(ctx)).contracts.assertDirectorSafe(previous, { knownValues: known(ctx.engine) });
   requireValue((await canonical(previous.project)) === snapshot.project.projectKey, 'retry_binding_invalid');
@@ -484,6 +511,8 @@ async function retrySettings(ctx, snapshot, previous) {
 // oxlint-disable-next-line max-lines-per-function -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
 async function foreground(ctx, id, options = {}) {
   let snapshot = await snapshotFor(ctx, id);
+  // A wave project is executed by the wave path before the foreground lease.
+  if ((await contractsFor()).isWaveProject(snapshot.project)) return waveForeground(ctx, id, options);
   if (snapshot.project.status === 'released') return { status: 'succeeded', projectStatus: 'released' };
   control(snapshot);
   const token = ctx.store.acquireLease(`project:${id}`, randomUUID(), { ttlMs: 60000, limit: 1 });
@@ -727,6 +756,32 @@ async function foreground(ctx, id, options = {}) {
   }
 }
 
+const waveContext = (ctx, W) =>
+  W.createWaveContext({ repo: ctx.repo, engine: ctx.engine, store: ctx.store, clock: ctx.clock });
+
+// `resume` of a wave project drains exactly one task with concurrency 1, so
+// `multiple_active_attempts` of the single-task path never applies to it.
+async function waveForeground(ctx, id, options) {
+  const W = await import('./project-director-waves.mjs');
+  const result = await W.drain(waveContext(ctx, W), id, {
+    maxWaves: 1,
+    concurrency: 1,
+    retryFailed: options.retryFailed === true,
+    signal: options.signal,
+    commandId: options.commandId,
+  });
+  return {
+    ...result,
+    status: ['accepted', 'max_waves'].includes(result.status) ? 'succeeded' : result.status,
+    drainStatus: result.status,
+  };
+}
+
+async function drainProject(ctx, id, options = {}) {
+  const W = await import('./project-director-waves.mjs');
+  return W.drain(waveContext(ctx, W), id, options);
+}
+
 function containerResult(ctx, { snapshot, blockers }) {
   return {
     status: settled(snapshot.project.status) ? 'succeeded' : 'blocked',
@@ -919,6 +974,14 @@ async function cancel(ctx, id, options = {}) {
     }
     const run = storedRun(ctx.store, attempt.runId);
     if (run) {
+      ctx.store.updateRun(run.id, { cancelRequested: true });
+      if (typeof ctx.engine.cancel === 'function') await ctx.engine.cancel(run.id);
+    }
+  }
+  // Wave gates: unfinished gate Runs are cancelled too. Legacy snapshots have no gates.
+  for (const gate of snapshot.gates ?? []) {
+    const run = storedRun(ctx.store, gate.runId);
+    if (run && !['succeeded', 'blocked', 'failed', 'cancelled'].includes(run.state)) {
       ctx.store.updateRun(run.id, { cancelRequested: true });
       if (typeof ctx.engine.cancel === 'function') await ctx.engine.cancel(run.id);
     }
