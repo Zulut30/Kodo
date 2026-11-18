@@ -48,17 +48,35 @@ export function fastCheckTimeout(run) {
   return value;
 }
 
-// Options that change which tests run: a filter without matches can report the file itself as one
-// passed test, so a selecting command never gives a countable summary.
-const selectionNames = new Set(['test-shard', 'test-name-pattern', 'test-skip-pattern', 'test-only']);
-// Kept for diagnostics: reporter arguments as written.
-const reporterOption = /^--test[-_]reporter(?:[-_]destination)?(?:=|$)/;
-// Node's built-in reporters whose final summary on stdout gives the pass count (ℹ/# lines).
-// dot, junit, lcov, custom reporters and any destination give no countable summary.
-const countableReporters = ['spec', 'tap'];
-const nodeCommand = command => command === process.execPath || /(?:^|[\\/])node(?:\.exe)?$/i.test(command);
-// Node options that take the next argument as their value unless written as --name=value.
-const valueOptions = new Set([
+// Node options Kodo knows: 'flag' takes no value, 'value' takes the next argument unless written
+// as --name=value. Any other option makes the command line ambiguous: Kodo cannot tell whether
+// the next argument is its value, a test pattern or the script.
+const flagOptions = [
+  'test',
+  'test-only',
+  'test-force-exit',
+  'test-randomize',
+  'test-update-snapshots',
+  'experimental-test-coverage',
+  'experimental-test-module-mocks',
+  'experimental-test-snapshots',
+  'experimental-strip-types',
+  'experimental-transform-types',
+  'no-experimental-strip-types',
+  'no-warnings',
+  'no-deprecation',
+  'enable-source-maps',
+  'trace-warnings',
+  'trace-deprecation',
+  'trace-uncaught',
+  'pending-deprecation',
+  'throw-deprecation',
+  'preserve-symlinks',
+  'preserve-symlinks-main',
+  'expose-gc',
+  'watch',
+];
+const valueOptions = [
   'test-reporter',
   'test-reporter-destination',
   'test-name-pattern',
@@ -67,6 +85,8 @@ const valueOptions = new Set([
   'test-concurrency',
   'test-timeout',
   'test-isolation',
+  'test-rerun-failures',
+  'experimental-test-tag-filter',
   'test-coverage-include',
   'test-coverage-exclude',
   'test-coverage-branches',
@@ -83,37 +103,106 @@ const valueOptions = new Set([
   'env-file',
   'env-file-if-exists',
   'input-type',
+  'unhandled-rejections',
+  'disable-warning',
+  'redirect-warnings',
+  'stack-trace-limit',
+  'max-old-space-size',
   'title',
   'watch-path',
-  'redirect-warnings',
+];
+const optionKinds = new Map([...flagOptions.map(name => [name, 'flag']), ...valueOptions.map(name => [name, 'value'])]);
+// The options a countable `node --test` may carry: they neither select tests nor move the summary
+// off stdout nor change which tests run. Anything else (a filter, a rerun state file, a tag filter,
+// watch mode, an unknown option) gives no countable summary: a filter without matches can report
+// the file itself as one passed test.
+const countableOptions = new Set([
+  'test',
+  'test-reporter',
+  'test-force-exit',
+  'test-randomize',
+  'test-concurrency',
+  'test-timeout',
+  'test-isolation',
+  'experimental-test-coverage',
+  'experimental-test-module-mocks',
+  'experimental-test-snapshots',
+  'test-coverage-include',
+  'test-coverage-exclude',
+  'test-coverage-branches',
+  'test-coverage-functions',
+  'test-coverage-lines',
+  'experimental-strip-types',
+  'experimental-transform-types',
+  'no-experimental-strip-types',
+  'no-warnings',
+  'no-deprecation',
+  'enable-source-maps',
+  'trace-warnings',
+  'trace-deprecation',
+  'trace-uncaught',
+  'pending-deprecation',
+  'throw-deprecation',
+  'preserve-symlinks',
+  'preserve-symlinks-main',
+  'expose-gc',
+  'import',
+  'require',
+  'r',
+  'loader',
+  'experimental-loader',
+  'conditions',
+  'C',
+  'env-file',
+  'env-file-if-exists',
+  'unhandled-rejections',
   'disable-warning',
+  'stack-trace-limit',
+  'max-old-space-size',
+  'title',
 ]);
-// Options known to take no value. Any other option without "=" is ambiguous: Kodo cannot tell
-// whether the next argument is its value, a test pattern or the script.
-const booleanOption = name =>
-  /^(?:test|test-only|test-force-exit|test-update-snapshots|watch|no-.+|experimental-.+|enable-.+|trace-.+|pending-deprecation|preserve-symlinks|preserve-symlinks-main|throw-deprecation|abort-on-uncaught-exception|expose-gc|frozen-intrinsics|insecure-http-parser)$/.test(
-    name,
-  );
+// Options that select tests: narrowed or not, they may run none at all.
+const selectionNames = new Set([
+  'test-shard',
+  'test-name-pattern',
+  'test-skip-pattern',
+  'test-only',
+  'test-rerun-failures',
+  'experimental-test-tag-filter',
+]);
+// A whole-suite threshold (coverage) cannot be judged on the affected files alone.
+const coverageOption = name => name === 'experimental-test-coverage' || name.startsWith('test-coverage-');
+// Kept for diagnostics: reporter arguments as written.
+const reporterOption = /^--test[-_]reporter(?:[-_]destination)?(?:=|$)/;
+// Node's built-in reporters whose final summary on stdout gives the pass count (ℹ/# lines).
+const countableReporters = ['spec', 'tap'];
+const nodeCommand = command => command === process.execPath || /(?:^|[\\/])node(?:\.exe)?$/i.test(command);
+const optionName = arg => {
+  const match = /^--?([^=]+)(?:=([\s\S]*))?$/.exec(arg);
+  return match ? { name: match[1].replaceAll('_', '-'), value: match[2] } : null;
+};
 
 /**
- * Node's own command line: its options up to the script, `--` or (in test mode) the test
- * patterns. Names are normalized (`_` as `-`, as Node accepts both). After a script, the
- * remaining arguments belong to the script and are never read as Node options.
+ * Node's own command line: its options up to the script, `--` or (in test mode) the test patterns.
+ * Names are normalized (`_` as `-`, as Node accepts both); after a script the remaining arguments
+ * belong to the script. An unknown option makes the parse ambiguous; when it is ambiguous and any
+ * later argument is `--test`, the command is treated as the test runner whose summary is unknown.
  * @param {string[]} [args]
  */
 export function nodeArguments(args = []) {
-  const options = [],
+  const list = args.map(String),
+    options = [],
     positionals = [];
   let ambiguous = false,
     separated = false,
     script = null;
-  for (let index = 0; index < args.length; index++) {
-    const arg = String(args[index]);
+  for (let index = 0; index < list.length; index++) {
+    const arg = list[index];
     const testMode = options.some(option => option.name === 'test');
     if (arg === '--') {
       separated = true;
-      if (testMode) positionals.push(...args.slice(index + 1).map(String));
-      else script = args[index + 1] ?? null;
+      if (testMode) positionals.push(...list.slice(index + 1));
+      else script = list[index + 1] ?? null;
       break;
     }
     if (!arg.startsWith('-') || arg === '-') {
@@ -124,15 +213,16 @@ export function nodeArguments(args = []) {
       positionals.push(arg);
       continue;
     }
-    const match = /^--?([^=]+)(?:=([\s\S]*))?$/.exec(arg);
-    const name = match ? match[1].replaceAll('_', '-') : arg;
-    let value = match?.[2];
-    const inline = value !== undefined;
-    if (!inline && valueOptions.has(name)) value = args[++index] === undefined ? undefined : String(args[index]);
-    else if (!inline && !booleanOption(name)) ambiguous = true;
-    options.push({ name, value, inline });
+    const parsedOption = optionName(arg) ?? { name: arg, value: undefined };
+    const kind = optionKinds.get(parsedOption.name);
+    const inline = parsedOption.value !== undefined;
+    let value = parsedOption.value;
+    if (!inline && kind === 'value') value = list[++index];
+    if (!kind) ambiguous = true;
+    options.push({ name: parsedOption.name, value, inline });
   }
-  const testMode = options.some(option => option.name === 'test');
+  const testFlag = list.some(arg => optionName(arg)?.name === 'test');
+  const testMode = options.some(option => option.name === 'test') || (ambiguous && testFlag);
   return { options, positionals, script, testMode, ambiguous, separated };
 }
 const parsed = step => nodeArguments(step.args || []);
@@ -145,27 +235,42 @@ const countableReporter = ({ options }) => {
   return !destinations.length && (!names.length || (names.length === 1 && countableReporters.includes(names[0])));
 };
 const selecting = ({ options }) => options.some(option => selectionNames.has(option.name));
-// A `node --test` command whose summary says how many tests passed.
+// A `node --test` command whose summary says how many tests passed: every option is known and
+// allowed, no test is selected away and the summary goes to stdout in a countable form.
 const countedRunner = step => {
   if (!nodeCommand(step.command)) return false;
   const node = parsed(step);
-  return node.testMode && !node.ambiguous && countableReporter(node) && !selecting(node);
+  return (
+    node.testMode &&
+    !node.ambiguous &&
+    node.options.every(option => countableOptions.has(option.name)) &&
+    countableReporter(node) &&
+    !selecting(node)
+  );
 };
 
 /**
- * Only Node's own test runner can be narrowed to the affected files. Its options must
- * survive the narrowing (written as --name=value or known flags, none that selects tests or
- * changes the reporter); a positional path limits which test files run.
+ * Only Node's own test runner can be narrowed to the affected files. Its options must survive
+ * the narrowing (written as --name=value or known flags, none that selects tests, changes the
+ * reporter or judges the whole suite such as a coverage threshold); a positional path limits which
+ * test files run.
  * @param {{ command: string, args?: string[] }[]} commands
  */
 function nodeTestRunner(commands) {
   if (commands.length !== 1) return { reason: commands.length ? 'runner-multiple-commands' : 'runner-not-configured' };
-  const [{ command, args = [] }] = commands;
+  const [step] = commands,
+    args = step.args || [];
   const node = nodeArguments(args);
-  if (!nodeCommand(command) || !node.testMode) return { reason: 'runner-not-node-test' };
+  if (!nodeCommand(step.command) || !node.testMode) return { reason: 'runner-not-node-test' };
   if (selecting(node)) return { reason: 'runner-selection' };
   if (!countableReporter(node)) return { reason: 'runner-reporter' };
-  if (node.ambiguous || node.separated || node.options.some(option => !option.inline && valueOptions.has(option.name)))
+  if (
+    !countedRunner(step) ||
+    node.separated ||
+    node.options.some(
+      option => coverageOption(option.name) || (!option.inline && optionKinds.get(option.name) === 'value'),
+    )
+  )
     return { reason: 'runner-options' };
   const flags = args.filter(arg => String(arg).startsWith('-')),
     scopes = [];

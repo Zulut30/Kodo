@@ -697,6 +697,9 @@ test('Task-fast checks never keep a green receipt for a narrowed run that execut
     [['--test', '--test-only'], 'runner-selection'],
     [['--test', '--test-reporter=dot'], 'runner-reporter'],
     [['--test', '--test-reporter-destination=stdout'], 'runner-reporter'],
+    [['--test', '--experimental-test-tag-filter=unit'], 'runner-selection'],
+    // A whole-suite coverage threshold cannot be judged on the affected files alone.
+    [['--test', '--experimental-test-coverage', '--test-coverage-lines=80'], 'runner-options'],
   ]) {
     const custom = {
       ...run,
@@ -822,4 +825,18 @@ test('Node arguments are parsed like Node: underscores, values, the script and -
   assert.deepEqual(nodeTestOutcome({ command: 'node', args: ['--import', 'x.mjs', '--test'] }, tap), { tests: 1 });
   assert.deepEqual(nodeTestOutcome({ command: 'node', args: ['--mystery', '--test'] }, tap), { tests: null });
   assert.deepEqual(nodeArguments(['--test', '--', 'a.test.mjs']).positionals, ['a.test.mjs']);
+});
+
+test('Only known, allowed node --test options give a countable summary', () => {
+  const tap = '# tests 1\n# suites 0\n# pass 1\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0\n';
+  const outcome = args => nodeTestOutcome({ command: 'node', args }, tap);
+  // A known value option consumes its value; --test after it is still the runner.
+  assert.deepEqual(outcome(['--unhandled-rejections', 'strict', '--test']), { tests: 1 });
+  // An unknown option before --test: the parse is ambiguous and --test may still run.
+  assert.deepEqual(outcome(['--mystery', 'strict', '--test']), { tests: null });
+  // Tag filters and rerun state files select tests: never counted.
+  assert.deepEqual(outcome(['--test', '--experimental-test-tag-filter=missing']), { tests: null });
+  assert.deepEqual(outcome(['--test', '--test-rerun-failures=rerun.json']), { tests: null });
+  // Order-only options stay countable.
+  assert.deepEqual(outcome(['--test', '--test-randomize']), { tests: 1 });
 });
