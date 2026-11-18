@@ -858,17 +858,27 @@ test('a private copy directory grants access only to its owner (and SYSTEM on Wi
     assert.equal(statSync(directory).mode & 0o077, 0);
     return;
   }
-  const script = `$a=Get-Acl -LiteralPath $env:KODO_ACL_TARGET
-$ids=@($a.Access | ForEach-Object { $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } | Sort-Object -Unique)
-[pscustomobject]@{ protected=$a.AreAccessRulesProtected; ids=$ids; user=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value } | ConvertTo-Json -Compress`;
+  // .NET directly, not Get-Acl: a pwsh parent's PSModulePath breaks Windows PowerShell module autoload.
+  const script = [
+    '$a=[IO.Directory]::GetAccessControl($env:KODO_ACL_TARGET)',
+    "$ids=@($a.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]) | Where-Object { $_.AccessControlType -eq 'Allow' } | ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique)",
+    '[pscustomobject]@{ protected=$a.AreAccessRulesProtected; owner=$a.GetOwner([Security.Principal.SecurityIdentifier]).Value; ids=$ids; user=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value } | ConvertTo-Json -Compress',
+  ].join('\n');
   const result = spawnSync('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], {
     encoding: 'utf8',
-    env: { ...process.env, KODO_ACL_TARGET: directory },
+    env: { ...process.env, PSModulePath: '', KODO_ACL_TARGET: directory },
   });
-  assert.equal(result.status, 0, result.stderr);
+  const detail = `status ${result.status}; stdout ${result.stdout}; stderr ${result.stderr}`;
+  assert.equal(result.status, 0, detail);
   const acl = JSON.parse(result.stdout);
-  assert.equal(acl.protected, true);
-  assert.deepEqual([...new Set([acl.ids].flat())].sort(), [acl.user, 'S-1-5-18'].sort());
+  const ids = [acl.ids].flat();
+  assert.equal(acl.protected, true, detail);
+  assert.equal(acl.owner, acl.user, detail);
+  assert.ok(ids.includes(acl.user), detail);
+  assert.ok(
+    ids.every(id => id === acl.user || id === 'S-1-5-18'),
+    detail,
+  );
 });
 
 test('a POSIX temporary root another account could rename into is not trusted for copies', () => {
