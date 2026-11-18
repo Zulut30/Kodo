@@ -560,3 +560,90 @@ test('extend prepares a feature bundle from the snapshot or appends a session mi
   assert.equal(target.repo.snapshot(target.projectId).project.status, 'running');
   assert.ok(target.repo.snapshot(target.projectId).milestones.some(item => item.id === 'm2'));
 });
+
+test('bootstrap and extend redact a CLI known secret found in repository metadata', async t => {
+  const f = await fixture(t);
+  const secret = 'kodo-cli-known-secret-4d2c8e1f9a';
+  const root = await f.root();
+  await writeFile(path.join(root, `config-${secret}.txt`), '');
+  const secrets = { token: secret };
+  const prepared = await f.run(['bootstrap', 'Сервис заметок', '--root', root, '--prepare'], { secrets });
+  assert.equal(prepared.exitCode, 0, JSON.stringify(prepared.report));
+  const context = await readFile(path.join(prepared.report.result.bundle.dir, 'context.md'), 'utf8');
+  assert.ok(!context.includes(secret), 'context.md carries no known secret');
+  assert.match(context, /config-\[REDACTED\]\.txt/);
+  assert.equal(prepared.report.result.summary.redacted, true);
+
+  const provider = blueprintWriter();
+  const generated = await f.run(['bootstrap', 'Сервис заметок', '--root', root], {
+    secrets,
+    createEngine: fakeEngine(provider),
+  });
+  assert.equal(generated.exitCode, 0, JSON.stringify(generated.report));
+  assert.equal(provider.calls.length, 1);
+  assert.ok(!provider.calls[0].prompt.includes(secret), 'the native session never receives the secret');
+
+  const accepted = await acceptedProject(f);
+  const architecture = { modules: [{ id: 'core', roots: [`src/${secret}`] }], edges: [] };
+  const extended = await f.run(['extend', accepted.projectId, 'Добавить теги', '--prepare'], {
+    secrets,
+    architecture,
+  });
+  assert.equal(extended.exitCode, 0, JSON.stringify(extended.report));
+  for (const name of extended.report.result.bundle.files)
+    assert.ok(!(await readFile(path.join(extended.report.result.bundle.dir, name), 'utf8')).includes(secret), name);
+});
+
+test('apply-spec requires a committed Git root with no changes outside the blueprint', async t => {
+  const f = await fixture(t);
+  const git = (cwd, ...args) => execFileSync('git', args, { cwd, env: f.env, windowsHide: true });
+  const gitCodes = async (root, extra) => {
+    const result = await f.run(['apply-spec', '--root', root], extra);
+    assert.equal(result.exitCode, 1, JSON.stringify(result.report));
+    assert.equal(result.report.result.code, 'blueprint_findings');
+    assert.ok(!JSON.stringify(result.report).includes(root), 'findings carry no project paths');
+    return codes(result.report);
+  };
+  const plain = path.join(f.dir, 'plain');
+  await mkdir(plain);
+  await writeBlueprint(plain);
+  let opened = 0;
+  const openStore = () => {
+    opened++;
+    throw Error('Git findings must stop before state');
+  };
+  assert.deepEqual(await gitCodes(plain, { openStore }), ['blueprint_git_required']);
+
+  const empty = path.join(f.dir, 'no-commit');
+  await mkdir(empty);
+  git(empty, 'init', '-b', 'main');
+  await writeBlueprint(empty);
+  assert.deepEqual(await gitCodes(empty, { openStore }), ['blueprint_git_required']);
+
+  const nested = path.join(await f.root(), 'packages', 'app');
+  await mkdir(nested, { recursive: true });
+  await writeBlueprint(nested);
+  assert.deepEqual(await gitCodes(nested, { openStore }), ['blueprint_git_required']);
+
+  const dirty = await f.root();
+  await writeBlueprint(dirty);
+  await writeFile(path.join(dirty, 'kodo.config.json'), '{}');
+  await writeFile(path.join(dirty, 'draft.txt'), 'untracked');
+  const dirtyResult = await f.run(['apply-spec', '--root', dirty], { openStore });
+  assert.deepEqual(codes(dirtyResult.report), ['blueprint_git_required']);
+  assert.match(dirtyResult.report.result.findings[0].message, /2/);
+  assert.equal(opened, 0);
+
+  // Blueprint findings and the Git rule are reported together.
+  const both = path.join(f.dir, 'both');
+  await mkdir(both);
+  await writeBlueprint(both, 'parallel-overlap');
+  assert.deepEqual(await gitCodes(both, { openStore }), ['blueprint_parallel_overlap', 'blueprint_git_required']);
+
+  // Ignored files and the uncommitted blueprint itself do not block registration.
+  git(dirty, 'checkout', '--', 'kodo.config.json');
+  await writeFile(path.join(dirty, '.git', 'info', 'exclude'), 'draft.txt\n');
+  const created = await f.run(['apply-spec', '--root', dirty]);
+  assert.equal(created.exitCode, 0, JSON.stringify(created.report));
+  assert.equal(created.report.result.status, 'created');
+});

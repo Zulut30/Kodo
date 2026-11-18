@@ -451,6 +451,60 @@ function waveZeroFindings(spec, ancestors) {
   return findings;
 }
 
+/** Epic graph: X → Y when a task of epic X depends on a task of another epic Y.
+ * Acyclic tasks can still form an epic cycle (A1 → B1 → A2 → B2), which the
+ * Store rejects for wave projects (project_epic_cycle): epic gates could never
+ * close in order. Each strongly connected group of epics is one finding; with
+ * `fresh`, only groups containing one of those epics are reported. Dependencies
+ * on unknown tasks are ignored (other rules report them).
+ * @param {Array<{ id: string, epicId: string, dependsOn?: string[] }>} tasks
+ * @param {{ fresh?: Set<string> }} [options] */
+export function epicCycleFindings(tasks, { fresh } = {}) {
+  const epicOf = new Map(tasks.map(task => [task.id, task.epicId]));
+  const edges = new Map();
+  for (const task of tasks)
+    for (const dependency of task.dependsOn ?? []) {
+      const target = epicOf.get(dependency);
+      if (target === undefined || target === task.epicId) continue;
+      edges.set(task.epicId, (edges.get(task.epicId) ?? new Set()).add(target));
+    }
+  const reach = new Map();
+  for (const epic of edges.keys()) {
+    const seen = new Set(),
+      stack = [epic];
+    while (stack.length)
+      for (const next of edges.get(stack.pop()) ?? [])
+        if (!seen.has(next)) {
+          seen.add(next);
+          stack.push(next);
+        }
+    reach.set(epic, seen);
+  }
+  const findings = [],
+    placed = new Set();
+  for (const epic of [...edges.keys()].sort(compare)) {
+    if (placed.has(epic) || !reach.get(epic).has(epic)) continue;
+    const group = [...reach.get(epic)].filter(other => reach.get(other)?.has(epic)).sort(compare);
+    for (const member of group) placed.add(member);
+    if (fresh && !group.some(member => fresh.has(member))) continue;
+    const members = new Set(group);
+    const ids = tasks
+      .filter(task => members.has(task.epicId))
+      .filter(task => (task.dependsOn ?? []).some(id => members.has(epicOf.get(id)) && epicOf.get(id) !== task.epicId))
+      .map(task => String(task.id));
+    const shownEpics = group.slice(0, 20).join(', ') + (group.length > 20 ? ` и ещё ${group.length - 20}` : '');
+    findings.push(
+      finding(
+        'blueprint_epic_cycle',
+        `Эпики ${shownEpics} зависят друг от друга по кругу через задачи; ` +
+          'перенесите задачи между эпиками или объедините эпики, чтобы граф эпиков стал ацикличным',
+        ids,
+      ),
+    );
+  }
+  return findings;
+}
+
 function interfaceFindings(spec, interfaces) {
   const fold = windowsLike(spec.root) ? value => value.toLowerCase() : value => value;
   const base = `${slashed(spec.root)}/.kodo/blueprint/`;
@@ -490,6 +544,7 @@ function analyzeFactorySpec(spec, options = {}) {
   findings.push(
     ...ownerFindings(base.spec.tasks),
     ...waveZeroFindings(base.spec, ancestors),
+    ...epicCycleFindings(base.spec.tasks),
     ...overlapFindings(parallelOverlaps(base.spec.tasks, { ancestors })),
     ...taskInputFindings({ project: storedProject(base.spec), tasks: base.spec.tasks, contracts, knownValues }),
     ...interfaceFindings(base.spec, interfaces),

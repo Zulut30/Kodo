@@ -197,6 +197,8 @@ async function bootstrap(ctx) {
       root,
       home: ctx.home,
       now: ports.now,
+      contracts: ctx.contracts,
+      knownValues: ctx.knownValues,
       ...inputs,
     });
     const target = path.join(bundle.summary.root, '.kodo', 'blueprint');
@@ -208,6 +210,7 @@ async function bootstrap(ctx) {
       next: [
         `Прочитай context.md, rules.md и templates/ в ${bundle.dir}.`,
         `Напиши чертёж только в ${target}: PROJECT.md, interfaces/<module>.md, spec.json (root = ${bundle.summary.root}).`,
+        'Перед регистрацией root — корень Git-репозитория с коммитом; всё вне .kodo/blueprint закоммичено или в .gitignore.',
         `Проверь и зарегистрируй проект: kodo project apply-spec --root "${bundle.summary.root}" --json`,
       ],
     });
@@ -236,15 +239,56 @@ async function bootstrap(ctx) {
   });
 }
 
+const BLUEPRINT_PREFIX = '.kodo/blueprint/';
+
+/** apply-spec registers a wave project whose integration branch and task
+ * worktrees start from the committed HEAD of root. Rule (blueprint_git_required):
+ * root is the top level of a Git work tree (realpath of `rev-parse
+ * --show-toplevel`), HEAD resolves to a commit, and `git status` (untracked
+ * files included, ignored excluded) lists nothing outside .kodo/blueprint/.
+ * A missing root is left to compile (blueprint_missing). */
+async function gitFindings(root, finding) {
+  const { realpath, stat } = await import('node:fs/promises');
+  const { execute } = await import('./command.mjs');
+  const real = await realpath(path.resolve(root)).catch(() => null);
+  if (!real || !(await stat(real)).isDirectory()) return [];
+  const run = args =>
+    execute('git', args, { cwd: real, allowFailure: true, rawOutput: true, timeoutMs: 30000 }).catch(() => ({
+      code: -1,
+      stdout: '',
+    }));
+  const fold = process.platform === 'win32' ? value => value.toLowerCase() : value => value;
+  const required = message => [finding('blueprint_git_required', message)];
+  const top = await run(['rev-parse', '--show-toplevel']);
+  const topReal = top.code === 0 ? await realpath(top.stdout.trim()).catch(() => null) : null;
+  if (!topReal || fold(topReal) !== fold(real))
+    return required('root должен быть корнем Git-репозитория: выполните git init в каталоге проекта');
+  if ((await run(['rev-parse', '--verify', '--quiet', 'HEAD^{commit}'])).code !== 0)
+    return required('В репозитории нет коммита: закоммитьте исходное состояние проекта до apply-spec');
+  const status = await run(['status', '--porcelain=v1', '-z', '--untracked-files=all', '--no-renames']);
+  if (status.code !== 0) return required('git status завершился ошибкой: проверьте репозиторий проекта');
+  const dirty = status.stdout
+    .split('\0')
+    .filter(Boolean)
+    .filter(entry => !entry.slice(3).startsWith(BLUEPRINT_PREFIX));
+  return dirty.length
+    ? required(
+        `Изменения вне ${BLUEPRINT_PREFIX} не закоммичены (файлов: ${dirty.length}); ` +
+          'закоммитьте их или добавьте в .gitignore — задачи волн начинаются от коммита HEAD',
+      )
+    : [];
+}
+
 async function applySpec(ctx) {
   const { options, contracts, knownValues, safety } = ctx;
-  const { compileBlueprint, bindInterfaceEvidence } = await import('./project-blueprint.mjs');
+  const { compileBlueprint, bindInterfaceEvidence, finding } = await import('./project-blueprint.mjs');
   const compiled = await compileBlueprint(options.flags['--root'], {
     contracts,
     knownValues,
     specFile: options.flags['--file'],
   });
-  if (!compiled.ok) return findingsReport(compiled.findings);
+  const findings = [...compiled.findings, ...(await gitFindings(options.flags['--root'], finding))];
+  if (findings.length) return findingsReport(findings);
   safety(compiled.spec);
   const { engine, repo } = await openState(ctx);
   // Content-addressed private envelopes in Kodo home; the batch prepares ACLs once.
