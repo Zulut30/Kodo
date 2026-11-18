@@ -719,8 +719,8 @@ async function epicGate(ctx, snapshot, epic, retryFailed, out) {
 // Execute an installed gate Run once, then accept what it verified.
 async function runAndAccept(ctx, projectId, { gate, run }, signal, out, entity) {
   if (run.state !== 'succeeded') run = await runEpicGate({ engine: ctx.engine, run, signal });
-  out.gates.push({ gateId: gate.id, runId: run.id, state: run.state });
   if (run.state !== 'succeeded') {
+    out.gates.push({ gateId: gate.id, runId: run.id, state: run.state });
     out.blocked.push({
       code: run.state === 'waiting_limits' ? 'quota' : blockerOf(run),
       ...entity,
@@ -733,6 +733,10 @@ async function runAndAccept(ctx, projectId, { gate, run }, signal, out, entity) 
   } catch (error) {
     if (!['project_integration_conflict', 'project_integration_invalid'].includes(error?.code)) throw error;
     out.blocked.push({ code: error.code, ...entity });
+  } finally {
+    // Acceptance may still block the Run (for example a repair history defect): report the saved state.
+    const saved = storedRun(ctx.store, run.id) ?? run;
+    out.gates.push({ gateId: gate.id, runId: saved.id, state: saved.state });
   }
 }
 

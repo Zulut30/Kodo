@@ -644,3 +644,16 @@ test('History inspection compares raw paths and bytes; content it cannot compare
   });
   assert.equal(merged.status, 'merged');
 });
+
+test('Changed paths are raw names: a non-ASCII file inside the write scope is owned, not a quoted Git name', async t => {
+  const f = await fixture(t);
+  const base = await git(f.root, ['rev-parse', 'HEAD']);
+  const head = await f.taskHead('unicode', base, { 'docs/заметка.md': 'note\n' });
+  const worktree = path.join(f.directory, 'tasks', 'unicode');
+  assert.equal(await git(worktree, ['rev-parse', 'HEAD']), head);
+  const { changedFiles } = await import('../runtime/workspace.mjs');
+  const { ownsPath } = await import('../runtime/contracts.mjs');
+  const files = await changedFiles(worktree, base);
+  assert.deepEqual(files, ['docs/заметка.md']);
+  assert.equal(ownsPath(['docs'], files[0]), true);
+});

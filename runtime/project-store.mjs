@@ -578,6 +578,17 @@ function assertGraph(ctx, s) {
   };
   for (const id of tasks.keys()) visit(id);
   // A wave epic is gated after the epics it depends on: an epic cycle would never be gated.
+  // A wave container without work is never gated and would block its parent for good. Checked
+  // after every mutation (create, insert, amend, appendMilestone), inside the transaction.
+  const empty = isWave(ctx, s.project) ? port(ctx, 'emptyContainers')(s.milestones, s.epics, s.tasks) : [];
+  if (empty.length)
+    throw Object.assign(
+      new Error(`Project container without work: ${empty.map(c => `${c.kind} ${c.id}`).join(', ')}`),
+      {
+        code: 'project_container_empty',
+        containers: empty,
+      },
+    );
   const cycle = isWave(ctx, s.project) ? port(ctx, 'epicCycle')(s.epics, s.tasks) : null;
   if (cycle)
     throw Object.assign(new Error(`Project epic dependency cycle ${cycle.join(' -> ')}`), {

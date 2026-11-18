@@ -803,3 +803,15 @@ test('A milestone joins a gate chain only when its other epics are already accep
     [[epic('e'), milestone, project]],
   );
 });
+
+test('An empty epic or milestone is refused by any mutation of a wave project, not only by create', async t => {
+  const f = await fixture(t);
+  const pid = await f.create(waveSpec(f.root(), [taskSpec('a')]));
+  await assert.rejects(f.run(pid, { op: 'insert', kind: 'epic', record: epicSpec('empty', 'm') }), {
+    code: 'project_container_empty',
+  });
+  await assert.rejects(f.run(pid, { op: 'insert', kind: 'milestone', record: milestoneSpec('m9') }), {
+    code: 'project_container_empty',
+  });
+  assert.equal(rows(f.store, pid).includes('epic:empty'), false, 'the transaction rolled back');
+});

@@ -782,6 +782,11 @@ test(
     assert.notEqual(snapshot.epics[0].status, 'accepted');
     const gate = f.store.getRun(snapshot.gates[0].runId);
     assert.deepEqual([gate.state, gate.error?.code], ['blocked', 'project_integration_history']);
+    // The drain result reports the saved gate state, not the state before acceptance blocked it.
+    assert.deepEqual(
+      result.gates.filter(row => row.runId === gate.id).map(row => row.state),
+      ['blocked'],
+    );
     assert.equal(f.branchHead(), snapshot.gates[0].headSha, 'the repairs were never merged back');
     const reachable = spawnSync('git', ['merge-base', '--is-ancestor', leaked, f.branchHead()], { cwd: f.root });
     assert.equal(reachable.status, 1, 'the commit with credentials.json is not on the integration branch');

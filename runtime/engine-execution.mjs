@@ -17,7 +17,7 @@ import { contentHash, evidencePrompt, lstatSafe } from './engine-core.mjs';
 export class EngineExecution extends EnginePlanning {
   async checkScope(cwd, baseSha, scopes) {
     const tracked = await changedFiles(cwd, baseSha);
-    const untracked = (await git(cwd, ['ls-files', '--others', '--exclude-standard', '-z']))
+    const untracked = (await git(cwd, ['ls-files', '--others', '--exclude-standard', '-z'], { rawOutput: true }))
       .split('\0')
       .filter(Boolean);
     const files = [...new Set([...tracked, ...untracked])];

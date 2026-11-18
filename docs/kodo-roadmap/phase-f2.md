@@ -83,6 +83,15 @@
 
 Изменённые контракты: `wavePolicyAt(cwd, commit, {secrets})`, `applyWavePolicy(draft, commit, {secrets})`, `assertWavePolicy({..., secrets})`; `inspectHistory` — вид дефекта `unverifiable`, экспорты `SECRET_SCAN_BYTES`, `HISTORY_SCAN_BYTES`; `nodeTestOutcome`, `nodeTestCommand`, `fastEnvironment` (`task-fast-checks.mjs`); `emptyContainers` (`project-contracts.mjs`); строка квитанции gate Run `tests`; `--abandon` требует `--attempt`. Новые коды: `project_wave_policy_unsafe`, `wave_policy_unsafe`, `project_integration_history_unverifiable`, `external_history_unverifiable`, `gate_check_no_tests`, `gate_check_summary_unknown`, `project_gate_tests_uncounted`, `project_container_empty`. Legacy-проекты и legacy Run не меняются (golden-хэши без правки).
 
+## Исправления по третьему ревью фабрики
+
+| Находка | Исправление | Тест |
+| --- | --- | --- |
+| `insert` добавлял пустой эпик в wave-проект | Пустые эпики и майлстоуны отвергаются в `assertGraph` после любой мутации wave-проекта (`project_container_empty`), транзакция откатывается | `tests/project-wave-store.test.mjs` |
+| Форма `--test-reporter tap` (значение отдельным аргументом) не считалась | Имена репортёров и назначения разбираются в обеих формах; итог spec/tap считается | `tests/task-fast-checks.test.mjs` |
+| Кириллические пути отвергались проверкой scope | `changedFiles` и список неотслеживаемых файлов читаются через `-z` без редактирования: имена совпадают с writePaths (касается и обычных Run) | `tests/project-integration.test.mjs` |
+| `drain` сообщал гейт `succeeded` после блокировки при приёмке | Строка гейта формируется после приёмки по сохранённому состоянию Run | `tests/project-wave-e2e.test.mjs` |
+
 ## Границы
 
 - Все мутации wave-проекта (`drain`, `next-wave`, `complete-task`) сериализует lease `project:<id>`; pull-команды во время `drain` отвечают `project_busy`. Переходы, чьё доказательство читает интеграционную ветку, — ещё и lease `project-integration:<id>` до фиксации.

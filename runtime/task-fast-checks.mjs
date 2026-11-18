@@ -58,13 +58,20 @@ const countableReporters = ['spec', 'tap'];
 const nodeCommand = command => command === process.execPath || /(?:^|[\\/])node(?:\.exe)?$/i.test(command);
 /** Whether a configured command is Node's own test runner (`node --test`). */
 export const nodeTestCommand = ({ command, args = [] }) => nodeCommand(command) && args.includes('--test');
-// The default reporter, or exactly one `--test-reporter=spec|tap` written to stdout.
+/** Reporter names and destinations in both forms: `--test-reporter=tap` and `--test-reporter tap`. */
+function reporterSpecs(args = []) {
+  const names = [],
+    destinations = [];
+  for (let index = 0; index < args.length; index++) {
+    const match = /^--test-reporter(-destination)?(?:=(.*))?$/.exec(args[index]);
+    if (match) (match[1] ? destinations : names).push(match[2] ?? args[index + 1]);
+  }
+  return { names, destinations };
+}
+// The default reporter, or exactly one spec/tap reporter written to stdout (either argument form).
 const countableReporter = (args = []) => {
-  const reporters = args.filter(arg => reporterOption.test(arg));
-  return (
-    !reporters.length ||
-    (reporters.length === 1 && countableReporters.some(name => reporters[0] === `--test-reporter=${name}`))
-  );
+  const { names, destinations } = reporterSpecs(args);
+  return !destinations.length && (!names.length || (names.length === 1 && countableReporters.includes(names[0])));
 };
 // A `node --test` command whose summary says how many tests passed.
 const countedRunner = step => nodeTestCommand(step) && countableReporter(step.args);

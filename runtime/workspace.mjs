@@ -92,7 +92,11 @@ export async function collectFiles(cwd, task, secrets = {}) {
   return { files, omitted: names.length - files.length, bytes: size };
 }
 export async function changedFiles(cwd, base) {
-  return (await git(cwd, ['diff', '--no-renames', '--name-only', base])).split('\n').filter(Boolean);
+  // NUL-separated raw names: Git quotes non-ASCII names in line mode, and redaction must not
+  // rewrite a path before it is matched against the task's write scope.
+  return (await git(cwd, ['diff', '--no-renames', '--name-only', '-z', base], { rawOutput: true }))
+    .split('\0')
+    .filter(Boolean);
 }
 export async function commitChanges(cwd, message, paths) {
   if (paths === undefined) await git(cwd, ['add', '-A']);

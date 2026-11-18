@@ -14,7 +14,13 @@ import * as D from '../runtime/project-evidence.mjs';
 import { openProjectStore } from '../runtime/project-store.mjs';
 import { createProjectDirector, createProjectTransitionAuthorizer } from '../runtime/project-director.mjs';
 import { withIntegrationLease } from '../runtime/project-integration-lease.mjs';
-import { TASK_FAST_PROFILE, passedTests, planFastChecks, runFastChecks } from '../runtime/task-fast-checks.mjs';
+import {
+  TASK_FAST_PROFILE,
+  nodeTestOutcome,
+  passedTests,
+  planFastChecks,
+  runFastChecks,
+} from '../runtime/task-fast-checks.mjs';
 import { fixture, git } from './helpers/engine-fixture.mjs';
 
 const nodeTest = { command: process.execPath, args: ['--test'] };
@@ -773,4 +779,19 @@ test('Task-fast checks count the tap and spec reporters and refuse a full run wi
   assert.equal(spec.complete, true);
   assert.equal(spec.plan.fallback, false, JSON.stringify(spec.plan.reasons));
   assert.equal(spec.results.find(row => row.kind === 'test').tests, 3);
+});
+
+test('Both reporter argument forms are counted: --test-reporter=tap and --test-reporter tap', () => {
+  const tap = '# tests 1\n# suites 0\n# pass 1\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0\n';
+  for (const args of [
+    ['--test', '--test-reporter=tap'],
+    ['--test', '--test-reporter', 'tap'],
+  ])
+    assert.deepEqual(nodeTestOutcome({ command: 'node', args }, tap), { tests: 1 }, args.join(' '));
+  // A destination file or an uncountable reporter gives no summary on stdout, in either form.
+  for (const args of [
+    ['--test', '--test-reporter', 'dot'],
+    ['--test', '--test-reporter', 'tap', '--test-reporter-destination', 'out.tap'],
+  ])
+    assert.deepEqual(nodeTestOutcome({ command: 'node', args }, tap), { tests: null }, args.join(' '));
 });
