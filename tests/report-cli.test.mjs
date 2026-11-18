@@ -25,7 +25,7 @@ import * as contracts from '../runtime/project-contracts.mjs';
 import { workerEnvironment } from '../runtime/security.mjs';
 import { reportCli } from '../runtime/report-cli.mjs';
 import {
-  protectCopyDirectory,
+  createPrivateDirectory,
   readRedactionSecrets,
   readReportState,
   REMOVE_ATTEMPTS,
@@ -471,7 +471,7 @@ test('kodo report reads a legacy key file for redaction and never migrates it', 
   const result = invokeCli(f, ['report', runId, '--json']);
   assert.equal(result.status, 0, result.stderr);
   assert.ok(!result.stdout.includes(SECRET));
-  assert.deepEqual(JSON.parse(result.stdout).models, [{ client: 'codex', model: '[REDACTED]', sessions: 1 }]);
+  assert.deepEqual(JSON.parse(result.stdout).models, [{ client: 'codex', model: '[REDACTED]', sessions: 1, observedSessions: 1 }]);
   const unknown = invokeCli(f, ['report', randomUUID(), '--json']);
   assert.equal(JSON.parse(unknown.stdout).code, 'report_not_found');
   // The legacy file stays byte for byte; no credential store or directory appears.
@@ -813,7 +813,7 @@ test('credentials equal to project field names mask values only: the project rep
   assert.match(human.output, new RegExp(`Project ${f.projectId}`));
 });
 
-test('a private copy directory is made private before any byte is copied, or the report fails closed', async t => {
+test('a private copy directory is created private and empty, or the report fails closed', async t => {
   const f = await fixture(t);
   const temporaryRoot = path.join(f.dir, 'snapshots');
   mkdirSync(temporaryRoot);
@@ -823,32 +823,34 @@ test('a private copy directory is made private before any byte is copied, or the
       home: f.home,
       secrets: {},
       temporaryRoot,
-      protectDirectory: async directory => {
+      createDirectory: async root => {
+        const directory = await createPrivateDirectory(root);
         seen.push(readdirSync(directory));
-        await protectCopyDirectory(directory);
+        return directory;
       },
     }),
     await reportCli([f.runId, '--json'], {
       home: f.home,
       secrets: {},
       temporaryRoot,
-      protectDirectory: async () => {
+      createDirectory: async () => {
         throw new Error('acl refused');
       },
     }),
   ]);
   assert.equal(ok.exitCode, 0, ok.output);
   assert.equal(ok.report.provenance.snapshot.method, 'wal-copy');
-  assert.deepEqual(seen, [[]], 'protected while still empty');
+  assert.deepEqual(seen, [[]], 'created private and still empty');
   assert.equal(refused.exitCode, 2);
   assert.equal(refused.report.code, 'report_unavailable');
   assert.deepEqual(readdirSync(temporaryRoot), [], 'no copy is left behind');
 });
 
-test('a protected copy directory grants access only to its owner (and SYSTEM on Windows)', async t => {
-  const directory = mkdtempSync(path.join(os.tmpdir(), 'kodo-report-acl-'));
-  t.after(() => rmSync(directory, { recursive: true, force: true }));
-  await protectCopyDirectory(directory);
+test('a private copy directory grants access only to its owner (and SYSTEM on Windows) from creation', async t => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'kodo-report-acl-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const directory = await createPrivateDirectory(root);
+  assert.deepEqual(readdirSync(directory), []);
   if (process.platform !== 'win32') {
     assert.equal(statSync(directory).mode & 0o077, 0);
     return;

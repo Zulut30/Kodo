@@ -85,7 +85,7 @@ test('run report: wall time from the saved creation to the terminal event, stage
   assert.equal(report.state, 'succeeded');
   assert.equal(report.mode, 'standard');
   assert.equal(report.client, 'codex');
-  assert.deepEqual(report.models, [{ client: 'codex', model: 'gpt-x', sessions: 3 }]);
+  assert.deepEqual(report.models, [{ client: 'codex', model: 'gpt-x', sessions: 3, observedSessions: 3 }]);
   assert.deepEqual(
     [report.timing.createdAt, report.timing.finishedAt, report.timing.wallMs],
     [iso(T0), iso(T0 + 60_000), 60_000],
@@ -875,7 +875,13 @@ test('a Run continued without its earlier history has no usage total, only the o
     [null, null, null, 3],
   );
   const implementation = run.timing.stages.implementation;
-  assert.deepEqual([implementation.durationMs, implementation.sessions], [null, null]);
+  assert.deepEqual([implementation.durationMs, implementation.sessions, implementation.total], [null, null, null]);
+  // How many sessions are missing is unknown: no stage invents a denominator.
+  assert.deepEqual([run.timing.stages.planning.total, run.timing.stages.planning.durationMs], [null, null]);
+  assert.deepEqual(
+    run.models.map(row => [row.sessions, row.observedSessions]),
+    [[null, 3]],
+  );
   assert.equal(typeof implementation.measuredMs, 'number');
   assert.equal(buildRunReport(finishedRun(), finishedEvents(), { now: NOW }).usage.usage.totalTokens, 360);
 

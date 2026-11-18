@@ -52,11 +52,11 @@ kodo project report PROJECT_ID [--json]   # алиас второй формы
 | --- | --- | --- |
 | `runId`, `state`, `client` | `runs.body` | Как в сохранённом Run |
 | `mode` | `executionMode.selected` | Выбранный режим или `null` |
-| `models[]` | `sessionAttempts[].client/model` | `{client, model, sessions}`. `null`, если Run не сохранил попытки сессий |
+| `models[]` | `sessionAttempts[].client/model` | `{client, model, sessions, observedSessions}`. `null`, если Run не сохранил попытки сессий. При `metrics.historyComplete: false` `sessions` равно `null`, сохранённое число — в `observedSessions` |
 | `timing.createdAt` | `createdAt`, иначе время события `created` | ISO |
 | `timing.finishedAt` | время последнего события, тип которого равен конечному `state` (`succeeded`, `blocked`, `cancelled`, `waiting_limits`) | `null`, пока Run не завершён |
 | `timing.wallMs` | `finishedAt − createdAt` | Включает простои и паузы. `null`, если нет одного из концов |
-| `timing.stages.<stage>` | см. ниже | `{durationMs, sessions, operations, known, total, source}` |
+| `timing.stages.<stage>` | см. ниже | `{durationMs, measuredMs, sessions, operations, known, total, source}`. `measuredMs` — сумма известных наблюдений, когда итог неизвестен. При `metrics.historyComplete: false` у стадий из сессий (`planning`, `implementation`, `verification`, `review`) `durationMs`, `sessions` и `total` равны `null`: число пропущенных сессий неизвестно, `known` и `measuredMs` описывают сохранённое |
 | `queue` | `kodo_job_events` очередей `run:<RUN_ID>:*` | `{jobs, waitMs, measuredMs, known, total, source}`. Ожидание — время в `queued`/`blocked` до выхода из этих состояний: обе границы — сохранённые квитанции состояния. `measuredMs` — сумма закрытых ожиданий, если открытое делает `waitMs` неизвестным. Без durable scheduler заданий нет: `jobs: 0`, `waitMs: null` |
 | `queue.delivery` | события `delivery.queue_waiting` | Ожидание lease очереди доставки, `{waitMs, measuredMs, polls, known, total, source}`. Серии опросов разных очередей (merge, release) — разные ожидания. См. «Окна ожидания по опросам» |
 | `checks.runs[]` | `checks.results` | `{kind, executable, durationMs, exitCode}` последнего раунда проверок. `executable` — базовое имя исполняемого файла вместе с расширением (`node`, `npm`, `lint.cmd`) без каталога и аргументов; `null`, если имени нет или его нельзя выделить однозначно (см. ниже) |

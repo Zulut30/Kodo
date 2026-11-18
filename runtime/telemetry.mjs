@@ -201,12 +201,13 @@ function stageTimings(run, deliveries, sessions, executions) {
     if (stage) add(stage, duration(attempt.metrics?.durationMs), 'session-attempts', 'sessions');
     else unmapped++;
   }
-  // A Run continued without its earlier sessions: every session stage may miss some. Its
-  // total and session count are unknown; what was saved stays in `measuredMs`.
+  // A Run continued without its earlier sessions: every session stage may miss an unknown
+  // number of them. Its total, denominator and session count are unknown; what was saved
+  // stays in `known` and `measuredMs`.
   if (historyIncomplete)
     for (const name of new Set(Object.values(sessionStages))) {
-      stages[name].samples.push(null);
       stages[name].sessions = null;
+      stages[name].partial = true;
     }
   let openOperations = 0;
   for (const operation of operations || []) {
@@ -227,14 +228,15 @@ function stageTimings(run, deliveries, sessions, executions) {
   const result = {};
   for (const [name, stage] of Object.entries(stages)) {
     const sum = total(stage.samples);
+    const partial = stage.partial === true;
     result[name] = {
-      durationMs: sum.value,
+      durationMs: partial ? null : sum.value,
       // The saved part when the total is unknown; never part of a total.
-      measuredMs: sum.value === null ? measured(stage.samples) : null,
+      measuredMs: partial || sum.value === null ? measured(stage.samples) : null,
       sessions: stage.sessions,
       operations: stage.operations,
       known: sum.known,
-      total: sum.total,
+      total: partial ? null : sum.total,
       source: stage.sources.join('+') || null,
     };
   }
@@ -440,7 +442,7 @@ function watchdog(run) {
   };
 }
 
-function models(sessions) {
+function models(sessions, historyIncomplete = false) {
   if (!sessions) return null;
   const counts = new Map();
   for (const attempt of sessions) {
@@ -450,7 +452,8 @@ function models(sessions) {
   return [...counts]
     .map(([key, count]) => {
       const [client, model] = JSON.parse(key);
-      return { client, model, sessions: count };
+      // Without the earlier sessions the saved count is only a part.
+      return { client, model, sessions: historyIncomplete ? null : count, observedSessions: count };
     })
     .sort((a, b) => String(a.client).localeCompare(String(b.client)) || String(a.model).localeCompare(String(b.model)));
 }
@@ -536,7 +539,7 @@ export function buildRunReport(run, events, { jobEvents = [], now = null } = {})
     state: code(run.state, 'unknown'),
     mode: token(run.executionMode?.selected),
     client: token(run.client),
-    models: models(sessions),
+    models: models(sessions, run.metrics?.historyComplete === false),
     timing: timing(run, sorted, stages),
     queue: {
       ...jobWaits(jobEvents),
