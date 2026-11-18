@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { compileBlueprint } from '../runtime/project-blueprint.mjs';
+import { assertDirectorSafe } from '../runtime/project-contracts.mjs';
 import {
   generateBlueprint,
   generateMilestone,
@@ -199,6 +200,7 @@ test('prepareBootstrap writes the bundle only under home and leaves the reposito
     completeFileMap: true,
     architecture: false,
     knowledge: false,
+    redacted: false,
   });
 });
 
@@ -379,6 +381,7 @@ test('prepareExtend builds a module map from the snapshot without rescanning cod
     acceptedTasks: 2,
     architecture: false,
     knowledge: false,
+    redacted: false,
   });
   const other = await temp(t);
   await assert.rejects(prepareExtend({ snapshot, prompt: 'x', root: other, home }), {
@@ -543,4 +546,99 @@ test('readMilestoneFile rejects a symlinked milestone file', async t => {
     throw error;
   }
   await assert.rejects(readMilestoneFile(path.join(dir, 'link.json')), { code: 'milestone_unsafe_path' });
+});
+
+// Review finding: repository metadata (file names, package.json, architecture
+// graph) carrying a known secret reached context.md and the native prompt.
+const KNOWN_SECRET = 'kodo-known-secret-7f3a9c1e5b';
+const PEM_KEY = '-----BEGIN PRIVATE KEY-----\nMIIBVQIBADANBgkqhkiG9w0BAQEFAASC\n-----END PRIVATE KEY-----';
+const SHAPED = 'sk-proj-abcdefghijklmnopqrstuv';
+const leakyGraph = {
+  modules: [{ id: 'core', roots: [`src/${KNOWN_SECRET}`], public: [SHAPED] }],
+  edges: [],
+};
+function assertClean(text) {
+  assert.ok(!text.includes(KNOWN_SECRET), 'known secret is redacted');
+  assert.ok(!text.includes(SHAPED), 'credential-shaped value is redacted');
+  assert.doesNotMatch(text, /BEGIN PRIVATE KEY/);
+  assertDirectorSafe(text, { knownValues: [KNOWN_SECRET] });
+}
+
+test('bootstrap context and the native prompt redact known secrets, PEM keys and credential-shaped values', async t => {
+  const root = await temp(t),
+    home = await temp(t, 'kodo-home-');
+  await writeFile(path.join(root, `notes-${KNOWN_SECRET}.md`), '');
+  await writeFile(path.join(root, 'package.json'), JSON.stringify({ type: PEM_KEY }));
+  const options = { prompt: 'Сервис заметок', root, home, now: AT, architecture: leakyGraph };
+  const prepared = await prepareBootstrap({ ...options, knownValues: [KNOWN_SECRET] });
+  const context = await readFile(path.join(prepared.dir, 'context.md'), 'utf8');
+  assertClean(context);
+  assert.match(context, /notes-\[REDACTED\]\.md/);
+  assert.match(context, /src\/\[REDACTED\]/);
+  assert.equal(prepared.summary.redacted, true);
+  for (const name of prepared.files) assertClean(await readFile(path.join(prepared.dir, name), 'utf8'));
+
+  const provider = fakeProvider(request => writeValidBlueprint(request.cwd));
+  const generated = await generateBlueprint({ ...options, provider, client: 'codex', knownValues: [KNOWN_SECRET] });
+  assert.equal(provider.calls.length, 1);
+  assertClean(provider.calls[0].prompt);
+  assert.match(provider.calls[0].prompt, /notes-\[REDACTED\]\.md/);
+  assert.equal(generated.ok, true, JSON.stringify(generated.findings));
+});
+
+test('extend context and the milestone prompt redact known secrets', async t => {
+  const { root, snapshot } = await project(t, { 'storage-module': 'accepted' });
+  const home = await temp(t, 'kodo-home-');
+  const options = { snapshot, prompt: 'Добавить поиск', root, home, now: AT, architecture: leakyGraph };
+  const prepared = await prepareExtend({ ...options, knownValues: [KNOWN_SECRET] });
+  for (const name of prepared.files) assertClean(await readFile(path.join(prepared.dir, name), 'utf8'));
+  assert.equal(prepared.summary.redacted, true);
+  const calls = [];
+  const provider = {
+    async runSession(request) {
+      calls.push(request);
+      return { output: { status: 'proposed', summary: 'Поиск', milestone: JSON.stringify(milestoneFile()) } };
+    },
+  };
+  const generated = await generateMilestone({ ...options, provider, client: 'codex', knownValues: [KNOWN_SECRET] });
+  assert.equal(generated.ok, true);
+  assert.equal(calls.length, 1);
+  assertClean(calls[0].prompt);
+});
+
+test('context that cannot be redacted safely is refused before anything is written', async t => {
+  const root = await temp(t),
+    home = await temp(t, 'kodo-home-');
+  await writeFile(path.join(root, 'package.json'), JSON.stringify({ type: PEM_KEY }));
+  // The redaction marker itself contains this known value: Kodo fails closed.
+  await assert.rejects(prepareBootstrap({ prompt: 'x', root, home, knownValues: ['REDACTED'] }), {
+    code: 'bootstrap_context_unsafe',
+  });
+  assert.deepEqual(await readdir(home), []);
+  const provider = fakeProvider();
+  await assert.rejects(
+    generateBlueprint({ provider, client: 'codex', root, home, prompt: 'x', knownValues: ['REDACTED'] }),
+    { code: 'bootstrap_context_unsafe' },
+  );
+  assert.equal(provider.calls.length, 0, 'the provider never receives unsafe context');
+});
+
+test('lintMilestone reports epic cycles of the new milestone before append', async t => {
+  const { snapshot } = await project(t, { 'storage-module': 'accepted' });
+  const cyclic = milestoneFile({ review: { dependsOn: ['tags-index'] } });
+  cyclic.epics.push({ id: 'tags-epic', milestoneId: 'search', title: 'Теги', acceptance: [criterion('tags-done')] });
+  cyclic.tasks.push({
+    ...cyclic.tasks[0],
+    id: 'tags-index',
+    epicId: 'tags-epic',
+    dependsOn: ['search-index'],
+    writePaths: ['src/tags'],
+  });
+  const result = lintMilestone(cyclic, snapshot);
+  assert.deepEqual(codes(result), ['blueprint_epic_cycle']);
+  assert.deepEqual(result.findings[0].taskIds, ['search-review', 'tags-index']);
+  assert.match(result.findings[0].message, /search-epic, tags-epic/);
+  const chain = structuredClone(cyclic);
+  chain.tasks[1].dependsOn = ['search-index'];
+  assert.deepEqual(lintMilestone(chain, snapshot), { ok: true, findings: [] });
 });

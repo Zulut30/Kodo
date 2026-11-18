@@ -112,7 +112,8 @@ test('Wave 0 tasks may not depend on later tasks', async t => {
     },
   });
   const result = await compileBlueprint(root);
-  assert.deepEqual(codes(result), ['blueprint_wave0_bypassed', 'blueprint_wave0_order']);
+  // foundation-setup → release-review → storage → foundation-setup is also an epic cycle.
+  assert.deepEqual(codes(result), ['blueprint_wave0_bypassed', 'blueprint_wave0_order', 'blueprint_epic_cycle']);
   assert.deepEqual(byCode(result, 'blueprint_wave0_bypassed').taskIds, ['early']);
   assert.deepEqual(byCode(result, 'blueprint_wave0_order').taskIds, ['test-bench']);
 });
@@ -451,4 +452,26 @@ test('a file symlink inside the blueprint is rejected', async t => {
     throw error;
   }
   assert.deepEqual(codes(await compileBlueprint(file.root)), ['blueprint_unsafe_path']);
+});
+
+test('epics whose tasks depend on each other in a cycle are reported before apply-spec', async t => {
+  // A1 → B1 → A2 → B2: tasks are acyclic, their epics are not (storage ↔ api).
+  const { root } = await blueprint(t, {
+    mutate(spec) {
+      task(spec, 'api-module').dependsOn = ['storage-module'];
+      spec.tasks.push({
+        ...task(spec, 'storage-module'),
+        id: 'storage-adapter',
+        dependsOn: ['api-module'],
+        writePaths: ['src/adapter'],
+      });
+    },
+  });
+  const result = await compileBlueprint(root);
+  assert.deepEqual(codes(result), ['blueprint_epic_cycle']);
+  assert.deepEqual(byCode(result, 'blueprint_epic_cycle').taskIds, ['api-module', 'storage-adapter']);
+  assert.match(byCode(result, 'blueprint_epic_cycle').message, /api, storage/);
+  const markdown = await readFile(path.join(fixtures, 'valid', 'PROJECT.md'), 'utf8');
+  const lint = lintFactorySpec(result.spec, { interfaces: result.interfaces, projectMarkdown: markdown });
+  assert.deepEqual(codes(lint), ['blueprint_epic_cycle']);
 });

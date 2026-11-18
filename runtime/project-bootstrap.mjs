@@ -7,6 +7,7 @@ import { lstat, mkdir, readFile, readdir, realpath, stat, writeFile } from 'node
 import path from 'node:path';
 import * as projectContracts from './project-contracts.mjs';
 import { projectKnowledge } from './knowledge-context.mjs';
+import { redact } from './security.mjs';
 import { inside } from './toolchains.mjs';
 import {
   BLUEPRINT_DIR,
@@ -15,6 +16,7 @@ import {
   FOUNDATION_ID,
   MAX_TASK_INPUT_BYTES,
   compileBlueprint,
+  epicCycleFindings,
   finding,
   overlapFindings,
   ownerFindings,
@@ -32,6 +34,9 @@ const LISTED_FILES = 400;
 const SCAN_LIMIT = 20000;
 const SCAN_DEPTH = 8;
 const CLOSED = ['accepted', 'released'];
+const REDACTED = '[REDACTED]';
+// A whole PEM private key block; an unterminated header redacts to the end.
+const PEM_BLOCK = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/gi;
 const SKIP_DIRS = new Set([
   '.git',
   '.hg',
@@ -280,9 +285,34 @@ function knowledgeSection(knowledge, prompt) {
   }
 }
 
+/** Context comes from repository metadata (file names, manifests, architecture
+ * graph, knowledge) and may carry credentials. Before anything is written or sent
+ * to a provider, known values, PEM private keys and credential-shaped values
+ * (security.redact) become [REDACTED]; the result must then pass
+ * assertDirectorSafe, otherwise Kodo refuses with bootstrap_context_unsafe. */
+function redactContext(text, { contracts = projectContracts, knownValues = [] } = {}) {
+  const known = [...new Set(knownValues.filter(value => typeof value === 'string' && value))].sort(
+    (left, right) => right.length - left.length,
+  );
+  let clean = text;
+  for (const value of known) clean = clean.split(value).join(REDACTED);
+  clean = redact(clean.replace(PEM_BLOCK, REDACTED), {});
+  try {
+    contracts.assertDirectorSafe(clean, { knownValues });
+  } catch (error) {
+    if (typeof error?.code !== 'string') throw error;
+    throw failure('bootstrap_context_unsafe', 'Контекст содержит секрет, который нельзя безопасно отредактировать');
+  }
+  return { text: clean, redacted: clean !== text };
+}
+
 /** Create <home>/bootstrap/<id>/ with exclusive writes. The bundle must never be
- * inside the project root: the repository is not changed by preparation. */
-async function writeBundle({ home, root, kind, now, files }) {
+ * inside the project root: the repository is not changed by preparation. Every
+ * file is redacted (redactContext) before the first write.
+ * @returns {Promise<{ id: string, dir: string, files: string[], redacted: boolean }>} */
+async function writeBundle({ home, root, kind, now, files: raw, safety }) {
+  const checked = raw.map(([name, content]) => [name, redactContext(content, safety)]);
+  const files = checked.map(([name, item]) => [name, item.text]);
   if (typeof home !== 'string' || !path.isAbsolute(home))
     throw failure('bootstrap_home_invalid', 'home должен быть абсолютным путём');
   const base = path.join(path.resolve(home), 'bootstrap');
@@ -301,7 +331,7 @@ async function writeBundle({ home, root, kind, now, files }) {
     await mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
     await writeFile(target, content, { flag: 'wx', mode: 0o600 });
   }
-  return { id, dir, files: files.map(([name]) => name) };
+  return { id, dir, files: files.map(([name]) => name), redacted: checked.some(([, item]) => item.redacted) };
 }
 
 // ---- Bootstrap bundle --------------------------------------------------------------
@@ -322,6 +352,7 @@ const RULES = `# Правила чертежа Kodo
 4. **Роли через owner:** ${FACTORY_ROLES.map(role => `\`${role}\``).join(', ')}.
 5. **Интерфейсы.** \`interfaceRefs\` указывают на \`interfaces/<module>.md\`. Короткая форма \`{ "kind": "interface", "path": "interfaces/<module>.md" }\`: Kodo подставит абсолютный путь, \`runId\`/\`headSha\` = null и sha256 текущего файла. Явный sha256 должен совпадать с файлом.
 6. \`root\` — абсолютный путь каталога проекта; id — slug; остальные поля строго по ProjectSpec v1.
+7. **Эпики без циклов.** Если задача эпика X зависит от задачи эпика Y, никакая задача Y не должна зависеть (через задачи любых эпиков) от задач X: гейты эпиков закрываются по порядку.
 
 ## Коды проверки
 
@@ -334,6 +365,7 @@ const RULES = `# Правила чертежа Kodo
 | \`blueprint_section_missing\`, \`blueprint_section_empty\` | Разделы PROJECT.md |
 | \`blueprint_owner_unknown\` | owner — одна из ролей |
 | \`blueprint_wave0_missing\`, \`blueprint_wave0_bypassed\`, \`blueprint_wave0_order\` | Волна 0 |
+| \`blueprint_epic_cycle\` | Цикл зависимостей между эпиками: перенести задачи или объединить эпики |
 | \`blueprint_parallel_overlap\` | Пересечение writePaths параллельных задач |
 | \`split_required\` | Разделить задачу |
 | \`blueprint_interface_missing\`, \`blueprint_interface_stale\` | Ссылки на interfaces/*.md |
@@ -478,7 +510,7 @@ function bootstrapContext({ prompt, root, at, scan, stack, architecture, knowled
  * context.md, rules.md and templates/. Returns { id, dir, files, summary }.
  * @param {Record<string, any>} [options] */
 export async function prepareBootstrap(options = {}) {
-  const { prompt, root, home, now, architecture, knowledge } = options;
+  const { prompt, root, home, now, architecture, knowledge, contracts, knownValues } = options;
   checkPrompt(prompt);
   const real = await existingRoot(root);
   const at = isoTime(now);
@@ -486,11 +518,12 @@ export async function prepareBootstrap(options = {}) {
   const stack = await detectStack(real, scan.files);
   const graph = await architectureSection(architecture);
   const facts = knowledgeSection(knowledge, prompt);
-  const bundle = await writeBundle({
+  const { redacted, ...bundle } = await writeBundle({
     home,
     root: real,
     kind: 'bootstrap',
     now: at,
+    safety: { contracts, knownValues },
     files: [
       ['context.md', bootstrapContext({ prompt, root: real, at, scan, stack, architecture: graph, knowledge: facts })],
       ['rules.md', RULES],
@@ -510,6 +543,7 @@ export async function prepareBootstrap(options = {}) {
       completeFileMap: scan.complete && scan.files.length <= LISTED_FILES,
       architecture: graph.available,
       knowledge: facts.available,
+      redacted,
     },
   };
 }
@@ -585,7 +619,8 @@ export async function generateBlueprint(options = {}) {
   const { provider, client, model, root, home, prompt, signal, now, architecture, knowledge, contracts, knownValues } =
     options;
   checkSession({ provider, client, model, signal });
-  const bundle = await prepareBootstrap({ prompt, root, home, now, architecture, knowledge });
+  const safety = { contracts, knownValues };
+  const bundle = await prepareBootstrap({ prompt, root, home, now, architecture, knowledge, ...safety });
   const real = bundle.summary.root;
   const files = await bundleFiles(bundle);
   const before = await scanProject(real);
@@ -593,7 +628,7 @@ export async function generateBlueprint(options = {}) {
     client,
     model: model ?? undefined,
     cwd: real,
-    prompt: sessionPrompt(real, bundle, files),
+    prompt: redactContext(sessionPrompt(real, bundle, files), safety).text,
     schema: SESSION_SCHEMA,
     readOnly: false,
     signal,
@@ -701,8 +736,9 @@ const MILESTONE_RULES = `# Правила нового майлстоуна
 4. writePaths задач, которые могут идти параллельно (новые без пути по dependsOn и незакрытые существующие), не пересекаются.
 5. Вход каждой задачи — до ${MAX_TASK_INPUT_BYTES} байт UTF-8; Kodo задачи не режет.
 6. owner — одна из ролей: ${FACTORY_ROLES.join(', ')}.
+7. Новые эпики не образуют цикл: если задача эпика X зависит от задачи эпика Y, никакая задача Y не зависит (через задачи любых эпиков) от задач X.
 
-Коды: \`milestone_shape\`, \`milestone_task_count\`, \`milestone_id_conflict\`, \`milestone_foreign_parent\`, \`milestone_dependency_unknown\`, \`milestone_dependency_not_accepted\`, \`milestone_snapshot_invalid\`, \`milestone_snapshot_incomplete\`, \`milestone_spec_invalid\`, \`blueprint_owner_unknown\`, \`blueprint_parallel_overlap\`, \`split_required\`.
+Коды: \`milestone_shape\`, \`milestone_task_count\`, \`milestone_id_conflict\`, \`milestone_foreign_parent\`, \`milestone_dependency_unknown\`, \`milestone_dependency_not_accepted\`, \`milestone_snapshot_invalid\`, \`milestone_snapshot_incomplete\`, \`milestone_spec_invalid\`, \`blueprint_owner_unknown\`, \`blueprint_epic_cycle\`, \`blueprint_parallel_overlap\`, \`split_required\`.
 `;
 
 function milestoneTemplate(snapshot) {
@@ -748,11 +784,12 @@ export async function prepareExtend(options = {}) {
   const at = isoTime(now);
   const graph = await architectureSection(architecture);
   const facts = knowledgeSection(knowledge, prompt);
-  const bundle = await writeBundle({
+  const { redacted, ...bundle } = await writeBundle({
     home,
     root: real,
     kind: 'extend',
     now: at,
+    safety: { contracts, knownValues },
     files: [
       [
         'context.md',
@@ -774,6 +811,7 @@ export async function prepareExtend(options = {}) {
       acceptedTasks: current.tasks.filter(task => CLOSED.includes(task.status)).length,
       architecture: graph.available,
       knowledge: facts.available,
+      redacted,
     },
   };
 }
@@ -825,7 +863,10 @@ export async function generateMilestone(options = {}) {
     client,
     model: model ?? undefined,
     cwd: bundle.summary.root,
-    prompt: milestonePrompt(bundle.summary.root, bundle, await bundleFiles(bundle)),
+    prompt: redactContext(milestonePrompt(bundle.summary.root, bundle, await bundleFiles(bundle)), {
+      contracts: options.contracts,
+      knownValues: options.knownValues,
+    }).text,
     schema: MILESTONE_SESSION_SCHEMA,
     readOnly: true,
     signal,
@@ -980,10 +1021,12 @@ export function lintMilestone(milestone, snapshot, options = {}) {
     return done(findings);
   }
   const raw = new Map(milestone.tasks.map(task => [task.id, task.dependsOn]));
-  const ancestors = taskAncestors(normalized.tasks.map(task => ({ ...task, dependsOn: raw.get(task.id) })));
+  const fresh = normalized.tasks.map(task => ({ ...task, dependsOn: raw.get(task.id) }));
+  const ancestors = taskAncestors(fresh);
   const others = current.tasks.filter(task => ![...CLOSED, 'cancelled'].includes(task.status));
   findings.push(
     ...ownerFindings(normalized.tasks),
+    ...epicCycleFindings([...current.tasks, ...fresh], { fresh: new Set(normalized.epics.map(epic => epic.id)) }),
     ...overlapFindings(parallelOverlaps(normalized.tasks, { ancestors, others })),
     ...taskInputFindings({ project: current.project, tasks: normalized.tasks, contracts, knownValues }),
   );
