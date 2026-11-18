@@ -52,6 +52,10 @@ export function fastCheckTimeout(run) {
 const selectionOption = /^--(?:test-shard|test-name-pattern|test-skip-pattern|test-only)(?:=|$)/;
 // Options that change the summary the narrowed run is counted by.
 const reporterOption = /^--test-reporter(?:-destination)?(?:=|$)/;
+const nodeCommand = command => command === process.execPath || /(?:^|[\\/])node(?:\.exe)?$/i.test(command);
+// A `node --test` command with the default reporter: its summary says how many tests passed.
+const countedRunner = ({ command, args = [] }) =>
+  nodeCommand(command) && args.includes('--test') && !args.some(arg => reporterOption.test(arg));
 
 /**
  * Only Node's own test runner can be narrowed to the affected files. Its options must
@@ -62,8 +66,7 @@ const reporterOption = /^--test-reporter(?:-destination)?(?:=|$)/;
 function nodeTestRunner(commands) {
   if (commands.length !== 1) return { reason: commands.length ? 'runner-multiple-commands' : 'runner-not-configured' };
   const [{ command, args = [] }] = commands;
-  if (!(command === process.execPath || /(?:^|[\\/])node(?:\.exe)?$/i.test(command)) || !args.includes('--test'))
-    return { reason: 'runner-not-node-test' };
+  if (!nodeCommand(command) || !args.includes('--test')) return { reason: 'runner-not-node-test' };
   const flags = [],
     scopes = [];
   for (const arg of args) {
@@ -101,17 +104,30 @@ const fullCommands = (configured, timeoutMs) =>
     timeoutMs: Math.min(own ?? timeoutMs, timeoutMs),
   }));
 
+const summaryLine = /^(?:ℹ|#) (tests|suites|pass|fail|cancelled|skipped|todo|duration_ms) (\d+(?:\.\d+)?)\r?$/u;
+const outcomes = ['pass', 'fail', 'cancelled', 'skipped', 'todo'];
+
 /**
- * Tests a `node --test` run actually executed, from its summary (spec `ℹ` or TAP `#`
- * lines): tests minus skipped. `null` when the output has no summary.
- * @param {string} output
+ * Tests a `node --test` run passed, from the runner's final summary on stdout (spec `ℹ`
+ * or TAP `#` lines): its `pass` count, which excludes skipped and todo tests. The last
+ * `tests` line opens that summary, so test output printed earlier cannot replace it.
+ * `null` when there is no complete, consistent summary.
+ * @param {string} stdout
  * @returns {number | null}
  */
-export function executedTests(output) {
+export function passedTests(stdout) {
+  const lines = String(stdout).split('\n');
+  const start = lines.findLastIndex(line => summaryLine.exec(line)?.[1] === 'tests');
+  if (start < 0) return null;
+  /** @type {Record<string, number>} */
   const counts = {};
-  for (const [, name, value] of String(output).matchAll(/^(?:ℹ|#) (tests|skipped) (\d+)\s*$/gmu))
-    counts[name] = Number(value);
-  return counts.tests === undefined ? null : counts.tests - (counts.skipped ?? 0);
+  for (const line of lines.slice(start)) {
+    const match = summaryLine.exec(line);
+    if (!match || match[1] in counts) break;
+    counts[match[1]] = Number(match[2]);
+  }
+  if (outcomes.some(name => !Number.isSafeInteger(counts[name]))) return null;
+  return outcomes.reduce((sum, name) => sum + counts[name], 0) === counts.tests ? counts.pass : null;
 }
 
 /**
@@ -241,7 +257,8 @@ async function cachedRow(engine, base, input, headSha) {
 
 /**
  * One command of the plan: a cached receipt, or its execution with persisted evidence.
- * A `counted` (narrowed) test step passes only when it executed at least one test.
+ * A `counted` step (a `node --test` command) records how many tests passed (`row.tests`);
+ * passing none is `noTests`, never cached.
  */
 async function runStep({ engine, run, step, headSha, env, cache, counted, signal }) {
   const base = { kind: step.kind, command: step.command, args: step.args };
@@ -252,8 +269,8 @@ async function runStep({ engine, run, step, headSha, env, cache, counted, signal
           kind: 'test',
           command: step.command,
           args: step.args,
-          // `executedTests`: only runs that executed a test are cached (older entries never match).
-          gateConfig: { profile: TASK_FAST_PROFILE, timeoutMs: step.timeoutMs, executedTests: true },
+          // `passedTests`: only runs that passed a test (not skip/todo) are cached; older entries never match.
+          gateConfig: { profile: TASK_FAST_PROFILE, timeoutMs: step.timeoutMs, passedTests: true },
         }
       : null;
   const hit = input && (await cachedRow(engine, base, input, headSha));
@@ -326,8 +343,8 @@ async function runStep({ engine, run, step, headSha, env, cache, counted, signal
       ),
     };
   if (counted) {
-    // Exit 0 after running nothing is not a pass: never cache or accept it.
-    row.tests = executedTests(`${value.stdout}\n${value.stderr}`);
+    // Exit 0 after passing nothing (only skip/todo, no tests, no summary) is not a pass: never cache it.
+    row.tests = passedTests(value.stdout);
     if (!(row.tests > 0)) return { row, noTests: true };
   }
   if (input)
@@ -425,14 +442,24 @@ async function executePlan({ engine, run, plan, headSha, signal }) {
   engine.save(run);
   const env = fastEnvironment();
   const cache = plan.fallback ? null : await cacheContext(run, plan, headSha, env);
+  // The full suite is judged by its summaries only when every test command is Node's own runner.
+  const judged = plan.commands.every(step => step.kind !== 'test' || countedRunner(step));
+  let passed = 0;
   for (const step of plan.commands) {
     engine.checkCancelled(run, signal);
-    const counted = !plan.fallback && step.kind === 'test';
+    const counted = step.kind === 'test' && countedRunner(step);
     const { row, error, noTests } = await runStep({ engine, run, step, headSha, env, cache, counted, signal });
     results.push(row);
     engine.save(run);
     if (error) throw error;
-    if (noTests) return { results, noTests: true };
+    // A narrowed run that passed no test is replaced by the full suite.
+    if (noTests && !plan.fallback) return { results, noTests: true };
+    passed += row.tests ?? 0;
   }
+  if (plan.fallback && judged && passed === 0)
+    throw fail(
+      'Полный прогон commands.test (node --test) не выполнил успешно ни одного теста: все тесты пропущены (skip/todo) или не найдены',
+      'fast_check_no_tests',
+    );
   return { results, noTests: false };
 }

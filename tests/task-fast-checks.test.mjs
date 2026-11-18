@@ -13,7 +13,7 @@ import * as A from '../runtime/project-contracts.mjs';
 import * as D from '../runtime/project-evidence.mjs';
 import { openProjectStore } from '../runtime/project-store.mjs';
 import { createProjectDirector, createProjectTransitionAuthorizer } from '../runtime/project-director.mjs';
-import { TASK_FAST_PROFILE, executedTests, planFastChecks, runFastChecks } from '../runtime/task-fast-checks.mjs';
+import { TASK_FAST_PROFILE, passedTests, planFastChecks, runFastChecks } from '../runtime/task-fast-checks.mjs';
 import { fixture, git } from './helpers/engine-fixture.mjs';
 
 const nodeTest = { command: process.execPath, args: ['--test'] };
@@ -570,11 +570,108 @@ test('A wave project is never run by the legacy director nor accepted by its own
   await assert.rejects(() => f.authorizer({ command: integrated, snapshot }), { code: 'project_transition_blocked' });
 });
 
-test('executedTests counts executed tests from the spec or TAP summary', () => {
-  assert.equal(executedTests('ℹ tests 3\nℹ suites 0\nℹ pass 1\nℹ fail 0\nℹ skipped 1\nℹ todo 1\n'), 2);
-  assert.equal(executedTests('# tests 4\n# pass 4\n# skipped 0\n'), 4);
-  assert.equal(executedTests('ℹ tests 0\nℹ pass 0\nℹ skipped 0\n'), 0);
-  assert.equal(executedTests('ok 1 - a\n'), null);
+const summary = (mark, counts) =>
+  ['tests', 'suites', 'pass', 'fail', 'cancelled', 'skipped', 'todo', 'duration_ms']
+    .map(name => `${mark} ${name} ${counts[name] ?? 0}\n`)
+    .join('');
+
+test('passedTests counts passed tests without skip and todo from the final spec or TAP summary', () => {
+  assert.equal(passedTests(summary('ℹ', { tests: 3, pass: 1, skipped: 1, todo: 1, duration_ms: 1.5 })), 1);
+  assert.equal(passedTests(summary('ℹ', { tests: 1, todo: 1 })), 0, 'a todo test is not a passed test');
+  assert.equal(passedTests(summary('ℹ', { tests: 2, skipped: 2 })), 0, 'a skipped test is not a passed test');
+  assert.equal(passedTests(summary('#', { tests: 4, pass: 4 }).replaceAll('\n', '\r\n')), 4);
+  assert.equal(passedTests(summary('ℹ', {})), 0);
+  // Test output printed before the runner's own summary cannot replace it.
+  assert.equal(
+    passedTests(`# pass 77\n${summary('ℹ', { tests: 9, pass: 9 })}${summary('ℹ', { tests: 1, todo: 1 })}`),
+    0,
+  );
+  assert.equal(passedTests(summary('ℹ', { tests: 2, pass: 1 })), null, 'an inconsistent summary is no summary');
+  assert.equal(passedTests('ℹ tests 1\nℹ pass 1\n'), null, 'an incomplete summary is no summary');
+  assert.equal(passedTests('ok 1 - a\n'), null);
+});
+
+test('Task-fast checks never accept todo or skipped tests as executed tests', async t => {
+  const { store, engine, run, commit } = await workspace(t);
+  // A narrowed run whose only test is a todo passes nothing: the full suite runs instead.
+  await commit({ 'tests/a.test.mjs': "import test from 'node:test';\ntest.todo('a is planned');\n" });
+  const todo = await runFastChecks({ engine, run });
+  assert.equal(todo.complete, true);
+  assert.equal(todo.plan.fallback, true);
+  assert.deepEqual(todo.plan.reasons, ['no-tests-executed']);
+  assert.deepEqual(
+    todo.results.map(row => [row.kind, row.args, row.exitCode, row.tests]),
+    [['test', ['--test'], 0, 1]],
+    'the full run counts only the passing test of b',
+  );
+  // Every test is skipped or todo: neither the narrowed nor the full run passes a test.
+  const skipped =
+    "import test from 'node:test';\ntest.skip('skipped', () => {});\ntest('skipped at runtime', t => t.skip());\n";
+  const headSha = await commit({ 'tests/a.test.mjs': skipped, 'tests/b.test.mjs': skipped });
+  await assert.rejects(() => runFastChecks({ engine, run }), { code: 'fast_check_no_tests' });
+  const saved = store.getRun(run.id).checks;
+  assert.equal(saved.headSha, headSha);
+  assert.equal(saved.complete, false, 'no green receipt for zero passed tests');
+  assert.deepEqual(saved.plan.reasons, ['no-tests-executed']);
+  assert.deepEqual(
+    saved.results.map(row => [row.kind, row.args, row.exitCode, row.tests]),
+    [['test', ['--test'], 0, 0]],
+  );
+  // A planned full fallback (a config change) that passes no test fails the same way.
+  await commit({ 'vitest.config.mjs': 'export default {};\n' });
+  await assert.rejects(() => runFastChecks({ engine, run }), { code: 'fast_check_no_tests' });
+  assert.equal(run.checks.complete, false);
+  assert.ok(
+    run.checks.plan.reasons.includes('config-change:vitest.config.mjs'),
+    JSON.stringify(run.checks.plan.reasons),
+  );
+  // One passing test beside skipped and todo ones is a green narrowed run.
+  git(run.cwd, 'rm', '-q', 'vitest.config.mjs');
+  await commit({
+    'tests/a.test.mjs':
+      "import test from 'node:test';\ntest.skip('skipped', () => {});\ntest.todo('planned');\ntest('a passes', () => {});\n",
+    'tests/b.test.mjs': files['tests/b.test.mjs'],
+  });
+  const mixed = await runFastChecks({ engine, run });
+  assert.equal(mixed.complete, true);
+  assert.equal(mixed.plan.fallback, false, JSON.stringify(mixed.plan.reasons));
+  assert.deepEqual(mixed.plan.testFiles, ['tests/a.test.mjs']);
+  assert.equal(mixed.results.find(row => row.kind === 'test').tests, 1);
+});
+
+test('Task-fast full fallback counts every node --test command and leaves other runners as before', async t => {
+  const twoRunners = [
+    { command: process.execPath, args: ['--test', 'tests/a.test.mjs'] },
+    { command: process.execPath, args: ['--test', 'tests/b.test.mjs'] },
+  ];
+  const { engine, run, commit } = await workspace(t, {
+    commands: { test: twoRunners, build: [], deploy: [], smoke: [] },
+  });
+  await commit({ 'tests/a.test.mjs': "import test from 'node:test';\ntest.skip('a is skipped', () => {});\n" });
+  // Two commands always fall back; together they passed b's test.
+  const together = await runFastChecks({ engine, run });
+  assert.equal(together.complete, true);
+  assert.ok(together.plan.reasons.includes('runner-multiple-commands'), JSON.stringify(together.plan.reasons));
+  assert.deepEqual(
+    together.results.map(row => row.tests),
+    [0, 1],
+  );
+  // Another runner's output is not counted (documented limitation): its exit code decides.
+  run.config.commands.test = [{ command: process.execPath, args: ['verify.mjs'] }];
+  engine.save(run);
+  const other = await runFastChecks({ engine, run });
+  assert.equal(other.complete, true);
+  assert.ok(other.plan.reasons.includes('runner-not-node-test'), JSON.stringify(other.plan.reasons));
+  assert.equal(other.results[0].tests, undefined);
+  // A node --test command beside another runner is counted, but the zero total is not decisive.
+  run.config.commands.test = [twoRunners[0], { command: process.execPath, args: ['verify.mjs'] }];
+  engine.save(run);
+  const mixedRunners = await runFastChecks({ engine, run });
+  assert.equal(mixedRunners.complete, true);
+  assert.deepEqual(
+    mixedRunners.results.map(row => row.tests),
+    [0, undefined],
+  );
 });
 
 test('Task-fast checks never keep a green receipt for a narrowed run that executed no test', async t => {

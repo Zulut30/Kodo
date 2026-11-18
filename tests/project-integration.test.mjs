@@ -425,3 +425,66 @@ test('A retry after a crash before the merge commit aborts only its own interrup
   await code(mergeTask({ ...input, pending: { before: 'not-a-sha' } }), 'project_integration_invalid');
   assert.equal(await mergeHead(), foreign, 'a foreign merge is never aborted');
 });
+
+test('A foreign unfinished Git operation with a clean status is refused before any merge and kept intact', async t => {
+  const f = await fixture(t);
+  const integration = await ensureIntegration({ root: f.root, projectId, worktreeHome: f.worktreeHome });
+  const worktree = integration.worktree;
+  const state = async name =>
+    (await execute('git', ['rev-parse', '-q', '--verify', name], { cwd: worktree, allowFailure: true })).stdout.trim();
+  const first = await f.taskHead('first', integration.head, { 'first.txt': 'first\n' });
+  const merged = await mergeTask({
+    worktree,
+    taskId: 'first',
+    taskHead: first,
+    writePaths: ['first.txt'],
+    savePending: async () => {},
+  });
+  const head = merged.mergeCommit;
+  // Someone else merges a branch with the same change: MERGE_HEAD exists while the status is empty.
+  const twin = await f.taskHead('twin', integration.head, { 'first.txt': 'first\n' });
+  await git(worktree, ['merge', '--no-ff', '--no-commit', twin]);
+  assert.equal(await state('MERGE_HEAD'), twin);
+  assert.equal(await git(worktree, ['status', '--porcelain=v1', '--untracked-files=all']), '');
+  const second = await f.taskHead('second', head, { 'second.txt': 'second\n' });
+  const input = {
+    worktree,
+    taskId: 'second',
+    taskHead: second,
+    writePaths: ['second.txt'],
+    savePending: async () => assert.fail('a refused merge never saves pending'),
+  };
+  const gateHead = await f.taskHead('gate', head, { 'gate.txt': 'gate\n' });
+  for (const attempt of [
+    () => mergeTask(input),
+    () => mergeTask({ ...input, pending: { before: head } }),
+    () => mergeTask({ ...input, pending: { before: integration.head } }),
+    () => mergeBackGate({ worktree, expectedHead: head, gateHead }),
+  ]) {
+    await code(attempt(), 'project_integration_worktree_invalid');
+    assert.equal(await state('MERGE_HEAD'), twin, 'a foreign merge is never aborted');
+    assert.equal(await git(worktree, ['rev-parse', 'HEAD']), head);
+  }
+  await git(worktree, ['merge', '--abort']);
+  // An empty cherry-pick keeps CHERRY_PICK_HEAD with a clean status as well.
+  const picked = await f.taskHead('picked', integration.head, { 'first.txt': 'first\n' });
+  const cherry = await execute('git', ['cherry-pick', picked], { cwd: worktree, allowFailure: true });
+  assert.notEqual(cherry.code, 0);
+  assert.equal(await state('CHERRY_PICK_HEAD'), picked);
+  assert.equal(await git(worktree, ['status', '--porcelain=v1', '--untracked-files=all']), '');
+  await code(mergeTask({ ...input, pending: { before: head } }), 'project_integration_worktree_invalid');
+  await code(mergeBackGate({ worktree, expectedHead: head, gateHead }), 'project_integration_worktree_invalid');
+  assert.equal(await state('CHERRY_PICK_HEAD'), picked, 'a foreign cherry-pick is never aborted');
+  await git(worktree, ['cherry-pick', '--abort']);
+  // A rebase in progress (its state directory) is refused too.
+  const rebase = await git(worktree, ['rev-parse', '--path-format=absolute', '--git-path', 'rebase-merge']);
+  await mkdir(rebase);
+  await code(mergeTask(input), 'project_integration_worktree_invalid');
+  await code(mergeBackGate({ worktree, expectedHead: head, gateHead }), 'project_integration_worktree_invalid');
+  assert.ok((await lstat(rebase)).isDirectory());
+  await rm(rebase, { recursive: true });
+  assert.equal(await git(worktree, ['rev-parse', 'HEAD']), head);
+  // Once the worktree is free, the same task merges normally.
+  const done = await mergeTask({ ...input, savePending: async () => {} });
+  assert.deepEqual(await parents(worktree, done.mergeCommit), [head, second]);
+});
