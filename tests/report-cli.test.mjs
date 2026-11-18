@@ -895,3 +895,20 @@ test('the text report shows stages with saved observations even when their denom
   assert.equal(exitCode, 0, output);
   assert.match(output, /planning: unknown \(\d+\/unknown known, measured [^;]+; unknown sessions;/);
 });
+
+test('the text report shows a stage whose only saved attempt has no duration', async t => {
+  const f = await fixture(t);
+  const store = new Store(f.home, {});
+  try {
+    const run = store.getRun(f.runId);
+    store.updateRun(f.runId, {
+      metrics: { ...run.metrics, historyComplete: false },
+      sessionAttempts: [{ stage: 'plan', node: null, client: 'codex', model: 'gpt-x', status: 'started' }],
+    });
+  } finally {
+    store.close?.();
+  }
+  const { exitCode, output } = await reportCli([f.runId], { home: f.home, secrets: {} });
+  assert.equal(exitCode, 0, output);
+  assert.match(output, /planning: unknown \(0\/unknown known; unknown sessions; session-attempts\)/);
+});

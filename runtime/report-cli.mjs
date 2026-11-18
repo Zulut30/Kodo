@@ -163,7 +163,7 @@ function humanRun(report) {
     'Stages (sum of measured durations):',
     ...Object.entries(timing.stages)
       // A stage with observations is shown even when its denominator is unknown (incomplete history).
-      .filter(([, stage]) => stage.total > 0 || stage.known > 0)
+      .filter(([, stage]) => stage.total > 0 || stage.known > 0 || stage.source !== null)
       .map(
         ([name, stage]) =>
           `  ${name}: ${time(stage.durationMs)} (${stage.known}/${value(stage.total)} known${measuredPart(stage)}; ${value(stage.sessions)} sessions; ${value(stage.source)})`,
