@@ -22,7 +22,57 @@ import { lstat, readFile } from 'node:fs/promises';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
-import { credentialRoot, decodeCredentials, decryptWindowsCredentials, secretNames } from './security.mjs';
+import {
+  credentialRoot,
+  decodeCredentials,
+  decryptWindowsCredentials,
+  secretNames,
+  workerEnvironment,
+} from './security.mjs';
+import { execute } from './command.mjs';
+
+// Owner-only ACL (current user and SYSTEM, inheritance cut) on a new copy directory, verified.
+const protectScript = `$ErrorActionPreference='Stop'
+[Console]::InputEncoding=[Text.UTF8Encoding]::new($false)
+try {
+  $target=[Console]::In.ReadToEnd()
+  $user=[Security.Principal.WindowsIdentity]::GetCurrent().User
+  $system=[Security.Principal.SecurityIdentifier]::new('S-1-5-18')
+  $acl=[Security.AccessControl.DirectorySecurity]::new()
+  $acl.SetOwner($user); $acl.SetAccessRuleProtection($true,$false)
+  $inherit=[Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit
+  foreach($sid in @($user,$system)) { $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid,[Security.AccessControl.FileSystemRights]::FullControl,$inherit,[Security.AccessControl.PropagationFlags]::None,[Security.AccessControl.AccessControlType]::Allow)) }
+  [IO.Directory]::SetAccessControl($target,$acl)
+  $actual=[IO.Directory]::GetAccessControl($target)
+  if (-not $actual.AreAccessRulesProtected) { exit 1 }
+  foreach($rule in $actual.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])) {
+    if ($rule.AccessControlType -eq 'Allow' -and $rule.IdentityReference.Value -notin @($user.Value,$system.Value)) { exit 1 }
+  }
+} catch { exit 1 }`;
+
+/**
+ * Make a new copy directory private before the first private byte is copied into it.
+ * Windows: a protected owner-only ACL (Node modes do not restrict ACLs, and a temporary
+ * root may grant inherited access to other principals). POSIX: mode 0700 and own uid.
+ */
+export async function protectCopyDirectory(directory) {
+  if (process.platform === 'win32') {
+    await execute(
+      path.join(process.env.SystemRoot || 'C:\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
+      [
+        '-NoLogo',
+        '-NoProfile',
+        '-NonInteractive',
+        '-EncodedCommand',
+        Buffer.from(protectScript, 'utf16le').toString('base64'),
+      ],
+      { input: directory, env: workerEnvironment(), timeoutMs: 30000 },
+    );
+    return;
+  }
+  const info = await lstat(directory);
+  if (!info.isDirectory() || info.mode & 0o077 || info.uid !== process.getuid?.()) throw new Error('copy_not_private');
+}
 
 export const STATE_ATTEMPTS = 3;
 /** Removal of a private copy is retried while Windows still holds a handle on it. */
@@ -143,7 +193,8 @@ async function removeCopy(directory, remove) {
  * @param {(state: { db: DatabaseSync, tables: Set<string>,
  *   snapshot?: { method: 'immutable' | 'wal-copy', attempts: number } }) => Promise<T> | T} read
  * @param {{ probed?: () => unknown, temporaryRoot?: string, credentialHome?: string,
- *   removeDirectory?: (directory: string, options: { recursive: boolean, force: boolean }) => void }} [options]
+ *   removeDirectory?: (directory: string, options: { recursive: boolean, force: boolean }) => void,
+ *   protectDirectory?: (directory: string) => Promise<void> }} [options]
  *   `probed` is a test seam called after the files were inspected and before they are opened or
  *   copied; `removeDirectory` is the removal port of a private copy.
  * @returns {Promise<T>}
@@ -151,7 +202,13 @@ async function removeCopy(directory, remove) {
 export async function readReportState(
   home,
   read,
-  { probed, temporaryRoot = os.tmpdir(), credentialHome = credentialRoot(), removeDirectory = rmSync } = {},
+  {
+    probed,
+    temporaryRoot = os.tmpdir(),
+    credentialHome = credentialRoot(),
+    removeDirectory = rmSync,
+    protectDirectory = protectCopyDirectory,
+  } = {},
 ) {
   const filename = path.join(home, 'state.sqlite');
   let root;
@@ -166,6 +223,8 @@ export async function readReportState(
     const stable = () => directory !== null || mark(probe(filename).db) === mark(before.db);
     let state;
     try {
+      // The copy holds private Run and Project data: the directory is private before any byte.
+      if (directory) await protectDirectory(directory);
       if (directory && !copyInto(filename, before, directory)) continue;
       state = openImmutable(directory ? path.join(directory, 'state.sqlite') : filename);
       const snapshot = { method: directory ? 'wal-copy' : 'immutable', attempts: attempt + 1 };

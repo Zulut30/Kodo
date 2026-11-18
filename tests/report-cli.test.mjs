@@ -5,6 +5,7 @@ import {
   appendFileSync,
   existsSync,
   mkdirSync,
+  mkdtempSync,
   readdirSync,
   readFileSync,
   rmSync,
@@ -23,7 +24,13 @@ import { openProjectStore } from '../runtime/project-store.mjs';
 import * as contracts from '../runtime/project-contracts.mjs';
 import { workerEnvironment } from '../runtime/security.mjs';
 import { reportCli } from '../runtime/report-cli.mjs';
-import { readRedactionSecrets, readReportState, REMOVE_ATTEMPTS, STATE_ATTEMPTS } from '../runtime/report-state.mjs';
+import {
+  protectCopyDirectory,
+  readRedactionSecrets,
+  readReportState,
+  REMOVE_ATTEMPTS,
+  STATE_ATTEMPTS,
+} from '../runtime/report-state.mjs';
 import { projectCli } from '../runtime/project-cli.mjs';
 
 const cli = fileURLToPath(new URL('../cli/index.mjs', import.meta.url));
@@ -804,4 +811,57 @@ test('credentials equal to project field names mask values only: the project rep
   const human = await reportCli(['--project', f.projectId], ports);
   assert.equal(human.exitCode, 0, human.output);
   assert.match(human.output, new RegExp(`Project ${f.projectId}`));
+});
+
+test('a private copy directory is made private before any byte is copied, or the report fails closed', async t => {
+  const f = await fixture(t);
+  const temporaryRoot = path.join(f.dir, 'snapshots');
+  mkdirSync(temporaryRoot);
+  const seen = [];
+  const [ok, refused] = await withWriter(f, async () => [
+    await reportCli([f.runId, '--json'], {
+      home: f.home,
+      secrets: {},
+      temporaryRoot,
+      protectDirectory: async directory => {
+        seen.push(readdirSync(directory));
+        await protectCopyDirectory(directory);
+      },
+    }),
+    await reportCli([f.runId, '--json'], {
+      home: f.home,
+      secrets: {},
+      temporaryRoot,
+      protectDirectory: async () => {
+        throw new Error('acl refused');
+      },
+    }),
+  ]);
+  assert.equal(ok.exitCode, 0, ok.output);
+  assert.equal(ok.report.provenance.snapshot.method, 'wal-copy');
+  assert.deepEqual(seen, [[]], 'protected while still empty');
+  assert.equal(refused.exitCode, 2);
+  assert.equal(refused.report.code, 'report_unavailable');
+  assert.deepEqual(readdirSync(temporaryRoot), [], 'no copy is left behind');
+});
+
+test('a protected copy directory grants access only to its owner (and SYSTEM on Windows)', async t => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'kodo-report-acl-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  await protectCopyDirectory(directory);
+  if (process.platform !== 'win32') {
+    assert.equal(statSync(directory).mode & 0o077, 0);
+    return;
+  }
+  const script = `$a=Get-Acl -LiteralPath $env:KODO_ACL_TARGET
+$ids=@($a.Access | ForEach-Object { $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } | Sort-Object -Unique)
+[pscustomobject]@{ protected=$a.AreAccessRulesProtected; ids=$ids; user=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value } | ConvertTo-Json -Compress`;
+  const result = spawnSync('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], {
+    encoding: 'utf8',
+    env: { ...process.env, KODO_ACL_TARGET: directory },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const acl = JSON.parse(result.stdout);
+  assert.equal(acl.protected, true);
+  assert.deepEqual([...new Set([acl.ids].flat())].sort(), [acl.user, 'S-1-5-18'].sort());
 });

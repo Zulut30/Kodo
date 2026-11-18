@@ -124,6 +124,7 @@ test('run report: wall time from the saved creation to the terminal event, stage
     sessions: 3,
     failedSessions: 0,
     pendingSessions: 0,
+    observedSessions: 3,
     nodeAttempts: 2,
     verificationRounds: 1,
     repairRounds: 0,
@@ -144,13 +145,22 @@ test('stage without data is null; delivery and release use the operation journal
   const { stages } = buildRunReport(run, events, { now: NOW }).timing;
   assert.deepEqual(stages.assessment, {
     durationMs: null,
+    measuredMs: null,
     sessions: 0,
     operations: 0,
     known: 0,
     total: 0,
     source: null,
   });
-  assert.deepEqual(stages.release, { durationMs: null, sessions: 0, operations: 0, known: 0, total: 0, source: null });
+  assert.deepEqual(stages.release, {
+    durationMs: null,
+    measuredMs: null,
+    sessions: 0,
+    operations: 0,
+    known: 0,
+    total: 0,
+    source: null,
+  });
   // The merge intent has no read-back: its duration is unknown, so the stage total is unknown.
   assert.deepEqual(
     [stages.delivery.durationMs, stages.delivery.operations, stages.delivery.known, stages.delivery.source],
@@ -859,6 +869,14 @@ test('a Run continued without its earlier history has no usage total, only the o
   assert.deepEqual(run.context, { originalBytes: null, sentBytes: null });
   assert.ok(run.provenance.notes.includes('history_incomplete'));
   assert.equal(run.provenance.complete, false);
+  // The saved sessions are only a part: counts and session-stage totals are unknown, the part is named.
+  assert.deepEqual(
+    [run.attempts.sessions, run.attempts.failedSessions, run.attempts.pendingSessions, run.attempts.observedSessions],
+    [null, null, null, 3],
+  );
+  const implementation = run.timing.stages.implementation;
+  assert.deepEqual([implementation.durationMs, implementation.sessions], [null, null]);
+  assert.equal(typeof implementation.measuredMs, 'number');
   assert.equal(buildRunReport(finishedRun(), finishedEvents(), { now: NOW }).usage.usage.totalTokens, 360);
 
   const project = buildProjectReport(
@@ -868,7 +886,8 @@ test('a Run continued without its earlier history has no usage total, only the o
     { now: NOW },
   );
   assert.equal(project.completeness.runs.complete, true);
-  assert.equal(project.totals.sessions, 3);
+  assert.equal(project.totals.sessions, null);
+  assert.equal(project.tasks[0].implementationMs, null);
   assert.equal(project.totals.usage, null);
   assert.equal(project.totals.observedUsage.usage.totalTokens, 360);
   assert.ok(project.provenance.notes.includes('history_incomplete'));

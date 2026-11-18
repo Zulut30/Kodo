@@ -184,6 +184,7 @@ function checkExecutions(run, events) {
 }
 
 function stageTimings(run, deliveries, sessions, executions) {
+  const historyIncomplete = run.metrics?.historyComplete === false;
   const operations = Array.isArray(run.coordinatorOperations) ? run.coordinatorOperations : null;
   const stages = Object.fromEntries(
     REPORT_STAGES.map(stage => [stage, { samples: [], sessions: sessions ? 0 : null, operations: 0, sources: [] }]),
@@ -200,6 +201,13 @@ function stageTimings(run, deliveries, sessions, executions) {
     if (stage) add(stage, duration(attempt.metrics?.durationMs), 'session-attempts', 'sessions');
     else unmapped++;
   }
+  // A Run continued without its earlier sessions: every session stage may miss some. Its
+  // total and session count are unknown; what was saved stays in `measuredMs`.
+  if (historyIncomplete)
+    for (const name of new Set(Object.values(sessionStages))) {
+      stages[name].samples.push(null);
+      stages[name].sessions = null;
+    }
   let openOperations = 0;
   for (const operation of operations || []) {
     const stage = stages[operationStages[operation?.kind]];
@@ -221,6 +229,8 @@ function stageTimings(run, deliveries, sessions, executions) {
     const sum = total(stage.samples);
     result[name] = {
       durationMs: sum.value,
+      // The saved part when the total is unknown; never part of a total.
+      measuredMs: sum.value === null ? measured(stage.samples) : null,
       sessions: stage.sessions,
       operations: stage.operations,
       known: sum.known,
@@ -365,11 +375,14 @@ function verificationRounds(events) {
 
 function attempts(run, events, sessions) {
   const nodes = record(run.nodes) ? Object.values(run.nodes).map(node => integer(node?.attempt)) : null;
+  // A Run continued without its earlier sessions: the saved ones are only a part.
+  const all = run.metrics?.historyComplete === false ? null : sessions;
   return {
-    sessions: sessions ? sessions.length : null,
-    failedSessions: sessions ? sessions.filter(item => item?.status === 'failed').length : null,
+    sessions: all ? all.length : null,
+    failedSessions: all ? all.filter(item => item?.status === 'failed').length : null,
     // Started and not finished: in flight, or interrupted before its receipt.
-    pendingSessions: sessions ? sessions.filter(item => item?.status === 'started').length : null,
+    pendingSessions: all ? all.filter(item => item?.status === 'started').length : null,
+    observedSessions: sessions ? sessions.length : null,
     nodeAttempts: nodes ? (total(nodes).value ?? (nodes.length ? null : 0)) : null,
     verificationRounds: verificationRounds(events),
     repairRounds: events.filter(event => event.type === 'repair_required').length,

@@ -225,7 +225,8 @@ async function buildReport(state, options, secrets) {
  * @param {string[]} argv
  * @param {{ home?: string, secrets?: Record<string, string>, loadSecrets?: () => Promise<Record<string, string>>,
  *   stateProbed?: () => unknown, temporaryRoot?: string, credentialHome?: string,
- *   removeDirectory?: (directory: string, options: { recursive: boolean, force: boolean }) => void }} [ports]
+ *   removeDirectory?: (directory: string, options: { recursive: boolean, force: boolean }) => void,
+ *   protectDirectory?: (directory: string) => Promise<void> }} [ports]
  *   Supplied by the coordinator or a test harness, never by decoded CLI data. `stateProbed`,
  *   `temporaryRoot`, `credentialHome` and `removeDirectory` are seams of the state snapshot
  *   (see `readReportState`).
@@ -251,6 +252,7 @@ export async function reportCli(argv, ports = {}) {
       // A private copy is never placed inside or around the state or the credential home.
       credentialHome: ports.credentialHome || security.credentialRoot(),
       removeDirectory: ports.removeDirectory,
+      protectDirectory: ports.protectDirectory,
     });
     report = redactValues(report, secrets, security.redact);
   } catch (error) {
