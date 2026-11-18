@@ -156,8 +156,7 @@ const countableOptions = new Set([
   'experimental-loader',
   'conditions',
   'C',
-  'env-file',
-  'env-file-if-exists',
+  // Not --env-file / --env-file-if-exists: a file may set NODE_OPTIONS with a test filter.
   'unhandled-rejections',
   'disable-warning',
   'stack-trace-limit',
@@ -319,7 +318,8 @@ const outcomes = ['pass', 'fail', 'cancelled', 'skipped', 'todo'];
  * @returns {number | null}
  */
 export function passedTests(stdout) {
-  const lines = String(stdout).split('\n');
+  // Colour codes (FORCE_COLOR) around summary lines are not part of the summary.
+  const lines = String(stdout).replace(ansiSequence, '').split('\n');
   const start = lines.findLastIndex(line => summaryLine.exec(line)?.[1] === 'tests');
   if (start < 0) return null;
   /** @type {Record<string, number>} */
@@ -330,8 +330,21 @@ export function passedTests(stdout) {
     counts[match[1]] = Number(match[2]);
   }
   if (outcomes.some(name => !Number.isSafeInteger(counts[name]))) return null;
-  return outcomes.reduce((sum, name) => sum + counts[name], 0) === counts.tests ? counts.pass : null;
+  if (outcomes.reduce((sum, name) => sum + counts[name], 0) !== counts.tests) return null;
+  // A file that registers no test is reported as one passed test named after the file: not a test.
+  return Math.max(0, counts.pass - lines.slice(0, start).filter(fileLevelPass).length);
 }
+
+const ansiSequence = /\u001b\[[0-?]*[ -/]*[@-~]/g;
+// A top-level passed point (TAP `ok N - name` without a directive, spec `✔ name (…ms)`) whose
+// name is a script file: the synthetic test of a file without tests.
+const scriptName = name => /\.(?:[cm]?[jt]s|[jt]sx)$/i.test(name.trim());
+const fileLevelPass = line => {
+  const tap = /^ok \d+ - (.+?)\r?$/.exec(line);
+  if (tap) return !/\s#\s*(?:SKIP|TODO)\b/i.test(tap[1]) && scriptName(tap[1]);
+  const spec = /^✔ (.+?) \(\d[\d.]*m?s\)\r?$/u.exec(line);
+  return Boolean(spec) && scriptName(spec[1]);
+};
 
 /**
  * The outcome of one full `node --test` command, judged like the task-fast fallback: null for a
@@ -401,8 +414,11 @@ export async function planFastChecks({ run, cwd = run.cwd, baseSha = run.baseSha
 /** The environment of a counted test run: no inherited `node --test` context. */
 export function fastEnvironment() {
   const env = workerEnvironment();
-  // A runner that inherits an enclosing `node --test` context skips every file and exits 0.
-  for (const name of Object.keys(env)) if (/^NODE_TEST_(?:CONTEXT|WORKER_ID)$/i.test(name)) delete env[name];
+  // A runner that inherits an enclosing `node --test` context skips every file and exits 0, and
+  // NODE_OPTIONS could add a test filter the command line does not show: wave checks run only
+  // the options written in the command.
+  for (const name of Object.keys(env))
+    if (/^(?:NODE_TEST_(?:CONTEXT|WORKER_ID)|NODE_OPTIONS)$/i.test(name)) delete env[name];
   return env;
 }
 

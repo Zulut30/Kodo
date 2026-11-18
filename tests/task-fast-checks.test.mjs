@@ -16,6 +16,7 @@ import { createProjectDirector, createProjectTransitionAuthorizer } from '../run
 import { withIntegrationLease } from '../runtime/project-integration-lease.mjs';
 import {
   TASK_FAST_PROFILE,
+  fastEnvironment,
   nodeArguments,
   nodeTestOutcome,
   passedTests,
@@ -839,4 +840,38 @@ test('Only known, allowed node --test options give a countable summary', () => {
   assert.deepEqual(outcome(['--test', '--test-rerun-failures=rerun.json']), { tests: null });
   // Order-only options stay countable.
   assert.deepEqual(outcome(['--test', '--test-randomize']), { tests: 1 });
+});
+
+test('A file without tests is not a passed test; colour codes and env files cannot fake a summary', () => {
+  const summary = (pass, tests = pass) =>
+    `# tests ${tests}\n# suites 0\n# pass ${pass}\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0\n`;
+  // Node reports a file that registered no test as one passed test named after the file.
+  assert.equal(
+    passedTests(`TAP version 13\n# Subtest: matrix.test.mjs\nok 1 - matrix.test.mjs\n1..1\n${summary(1)}`),
+    0,
+  );
+  assert.equal(
+    passedTests(
+      `ok 1 - matrix.test.mjs\nok 2 - real\nok 3 - skipped.mjs # SKIP\n1..3\n${summary(2, 3).replace('# skipped 0', '# skipped 1')}`,
+    ),
+    1,
+  );
+  const spec =
+    '✔ C:\tmp\matrix.test.mjs (70.5ms)\n✔ real (0.7ms)\nℹ tests 2\nℹ suites 0\nℹ pass 2\nℹ fail 0\nℹ cancelled 0\nℹ skipped 0\nℹ todo 0\n';
+  assert.equal(passedTests(spec), 1);
+  // FORCE_COLOR wraps summary lines in ANSI sequences: they are not part of the summary.
+  const coloured = spec.replace(/^(ℹ .*)$/gmu, '\u001b[34m$1\u001b[39m');
+  assert.equal(passedTests(coloured), 1);
+  // An env file may set NODE_OPTIONS with a test filter: never counted; NODE_OPTIONS is not inherited.
+  assert.deepEqual(nodeTestOutcome({ command: 'node', args: ['--test', '--env-file=test.env'] }, summary(1)), {
+    tests: null,
+  });
+  const previous = process.env.NODE_OPTIONS;
+  process.env.NODE_OPTIONS = '--test-name-pattern=missing';
+  try {
+    assert.equal(fastEnvironment().NODE_OPTIONS, undefined);
+  } finally {
+    if (previous === undefined) delete process.env.NODE_OPTIONS;
+    else process.env.NODE_OPTIONS = previous;
+  }
 });
