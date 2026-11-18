@@ -52,6 +52,10 @@ const priority = [
   'tests/project-external.test.mjs', // ~69000 ms
   // Wave end to end (drain, T3 pull path, reservation ownership): one local Windows run (Node 24), not a receipt.
   'tests/project-wave-e2e.test.mjs', // ~165000 ms
+  // Project factory CLI: sum of case durations from one local Windows run (Node 24), not a receipt.
+  'tests/project-cli-blueprint.test.mjs', // ~16000 ms
+  // Factory end to end (apply-spec, drain, append-milestone, drain): one local Windows run (Node 24), not a receipt.
+  'tests/project-factory-e2e.test.mjs', // ~100000 ms
 ];
 
 // `npm run test:fast`: unit-level files measured at a few seconds each on
@@ -81,6 +85,8 @@ export const fastTests = [
   'tests/modes.test.mjs',
   'tests/package-pins.test.mjs',
   'tests/progress.test.mjs',
+  'tests/project-blueprint.test.mjs',
+  'tests/project-bootstrap.test.mjs',
   'tests/project-cancel.test.mjs',
   'tests/project-contracts.test.mjs',
   'tests/project-evidence.test.mjs',

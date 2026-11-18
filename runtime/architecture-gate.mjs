@@ -85,6 +85,9 @@ async function pins() {
     'project-external.mjs',
     'project-cli-external.mjs',
     'worker-roles.mjs',
+    'project-blueprint.mjs',
+    'project-bootstrap.mjs',
+    'project-cli-blueprint.mjs',
   ];
   const lock = new URL('../package-lock.json', import.meta.url);
   const urls = [
