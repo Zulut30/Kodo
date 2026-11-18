@@ -55,6 +55,22 @@
 
 Accepted требует actual current-head checks/review и fresh enabled gates, verified criterion mappings и frozen task. Accepted children не заменяют собственное proof Epic/Milestone/Project; CLI пока не предоставляет container evidence/mapping importer, и Project может остаться blocked после всех Task. Released дополнительно требует проверенную publication chain. Disabled нейтрален. Offline template smoke не доказывает native продукт, реального провайдера, опубликованный пакет или deployment. [Текущая граница06](kodo-roadmap/phase-06.md).
 
+### Фабрика проектов и волны
+
+Волновой проект (`execution: {cadence:'wave', integration:'branch'}`) создаётся из файлового чертежа и исполняется волнами:
+
+```text
+kodo project bootstrap "IDEA" --root PATH [--prepare] [--client codex|claude-code] [--model MODEL] [--json]
+kodo project apply-spec --root PATH [--file SPEC_JSON] [--command-id UUID] [--json]
+kodo project drain PROJECT_ID [--max-waves 1..100] [--concurrency 1..5] [--retry-failed] [--command-id UUID] [--json]
+kodo project next-wave PROJECT_ID --host t3|orca [--limit 1..5] [--retry-failed] [--json]
+kodo project complete-task PROJECT_ID TASK_ID --head SHA [--defer-gate|--abandon] [--command-id UUID] [--json]
+kodo project extend PROJECT_ID "FEATURE" [--prepare] [--client codex|claude-code] [--model MODEL] [--command-id UUID] [--json]
+kodo project append-milestone PROJECT_ID --file MILESTONE_JSON [--command-id UUID] [--json]
+```
+
+`bootstrap`/`extend` с `--prepare` готовят контекст-пакет в Kodo home, не меняя репозиторий; `apply-spec` проверяет чертёж (findings — exit 1) и создаёт проект; `drain` исполняет волны нативными сессиями, `next-wave`/`complete-task` отдают их видимым воркер-чатам T3; `append-milestone` добавляет новую фичу в принятый проект. Задачи проходят профиль `task-fast` в режиме quick, полные проверки и ревью — у gate Run эпика. Подробно: [BLUEPRINT.md](BLUEPRINT.md), [PROJECTS.md](PROJECTS.md#волновой-режим-исполнение-drain), [T3-HOST.md](T3-HOST.md); алгоритм главного чата — навык `kodo-project-director`.
+
 ## Два способа планирования
 
 В CLI команда `kodo run "<задача>" --client codex` выбирает режим, выполняет соответствующий анализ и вызывает планировщик через указанный клиент. `--mode quick|standard|deep` задаёт режим явно. `--model` имеет приоритет над настроенной основной моделью и фиксирует модель для всех native-этапов, включая ревью и повторы. `--providers both` разрешает обе подписки, но не снимает явную фиксацию модели.

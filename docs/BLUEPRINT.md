@@ -2,7 +2,7 @@
 
 Большой проект в Kodo начинается не с вручную написанного ProjectSpec, а с файлового чертежа. Главный чат по идее пользователя пишет `.kodo/blueprint/` в корне проекта (filesystem-first), Kodo проверяет чертёж детерминированно и компилирует его в [ProjectSpec v1](PROJECTS.md#формат-projectspec-v1). Kodo задачи не режет и не переписывает: если правило нарушено, он возвращает finding, а чертёж правит главный чат.
 
-Статус: модули `runtime/project-blueprint.mjs`, `runtime/project-bootstrap.mjs` и CLI `runtime/project-cli-blueprint.mjs` (`kodo project bootstrap|apply-spec|extend|append-milestone`), их тесты и фикстуры. Compile нормализует spec вместе с `execution` строгим `normalizeProjectSpec` (F1).
+Статус: модули `runtime/project-blueprint.mjs`, `runtime/project-bootstrap.mjs` и CLI `runtime/project-cli-blueprint.mjs` (`kodo project bootstrap|apply-spec|extend|append-milestone`), их тесты и фикстуры. Compile нормализует spec вместе с `execution` строгим `normalizeProjectSpec` (F1). С F3 CLI фабрики собран поверх исполнения волн F2 и входит в пины Architecture Guardian; решение — [ADR-0014](decisions/0014-wave-factory.md).
 
 ## Формат
 
@@ -109,9 +109,11 @@ kodo project append-milestone PROJECT_ID --file MILESTONE_JSON [--command-id UUI
 1. **Идея → контекст.** `kodo project bootstrap "Сервис заметок с поиском" --root D:\notes --prepare --json`. Главный чат читает `context.md`, `rules.md` и шаблоны из `bundle.dir`.
 2. **Чертёж.** Главный чат пишет `D:\notes\.kodo\blueprint\PROJECT.md`, `interfaces\*.md` и `spec.json`. Или без `--prepare` их пишет одна нативная сессия: `kodo project bootstrap "…" --root D:\notes --client claude-code`.
 3. **Регистрация.** `kodo project apply-spec --root D:\notes --command-id <UUID> --json`. При findings главный чат правит чертёж и повторяет команду. При успехе есть `projectId`, Волна 0 в `modules.waveZero`, а `kodo project plan <projectId>` предлагает задачи Волны 0 без зависимостей. Остальные задачи ждут зависимостей (`dependency_not_accepted:<id>`).
-4. **Исполнение волн.** Волны исполняют `kodo project drain` и внешние воркер-чаты T3 (`next-wave`/`complete-task`). Они описаны в [PROJECTS.md](PROJECTS.md) и этапах F2/F3. Эпики принимает gate Run, проект становится `accepted`.
+4. **Исполнение волн.** Без T3: `kodo project drain <projectId> --concurrency 2 --json` — Волна 0, затем параллельные задачи, интеграция в `kodo/project/<projectId>` и gate Run эпиков до `accepted`. В T3 главный чат повторяет `kodo project next-wave <projectId> --host t3 --limit 3 --json`, открывает по брифу воркер-чат (`delegate_task`) и сдаёт каждый коммит `kodo project complete-task <projectId> <taskId> --head <SHA> --json`; гейт эпика запускается автоматически ([T3-HOST.md](T3-HOST.md)). Алгоритм главного чата — навык [`kodo-project-director`](../skills/kodo-project-director/SKILL.md).
 5. **Новая фича.** `kodo project extend <projectId> "Теги заметок" --prepare --json`. Главный чат пишет `<bundle>/milestone.json` по шаблону. Или без `--prepare`: сессия предлагает майлстоун, и Kodo сразу его добавляет.
 6. **Добавление.** `kodo project append-milestone <projectId> --file <bundle>/milestone.json --json`. Проект открывается заново (`running`) с новым майлстоуном, история прежних цела. Дальше снова шаг 4.
+
+Сценарий целиком — чертёж с Волной 0 и двумя параллельными задачами, `apply-spec`, `drain` до `accepted`, `extend --prepare`, `append-milestone` и второй `drain` до `accepted` без изменения прежних майлстоунов — проверяет `tests/project-factory-e2e.test.mjs` (реальные Store, project store, авторизатор и Engine с fake-провайдерами, временный Git, только CLI).
 
 ## Пример: заметки (3 модуля + Волна 0)
 

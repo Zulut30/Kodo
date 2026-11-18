@@ -54,6 +54,8 @@ const priority = [
   'tests/project-wave-e2e.test.mjs', // ~165000 ms
   // Project factory CLI: sum of case durations from one local Windows run (Node 24), not a receipt.
   'tests/project-cli-blueprint.test.mjs', // ~16000 ms
+  // Factory end to end (apply-spec, drain, append-milestone, drain): one local Windows run (Node 24), not a receipt.
+  'tests/project-factory-e2e.test.mjs', // ~100000 ms
 ];
 
 // `npm run test:fast`: unit-level files measured at a few seconds each on

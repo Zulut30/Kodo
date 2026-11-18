@@ -40,7 +40,7 @@ Engine сначала фиксирует один отредактированн
 
 ## RTK: только поддерживаемый локальный вывод
 
-Managed `rtk-ai/rtk` OSS **1.1.0**, revision `753a3b0e939f2e4490fc24e3a1984010f40a103c`, входит десятым optional tool. Registry остаётся из 33 компонентов, default skills — из 13. Закреплены Windows x64 MSVC ZIP и Linux x64 musl TAR.GZ с SHA-256; иных RTK assets в каталоге нет. [Pins и установка](UI-TOOLS.md#rtk-и-вывод-shell).
+Managed `rtk-ai/rtk` OSS **1.1.0**, revision `753a3b0e939f2e4490fc24e3a1984010f40a103c`, входит десятым optional tool. Registry остаётся из 34 компонентов, default skills — из 13. Закреплены Windows x64 MSVC ZIP и Linux x64 musl TAR.GZ с SHA-256; иных RTK assets в каталоге нет. [Pins и установка](UI-TOOLS.md#rtk-и-вывод-shell).
 
 После получения subscription lease Engine один раз разрешает и проверяет инструменты для сессии; результат используется для её guidance и environment. Следующая сессия проверяет целостность заново. Готовый managed RTK добавляется перед унаследованным PATH только native worker-сессии. Приватный `RTK_DB_PATH` выделяется вне Git, `RTK_RECALL=0`, `RTK_TEE=0`, `RTK_TELEMETRY_DISABLED=1`. Подписочные HOME/auth не перенаправляются.
 

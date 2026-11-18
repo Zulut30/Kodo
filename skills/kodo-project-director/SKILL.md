@@ -1,0 +1,60 @@
+---
+name: kodo-project-director
+description: Веди большой проект через фабрику Kodo из постоянного чата «Kodo · Диспетчер задач» в T3 Code — чертёж .kodo/blueprint с Волной 0, apply-spec, волны next-wave/complete-task по видимым воркер-чатам, гейты эпиков, новые фичи через extend/append-milestone; без T3 — kodo project drain.
+---
+
+Навык для постоянного главного чата `Kodo · Диспетчер задач`. Применяй его, когда поручение — целый проект или крупная фича из нескольких модулей; одну задачу веди навыком `kodo-build-feature`. Используй установленный `kodo` или локальный `node cli/index.mjs`. Все команды — с `--json`; читай `result` ответа и код выхода: 0 — успех, 1 — неверные аргументы или findings, 2 — блокер состояния. Подробности: `docs/BLUEPRINT.md`, `docs/T3-HOST.md`, `docs/PROJECTS.md`.
+
+## 1. Чертёж проекта
+
+1. `kodo project bootstrap "<идея пользователя>" --root <абсолютный корень> --prepare --json`. Репозиторий не меняется. Прочитай все файлы пакета из `result.bundle.dir` (контекст, правила, шаблоны) и шаги `result.next`.
+2. Напиши чертёж в `<root>/.kodo/blueprint/` сам, текущей моделью:
+   - `PROJECT.md` с непустыми разделами «Цель», «Модули», «Стек», «Критерии готовности»; карта модулей — какие каталоги принадлежат какому модулю.
+   - `interfaces/<module>.md` — замороженные контракты между модулями (имя файла — slug модуля).
+   - `spec.json` — ProjectSpec v1 с `"execution": {"cadence": "wave", "integration": "branch"}` и `root`, равным корню проекта.
+   - Волна 0 — эпик или майлстоун `foundation`: каркас, линтеры, стенд тестов, общие интерфейсы. Каждая задача вне Волны 0 транзитивно зависит от её задачи; задачи Волны 0 не зависят от остальных.
+   - Задачи без пути по `dependsOn` идут параллельно: их `writePaths` не пересекаются (ни равенства, ни вложенности, ни glob-перекрытия).
+   - `owner` каждой задачи — роль: `architect`, `developer`, `ui-qa`, `performance`, `security`, `reviewer`. У задачи — проверяемые `acceptance` и ссылки `interfaceRefs` вида `{"kind": "interface", "path": "interfaces/<module>.md"}`.
+3. Покажи пользователю карту модулей, Волну 0 и порядок волн коротким списком до регистрации.
+4. `kodo project apply-spec --root <root> --command-id <новый UUID> --json`.
+   - Exit 1 и `result.code: "blueprint_findings"` — исправь чертёж по каждому `findings[].code` и повтори. `split_required` — раздроби перечисленные задачи на меньшие с отдельными `writePaths` и зависимостями; `blueprint_parallel_overlap` — разведи пути пары или добавь зависимость.
+   - Успех: сохрани `projectId`; `result.modules` — майлстоуны, эпики и `waveZero`.
+
+## 2. Цикл волн в T3
+
+1. `kodo project next-wave <projectId> --host t3 --limit <1..5> --json`. Exit 2 с пустыми `briefs` — свободных задач нет: дождись идущих делегатов или разбери `blocked`. Повтор возвращает те же брифы идущих попыток, новых попыток не создаёт.
+2. Один раз за сессию вызови `orchestrator_capabilities`, если ещё не вызывал.
+3. На каждый бриф — один `delegate_task`:
+   - `title: brief.chatTitle`, `isolation: "shared"`, `role: "implementation"`; второй worktree не создавай — он уже есть в `brief.worktree`.
+   - `task`: `brief.prompt`, затем `brief.roleInstructions`, затем требования: работать строго в абсолютном пути `brief.worktree` и только в `brief.writePaths`; читать интерфейсы из `brief.interfaces`; выполнить `brief.selfCheck` и исправить найденное; закоммитить в `brief.branch` без push, PR, merge и rebase; закончить с чистым worktree и последней строкой вернуть полный SHA коммита.
+   - Без секретов, токенов и приватных конфигураций в `task`.
+4. Жди уведомлений о завершении делегатов по правилам хоста, без циклов опроса. По каждому завершению: `kodo project complete-task <projectId> <taskId> --head <полный SHA> --json`.
+   - `integrated` — задача влита в `kodo/project/<projectId>`; гейт эпика запускается автоматически, итог в `result.gates`.
+   - `checks_failed` — передай воркеру `result.code` и `result.message` новым поручением в тот же worktree и повтори `complete-task` с новым SHA. Если исправление невозможно (например, конфликт интеграции) — `complete-task ... --abandon`, затем `next-wave ... --retry-failed`.
+   - `blocked` — покажи код пользователю; `project_busy` — другой контроллер держит проект, повтори позже.
+5. Повторяй шаги 1–4, пока `kodo project status <projectId> --json` не покажет проект `accepted` или блокер, который нужно показать пользователю.
+
+Принятие (`accepted`) даёт только gate Run эпика, майлстоуна или проекта. Не помечай задачи принятыми сам и не обходи проверки.
+
+## 3. После приёмки
+
+1. Архивируй только воркер-чаты, созданные тобой для этого проекта, поддерживаемым механизмом T3 (`t3_thread_organize` с `action: "archive"` для их thread id). Архив сохраняет историю; не удаляй её, не трогай диспетчер и чужие чаты, не правь базы клиента.
+2. Покажи пользователю `kodo report --project <projectId>`: принятые эпики, проверки, блокеры. Если установленная версия Kodo этой команды не знает, покажи `kodo project status <projectId> --json`.
+
+## Без T3
+
+`kodo project drain <projectId> --concurrency <1..5> --json` исполняет волны нативными сессиями Kodo до `accepted` или блокера. Pull-команды во время идущего `drain` отвечают `project_busy`.
+
+## Новая фича в готовый проект
+
+1. `kodo project extend <projectId> "<фича>" --prepare --json`; прочитай пакет и шаблон `result.template`.
+2. Запиши майлстоун в `<result.bundle.dir>/milestone.json`: новый майлстоун, его эпики, 1–6 задач; зависимости — только на новые или уже принятые задачи; `writePaths` не пересекаются с параллельными и незакрытыми задачами.
+3. `kodo project append-milestone <projectId> --file <путь к milestone.json> --json`. Findings — исправь файл и повтори. Прежние майлстоуны, эпики и задачи не меняются; проект снова `running`.
+4. Дальше — тот же цикл волн.
+
+## Правила
+
+- GPT и Claude — только через подписочные клиенты, без API и fallback на API.
+- Секреты не попадают в чертёж, брифы, поручения и отчёты.
+- Воркеры коммитят только в свой `brief.worktree` и свою ветку; доставку (push, PR, merge, release) выполняет координатор по своим правилам, не воркеры.
+- Блокеры, отказы проверок и решения, меняющие объём, показывай пользователю, а не скрывай повторами.

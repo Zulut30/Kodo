@@ -12,9 +12,9 @@ const cli = path.join(root, 'cli/index.mjs');
 const registry = JSON.parse(await readFile(path.join(root, 'registry.json'), 'utf8'));
 const expectedStats = {
   version: registry.version,
-  total: 33,
-  byType: { skill: 18, agent: 5, pipeline: 4, mcp: 3, preset: 3 },
-  dependencies: 51,
+  total: 34,
+  byType: { skill: 19, agent: 5, pipeline: 4, mcp: 3, preset: 3 },
+  dependencies: 52,
 };
 
 // Independently checked manifest order and existing text output, including spacing.
@@ -61,6 +61,10 @@ const listRows = [
   ['skills/composition-patterns', 'skills/composition-patterns   Стандарт Kodo composition patterns'],
   ['skills/ce-compound', 'skills/ce-compound            Стандарт Kodo ce compound'],
   ['skills/spec-kit', 'skills/spec-kit               Стандарт Kodo spec kit'],
+  [
+    'skills/kodo-project-director',
+    'skills/kodo-project-director  Фабрика проектов Kodo из главного чата с чертежом волнами и воркер-чатами',
+  ],
 ];
 const skillRows = [listRows[0], listRows[1], listRows[2], listRows[3], ...listRows.slice(19)];
 
@@ -106,8 +110,8 @@ test('Registry stats JSON has exactly the required keys, types and values', asyn
     });
 });
 
-test('Registry dependencies counts 51 direct requires references including repeated targets', () => {
-  // Audited direct edges: 4 + 4 + 3 + 7 + 7 + 5 + 6 + 15 = 51.
+test('Registry dependencies counts 52 direct requires references including repeated targets', () => {
+  // Audited direct edges: 4 + 4 + 3 + 7 + 7 + 5 + 6 + 15 + 1 = 52.
   // There are only 29 distinct targets, and presets point to pipelines with
   // dependencies of their own. Deduplication or transitive expansion is wrong.
   const directReferenceCounts = [
@@ -119,6 +123,7 @@ test('Registry dependencies counts 51 direct requires references including repea
     ['presets/dotnet', 5],
     ['presets/wordpress', 6],
     ['skills/kodo-build-feature', 15],
+    ['skills/kodo-project-director', 1],
   ];
   assert.deepEqual(
     registry.components.filter(item => item.requires.length > 0).map(item => [item.id, item.requires.length]),
@@ -126,20 +131,20 @@ test('Registry dependencies counts 51 direct requires references including repea
   );
   assert.equal(new Set(registry.components.flatMap(item => item.requires)).size, 29);
   const stats = JSON.parse(successful(['registry', 'stats', '--json']));
-  assert.equal(stats.dependencies, 51);
+  assert.equal(stats.dependencies, 52);
 });
 
 test('Registry stats table associates every label with its value', async t => {
   const expectedRows = [
     ['Показатель', 'Значение'],
     ['Версия registry', registry.version],
-    ['Всего компонентов', '33'],
-    ['skill', '18'],
+    ['Всего компонентов', '34'],
+    ['skill', '19'],
     ['agent', '5'],
     ['pipeline', '4'],
     ['mcp', '3'],
     ['preset', '3'],
-    ['Ссылок requires', '51'],
+    ['Ссылок requires', '52'],
   ];
   for (const [name, cwd] of workingDirectories)
     await t.test(name, () => {

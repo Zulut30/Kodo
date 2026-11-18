@@ -47,15 +47,15 @@ node cli/index.mjs --help
 ```json
 {
   "version": "0.2.0",
-  "total": 33,
+  "total": 34,
   "byType": {
-    "skill": 18,
+    "skill": 19,
     "agent": 5,
     "pipeline": 4,
     "mcp": 3,
     "preset": 3
   },
-  "dependencies": 51
+  "dependencies": 52
 }
 ```
 
@@ -66,13 +66,13 @@ node cli/index.mjs --help
 ```text
 Показатель           | Значение
 Версия registry      | 0.2.0
-Всего компонентов    | 33
-skill                | 18
+Всего компонентов    | 34
+skill                | 19
 agent                | 5
 pipeline             | 4
 mcp                  | 3
 preset               | 3
-Ссылок requires      | 51
+Ссылок requires      | 52
 ```
 
 Строки таблицы передают те же данные: версию registry, общее число компонентов, пять счётчиков по типам и общее число ссылок `requires`. Для обработки скриптами используй `--json`.

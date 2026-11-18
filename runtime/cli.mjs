@@ -197,7 +197,7 @@ export async function runtimeCli(command, args) {
     const catalog = await loadCatalog(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'));
     const installation = await planInstallation(
       catalog,
-      ['skills/kodo-build-feature'],
+      ['skills/kodo-build-feature', 'skills/kodo-project-director'],
       [options.client || 'all'],
       project,
     );
