@@ -72,12 +72,15 @@ function human(report) {
   return heading + '\n' + JSON.stringify(result, null, 2);
 }
 
-// Wave commands keep their own strict parsers: drain, and the pull protocol of external chats.
+// Wave and blueprint commands keep their own strict parsers: drain, the pull protocol of
+// external chats, and the project factory (bootstrap, apply-spec, extend, append-milestone).
+const blueprintActions = new Set(['bootstrap', 'apply-spec', 'extend', 'append-milestone']);
 async function waveCommand(argv) {
   const action = Array.isArray(argv) ? argv[0] : undefined;
   if (action === 'drain') return (await import('./project-cli-wave.mjs')).projectWaveCli;
   if (action === 'next-wave' || action === 'complete-task')
     return (await import('./project-cli-external.mjs')).projectExternalCli;
+  if (blueprintActions.has(action)) return (await import('./project-cli-blueprint.mjs')).projectBlueprintCli;
   return null;
 }
 
