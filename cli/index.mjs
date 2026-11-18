@@ -29,6 +29,8 @@ kodo project drain PROJECT_ID [--max-waves 1..100] [--concurrency 1..5] [--retry
 kodo project cancel|pause PROJECT_ID [--command-id UUID] [--json]
 kodo project reprioritize PROJECT_ID TASK_ID --priority 0..100 [--command-id UUID] [--json]
 kodo project approve-risk PROJECT_ID TASK_ID --reason TEXT [--command-id UUID] [--json]
+kodo project next-wave PROJECT_ID --host t3|orca [--limit 1..5] [--retry-failed] [--json]
+kodo project complete-task PROJECT_ID TASK_ID --head SHA [--defer-gate|--abandon] [--command-id UUID] [--json]
 kodo jobs list [--queue QUEUE] [--json]
 kodo jobs status JOB_ID [--json]
 kodo research status [--project PATH] [--json]

@@ -363,7 +363,11 @@ async function authorizeWave({ store, engine, A, evaluator, command, snapshot, o
     {
       contracts: A,
       knownValues: options.knownValues,
-      verifyRef: ref => verifyRef(engine, ref, run, !['task', 'attempt'].includes(action.kind)),
+      // A wave container is accepted only by a gate Run whose own observation (gate
+      // binding, gate input over every covered task, full receipts) is its proof, so a
+      // ref is checked exactly against that Run; a task Run's observation never reaches
+      // a container (waveInput binds containers only to gate Runs).
+      verifyRef: ref => verifyRef(engine, ref, run, !gate && !['task', 'attempt'].includes(action.kind)),
       validateRun: value => validateWaveRun({ store, engine, contracts: A, snapshot, run: value, gate }),
     },
   );

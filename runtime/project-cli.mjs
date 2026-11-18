@@ -76,6 +76,11 @@ function human(report) {
  * Ports belong to the coordinator/test harness, never to decoded CLI data.
  */
 export async function projectCli(argv, ports = {}) {
+  // Wave commands keep their own strict parsers: drain, and the pull protocol of external chats.
+  if (Array.isArray(argv) && argv[0] === 'drain')
+    return (await import('./project-cli-wave.mjs')).projectWaveCli(argv, ports);
+  if (Array.isArray(argv) && ['next-wave', 'complete-task'].includes(argv[0]))
+    return (await import('./project-cli-external.mjs')).projectExternalCli(argv, ports);
   let options,
     store,
     ownedStore = false,
@@ -83,8 +88,6 @@ export async function projectCli(argv, ports = {}) {
     exitCode = 0,
     safety,
     phase = 'arguments';
-  if (Array.isArray(argv) && argv[0] === 'drain')
-    return (await import('./project-cli-wave.mjs')).projectWaveCli(argv, ports);
   try {
     options = argumentsFor(argv); // No credentials, state, file or providers before strict parsing.
     phase = 'credentials';

@@ -126,12 +126,18 @@ function controlState(snapshot) {
   if (['failed', 'blocked'].includes(snapshot.project.status)) return 'blocked';
   return null;
 }
+/** The actor of the drain's commands; its `reserveAttempt` events mark native attempts. */
+export const NATIVE_RESERVER = 'project-director';
+const EXTERNAL_RESERVER = 'project-external:';
+/** The actor with which pull host `host` reserves an attempt (project-external). */
+export const externalReserver = host => `${EXTERNAL_RESERVER}${host}`;
+
 const commandFor = (snapshot, action, options = {}) => ({
   schemaVersion: 1,
   commandId: options.commandId || randomUUID(),
   projectId: snapshot.project.projectId,
   expectedRevision: snapshot.revision,
-  actor: 'project-director',
+  actor: NATIVE_RESERVER,
   reason: options.reason || 'Wave project command',
   action,
 });
@@ -835,7 +841,42 @@ async function executeWave(ctx, projectId, attempts, options, control, state) {
   return null;
 }
 
-// Native attempts still open (crash or quota mid-wave) and tasks in flight in external chats.
+// The actor of the attempt's own reservation event (null when none is recorded).
+async function reservationActor(repo, projectId, attemptId) {
+  let after = 0;
+  for (let page = 0; page < 64; page++) {
+    const history = await repo.history(projectId, { after, limit: 1000 });
+    const event = history.events.find(
+      row => row.type === 'reserveAttempt' && row.entity.kind === 'attempt' && row.entity.id === attemptId,
+    );
+    if (event) return event.actor;
+    if (history.complete || history.nextAfter <= after) return null;
+    after = history.nextAfter;
+  }
+  return null;
+}
+
+/**
+ * Who executes a wave attempt: `{kind:'native'}` (the drain), `{kind:'external', host}`
+ * (a pull host) or `{kind:'unknown'}`. An installed Run decides by its `executor`; a
+ * reservation without a Run (an interrupted install) by the actor of its reservation
+ * event, so only its owner ever resumes it.
+ * @param {{ repo: any, store: any }} ports
+ * @param {any} snapshot
+ * @param {any} attempt
+ */
+export async function attemptExecutor({ repo, store }, snapshot, attempt) {
+  const run = storedRun(store, attempt.runId);
+  if (run) return run.executor?.kind === 'external' ? { kind: 'external', host: run.executor.host } : { kind: 'native' };
+  const actor = await reservationActor(repo, snapshot.project.projectId, attempt.id);
+  if (actor === NATIVE_RESERVER) return { kind: 'native' };
+  if (typeof actor === 'string' && actor.startsWith(EXTERNAL_RESERVER))
+    return { kind: 'external', host: actor.slice(EXTERNAL_RESERVER.length) };
+  return { kind: 'unknown' };
+}
+
+// Native attempts still open (crash or quota mid-wave) and tasks in flight elsewhere
+// (external chats, or a reservation of an unknown owner): never executed by the drain.
 async function activeAttempts(ctx, projectId) {
   const snapshot = await snapshotOf(ctx, projectId);
   const native = [],
@@ -847,8 +888,8 @@ async function activeAttempts(ctx, projectId) {
         ? !reached(task.status, 'integrated')
         : !settled(attempt.status) && !retryStates.includes(attempt.status);
     if (!open) continue;
-    if (storedRun(ctx.store, attempt.runId)?.executor?.kind === 'external') external.push(attempt.taskId);
-    else native.push(attempt);
+    if ((await attemptExecutor(ctx, snapshot, attempt)).kind === 'native') native.push(attempt);
+    else external.push(attempt.taskId);
   }
   return { native, external };
 }
@@ -857,7 +898,8 @@ async function activeAttempts(ctx, projectId) {
 async function reserveRetries(ctx, projectId, options, control, state) {
   let snapshot = await snapshotOf(ctx, projectId);
   const horizon = await horizonOf(ctx, snapshot);
-  const taken = (await activeAttempts(ctx, projectId)).native.map(row => taskOf(snapshot, row.taskId).writePaths);
+  const active = await activeAttempts(ctx, projectId);
+  const taken = [...active.native.map(row => row.taskId), ...active.external].map(id => taskOf(snapshot, id).writePaths);
   let count = 0;
   for (const attempt of snapshot.currentAttempts.filter(row => retryStates.includes(row.status))) {
     const task = taskOf(snapshot, attempt.taskId);
