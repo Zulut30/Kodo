@@ -471,7 +471,9 @@ test('kodo report reads a legacy key file for redaction and never migrates it', 
   const result = invokeCli(f, ['report', runId, '--json']);
   assert.equal(result.status, 0, result.stderr);
   assert.ok(!result.stdout.includes(SECRET));
-  assert.deepEqual(JSON.parse(result.stdout).models, [{ client: 'codex', model: '[REDACTED]', sessions: 1, observedSessions: 1 }]);
+  assert.deepEqual(JSON.parse(result.stdout).models, [
+    { client: 'codex', model: '[REDACTED]', sessions: 1, observedSessions: 1 },
+  ]);
   const unknown = invokeCli(f, ['report', randomUUID(), '--json']);
   assert.equal(JSON.parse(unknown.stdout).code, 'report_not_found');
   // The legacy file stays byte for byte; no credential store or directory appears.

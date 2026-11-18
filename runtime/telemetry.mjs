@@ -187,7 +187,10 @@ function stageTimings(run, deliveries, sessions, executions) {
   const historyIncomplete = run.metrics?.historyComplete === false;
   const operations = Array.isArray(run.coordinatorOperations) ? run.coordinatorOperations : null;
   const stages = Object.fromEntries(
-    REPORT_STAGES.map(stage => [stage, { samples: [], sessions: sessions ? 0 : null, operations: 0, sources: [] }]),
+    REPORT_STAGES.map(stage => [
+      stage,
+      { samples: [], sessions: sessions ? 0 : null, operations: 0, sources: [], partial: false },
+    ]),
   );
   if (!operations) stages.assessment.operations = stages.analysis.operations = null;
   const add = (stage, sample, source, kind) => {
