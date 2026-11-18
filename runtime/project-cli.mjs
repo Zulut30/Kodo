@@ -72,15 +72,21 @@ function human(report) {
   return heading + '\n' + JSON.stringify(result, null, 2);
 }
 
+// Wave commands keep their own strict parsers: drain, and the pull protocol of external chats.
+async function waveCommand(argv) {
+  const action = Array.isArray(argv) ? argv[0] : undefined;
+  if (action === 'drain') return (await import('./project-cli-wave.mjs')).projectWaveCli;
+  if (action === 'next-wave' || action === 'complete-task')
+    return (await import('./project-cli-external.mjs')).projectExternalCli;
+  return null;
+}
+
 /** Explicit, lazy Project composition. Only resume enters foreground Engine.run.
  * Ports belong to the coordinator/test harness, never to decoded CLI data.
  */
 export async function projectCli(argv, ports = {}) {
-  // Wave commands keep their own strict parsers: drain, and the pull protocol of external chats.
-  if (Array.isArray(argv) && argv[0] === 'drain')
-    return (await import('./project-cli-wave.mjs')).projectWaveCli(argv, ports);
-  if (Array.isArray(argv) && ['next-wave', 'complete-task'].includes(argv[0]))
-    return (await import('./project-cli-external.mjs')).projectExternalCli(argv, ports);
+  const wave = await waveCommand(argv);
+  if (wave) return wave(argv, ports);
   let options,
     store,
     ownedStore = false,

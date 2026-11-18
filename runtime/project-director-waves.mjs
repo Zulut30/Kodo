@@ -867,7 +867,8 @@ async function reservationActor(repo, projectId, attemptId) {
  */
 export async function attemptExecutor({ repo, store }, snapshot, attempt) {
   const run = storedRun(store, attempt.runId);
-  if (run) return run.executor?.kind === 'external' ? { kind: 'external', host: run.executor.host } : { kind: 'native' };
+  if (run)
+    return run.executor?.kind === 'external' ? { kind: 'external', host: run.executor.host } : { kind: 'native' };
   const actor = await reservationActor(repo, snapshot.project.projectId, attempt.id);
   if (actor === NATIVE_RESERVER) return { kind: 'native' };
   if (typeof actor === 'string' && actor.startsWith(EXTERNAL_RESERVER))
@@ -899,7 +900,9 @@ async function reserveRetries(ctx, projectId, options, control, state) {
   let snapshot = await snapshotOf(ctx, projectId);
   const horizon = await horizonOf(ctx, snapshot);
   const active = await activeAttempts(ctx, projectId);
-  const taken = [...active.native.map(row => row.taskId), ...active.external].map(id => taskOf(snapshot, id).writePaths);
+  const taken = [...active.native.map(row => row.taskId), ...active.external].map(
+    id => taskOf(snapshot, id).writePaths,
+  );
   let count = 0;
   for (const attempt of snapshot.currentAttempts.filter(row => retryStates.includes(row.status))) {
     const task = taskOf(snapshot, attempt.taskId);

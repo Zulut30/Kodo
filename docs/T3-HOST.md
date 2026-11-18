@@ -18,10 +18,10 @@ kodo project complete-task --head ►  проверка commit, task-fast,
             ◄──────────────────────  integrated | checks_failed | blocked
 ```
 
-1. `next-wave` под lease `project:<id>` создаёт или находит интеграционную ветку `kodo/project/<id>` (`ensureIntegration`) и сначала возвращает брифы уже идущих внешних попыток этого хоста. Затем добирает пачку до `--limit` через `selectWave(snapshot, {limit, inFlight})` директора: задачи без пересечения `writePaths` с идущими. Для каждой новой задачи: `task → ready`, `reserveAttempt`, черновик Run через `engine.createReserved` и `repo.installRun`, worktree на ветке `kodo/<runId>` от головы интеграционной ветки (`waveFrontier`), Run в `executing`, переходы `attempt/task → running`.
+1. `next-wave` под lease `project:<id>` создаёт или находит интеграционную ветку `kodo/project/<id>` (`ensureIntegration`) и сначала возвращает брифы уже идущих внешних попыток этого хоста. Затем добирает пачку до `--limit` через `selectWave(snapshot, {limit, inFlight})` директора: задачи без пересечения `writePaths` с идущими. Для каждой новой задачи: `task → ready`, `reserveAttempt` с actor `project-external:<host>` (владелец резерва), черновик Run через `engine.createReserved` и `repo.installRun`, worktree на ветке `kodo/<runId>` от головы интеграционной ветки (`waveFrontier`), Run в `executing`, переходы `attempt/task → running`.
 2. Главный чат открывает по брифу один воркер-чат с заголовком `brief.chatTitle`. Второй worktree хост не создаёт: чат запускается в общей папке проекта и работает по абсолютному пути `brief.worktree`.
 3. Воркер коммитит в `brief.branch`, запускает `brief.selfCheck` и возвращает полный SHA.
-4. `complete-task` проверяет коммит, один раз выполняет `task-fast` (`verifyTaskFastOnce`), переводит Run в `succeeded` и передаёт его `integrateAndAdvance` директора. Если не задан `--defer-gate`, затем вызывается `runPendingGates`.
+4. `complete-task` под тем же lease `project:<id>` проверяет коммит, один раз выполняет `task-fast` (`verifyTaskFastOnce`), переводит Run в `succeeded` и передаёт его `integrateAndAdvance` директора. Результат интеграции сразу записывается в `externalCompletion` (`gates: null`); если не задан `--defer-gate`, затем вызывается `runPendingGates` и его итог дописывается туда же. Гейт эпика с ремонтом принимает задачи, эпик и, если покрывает, milestone и проект.
 
 ## Run внешней задачи
 
@@ -31,11 +31,12 @@ kodo project complete-task --head ►  проверка commit, task-fast,
 | `verificationProfile` | `'task-fast'` |
 | `config.repairRounds` | `1`; ремонта при `complete-task` нет |
 | `config.delivery.enabled` | `false`; доставку делает координатор |
+| `review` | `null`: собственного ревью нет, ревью — у gate Run эпика |
 | `baseSha` | голова интеграционной ветки на момент резерва |
 | `state` | `executing` после резерва, `succeeded` после пройденной проверки |
-| `externalCompletion` | `{schemaVersion, headSha, integration, gates}` после интеграции; `gates: null` при `--defer-gate` |
+| `externalCompletion` | `{schemaVersion, headSha, integration, gates}` после интеграции; `gates: null` до прохода гейтов и при `--defer-gate` |
 
-Переходы волновых задач авторизует `createExternalTransitionAuthorizer`: authorizer директора с evaluator `evaluateWaveTransition` и проверкой Run профиля `task-fast` (Run совпадает с сохранённым, binding и frozen task прежние, корень проекта не сменился; у `succeeded` — чистый worktree на проверенном head, неизменные `commands` и целые evidence быстрых проверок). Принятие (`accepted`) gate Run'ом этот authorizer не покрывает.
+Все переходы авторизует один production-authorizer `createProjectTransitionAuthorizer` (ветка wave → `evaluateWaveTransition`, доверенная проверка `validateWaveRun`), тот же, что у `drain`. Run внешней задачи проверяется как любой Run задачи волны: совпадает с сохранённым, binding и frozen task прежние, `verificationProfile: 'task-fast'`, корень и конфигурация проверки не сменились, worktree чист на `run.headSha`. Пока Run `executing`, этим проверка ограничена и разрешено не больше `running`; у `succeeded` — журналы `fast-check` каждой строки и Git-сверка записанного слияния. Принятие (`accepted`) даёт только gate Run эпика ([PROJECTS.md](PROJECTS.md), «Волновой режим»).
 
 ## Бриф
 
@@ -93,24 +94,25 @@ kodo project complete-task PROJECT_ID TASK_ID --head SHA [--defer-gate|--abandon
 
 ## Идемпотентность
 
-- Повтор `next-wave` возвращает те же брифы и не создаёт попыток: идущие попытки хоста подхватываются первыми, лимит добирается только свободными задачами. Резерв без установленного Run (сбой между записями) подхватывается тем же вызовом.
+- Повтор `next-wave` возвращает те же брифы и не создаёт попыток: идущие попытки хоста подхватываются первыми, лимит добирается только свободными задачами.
+- Владение резервом (`attemptExecutor`): у установленного Run — его `executor`, у резерва без Run (сбой между `reserveAttempt` и установкой) — actor события резерва. Такой резерв подхватывает только его владелец: `next-wave` того же хоста, а резерв `drain` (actor `project-director`) — только `drain`. Чужие попытки `next-wave` не трогает, `drain` не исполняет внешние попытки, а лишь считает их writePaths занятыми.
 - Ошибка одной задачи не прерывает пачку: она попадает в `blocked` с кодом, следующий вызов продолжит её.
-- Повтор `complete-task` с тем же head после интеграции возвращает сохранённый `externalCompletion` с `replayed: true` без проверки, слияния и гейтов. Отложенные `--defer-gate` гейты выполнит первый повтор без этого флага.
-- Уже проверенный head после отказа интеграции повторно не проверяется.
+- Повтор `complete-task` с тем же head после интеграции возвращает сохранённый `externalCompletion` с `replayed: true` без проверки, слияния и гейтов. Отложенные (`--defer-gate`) или прерванные гейты выполнит первый повтор без этого флага.
+- Уже проверенный head после отказа интеграции повторно не проверяется; если сбой прервал интеграцию проверенного head (слияние `pending` или `merged` без `externalCompletion`), повтор продолжает её без новой проверки и без второго merge-коммита.
 - `--abandon` переводит попытку в `blocked` и отменяет Run (`cancelRequested`, `cancelled`); повтор возвращает `abandoned` с `replayed: true`. Новую попытку создаёт только `next-wave --retry-failed`, со своим Run и worktree.
 
 ## Ограничения
 
 - Конфликт при интеграции оставляет попытку `running` со статусом `blocked`. Rebase на новую голову интеграционной ветки протоколом не поддерживается: diff от старой базы захватит чужие изменения и не пройдёт проверку scope. Выход — `--abandon` и `next-wave --retry-failed`.
-- `next-wave` держит lease `project:<id>`, как foreground-директор: пока его держит другой контроллер, ответ — `project_busy`. `complete-task` этот lease не берёт; проверку сериализует lease `run:<id>`, слияния — директор.
+- `next-wave` и `complete-task` держат lease `project:<id>`, как `drain` и foreground-директор: пока его держит другой контроллер (например, идущий `drain`), ответ — `project_busy`, команду повторяют позже. Проверку дополнительно сериализует lease `run:<id>`, слияния — lease `project-integration:<id>`.
 - `--command-id` используется только для перехода `--abandon`; команды интеграции директор строит сам.
-- Gate Run эпика и принятие задач (`accepted`) выполняет директор (`runPendingGates`); переходы принятия этот authorizer не авторизует.
+- Gate Run эпика и принятие задач (`accepted`) выполняет директор (`runPendingGates`) внутри `complete-task` или `drain`.
 - Kodo не создаёт, не читает и не архивирует чаты хоста; это делает главный чат своими инструментами.
 - Orca использует тот же протокол (`--host orca`), но с Orca он не проверялся.
-- Функции директора (`selectWave`, `createWaveContext`, `integrateAndAdvance`, `runPendingGates`) берутся из `runtime/project-director-waves.mjs`; тесты протокола подменяют их fake-портами.
+- Функции директора (`selectWave`, `createWaveContext`, `integrateAndAdvance`, `runPendingGates`) берутся из `runtime/project-director-waves.mjs`; модульные тесты протокола подменяют их fake-портами, сквозной `tests/project-wave-e2e.test.mjs` идёт без подмен.
 
 ## Проверка
 
 ```powershell
-node --test tests/project-external.test.mjs tests/project-external-cli.test.mjs
+node --test tests/project-external.test.mjs tests/project-external-cli.test.mjs tests/project-wave-e2e.test.mjs
 ```

@@ -50,6 +50,8 @@ const priority = [
   'tests/project-wave-director.test.mjs', // ~320000 ms
   // External pull protocol: one local Windows run (Node 24), not a receipt and no speed claim.
   'tests/project-external.test.mjs', // ~69000 ms
+  // Wave end to end (drain, T3 pull path, reservation ownership): one local Windows run (Node 24), not a receipt.
+  'tests/project-wave-e2e.test.mjs', // ~165000 ms
 ];
 
 // `npm run test:fast`: unit-level files measured at a few seconds each on

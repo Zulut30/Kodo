@@ -181,6 +181,9 @@ async function installExternalRun(state, attempt, task) {
         value.runDraft.executor = { kind: 'external', host };
         value.runDraft.verificationProfile = 'task-fast';
         value.runDraft.config.repairRounds = 1;
+        // No independent review of its own (the epic gate reviews): an explicit null keeps the
+        // persisted acceptance observation equal to the Run's (JSON drops undefined fields).
+        value.runDraft.review = null;
         return ctx.repo.installRun(value);
       },
     },
