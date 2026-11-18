@@ -413,6 +413,8 @@ const gateFields = {
 };
 // A reservation replaced before its install (its head went stale) names its successor.
 const gateOptional = { supersededBy: uuid };
+// The acceptance criteria of one covered container, as the gate manifest carries them.
+const gateContainerCriteriaRow = v => object(v, { kind: member(containerKinds), id: short, criteria });
 function gateRecord(value) {
   const g = dated(extended(value, gateFields, gateOptional));
   if (g.supersededBy !== undefined && (g.installed || g.supersededBy === g.id)) fail('project_gate_invalid');
@@ -489,6 +491,51 @@ function hierarchy({ milestones, epics, tasks }, complete = { milestones: true, 
     seen.add(id);
   }
   for (const t of tasks) visit(t.id);
+}
+/**
+ * The first cycle of the epic dependency graph (epic X → epic Y when a task of X depends on a task
+ * of Y), as the epic ids along it, or null. A wave epic is gated only after the epics it depends on
+ * are accepted, so a cycle (A1 → B1 → A2 → B2) would leave every epic of it integrated forever.
+ * @param {{ id: string }[]} epics
+ * @param {{ id: string, epicId: string, dependsOn: string[] }[]} tasks
+ */
+export function epicCycle(epics, tasks) {
+  const epicOf = new Map(tasks.map(t => [t.id, t.epicId]));
+  const edges = new Map(epics.map(e => [e.id, []]));
+  for (const t of tasks)
+    for (const dep of t.dependsOn) {
+      const to = epicOf.get(dep);
+      const out = edges.get(t.epicId);
+      if (to !== undefined && to !== t.epicId && out && !out.includes(to)) out.push(to);
+    }
+  const state = new Map(),
+    path = [];
+  const visit = id => {
+    if (state.get(id) === 'active') return path.slice(path.indexOf(id));
+    if (state.has(id) || !edges.has(id)) return null;
+    state.set(id, 'active');
+    path.push(id);
+    for (const next of edges.get(id)) {
+      const cycle = visit(next);
+      if (cycle) return cycle;
+    }
+    path.pop();
+    state.set(id, 'done');
+    return null;
+  };
+  for (const e of epics) {
+    const cycle = visit(e.id);
+    if (cycle) return cycle;
+  }
+  return null;
+}
+function assertEpicsAcyclic(epics, tasks) {
+  const cycle = epicCycle(epics, tasks);
+  if (cycle)
+    throw Object.assign(new Error(`Invalid project Director data: epic dependency cycle ${cycle.join(' -> ')}`), {
+      code: 'project_epic_cycle',
+      epics: cycle,
+    });
 }
 function projectSpec(value) {
   const s = extended(
@@ -618,7 +665,12 @@ function snapshot(value) {
 }
 function action(value) {
   plain(value);
-  if (value.op === 'create') return object(value, { op: member(['create']), spec: projectSpec });
+  if (value.op === 'create') {
+    const created = object(value, { op: member(['create']), spec: projectSpec });
+    // Wave epics are gated in dependency order; legacy projects keep their rules.
+    if (isWaveProject(created.spec)) assertEpicsAcyclic(created.spec.epics, created.spec.tasks);
+    return created;
+  }
   if (['insert', 'amend'].includes(value.op)) {
     const fields = { milestone: milestoneFields, epic: epicFields, task: taskFields }[value.kind];
     if (!fields) fail();
@@ -743,9 +795,10 @@ const normalize = {
   },
   gateManifest: v => {
     const input = object(v, {
-      schemaVersion: one,
+      schemaVersion: v => int(v, 2, 2),
       projectContext: v => object(v, projectContextFields),
       gate: v => object(v, { containers: gateContainers, baseSha: sha, headSha: sha }),
+      containers: v => list(v, gateContainerCriteriaRow, c => c.kind, 1),
       tasks: v =>
         list(
           v,
@@ -754,7 +807,12 @@ const normalize = {
           1,
         ),
     });
-    if (input.tasks.some(t => t.projectId !== input.projectContext.projectId)) fail('project_identity');
+    if (
+      input.tasks.some(t => t.projectId !== input.projectContext.projectId) ||
+      input.containers.length !== input.gate.containers.length ||
+      input.containers.some((c, i) => c.kind !== input.gate.containers[i].kind || c.id !== input.gate.containers[i].id)
+    )
+      fail('project_identity');
     return input;
   },
   gateRunInput: v =>
@@ -844,7 +902,9 @@ function contextOf(project) {
   };
 }
 /** The gate manifest: frozen contracts of every covered task in `gate.merges` order with the
- * project context and the gate range. It is kept as an immutable evidence artifact of the
+ * project context, the gate range and the acceptance criteria of the covered containers
+ * (input `{project, gate, tasks, containers: gateContainerCriteria(snapshot, gate)}`, schema 2).
+ * It is kept as an immutable evidence artifact of the
  * gate Run (kind `gate-manifest`); `sha256` covers its canonical bytes and is bound into
  * the gate input. Returns `{ manifest, sha256, bytes }`. */
 export function buildGateManifest(input, options = { knownValues: [] }) {
@@ -871,7 +931,7 @@ export function buildGateInput(input, options = { knownValues: [] }) {
 }
 function gateManifestBody(input, options) {
   assertDirectorSafe(input, options);
-  const { project, gate, tasks } = object(input, {
+  const { project, gate, tasks, containers } = object(input, {
     project: v => normalizeDirectorRecord('project', v, options),
     gate: v => normalizeDirectorRecord('gate', v, options),
     tasks: v =>
@@ -881,6 +941,7 @@ function gateManifestBody(input, options) {
         t => t.id,
         1,
       ),
+    containers: v => list(v, gateContainerCriteriaRow, c => c.kind, 1),
   });
   if (!isWaveProject(project)) fail('project_gate_unsupported');
   const byId = new Map(tasks.map(t => [t.id, t]));
@@ -888,15 +949,44 @@ function gateManifestBody(input, options) {
     gate.projectId !== project.projectId ||
     tasks.some(t => t.projectId !== project.projectId) ||
     byId.size !== gate.merges.length ||
-    gate.merges.some(m => !byId.has(m.taskId))
+    gate.merges.some(m => !byId.has(m.taskId)) ||
+    containers.some(
+      (c, i) =>
+        c.kind !== gate.containers[i]?.kind ||
+        c.id !== gate.containers[i].id ||
+        (c.kind === 'project' && JSON.stringify(c.criteria) !== JSON.stringify(project.definitionOfDone)),
+    ) ||
+    containers.length !== gate.containers.length
   )
     fail('project_identity');
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     projectContext: contextOf(project),
     gate: { containers: gate.containers, baseSha: gate.baseSha, headSha: gate.headSha },
+    containers,
     tasks: gate.merges.map(m => contract(byId.get(m.taskId))),
   };
+}
+/** The acceptance criteria of a gate's containers from the snapshot records, narrowest first
+ * (`containers` of buildGateManifest/buildGateInput): an epic's and a milestone's `acceptance`,
+ * the project's `definitionOfDone`. A missing record leaves `criteria` undefined (refused). */
+export function gateContainerCriteria(snapshot, gate) {
+  return gate.containers.map(c => ({
+    kind: c.kind,
+    id: c.id,
+    criteria:
+      c.kind === 'project'
+        ? snapshot.project.definitionOfDone
+        : snapshot[`${c.kind}s`]?.find(row => row.id === c.id)?.acceptance,
+  }));
+}
+/** The criteria a gate review confirms one by one (`review.criteria[].id`): every criterion of
+ * the covered containers (`<kind>:<id>:<criterion>`) and tasks (`task:<taskId>:<criterion>`). */
+export function gateReviewCriteria(manifest) {
+  return [
+    ...manifest.containers.flatMap(c => c.criteria.map(x => ({ id: `${c.kind}:${c.id}:${x.id}`, text: x.text }))),
+    ...manifest.tasks.flatMap(t => t.acceptance.map(x => ({ id: `task:${t.taskId}:${x.id}`, text: x.text }))),
+  ];
 }
 /** Install binding for a gate Run; mergesHash covers the canonical merges JSON. */
 export function gateBindingFor(input, options = { knownValues: [] }) {
@@ -953,6 +1043,7 @@ export function assertProjectReopen(input) {
     state.set(id, 'done');
   };
   for (const id of fresh.keys()) visit(id);
+  assertEpicsAcyclic([...s.epics, ...a.epics], [...s.tasks, ...a.tasks]);
   if (s.tasks.length + a.tasks.length > MAX_ITEMS || s.epics.length + a.epics.length > MAX_ITEMS) fail('project_limit');
 }
 

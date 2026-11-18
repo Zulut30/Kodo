@@ -24,15 +24,24 @@ import { git, makeWorktree } from './workspace.mjs';
 import { scopesOverlap } from './contracts.mjs';
 import { redact } from './security.mjs';
 import { isPullHost } from './job-contracts.mjs';
-import { ensureIntegration, waveFrontier } from './project-integration.mjs';
+import {
+  ensureIntegration,
+  inspectHistory,
+  integrationHeadOf,
+  mergeOnBranch,
+  waveFrontier,
+} from './project-integration.mjs';
+import { withIntegrationLease } from './project-integration-lease.mjs';
 import { bindingFor, known, storedRun, verifyRef } from './project-director.mjs';
 import * as waves from './project-director-waves.mjs';
 import { verifyTaskFastOnce } from './wave-verifier.mjs';
 import { workerRole } from './worker-roles.mjs';
+import { applyWavePolicy } from './wave-policy.mjs';
 
 /** The largest batch one `nextWave` call returns. */
 export const MAX_WAVE_LIMIT = 5;
 const shaPattern = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
+const uuidPattern = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 const settled = new Set(['accepted', 'released']);
 const retryable = new Set(['blocked', 'failed', 'cancelled']);
 const inFlightStates = new Set(['reserved', 'running', 'verifying']);
@@ -158,6 +167,7 @@ function briefFor(state, attempt, task, run) {
     prompt: `${input}\n\n${workerContract(run, task.writePaths, selfCheck)}`,
     selfCheck,
     completeCommand: `kodo project complete-task ${project.projectId} ${task.id} --head <SHA>`,
+    abandonCommand: `kodo project complete-task ${project.projectId} ${task.id} --head <SHA> --abandon --attempt ${attempt.id}`,
   };
   C.assertDirectorSafe(brief, options);
   return brief;
@@ -180,6 +190,8 @@ async function installExternalRun(state, attempt, task) {
         // External chats implement; Kodo only verifies once (task-fast) and never delivers.
         value.runDraft.executor = { kind: 'external', host };
         value.runDraft.verificationProfile = 'task-fast';
+        // The policy of the base commit, not of the user's checkout (runtime/wave-policy.mjs).
+        await applyWavePolicy(value.runDraft, value.runDraft.baseSha);
         value.runDraft.config.repairRounds = 1;
         // No independent review of its own (the epic gate reviews): an explicit null keeps the
         // persisted acceptance observation equal to the Run's (JSON drops undefined fields).
@@ -426,6 +438,32 @@ const problem = (code, error, secrets = {}) => ({
   ...(error ? { message: redact(String(error.message), secrets).slice(0, 2000) } : {}),
 });
 
+const historyCodes = {
+  scope: 'external_scope',
+  secret_path: 'external_scope',
+  special: 'external_symlink',
+  secret: 'external_unsafe_change',
+  too_long: 'external_history_too_long',
+};
+
+// Every commit of base..head, not only the result: a secret committed and deleted later is still
+// in the history the merge would bring into the integration branch.
+async function historyDefect(engine, run, task, head) {
+  const found = await inspectHistory({
+    cwd: run.project,
+    base: run.baseSha,
+    head,
+    writePaths: task.writePaths,
+    secrets: engine.secrets,
+  });
+  if (!found) return null;
+  const where = found.commit ? `commit ${found.commit.slice(0, 12)}: ${found.file}` : `more than the commit limit`;
+  return {
+    code: historyCodes[found.kind],
+    message: redact(`Unsafe history (${found.kind}) in ${where}`, engine.secrets).slice(0, 2000),
+  };
+}
+
 // Worker-fixable defects of the submitted commit, before any check runs.
 async function inspectSubmission(engine, run, task, head) {
   const branch = await execute('git', ['rev-parse', '--verify', '--quiet', `refs/heads/${run.branch}`], {
@@ -441,6 +479,8 @@ async function inspectSubmission(engine, run, task, head) {
     return problem('external_worktree_dirty');
   if (head === run.baseSha) return problem('external_no_changes');
   if (!(await ancestor(run.project, run.baseSha, head))) return problem('external_not_descendant');
+  const history = await historyDefect(engine, run, task, head);
+  if (history) return history;
   if ((await specialEntries(run.project, run.baseSha, head)).length) return problem('external_symlink');
   try {
     await engine.checkScope(run.cwd, run.baseSha, task.writePaths);
@@ -454,11 +494,14 @@ async function inspectSubmission(engine, run, task, head) {
   return null;
 }
 
-async function abandonAttempt(ctx, snapshot, attempt, run, commandId) {
+async function abandonAttempt(ctx, snapshot, attempt, run, { head, commandId }) {
   const store = storeOf(ctx);
+  // The abandon names its attempt and head: a late repeat replays it and never stops a retry.
+  const abandoned = run.externalAbandon ?? { schemaVersion: 1, attemptId: attempt.id, headSha: head };
   if (attempt.status === 'blocked') {
-    if (run.state !== 'cancelled') store.updateRun(run.id, { cancelRequested: true, state: 'cancelled' });
-    return { status: 'abandoned', revision: snapshot.revision, replayed: true };
+    if (run.state !== 'cancelled' || !run.externalAbandon)
+      store.updateRun(run.id, { cancelRequested: true, state: 'cancelled', externalAbandon: abandoned });
+    return { status: 'abandoned', attemptId: attempt.id, revision: snapshot.revision, replayed: true };
   }
   if (!inFlightStates.has(attempt.status) || run.integration?.status === 'merged')
     return { status: 'blocked', code: 'project_attempt_not_running', revision: snapshot.revision };
@@ -472,8 +515,50 @@ async function abandonAttempt(ctx, snapshot, attempt, run, commandId) {
     cancelRequested: true,
     state: 'cancelled',
     error: { code: 'external_abandoned', message: 'External worker abandoned the task' },
+    externalAbandon: abandoned,
   });
-  return { status: 'abandoned', revision: (await snapshotOf(ctx, snapshot.project.projectId)).revision };
+  return {
+    status: 'abandoned',
+    attemptId: attempt.id,
+    revision: (await snapshotOf(ctx, snapshot.project.projectId)).revision,
+  };
+}
+
+// The Run of an earlier attempt of this task that an abandon already stopped: the named attempt
+// (`--attempt`), or else the one abandoned with this head. Null when the current attempt is meant.
+function earlierAbandon(ctx, snapshot, attempt, { head, attemptId }) {
+  if (attemptId === attempt.id) return null;
+  return (
+    storeOf(ctx)
+      .listRuns(snapshot.project.root)
+      .find(
+        row =>
+          row.directorBinding?.projectId === snapshot.project.projectId &&
+          row.directorBinding.taskId === attempt.taskId &&
+          row.directorBinding.attemptId !== attempt.id &&
+          row.executor?.kind === 'external' &&
+          row.externalAbandon?.schemaVersion === 1 &&
+          (attemptId === undefined
+            ? row.externalAbandon.headSha === head
+            : row.directorBinding.attemptId === attemptId),
+      ) ?? null
+  );
+}
+
+// `--abandon` stops exactly one attempt: a repeat for an earlier attempt returns that result and
+// leaves the current attempt (a retry) alone; a named attempt that is not current is stale.
+async function abandonTarget(ctx, { snapshot, attempt, run }, input) {
+  const earlier = earlierAbandon(ctx, snapshot, attempt, input);
+  if (earlier)
+    return {
+      status: 'abandoned',
+      attemptId: earlier.directorBinding.attemptId,
+      revision: snapshot.revision,
+      replayed: true,
+    };
+  if (input.attemptId !== undefined && input.attemptId !== attempt.id)
+    return { status: 'blocked', code: 'project_attempt_stale', revision: snapshot.revision };
+  return abandonAttempt(ctx, snapshot, attempt, run, input);
 }
 
 async function runGates(W, waveCtx, projectId, signal) {
@@ -492,10 +577,39 @@ function waveContextOf(ctx, C, W) {
   });
 }
 
-// A completion already recorded for this head is returned, not repeated; deferred gates may still run.
+// Whether the merge the Run recorded is still on the integration branch with its recorded parents.
+async function mergeRecorded(projectId, run) {
+  const integration = run.integration;
+  return (
+    integration?.status === 'merged' &&
+    integration.mergedHead === run.headSha &&
+    (await mergeOnBranch({
+      cwd: run.project,
+      branchHead: await integrationHeadOf({ cwd: run.project, projectId }),
+      mergeCommit: integration.mergeCommit,
+      before: integration.before,
+      mergedHead: run.headSha,
+    }))
+  );
+}
+
+// A completion already recorded for this head is returned, not repeated; deferred gates may still
+// run. The recorded merge is checked first under lease `project-integration:<id>`: a merge that
+// left the branch (reset, rewrite) is a recovery blocker, never a replayed `integrated`.
 async function replayCompletion(ctx, C, input, run) {
   const completion = run.externalCompletion,
     store = storeOf(ctx);
+  const present = await withIntegrationLease(store, input.projectId, () => mergeRecorded(input.projectId, run), {
+    signal: input.signal,
+  });
+  if (!present)
+    return {
+      status: 'blocked',
+      code: 'project_integration_missing',
+      integration: completion.integration,
+      revision: (await snapshotOf(ctx, input.projectId)).revision,
+      replayed: true,
+    };
   let gates = completion.gates;
   if (gates === null && !input.deferGate) {
     const W = wavePorts(input.ports, ['createWaveContext', 'runPendingGates']);
@@ -568,23 +682,28 @@ async function externalAttempt(ctx, C, projectId, taskId) {
 /**
  * Accept the commit of an external worker: check it, run `task-fast` once and
  * integrate it (`integrateAndAdvance`), then run pending epic gates unless deferred.
- * `abandon` blocks the attempt and cancels its Run instead. The whole call holds lease
+ * `abandon` blocks the attempt and cancels its Run instead; `attemptId` (CLI `--attempt`) binds
+ * the call to one attempt (a stale one is `project_attempt_stale`), and a late abandon of an earlier
+ * attempt replays its result without touching the current one. The whole call holds lease
  * `project:<id>` (as `nextWave` and the drain do): `project_busy` while another holds it.
  * @param {{ repo: any, engine: any, store?: any, contracts?: any, clock?: () => string }} ctx
  * @param {{ projectId: string, taskId: string, head: string, deferGate?: boolean, abandon?: boolean,
- *   commandId?: string, ports?: any, signal?: AbortSignal }} input
+ *   commandId?: string, attemptId?: string, ports?: any, signal?: AbortSignal }} input
  */
 export async function completeTask(ctx, input) {
-  const { projectId, taskId, head, deferGate = false, abandon = false, commandId, signal } = input;
+  const { projectId, taskId, head, deferGate = false, abandon = false, commandId, signal, attemptId } = input;
   need(typeof head === 'string' && shaPattern.test(head), 'head_invalid');
   need(!(deferGate && abandon), 'arguments');
+  need(attemptId === undefined || uuidPattern.test(attemptId), 'arguments');
   const C = await contractsOf(ctx);
   await externalAttempt(ctx, C, projectId, taskId);
   return withProjectLease(storeOf(ctx), projectId, async () => {
-    const { snapshot, task, attempt, run } = await externalAttempt(ctx, C, projectId, taskId);
-    if (abandon) return abandonAttempt(ctx, snapshot, attempt, run, commandId);
-    if (run.externalCompletion?.headSha === head) return replayCompletion(ctx, C, { ...input, deferGate }, run);
+    const current = await externalAttempt(ctx, C, projectId, taskId);
+    const { snapshot, task, attempt, run } = current;
+    if (abandon) return abandonTarget(ctx, current, { head, attemptId, commandId });
     const blocked = code => ({ status: 'blocked', code, revision: snapshot.revision });
+    if (attemptId !== undefined && attemptId !== attempt.id) return blocked('project_attempt_stale');
+    if (run.externalCompletion?.headSha === head) return replayCompletion(ctx, C, { ...input, deferGate }, run);
     if (snapshot.project.paused || ['cancelled', 'failed', 'blocked'].includes(snapshot.project.status))
       return blocked('project_control_blocked');
     // A verified head whose integration was interrupted (crash) continues where it stopped.

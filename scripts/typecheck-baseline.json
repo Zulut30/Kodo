@@ -84,18 +84,6 @@
     "count": 2
   },
   {
-    "file": "runtime/config.mjs",
-    "code": "TS2339",
-    "message": "Property 'executionMode' does not exist on type '{ schemaVersion: number; repository: any; baseBranch: string; client: string; primaryModel: any; concurrency: number; repairRounds: number; researchBudget: number; uiVerification: { enabled: any; cases: any[]; autoInstall: any; maxSteps: any; timeoutMs: any; }; ... 5 more ...; delivery: any; }'.",
-    "count": 1
-  },
-  {
-    "file": "runtime/config.mjs",
-    "code": "TS2339",
-    "message": "Property 'maxTasks' does not exist on type '{ schemaVersion: number; repository: any; baseBranch: string; client: string; primaryModel: any; concurrency: number; repairRounds: number; researchBudget: number; uiVerification: { enabled: any; cases: any[]; autoInstall: any; maxSteps: any; timeoutMs: any; }; ... 5 more ...; delivery: any; }'.",
-    "count": 4
-  },
-  {
     "file": "runtime/context-pack.mjs",
     "code": "TS2339",
     "message": "Property 'analysis' does not exist on type '{}'.",
@@ -213,12 +201,6 @@
     "file": "runtime/engine-core.mjs",
     "code": "TS2339",
     "message": "Property 'binding' does not exist on type '{}'.",
-    "count": 1
-  },
-  {
-    "file": "runtime/engine-core.mjs",
-    "code": "TS2339",
-    "message": "Property 'executionMode' does not exist on type '{ schemaVersion: number; repository: any; baseBranch: string; client: string; primaryModel: any; concurrency: number; repairRounds: number; researchBudget: number; uiVerification: { enabled: any; cases: any[]; autoInstall: any; maxSteps: any; timeoutMs: any; }; ... 5 more ...; delivery: any; }'.",
     "count": 1
   },
   {

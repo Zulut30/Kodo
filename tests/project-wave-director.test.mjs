@@ -14,6 +14,7 @@ import { createProjectDirector, createProjectTransitionAuthorizer } from '../run
 import { createWaveContext, selectWave } from '../runtime/project-director-waves.mjs';
 import { withIntegrationLease } from '../runtime/project-integration-lease.mjs';
 import { evaluateWaveTransition } from '../runtime/project-wave-evidence.mjs';
+import { confirmedCriteria } from './helpers/gate-review.mjs';
 
 // Wave execution through the real Engine with fake subscription providers, a real
 // temporary Git repository and the production transition authorizer.
@@ -95,7 +96,10 @@ function providers(fileOf, hooks) {
       if (request.schema?.properties?.passed) {
         calls.review++;
         if (hooks.onReview) await hooks.onReview(request, calls);
-        return { sessionId: `review-${calls.review}`, output: { passed: true, findings: [] } };
+        return {
+          sessionId: `review-${calls.review}`,
+          output: { passed: true, findings: [], ...confirmedCriteria(request.schema) },
+        };
       }
       if (/Repair confirmed failures/.test(request.prompt)) {
         calls.repair.push(request);

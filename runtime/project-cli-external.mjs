@@ -8,7 +8,7 @@ const sha = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 const booleans = ['--json', '--retry-failed', '--defer-gate', '--abandon'];
 const flagsFor = {
   'next-wave': ['--json', '--host', '--limit', '--retry-failed'],
-  'complete-task': ['--json', '--head', '--defer-gate', '--abandon', '--command-id'],
+  'complete-task': ['--json', '--head', '--defer-gate', '--abandon', '--command-id', '--attempt'],
 };
 // Constant codes of the protocol itself; never data, paths or provider output.
 const reported = new Set([
@@ -73,6 +73,7 @@ function argumentsFor(argv) {
     invalid();
   if (!next && (!sha.test(flags['--head'] ?? '') || (flags['--defer-gate'] && flags['--abandon']))) invalid();
   if (flags['--command-id'] !== undefined && !uuid.test(flags['--command-id'])) invalid();
+  if (flags['--attempt'] !== undefined && !uuid.test(flags['--attempt'])) invalid();
   return { action, projectId: positional[0], taskId: positional[1], flags, json: flags['--json'] === true };
 }
 
@@ -136,6 +137,7 @@ async function operate(options, ports, safety) {
         deferGate: flags['--defer-gate'] === true,
         abandon: flags['--abandon'] === true,
         ...(flags['--command-id'] ? { commandId: flags['--command-id'] } : {}),
+        ...(flags['--attempt'] ? { attemptId: flags['--attempt'] } : {}),
         ports: ports.wave,
         ...(ports.signal ? { signal: ports.signal } : {}),
       });

@@ -488,3 +488,78 @@ test('A foreign unfinished Git operation with a clean status is refused before a
   const done = await mergeTask({ ...input, savePending: async () => {} });
   assert.deepEqual(await parents(worktree, done.mergeCommit), [head, second]);
 });
+
+test('A linked checkout of the integration branch outside the canonical path is busy and never moved', async t => {
+  // Review finding (major): ensureIntegration adopted any worktree of kodo/project/<id> and moved its HEAD.
+  const f = await fixture(t);
+  const before = await f.user();
+  const foreign = path.join(f.directory, 'my-checkout');
+  await git(f.root, ['worktree', 'add', '-b', integrationBranch(projectId), foreign, before.head]);
+  const scoped = await f.taskHead('first', before.head, { 'first.txt': 'first\n' });
+  await code(
+    ensureIntegration({ root: f.root, projectId, worktreeHome: f.worktreeHome }),
+    'project_integration_branch_busy',
+  );
+  assert.equal(await git(foreign, ['rev-parse', 'HEAD']), before.head, "the user's linked checkout keeps its HEAD");
+  assert.equal(await git(foreign, ['branch', '--show-current']), integrationBranch(projectId));
+  assert.equal(await lstat(path.join(f.worktreeHome, `project-${projectId}`)).catch(() => null), null);
+  assert.ok(scoped);
+  // Once the user's checkout leaves the branch, Kodo attaches it at its own canonical path.
+  await git(foreign, ['switch', '-q', '--detach']);
+  const integration = await ensureIntegration({ root: f.root, projectId, worktreeHome: f.worktreeHome });
+  assert.equal(integration.worktree, path.join(f.worktreeHome, `project-${projectId}`, 'integration'));
+  assert.deepEqual(await f.user(), before);
+});
+
+test('mergeTask inspects every commit of the task: secrets and paths outside scope in the history roll it back', async t => {
+  // Review finding (major): only the merged result was checked; a file committed and deleted later
+  // stayed reachable from the integration branch.
+  const f = await fixture(t);
+  const integration = await ensureIntegration({ root: f.root, projectId, worktreeHome: f.worktreeHome });
+  const history = async (name, first) => {
+    const head = await f.taskHead(name, integration.head, { ...first, [`${name}/${name}.txt`]: `${name}\n` });
+    const worktree = path.join(f.directory, 'tasks', name);
+    // The next commit undoes the first one's extra files: the merged result alone is clean.
+    for (const file of Object.keys(first))
+      if (file === 'shared.txt') await git(worktree, ['checkout', integration.head, '--', file]);
+      else await git(worktree, ['rm', '-q', file]);
+    await git(worktree, ['commit', '-q', '-m', `Clean ${name}`]);
+    return { leaked: head, head: await git(worktree, ['rev-parse', 'HEAD']) };
+  };
+  const secrets = { token: 'kodo-owned-secret-value' };
+  for (const [name, first] of [
+    ['credentials', { 'credentials/credentials.json': '{"token":"x"}\n' }],
+    ['outside', { 'shared.txt': 'escaped\n' }],
+    ['content', { 'content/notes.txt': `token ${secrets.token}\n` }],
+  ]) {
+    const task = await history(name, first);
+    await code(
+      mergeTask({
+        worktree: integration.worktree,
+        taskId: name,
+        taskHead: task.head,
+        writePaths: [`${name}/**`],
+        savePending: async () => {},
+        secrets,
+      }),
+      'project_integration_history',
+    );
+    assert.equal(await git(integration.worktree, ['rev-parse', 'HEAD']), integration.head, name);
+    const reachable = await execute('git', ['merge-base', '--is-ancestor', task.leaked, integration.head], {
+      cwd: f.root,
+      allowFailure: true,
+    });
+    assert.equal(reachable.code, 1, `${name}: the leaked commit is not on the branch`);
+  }
+  // A clean history merges as before.
+  const clean = await f.taskHead('clean', integration.head, { 'clean/clean.txt': 'clean\n' });
+  const merged = await mergeTask({
+    worktree: integration.worktree,
+    taskId: 'clean',
+    taskHead: clean,
+    writePaths: ['clean/**'],
+    savePending: async () => {},
+    secrets,
+  });
+  assert.equal(merged.status, 'merged');
+});

@@ -16,6 +16,8 @@ import {
   treesDiffer,
 } from './project-integration.mjs';
 import { integrationLeaseHeld } from './project-integration-lease.mjs';
+import { WAVE_POLICY_FIELDS, assertWavePolicy } from './wave-policy.mjs';
+import { isCurrentBehaviorReceipt } from './behavior-gate.mjs';
 
 const fail = code => {
   throw Object.assign(new Error(`Project ${code}`), { code: `project_${code}` });
@@ -125,20 +127,15 @@ async function validateRun({ store, engine, contracts, snapshot, run, publicatio
   if (publication) await assertPublication(engine, run);
   requireValue((await inspectCurrentSource({ project: run.cwd, headSha: run.headSha })) === 'clean', 'head_changed');
 }
-// Same root, same verification config, an unstopped Run and a clean verified head.
-async function assertRunSource(snapshot, run) {
+// Same root, same verification config, an unstopped Run and a clean verified head. A wave Run's
+// verification policy (WAVE_POLICY_FIELDS) belongs to its verified commit (assertWavePolicy), so
+// only its other settings are compared, and only with the user's checkout.
+async function assertRunSource(snapshot, run, wave = false) {
   requireValue((await canonical(run.project)) === snapshot.project.projectKey, 'root_changed');
-  for (const root of new Set([run.project, run.cwd])) {
+  const fields = ['commands', 'checks', 'security', 'uiVerification', 'architecture', 'repository', 'baseBranch'];
+  for (const root of new Set(wave ? [run.project] : [run.project, run.cwd])) {
     const current = await readConfig(root, { client: run.client });
-    for (const field of [
-      'commands',
-      'checks',
-      'security',
-      'uiVerification',
-      'architecture',
-      'repository',
-      'baseBranch',
-    ])
+    for (const field of wave ? fields.filter(name => !WAVE_POLICY_FIELDS.includes(name)) : fields)
       requireValue(isDeepStrictEqual(current[field], run.config[field]), 'config_changed');
     if (run.fixedModel)
       requireValue(current.models[run.fixedModel.client]?.includes(run.fixedModel.model), 'model_unavailable');
@@ -283,8 +280,8 @@ async function assertTaskMerge(snapshot, run) {
 }
 
 // The gate manifest artifact: intact, in the gate Run's evidence, on the gate head, and equal to
-// the manifest of the covered tasks whose SHA-256 the gate input (run.task) binds.
-async function assertGateManifest({ engine, contracts, snapshot, run, gate, tasks, options }) {
+// the manifest of the covered tasks and containers whose SHA-256 the gate input (run.task) binds.
+async function assertGateManifest({ engine, contracts, run, gate, input, options }) {
   const ref = run.gateManifest;
   requireValue(
     typeof contracts.buildGateManifest === 'function' && ref?.headSha === gate.headSha,
@@ -292,13 +289,54 @@ async function assertGateManifest({ engine, contracts, snapshot, run, gate, task
   );
   await verifyRef(engine, { kind: 'gate-manifest', path: ref.path, sha256: ref.sha256, headSha: ref.headSha }, run);
   const envelope = JSON.parse(await readFile(ref.path, 'utf8'));
-  const { manifest } = contracts.buildGateManifest({ project: snapshot.project, gate, tasks }, options);
+  const { manifest } = contracts.buildGateManifest(input, options);
   requireValue(
     envelope.kind === 'gate-manifest' &&
       envelope.baseSha === gate.baseSha &&
       isDeepStrictEqual(envelope.value, manifest),
     'gate_manifest_invalid',
   );
+  return manifest;
+}
+
+// The independent review of a gate confirmed every criterion of its manifest (each covered
+// container's and task's), each exactly once, met, with evidence.
+function assertGateCriteria(contracts, run, manifest) {
+  const expected = contracts.gateReviewCriteria(manifest),
+    confirmed = Array.isArray(run.review?.criteria) ? run.review.criteria : [];
+  requireValue(
+    isDeepStrictEqual(run.gateCriteria, expected) &&
+      confirmed.length === expected.length &&
+      expected.every(
+        criterion =>
+          confirmed.filter(
+            row =>
+              row?.id === criterion.id &&
+              row.met === true &&
+              typeof row.evidence === 'string' &&
+              row.evidence.trim().length > 0,
+          ).length === 1,
+      ),
+    'gate_criteria_unmet',
+  );
+}
+
+// `commands.smoke` of the gate's policy ran completely and passed on the verified head.
+async function assertSmoke(engine, run) {
+  const commands = run.config.commands.smoke ?? [],
+    smoke = run.smoke;
+  requireValue(
+    smoke?.complete === true &&
+      smoke.headSha === run.headSha &&
+      Array.isArray(smoke.results) &&
+      smoke.results.length === commands.length &&
+      commands.every(
+        ({ command, args = [] }, index) =>
+          smoke.results[index].command === command && isDeepStrictEqual(smoke.results[index].args ?? [], args),
+      ),
+    'smoke_stale',
+  );
+  await assertLogs(engine, run, smoke.results, 'smoke');
 }
 
 // The gate's range and everything it accepts are on the integration branch now (the caller holds
@@ -332,46 +370,67 @@ async function assertGateOnBranch({ store, snapshot, run, gate }) {
   }
 }
 
-// Wave Runs: a task Run (native or of an external chat, always profile task-fast)
-// carries the task-fast receipt once it succeeded; before that it proves only its
-// binding and source, and the evaluator grants it at most running/verifying. A gate
-// Run is bound to its gate record, carries the full receipts and smoke logs, its
-// verified head descends from the gate head inside the covered tasks' write paths
-// and is already contained in the integration branch.
+// A wave task Run (native or of an external chat, always profile task-fast) verifies under the
+// policy of its base (the frontier); once it succeeded it carries the task-fast receipt, and its
+// head may change the policy only inside its write paths. Before that it proves only its binding
+// and source, and the evaluator grants it at most running/verifying.
+async function validateWaveTask({ engine, contracts, snapshot, run, options }) {
+  assertAttemptBinding({ contracts, snapshot, run, options });
+  requireValue(run.verificationProfile === 'task-fast', 'checks_stale');
+  await assertRunSource(snapshot, run, true);
+  const task = snapshot.tasks.find(row => row.id === run.directorBinding.taskId);
+  const succeeded = run.state === 'succeeded';
+  await assertWavePolicy({
+    run,
+    policyCommit: run.baseSha,
+    ...(succeeded ? { headSha: run.headSha } : {}),
+    writePaths: task.writePaths,
+  });
+  if (!succeeded) return;
+  requireValue(run.checks?.profile === 'task-fast' && Array.isArray(run.checks.results), 'checks_stale');
+  await assertLogs(engine, run, run.checks.results, 'fast-check');
+  await assertTaskMerge(snapshot, run);
+}
+
+// A gate Run is bound to its gate record and the manifest of its covered tasks and containers,
+// verifies under the policy of the gate head (which its verified head keeps), carries the full
+// receipts, the behaviour receipt of that policy, the smoke logs and a review that confirmed
+// every criterion; its verified head descends from the gate head inside the covered tasks'
+// write paths and is already contained in the integration branch.
+async function validateWaveGate({ store, engine, contracts, snapshot, run, gate, options }) {
+  const tasks = gate.merges.map(merge => snapshot.tasks.find(row => row.id === merge.taskId));
+  requireValue(tasks.every(Boolean), 'binding_invalid');
+  const input = { project: snapshot.project, gate, tasks, containers: contracts.gateContainerCriteria(snapshot, gate) };
+  requireValue(
+    JSON.stringify(run.directorBinding) === JSON.stringify(contracts.gateBindingFor(gate, options)) &&
+      run.task === contracts.buildGateInput(input, options),
+    'binding_invalid',
+  );
+  await assertRunSource(snapshot, run, true);
+  await assertWavePolicy({ run, policyCommit: gate.headSha, headSha: run.headSha });
+  await assertFullReceipts(engine, run);
+  requireValue(
+    isCurrentBehaviorReceipt(run.behavior, { headSha: run.headSha, baseSha: run.baseSha, config: run.config }),
+    'behavior_stale',
+  );
+  await assertSmoke(engine, run);
+  const writePaths = tasks.flatMap(task => task.writePaths);
+  requireValue(
+    await gateRepairInScope({ worktree: run.cwd, from: gate.headSha, to: run.headSha, writePaths }),
+    'gate_scope',
+  );
+  const manifest = await assertGateManifest({ engine, contracts, run, gate, input, options });
+  assertGateCriteria(contracts, run, manifest);
+  // Nothing is accepted that the integration branch does not contain (mergeBackGate first).
+  await assertGateOnBranch({ store, snapshot, run, gate });
+}
+
 async function validateWaveRun({ store, engine, contracts, snapshot, run, gate }) {
   const options = { knownValues: known(engine) };
   contracts.assertDirectorSafe(run, options);
   requireValue(isDeepStrictEqual(run, store.getRun(run.id)), 'run_changed');
-  if (!gate) {
-    assertAttemptBinding({ contracts, snapshot, run, options });
-    requireValue(run.verificationProfile === 'task-fast', 'checks_stale');
-    await assertRunSource(snapshot, run);
-    if (run.state === 'succeeded') {
-      requireValue(run.checks?.profile === 'task-fast' && Array.isArray(run.checks.results), 'checks_stale');
-      await assertLogs(engine, run, run.checks.results, 'fast-check');
-      await assertTaskMerge(snapshot, run);
-    }
-  } else {
-    const tasks = gate.merges.map(merge => snapshot.tasks.find(row => row.id === merge.taskId));
-    requireValue(
-      tasks.every(Boolean) &&
-        JSON.stringify(run.directorBinding) === JSON.stringify(contracts.gateBindingFor(gate, options)) &&
-        run.task === contracts.buildGateInput({ project: snapshot.project, gate, tasks }, options),
-      'binding_invalid',
-    );
-    await assertRunSource(snapshot, run);
-    await assertFullReceipts(engine, run);
-    requireValue(Array.isArray(run.smoke?.results), 'smoke_stale');
-    await assertLogs(engine, run, run.smoke.results, 'smoke');
-    const writePaths = tasks.flatMap(task => task.writePaths);
-    requireValue(
-      await gateRepairInScope({ worktree: run.cwd, from: gate.headSha, to: run.headSha, writePaths }),
-      'gate_scope',
-    );
-    await assertGateManifest({ engine, contracts, snapshot, run, gate, tasks, options });
-    // Nothing is accepted that the integration branch does not contain (mergeBackGate first).
-    await assertGateOnBranch({ store, snapshot, run, gate });
-  }
+  if (gate) await validateWaveGate({ store, engine, contracts, snapshot, run, gate, options });
+  else await validateWaveTask({ engine, contracts, snapshot, run, options });
   requireValue((await inspectCurrentSource({ project: run.cwd, headSha: run.headSha })) === 'clean', 'head_changed');
 }
 

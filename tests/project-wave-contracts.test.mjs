@@ -527,8 +527,12 @@ test('Gate binding hashes canonical merges and gate input is bounded and executi
   assert.throws(() => C.normalizeDirectorRecord('gateBinding', { ...binding, extra: 1 }, options));
 
   const s = C.normalizeDirectorRecord('snapshot', waveSnapshot(), options);
-  const text = C.buildGateInput({ project: s.project, gate, tasks: s.tasks });
-  assert.equal(C.buildGateInput({ project: s.project, gate, tasks: [...s.tasks].reverse() }, options), text);
+  const containers = C.gateContainerCriteria(s, gate);
+  const text = C.buildGateInput({ project: s.project, gate, tasks: s.tasks, containers });
+  assert.equal(
+    C.buildGateInput({ project: s.project, gate, tasks: [...s.tasks].reverse(), containers }, options),
+    text,
+  );
   const newline = text.indexOf('\n');
   assert.ok(newline > 0);
   // The Run text is a compact summary bound to the gate manifest by its SHA-256.
@@ -538,14 +542,20 @@ test('Gate binding hashes canonical merges and gate input is bounded and executi
   assert.equal(body.projectId, projectId);
   assert.deepEqual(body.gate, { containers: gate.containers, baseSha: gate.baseSha, headSha: gate.headSha });
   assert.equal(body.taskCount, 2);
-  const built = C.buildGateManifest({ project: s.project, gate, tasks: s.tasks });
+  const built = C.buildGateManifest({ project: s.project, gate, tasks: s.tasks, containers });
   assert.deepEqual(body.manifest, { kind: 'gate-manifest', sha256: built.sha256, bytes: built.bytes });
   assert.equal(built.sha256, sha(JSON.stringify(built.manifest)));
   assert.equal(built.bytes, Buffer.byteLength(JSON.stringify(built.manifest)));
-  // The manifest holds the frozen contracts of every covered task in merge order.
+  // The manifest holds the frozen contracts of every covered task in merge order and the
+  // acceptance criteria of every covered container (review finding: epic criteria were missing).
   const manifest = built.manifest;
-  assert.deepEqual(Object.keys(manifest), ['schemaVersion', 'projectContext', 'gate', 'tasks']);
-  assert.equal(manifest.schemaVersion, 1);
+  assert.deepEqual(Object.keys(manifest), ['schemaVersion', 'projectContext', 'gate', 'containers', 'tasks']);
+  assert.equal(manifest.schemaVersion, 2);
+  assert.deepEqual(manifest.containers, [
+    { kind: 'epic', id: 'e', criteria: s.epics[0].acceptance },
+    { kind: 'milestone', id: 'm', criteria: s.milestones[0].acceptance },
+    { kind: 'project', id: projectId, criteria: s.project.definitionOfDone },
+  ]);
   assert.deepEqual(manifest.gate, body.gate);
   assert.deepEqual(
     manifest.tasks.map(t => t.taskId),
@@ -558,16 +568,23 @@ test('Gate binding hashes canonical merges and gate input is bounded and executi
   assert.deepEqual(manifest.tasks[0], taskInput.task);
   assert.doesNotMatch(text, /execution|wave/);
   assert.doesNotMatch(JSON.stringify(manifest), /execution|wave/);
-  assert.throws(() => C.buildGateInput({ project: s.project, gate, tasks: [s.tasks[0]] }), {
+  assert.throws(() => C.buildGateInput({ project: s.project, gate, tasks: [s.tasks[0]], containers }), {
     code: 'project_identity',
   });
   const legacy = C.normalizeDirectorRecord('snapshot', legacySnapshot(), options);
-  assert.throws(() => C.buildGateInput({ project: legacy.project, gate, tasks: legacy.tasks }), {
+  assert.throws(() => C.buildGateInput({ project: legacy.project, gate, tasks: legacy.tasks, containers }), {
     code: 'project_gate_unsupported',
   });
-  assert.throws(() => C.buildGateInput({ project: s.project, gate, tasks: s.tasks, extra: 1 }));
+  assert.throws(() => C.buildGateInput({ project: s.project, gate, tasks: s.tasks, containers, extra: 1 }));
+  // Containers must be the gate's own, in order, with the project's definition of done.
+  for (const bad of [containers.slice(1), [...containers].reverse(), containers.slice(0, 2)])
+    assert.throws(() => C.buildGateInput({ project: s.project, gate, tasks: s.tasks, containers: bad }), {
+      code: 'project_identity',
+    });
+  assert.throws(() => C.buildGateInput({ project: s.project, gate, tasks: s.tasks }));
   assert.throws(
-    () => C.buildGateInput({ project: s.project, gate, tasks: s.tasks }, { knownValues: ['Owned fixture'] }),
+    () =>
+      C.buildGateInput({ project: s.project, gate, tasks: s.tasks, containers }, { knownValues: ['Owned fixture'] }),
     {
       code: 'project_unsafe',
     },
@@ -583,9 +600,9 @@ test('Gate binding hashes canonical merges and gate input is bounded and executi
     runId: `${String(i + 1).padStart(8, '0')}-1111-4111-8111-111111111111`,
     mergeCommit: String(i + 1).repeat(40),
   }));
-  const big = C.buildGateInput({ project: s.project, gate: gateRecord({ merges }), tasks });
+  const big = C.buildGateInput({ project: s.project, gate: gateRecord({ merges }), tasks, containers });
   assert.ok(Buffer.byteLength(big) < 2048, 'a compact summary');
-  const bigManifest = C.buildGateManifest({ project: s.project, gate: gateRecord({ merges }), tasks });
+  const bigManifest = C.buildGateManifest({ project: s.project, gate: gateRecord({ merges }), tasks, containers });
   assert.ok(bigManifest.bytes > 7 * 11000);
   assert.equal(bigManifest.manifest.tasks.length, 7);
   assert.equal(JSON.parse(big.slice(big.indexOf('\n') + 1)).manifest.sha256, bigManifest.sha256);
@@ -745,5 +762,70 @@ test('Progress adds a counts-only gates line only for snapshots that carry gates
   assert.match(
     buildProjectProgress({ ...s, gates: null }),
     /^gates: returned unknown \/ total unknown; completeness: unknown \(blocked\)\n {2}installed unknown; reserved unknown$/m,
+  );
+});
+
+test('A wave project refuses an epic dependency cycle at create and appendMilestone; legacy keeps its rules', () => {
+  // Review finding (major): tasks A1 → B1 → A2 → B2 (letters are epics) left both epics integrated
+  // with wave_dependency_unaccepted and no gate at all.
+  const create = spec =>
+    C.normalizeDirectorRecord(
+      'command',
+      legacyCommand({ op: 'create', spec }, { projectId: null, expectedRevision: null }),
+      options,
+    );
+  const interleaved = {
+    ...legacySpec(),
+    epics: [epicSpec('a'), epicSpec('b')],
+    tasks: [
+      taskSpec('a1', { epicId: 'a' }),
+      taskSpec('b1', { epicId: 'b', dependsOn: ['a1'] }),
+      taskSpec('a2', { epicId: 'a', dependsOn: ['b1'] }),
+      taskSpec('b2', { epicId: 'b', dependsOn: ['a2'] }),
+    ],
+  };
+  assert.throws(
+    () => create({ ...interleaved, execution: clone(wave) }),
+    error => error.code === 'project_epic_cycle' && JSON.stringify(error.epics) === '["a","b"]',
+  );
+  assert.deepEqual(C.epicCycle(interleaved.epics, interleaved.tasks), ['a', 'b']);
+  assert.doesNotThrow(() => create(interleaved), 'a legacy project keeps its rules');
+  // An acyclic epic graph (b after a) is admitted.
+  const ordered = {
+    ...interleaved,
+    tasks: [
+      taskSpec('a1', { epicId: 'a' }),
+      taskSpec('a2', { epicId: 'a', dependsOn: ['a1'] }),
+      taskSpec('b1', { epicId: 'b', dependsOn: ['a2'] }),
+      taskSpec('b2', { epicId: 'b', dependsOn: ['b1', 'a1'] }),
+    ],
+    execution: clone(wave),
+  };
+  assert.doesNotThrow(() => create(ordered));
+  assert.equal(C.epicCycle(ordered.epics, ordered.tasks), null);
+  // appendMilestone: two new epics whose tasks depend on each other form a cycle.
+  const reopen = action => C.assertProjectReopen({ snapshot: closedWave(), action });
+  const epics = [epicSpec('e2', 'm2'), epicSpec('e3', 'm2')];
+  assert.throws(
+    () =>
+      reopen(
+        append({
+          epics,
+          tasks: [
+            taskSpec('c', { epicId: 'e2', dependsOn: ['a'] }),
+            taskSpec('d', { epicId: 'e3', dependsOn: ['c'] }),
+            taskSpec('f', { epicId: 'e2', dependsOn: ['d'] }),
+          ],
+        }),
+      ),
+    error => error.code === 'project_epic_cycle' && JSON.stringify(error.epics) === '["e2","e3"]',
+  );
+  assert.doesNotThrow(() =>
+    reopen(
+      append({
+        epics,
+        tasks: [taskSpec('c', { epicId: 'e2', dependsOn: ['a'] }), taskSpec('d', { epicId: 'e3', dependsOn: ['c'] })],
+      }),
+    ),
   );
 });

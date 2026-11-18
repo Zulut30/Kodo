@@ -207,6 +207,7 @@ test('240 tasks in 24 epics reach the install of the project gate; the manifest 
     project: repo.snapshot(projectId).project,
     gate,
     tasks: repo.snapshot(projectId).tasks,
+    containers: contracts.gateContainerCriteria(repo.snapshot(projectId), gate),
     installGateRun: repo.installGateRun,
     leaseHeld: true,
   });
@@ -218,7 +219,12 @@ test('240 tasks in 24 epics reach the install of the project gate; the manifest 
   // The Run text is a compact summary bound to the manifest artifact by its hash.
   assert.ok(Buffer.byteLength(run.task) < 2048, `${Buffer.byteLength(run.task)} bytes of Run text`);
   const summary = JSON.parse(run.task.slice(run.task.indexOf('\n') + 1));
-  const manifest = contracts.buildGateManifest({ project: installed.project, gate, tasks: installed.tasks });
+  const manifest = contracts.buildGateManifest({
+    project: installed.project,
+    gate,
+    tasks: installed.tasks,
+    containers: contracts.gateContainerCriteria(installed, gate),
+  });
   assert.equal(summary.taskCount, 240);
   assert.ok(
     manifest.bytes > 64 * 1024,

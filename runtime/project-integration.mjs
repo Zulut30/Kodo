@@ -3,6 +3,7 @@ import { lstat, realpath } from 'node:fs/promises';
 import { execute } from './command.mjs';
 import { git, makeWorktree } from './workspace.mjs';
 import { ownsPath } from './contracts.mjs';
+import { secretFile } from './security.mjs';
 
 // Git layer of a wave project's shared integration branch. It never touches the
 // user's checkout, branch or HEAD: all merges happen in a private linked
@@ -57,17 +58,22 @@ function parseWorktrees(output) {
     .filter(record => typeof record.worktree === 'string');
 }
 
-/** @param {{ root: string, projectId: string, worktreeHome: string }} options */
+/**
+ * The project's integration branch and its private worktree. The worktree is accepted only at its
+ * canonical path `<worktreeHome>/project-<projectId>/integration` (compared by realpath): a branch
+ * checked out by any other worktree (a user's linked checkout) is `project_integration_branch_busy`
+ * before any Git operation changes anything, so Kodo never moves another checkout's HEAD.
+ * @param {{ root: string, projectId: string, worktreeHome: string }} options
+ */
 export async function ensureIntegration({ root, projectId, worktreeHome }) {
   const branch = integrationBranch(projectId);
   if (typeof root !== 'string' || typeof worktreeHome !== 'string' || !path.isAbsolute(worktreeHome))
     fail('integration_worktree_invalid');
   const checkout = await git(root, ['rev-parse', '--show-toplevel']);
   const userCheckout = await canonical(checkout);
-  const outside = async directory => {
-    if (inside(userCheckout, await canonical(directory))) fail('integration_worktree_invalid');
-    return directory;
-  };
+  const expected = path.join(path.resolve(worktreeHome), `project-${projectId}`, 'integration');
+  const own = await canonical(expected);
+  if (inside(userCheckout, own)) fail('integration_worktree_invalid');
   let found = parseWorktrees(await git(checkout, ['worktree', 'list', '--porcelain'])).find(
     record => record.branch === `refs/heads/${branch}`,
   );
@@ -77,10 +83,9 @@ export async function ensureIntegration({ root, projectId, worktreeHome }) {
     await git(checkout, ['worktree', 'prune']);
     found = null;
   }
-  let worktree;
-  if (found) worktree = await outside(path.resolve(found.worktree));
-  else {
-    worktree = await outside(path.join(path.resolve(worktreeHome), `project-${projectId}`, 'integration'));
+  if (found && (await canonical(path.resolve(found.worktree))) !== own) fail('integration_branch_busy');
+  const worktree = expected;
+  if (!found) {
     const base = await git(checkout, ['rev-parse', '--verify', 'HEAD^{commit}']);
     // An existing branch without a worktree is attached as is, never reset.
     await makeWorktree(checkout, worktree, branch, base);
@@ -326,16 +331,95 @@ async function abandonInterruptedMerge(worktree, pending, taskHead) {
   await abortMerge(worktree, pending.before);
 }
 
+/** The most commits of one task history that are inspected; a longer history is refused. */
+export const HISTORY_LIMIT = 1000;
+const SECRET_SCAN_BYTES = 2000000;
+const specialMode = mode => mode === '120000' || mode === '160000';
+
+// The raw entries of one commit against each of its parents: {from, to, blob, path}.
+async function commitEntries(cwd, commit) {
+  const found = await execute(
+    'git',
+    ['diff-tree', '-r', '-m', '--root', '--no-renames', '--no-commit-id', '--raw', '-z', '--no-abbrev', commit],
+    { cwd, allowFailure: true },
+  );
+  if (found.code !== 0) fail('integration_invalid');
+  const tokens = found.stdout.split('\0'),
+    entries = [];
+  for (let index = 0; index < tokens.length; index++) {
+    const meta = /^:(\d{6}) (\d{6}) [a-f0-9]+ ([a-f0-9]+) [A-Z]\d*$/.exec(tokens[index].trim());
+    if (meta) entries.push({ from: meta[1], to: meta[2], blob: meta[3], path: tokens[++index] });
+  }
+  return entries;
+}
+
+// Whether a regular blob (below the scan size) holds a known secret value.
+async function blobHoldsSecret(cwd, blob, values) {
+  const size = await execute('git', ['cat-file', '-s', blob], { cwd, allowFailure: true });
+  if (size.code !== 0 || Number(size.stdout.trim()) >= SECRET_SCAN_BYTES) return false;
+  const content = await execute('git', ['cat-file', 'blob', blob], { cwd, allowFailure: true });
+  return content.code === 0 && values.some(value => content.stdout.includes(value));
+}
+
+/**
+ * Inspect every commit of `base..head` (reachable from head, not from base), not only the
+ * result: a file a commit adds and a later commit deletes still enters the branch history.
+ * Each changed path must be inside `writePaths` and not a secret file (`secretFile`), no
+ * symbolic link or submodule may appear, and no added content may hold a value of `secrets`.
+ * Returns null, or the first defect `{kind, commit, file}` with kind `scope`, `secret_path`,
+ * `special`, `secret` or `too_long` (more than HISTORY_LIMIT commits).
+ * @param {{ cwd: string, base: string, head: string, writePaths: string[], secrets?: Record<string, unknown> }} options
+ */
+export async function inspectHistory({ cwd, base, head, writePaths, secrets = {} }) {
+  if (!sha(base) || !sha(head) || !Array.isArray(writePaths) || !writePaths.length) fail('integration_invalid');
+  const listed = await execute('git', ['rev-list', '--reverse', head, `^${base}`], { cwd, allowFailure: true });
+  if (listed.code !== 0) fail('integration_invalid');
+  const commits = listed.stdout.split(/\r?\n/).filter(Boolean);
+  if (commits.length > HISTORY_LIMIT) return { kind: 'too_long', commit: null, file: null };
+  const values = Object.values(secrets).filter(value => typeof value === 'string' && value.length > 5);
+  for (const commit of commits)
+    for (const entry of await commitEntries(cwd, commit)) {
+      const defect = (kind, file = entry.path) => ({ kind, commit, file });
+      if (secretFile(entry.path)) return defect('secret_path');
+      if (specialMode(entry.from) || specialMode(entry.to)) return defect('special');
+      if (!ownsPath(writePaths, entry.path)) return defect('scope');
+      if (values.length && entry.to !== '000000' && (await blobHoldsSecret(cwd, entry.blob, values)))
+        return defect('secret');
+    }
+  return null;
+}
+
+// The merge `commit` of `taskHead` onto `before`: its result must stay inside the write paths
+// (`integration_scope`) and so must every commit it brings in (`integration_history`).
+async function mergeDefect(worktree, before, taskHead, writePaths, secrets, commit = 'HEAD') {
+  if (!(await verifiedMerge(worktree, before, taskHead, writePaths, commit))) return 'integration_scope';
+  if (await inspectHistory({ cwd: worktree, base: before, head: taskHead, writePaths, secrets }))
+    return 'integration_history';
+  return null;
+}
+
 /**
  * `pending` is the value an earlier attempt passed to `savePending` (null when none was saved).
+ * Besides the merged result, every commit the merge brings in is inspected (`inspectHistory`,
+ * with `secrets`): a defect rolls the merge back as `project_integration_history`.
  * @param {{
  *   worktree: string, taskId: string, taskHead: string, writePaths: string[],
  *   savePending: (pending: { before: string }) => unknown,
  *   pending?: { before: string } | null,
  *   withLease?: <T>(work: () => Promise<T>) => Promise<T>,
+ *   secrets?: Record<string, unknown>,
  * }} options
  */
-export async function mergeTask({ worktree, taskId, taskHead, writePaths, savePending, pending = null, withLease }) {
+export async function mergeTask({
+  worktree,
+  taskId,
+  taskHead,
+  writePaths,
+  savePending,
+  pending = null,
+  withLease,
+  secrets = {},
+}) {
   if (
     !slug(taskId) ||
     !sha(taskHead) ||
@@ -355,9 +439,17 @@ export async function mergeTask({ worktree, taskId, taskHead, writePaths, savePe
     if (await ancestor(worktree, taskHead, head)) {
       // A crash may also have hit between the merge and its scope check.
       const recovered = await existingMerge(worktree, taskHead);
-      if (!(await verifiedMerge(worktree, recovered.before, taskHead, writePaths, recovered.mergeCommit))) {
+      const defect = await mergeDefect(
+        worktree,
+        recovered.before,
+        taskHead,
+        writePaths,
+        secrets,
+        recovered.mergeCommit,
+      );
+      if (defect) {
         if (recovered.mergeCommit === head) await git(worktree, ['reset', '--hard', recovered.before]);
-        fail('integration_scope');
+        fail(defect);
       }
       return { branch, ...recovered, mergedHead: taskHead, status: 'merged' };
     }
@@ -372,9 +464,10 @@ export async function mergeTask({ worktree, taskId, taskHead, writePaths, savePe
       await abortMerge(worktree, before);
       fail('integration_conflict');
     }
-    if (!(await verifiedMerge(worktree, before, taskHead, writePaths))) {
+    const defect = await mergeDefect(worktree, before, taskHead, writePaths, secrets);
+    if (defect) {
       await git(worktree, ['reset', '--hard', before]);
-      fail('integration_scope');
+      fail(defect);
     }
     return { branch, before, mergeCommit: await headOf(worktree), mergedHead: taskHead, status: 'merged' };
   };

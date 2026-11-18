@@ -52,10 +52,21 @@ export function fastCheckTimeout(run) {
 const selectionOption = /^--(?:test-shard|test-name-pattern|test-skip-pattern|test-only)(?:=|$)/;
 // Options that change the summary the narrowed run is counted by.
 const reporterOption = /^--test-reporter(?:-destination)?(?:=|$)/;
+// Node's built-in reporters whose final summary on stdout gives the pass count (`ℹ`/`#` lines).
+// `dot`, `junit`, `lcov`, custom reporters and any destination give no countable summary.
+const countableReporters = ['spec', 'tap'];
 const nodeCommand = command => command === process.execPath || /(?:^|[\\/])node(?:\.exe)?$/i.test(command);
-// A `node --test` command with the default reporter: its summary says how many tests passed.
-const countedRunner = ({ command, args = [] }) =>
-  nodeCommand(command) && args.includes('--test') && !args.some(arg => reporterOption.test(arg));
+const nodeTestCommand = ({ command, args = [] }) => nodeCommand(command) && args.includes('--test');
+// The default reporter, or exactly one `--test-reporter=spec|tap` written to stdout.
+const countableReporter = (args = []) => {
+  const reporters = args.filter(arg => reporterOption.test(arg));
+  return (
+    !reporters.length ||
+    (reporters.length === 1 && countableReporters.some(name => reporters[0] === `--test-reporter=${name}`))
+  );
+};
+// A `node --test` command whose summary says how many tests passed.
+const countedRunner = step => nodeTestCommand(step) && countableReporter(step.args);
 
 /**
  * Only Node's own test runner can be narrowed to the affected files. Its options must
@@ -71,7 +82,7 @@ function nodeTestRunner(commands) {
     scopes = [];
   for (const arg of args) {
     if (selectionOption.test(arg)) return { reason: 'runner-selection' };
-    if (reporterOption.test(arg)) return { reason: 'runner-reporter' };
+    if (reporterOption.test(arg) && !countableReporter(args)) return { reason: 'runner-reporter' };
     if (arg === '--test' || /^--[a-z][a-z0-9-]*=/.test(arg)) flags.push(arg);
     else if (arg.startsWith('-') || /[*?[\]{}]/.test(arg)) return { reason: 'runner-options' };
     else {
@@ -345,7 +356,7 @@ async function runStep({ engine, run, step, headSha, env, cache, counted, signal
   if (counted) {
     // Exit 0 after passing nothing (only skip/todo, no tests, no summary) is not a pass: never cache it.
     row.tests = passedTests(value.stdout);
-    if (!(row.tests > 0)) return { row, noTests: true };
+    if (!(row.tests > 0)) return { row, noTests: true, unknown: row.tests === null };
   }
   if (input)
     await writeCheckCache({
@@ -407,6 +418,18 @@ export async function runFastChecks({ engine, run, signal }) {
   return run.checks;
 }
 
+/**
+ * A full `node --test` run passed with an unknown outcome: its reporter gives no countable summary
+ * (`dot`, `junit`, `lcov`, a custom reporter or a destination other than stdout) or the summary is
+ * missing or inconsistent. Like zero passed tests, it is never a green receipt.
+ * @param {{ args: string[] }} step
+ */
+const summaryUnknown = step =>
+  fail(
+    `Полный прогон node --test не дал разбираемого итога (${step.args.filter(arg => reporterOption.test(arg)).join(' ') || 'нет сводки'}): используй репортёр spec или tap`,
+    'fast_check_summary_unknown',
+  );
+
 /** Record a fresh, incomplete receipt for the plan and execute its commands in order. */
 async function executePlan({ engine, run, plan, headSha, signal }) {
   const results = [];
@@ -448,12 +471,15 @@ async function executePlan({ engine, run, plan, headSha, signal }) {
   for (const step of plan.commands) {
     engine.checkCancelled(run, signal);
     const counted = step.kind === 'test' && countedRunner(step);
-    const { row, error, noTests } = await runStep({ engine, run, step, headSha, env, cache, counted, signal });
+    const { row, error, noTests, unknown } = await runStep({ engine, run, step, headSha, env, cache, counted, signal });
     results.push(row);
     engine.save(run);
     if (error) throw error;
     // A narrowed run that passed no test is replaced by the full suite.
     if (noTests && !plan.fallback) return { results, noTests: true };
+    // A full `node --test` run whose outcome is unknown proves nothing (see summaryUnknown).
+    if (plan.fallback && step.kind === 'test' && (unknown || (!counted && nodeTestCommand(step))))
+      throw summaryUnknown(step);
     passed += row.tests ?? 0;
   }
   if (plan.fallback && judged && passed === 0)

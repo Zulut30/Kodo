@@ -577,6 +577,13 @@ function assertGraph(ctx, s) {
     visited.add(id);
   };
   for (const id of tasks.keys()) visit(id);
+  // A wave epic is gated after the epics it depends on: an epic cycle would never be gated.
+  const cycle = isWave(ctx, s.project) ? port(ctx, 'epicCycle')(s.epics, s.tasks) : null;
+  if (cycle)
+    throw Object.assign(new Error(`Project epic dependency cycle ${cycle.join(' -> ')}`), {
+      code: 'project_epic_cycle',
+      epics: cycle,
+    });
 }
 
 // Per-op project commands inside the apply() transaction. Each handler may set
@@ -1212,7 +1219,8 @@ async function installGateRun(ctx, input) {
     'record_invalid',
   );
   const bindingFor = port(ctx, 'gateBindingFor'),
-    gateInput = port(ctx, 'buildGateInput');
+    gateInput = port(ctx, 'buildGateInput'),
+    criteriaOf = port(ctx, 'gateContainerCriteria');
   const binding = normalize(ctx, 'gateBinding', input.binding),
     runDraft = structuredClone(input.runDraft);
   const bound = value =>
@@ -1228,7 +1236,8 @@ async function installGateRun(ctx, input) {
     requireValue(
       runDraft.id === binding.runId &&
         identity(runDraft.project) === s.project.projectKey &&
-        runDraft.task === gateInput({ project: s.project, gate, tasks }, ctx.options) &&
+        runDraft.task ===
+          gateInput({ project: s.project, gate, tasks, containers: criteriaOf(s, gate) }, ctx.options) &&
         bound(runDraft.directorBinding),
       'binding_conflict',
     );

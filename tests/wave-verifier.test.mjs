@@ -138,6 +138,7 @@ async function epic(t, { testScript = 'process.exit(0);\n', onWorker } = {}) {
       project: repo.snapshot(projectId).project,
       gate,
       tasks: repo.snapshot(projectId).tasks,
+      containers: contracts.gateContainerCriteria(repo.snapshot(projectId), gate),
       installGateRun: repo.installGateRun,
       leaseHeld: true,
       ...extra,
@@ -205,7 +206,12 @@ test('reserveGate → createGateRunDraft → installGateRun installs one gate Ru
   assert.equal(path.basename(run.cwd), 'integration');
   assert.equal(
     run.task,
-    buildGateInput({ project: snapshot.project, gate, tasks: snapshot.tasks }),
+    buildGateInput({
+      project: snapshot.project,
+      gate,
+      tasks: snapshot.tasks,
+      containers: contracts.gateContainerCriteria(snapshot, gate),
+    }),
     'the Run task is the exact gate input',
   );
   assert.equal(JSON.stringify(run.directorBinding), JSON.stringify(gateBindingFor(gate)));
@@ -305,7 +311,12 @@ test('A gate range is never empty: the store and createGateRunDraft refuse a bas
   const envelope = JSON.parse(await readFile(run.gateManifest.path, 'utf8'));
   assert.deepEqual(
     envelope.value,
-    buildGateManifest({ project: snapshot.project, gate, tasks: snapshot.tasks }).manifest,
+    buildGateManifest({
+      project: snapshot.project,
+      gate,
+      tasks: snapshot.tasks,
+      containers: contracts.gateContainerCriteria(snapshot, gate),
+    }).manifest,
   );
 });
 

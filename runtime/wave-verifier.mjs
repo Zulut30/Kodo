@@ -19,7 +19,8 @@ import { resolveMode } from './modes.mjs';
 import { normalizeWatchdogConfig, resolveBlocker } from './watchdog.mjs';
 import { currentBlocker } from './engine.mjs';
 import { runFastChecks } from './task-fast-checks.mjs';
-import { buildGateInput, buildGateManifest, gateBindingFor } from './project-contracts.mjs';
+import { buildGateInput, buildGateManifest, gateBindingFor, gateReviewCriteria } from './project-contracts.mjs';
+import { applyWavePolicy, assertWavePolicy } from './wave-policy.mjs';
 import { gateRange, gateRepairInScope, integrationHeadOf } from './project-integration.mjs';
 
 /** The watchdog of a wave gate when the project sets none. */
@@ -112,7 +113,7 @@ async function assertIntegrationHead(project, gate) {
 }
 
 /** An installed gate's Run, replayed through the store before any head check (null when none). */
-async function installedRun({ engine, project, gate, tasks, installGateRun }) {
+async function installedRun({ engine, project, gate, tasks, containers, installGateRun }) {
   let stored = null;
   try {
     stored = engine.store.getRun(gate.runId);
@@ -129,7 +130,7 @@ async function installedRun({ engine, project, gate, tasks, installGateRun }) {
     runDraft: {
       id: gate.runId,
       project: project.root,
-      task: buildGateInput({ project, gate, tasks: covered }),
+      task: buildGateInput({ project, gate, tasks: covered, containers }),
       directorBinding: gateBindingFor(gate),
     },
   });
@@ -143,13 +144,16 @@ const acceptance = task => {
 /**
  * Build the gate Run draft and install it through the project store:
  * `installGateRun({ binding: gateBindingFor(gate), runDraft })` (e.g. `projectStore.installGateRun`).
- * `project` and `tasks` are the stored records of the snapshot; `runDraft.task` is
- * `buildGateInput({ project, gate, tasks: covered tasks in merge order })`.
+ * `project` and `tasks` are the stored records of the snapshot and `containers` the criteria of
+ * the gate's containers (`gateContainerCriteria(snapshot, gate)`); `runDraft.task` is
+ * `buildGateInput({ project, gate, tasks: covered tasks in merge order, containers })`.
+ * The draft verifies under the policy of the gate head (`applyWavePolicy`) and its review
+ * confirms every criterion of the manifest (`runDraft.gateCriteria`).
  * `input`: the Run options `client`, `model`, `providers`, `mode`, `concurrency`.
  * The caller serializes integration: pass `withLease` (runs the head check and the install
  * inside lease `project-integration:<projectId>`) or `leaseHeld: true` when it already holds it.
  * @param {{
- *   engine: any, project: any, gate: any, tasks: any[],
+ *   engine: any, project: any, gate: any, tasks: any[], containers: any[],
  *   input?: { client?: string, model?: string, providers?: string, mode?: string, concurrency?: number },
  *   installGateRun: (input: { binding: any, runDraft: any }) => any,
  *   withLease?: <T>(work: () => Promise<T>) => Promise<T>, leaseHeld?: boolean,
@@ -160,6 +164,7 @@ export async function createGateRunDraft({
   project,
   gate,
   tasks,
+  containers,
   input = {},
   installGateRun,
   withLease,
@@ -171,21 +176,22 @@ export async function createGateRunDraft({
     throw fail('Черновик гейта требует lease project-integration проекта', 'gate_lease_required');
   const work = async () => {
     // An exact repeat of a finished install returns its Run even after the branch moved on.
-    const replayed = await installedRun({ engine, project, gate, tasks, installGateRun });
+    const replayed = await installedRun({ engine, project, gate, tasks, containers, installGateRun });
     if (replayed) return replayed;
     const covered = await coveredTasks({ engine, project, gate, tasks });
     await assertIntegrationHead(project, gate);
-    const runDraft = await gateDraft({ engine, project, gate, covered, input });
+    const runDraft = await gateDraft({ engine, project, gate, covered, containers, input });
     return await installGateRun({ binding: gateBindingFor(gate), runDraft });
   };
   return withLease ? await withLease(work) : await work();
 }
 
-async function gateDraft({ engine, project, gate, covered, input }) {
+async function gateDraft({ engine, project, gate, covered, containers, input }) {
   const ids = covered.map(({ task }) => task.id);
   const knownValues = Object.values(engine.secrets || {}).filter(value => typeof value === 'string');
+  const manifestInput = { project, gate, tasks: covered.map(({ task }) => task), containers };
   // Single source of truth with the store: installGateRun compares these bytes.
-  const text = buildGateInput({ project, gate, tasks: covered.map(({ task }) => task) }, { knownValues });
+  const text = buildGateInput(manifestInput, { knownValues });
   const options = Object.fromEntries(passThrough.filter(key => input[key] !== undefined).map(key => [key, input[key]]));
   // The gate never delivers: the coordinator merges and publishes.
   const prepared = await engine.prepareRun(
@@ -243,11 +249,15 @@ async function gateDraft({ engine, project, gate, covered, input }) {
     headSha: gate.headSha,
     research: { items: [], requests: 0, errors: [], cache: [] },
   };
+  // The gate executes the verification policy of its head, which holds every covered merge.
+  await applyWavePolicy(draft, gate.headSha);
   await engine.initializeRun(draft);
-  // The full list and contracts of the covered tasks: an immutable evidence artifact whose
-  // canonical SHA-256 the gate input (draft.task) already binds.
-  const { manifest } = buildGateManifest({ project, gate, tasks: covered.map(({ task }) => task) }, { knownValues });
+  // The full list and contracts of the covered tasks and the criteria of the covered containers:
+  // an immutable evidence artifact whose canonical SHA-256 the gate input (draft.task) binds.
+  const { manifest } = buildGateManifest(manifestInput, { knownValues });
   draft.gateManifest = await engine.persistEvidence(draft, 'gate-manifest', manifest, { headSha: gate.headSha });
+  // The independent review confirms each of them (review.criteria).
+  draft.gateCriteria = gateReviewCriteria(manifest);
   return draft;
 }
 
@@ -419,6 +429,11 @@ export async function runEpicGate({ engine, run: input, signal }) {
         }))
       )
         throw fail('Проверенный head гейта не продолжает head гейта в пределах writePaths задач', 'gate_scope');
+      // The verified head keeps the policy the gate executed (a repair may not change it).
+      await assertWavePolicy({ run, policyCommit: run.directorBinding.headSha, headSha: run.headSha }).catch(error => {
+        if (!['project_wave_policy_mismatch', 'project_wave_policy_invalid'].includes(error?.code)) throw error;
+        throw fail('Политика проверок проверенного head гейта отличается от исполненной', 'wave_policy_mismatch');
+      });
       await runSmoke(engine, run, leased);
       engine.checkCancelled(run, leased);
       run.state = 'succeeded';

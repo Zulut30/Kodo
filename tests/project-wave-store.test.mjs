@@ -205,7 +205,10 @@ function gateDraft(repo, projectId, gate) {
   return {
     id: gate.runId,
     project: s.project.root,
-    task: contracts.buildGateInput({ project: s.project, gate, tasks }, options),
+    task: contracts.buildGateInput(
+      { project: s.project, gate, tasks, containers: contracts.gateContainerCriteria(s, gate) },
+      options,
+    ),
     createdAt: '2026-11-17T12:00:00.000Z',
     state: 'created',
     completed: { implementation: true },

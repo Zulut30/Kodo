@@ -33,6 +33,8 @@ kodo project complete-task --head ►  проверка commit, task-fast,
 | `config.delivery.enabled` | `false`; доставку делает координатор |
 | `review` | `null`: собственного ревью нет, ревью — у gate Run эпика |
 | `baseSha` | голова интеграционной ветки на момент резерва |
+| `config` (политика проверок), `wavePolicy` | `commands`, `verification`, `security`, `uiVerification`, `architecture` — из `kodo.config.json` коммита `baseSha`, не из checkout пользователя; `wavePolicy: {schemaVersion, commit: baseSha, hash}` ([VERIFICATION.md](VERIFICATION.md#политика-проверок-волнового-run)) |
+| `externalAbandon` | `{schemaVersion, attemptId, headSha}` после `--abandon` |
 | `state` | `executing` после резерва, `succeeded` после пройденной проверки |
 | `externalCompletion` | `{schemaVersion, headSha, integration, gates}` после интеграции; `gates: null` до прохода гейтов и при `--defer-gate` |
 
@@ -51,6 +53,7 @@ kodo project complete-task --head ►  проверка commit, task-fast,
 | `prompt` | Точный `buildDirectorTaskInput` задачи и контракт воркера |
 | `selfCheck` | `kodo ci feedback --base <baseSha> --project "<worktree>" --json` |
 | `completeCommand` | `kodo project complete-task <projectId> <taskId> --head <SHA>` |
+| `abandonCommand` | `kodo project complete-task <projectId> <taskId> --head <SHA> --abandon --attempt <attemptId>` — отказ привязан к этой попытке |
 
 Контракт воркера в `prompt`: работать только в worktree и только в `writePaths`; не удалять, не пропускать и не ослаблять тесты; закоммитить в свою ветку без push, PR, merge и rebase; запустить `selfCheck`; закончить с чистым worktree и вернуть полный SHA. Бриф проходит `assertDirectorSafe` (известные секреты, PEM, redaction). Из абсолютных путей он содержит только worktree, пути `interfaces` и `projectContext.root` внутри замороженного входа задачи; state home, артефакты Run и интеграционный worktree в бриф не попадают.
 
@@ -62,7 +65,7 @@ kodo project complete-task --head ►  проверка commit, task-fast,
 
 ```text
 kodo project next-wave PROJECT_ID --host t3|orca [--limit 1..5] [--retry-failed] [--json]
-kodo project complete-task PROJECT_ID TASK_ID --head SHA [--defer-gate|--abandon] [--command-id UUID] [--json]
+kodo project complete-task PROJECT_ID TASK_ID --head SHA [--defer-gate|--abandon] [--attempt UUID] [--command-id UUID] [--json]
 ```
 
 Аргументы разбираются строго до чтения учётных данных, состояния и Git; любая ошибка — exit 1, `project_arguments`. `--limit` по умолчанию 3.
@@ -86,20 +89,21 @@ kodo project complete-task PROJECT_ID TASK_ID --head SHA [--defer-gate|--abandon
 | `external_worktree_dirty` | Есть незакоммиченные или неотслеживаемые файлы |
 | `external_no_changes` | `--head` равен базе |
 | `external_not_descendant` | База не предок `--head` |
-| `external_symlink` | В diff есть симлинк или submodule |
-| `external_scope`, `external_unsafe_change` | Файлы вне `writePaths`, секретные имена или содержимое (`engine.checkScope`) |
+| `external_symlink` | В diff или в любом коммите `base..head` есть симлинк или submodule |
+| `external_scope`, `external_unsafe_change` | Файлы вне `writePaths`, секретные имена или содержимое (`engine.checkScope`) — в итоговом diff и в каждом коммите `base..head` (`inspectHistory`): файл, добавленный одним коммитом и удалённый следующим, тоже отказ, `message` называет коммит и путь |
+| `external_history_too_long` | В `base..head` больше 1000 коммитов (`HISTORY_LIMIT`) |
 | код быстрой проверки | `task-fast` или behaviour gate не прошли (например, `check_failed`, `behavior_failed` при удалённом тесте) |
 
-`blocked`: попытка не внешняя, не идёт или уже интегрирована (`project_attempt_not_running`), проект на паузе или остановлен (`project_control_blocked`), отказ `integrateAndAdvance` (его код).
+`blocked`: попытка не внешняя, не идёт или уже интегрирована (`project_attempt_not_running`), `--attempt` называет не текущую попытку (`project_attempt_stale`), проект на паузе или остановлен (`project_control_blocked`), отказ `integrateAndAdvance` (его код, например `wave_policy_mismatch` — голова меняет политику проверок `kodo.config.json` вне `writePaths`, или `project_integration_history` при слиянии).
 
 ## Идемпотентность
 
 - Повтор `next-wave` возвращает те же брифы и не создаёт попыток: идущие попытки хоста подхватываются первыми, лимит добирается только свободными задачами.
 - Владение резервом (`attemptExecutor`): у установленного Run — его `executor`, у резерва без Run (сбой между `reserveAttempt` и установкой) — actor события резерва. Такой резерв подхватывает только его владелец: `next-wave` того же хоста, а резерв `drain` (actor `project-director`) — только `drain`. Чужие попытки `next-wave` не трогает, `drain` не исполняет внешние попытки, а лишь считает их writePaths занятыми.
 - Ошибка одной задачи не прерывает пачку: она попадает в `blocked` с кодом, следующий вызов продолжит её.
-- Повтор `complete-task` с тем же head после интеграции возвращает сохранённый `externalCompletion` с `replayed: true` без проверки, слияния и гейтов. Отложенные (`--defer-gate`) или прерванные гейты выполнит первый повтор без этого флага.
+- Повтор `complete-task` с тем же head после интеграции возвращает сохранённый `externalCompletion` с `replayed: true` без проверки, слияния и гейтов. Отложенные (`--defer-gate`) или прерванные гейты выполнит первый повтор без этого флага. Перед ответом повтор под lease `project-integration:<id>` сверяет, что записанный merge-коммит достижим из головы интеграционной ветки и его родители — записанный `before` и проверенный head; иначе (ветку откатили или переписали) ответ — `blocked`, `project_integration_missing`, `replayed: true`: это блокер восстановления, не `integrated`.
 - Уже проверенный head после отказа интеграции повторно не проверяется; если сбой прервал интеграцию проверенного head (слияние `pending` или `merged` без `externalCompletion`), повтор продолжает её без новой проверки и без второго merge-коммита.
-- `--abandon` переводит попытку в `blocked` и отменяет Run (`cancelRequested`, `cancelled`); повтор возвращает `abandoned` с `replayed: true`. Новую попытку создаёт только `next-wave --retry-failed` того же хоста, со своим Run и worktree. Повтор идёт тем же исполнителем, что и прошлая попытка: `next-wave --retry-failed` пропускает неудачные попытки `drain` и других хостов (`project_retry_executor` в `blocked`), а `drain --retry-failed` не исполняет нативно задачу, брошенную внешним чатом (`wave_retry_executor`).
+- `--abandon` переводит попытку в `blocked` и отменяет Run (`cancelRequested`, `cancelled`), записывая в Run `externalAbandon: {schemaVersion: 1, attemptId, headSha}`; ответ содержит `attemptId`. Отказ привязан к попытке: `--attempt <attemptId>` (поле `abandonCommand` брифа) называет её явно, без флага попытка выводится из `--head` — если более ранняя попытка задачи уже отменена с этим head, это повтор её отмены. Повтор возвращает `abandoned` с `replayed: true` и `attemptId` той попытки и не трогает текущую (новую после `next-wave --retry-failed`); `--attempt` не текущей и не отменённой попытки — `project_attempt_stale`. Чтобы отменить новую попытку с той же базой, укажи её `--attempt`. Новую попытку создаёт только `next-wave --retry-failed` того же хоста, со своим Run и worktree. Повтор идёт тем же исполнителем, что и прошлая попытка: `next-wave --retry-failed` пропускает неудачные попытки `drain` и других хостов (`project_retry_executor` в `blocked`), а `drain --retry-failed` не исполняет нативно задачу, брошенную внешним чатом (`wave_retry_executor`).
 
 ## Ограничения
 

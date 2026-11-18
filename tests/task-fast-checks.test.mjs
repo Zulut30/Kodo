@@ -722,3 +722,55 @@ test('Task-fast checks never keep a green receipt for a narrowed run that execut
   assert.equal(narrowed.plan.fallback, false, JSON.stringify(narrowed.plan.reasons));
   assert.equal(narrowed.results.find(row => row.kind === 'test').tests, 3);
 });
+
+test('Task-fast checks count the tap and spec reporters and refuse a full run with an unknown summary', async t => {
+  // Review finding (major): `node --test --test-reporter=tap` with one skipped test gave `# pass 0`
+  // and still a complete receipt, and the project was accepted.
+  const reporter = (...extra) => [{ command: process.execPath, args: ['--test', ...extra] }];
+  const { store, engine, run, commit } = await workspace(t, {
+    commands: { test: reporter('--test-reporter=tap'), build: [], deploy: [], smoke: [] },
+  });
+  const passing = testSource('a', [...aCases, ['a is finite', 'assert.ok(Number.isFinite(a))']]);
+  // tap and spec summaries are countable: the narrowed run keeps the reporter and counts passed tests.
+  await commit({ 'tests/a.test.mjs': passing });
+  const narrowed = await runFastChecks({ engine, run });
+  assert.equal(narrowed.plan.fallback, false, JSON.stringify(narrowed.plan.reasons));
+  assert.deepEqual(narrowed.results.find(row => row.kind === 'test').args, [
+    '--test',
+    '--test-reporter=tap',
+    'tests/a.test.mjs',
+  ]);
+  assert.equal(narrowed.results.find(row => row.kind === 'test').tests, 3);
+  // Only skipped tests: the TAP summary confirms zero passed tests, never a green receipt.
+  const skipped = "import test from 'node:test';\ntest.skip('skipped', () => {});\n";
+  await commit({ 'tests/a.test.mjs': skipped, 'tests/b.test.mjs': skipped });
+  await assert.rejects(() => runFastChecks({ engine, run }), { code: 'fast_check_no_tests' });
+  assert.equal(store.getRun(run.id).checks.complete, false);
+  assert.deepEqual(store.getRun(run.id).checks.plan.reasons, ['no-tests-executed'], 'the narrowed run passed none');
+  assert.deepEqual(
+    store.getRun(run.id).checks.results.map(row => [row.args, row.tests]),
+    [[['--test', '--test-reporter=tap'], 0]],
+  );
+  // A reporter without a countable summary falls back to the full run, whose unknown outcome is refused.
+  await commit({ 'tests/a.test.mjs': passing, 'tests/b.test.mjs': files['tests/b.test.mjs'] });
+  for (const args of [['--test-reporter=dot'], ['--test-reporter=spec', '--test-reporter-destination=stdout']]) {
+    run.config.commands.test = reporter(...args);
+    engine.save(run);
+    await assert.rejects(() => runFastChecks({ engine, run }), { code: 'fast_check_summary_unknown' }, args.join(' '));
+    const saved = store.getRun(run.id).checks;
+    assert.equal(saved.complete, false);
+    assert.ok(saved.plan.reasons.includes('runner-reporter'), JSON.stringify(saved.plan.reasons));
+    assert.deepEqual(
+      saved.results.map(row => row.exitCode),
+      [0],
+      'the suite passed, but its count is unknown',
+    );
+  }
+  // The spec reporter alone is countable again.
+  run.config.commands.test = reporter('--test-reporter=spec');
+  engine.save(run);
+  const spec = await runFastChecks({ engine, run });
+  assert.equal(spec.complete, true);
+  assert.equal(spec.plan.fallback, false, JSON.stringify(spec.plan.reasons));
+  assert.equal(spec.results.find(row => row.kind === 'test').tests, 3);
+});

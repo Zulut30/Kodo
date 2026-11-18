@@ -38,6 +38,7 @@ import {
 import { withIntegrationLease as withLease } from './project-integration-lease.mjs';
 import { GATE_WATCHDOG, createGateRunDraft, runEpicGate } from './wave-verifier.mjs';
 import { normalizeWatchdogConfig } from './watchdog.mjs';
+import { applyWavePolicy, assertWavePolicy } from './wave-policy.mjs';
 import {
   bindingFor,
   known,
@@ -323,6 +324,8 @@ async function mergeRun(ctx, snapshot, task, run) {
       taskId: task.id,
       taskHead: run.headSha,
       writePaths: task.writePaths,
+      // Every commit of the task enters the branch: each one is inspected, not only the result.
+      secrets: ctx.engine.secrets,
       savePending: ({ before }) => ctx.store.updateRun(run.id, { integration: { branch, before, status: 'pending' } }),
       // A crash after savePending may have left this merge unfinished (MERGE_HEAD).
       pending: run.integration?.status === 'pending' ? { before: run.integration.before } : null,
@@ -337,7 +340,12 @@ async function mergeRun(ctx, snapshot, task, run) {
     ctx.store.updateRun(run.id, { integration });
     return integration;
   } catch (error) {
-    if (!['project_integration_conflict', 'project_integration_scope'].includes(error?.code)) throw error;
+    if (
+      !['project_integration_conflict', 'project_integration_scope', 'project_integration_history'].includes(
+        error?.code,
+      )
+    )
+      throw error;
     ctx.store.updateRun(run.id, {
       integration: { branch, before: run.integration?.before ?? null, status: 'failed', code: error.code },
     });
@@ -395,6 +403,18 @@ async function advanceContainers(ctx, projectId) {
   return blockers;
 }
 
+// `wave_policy_mismatch` when the task Run did not verify under the policy of its base, or its head
+// changes the policy outside its write paths; null otherwise.
+async function taskPolicy(run, task) {
+  try {
+    await assertWavePolicy({ run, policyCommit: run.baseSha, headSha: run.headSha, writePaths: task.writePaths });
+    return null;
+  } catch (error) {
+    if (!['project_wave_policy_mismatch', 'project_wave_policy_invalid'].includes(error?.code)) throw error;
+    return 'wave_policy_mismatch';
+  }
+}
+
 /**
  * Merge a finished task Run into the integration branch and advance its attempt and task to
  * `integrated`. Idempotent: a repeat after a crash recovers the recorded or existing merge.
@@ -424,7 +444,9 @@ export async function integrateAndAdvance(ctx, { projectId, taskId, run, signal 
     if (stored.state !== 'succeeded') return blocked('run_not_succeeded');
     if (stored.verificationProfile !== 'task-fast' || stored.checks?.profile !== 'task-fast')
       return blocked('wave_fast_proof_missing');
-    const merged = await mergeRun(ctx, snapshot, task, stored);
+    // The task verified under the policy of its base; its head may change it only in its write paths.
+    const policy = await taskPolicy(stored, task);
+    const merged = policy ? { status: 'failed', code: policy } : await mergeRun(ctx, snapshot, task, stored);
     if (merged.status !== 'merged') {
       // The result cannot be integrated; an explicit retry starts from the current frontier.
       snapshot = await snapshotOf(ctx, projectId);
@@ -535,6 +557,7 @@ async function installGate(ctx, projectId, gate) {
     project: snapshot.project,
     gate,
     tasks: snapshot.tasks,
+    containers: ctx.contracts.gateContainerCriteria(snapshot, gate),
     installGateRun: input => ctx.repo.installGateRun(input),
     withLease: work => withIntegrationLease(ctx, projectId, undefined, work),
   });
@@ -792,6 +815,8 @@ async function installTaskRun(ctx, projectId, attempt, options, control) {
         installRun: async value => {
           const draft = value.runDraft;
           draft.verificationProfile = 'task-fast';
+          // The task verifies under the policy of its base commit, not of the user's checkout.
+          await applyWavePolicy(draft, draft.baseSha);
           draft.config.watchdog = normalizeWatchdogConfig(project.execution?.watchdog ?? GATE_WATCHDOG);
           draft.config.concurrency = concurrency;
           draft.config.delivery = { ...draft.config.delivery, enabled: false, release: false };

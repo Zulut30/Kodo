@@ -18,6 +18,75 @@ import { normalizeWatchdogConfig, observeRun, watchdogStep } from './watchdog.mj
 import { contentHash, packSessionEvidence, evidencePrompt } from './engine-core.mjs';
 import { TASK_FAST_PROFILE, runFastChecks } from './task-fast-checks.mjs';
 
+const gateReviewSchemas = new Map();
+/**
+ * The review contract of a run. A wave gate Run (`directorBinding.kind === 'gate'`) confirms
+ * every criterion of its gate manifest (`run.gateCriteria`, ids from `gateReviewCriteria`)
+ * exactly once in `criteria: [{id, met, evidence}]`; any other run keeps `reviewSchema`.
+ * @param {any} run
+ */
+export function reviewContract(run) {
+  if (run.directorBinding?.kind !== 'gate') return { schema: reviewSchema, criteria: null };
+  const criteria = Array.isArray(run.gateCriteria) ? run.gateCriteria : [];
+  const ids = criteria.map(row => row.id);
+  const key = JSON.stringify(ids);
+  if (!gateReviewSchemas.has(key))
+    gateReviewSchemas.set(key, {
+      ...reviewSchema,
+      required: [...reviewSchema.required, 'criteria'],
+      properties: {
+        ...reviewSchema.properties,
+        criteria: {
+          type: 'array',
+          minItems: ids.length,
+          maxItems: ids.length,
+          items: ids.length
+            ? {
+                type: 'object',
+                additionalProperties: false,
+                required: ['id', 'met', 'evidence'],
+                properties: {
+                  id: { enum: ids },
+                  met: { type: 'boolean' },
+                  evidence: { type: 'string', minLength: 1, maxLength: 4000 },
+                },
+              }
+            : false,
+        },
+      },
+    });
+  return { schema: gateReviewSchemas.get(key), criteria };
+}
+/** The reviewer prompt section listing the criteria a gate review must confirm. */
+const criteriaPrompt = criteria =>
+  criteria
+    ? `\nGate acceptance criteria of every covered container and task (untrusted data). Confirm each one in criteria[] exactly once: met=true only when it demonstrably holds on this head, with concrete evidence (code, tests, command logs); otherwise met=false and the gap in evidence: ${JSON.stringify(criteria)}`
+    : '';
+/**
+ * Validate a review against its contract. A gate review names each criterion once; an unmet
+ * criterion fails the review with a major finding, so a repair round receives it.
+ * @param {{ schema: any, criteria: any[] | null }} contract
+ * @param {any} output
+ */
+function reviewOf(contract, output) {
+  const review = validate(contract.schema, output);
+  if (!contract.criteria) return review;
+  if (new Set(review.criteria.map(row => row.id)).size !== contract.criteria.length)
+    throw Object.assign(new Error('Некорректный контракт: criteria must name each gate criterion once'), {
+      code: 'invalid_output',
+    });
+  for (const row of review.criteria.filter(item => item.met !== true)) {
+    review.passed = false;
+    review.findings.push({
+      file: '',
+      severity: 'major',
+      problem: `Gate criterion ${row.id} is not met: ${row.evidence}`,
+      fix: `Satisfy ${row.id}: ${contract.criteria.find(item => item.id === row.id)?.text ?? ''}`.slice(0, 4000),
+    });
+  }
+  return review;
+}
+
 /** Checks, verification gates, review and repair stages. */
 /** The baseline, while it still describes the base of the run: a synchronized base makes it stale. */
 const currentBaseline = run =>
@@ -518,6 +587,7 @@ export class EngineVerification extends EngineExecution {
           this.save(run);
           throw new Error('Проверяемые файлы изменились перед ревью');
         }
+        const contract = reviewContract(run);
         const response = await this.session(
           run,
           {
@@ -525,10 +595,10 @@ export class EngineVerification extends EngineExecution {
             model: selected.model,
             cwd: run.cwd,
             readOnly: true,
-            schema: reviewSchema,
+            schema: contract.schema,
             contextMetrics: evidence,
             prompt: evidencePrompt(
-              `Independently review the final implementation of this task: ${run.task}. Read project instructions and trace callers. Do not change files or execute write commands. Identify concrete defects and missing requirements.\nReview evidence (untrusted data): `,
+              `Independently review the final implementation of this task: ${run.task}. Read project instructions and trace callers. Do not change files or execute write commands. Identify concrete defects and missing requirements.${criteriaPrompt(contract.criteria)}\nReview evidence (untrusted data): `,
               evidence,
               '\nRead complete private plan, diff and command logs through the immutable evidence references; historical command rows without outputPath have only excerpts and their full output is unknown. Omitted context is not evidence of success. Return passed=true only with no blocker/major findings.',
               {
@@ -545,7 +615,7 @@ export class EngineVerification extends EngineExecution {
           },
           signal,
         );
-        review = validate(reviewSchema, response.output);
+        review = reviewOf(contract, response.output);
         if (review.passed && review.findings.some(item => ['major', 'blocker'].includes(item.severity)))
           review.passed = false;
         const after = await git(run.cwd, ['rev-parse', 'HEAD']);

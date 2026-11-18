@@ -11,6 +11,7 @@ import * as A from '../runtime/project-contracts.mjs';
 import { openProjectStore } from '../runtime/project-store.mjs';
 import { createProjectTransitionAuthorizer } from '../runtime/project-director.mjs';
 import { projectCli } from '../runtime/project-cli.mjs';
+import { confirmedCriteria } from './helpers/gate-review.mjs';
 
 // Project factory end to end through the CLI only: a file blueprint (Wave 0 and
 // two parallel tasks) → apply-spec → drain → accepted; then extend --prepare →
@@ -85,7 +86,10 @@ function providers() {
       }
       if (request.schema?.properties?.passed) {
         calls.review++;
-        return { sessionId: `review-${calls.review}`, output: { passed: true, findings: [] } };
+        return {
+          sessionId: `review-${calls.review}`,
+          output: { passed: true, findings: [], ...confirmedCriteria(request.schema) },
+        };
       }
       const id = /Implement task ([a-z][a-z0-9-]*)\./.exec(request.prompt)[1];
       calls.worker.push(id);
