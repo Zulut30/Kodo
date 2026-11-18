@@ -30,8 +30,10 @@ import { planProjectHorizon } from './project-planner.mjs';
 import {
   ensureIntegration,
   gateBase,
+  inspectHistory,
   integrationHeadOf,
   mergeBackGate,
+  mergeOnBranch,
   mergeTask,
   waveFrontier,
 } from './project-integration.mjs';
@@ -314,9 +316,35 @@ export async function integrationOf(ctx, snapshot) {
   });
 }
 
-// Merge the task head once; a recorded or recovered merge is never repeated.
+// Whether the merge a task Run recorded is still on the integration branch with its recorded
+// parents: a crash, reset or rewrite may have removed it. The caller holds the integration lease.
+async function recordedMergePresent(snapshot, run) {
+  const integration = run.integration,
+    cwd = snapshot.project.root;
+  if (integration?.status !== 'merged' || integration.mergedHead !== run.headSha) return false;
+  return mergeOnBranch({
+    cwd,
+    branchHead: await integrationHeadOf({ cwd, projectId: snapshot.project.projectId }),
+    mergeCommit: integration.mergeCommit,
+    before: integration.before,
+    mergedHead: run.headSha,
+  });
+}
+
+const integrationFailures = [
+  'project_integration_conflict',
+  'project_integration_scope',
+  'project_integration_history',
+  'project_integration_history_unverifiable',
+];
+
+// Merge the task head once; a recorded or recovered merge is never repeated. A recorded merge
+// that left the branch is `project_integration_missing`, never a replayed success.
 async function mergeRun(ctx, snapshot, task, run) {
-  if (run.integration?.status === 'merged' && run.integration.mergedHead === run.headSha) return run.integration;
+  if (run.integration?.status === 'merged' && run.integration.mergedHead === run.headSha)
+    return (await recordedMergePresent(snapshot, run))
+      ? run.integration
+      : { status: 'failed', code: 'project_integration_missing' };
   const { branch, worktree } = await integrationOf(ctx, snapshot);
   try {
     const merged = await mergeTask({
@@ -340,12 +368,7 @@ async function mergeRun(ctx, snapshot, task, run) {
     ctx.store.updateRun(run.id, { integration });
     return integration;
   } catch (error) {
-    if (
-      !['project_integration_conflict', 'project_integration_scope', 'project_integration_history'].includes(
-        error?.code,
-      )
-    )
-      throw error;
+    if (!integrationFailures.includes(error?.code)) throw error;
     ctx.store.updateRun(run.id, {
       integration: { branch, before: run.integration?.before ?? null, status: 'failed', code: error.code },
     });
@@ -404,12 +427,20 @@ async function advanceContainers(ctx, projectId) {
 }
 
 // `wave_policy_mismatch` when the task Run did not verify under the policy of its base, or its head
-// changes the policy outside its write paths; null otherwise.
-async function taskPolicy(run, task) {
+// changes the policy outside its write paths; `wave_policy_unsafe` when a policy holds a known
+// secret or a value the Store would redact; null otherwise.
+async function taskPolicy(ctx, run, task) {
   try {
-    await assertWavePolicy({ run, policyCommit: run.baseSha, headSha: run.headSha, writePaths: task.writePaths });
+    await assertWavePolicy({
+      run,
+      policyCommit: run.baseSha,
+      headSha: run.headSha,
+      writePaths: task.writePaths,
+      secrets: ctx.engine.secrets,
+    });
     return null;
   } catch (error) {
+    if (error?.code === 'project_wave_policy_unsafe') return 'wave_policy_unsafe';
     if (!['project_wave_policy_mismatch', 'project_wave_policy_invalid'].includes(error?.code)) throw error;
     return 'wave_policy_mismatch';
   }
@@ -433,6 +464,8 @@ export async function integrateAndAdvance(ctx, { projectId, taskId, run, signal 
     requireValue(stored && isDeepStrictEqual(stored.directorBinding, bindingFor(attempt)), 'binding_invalid');
     const blocked = async code => ({ status: 'blocked', code, revision: (await snapshotOf(ctx, projectId)).revision });
     if (reached(attempt.status, 'integrated') && reached(task.status, 'integrated')) {
+      // A repeat (crash recovery) is `integrated` only while the recorded merge is on the branch.
+      if (!(await recordedMergePresent(snapshot, stored))) return blocked('project_integration_missing');
       await advanceContainers(ctx, projectId);
       return {
         status: 'integrated',
@@ -445,7 +478,7 @@ export async function integrateAndAdvance(ctx, { projectId, taskId, run, signal 
     if (stored.verificationProfile !== 'task-fast' || stored.checks?.profile !== 'task-fast')
       return blocked('wave_fast_proof_missing');
     // The task verified under the policy of its base; its head may change it only in its write paths.
-    const policy = await taskPolicy(stored, task);
+    const policy = await taskPolicy(ctx, stored, task);
     const merged = policy ? { status: 'failed', code: policy } : await mergeRun(ctx, snapshot, task, stored);
     if (merged.status !== 'merged') {
       // The result cannot be integrated; an explicit retry starts from the current frontier.
@@ -603,6 +636,33 @@ async function accept(ctx, snapshot, kind, record, criteria, refs, out) {
 const projectHeadMoved = async (snapshot, verifiedHead) =>
   (await integrationHeadOf({ cwd: snapshot.project.root, projectId: snapshot.project.projectId })) !== verifiedHead;
 
+// Every repair commit of a gate (`gate.headSha..run.headSha`), not only the verified result, would
+// enter the branch: each must stay inside the covered tasks' write paths, without secret files,
+// links or known secret values (`inspectHistory`). A defect blocks the gate Run (a retry reserves a
+// new gate on the branch head) and is returned as its blocker code; null when the history is clean.
+async function gateHistoryDefect(ctx, snapshot, gate, run, worktree) {
+  if (run.headSha === gate.headSha) return null;
+  const writePaths = gate.merges.flatMap(merge => taskOf(snapshot, merge.taskId)?.writePaths ?? []);
+  const found = writePaths.length
+    ? await inspectHistory({
+        cwd: worktree,
+        base: gate.headSha,
+        head: run.headSha,
+        writePaths,
+        secrets: ctx.engine.secrets,
+      })
+    : { kind: 'scope' };
+  if (!found) return null;
+  const code =
+    found.kind === 'unverifiable' ? 'project_integration_history_unverifiable' : 'project_integration_history';
+  const where = found.commit ? `commit ${found.commit.slice(0, 12)}` : 'the repair history';
+  ctx.store.updateRun(run.id, {
+    state: 'blocked',
+    error: { code, message: `Gate repair history is unsafe (${found.kind}) in ${where}` },
+  });
+  return code;
+}
+
 // Bring the verified gate head back, then accept the covered tasks and containers, all under one
 // integration lease held until each acceptance commits: the authorizer's Git proof (merges,
 // range, verified head on the branch) cannot go stale in between. The project is accepted only
@@ -611,6 +671,12 @@ async function acceptGate(ctx, projectId, gate, run, out) {
   await withIntegrationLease(ctx, projectId, undefined, async () => {
     const before = await snapshotOf(ctx, projectId);
     const { worktree } = await integrationOf(ctx, before);
+    const unsafe = await gateHistoryDefect(ctx, before, gate, run, worktree);
+    if (unsafe) {
+      const [gated] = gate.containers;
+      out.blocked.push({ code: unsafe, kind: gated.kind, id: gated.id });
+      return;
+    }
     // Fast-forward while the branch still stands on the gate head; otherwise the
     // in-scope repairs are merged `--no-ff`.
     await mergeBackGate({ worktree, expectedHead: gate.headSha, gateHead: run.headSha });
@@ -816,7 +882,7 @@ async function installTaskRun(ctx, projectId, attempt, options, control) {
           const draft = value.runDraft;
           draft.verificationProfile = 'task-fast';
           // The task verifies under the policy of its base commit, not of the user's checkout.
-          await applyWavePolicy(draft, draft.baseSha);
+          await applyWavePolicy(draft, draft.baseSha, { secrets: ctx.engine.secrets });
           draft.config.watchdog = normalizeWatchdogConfig(project.execution?.watchdog ?? GATE_WATCHDOG);
           draft.config.concurrency = concurrency;
           draft.config.delivery = { ...draft.config.delivery, enabled: false, release: false };

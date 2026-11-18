@@ -359,7 +359,16 @@ test('drain --retry-failed never executes natively a task an external chat aband
   const next = await f.cli(['next-wave', f.id, '--host', 't3']);
   assert.equal(next.exitCode, 0, next.output);
   const [brief] = next.report.result.briefs;
-  const abandoned = await f.cli(['complete-task', f.id, 'ext', '--head', brief.baseSha, '--abandon']);
+  const abandoned = await f.cli([
+    'complete-task',
+    f.id,
+    'ext',
+    '--head',
+    brief.baseSha,
+    '--abandon',
+    '--attempt',
+    brief.attemptId,
+  ]);
   assert.equal(abandoned.report.result.status, 'abandoned', abandoned.output);
   const drained = await f.cli(['drain', f.id, '--retry-failed']);
   assert.equal(drained.report.result.status, 'blocked', drained.output);
@@ -670,12 +679,16 @@ test('A late repeat of --abandon replays its own attempt and never blocks the re
   const f = await fixture(t, { epics: ['e1'], tasks: [task('ext')] });
   const [brief] = (await f.cli(['next-wave', f.id, '--host', 't3'])).report.result.briefs;
   const abandon = ['complete-task', f.id, 'ext', '--head', brief.baseSha, '--abandon'];
-  const first = await f.cli(abandon);
+  const first = await f.cli([...abandon, '--attempt', brief.attemptId]);
   assert.equal(first.report.result.status, 'abandoned', first.output);
   const [retry] = (await f.cli(['next-wave', f.id, '--host', 't3', '--retry-failed'])).report.result.briefs;
   assert.notEqual(retry.attemptId, brief.attemptId);
   const current = () => f.repo.snapshot(f.id).currentAttempts[0];
-  for (const argv of [abandon, [...abandon, '--attempt', brief.attemptId]]) {
+  // Without --attempt the CLI refuses the abandon before touching any state.
+  const unnamed = await f.cli(abandon);
+  assert.deepEqual([unnamed.exitCode, unnamed.report.result.code], [1, 'project_arguments']);
+  assert.deepEqual([current().id, current().status], [retry.attemptId, 'running']);
+  for (const argv of [[...abandon, '--attempt', brief.attemptId]]) {
     const late = await f.cli(argv);
     assert.deepEqual([current().id, current().status], [retry.attemptId, 'running'], 'the retry keeps running');
     assert.equal(f.store.getRun(retry.runId).state, 'executing');
@@ -697,3 +710,200 @@ test('A late repeat of --abandon replays its own attempt and never blocks the re
   assert.equal(own.report.result.replayed, undefined);
   assert.equal(current().status, 'blocked');
 });
+
+// --- Second review of the project factory: regression tests ------------------------------------
+
+test(
+  'A policy the Store would record redacted is refused: a command that exits 19 intact never accepts the project',
+  { timeout: 600000 },
+  async t => {
+    // Review finding (blocker): the policy was read through the redacting runner; `?key=intact-value`
+    // became `?key=[REDACTED]`, so the gate executed a command that exits 0 instead of 19.
+    const f = await fixture(t, {
+      epics: ['e1'],
+      tasks: [task('redacted', { writePaths: ['kodo.config.json', 'redacted.txt'] })],
+      hooks: {
+        writePaths: { redacted: ['kodo.config.json', 'redacted.txt'] },
+        onWorker: (id, calls, request) =>
+          editConfig(request.cwd, config => ({
+            ...config,
+            commands: {
+              ...config.commands,
+              test: [
+                {
+                  command: process.execPath,
+                  args: ['-e', "process.exit(process.argv[1].includes('REDACTED') ? 0 : 19)", '?key=intact-value'],
+                },
+              ],
+            },
+          })),
+      },
+    });
+    const base = git(f.root, 'rev-parse', 'HEAD');
+    const result = await createProjectDirector({ repo: f.repo, engine: f.engine }).drain(f.id);
+    assert.equal(result.status, 'blocked', JSON.stringify(result));
+    assert.match(JSON.stringify(result), /wave_policy_unsafe/);
+    const snapshot = f.repo.snapshot(f.id);
+    assert.notEqual(snapshot.project.status, 'accepted');
+    assert.ok(!['integrated', 'accepted'].includes(snapshot.tasks[0].status), snapshot.tasks[0].status);
+    assert.equal(f.branchHead(), base, 'nothing was merged');
+    assert.deepEqual(snapshot.gates, [], 'no gate executed the policy');
+  },
+);
+
+test(
+  'Every repair commit of a gate is inspected: a credentials file committed and deleted never enters the branch',
+  { timeout: 600000 },
+  async t => {
+    // Review finding (major): only the verified result of the repairs was checked; the project was
+    // accepted and the commit with credentials.json was on the integration branch.
+    let leaked = null;
+    const f = await fixture(t, {
+      epics: ['e1'],
+      tasks: [task('left'), task('right')],
+      hooks: {
+        onRepair: async request => {
+          await writeFile(path.join(request.cwd, 'credentials.json'), '{"token":"leaked"}\n');
+          git(request.cwd, 'add', '-A');
+          git(request.cwd, 'commit', '-q', '-m', 'Repair with credentials');
+          leaked = git(request.cwd, 'rev-parse', 'HEAD');
+          git(request.cwd, 'rm', '-q', 'credentials.json');
+          git(request.cwd, 'commit', '-q', '-m', 'Remove credentials');
+          await writeFile(path.join(request.cwd, 'left.txt'), 'left fixed\n');
+        },
+      },
+    });
+    const result = await createProjectDirector({ repo: f.repo, engine: f.engine }).drain(f.id, { concurrency: 2 });
+    assert.ok(leaked, 'the gate repaired the combined result');
+    assert.equal(result.status, 'blocked', JSON.stringify(result));
+    assert.match(JSON.stringify(result), /project_integration_history/);
+    const snapshot = f.repo.snapshot(f.id);
+    assert.notEqual(snapshot.project.status, 'accepted');
+    assert.notEqual(snapshot.epics[0].status, 'accepted');
+    const gate = f.store.getRun(snapshot.gates[0].runId);
+    assert.deepEqual([gate.state, gate.error?.code], ['blocked', 'project_integration_history']);
+    assert.equal(f.branchHead(), snapshot.gates[0].headSha, 'the repairs were never merged back');
+    const reachable = spawnSync('git', ['merge-base', '--is-ancestor', leaked, f.branchHead()], { cwd: f.root });
+    assert.equal(reachable.status, 1, 'the commit with credentials.json is not on the integration branch');
+  },
+);
+
+test(
+  'A full node --test of the gate that passes no test fails the gate and records the parsed count',
+  { timeout: 600000 },
+  async t => {
+    // Review finding (major): a task switched commands.test to `node --test --test-reporter=tap` in a
+    // repository without tests; `# tests 0`, `# pass 0` and exit 0 accepted the project.
+    const f = await fixture(t, {
+      epics: ['e1'],
+      tasks: [task('zero', { writePaths: ['kodo.config.json', 'zero.txt'] })],
+      hooks: {
+        writePaths: { zero: ['kodo.config.json', 'zero.txt'] },
+        onWorker: (id, calls, request) =>
+          editConfig(request.cwd, config => ({
+            ...config,
+            commands: {
+              ...config.commands,
+              test: [{ command: process.execPath, args: ['--test', '--test-reporter=tap'] }],
+            },
+          })),
+      },
+    });
+    const result = await createProjectDirector({ repo: f.repo, engine: f.engine }).drain(f.id);
+    assert.equal(result.status, 'blocked', JSON.stringify(result));
+    const snapshot = f.repo.snapshot(f.id);
+    assert.notEqual(snapshot.project.status, 'accepted');
+    assert.equal(snapshot.tasks[0].status, 'integrated');
+    const gate = f.store.getRun(snapshot.gates[0].runId);
+    assert.notEqual(gate.state, 'succeeded');
+    assert.deepEqual(gate.config.commands.test[0].args, ['--test', '--test-reporter=tap']);
+    assert.equal(gate.checks.results[0].exitCode, 0, 'the runner itself exited 0');
+    assert.equal(gate.checks.results[0].tests, 0, 'the receipt records the parsed count');
+    assert.match(gate.error.message, /node --test/);
+  },
+);
+
+test(
+  'A gate whose node --test passed tests records the count, and the validator binds it to the evidence log',
+  { timeout: 600000 },
+  async t => {
+    const paths = ['kodo.config.json', 'counted.txt', 'counted.test.mjs'];
+    const f = await fixture(t, {
+      epics: ['e1'],
+      tasks: [task('counted', { writePaths: paths })],
+      hooks: {
+        writePaths: { counted: paths },
+        onWorker: async (id, calls, request) => {
+          await writeFile(
+            path.join(request.cwd, 'counted.test.mjs'),
+            ["import test from 'node:test';", "test('counted', () => {});", ''].join('\n'),
+          );
+          await editConfig(request.cwd, config => ({
+            ...config,
+            commands: {
+              ...config.commands,
+              test: [{ command: process.execPath, args: ['--test', '--test-reporter=tap'] }],
+            },
+          }));
+        },
+      },
+    });
+    const result = await createProjectDirector({ repo: f.repo, engine: f.engine }).drain(f.id);
+    assert.equal(result.status, 'accepted', JSON.stringify(result));
+    const gate = f.store.getRun(f.repo.snapshot(f.id).gates[0].runId);
+    assert.equal(gate.checks.results[0].tests, 1);
+    await authorizeByGate(f, gate);
+    for (const tests of [2, 0, undefined]) {
+      const results = gate.checks.results.map((row, index) => (index ? row : { ...row, tests }));
+      f.store.updateRun(gate.id, { checks: { ...gate.checks, results } });
+      await assert.rejects(() => authorizeByGate(f, f.store.getRun(gate.id)), {
+        code: 'project_gate_tests_uncounted',
+      });
+    }
+  },
+);
+
+test(
+  'complete-task after a crash between integration and its record reports a merge that left the branch',
+  { timeout: 600000 },
+  async t => {
+    // Review finding (major): the write of externalCompletion failed after attempt and task reached
+    // `integrated`; after the branch was reset, the repeat answered exit 0 `integrated`.
+    const f = await fixture(t, { epics: ['e1'], tasks: [task('alpha')] });
+    const [brief] = (await f.cli(['next-wave', f.id, '--host', 't3'])).report.result.briefs;
+    await writeFile(path.join(brief.worktree, 'alpha.txt'), 'alpha\n');
+    git(brief.worktree, 'add', '-A');
+    git(brief.worktree, 'commit', '-m', 'Implement alpha');
+    const head = git(brief.worktree, 'rev-parse', 'HEAD');
+    const complete = ['complete-task', f.id, 'alpha', '--head', head, '--defer-gate'];
+    const updateRun = f.store.updateRun;
+    let injected = false;
+    f.store.updateRun = function (id, patch, ...rest) {
+      if (!injected && patch?.externalCompletion) {
+        injected = true;
+        throw Object.assign(new Error('Injected crash before the completion record'), { code: 'injected_crash' });
+      }
+      return updateRun.call(this, id, patch, ...rest);
+    };
+    t.after(() => delete f.store.updateRun);
+    const crashed = await f.cli(complete);
+    assert.equal(injected, true);
+    assert.equal(crashed.exitCode, 2, crashed.output);
+    delete f.store.updateRun;
+    const snapshot = f.repo.snapshot(f.id);
+    assert.deepEqual([snapshot.currentAttempts[0].status, snapshot.tasks[0].status], ['integrated', 'integrated']);
+    const { integration, externalCompletion } = f.store.getRun(brief.runId);
+    assert.equal(externalCompletion, undefined, 'the completion was never recorded');
+    // The merge leaves the branch (a manual reset of the integration worktree).
+    const block = git(f.root, 'worktree', 'list', '--porcelain')
+      .split(/\r?\n\r?\n/)
+      .find(row => row.includes(`branch refs/heads/kodo/project/${f.id}`));
+    git(/^worktree (.+)$/m.exec(block)[1], 'reset', '-q', '--hard', integration.before);
+    const late = await f.cli(complete);
+    assert.deepEqual(
+      [late.exitCode, late.report.result.status, late.report.result.code],
+      [2, 'blocked', 'project_integration_missing'],
+      late.output,
+    );
+  },
+);

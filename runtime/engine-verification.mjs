@@ -16,7 +16,7 @@ import {
 import { EngineExecution } from './engine-execution.mjs';
 import { normalizeWatchdogConfig, observeRun, watchdogStep } from './watchdog.mjs';
 import { contentHash, packSessionEvidence, evidencePrompt } from './engine-core.mjs';
-import { TASK_FAST_PROFILE, runFastChecks } from './task-fast-checks.mjs';
+import { TASK_FAST_PROFILE, fastEnvironment, nodeTestOutcome, runFastChecks } from './task-fast-checks.mjs';
 
 const gateReviewSchemas = new Map();
 /**
@@ -109,6 +109,26 @@ function failedCheck(run, kind, result, comparison) {
     { code: 'check_failed', ...(classification ? { classification } : {}) },
   );
 }
+/**
+ * The test count of a full `node --test` command of a wave gate Run (`directorBinding.kind ===
+ * 'gate'`), null for any other Run or command: a gate never accepts a run that passed no test or
+ * whose summary cannot be parsed. Legacy Runs keep their checks unchanged.
+ */
+const gateTestCount = (run, kind, command, stdout) =>
+  run.directorBinding?.kind === 'gate' && kind === 'test' ? nodeTestOutcome(command, stdout) : null;
+
+function assertGateTests(counted) {
+  if (!counted || counted.tests > 0) return;
+  throw Object.assign(
+    new Error(
+      counted.tests === 0
+        ? 'Полный прогон node --test гейта не выполнил успешно ни одного теста (tests/pass 0)'
+        : 'Полный прогон node --test гейта не дал разбираемого итога: используй репортёр spec или tap на stdout',
+    ),
+    { code: counted.tests === 0 ? 'gate_check_no_tests' : 'gate_check_summary_unknown' },
+  );
+}
+
 export class EngineVerification extends EngineExecution {
   /**
    * Optional (`verification.baseline`): run the check commands on the untouched
@@ -229,7 +249,8 @@ export class EngineVerification extends EngineExecution {
         (row, index) =>
           row.exitCode === 0 &&
           row.kind === expected[index].kind &&
-          isDeepStrictEqual(row.command, expected[index].command),
+          isDeepStrictEqual(row.command, expected[index].command) &&
+          (!gateTestCount(run, row.kind, row.command, '') || row.tests > 0),
       )
     ) {
       for (const reference of this.checkEvidenceReferences(run)) await this.assertEvidence(reference);
@@ -248,7 +269,8 @@ export class EngineVerification extends EngineExecution {
           result = await execute(command.command, command.args, {
             cwd: run.cwd,
             signal,
-            env: workerEnvironment(),
+            // A wave gate counts its node --test runs: an inherited runner context would hide them.
+            env: run.directorBinding?.kind === 'gate' ? fastEnvironment() : workerEnvironment(),
             secrets: this.secrets,
             timeoutMs: command.timeoutMs,
             allowFailure: true,
@@ -320,10 +342,12 @@ export class EngineVerification extends EngineExecution {
           { kind, command, exitCode: result.code, stdout: result.stdout, stderr: result.stderr },
           { headSha },
         );
+        const counted = gateTestCount(run, kind, command, result.stdout);
         results.push({
           kind,
           command,
           exitCode: result.code,
+          ...(counted ? { tests: counted.tests } : {}),
           output: (result.stdout + result.stderr).slice(-24000),
           outputPath: evidence.path,
           outputHash: evidence.sha256,
@@ -332,6 +356,7 @@ export class EngineVerification extends EngineExecution {
         if (comparison) run.checks.comparison = comparison;
         this.save(run);
         if (result.code !== 0) throw failedCheck(run, kind, result, comparison);
+        assertGateTests(counted);
       }
     if (!run.config.commands.test.length) throw new Error('Не настроена команда проверки результата');
     const comparison = compareWithBaseline(currentBaseline(run), results);

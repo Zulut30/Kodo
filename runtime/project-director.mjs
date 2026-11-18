@@ -18,6 +18,7 @@ import {
 import { integrationLeaseHeld } from './project-integration-lease.mjs';
 import { WAVE_POLICY_FIELDS, assertWavePolicy } from './wave-policy.mjs';
 import { isCurrentBehaviorReceipt } from './behavior-gate.mjs';
+import { nodeTestOutcome } from './task-fast-checks.mjs';
 
 const fail = code => {
   throw Object.assign(new Error(`Project ${code}`), { code: `project_${code}` });
@@ -385,11 +386,23 @@ async function validateWaveTask({ engine, contracts, snapshot, run, options }) {
     policyCommit: run.baseSha,
     ...(succeeded ? { headSha: run.headSha } : {}),
     writePaths: task.writePaths,
+    secrets: engine.secrets,
   });
   if (!succeeded) return;
   requireValue(run.checks?.profile === 'task-fast' && Array.isArray(run.checks.results), 'checks_stale');
   await assertLogs(engine, run, run.checks.results, 'fast-check');
   await assertTaskMerge(snapshot, run);
+}
+
+// Each full `node --test` command of a gate Run passed a parsed, non-zero number of tests: its
+// receipt row (`tests`) is the summary of its evidence log (assertFullReceipts checked the log).
+async function assertGateTestCounts(run) {
+  for (const row of run.checks.results) {
+    if (row.kind !== 'test') continue;
+    const log = JSON.parse(await readFile(row.outputPath, 'utf8'));
+    const outcome = nodeTestOutcome(row.command, log.value?.stdout ?? '');
+    requireValue(!outcome || (outcome.tests > 0 && row.tests === outcome.tests), 'gate_tests_uncounted');
+  }
 }
 
 // A gate Run is bound to its gate record and the manifest of its covered tasks and containers,
@@ -407,8 +420,9 @@ async function validateWaveGate({ store, engine, contracts, snapshot, run, gate,
     'binding_invalid',
   );
   await assertRunSource(snapshot, run, true);
-  await assertWavePolicy({ run, policyCommit: gate.headSha, headSha: run.headSha });
+  await assertWavePolicy({ run, policyCommit: gate.headSha, headSha: run.headSha, secrets: engine.secrets });
   await assertFullReceipts(engine, run);
+  await assertGateTestCounts(run);
   requireValue(
     isCurrentBehaviorReceipt(run.behavior, { headSha: run.headSha, baseSha: run.baseSha, config: run.config }),
     'behavior_stale',

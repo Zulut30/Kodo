@@ -74,6 +74,8 @@ function argumentsFor(argv) {
   if (!next && (!sha.test(flags['--head'] ?? '') || (flags['--defer-gate'] && flags['--abandon']))) invalid();
   if (flags['--command-id'] !== undefined && !uuid.test(flags['--command-id'])) invalid();
   if (flags['--attempt'] !== undefined && !uuid.test(flags['--attempt'])) invalid();
+  // An abandon names the attempt it stops: a late repeat can never stop a newer attempt.
+  if (flags['--abandon'] && flags['--attempt'] === undefined) invalid();
   return { action, projectId: positional[0], taskId: positional[1], flags, json: flags['--json'] === true };
 }
 

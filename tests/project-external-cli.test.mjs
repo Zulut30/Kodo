@@ -190,8 +190,25 @@ test('Project CLI delegates next-wave and complete-task to the pull protocol', a
   assert.equal(other.exitCode, 2, 'another host does not receive orca’s attempt');
   assert.deepEqual(other.report.result.briefs, []);
 
+  // An abandon names its attempt: without --attempt it is an argument error that stops nothing.
+  const unnamed = await projectCli(
+    ['complete-task', waveId, 'task-a', '--head', brief.baseSha, '--abandon', '--json'],
+    base,
+  );
+  assert.deepEqual([unnamed.exitCode, unnamed.report.result.code], [1, 'project_arguments']);
   const abandoned = await projectCli(
-    ['complete-task', waveId, 'task-a', '--head', brief.baseSha, '--abandon', '--command-id', crypto.randomUUID()],
+    [
+      'complete-task',
+      waveId,
+      'task-a',
+      '--head',
+      brief.baseSha,
+      '--abandon',
+      '--attempt',
+      brief.attemptId,
+      '--command-id',
+      crypto.randomUUID(),
+    ],
     base,
   );
   assert.equal(abandoned.exitCode, 0, abandoned.output);

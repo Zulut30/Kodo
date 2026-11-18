@@ -563,3 +563,84 @@ test('mergeTask inspects every commit of the task: secrets and paths outside sco
   });
   assert.equal(merged.status, 'merged');
 });
+
+test('A second checkout of the integration branch next to the canonical one is busy before any Git operation', async t => {
+  // Review finding (major): only the first worktree of kodo/project/<id> was checked; a second one
+  // (git switch --ignore-other-worktrees) was merged into and its HEAD moved.
+  const f = await fixture(t);
+  const integration = await ensureIntegration({ root: f.root, projectId, worktreeHome: f.worktreeHome });
+  // Listed after the canonical worktree, so a check of the first holder alone misses it.
+  const second = path.join(f.directory, 'zz-second-checkout');
+  await git(f.root, ['worktree', 'add', '--detach', second, integration.head]);
+  await git(second, ['switch', '-q', '--ignore-other-worktrees', integrationBranch(projectId)]);
+  await code(
+    ensureIntegration({ root: f.root, projectId, worktreeHome: f.worktreeHome }),
+    'project_integration_branch_busy',
+  );
+  assert.equal(await git(second, ['rev-parse', 'HEAD']), integration.head, 'the second checkout keeps its HEAD');
+  assert.equal(await git(integration.worktree, ['rev-parse', 'HEAD']), integration.head);
+  // Once it leaves the branch, the canonical worktree is used again.
+  await git(second, ['switch', '-q', '--detach']);
+  assert.equal(
+    (await ensureIntegration({ root: f.root, projectId, worktreeHome: f.worktreeHome })).worktree,
+    integration.worktree,
+  );
+});
+
+test('History inspection compares raw paths and bytes; content it cannot compare blocks the merge', async t => {
+  // Review finding (major): `git cat-file` redacted a provider-shaped known value before the
+  // comparison, and a blob of 2 000 000 bytes or more was skipped entirely.
+  const f = await fixture(t);
+  const integration = await ensureIntegration({ root: f.root, projectId, worktreeHome: f.worktreeHome });
+  const providerShaped = `sk-proj-${'A1b2C3d4'.repeat(4)}`;
+  const secrets = { openai: providerShaped, other: 'kodo-owned-history-secret' };
+  // Commit `files`, delete them in the next commit and finish with a clean file.
+  const history = async (name, files) => {
+    const leaked = await f.taskHead(name, integration.head, files);
+    const worktree = path.join(f.directory, 'tasks', name);
+    await git(worktree, ['rm', '-q', '-r', '--', ...Object.keys(files)]);
+    await mkdir(path.join(worktree, name), { recursive: true });
+    await writeFile(path.join(worktree, name, 'done.txt'), `${name}\n`);
+    await git(worktree, ['add', '-A']);
+    await git(worktree, ['commit', '-q', '-m', `Clean ${name}`]);
+    return { leaked, head: await git(worktree, ['rev-parse', 'HEAD']) };
+  };
+  const big = Buffer.alloc(16 * 1024 * 1024 + 1, 'x');
+  big.write(secrets.other, 1024);
+  const cases = [
+    ['shaped', { 'shaped/config.txt': `key ${providerShaped}\n` }, 'project_integration_history'],
+    ['big', { 'big/blob.bin': big }, 'project_integration_history_unverifiable'],
+    // A redacted name (`a&key=[REDACTED]`) hid the secret file name from the path checks.
+    ['named', { 'named/a&key=b/credentials.json': '{}\n' }, 'project_integration_history'],
+  ];
+  for (const [name, files, expected] of cases) {
+    const task = await history(name, files);
+    await code(
+      mergeTask({
+        worktree: integration.worktree,
+        taskId: name,
+        taskHead: task.head,
+        writePaths: [`${name}/**`],
+        savePending: async () => {},
+        secrets,
+      }),
+      expected,
+    );
+    assert.equal(await git(integration.worktree, ['rev-parse', 'HEAD']), integration.head, name);
+    const reachable = await execute('git', ['merge-base', '--is-ancestor', task.leaked, integration.head], {
+      cwd: f.root,
+      allowFailure: true,
+    });
+    assert.equal(reachable.code, 1, `${name}: the leaked commit is not on the branch`);
+  }
+  // Without known values there is nothing to compare: a large file merges.
+  const plain = await f.taskHead('plain', integration.head, { 'plain/blob.bin': Buffer.alloc(3 * 1024 * 1024, 'y') });
+  const merged = await mergeTask({
+    worktree: integration.worktree,
+    taskId: 'plain',
+    taskHead: plain,
+    writePaths: ['plain/**'],
+    savePending: async () => {},
+  });
+  assert.equal(merged.status, 'merged');
+});

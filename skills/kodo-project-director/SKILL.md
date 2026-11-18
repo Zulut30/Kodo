@@ -30,14 +30,14 @@ description: Веди большой проект через фабрику Kodo
    - Бриф, чей `attemptId` уже есть в журнале, назначен: `delegate_task` не вызывай, жди уведомления его чата. Иначе два чата будут писать в один worktree.
    - После перезапуска диспетчера (новая сессия, сжатие контекста) восстанови журнал из истории этого чата и один раз сверь сохранённые чаты: `t3_thread_list` с `titleContains: brief.chatTitle` и `includeSubagents: true` — статус чата; `task_status` — только для делегата, чей чат уже завершён (прочитать SHA). Это разовая сверка, не цикл опроса. Идущий чат — жди уведомления; завершённый с SHA — шаг 5.
    - Бриф, для которого журнал или чат найти не удалось, всё равно считай назначенным: второй чат не создавай, покажи пользователю `taskId` и `attemptId`.
-   - Переназначение — только `kodo project complete-task <projectId> <taskId> --abandon --json`, затем `next-wave ... --retry-failed`: новая попытка получает новый `attemptId`, и для неё создаётся новый чат.
+   - Переназначение — только `brief.abandonCommand` этой попытки с подстановкой `<SHA>` (последний SHA из отчёта воркера, если его нет — `brief.baseSha`) и `--json`, затем `next-wave ... --retry-failed`: новая попытка получает новый `attemptId`, и для неё создаётся новый чат. Без `--head` или `--attempt` команда отказывает `project_arguments`; отказ без `--attempt` мог бы остановить чужую (новую) попытку.
 4. `delegate_task` — только для брифов без записи в журнале, по одному на бриф:
    - `title: brief.chatTitle`, `isolation: "shared"`, `role: "implementation"`; второй worktree не создавай — он уже есть в `brief.worktree`.
    - `task`: `brief.prompt`, затем `brief.roleInstructions`, затем требования: работать строго в абсолютном пути `brief.worktree` и только в `brief.writePaths`; читать интерфейсы из `brief.interfaces`; выполнить `brief.selfCheck` и исправить найденное; закоммитить в `brief.branch` без push, PR, merge и rebase; не запускать других агентов; закончить с чистым worktree и последней строкой вернуть полный SHA коммита.
    - Без секретов, токенов и приватных конфигураций в `task`.
 5. Жди уведомлений о завершении делегатов по правилам хоста, без циклов опроса. По каждому завершению: `kodo project complete-task <projectId> <taskId> --head <полный SHA> --json`.
    - `integrated` — задача влита в `kodo/project/<projectId>`; гейт эпика запускается автоматически, итог в `result.gates`.
-   - `checks_failed` — передай `result.code` и `result.message` в тот же воркер-чат (тот же worktree) и повтори `complete-task` с новым SHA. Если исправление невозможно (например, конфликт интеграции) — `complete-task ... --abandon`, затем `next-wave ... --retry-failed` (шаг 3).
+   - `checks_failed` — передай `result.code` и `result.message` в тот же воркер-чат (тот же worktree) и повтори `complete-task` с новым SHA. Если исправление невозможно (например, конфликт интеграции) — `brief.abandonCommand` с подстановкой SHA и `--json`, затем `next-wave ... --retry-failed` (шаг 3).
    - `blocked` — покажи код пользователю; `project_busy` — другой контроллер держит проект, повтори позже.
 6. Повторяй шаги 1–5, пока `kodo project status <projectId> --json` не покажет проект `accepted` или блокер, который нужно показать пользователю.
 

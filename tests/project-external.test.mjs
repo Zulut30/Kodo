@@ -439,7 +439,7 @@ test('abandon blocks the attempt and cancels its Run; retry-failed reserves a ne
   const f = await fixture(t);
   const wave = await f.wave({ limit: 1 });
   const a = wave.briefs[0];
-  const abandoned = await f.complete('task-a', a.baseSha, { abandon: true });
+  const abandoned = await f.complete('task-a', a.baseSha, { abandon: true, attemptId: a.attemptId });
   assert.equal(abandoned.status, 'abandoned');
   let snapshot = await f.snapshot();
   assert.equal(snapshot.currentAttempts[0].status, 'blocked');
@@ -463,6 +463,38 @@ test('abandon blocks the attempt and cancels its Run; retry-failed reserves a ne
   snapshot = await f.snapshot();
   const attempt = snapshot.currentAttempts.find(row => row.taskId === 'task-a');
   assert.deepEqual([attempt.number, attempt.status], [2, 'running']);
+});
+
+test('An abandon without an attempt id never stops the current attempt; only a recorded one is replayed', async t => {
+  // Review finding (major): a late --abandon without --attempt cancelled the NEW attempt of a retry.
+  const f = await fixture(t);
+  const a = brief(await f.wave({ limit: 1 }), 'task-a');
+  // A first abandon must name its attempt.
+  await assert.rejects(f.complete('task-a', a.baseSha, { abandon: true }), { code: 'project_arguments' });
+  assert.equal((await f.snapshot()).currentAttempts[0].status, 'running', 'nothing was stopped');
+  assert.equal(f.store.getRun(a.runId).state, 'executing');
+  const first = await f.complete('task-a', a.baseSha, { abandon: true, attemptId: a.attemptId });
+  assert.equal(first.status, 'abandoned');
+  const fresh = brief(await f.wave({ limit: 2, retryFailed: true }), 'task-a');
+  assert.notEqual(fresh.attemptId, a.attemptId);
+  const current = async () => (await f.snapshot()).currentAttempts.find(row => row.taskId === 'task-a');
+  // A late repeat with another head names no recorded abandon: refused, the retry keeps running.
+  await assert.rejects(f.complete('task-a', 'b'.repeat(40), { abandon: true }), { code: 'project_arguments' });
+  assert.deepEqual([(await current()).id, (await current()).status], [fresh.attemptId, 'running']);
+  assert.notEqual(f.store.getRun(fresh.runId).state, 'cancelled');
+  // The same head as the recorded abandon is its unambiguous repeat: the earlier result, unchanged state.
+  const revision = (await f.snapshot()).revision;
+  const repeat = await f.complete('task-a', a.baseSha, { abandon: true });
+  assert.deepEqual([repeat.status, repeat.attemptId, repeat.replayed], ['abandoned', a.attemptId, true]);
+  assert.deepEqual([(await current()).status, (await f.snapshot()).revision], ['running', revision]);
+  // Two recorded abandons with the same head are ambiguous without an attempt id.
+  assert.equal(
+    (await f.complete('task-a', a.baseSha, { abandon: true, attemptId: fresh.attemptId })).status,
+    'abandoned',
+  );
+  await assert.rejects(f.complete('task-a', a.baseSha, { abandon: true }), { code: 'project_arguments' });
+  const named = await f.complete('task-a', a.baseSha, { abandon: true, attemptId: a.attemptId });
+  assert.deepEqual([named.attemptId, named.replayed], [a.attemptId, true]);
 });
 
 test('next-wave never hands out a task whose interface proofs do not verify', async t => {
@@ -489,7 +521,7 @@ test('next-wave --retry-failed retries only attempts of its own host', async t =
   const f = await fixture(t);
   const wave = await f.wave({ limit: 1 });
   const a = brief(wave, 'task-a');
-  assert.equal((await f.complete('task-a', a.baseSha, { abandon: true })).status, 'abandoned');
+  assert.equal((await f.complete('task-a', a.baseSha, { abandon: true, attemptId: a.attemptId })).status, 'abandoned');
   const other = await nextWave(f.ctx, {
     projectId: f.projectId,
     host: 'orca',

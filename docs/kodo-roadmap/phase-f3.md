@@ -33,6 +33,13 @@
 | Циклы эпиков: Store отклоняет волновой проект с циклическим графом эпиков (`project_epic_cycle`), а lint этого не видел | `epicCycleFindings`: в `lintFactorySpec`/`compileBlueprint` и `lintMilestone` (по существующим и новым задачам, только циклы с новым эпиком) — finding `blueprint_epic_cycle` с перечнем эпиков | `tests/project-blueprint.test.mjs`, `tests/project-bootstrap.test.mjs` |
 | minor: навык не различал уже назначенные брифы, повтор `next-wave` вёл ко второму чату на тот же worktree | Журнал `attemptId → делегат, threadId` в истории чата диспетчера; `delegate_task` только для брифов без записи; после перезапуска — разовая сверка `t3_thread_list`/`task_status`, ненайденный бриф считается назначенным; переназначение — только `--abandon` + `next-wave --retry-failed`. Сверено с AGENTS.md и T3-HOST.md | `node cli/index.mjs validate`, `tests/toolkit.test.mjs` |
 
+### Второе ревью фабрики
+
+| Находка | Исправление | Тест |
+| --- | --- | --- |
+| major (lint): пустой эпик или майлстоун проходил чертёж и `lintMilestone`, а Store теперь его отклоняет (`project_container_empty`) | `containerFindings` (`project-blueprint.mjs`): finding `blueprint_container_empty` со списком пустых контейнеров — в `lintFactorySpec`/`compileBlueprint` (после Волны 0, до циклов эпиков) и в `lintMilestone` (новые эпики без своих задач); правило 8 в BLUEPRINT.md, код — в таблицах промптов bootstrap | `tests/project-blueprint.test.mjs`, `tests/project-bootstrap.test.mjs` |
+| minor: навык давал команду переназначения без `--head`/`--attempt` — `project_arguments` | Навык использует `brief.abandonCommand` с подстановкой `<SHA>` (последний SHA воркера, иначе `brief.baseSha`) и `--json` | `node cli/index.mjs validate`, `tests/toolkit.test.mjs` |
+
 ## Границы
 
 - Kodo не создаёт, не ждёт и не архивирует чаты T3: это делает главный чат своими инструментами по навыку. Kodo не знает id чатов и не проверяет их архивирование.

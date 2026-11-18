@@ -250,7 +250,7 @@ async function gateDraft({ engine, project, gate, covered, containers, input }) 
     research: { items: [], requests: 0, errors: [], cache: [] },
   };
   // The gate executes the verification policy of its head, which holds every covered merge.
-  await applyWavePolicy(draft, gate.headSha);
+  await applyWavePolicy(draft, gate.headSha, { secrets: engine.secrets });
   await engine.initializeRun(draft);
   // The full list and contracts of the covered tasks and the criteria of the covered containers:
   // an immutable evidence artifact whose canonical SHA-256 the gate input (draft.task) binds.
@@ -430,7 +430,14 @@ export async function runEpicGate({ engine, run: input, signal }) {
       )
         throw fail('Проверенный head гейта не продолжает head гейта в пределах writePaths задач', 'gate_scope');
       // The verified head keeps the policy the gate executed (a repair may not change it).
-      await assertWavePolicy({ run, policyCommit: run.directorBinding.headSha, headSha: run.headSha }).catch(error => {
+      await assertWavePolicy({
+        run,
+        policyCommit: run.directorBinding.headSha,
+        headSha: run.headSha,
+        secrets: engine.secrets,
+      }).catch(error => {
+        if (error?.code === 'project_wave_policy_unsafe')
+          throw fail('Политика проверок гейта содержит секрет или редактируемое значение', 'wave_policy_unsafe');
         if (!['project_wave_policy_mismatch', 'project_wave_policy_invalid'].includes(error?.code)) throw error;
         throw fail('Политика проверок проверенного head гейта отличается от исполненной', 'wave_policy_mismatch');
       });

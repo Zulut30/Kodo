@@ -56,7 +56,8 @@ const reporterOption = /^--test-reporter(?:-destination)?(?:=|$)/;
 // `dot`, `junit`, `lcov`, custom reporters and any destination give no countable summary.
 const countableReporters = ['spec', 'tap'];
 const nodeCommand = command => command === process.execPath || /(?:^|[\\/])node(?:\.exe)?$/i.test(command);
-const nodeTestCommand = ({ command, args = [] }) => nodeCommand(command) && args.includes('--test');
+/** Whether a configured command is Node's own test runner (`node --test`). */
+export const nodeTestCommand = ({ command, args = [] }) => nodeCommand(command) && args.includes('--test');
 // The default reporter, or exactly one `--test-reporter=spec|tap` written to stdout.
 const countableReporter = (args = []) => {
   const reporters = args.filter(arg => reporterOption.test(arg));
@@ -142,6 +143,20 @@ export function passedTests(stdout) {
 }
 
 /**
+ * The outcome of one full `node --test` command, judged like the task-fast fallback: null for a
+ * command that is not Node's test runner; otherwise `{ tests }`, the pass count of its countable
+ * summary (default, `spec` or `tap` reporter on stdout), or `tests: null` when there is none.
+ * A wave gate Run requires `tests > 0` for each of its full `node --test` commands.
+ * @param {{ command: string, args?: string[] }} step
+ * @param {string} stdout
+ * @returns {{ tests: number | null } | null}
+ */
+export function nodeTestOutcome(step, stdout) {
+  if (!nodeTestCommand(step)) return null;
+  return { tests: countedRunner(step) ? passedTests(stdout) : null };
+}
+
+/**
  * The fast plan for one head, with the reasons for any full fallback.
  * @param {{ run: any, cwd?: string, baseSha?: string, headSha: string }} input
  */
@@ -192,7 +207,8 @@ export async function planFastChecks({ run, cwd = run.cwd, baseSha = run.baseSha
   };
 }
 
-function fastEnvironment() {
+/** The environment of a counted test run: no inherited `node --test` context. */
+export function fastEnvironment() {
   const env = workerEnvironment();
   // A runner that inherits an enclosing `node --test` context skips every file and exits 0.
   for (const name of Object.keys(env)) if (/^NODE_TEST_(?:CONTEXT|WORKER_ID)$/i.test(name)) delete env[name];

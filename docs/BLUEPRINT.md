@@ -30,9 +30,11 @@
 6. **root** в `spec.json` — этот каталог проекта (сравнение после realpath; в результате — канонический путь).
 7. **Эпики без циклов.** Граф эпиков — ребро X → Y, если задача эпика X зависит от задачи другого эпика Y. Задачи могут быть ацикличны, а эпики — нет (A1 → B1 → A2 → B2); такой волновой проект Store отклоняет (`project_epic_cycle`), поэтому lint сообщает об этом раньше: одна находка на каждую сильно связную группу эпиков, эпики — в сообщении, в `taskIds` — задачи, чьи зависимости ведут в другой эпик той же группы.
 
+8. **Нет пустых контейнеров.** В каждом майлстоуне есть эпик, в каждом эпике — задача. Пустой эпик никогда не получит гейт и остался бы `proposed`; такой волновой проект Store отклоняет (`project_container_empty`), lint сообщает раньше: одна находка со списком пустых контейнеров в сообщении.
+
 ## Коды findings
 
-Finding — `{ code, taskIds?, message }`; сообщения не содержат содержимого файлов. Порядок детерминирован: чтение, root/ссылки, execution, схема, разделы, роли, Волна 0, циклы эпиков, пары, размер, интерфейсы; у `apply-spec` затем — Git.
+Finding — `{ code, taskIds?, message }`; сообщения не содержат содержимого файлов. Порядок детерминирован: чтение, root/ссылки, execution, схема, разделы, роли, Волна 0, пустые контейнеры, циклы эпиков, пары, размер, интерфейсы; у `apply-spec` затем — Git.
 
 | Код | Когда |
 | --- | --- |
@@ -50,6 +52,7 @@ Finding — `{ code, taskIds?, message }`; сообщения не содерж�
 | `blueprint_wave0_missing` | нет `foundation` или в нём нет задач |
 | `blueprint_wave0_bypassed` | задача вне Волны 0 не зависит от неё транзитивно |
 | `blueprint_wave0_order` | задача Волны 0 зависит от задачи вне неё |
+| `blueprint_container_empty` | майлстоун без эпиков или эпик без задач (правило 8) |
 | `blueprint_epic_cycle` | эпики зависят друг от друга по кругу через задачи (правило 7) |
 | `blueprint_parallel_overlap` | пара параллельных задач с пересекающимися `writePaths` |
 | `split_required` | вход задачи больше 12000 байт UTF-8 |
@@ -60,7 +63,7 @@ Finding — `{ code, taskIds?, message }`; сообщения не содерж�
 | `blueprint_session_output`, `blueprint_session_blocked` | (generate) сессия не вернула статус или сообщила, что чертёж составить нельзя |
 | `milestone_session_output`, `milestone_session_blocked` | (extend) сессия не вернула майлстоун или сообщила, что описать фичу нельзя |
 
-Проверка нового майлстоуна (`lintMilestone`): `milestone_shape`, `milestone_task_count` (1–6 задач), `milestone_id_conflict`, `milestone_foreign_parent` (эпик не в новом майлстоуне или задача не в новом эпике), `milestone_dependency_unknown`, `milestone_dependency_not_accepted` (зависимость не на новую и не на accepted/released задачу), `milestone_snapshot_invalid`, `milestone_snapshot_incomplete`, `milestone_spec_invalid`, а также `blueprint_owner_unknown`, `blueprint_epic_cycle` (граф существующих и новых задач; сообщаются только циклы с новым эпиком), `blueprint_parallel_overlap` (между новыми задачами и с незакрытыми существующими: всё, кроме accepted/released/cancelled) и `split_required` (с реальным контекстом проекта из снапшота). Ошибки `readMilestoneFile`: `milestone_missing`, `milestone_unsafe_path`, `milestone_too_large` (1 МиБ), `milestone_encoding`, `milestone_invalid_json`.
+Проверка нового майлстоуна (`lintMilestone`): `milestone_shape`, `milestone_task_count` (1–6 задач), `milestone_id_conflict`, `milestone_foreign_parent` (эпик не в новом майлстоуне или задача не в новом эпике), `milestone_dependency_unknown`, `milestone_dependency_not_accepted` (зависимость не на новую и не на accepted/released задачу), `milestone_snapshot_invalid`, `milestone_snapshot_incomplete`, `milestone_spec_invalid`, а также `blueprint_owner_unknown`, `blueprint_container_empty` (новый эпик без своей задачи), `blueprint_epic_cycle` (граф существующих и новых задач; сообщаются только циклы с новым эпиком), `blueprint_parallel_overlap` (между новыми задачами и с незакрытыми существующими: всё, кроме accepted/released/cancelled) и `split_required` (с реальным контекстом проекта из снапшота). Ошибки `readMilestoneFile`: `milestone_missing`, `milestone_unsafe_path`, `milestone_too_large` (1 МиБ), `milestone_encoding`, `milestone_invalid_json`.
 
 ## API
 

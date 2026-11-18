@@ -529,6 +529,30 @@ export function epicCycle(epics, tasks) {
   }
   return null;
 }
+/**
+ * The containers of a wave project without children: milestones with no epic and epics with no
+ * task, as `{kind, id}`. Such an epic never gets a gate (it has no task to integrate), so it and
+ * its milestone would stay `proposed` forever.
+ * @param {{ id: string }[]} milestones
+ * @param {{ id: string, milestoneId: string }[]} epics
+ * @param {{ epicId: string }[]} tasks
+ */
+export function emptyContainers(milestones, epics, tasks) {
+  const parents = new Set(epics.map(e => e.milestoneId)),
+    filled = new Set(tasks.map(t => t.epicId));
+  return [
+    ...milestones.filter(m => !parents.has(m.id)).map(m => ({ kind: 'milestone', id: m.id })),
+    ...epics.filter(e => !filled.has(e.id)).map(e => ({ kind: 'epic', id: e.id })),
+  ];
+}
+function assertContainersFilled(milestones, epics, tasks) {
+  const empty = emptyContainers(milestones, epics, tasks);
+  if (empty.length)
+    throw Object.assign(
+      new Error(`Invalid project Director data: empty ${empty.map(c => `${c.kind} ${c.id}`).join(', ')}`),
+      { code: 'project_container_empty', containers: empty },
+    );
+}
 function assertEpicsAcyclic(epics, tasks) {
   const cycle = epicCycle(epics, tasks);
   if (cycle)
@@ -667,8 +691,11 @@ function action(value) {
   plain(value);
   if (value.op === 'create') {
     const created = object(value, { op: member(['create']), spec: projectSpec });
-    // Wave epics are gated in dependency order; legacy projects keep their rules.
-    if (isWaveProject(created.spec)) assertEpicsAcyclic(created.spec.epics, created.spec.tasks);
+    // Wave epics are gated in dependency order, each over its tasks; legacy projects keep their rules.
+    if (isWaveProject(created.spec)) {
+      assertContainersFilled(created.spec.milestones, created.spec.epics, created.spec.tasks);
+      assertEpicsAcyclic(created.spec.epics, created.spec.tasks);
+    }
     return created;
   }
   if (['insert', 'amend'].includes(value.op)) {
@@ -1043,6 +1070,8 @@ export function assertProjectReopen(input) {
     state.set(id, 'done');
   };
   for (const id of fresh.keys()) visit(id);
+  // The new milestone and each new epic hold work: an empty one would never be gated.
+  assertContainersFilled([a.milestone], a.epics, a.tasks);
   assertEpicsAcyclic([...s.epics, ...a.epics], [...s.tasks, ...a.tasks]);
   if (s.tasks.length + a.tasks.length > MAX_ITEMS || s.epics.length + a.epics.length > MAX_ITEMS) fail('project_limit');
 }

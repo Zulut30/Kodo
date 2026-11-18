@@ -191,7 +191,7 @@ async function installExternalRun(state, attempt, task) {
         value.runDraft.executor = { kind: 'external', host };
         value.runDraft.verificationProfile = 'task-fast';
         // The policy of the base commit, not of the user's checkout (runtime/wave-policy.mjs).
-        await applyWavePolicy(value.runDraft, value.runDraft.baseSha);
+        await applyWavePolicy(value.runDraft, value.runDraft.baseSha, { secrets: ctx.engine.secrets });
         value.runDraft.config.repairRounds = 1;
         // No independent review of its own (the epic gate reviews): an explicit null keeps the
         // persisted acceptance observation equal to the Run's (JSON drops undefined fields).
@@ -424,9 +424,9 @@ export async function nextWave(ctx, input) {
   }
 }
 
-// Symbolic links and submodules never enter the integration branch.
+// Symbolic links and submodules never enter the integration branch (raw output: never redacted).
 async function specialEntries(cwd, base, head) {
-  const raw = await git(cwd, ['diff', '--raw', '--no-renames', '--no-abbrev', base, head]);
+  const raw = await git(cwd, ['diff', '--raw', '--no-renames', '--no-abbrev', base, head], { rawOutput: true });
   return raw
     .split(/\r?\n/)
     .filter(Boolean)
@@ -443,6 +443,7 @@ const historyCodes = {
   secret_path: 'external_scope',
   special: 'external_symlink',
   secret: 'external_unsafe_change',
+  unverifiable: 'external_history_unverifiable',
   too_long: 'external_history_too_long',
 };
 
@@ -473,7 +474,10 @@ async function inspectSubmission(engine, run, task, head) {
   if (branch.code !== 0 || branch.stdout.trim() !== head) return problem('external_branch_mismatch');
   const worktreeHead = await execute('git', ['rev-parse', 'HEAD'], { cwd: run.cwd, allowFailure: true });
   if (worktreeHead.code !== 0) return problem('external_worktree_missing');
-  if (worktreeHead.stdout.trim() !== head || (await git(run.cwd, ['branch', '--show-current'])) !== run.branch)
+  if (
+    worktreeHead.stdout.trim() !== head ||
+    (await git(run.cwd, ['branch', '--show-current'], { rawOutput: true })) !== run.branch
+  )
     return problem('external_worktree_mismatch');
   if (await git(run.cwd, ['status', '--porcelain=v1', '--untracked-files=all']))
     return problem('external_worktree_dirty');
@@ -524,9 +528,24 @@ async function abandonAttempt(ctx, snapshot, attempt, run, { head, commandId }) 
   };
 }
 
-// The Run of an earlier attempt of this task that an abandon already stopped: the named attempt
-// (`--attempt`), or else the one abandoned with this head. Null when the current attempt is meant.
-function earlierAbandon(ctx, snapshot, attempt, { head, attemptId }) {
+// The Runs of this task's attempts that an abandon already stopped with `head`.
+function recordedAbandons(ctx, snapshot, taskId, head) {
+  return storeOf(ctx)
+    .listRuns(snapshot.project.root)
+    .filter(
+      row =>
+        row.directorBinding?.projectId === snapshot.project.projectId &&
+        row.directorBinding.taskId === taskId &&
+        row.executor?.kind === 'external' &&
+        row.externalAbandon?.schemaVersion === 1 &&
+        row.externalAbandon.attemptId === row.directorBinding.attemptId &&
+        row.externalAbandon.headSha === head,
+    );
+}
+
+// The Run of an earlier attempt of this task that an abandon already stopped (`attemptId`). Null
+// when the current attempt is meant or the named attempt was never abandoned.
+function earlierAbandon(ctx, snapshot, attempt, attemptId) {
   if (attemptId === attempt.id) return null;
   return (
     storeOf(ctx)
@@ -535,28 +554,34 @@ function earlierAbandon(ctx, snapshot, attempt, { head, attemptId }) {
         row =>
           row.directorBinding?.projectId === snapshot.project.projectId &&
           row.directorBinding.taskId === attempt.taskId &&
-          row.directorBinding.attemptId !== attempt.id &&
+          row.directorBinding.attemptId === attemptId &&
           row.executor?.kind === 'external' &&
-          row.externalAbandon?.schemaVersion === 1 &&
-          (attemptId === undefined
-            ? row.externalAbandon.headSha === head
-            : row.directorBinding.attemptId === attemptId),
+          row.externalAbandon?.schemaVersion === 1,
       ) ?? null
   );
 }
 
-// `--abandon` stops exactly one attempt: a repeat for an earlier attempt returns that result and
-// leaves the current attempt (a retry) alone; a named attempt that is not current is stale.
+const replayedAbandon = (row, snapshot) => ({
+  status: 'abandoned',
+  attemptId: row.directorBinding.attemptId,
+  revision: snapshot.revision,
+  replayed: true,
+});
+
+// `--abandon` stops exactly the attempt it names (`attemptId`): a repeat for an earlier attempt
+// returns that result and leaves the current attempt (a retry) alone; a named attempt that is
+// not current is stale. Without an attempt id only an unambiguous repeat of an abandon already
+// recorded with this head is answered (its result, nothing changes); anything else is
+// `project_arguments` and never stops the current attempt.
 async function abandonTarget(ctx, { snapshot, attempt, run }, input) {
-  const earlier = earlierAbandon(ctx, snapshot, attempt, input);
-  if (earlier)
-    return {
-      status: 'abandoned',
-      attemptId: earlier.directorBinding.attemptId,
-      revision: snapshot.revision,
-      replayed: true,
-    };
-  if (input.attemptId !== undefined && input.attemptId !== attempt.id)
+  if (input.attemptId === undefined) {
+    const recorded = recordedAbandons(ctx, snapshot, attempt.taskId, input.head);
+    need(recorded.length === 1, 'arguments');
+    return replayedAbandon(recorded[0], snapshot);
+  }
+  const earlier = earlierAbandon(ctx, snapshot, attempt, input.attemptId);
+  if (earlier) return replayedAbandon(earlier, snapshot);
+  if (input.attemptId !== attempt.id)
     return { status: 'blocked', code: 'project_attempt_stale', revision: snapshot.revision };
   return abandonAttempt(ctx, snapshot, attempt, run, input);
 }
@@ -682,9 +707,11 @@ async function externalAttempt(ctx, C, projectId, taskId) {
 /**
  * Accept the commit of an external worker: check it, run `task-fast` once and
  * integrate it (`integrateAndAdvance`), then run pending epic gates unless deferred.
- * `abandon` blocks the attempt and cancels its Run instead; `attemptId` (CLI `--attempt`) binds
- * the call to one attempt (a stale one is `project_attempt_stale`), and a late abandon of an earlier
- * attempt replays its result without touching the current one. The whole call holds lease
+ * `abandon` blocks the attempt and cancels its Run instead; it requires `attemptId` (CLI
+ * `--attempt`), except as an unambiguous repeat of an abandon already recorded with this head
+ * (`project_arguments` otherwise). `attemptId` binds the call to one attempt (a stale one is
+ * `project_attempt_stale`), and a late abandon of an earlier attempt replays its result without
+ * touching the current one. The whole call holds lease
  * `project:<id>` (as `nextWave` and the drain do): `project_busy` while another holds it.
  * @param {{ repo: any, engine: any, store?: any, contracts?: any, clock?: () => string }} ctx
  * @param {{ projectId: string, taskId: string, head: string, deferGate?: boolean, abandon?: boolean,

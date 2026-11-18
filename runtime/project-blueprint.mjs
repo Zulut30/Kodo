@@ -505,6 +505,28 @@ export function epicCycleFindings(tasks, { fresh } = {}) {
   return findings;
 }
 
+/** Containers without children: a milestone with no epic, an epic with no task. The Store
+ * rejects them for wave projects (project_container_empty): an empty epic never gets a gate,
+ * so it and its milestone would stay `proposed`. One finding lists every empty container.
+ * @param {{ milestones: Array<{ id: string }>, epics: Array<{ id: string, milestoneId: string }>,
+ *   tasks: Array<{ epicId: string }> }} spec */
+export function containerFindings({ milestones, epics, tasks }) {
+  const parents = new Set(epics.map(epic => epic.milestoneId)),
+    filled = new Set(tasks.map(task => task.epicId));
+  const empty = [
+    ...milestones.filter(milestone => !parents.has(milestone.id)).map(milestone => `майлстоун ${milestone.id}`),
+    ...epics.filter(epic => !filled.has(epic.id)).map(epic => `эпик ${epic.id}`),
+  ];
+  if (!empty.length) return [];
+  const shown = empty.slice(0, 20).join(', ') + (empty.length > 20 ? ` и ещё ${empty.length - 20}` : '');
+  return [
+    finding(
+      'blueprint_container_empty',
+      `Пустые контейнеры: ${shown}; в каждом майлстоуне нужен эпик, в каждом эпике — задача (или удалите контейнер)`,
+    ),
+  ];
+}
+
 function interfaceFindings(spec, interfaces) {
   const fold = windowsLike(spec.root) ? value => value.toLowerCase() : value => value;
   const base = `${slashed(spec.root)}/.kodo/blueprint/`;
@@ -544,6 +566,7 @@ function analyzeFactorySpec(spec, options = {}) {
   findings.push(
     ...ownerFindings(base.spec.tasks),
     ...waveZeroFindings(base.spec, ancestors),
+    ...containerFindings(base.spec),
     ...epicCycleFindings(base.spec.tasks),
     ...overlapFindings(parallelOverlaps(base.spec.tasks, { ancestors })),
     ...taskInputFindings({ project: storedProject(base.spec), tasks: base.spec.tasks, contracts, knownValues }),

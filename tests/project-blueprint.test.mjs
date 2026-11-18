@@ -475,3 +475,21 @@ test('epics whose tasks depend on each other in a cycle are reported before appl
   const lint = lintFactorySpec(result.spec, { interfaces: result.interfaces, projectMarkdown: markdown });
   assert.deepEqual(codes(lint), ['blueprint_epic_cycle']);
 });
+
+test('an empty epic or milestone of the blueprint is reported before apply-spec', async t => {
+  // Review finding (major): the Store accepted a wave project with an empty epic that stayed
+  // `proposed` forever; it now refuses it (project_container_empty), and lint says so first.
+  const { root } = await blueprint(t, {
+    mutate(spec) {
+      spec.epics.push({ ...spec.epics.at(-1), id: 'idle-epic', title: 'Idle epic' });
+      spec.milestones.push({ ...spec.milestones.at(-1), id: 'idle-milestone', title: 'Idle milestone' });
+    },
+  });
+  const result = await compileBlueprint(root);
+  assert.deepEqual(codes(result), ['blueprint_container_empty']);
+  assert.equal(byCode(result, 'blueprint_container_empty').taskIds, undefined);
+  assert.match(byCode(result, 'blueprint_container_empty').message, /майлстоун idle-milestone, эпик idle-epic/);
+  const markdown = await readFile(path.join(fixtures, 'valid', 'PROJECT.md'), 'utf8');
+  const lint = lintFactorySpec(result.spec, { interfaces: result.interfaces, projectMarkdown: markdown });
+  assert.deepEqual(codes(lint), ['blueprint_container_empty']);
+});

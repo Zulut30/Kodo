@@ -623,6 +623,17 @@ test('context that cannot be redacted safely is refused before anything is writt
   assert.equal(provider.calls.length, 0, 'the provider never receives unsafe context');
 });
 
+test('lintMilestone reports a new epic without a task before append', async t => {
+  // Review finding (major): appendMilestone admitted an empty epic, which never got a gate.
+  const { snapshot } = await project(t, { 'storage-module': 'accepted' });
+  const idle = milestoneFile();
+  idle.epics.push({ id: 'idle-epic', milestoneId: 'search', title: 'Пусто', acceptance: [criterion('idle-done')] });
+  const result = lintMilestone(idle, snapshot);
+  assert.deepEqual(codes(result), ['blueprint_container_empty']);
+  assert.match(result.findings[0].message, /эпик idle-epic/);
+  assert.deepEqual(codes(lintMilestone(milestoneFile(), snapshot)), []);
+});
+
 test('lintMilestone reports epic cycles of the new milestone before append', async t => {
   const { snapshot } = await project(t, { 'storage-module': 'accepted' });
   const cyclic = milestoneFile({ review: { dependsOn: ['tags-index'] } });

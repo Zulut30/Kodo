@@ -10,6 +10,7 @@ import { createHash } from 'node:crypto';
 import { execute } from './command.mjs';
 import { normalizeConfig } from './config.mjs';
 import { ownsPath } from './contracts.mjs';
+import { redact } from './security.mjs';
 
 /** The configuration fields that decide how a head is verified. */
 export const WAVE_POLICY_FIELDS = Object.freeze([
@@ -54,21 +55,46 @@ export const wavePolicyHash = config =>
     .digest('hex');
 
 /**
+ * Whether a policy holds a value the Store would redact: a known secret value (`secrets`) or a
+ * provider-shaped credential, `Bearer` or `?token=` value (`redact`). Runs are persisted redacted,
+ * so such a policy would be recorded and executed as something else than the commit holds.
+ * @param {unknown} value
+ * @param {Record<string, unknown>} secrets
+ * @returns {boolean}
+ */
+function unsafePolicy(value, secrets) {
+  if (typeof value === 'string') return redact(value, secrets) !== value;
+  if (Array.isArray(value)) return value.some(item => unsafePolicy(item, secrets));
+  if (value && typeof value === 'object')
+    return Object.entries(value).some(([key, item]) => unsafePolicy(key, secrets) || unsafePolicy(item, secrets));
+  return false;
+}
+
+/**
  * The normalized configuration of `kodo.config.json` in `commit` (defaults when the file is
- * absent) and its policy hash. An unreadable or invalid file is `project_wave_policy_invalid`.
+ * absent) and its policy hash. The file is read raw (never redacted): what is parsed and hashed
+ * is exactly the policy that will be executed. An unreadable or invalid file is
+ * `project_wave_policy_invalid`; a policy holding a known secret or a value the Store would redact
+ * (`unsafePolicy`) is `project_wave_policy_unsafe`, before anything records or executes it.
  * @param {string} cwd a checkout of the repository
  * @param {string} commit
+ * @param {{ secrets?: Record<string, unknown> }} [options]
  */
-export async function wavePolicyAt(cwd, commit) {
+export async function wavePolicyAt(cwd, commit, { secrets = {} } = {}) {
   if (!sha(commit)) fail('wave_policy_invalid');
   const listed = await execute('git', ['ls-tree', '--name-only', commit, '--', CONFIG_FILE], {
     cwd,
     allowFailure: true,
+    rawOutput: true,
   });
   if (listed.code !== 0) fail('wave_policy_invalid');
   let file = {};
   if (listed.stdout.trim()) {
-    const shown = await execute('git', ['show', `${commit}:${CONFIG_FILE}`], { cwd, allowFailure: true });
+    const shown = await execute('git', ['show', `${commit}:${CONFIG_FILE}`], {
+      cwd,
+      allowFailure: true,
+      rawOutput: true,
+    });
     if (shown.code !== 0) fail('wave_policy_invalid');
     try {
       file = JSON.parse(shown.stdout);
@@ -83,6 +109,7 @@ export async function wavePolicyAt(cwd, commit) {
   } catch {
     fail('wave_policy_invalid');
   }
+  if (unsafePolicy(wavePolicyOf(config), secrets)) fail('wave_policy_unsafe');
   return { config, hash: wavePolicyHash(config) };
 }
 
@@ -91,9 +118,10 @@ export async function wavePolicyAt(cwd, commit) {
  * `draft.wavePolicy = {schemaVersion: 1, commit, hash}`. Other settings stay the caller's.
  * @param {{ project: string, config: Record<string, any>, wavePolicy?: any }} draft
  * @param {string} commit
+ * @param {{ secrets?: Record<string, unknown> }} [options]
  */
-export async function applyWavePolicy(draft, commit) {
-  const { config, hash } = await wavePolicyAt(draft.project, commit);
+export async function applyWavePolicy(draft, commit, options = {}) {
+  const { config, hash } = await wavePolicyAt(draft.project, commit, options);
   for (const field of WAVE_POLICY_FIELDS)
     if (config[field] === undefined) delete draft.config[field];
     else draft.config[field] = structuredClone(config[field]);
@@ -106,15 +134,16 @@ export async function applyWavePolicy(draft, commit) {
  * recorded hash, which is the policy of `run.wavePolicy.commit` (`policyCommit`). `headSha`, when
  * given, is the verified head: its policy must be the same, unless `kodo.config.json` is one of
  * `writePaths` (a task that changes the policy; its epic gate executes the new one).
- * Throws `project_wave_policy_mismatch`.
- * @param {{ run: any, policyCommit: string, headSha?: string, writePaths?: string[] }} input
+ * Throws `project_wave_policy_mismatch` (or `project_wave_policy_unsafe`, see wavePolicyAt).
+ * @param {{ run: any, policyCommit: string, headSha?: string, writePaths?: string[],
+ *   secrets?: Record<string, unknown> }} input
  */
-export async function assertWavePolicy({ run, policyCommit, headSha, writePaths = [] }) {
+export async function assertWavePolicy({ run, policyCommit, headSha, writePaths = [], secrets = {} }) {
   const own = wavePolicyHash(run.config);
   if (run.wavePolicy?.schemaVersion !== 1 || run.wavePolicy.commit !== policyCommit || run.wavePolicy.hash !== own)
     fail('wave_policy_mismatch');
-  if ((await wavePolicyAt(run.project, policyCommit)).hash !== own) fail('wave_policy_mismatch');
+  if ((await wavePolicyAt(run.project, policyCommit, { secrets })).hash !== own) fail('wave_policy_mismatch');
   if (!headSha || headSha === policyCommit) return;
-  if ((await wavePolicyAt(run.project, headSha)).hash !== own && !ownsPath(writePaths, CONFIG_FILE))
+  if ((await wavePolicyAt(run.project, headSha, { secrets })).hash !== own && !ownsPath(writePaths, CONFIG_FILE))
     fail('wave_policy_mismatch');
 }

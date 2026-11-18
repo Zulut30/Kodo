@@ -829,3 +829,36 @@ test('A wave project refuses an epic dependency cycle at create and appendMilest
     ),
   );
 });
+
+test('A wave project refuses an empty epic or milestone at create and appendMilestone; legacy keeps its rules', () => {
+  // Review finding (major): an empty epic stayed `proposed` and drain --retry-failed answered
+  // wave_dependency_unaccepted forever.
+  const create = spec =>
+    C.normalizeDirectorRecord(
+      'command',
+      legacyCommand({ op: 'create', spec }, { projectId: null, expectedRevision: null }),
+      options,
+    );
+  const empty = (spec, containers) =>
+    assert.throws(
+      () => create({ ...spec, execution: clone(wave) }),
+      error => error.code === 'project_container_empty' && JSON.stringify(error.containers) === containers,
+    );
+  const emptyEpic = { ...legacySpec(), epics: [epicSpec(), epicSpec('idle')] };
+  empty(emptyEpic, '[{"kind":"epic","id":"idle"}]');
+  const emptyMilestone = { ...legacySpec(), milestones: [milestoneSpec(), milestoneSpec('later')] };
+  empty(emptyMilestone, '[{"kind":"milestone","id":"later"}]');
+  assert.deepEqual(C.emptyContainers(emptyEpic.milestones, emptyEpic.epics, emptyEpic.tasks), [
+    { kind: 'epic', id: 'idle' },
+  ]);
+  for (const spec of [emptyEpic, emptyMilestone]) assert.doesNotThrow(() => create(spec), 'legacy keeps its rules');
+  assert.doesNotThrow(() => create({ ...legacySpec(), execution: clone(wave) }));
+  // appendMilestone: a new epic without a task of its own.
+  const reopen = action => C.assertProjectReopen({ snapshot: closedWave(), action });
+  assert.throws(
+    () => reopen(append({ epics: [epicSpec('e2', 'm2'), epicSpec('e3', 'm2')] })),
+    error =>
+      error.code === 'project_container_empty' && JSON.stringify(error.containers) === '[{"kind":"epic","id":"e3"}]',
+  );
+  assert.doesNotThrow(() => reopen(append()));
+});

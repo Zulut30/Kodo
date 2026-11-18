@@ -16,6 +16,7 @@ import {
   FOUNDATION_ID,
   MAX_TASK_INPUT_BYTES,
   compileBlueprint,
+  containerFindings,
   epicCycleFindings,
   finding,
   overlapFindings,
@@ -365,6 +366,7 @@ const RULES = `# Правила чертежа Kodo
 | \`blueprint_section_missing\`, \`blueprint_section_empty\` | Разделы PROJECT.md |
 | \`blueprint_owner_unknown\` | owner — одна из ролей |
 | \`blueprint_wave0_missing\`, \`blueprint_wave0_bypassed\`, \`blueprint_wave0_order\` | Волна 0 |
+| \`blueprint_container_empty\` | Пустой майлстоун или эпик: добавить в него эпик/задачу или удалить его |
 | \`blueprint_epic_cycle\` | Цикл зависимостей между эпиками: перенести задачи или объединить эпики |
 | \`blueprint_parallel_overlap\` | Пересечение writePaths параллельных задач |
 | \`split_required\` | Разделить задачу |
@@ -737,8 +739,9 @@ const MILESTONE_RULES = `# Правила нового майлстоуна
 5. Вход каждой задачи — до ${MAX_TASK_INPUT_BYTES} байт UTF-8; Kodo задачи не режет.
 6. owner — одна из ролей: ${FACTORY_ROLES.join(', ')}.
 7. Новые эпики не образуют цикл: если задача эпика X зависит от задачи эпика Y, никакая задача Y не зависит (через задачи любых эпиков) от задач X.
+8. В майлстоуне есть хотя бы один эпик, в каждом новом эпике — хотя бы одна задача.
 
-Коды: \`milestone_shape\`, \`milestone_task_count\`, \`milestone_id_conflict\`, \`milestone_foreign_parent\`, \`milestone_dependency_unknown\`, \`milestone_dependency_not_accepted\`, \`milestone_snapshot_invalid\`, \`milestone_snapshot_incomplete\`, \`milestone_spec_invalid\`, \`blueprint_owner_unknown\`, \`blueprint_epic_cycle\`, \`blueprint_parallel_overlap\`, \`split_required\`.
+Коды: \`milestone_shape\`, \`milestone_task_count\`, \`milestone_id_conflict\`, \`milestone_foreign_parent\`, \`milestone_dependency_unknown\`, \`milestone_dependency_not_accepted\`, \`milestone_snapshot_invalid\`, \`milestone_snapshot_incomplete\`, \`milestone_spec_invalid\`, \`blueprint_owner_unknown\`, \`blueprint_container_empty\`, \`blueprint_epic_cycle\`, \`blueprint_parallel_overlap\`, \`split_required\`.
 `;
 
 function milestoneTemplate(snapshot) {
@@ -1026,6 +1029,8 @@ export function lintMilestone(milestone, snapshot, options = {}) {
   const others = current.tasks.filter(task => ![...CLOSED, 'cancelled'].includes(task.status));
   findings.push(
     ...ownerFindings(normalized.tasks),
+    // Raw task parents: normalization re-homes a foreign epicId (milestone_foreign_parent reports it).
+    ...containerFindings({ ...normalized, tasks: milestone.tasks.filter(isPlain) }),
     ...epicCycleFindings([...current.tasks, ...fresh], { fresh: new Set(normalized.epics.map(epic => epic.id)) }),
     ...overlapFindings(parallelOverlaps(normalized.tasks, { ancestors, others })),
     ...taskInputFindings({ project: current.project, tasks: normalized.tasks, contracts, knownValues }),
