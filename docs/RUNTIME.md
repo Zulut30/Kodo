@@ -256,6 +256,8 @@ kodo architecture check --project D:\Projects\example --base FULL_COMMIT_SHA --e
 
 Usage нормализуется в nullable `inputTokens`, `cachedInputTokens`, `outputTokens`, `cacheReadTokens`, `cacheWriteTokens`, `totalTokens`, со `source` и `semantics`. У Codex input уже включает cached input, поэтому total = input + output. У Claude cache read/write отдельны: total = input + cacheRead + cacheWrite + output только при известных компонентах. Невалидные, отсутствующие и не предоставленные host-клиентом значения остаются `null`. Агрегат не заменяет неизвестные нулями и показывает полноту каждого поля; смешанная семантика помечается `mixed`. Стоимость подписки в USD не выводится из токенов. [Парное измерение полного времени и ограничения](BENCHMARK.md).
 
+Read-only отчёт по этим метрикам, времени стадий, ожиданиям, попыткам, неудачам и блокерам Run или Project строит `kodo report RUN_ID|--project PROJECT_ID [--json]`: [OBSERVABILITY](OBSERVABILITY.md).
+
 ## Аудит сохранённого запуска
 
 `kodo audit RUN_ID [--json]` позволяет проверить сохранённую политику стандартных навыков и краткие квитанции проверок, ревью и доставки. Требуется только установленный CLI с этой командой и локальное состояние запуска; подготовка проекта из начала документа к аудиту не относится.

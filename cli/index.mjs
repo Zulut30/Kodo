@@ -28,6 +28,9 @@ kodo project resume PROJECT_ID [--retry-failed] [--command-id UUID] [--json]
 kodo project cancel|pause PROJECT_ID [--command-id UUID] [--json]
 kodo project reprioritize PROJECT_ID TASK_ID --priority 0..100 [--command-id UUID] [--json]
 kodo project approve-risk PROJECT_ID TASK_ID --reason TEXT [--command-id UUID] [--json]
+kodo project report PROJECT_ID [--json]
+kodo report RUN_ID [--json]
+kodo report --project PROJECT_ID [--json]
 kodo jobs list [--queue QUEUE] [--json]
 kodo jobs status JOB_ID [--json]
 kodo research status [--project PATH] [--json]
@@ -110,6 +113,13 @@ async function main() {
   if (command === 'jobs') {
     const { jobsCli } = await import('../runtime/job-cli.mjs');
     const result = await jobsCli(argv);
+    console.log(result.output);
+    process.exitCode = result.exitCode;
+    return;
+  }
+  if (command === 'report') {
+    const { reportCli } = await import('../runtime/report-cli.mjs');
+    const result = await reportCli(argv);
     console.log(result.output);
     process.exitCode = result.exitCode;
     return;
