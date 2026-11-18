@@ -111,7 +111,10 @@ const valueOptions = [
   'title',
   'watch-path',
 ];
-const optionKinds = new Map([...flagOptions.map(name => [name, 'flag']), ...valueOptions.map(name => [name, 'value'])]);
+/** @type {Map<string, 'flag' | 'value'>} */
+const optionKinds = new Map();
+for (const name of flagOptions) optionKinds.set(name, 'flag');
+for (const name of valueOptions) optionKinds.set(name, 'value');
 // The options a countable `node --test` may carry: they neither select tests nor move the summary
 // off stdout nor change which tests run. Anything else (a filter, a rerun state file, a tag filter,
 // watch mode, an unknown option) gives no countable summary: a filter without matches can report
