@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { realpath } from 'node:fs/promises';
+import { lstat, realpath } from 'node:fs/promises';
 import { execute } from './command.mjs';
 import { git, makeWorktree } from './workspace.mjs';
 import { ownsPath } from './contracts.mjs';
@@ -101,10 +101,42 @@ async function integrationWorktree(worktree) {
   return branch;
 }
 
-// ...and it must also be clean.
+// Per-worktree state of an unfinished Git operation. A merge may start only when
+// none exists: a merge or cherry-pick with no net change keeps its state file
+// while `git status --porcelain` is empty.
+const unfinishedStates = [
+  'MERGE_HEAD',
+  'CHERRY_PICK_HEAD',
+  'REVERT_HEAD',
+  'rebase-merge',
+  'rebase-apply',
+  'sequencer',
+  'BISECT_LOG',
+];
+
+async function unfinishedOperations(worktree) {
+  const paths = (
+    await git(worktree, [
+      'rev-parse',
+      '--path-format=absolute',
+      ...unfinishedStates.flatMap(name => ['--git-path', name]),
+    ])
+  ).split(/\r?\n/);
+  if (paths.length !== unfinishedStates.length) fail('integration_worktree_invalid');
+  const found = [];
+  for (const [index, name] of unfinishedStates.entries())
+    if (await lstat(path.resolve(worktree, paths[index])).catch(() => null)) found.push(name);
+  return found;
+}
+
+// ...and it must also be clean, with no unfinished operation.
 async function assertIntegrationWorktree(worktree) {
   const branch = await integrationWorktree(worktree);
-  if (await git(worktree, ['status', '--porcelain=v1', '--untracked-files=all'])) fail('integration_worktree_invalid');
+  if (
+    (await git(worktree, ['status', '--porcelain=v1', '--untracked-files=all'])) ||
+    (await unfinishedOperations(worktree)).length
+  )
+    fail('integration_worktree_invalid');
   return branch;
 }
 
@@ -168,17 +200,22 @@ async function verifiedMerge(worktree, before, taskHead, writePaths, commit = 'H
   );
 }
 
-// A crash after savePending but before the merge commit leaves MERGE_HEAD and a
-// changed index. Only our own interrupted merge (HEAD = the saved `before`,
-// MERGE_HEAD = this task head) is aborted; any other state is refused later.
+// A crash after savePending but before the merge commit leaves MERGE_HEAD. Only
+// our own interrupted merge (the only unfinished operation, HEAD = the saved
+// `before`, MERGE_HEAD = this task head) is aborted. Any other unfinished
+// operation, or one without `pending`, belongs to someone else: it is refused
+// at once and left untouched.
 async function abandonInterruptedMerge(worktree, pending, taskHead) {
+  await integrationWorktree(worktree);
+  const unfinished = await unfinishedOperations(worktree);
+  if (!unfinished.length) return;
+  if (!pending || unfinished.length !== 1 || unfinished[0] !== 'MERGE_HEAD') fail('integration_worktree_invalid');
   const mergeHead = await execute('git', ['rev-parse', '--verify', '--quiet', 'MERGE_HEAD'], {
     cwd: worktree,
     allowFailure: true,
   });
-  if (mergeHead.code !== 0) return;
-  await integrationWorktree(worktree);
-  if (!pending || mergeHead.stdout.trim() !== taskHead || (await headOf(worktree)) !== pending.before) return;
+  if (mergeHead.code !== 0 || mergeHead.stdout.trim() !== taskHead || (await headOf(worktree)) !== pending.before)
+    fail('integration_worktree_invalid');
   await abortMerge(worktree, pending.before);
 }
 
