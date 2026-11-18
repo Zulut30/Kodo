@@ -35,6 +35,9 @@ kodo project bootstrap "IDEA" --root PATH [--prepare] [--client codex|claude-cod
 kodo project apply-spec --root PATH [--file SPEC_JSON] [--command-id UUID] [--json]
 kodo project extend PROJECT_ID "FEATURE" [--prepare] [--client codex|claude-code] [--model MODEL] [--command-id UUID] [--json]
 kodo project append-milestone PROJECT_ID --file MILESTONE_JSON [--command-id UUID] [--json]
+kodo project report PROJECT_ID [--json]
+kodo report RUN_ID [--json]
+kodo report --project PROJECT_ID [--json]
 kodo jobs list [--queue QUEUE] [--json]
 kodo jobs status JOB_ID [--json]
 kodo research status [--project PATH] [--json]
@@ -117,6 +120,13 @@ async function main() {
   if (command === 'jobs') {
     const { jobsCli } = await import('../runtime/job-cli.mjs');
     const result = await jobsCli(argv);
+    console.log(result.output);
+    process.exitCode = result.exitCode;
+    return;
+  }
+  if (command === 'report') {
+    const { reportCli } = await import('../runtime/report-cli.mjs');
+    const result = await reportCli(argv);
     console.log(result.output);
     process.exitCode = result.exitCode;
     return;

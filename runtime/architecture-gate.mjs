@@ -88,6 +88,9 @@ async function pins() {
     'project-blueprint.mjs',
     'project-bootstrap.mjs',
     'project-cli-blueprint.mjs',
+    'telemetry.mjs',
+    'report-cli.mjs',
+    'report-state.mjs',
   ];
   const lock = new URL('../package-lock.json', import.meta.url);
   const urls = [

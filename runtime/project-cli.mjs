@@ -75,8 +75,17 @@ function human(report) {
 // Wave and blueprint commands keep their own strict parsers: drain, the pull protocol of
 // external chats, and the project factory (bootstrap, apply-spec, extend, append-milestone).
 const blueprintActions = new Set(['bootstrap', 'apply-spec', 'extend', 'append-milestone']);
+/** Read-only alias: `project report PROJECT_ID [--json]` is `report --project PROJECT_ID [--json]`. */
+async function reportAlias(argv, ports) {
+  const { reportCli } = await import('./report-cli.mjs');
+  const rest = argv.slice(1),
+    at = rest.findIndex(arg => typeof arg === 'string' && !arg.startsWith('-'));
+  return reportCli(at < 0 ? rest : [...rest.slice(0, at), '--project', ...rest.slice(at)], ports);
+}
+
 async function waveCommand(argv) {
   const action = Array.isArray(argv) ? argv[0] : undefined;
+  if (action === 'report') return reportAlias;
   if (action === 'drain') return (await import('./project-cli-wave.mjs')).projectWaveCli;
   if (action === 'next-wave' || action === 'complete-task')
     return (await import('./project-cli-external.mjs')).projectExternalCli;

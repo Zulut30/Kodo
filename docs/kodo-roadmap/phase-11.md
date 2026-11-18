@@ -2,6 +2,8 @@
 
 Статус на 2026-11-10: **реализация завершена, кандидат на приёмку.** Ветка `kodo/11-delivery-recovery` поверх этапа 10. Проверки замороженного head, ревью и CI перечислены в описании PR этапа.
 
+Приёмка: **ACCEPTED** — [PR #21](https://github.com/Zulut30/Kodo/pull/21) влит в `main` коммитом `55fc4ba` 2026-11-10; обязательные проверки `check (ubuntu-latest, 24)`, `check (windows-latest, 24)` и `kodo/review` — SUCCESS на head PR. Строка выше сохранена как исторический статус кандидата.
+
 План требовал сначала аудита и реализации только отсутствующего. Аудит и его итог — в [DELIVERY-RECOVERY](../DELIVERY-RECOVERY.md); решения — в [ADR-0013](../decisions/0013-delivery-operation-journal.md).
 
 ## Что сделано

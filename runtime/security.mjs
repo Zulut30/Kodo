@@ -169,13 +169,43 @@ function sameSecrets(left, right) {
   return secretNames.every(name => (left[name] || '') === (right[name] || ''));
 }
 
+/** Decrypt only: DPAPI `Unprotect` for the current user with the credential store's entropy. */
+export function decryptWindowsCredentials(ciphertext) {
+  return windowsCrypt('decrypt', ciphertext);
+}
+
+/**
+ * Read-only decoding of a credential store file's text: the envelope, its
+ * protection and, on Windows, its decryption. No file, directory or permission
+ * is touched. Any malformed input throws `credential_store`.
+ * @param {string} text
+ * @param {{ platform?: NodeJS.Platform, decrypt?: (ciphertext: Buffer) => Promise<Buffer> }} [options]
+ * @returns {Promise<Record<string, string>>}
+ */
+export async function decodeCredentials(
+  text,
+  { platform = process.platform, decrypt = decryptWindowsCredentials } = {},
+) {
+  const envelope = JSON.parse(text.replace(/^﻿/, ''));
+  const protection = platform === 'win32' ? 'windows-dpapi-current-user' : 'file-permissions';
+  if (envelope?.version !== 1 || envelope.protection !== protection) throw credentialError();
+  if (platform !== 'win32') return onlySecrets(envelope.data);
+  if (typeof envelope.data !== 'string' || !/^[A-Za-z0-9+/]+={0,2}$/.test(envelope.data)) throw credentialError();
+  const plaintext = await decrypt(Buffer.from(envelope.data, 'base64'));
+  try {
+    return onlySecrets(JSON.parse(plaintext.toString('utf8')));
+  } finally {
+    plaintext.fill(0);
+  }
+}
+
 // The injected crypto/permission operations keep migration failure tests portable.
 export function createCredentialStore({
   directory = credentialRoot(),
   legacyDirectory = stateHome(),
   platform = process.platform,
   encrypt = input => windowsCrypt('encrypt', input),
-  decrypt = input => windowsCrypt('decrypt', input),
+  decrypt = decryptWindowsCredentials,
   securePath = (target, isDirectory) => secureCredentialPath(target, isDirectory, platform),
 } = {}) {
   const file = path.join(path.resolve(directory), platform === 'win32' ? 'credentials.dpapi.json' : 'credentials.json');
@@ -190,16 +220,7 @@ export function createCredentialStore({
       await securePath(filename, false);
       const text = await readFile(filename, 'utf8');
       if (text.length > 1024 * 1024) throw credentialError();
-      const envelope = JSON.parse(text.replace(/^\uFEFF/, ''));
-      if (envelope.version !== 1 || envelope.protection !== protection) throw credentialError();
-      if (platform !== 'win32') return onlySecrets(envelope.data);
-      if (typeof envelope.data !== 'string' || !/^[A-Za-z0-9+/]+={0,2}$/.test(envelope.data)) throw credentialError();
-      const plaintext = await decrypt(Buffer.from(envelope.data, 'base64'));
-      try {
-        return onlySecrets(JSON.parse(plaintext.toString('utf8')));
-      } finally {
-        plaintext.fill(0);
-      }
+      return await decodeCredentials(text, { platform, decrypt });
     } catch (error) {
       if (error.code === 'ENOENT') return null;
       throw credentialError();
