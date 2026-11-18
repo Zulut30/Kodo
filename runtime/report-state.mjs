@@ -54,8 +54,8 @@ try {
     if ($rule.AccessControlType -eq 'Allow' -and $rule.IdentityReference.Value -notin @($user.Value,$system.Value)) { exit 1 }
   }
 } catch { exit 1 }`;
-const powershell = () =>
-  path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+const systemRoot = () => process.env.SystemRoot || 'C:\\Windows';
+const powershell = () => path.join(systemRoot(), 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
 
 /**
  * Create a new private directory for a copy under `root` before any private byte exists.
@@ -77,7 +77,8 @@ export async function createPrivateDirectory(root) {
         '-EncodedCommand',
         Buffer.from(createScript, 'utf16le').toString('base64'),
       ],
-      { input: directory, env: workerEnvironment(), timeoutMs: 30000 },
+      // PowerShell needs SystemRoot to start; the same root also locates it.
+      { input: directory, env: { ...workerEnvironment(), SystemRoot: systemRoot() }, timeoutMs: 30000 },
     );
     return directory;
   }
@@ -159,7 +160,23 @@ function snapshotRoot(temporaryRoot, protectedRoots) {
     const guarded = canonical(item);
     if (contains(guarded, root) || contains(root, guarded)) fail('report_unavailable');
   }
+  if (!trustedRoot(root)) fail('report_unavailable');
   return root;
+}
+
+/**
+ * On POSIX another account must not be able to rename or replace a directory created in
+ * the root: it belongs to root or to this user and is not writable by others unless it is
+ * sticky (like /tmp). Windows copies get a protected ACL at creation instead.
+ * @param {string} root
+ * @param {{ platform?: string, stat?: (file: string) => import('node:fs').Stats, uid?: number }} [ports]
+ */
+export function trustedRoot(root, { platform = process.platform, stat = statSync, uid = process.getuid?.() } = {}) {
+  if (platform === 'win32') return true;
+  const info = stat(root);
+  const owner = info.uid === 0 || info.uid === uid;
+  const othersWrite = (info.mode & 0o022) !== 0;
+  return info.isDirectory() && owner && (!othersWrite || (info.mode & 0o1000) !== 0);
 }
 
 /**

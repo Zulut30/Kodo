@@ -26,6 +26,7 @@ import { workerEnvironment } from '../runtime/security.mjs';
 import { reportCli } from '../runtime/report-cli.mjs';
 import {
   createPrivateDirectory,
+  trustedRoot,
   readRedactionSecrets,
   readReportState,
   REMOVE_ATTEMPTS,
@@ -868,4 +869,29 @@ $ids=@($a.Access | ForEach-Object { $_.IdentityReference.Translate([Security.Pri
   const acl = JSON.parse(result.stdout);
   assert.equal(acl.protected, true);
   assert.deepEqual([...new Set([acl.ids].flat())].sort(), [acl.user, 'S-1-5-18'].sort());
+});
+
+test('a POSIX temporary root another account could rename into is not trusted for copies', () => {
+  const stats = (mode, uid) => () => ({ mode, uid, isDirectory: () => true });
+  const check = (mode, uid) => trustedRoot('/x', { platform: 'linux', stat: stats(mode, uid), uid: 1000 });
+  assert.equal(check(0o40700, 1000), true, 'own private root');
+  assert.equal(check(0o41777, 0), true, 'sticky shared /tmp owned by root');
+  assert.equal(check(0o40777, 0), false, 'shared writable without sticky bit');
+  assert.equal(check(0o40775, 1000), false, 'group writable without sticky bit');
+  assert.equal(check(0o40700, 2000), false, 'owned by another account');
+  assert.equal(trustedRoot('C:/x', { platform: 'win32' }), true, 'Windows copies get a protected ACL at creation');
+});
+
+test('the text report shows stages with saved observations even when their denominator is unknown', async t => {
+  const f = await fixture(t);
+  const store = new Store(f.home, {});
+  try {
+    const run = store.getRun(f.runId);
+    store.updateRun(f.runId, { metrics: { ...run.metrics, historyComplete: false } });
+  } finally {
+    store.close?.();
+  }
+  const { exitCode, output } = await reportCli([f.runId], { home: f.home, secrets: {} });
+  assert.equal(exitCode, 0, output);
+  assert.match(output, /planning: unknown \(\d+\/unknown known, measured [^;]+; unknown sessions;/);
 });

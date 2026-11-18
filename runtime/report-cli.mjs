@@ -162,10 +162,11 @@ function humanRun(report) {
     `Wall time: ${time(timing.wallMs)} (created ${value(timing.createdAt)}, finished ${timing.finishedAt ?? 'not finished'})`,
     'Stages (sum of measured durations):',
     ...Object.entries(timing.stages)
-      .filter(([, stage]) => stage.total > 0)
+      // A stage with observations is shown even when its denominator is unknown (incomplete history).
+      .filter(([, stage]) => stage.total > 0 || stage.known > 0)
       .map(
         ([name, stage]) =>
-          `  ${name}: ${time(stage.durationMs)} (${stage.known}/${stage.total} known; ${value(stage.sessions)} sessions; ${stage.source})`,
+          `  ${name}: ${time(stage.durationMs)} (${stage.known}/${value(stage.total)} known${measuredPart(stage)}; ${value(stage.sessions)} sessions; ${value(stage.source)})`,
       ),
     `Queue wait: ${time(queue.waitMs)} (${queue.jobs} jobs, ${queue.known}/${queue.total} waits known${measuredPart(queue)}); CI wait: ${time(checks.ci.waitMs)} (${checks.ci.polls} polls${measuredPart(checks.ci)})`,
     `Checks: ${checks.runs.length} saved results, ${checks.executions} started (${checks.unclosed} without result), ${checks.reused} reused; duration ${time(checks.totalMs)}`,
