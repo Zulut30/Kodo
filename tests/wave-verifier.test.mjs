@@ -13,7 +13,7 @@ import { evaluateWaveTransition } from '../runtime/project-wave-evidence.mjs';
 import { isCurrentBehaviorReceipt } from '../runtime/behavior-gate.mjs';
 import { fixture, fakeServices, git } from './helpers/engine-fixture.mjs';
 
-const { buildGateInput, gateBindingFor } = contracts;
+const { buildGateInput, buildGateManifest, gateBindingFor } = contracts;
 const done = { sessionId: 'worker', output: { summary: 'done', checks: [], complete: true } };
 const isRepair = call => /Repair confirmed failures/.test(call.prompt);
 const smoke = { command: process.execPath, args: ['smoke.mjs'] };
@@ -268,6 +268,85 @@ test('createGateRunDraft checks the merges and the integration head with Git bef
   await commit(e.integration.worktree, 'src/late.mjs', 'export const late = true;\n');
   await assert.rejects(() => e.draft(gate, { installGateRun: counted }), { code: 'gate_head_stale' });
   assert.equal(installs, 0, 'an invalid gate never reaches the installer');
+});
+
+test('A gate range is never empty: the store and createGateRunDraft refuse a base other than the first parent of the earliest covered merge', async t => {
+  // Review finding F1-1: base = head after all merges installed a gate over an empty diff.
+  const e = await epic(t);
+  for (const [label, baseSha] of [
+    ['base = head', e.headSha],
+    ['base after the earliest merge', e.merges[0].mergeCommit],
+  ])
+    await assert.rejects(e.reserve({ baseSha }), { code: 'project_gate_invalid' }, label);
+  assert.deepEqual(e.repo.snapshot(e.projectId).gates, []);
+  const gate = await e.reserve();
+  let installs = 0;
+  const counted = async input => {
+    installs++;
+    return e.repo.installGateRun(input);
+  };
+  // Forged gate records never reach the installer either.
+  for (const [label, forged] of [
+    ['base = head', { ...gate, baseSha: gate.headSha }],
+    ['base after the earliest merge', { ...gate, baseSha: e.merges[0].mergeCommit }],
+  ])
+    await assert.rejects(e.draft(forged, { installGateRun: counted }), { code: 'gate_invalid' }, label);
+  // The first parent of each merge must be the `before` its task Run recorded.
+  const [first] = e.merges;
+  const recorded = e.store.getRun(first.runId);
+  e.store.updateRun(first.runId, { integration: { ...recorded.integration, before: e.headSha } });
+  await assert.rejects(e.draft(gate, { installGateRun: counted }), { code: 'gate_invalid' }, 'first parent');
+  e.store.updateRun(first.runId, { integration: recorded.integration });
+  assert.equal(installs, 0);
+  const run = await e.draft(gate, { installGateRun: counted });
+  assert.deepEqual([run.baseSha, run.headSha], [e.baseSha, e.headSha], 'the range holds both merges');
+  // The full contracts of the covered tasks are the gate manifest artifact the input binds.
+  const snapshot = e.repo.snapshot(e.projectId);
+  const envelope = JSON.parse(await readFile(run.gateManifest.path, 'utf8'));
+  assert.deepEqual(
+    envelope.value,
+    buildGateManifest({ project: snapshot.project, gate, tasks: snapshot.tasks }).manifest,
+  );
+});
+
+test('An exact repeat of an installed gate returns its Run after the branch moved', async t => {
+  // Review finding F1-3b: the repeat checked the head first and failed with gate_head_stale.
+  const e = await epic(t);
+  const gate = await e.reserve();
+  const run = await e.draft(gate);
+  await commit(e.integration.worktree, 'src/late.mjs', 'export const late = true;\n');
+  assert.deepEqual(await e.draft(gate), run);
+  assert.deepEqual(await e.draft(e.repo.snapshot(e.projectId).gates[0]), run);
+});
+
+test('A quick-mode gate Run keeps two repair rounds: a repair is verified again', async t => {
+  const e = await epic(t);
+  const run = await e.draft(await e.reserve(), { input: { mode: 'quick' } });
+  assert.equal(run.executionMode.selected, 'quick');
+  assert.equal(run.executionMode.profile.repairRounds, 1, 'the quick profile alone allows one');
+  assert.equal(run.config.repairRounds, 2);
+});
+
+test('A reservation whose head went stale before its install is replaced by one on the current head', async t => {
+  // Review finding F1-3a: the stale reservation blocked every new one with project_gate_exists.
+  const e = await epic(t);
+  const stale = await e.reserve();
+  await commit(e.integration.worktree, 'src/late.mjs', 'export const late = true;\n');
+  await assert.rejects(e.draft(stale), { code: 'gate_head_stale' });
+  const head = git(e.integration.worktree, 'rev-parse', 'HEAD');
+  const fresh = await e.reserve({ headSha: head });
+  const gates = e.repo.snapshot(e.projectId).gates;
+  assert.deepEqual(
+    gates.map(row => [row.number, row.installed, row.supersededBy ?? null]),
+    [
+      [1, false, fresh.id],
+      [2, false, null],
+    ],
+  );
+  await assert.rejects(e.draft(gates[0]), { code: 'gate_head_stale' });
+  const run = await e.draft(fresh);
+  assert.deepEqual([run.id, run.headSha], [fresh.runId, head]);
+  assert.equal(e.repo.snapshot(e.projectId).gates[1].installed, true);
 });
 
 test('Epic gate verifies once with review, executes smoke and records it', async t => {

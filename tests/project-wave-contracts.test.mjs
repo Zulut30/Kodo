@@ -484,6 +484,16 @@ test('Gate records validate the epic-milestone-project chain and merges', () => 
   assert.throws(() =>
     C.normalizeDirectorRecord('gate', gateRecord({ updatedAt: '2026-11-16T00:00:00.000Z' }), options),
   );
+  // A reservation replaced before its install names its successor; absent, the bytes are unchanged.
+  const successor = '99999999-9999-4999-8999-999999999990';
+  const superseded = gateRecord({ supersededBy: successor });
+  assert.deepEqual(C.normalizeDirectorRecord('gate', superseded, options), superseded);
+  assert.equal(JSON.stringify(C.normalizeDirectorRecord('gate', gateRecord(), options)), JSON.stringify(gateRecord()));
+  for (const bad of [
+    gateRecord({ installed: true, supersededBy: successor }),
+    gateRecord({ supersededBy: gateRecord().id }),
+  ])
+    assert.throws(() => C.normalizeDirectorRecord('gate', bad, options), { code: 'project_gate_invalid' });
 });
 
 test('Gate binding hashes canonical merges and gate input is bounded and execution-free', () => {
@@ -521,20 +531,33 @@ test('Gate binding hashes canonical merges and gate input is bounded and executi
   assert.equal(C.buildGateInput({ project: s.project, gate, tasks: [...s.tasks].reverse() }, options), text);
   const newline = text.indexOf('\n');
   assert.ok(newline > 0);
+  // The Run text is a compact summary bound to the gate manifest by its SHA-256.
   const body = JSON.parse(text.slice(newline + 1));
-  assert.deepEqual(Object.keys(body), ['schemaVersion', 'projectContext', 'gate', 'tasks']);
-  assert.equal(body.schemaVersion, 1);
+  assert.deepEqual(Object.keys(body), ['schemaVersion', 'projectId', 'gate', 'taskCount', 'manifest']);
+  assert.equal(body.schemaVersion, 2);
+  assert.equal(body.projectId, projectId);
   assert.deepEqual(body.gate, { containers: gate.containers, baseSha: gate.baseSha, headSha: gate.headSha });
+  assert.equal(body.taskCount, 2);
+  const built = C.buildGateManifest({ project: s.project, gate, tasks: s.tasks });
+  assert.deepEqual(body.manifest, { kind: 'gate-manifest', sha256: built.sha256, bytes: built.bytes });
+  assert.equal(built.sha256, sha(JSON.stringify(built.manifest)));
+  assert.equal(built.bytes, Buffer.byteLength(JSON.stringify(built.manifest)));
+  // The manifest holds the frozen contracts of every covered task in merge order.
+  const manifest = built.manifest;
+  assert.deepEqual(Object.keys(manifest), ['schemaVersion', 'projectContext', 'gate', 'tasks']);
+  assert.equal(manifest.schemaVersion, 1);
+  assert.deepEqual(manifest.gate, body.gate);
   assert.deepEqual(
-    body.tasks.map(t => t.taskId),
+    manifest.tasks.map(t => t.taskId),
     ['b', 'a'],
   );
   const taskInput = JSON.parse(
     C.buildDirectorTaskInput({ project: s.project, task: s.tasks[1] }, options).split('\n')[1],
   );
-  assert.deepEqual(body.projectContext, taskInput.projectContext);
-  assert.deepEqual(body.tasks[0], taskInput.task);
+  assert.deepEqual(manifest.projectContext, taskInput.projectContext);
+  assert.deepEqual(manifest.tasks[0], taskInput.task);
   assert.doesNotMatch(text, /execution|wave/);
+  assert.doesNotMatch(JSON.stringify(manifest), /execution|wave/);
   assert.throws(() => C.buildGateInput({ project: s.project, gate, tasks: [s.tasks[0]] }), {
     code: 'project_identity',
   });
@@ -550,6 +573,8 @@ test('Gate binding hashes canonical merges and gate input is bounded and executi
     },
   );
 
+  // Review finding F1-4: the size of the covered contracts no longer bounds the gate input;
+  // tasks that overflowed the 64 KiB Run text are carried by the manifest.
   const ids = Array.from({ length: 7 }, (_, i) => 'big-' + i);
   const tasks = ids.map(id => ({ ...taskSpec(id, { description: 'x'.repeat(11000) }), ...meta(1, 'integrated') }));
   const merges = ids.map((taskId, i) => ({
@@ -558,18 +583,12 @@ test('Gate binding hashes canonical merges and gate input is bounded and executi
     runId: `${String(i + 1).padStart(8, '0')}-1111-4111-8111-111111111111`,
     mergeCommit: String(i + 1).repeat(40),
   }));
-  assert.ok(
-    Buffer.byteLength(
-      C.buildGateInput({
-        project: s.project,
-        gate: gateRecord({ merges: merges.slice(0, 5) }),
-        tasks: tasks.slice(0, 5),
-      }),
-    ) <= 65536,
-  );
-  assert.throws(() => C.buildGateInput({ project: s.project, gate: gateRecord({ merges }), tasks }), {
-    code: 'project_gate_too_large',
-  });
+  const big = C.buildGateInput({ project: s.project, gate: gateRecord({ merges }), tasks });
+  assert.ok(Buffer.byteLength(big) < 2048, 'a compact summary');
+  const bigManifest = C.buildGateManifest({ project: s.project, gate: gateRecord({ merges }), tasks });
+  assert.ok(bigManifest.bytes > 7 * 11000);
+  assert.equal(bigManifest.manifest.tasks.length, 7);
+  assert.equal(JSON.parse(big.slice(big.indexOf('\n') + 1)).manifest.sha256, bigManifest.sha256);
 });
 
 test('appendMilestone and reserveGate actions normalize strictly; events accept gate entities', () => {

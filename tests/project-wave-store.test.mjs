@@ -108,10 +108,17 @@ async function fixture(t) {
     rmSync(temp, { recursive: true, force: true });
   });
   const home = path.join(temp, 'state');
+  // Fixture SHAs are not Git objects: the Git range of a reservation is a fake port here
+  // (tests/wave-verifier.test.mjs covers the real Git one).
+  const ranges = { refused: new Set() };
+  const gateRange = async ({ baseSha, headSha }) => !ranges.refused.has(`${baseSha}..${headSha}`);
   const open = async () => {
     const store = new Store(home, {});
     stores.push(store);
-    return { store, repo: await openProjectStore({ store, contracts, authorizeTransition: async () => undefined }) };
+    return {
+      store,
+      repo: await openProjectStore({ store, contracts, authorizeTransition: async () => undefined, gateRange }),
+    };
   };
   const { store, repo } = await open();
   let roots = 0;
@@ -154,7 +161,23 @@ async function fixture(t) {
     await drive(projectId, 'task', taskId, ['accepted']);
   };
   const forward = ['ready', 'running', 'verifying', 'integrated', 'accepted'];
-  return { temp, home, store, repo, open, root, command, run, create, drive, integrate, accept, current, forward };
+  return {
+    temp,
+    home,
+    store,
+    repo,
+    open,
+    root,
+    command,
+    run,
+    create,
+    drive,
+    integrate,
+    accept,
+    current,
+    forward,
+    ranges,
+  };
 }
 const waveSpec = (root, tasks = [taskSpec('a'), taskSpec('b', { dependsOn: ['a'] })]) => ({
   ...legacySpec(root),
@@ -226,6 +249,12 @@ function gateDraft(repo, projectId, gate) {
     cwd: path.join(s.project.root, 'fake-worktrees', 'integration'),
     branch: 'kodo/wave-gate',
     directorBinding: contracts.gateBindingFor(gate, options),
+    gateManifest: {
+      path: path.join(s.project.root, 'fake-artifacts', 'evidence', `gate-manifest-${'a'.repeat(64)}.json`),
+      sha256: 'a'.repeat(64),
+      bytes: 10,
+      headSha: gate.headSha,
+    },
   };
 }
 const rows = (store, projectId) =>
@@ -486,7 +515,7 @@ test('reserveGate validates scope, merges and retries; installGateRun binds exac
   const reserve = (extra = {}) => ({
     op: 'reserveGate',
     containers,
-    baseSha: '1'.repeat(40),
+    baseSha: '0'.repeat(40),
     headSha: '3'.repeat(40),
     merges: [mergeOf(a), mergeOf(b, '5'.repeat(40))],
     retry: false,
@@ -612,10 +641,40 @@ test('reserveGate validates scope, merges and retries; installGateRun binds exac
   );
   assert.equal(gates[1].id, retried.entity.id);
   assert.notEqual(gates[1].runId, gate.runId);
-  await assert.rejects(f.run(pid, reserve({ retry: true })), { code: 'project_gate_exists' });
+  // An uninstalled reservation on the same head is not duplicated.
+  await assert.rejects(f.run(pid, reserve({ retry: true, headSha: '6'.repeat(40) })), { code: 'project_gate_exists' });
   // The installed, superseded gate still replays its own (now failed) Run and nothing else.
   const replayed = await f.repo.installGateRun({ binding, runDraft });
   assert.deepEqual([replayed.id, replayed.state], [gate.runId, 'failed']);
+
+  // Review finding F1-3: an uninstalled reservation whose head went stale is replaced atomically
+  // by a reservation on the current head; the stale one names its successor and never installs.
+  const stale = gates[1];
+  const replacing = await f.run(pid, reserve({ headSha: '7'.repeat(40) }));
+  const replaced = f.repo.snapshot(pid).gates;
+  assert.deepEqual(
+    replaced.map(g => [g.number, g.installed, g.supersededBy ?? null, g.headSha.slice(0, 1)]),
+    [
+      [1, true, null, '3'],
+      [2, false, replacing.entity.id, '6'],
+      [3, false, null, '7'],
+    ],
+  );
+  assert.equal(f.repo.history(pid).events.at(-1).type, 'reserveGate');
+  await assert.rejects(
+    f.repo.installGateRun({
+      binding: contracts.gateBindingFor(stale, options),
+      runDraft: gateDraft(f.repo, pid, stale),
+    }),
+    { code: 'project_binding_conflict' },
+    'a superseded reservation is never installed',
+  );
+  const current = replaced[2];
+  const installed = await f.repo.installGateRun({
+    binding: contracts.gateBindingFor(current, options),
+    runDraft: gateDraft(f.repo, pid, current),
+  });
+  assert.equal(installed.id, current.runId);
 
   // A milestone-first gate needs every epic of the milestone accepted.
   await assert.rejects(f.run(pid, reserve({ containers: [{ kind: 'milestone', id: 'm' }] })), {
@@ -631,7 +690,7 @@ test('reserveGate binds only the merge commits the attempts recorded for their v
   const reserve = merges => ({
     op: 'reserveGate',
     containers: [{ kind: 'epic', id: 'e' }],
-    baseSha: '1'.repeat(40),
+    baseSha: '0'.repeat(40),
     headSha: '3'.repeat(40),
     merges,
     retry: false,
@@ -663,6 +722,42 @@ test('reserveGate binds only the merge commits the attempts recorded for their v
   assert.equal(f.repo.snapshot(pid).gates.length, 1);
 });
 
+test('reserveGate refuses an empty or misplaced gate range: base = head, base not a recorded first parent, merges outside base..head', async t => {
+  // Review finding F1-1: a gate with baseSha = headSha reviewed an empty diff and was accepted.
+  const f = await fixture(t);
+  const pid = await f.create(waveSpec(f.root()));
+  const a = await f.integrate(pid, 'a');
+  const b = await f.integrate(pid, 'b');
+  recordMerge(f.store, a, '4'.repeat(40));
+  recordMerge(f.store, b, '5'.repeat(40), 'c'.repeat(40));
+  const reserve = (extra = {}) => ({
+    op: 'reserveGate',
+    containers: [{ kind: 'epic', id: 'e' }],
+    baseSha: '0'.repeat(40),
+    headSha: '5'.repeat(40),
+    merges: [mergeOf(a), mergeOf(b, '5'.repeat(40))],
+    retry: false,
+    ...extra,
+  });
+  const before = f.repo.snapshot(pid).revision;
+  for (const [label, action] of [
+    ['base = head', reserve({ headSha: '0'.repeat(40) })],
+    ['base is not the recorded first parent of a covered merge', reserve({ baseSha: '1'.repeat(40) })],
+    ['base is a covered merge', reserve({ baseSha: '4'.repeat(40) })],
+  ])
+    await assert.rejects(f.run(pid, action), { code: 'project_gate_invalid' }, label);
+  // Git: the covered merges are not all strict descendants of the base inside the head.
+  f.ranges.refused.add(`${'0'.repeat(40)}..${'5'.repeat(40)}`);
+  await assert.rejects(f.run(pid, reserve()), { code: 'project_gate_invalid' }, 'Git range');
+  assert.equal(f.repo.snapshot(pid).revision, before);
+  f.ranges.refused.clear();
+  await f.run(pid, reserve());
+  assert.deepEqual(
+    f.repo.snapshot(pid).gates.map(gate => [gate.baseSha, gate.headSha]),
+    [['0'.repeat(40), '5'.repeat(40)]],
+  );
+});
+
 test('A milestone joins a gate chain only when its other epics are already accepted', async t => {
   const f = await fixture(t);
   const pid = await f.create({
@@ -677,7 +772,7 @@ test('A milestone joins a gate chain only when its other epics are already accep
   const reserve = (containers, gateMerges = merges) => ({
     op: 'reserveGate',
     containers,
-    baseSha: '1'.repeat(40),
+    baseSha: '0'.repeat(40),
     headSha: '3'.repeat(40),
     merges: gateMerges,
     retry: false,

@@ -22,13 +22,20 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { realpath } from 'node:fs/promises';
 import { isDeepStrictEqual } from 'node:util';
-import { setTimeout as delay } from 'node:timers/promises';
 import { execute } from './command.mjs';
 import { makeWorktree, worktreeHomeFor } from './workspace.mjs';
 import { scopesOverlap } from './contracts.mjs';
 import * as projectContracts from './project-contracts.mjs';
 import { planProjectHorizon } from './project-planner.mjs';
-import { ensureIntegration, mergeBackGate, mergeTask, waveFrontier } from './project-integration.mjs';
+import {
+  ensureIntegration,
+  gateBase,
+  integrationHeadOf,
+  mergeBackGate,
+  mergeTask,
+  waveFrontier,
+} from './project-integration.mjs';
+import { withIntegrationLease as withLease } from './project-integration-lease.mjs';
 import { GATE_WATCHDOG, createGateRunDraft, runEpicGate } from './wave-verifier.mjs';
 import { normalizeWatchdogConfig } from './watchdog.mjs';
 import {
@@ -154,31 +161,17 @@ const blockerOf = run => run.blocker?.current?.code ?? run.error?.code ?? `run_$
 
 // --- leases -----------------------------------------------------------------------------------
 
-/** Serialize merges and frontier reads of one project (`project-integration:<id>`). */
-async function withIntegrationLease(ctx, projectId, signal, work) {
-  const name = `project-integration:${projectId}`,
-    deadline = Date.now() + INTEGRATION_WAIT_MS;
-  let token;
-  while (!(token = ctx.store.acquireLease(name, randomUUID(), { ttlMs: 60000, limit: 1 }))) {
-    requireValue(!signal?.aborted, 'control_blocked');
-    requireValue(Date.now() < deadline, 'integration_busy');
-    await delay(50);
-  }
-  const timer = setInterval(() => {
-    try {
-      ctx.store.renewLease(token);
-    } catch {
-      /* The work below is short; a lost renewal surfaces on the next acquisition. */
-    }
-  }, ctx.engine.leaseHeartbeatMs || 10000);
-  timer.unref();
-  try {
-    return await work();
-  } finally {
-    clearInterval(timer);
-    ctx.store.releaseLease(token);
-  }
-}
+/**
+ * Serialize merges, frontier reads and every transition whose proof reads the integration
+ * branch (`project-integration:<id>`, reentrant): the authorizer requires it for
+ * task/attempt → integrated and for every acceptance, and it is held until the store commits.
+ */
+const withIntegrationLease = (ctx, projectId, signal, work) =>
+  withLease(ctx.store, projectId, work, {
+    signal,
+    waitMs: INTEGRATION_WAIT_MS,
+    heartbeatMs: ctx.engine.leaseHeartbeatMs || 10000,
+  });
 
 /** The foreground lease `project:<id>` with heartbeat and cancellation polling, as in `resume`. */
 async function withProjectControl(ctx, projectId, signal, work) {
@@ -264,7 +257,13 @@ export function selectWave(snapshot, { limit, inFlight = [], availability, now }
   return selected;
 }
 
-async function availabilityFor(ctx, snapshot) {
+/**
+ * Planner availability rows of a wave snapshot: a task not yet integrated is available only with
+ * verified interface proofs (`interface_proof_invalid` otherwise). Used by drain and next-wave.
+ * @param {{ engine: any }} ctx
+ * @param {any} snapshot
+ */
+export async function waveAvailability(ctx, snapshot) {
   const rows = [];
   for (const task of snapshot.tasks) {
     let verified = true;
@@ -286,7 +285,7 @@ async function availabilityFor(ctx, snapshot) {
 
 const horizonOf = async (ctx, snapshot) =>
   planProjectHorizon(
-    { snapshot, limit: 24, availability: await availabilityFor(ctx, snapshot), now: ctx.clock() },
+    { snapshot, limit: 24, availability: await waveAvailability(ctx, snapshot), now: ctx.clock() },
     portsFor(ctx),
   );
 
@@ -487,56 +486,47 @@ function gateContainers(snapshot, epic) {
   return containers;
 }
 
-async function reserveEpicGate(ctx, snapshot, epic, retry) {
-  const containers = gateContainers(snapshot, epic),
-    widest = containers.at(-1);
-  const tasks =
-    widest.kind === 'project'
-      ? snapshot.tasks
-      : widest.kind === 'milestone'
-        ? snapshot.tasks.filter(task => recordOf(snapshot, 'epic', task.epicId).milestoneId === widest.id)
-        : childrenOf(snapshot, 'epic', epic.id);
-  const merges = [],
-    befores = [];
-  for (const task of tasks) {
+// The merges of the covered tasks at their current attempts, as their task Runs recorded them.
+function coveredMerges(ctx, snapshot, tasks) {
+  return tasks.map(task => {
     const attempt = currentOf(snapshot, task.id),
       run = attempt && storedRun(ctx.store, attempt.runId);
     requireValue(run?.integration?.status === 'merged', 'wave_integration_missing');
-    merges.push({
-      taskId: task.id,
-      attemptId: attempt.id,
-      runId: attempt.runId,
-      mergeCommit: run.integration.mergeCommit,
-    });
-    befores.push(run.integration.before);
-  }
+    return { taskId: task.id, attemptId: attempt.id, runId: attempt.runId, mergeCommit: run.integration.mergeCommit };
+  });
+}
+
+// The tasks a gate over `containers` covers: those of its widest container.
+function containerTasks(snapshot, containers) {
+  const widest = containers.at(-1);
+  if (widest.kind === 'project') return snapshot.tasks;
+  if (widest.kind === 'milestone')
+    return snapshot.tasks.filter(task => recordOf(snapshot, 'epic', task.epicId).milestoneId === widest.id);
+  return childrenOf(snapshot, 'epic', widest.id);
+}
+
+// Reserve a gate over `containers` on the current integration head and install its Run, both
+// under one integration lease: no merge moves the branch head between them. The base is the
+// first parent of the earliest covered merge on the branch history (never the head itself).
+async function reserveGate(ctx, snapshot, containers, retry) {
   const projectId = snapshot.project.projectId;
-  // Reservation and install share one integration lease: no merge moves the branch
-  // head between them, so the installed gate always starts on the head it reserved.
+  const merges = coveredMerges(ctx, snapshot, containerTasks(snapshot, containers));
   return withIntegrationLease(ctx, projectId, undefined, async () => {
     const { worktree } = await integrationOf(ctx, snapshot);
-    // The base precedes the first merge of the covered tasks on the branch.
-    let baseSha = befores[0];
-    for (const before of befores.slice(1)) {
-      const older = await execute('git', ['merge-base', '--is-ancestor', before, baseSha], {
-        cwd: worktree,
-        allowFailure: true,
-      });
-      if (older.code === 0) baseSha = before;
-    }
-    const headSha = await waveFrontier({ worktree, mergeCommits: merges.map(m => m.mergeCommit) });
+    const mergeCommits = merges.map(merge => merge.mergeCommit);
+    const headSha = await waveFrontier({ worktree, mergeCommits });
+    const baseSha = await gateBase({ cwd: worktree, headSha, mergeCommits });
     const result = await ctx.repo.apply(
-      commandFor(snapshot, { op: 'reserveGate', containers, baseSha, headSha, merges, retry }),
+      commandFor(await snapshotOf(ctx, projectId), { op: 'reserveGate', containers, baseSha, headSha, merges, retry }),
     );
     const gate = (await snapshotOf(ctx, projectId)).gates.find(row => row.id === result.entity.id);
-    return { gate, run: await installGate(ctx, projectId, gate, true) };
+    return { gate, run: await installGate(ctx, projectId, gate) };
   });
 }
 
 // The gate Run through the store's own contract (installGateRun with gateBindingFor and
-// buildGateInput); an installed gate keeps its Run. `leaseHeld`: the caller holds
-// lease `project-integration:<id>`.
-async function installGate(ctx, projectId, gate, leaseHeld = false) {
+// buildGateInput); an installed gate keeps its Run. Runs inside the (reentrant) integration lease.
+async function installGate(ctx, projectId, gate) {
   const stored = storedRun(ctx.store, gate.runId);
   if (stored) return stored;
   const snapshot = await snapshotOf(ctx, projectId);
@@ -546,8 +536,21 @@ async function installGate(ctx, projectId, gate, leaseHeld = false) {
     gate,
     tasks: snapshot.tasks,
     installGateRun: input => ctx.repo.installGateRun(input),
-    ...(leaseHeld ? { leaseHeld: true } : { withLease: work => withIntegrationLease(ctx, projectId, undefined, work) }),
+    withLease: work => withIntegrationLease(ctx, projectId, undefined, work),
   });
+}
+
+// A reservation whose install was interrupted is installed now; when the branch has moved past
+// its head, a new reservation on the current head replaces it (the store marks it superseded).
+async function installOrReplace(ctx, snapshot, gate, containers, out) {
+  try {
+    return { gate, run: await installGate(ctx, snapshot.project.projectId, gate) };
+  } catch (error) {
+    if (error?.code === 'gate_head_stale') return reserveGate(ctx, snapshot, containers, false);
+    if (error?.code !== 'gate_invalid') throw error;
+    out.blocked.push({ code: error.code, kind: containers[0].kind, id: containers[0].id });
+    return null;
+  }
 }
 
 async function accept(ctx, snapshot, kind, record, criteria, refs, out) {
@@ -565,6 +568,8 @@ async function accept(ctx, snapshot, kind, record, criteria, refs, out) {
   try {
     await ctx.repo.apply(commandFor(snapshot, transitionAction(kind, id, 'accepted', refs, mappings)));
   } catch (error) {
+    // The branch moved while the project proof was checked: the project gate follows.
+    if (kind === 'project' && (await projectHeadMoved(snapshot, refs[0]?.headSha))) return false;
     out.blocked.push({ code: error?.code || 'project_transition_blocked', kind, id });
     return false;
   }
@@ -572,32 +577,39 @@ async function accept(ctx, snapshot, kind, record, criteria, refs, out) {
   return true;
 }
 
-// Bring the verified gate head back, then accept the covered tasks and containers.
+const projectHeadMoved = async (snapshot, verifiedHead) =>
+  (await integrationHeadOf({ cwd: snapshot.project.root, projectId: snapshot.project.projectId })) !== verifiedHead;
+
+// Bring the verified gate head back, then accept the covered tasks and containers, all under one
+// integration lease held until each acceptance commits: the authorizer's Git proof (merges,
+// range, verified head on the branch) cannot go stale in between. The project is accepted only
+// while the branch head is the gate's verified head; otherwise a project gate follows.
 async function acceptGate(ctx, projectId, gate, run, out) {
-  const before = await snapshotOf(ctx, projectId);
   await withIntegrationLease(ctx, projectId, undefined, async () => {
+    const before = await snapshotOf(ctx, projectId);
     const { worktree } = await integrationOf(ctx, before);
     // Fast-forward while the branch still stands on the gate head; otherwise the
     // in-scope repairs are merged `--no-ff`.
     await mergeBackGate({ worktree, expectedHead: gate.headSha, gateHead: run.headSha });
-  });
-  const refs = await persistRefs(ctx, run, gateKinds);
-  for (const merge of gate.merges)
-    for (const kind of ['attempt', 'task']) {
+    const refs = await persistRefs(ctx, run, gateKinds);
+    for (const merge of gate.merges)
+      for (const kind of ['attempt', 'task']) {
+        const snapshot = await snapshotOf(ctx, projectId);
+        const task = taskOf(snapshot, merge.taskId),
+          record = kind === 'attempt' ? currentOf(snapshot, merge.taskId) : task;
+        if (settled(record.status)) continue;
+        if (!(await accept(ctx, snapshot, kind, record, task.acceptance, refs, out))) return;
+      }
+    await advanceContainers(ctx, projectId);
+    for (const container of gate.containers) {
       const snapshot = await snapshotOf(ctx, projectId);
-      const task = taskOf(snapshot, merge.taskId),
-        record = kind === 'attempt' ? currentOf(snapshot, merge.taskId) : task;
+      const record = recordOf(snapshot, container.kind, container.id);
       if (settled(record.status)) continue;
-      if (!(await accept(ctx, snapshot, kind, record, task.acceptance, refs, out))) return;
+      if (container.kind === 'project' && (await projectHeadMoved(snapshot, run.headSha))) return;
+      const criteria = container.kind === 'project' ? record.definitionOfDone : record.acceptance;
+      if (!(await accept(ctx, snapshot, container.kind, record, criteria, refs, out))) return;
     }
-  await advanceContainers(ctx, projectId);
-  for (const container of gate.containers) {
-    const snapshot = await snapshotOf(ctx, projectId);
-    const record = recordOf(snapshot, container.kind, container.id);
-    if (settled(record.status)) continue;
-    const criteria = container.kind === 'project' ? record.definitionOfDone : record.acceptance;
-    if (!(await accept(ctx, snapshot, container.kind, record, criteria, refs, out))) return;
-  }
+  });
 }
 
 // The current gate of an epic and its Run: the latest one, a new one, or a retry.
@@ -605,35 +617,24 @@ async function epicGate(ctx, snapshot, epic, retryFailed, out) {
   const gate = latestGate(snapshot, 'epic', epic.id),
     run = gate && storedRun(ctx.store, gate.runId);
   if (gate && run && retryStates.includes(run.state)) {
-    if (retryFailed) return reserveEpicGate(ctx, snapshot, epic, true);
+    if (retryFailed) return reserveGate(ctx, snapshot, gateContainers(snapshot, epic), true);
     out.gates.push({ gateId: gate.id, runId: run.id, state: run.state });
     out.blocked.push({ code: blockerOf(run), kind: 'epic', id: epic.id });
     return null;
   }
-  if (!gate) return reserveEpicGate(ctx, snapshot, epic, false);
-  try {
-    // A reservation whose install was interrupted is installed now, if its head is still current.
-    return { gate, run: run ?? (await installGate(ctx, snapshot.project.projectId, gate)) };
-  } catch (error) {
-    if (!['gate_head_stale', 'gate_invalid'].includes(error?.code)) throw error;
-    out.blocked.push({ code: error.code, kind: 'epic', id: epic.id });
-    return null;
-  }
+  if (!gate) return reserveGate(ctx, snapshot, gateContainers(snapshot, epic), false);
+  if (run) return { gate, run };
+  return installOrReplace(ctx, snapshot, gate, gateContainers(snapshot, epic), out);
 }
 
-async function gateEpic(ctx, snapshot, epic, { signal, retryFailed }, out) {
-  const projectId = snapshot.project.projectId;
-  const current = await epicGate(ctx, snapshot, epic, retryFailed, out);
-  if (!current) return;
-  const gate = current.gate;
-  let run = current.run;
+// Execute an installed gate Run once, then accept what it verified.
+async function runAndAccept(ctx, projectId, { gate, run }, signal, out, entity) {
   if (run.state !== 'succeeded') run = await runEpicGate({ engine: ctx.engine, run, signal });
   out.gates.push({ gateId: gate.id, runId: run.id, state: run.state });
   if (run.state !== 'succeeded') {
     out.blocked.push({
       code: run.state === 'waiting_limits' ? 'quota' : blockerOf(run),
-      kind: 'epic',
-      id: epic.id,
+      ...entity,
       state: run.state,
     });
     return;
@@ -642,14 +643,65 @@ async function gateEpic(ctx, snapshot, epic, { signal, retryFailed }, out) {
     await acceptGate(ctx, projectId, gate, run, out);
   } catch (error) {
     if (!['project_integration_conflict', 'project_integration_invalid'].includes(error?.code)) throw error;
-    out.blocked.push({ code: error.code, kind: 'epic', id: epic.id });
+    out.blocked.push({ code: error.code, ...entity });
   }
+}
+
+async function gateEpic(ctx, snapshot, epic, { signal, retryFailed }, out) {
+  const current = await epicGate(ctx, snapshot, epic, retryFailed, out);
+  if (current) await runAndAccept(ctx, snapshot.project.projectId, current, signal, out, { kind: 'epic', id: epic.id });
+}
+
+// The project gate's Run: the latest one, a new one (none yet, a stale reservation, or a verified
+// gate whose head the branch has since left) or a retry.
+async function projectGateRun(ctx, snapshot, { retryFailed, stale }, out) {
+  const projectId = snapshot.project.projectId,
+    containers = [{ kind: 'project', id: projectId }];
+  const gate = latestGate(snapshot, 'project', projectId),
+    run = gate && storedRun(ctx.store, gate.runId);
+  if (!gate || (stale && run?.state === 'succeeded')) return reserveGate(ctx, snapshot, containers, false);
+  if (!run) return installOrReplace(ctx, snapshot, gate, containers, out);
+  if (!retryStates.includes(run.state)) return { gate, run };
+  if (retryFailed) return reserveGate(ctx, snapshot, containers, true);
+  out.gates.push({ gateId: gate.id, runId: run.id, state: run.state });
+  out.blocked.push({ code: blockerOf(run), kind: 'project', id: projectId });
+  return null;
+}
+
+/**
+ * The project gate: once every milestone is accepted but the project is not (the integration
+ * branch moved past the verified head of the gate that covered the project), one gate over the
+ * whole project verifies the current integration head and accepts the project. A branch that
+ * moves again during that gate leaves `wave_project_head_mismatch`.
+ * @param {any} ctx
+ * @param {{ projectId: string, signal?: AbortSignal, retryFailed?: boolean }} input
+ * @param {{ gates: any[], accepted: any[], blocked: any[] }} out
+ */
+async function gateProject(ctx, { projectId, signal, retryFailed }, out) {
+  for (const stale of [false, true]) {
+    const snapshot = await snapshotOf(ctx, projectId);
+    if (
+      settled(snapshot.project.status) ||
+      controlState(snapshot) ||
+      signal?.aborted ||
+      !reached(snapshot.project.status, 'integrated') ||
+      !snapshot.milestones.every(row => settled(row.status))
+    )
+      return;
+    const blocked = out.blocked.length;
+    const current = await projectGateRun(ctx, snapshot, { retryFailed, stale }, out);
+    if (!current) return;
+    await runAndAccept(ctx, projectId, current, signal, out, { kind: 'project', id: projectId });
+    if (out.blocked.length > blocked) return;
+  }
+  if (!settled((await snapshotOf(ctx, projectId)).project.status))
+    out.blocked.push({ code: 'wave_project_head_mismatch', kind: 'project', id: projectId });
 }
 
 /**
  * Run the gates of every epic whose tasks are all integrated and not covered by its current
- * gate, then accept what a successful gate verified. A failed gate is retried only with
- * `retryFailed`.
+ * gate, then accept what a successful gate verified; then the project gate when only the
+ * project is left. A failed gate is retried only with `retryFailed`.
  * @param {any} ctx
  * @param {{ projectId: string, signal?: AbortSignal, retryFailed?: boolean }} input
  */
@@ -660,12 +712,13 @@ export async function runPendingGates(ctx, { projectId, signal, retryFailed = fa
     await advanceContainers(ctx, projectId);
     const snapshot = await snapshotOf(ctx, projectId);
     requireValue(waveProject(ctx, snapshot), 'wave_not_enabled');
-    if (controlState(snapshot) || signal?.aborted) break;
+    if (controlState(snapshot) || signal?.aborted) return out;
     const epic = snapshot.epics.find(row => !handled.has(row.id) && gateCandidate(snapshot, row));
     if (!epic) break;
     handled.add(epic.id);
     await gateEpic(ctx, snapshot, epic, { signal, retryFailed }, out);
   }
+  if (!out.blocked.length) await gateProject(ctx, { projectId, signal, retryFailed }, out);
   return out;
 }
 
@@ -896,6 +949,8 @@ async function activeAttempts(ctx, projectId) {
 }
 
 // `--retry-failed`: one new attempt per failed task, disjoint scopes, at most `concurrency`.
+// A retry goes to the executor of the failed attempt: the drain retries only its own native
+// attempts; a task an external chat abandoned is retried by `next-wave --retry-failed`.
 async function reserveRetries(ctx, projectId, options, control, state) {
   let snapshot = await snapshotOf(ctx, projectId);
   const horizon = await horizonOf(ctx, snapshot);
@@ -907,6 +962,16 @@ async function reserveRetries(ctx, projectId, options, control, state) {
   for (const attempt of snapshot.currentAttempts.filter(row => retryStates.includes(row.status))) {
     const task = taskOf(snapshot, attempt.taskId);
     if (count >= options.concurrency || reached(task.status, 'integrated') || task.status === 'cancelled') continue;
+    const executor = await attemptExecutor(ctx, snapshot, attempt);
+    if (executor.kind !== 'native') {
+      state.blockers.push({
+        code: 'wave_retry_executor',
+        kind: 'task',
+        id: task.id,
+        ...(executor.host ? { host: executor.host } : {}),
+      });
+      continue;
+    }
     const allowed = new Set(['horizon_limit', 'retry_required', 'attempt_revision_mismatch', `task_${task.status}`]);
     const reasons = horizon.blocked.find(row => row.taskId === task.id)?.reasons.filter(r => !allowed.has(r)) ?? [];
     if (reasons.length) {
@@ -999,7 +1064,7 @@ async function drainLoop(ctx, projectId, options, control, state) {
     const taskIds = selectWave(snapshot, {
       limit: options.concurrency,
       inFlight: active.external,
-      availability: await availabilityFor(ctx, snapshot),
+      availability: await waveAvailability(ctx, snapshot),
       now: ctx.clock(),
     });
     if (!taskIds.length) return finish(ctx, projectId, state, await noProgress(ctx, projectId, state));

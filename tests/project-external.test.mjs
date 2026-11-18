@@ -11,6 +11,7 @@ import * as contracts from '../runtime/project-contracts.mjs';
 import { openProjectStore } from '../runtime/project-store.mjs';
 import { scopesOverlap } from '../runtime/contracts.mjs';
 import { ensureIntegration, mergeTask } from '../runtime/project-integration.mjs';
+import { withIntegrationLease } from '../runtime/project-integration-lease.mjs';
 import { completeTask, nextWave } from '../runtime/project-external.mjs';
 import { createProjectTransitionAuthorizer } from '../runtime/project-director.mjs';
 import { workerRole, WORKER_ROLES } from '../runtime/worker-roles.mjs';
@@ -71,7 +72,11 @@ function selectWave(snapshot, { limit, inFlight = [] }) {
 
 // A fake director step with the real Git and Store effects: merge into the
 // integration branch, persist the checks observation, advance attempt and task.
-async function integrate(f, { projectId, taskId, run }) {
+// It holds the integration lease like the director: the authorizer requires it for `integrated`.
+async function integrate(f, input) {
+  return withIntegrationLease(f.store, input.projectId, () => integrateLeased(f, input));
+}
+async function integrateLeased(f, { projectId, taskId, run }) {
   const snapshot = await f.repo.snapshot(projectId);
   const task = snapshot.tasks.find(row => row.id === taskId);
   const branch = await ensureIntegration({
@@ -262,7 +267,18 @@ test('next-wave reserves non-overlapping tasks on the integration head; a repeat
     'task-c overlaps task-a and task-d waits for task-a',
   );
   assert.deepEqual(brief(second, 'task-a'), first.briefs[0], 'an in-flight attempt keeps its brief');
-  assert.deepEqual(f.calls.select.at(-1), { limit: 2, inFlight: ['task-a'] });
+  const { availability, now, ...selection } = f.calls.select.at(-1);
+  assert.deepEqual(selection, { limit: 2, inFlight: ['task-a'] });
+  assert.ok(Date.parse(now));
+  assert.deepEqual(
+    availability.map(row => [row.taskId, row.interfacesVerified]),
+    [
+      ['task-a', true],
+      ['task-b', true],
+      ['task-c', true],
+      ['task-d', true],
+    ],
+  );
 
   const head = f.integrationHead();
   const snapshot = await f.snapshot();
@@ -447,6 +463,51 @@ test('abandon blocks the attempt and cancels its Run; retry-failed reserves a ne
   snapshot = await f.snapshot();
   const attempt = snapshot.currentAttempts.find(row => row.taskId === 'task-a');
   assert.deepEqual([attempt.number, attempt.status], [2, 'running']);
+});
+
+test('next-wave never hands out a task whose interface proofs do not verify', async t => {
+  // F2 open question: next-wave chose its wave without the interface check drain and horizon use.
+  const f = await fixture(t);
+  await writeFile(f.iface.path, JSON.stringify({ tampered: true }));
+  // The director's selection (default ports) skips it: task-c overlaps task-a, task-d waits for it.
+  const selected = await f.wave({ limit: 3, ports: undefined });
+  assert.deepEqual(
+    selected.briefs.map(row => row.taskId),
+    ['task-a'],
+  );
+  assert.deepEqual(selected.blocked, [], 'it was never selected, so no attempt was reserved for it');
+  // Even a selector that ignores availability cannot reserve it.
+  const forced = await f.wave({ limit: 3 });
+  assert.deepEqual(forced.blocked, [{ taskId: 'task-b', code: 'project_interface_unverified' }]);
+  assert.equal(
+    (await f.snapshot()).currentAttempts.some(row => row.taskId === 'task-b'),
+    false,
+  );
+});
+
+test('next-wave --retry-failed retries only attempts of its own host', async t => {
+  const f = await fixture(t);
+  const wave = await f.wave({ limit: 1 });
+  const a = brief(wave, 'task-a');
+  assert.equal((await f.complete('task-a', a.baseSha, { abandon: true })).status, 'abandoned');
+  const other = await nextWave(f.ctx, {
+    projectId: f.projectId,
+    host: 'orca',
+    ports: f.ports,
+    retryFailed: true,
+    limit: 1,
+  });
+  assert.ok(!other.briefs.some(row => row.taskId === 'task-a'), 'another host never takes over the attempt');
+  assert.deepEqual(
+    other.blocked.filter(row => row.taskId === 'task-a'),
+    [{ taskId: 'task-a', code: 'project_retry_executor' }],
+  );
+  const own = await f.wave({ limit: 1, retryFailed: true });
+  assert.deepEqual(
+    own.briefs.map(row => row.taskId),
+    ['task-a'],
+  );
+  assert.notEqual(brief(own, 'task-a').runId, a.runId);
 });
 
 test('next-wave and complete-task require a pull host, a bound limit and a wave project', async t => {

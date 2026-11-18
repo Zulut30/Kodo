@@ -13,6 +13,7 @@ import * as A from '../runtime/project-contracts.mjs';
 import * as D from '../runtime/project-evidence.mjs';
 import { openProjectStore } from '../runtime/project-store.mjs';
 import { createProjectDirector, createProjectTransitionAuthorizer } from '../runtime/project-director.mjs';
+import { withIntegrationLease } from '../runtime/project-integration-lease.mjs';
 import { TASK_FAST_PROFILE, passedTests, planFastChecks, runFastChecks } from '../runtime/task-fast-checks.mjs';
 import { fixture, git } from './helpers/engine-fixture.mjs';
 
@@ -549,8 +550,11 @@ test('A wave project is never run by the legacy director nor accepted by its own
   );
   assert.ok(legacy.eligibleStates.includes('accepted'), 'the legacy evaluator would accept this proof');
   // The production authorizer routes the wave project to the wave evaluator: no gate, no acceptance.
+  // Wave proof that reads the integration branch needs its lease, held until the commit.
+  await assert.rejects(() => f.authorizer({ command, snapshot }), { code: 'project_integration_lease_required' });
+  const leased = work => withIntegrationLease(f.store, f.id, work);
   await assert.rejects(
-    () => f.authorizer({ command, snapshot }),
+    () => leased(() => f.authorizer({ command, snapshot })),
     error => ['project_binding_invalid', 'project_transition_blocked'].includes(error.code),
   );
   // The full receipt of a task Run is not task-fast proof either: not even integrated.
@@ -564,7 +568,9 @@ test('A wave project is never run by the legacy director nor accepted by its own
     evidence,
     mappings: [],
   });
-  await assert.rejects(() => f.authorizer({ command: integrated, snapshot }), { code: 'project_transition_blocked' });
+  await assert.rejects(() => leased(() => f.authorizer({ command: integrated, snapshot })), {
+    code: 'project_transition_blocked',
+  });
 });
 
 const summary = (mark, counts) =>

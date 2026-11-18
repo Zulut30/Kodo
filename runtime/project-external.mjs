@@ -25,7 +25,7 @@ import { scopesOverlap } from './contracts.mjs';
 import { redact } from './security.mjs';
 import { isPullHost } from './job-contracts.mjs';
 import { ensureIntegration, waveFrontier } from './project-integration.mjs';
-import { bindingFor, known, storedRun } from './project-director.mjs';
+import { bindingFor, known, storedRun, verifyRef } from './project-director.mjs';
 import * as waves from './project-director-waves.mjs';
 import { verifyTaskFastOnce } from './wave-verifier.mjs';
 import { workerRole } from './worker-roles.mjs';
@@ -276,8 +276,18 @@ async function resumeInFlight(state) {
   }
 }
 
+async function interfacesVerified(state, task) {
+  try {
+    for (const ref of task.interfaceRefs) await verifyRef(state.ctx.engine, ref);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function reserve(state, task, retryFailed) {
-  const reason = admissible(state, task);
+  const reason =
+    admissible(state, task) ?? ((await interfacesVerified(state, task)) ? null : 'project_interface_unverified');
   if (reason) {
     state.blocked.push({ taskId: task.id, code: reason });
     return;
@@ -303,13 +313,25 @@ async function reserve(state, task, retryFailed) {
 
 const byPriority = (a, b) => b.priority - a.priority || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
 
+// A retry goes to the executor of the failed attempt: this host retries only its own attempts;
+// the drain's (native) and other hosts' failed attempts are left to them.
 async function reserveRetries(state, limit) {
+  const store = storeOf(state.ctx);
   const candidates = state.snapshot.tasks
     .filter(task => !settled.has(task.status) && task.status !== 'integrated' && task.status !== 'cancelled')
     .filter(task => retryable.has(currentOf(state.snapshot, task.id)?.status))
     .sort(byPriority);
   for (const candidate of candidates) {
     if (state.briefs.length >= limit) return;
+    const executor = await waves.attemptExecutor(
+      { repo: state.ctx.repo, store },
+      state.snapshot,
+      currentOf(state.snapshot, candidate.id),
+    );
+    if (executor.kind !== 'external' || executor.host !== state.host) {
+      state.blocked.push({ taskId: candidate.id, code: 'project_retry_executor' });
+      continue;
+    }
     await reserve(
       state,
       state.snapshot.tasks.find(row => row.id === candidate.id),
@@ -322,7 +344,13 @@ async function reserveSelected(state, limit, ports) {
   const remaining = limit - state.briefs.length;
   if (remaining <= 0) return;
   const W = wavePorts(ports, ['selectWave']);
-  const selected = W.selectWave(state.snapshot, { limit: remaining, inFlight: [...state.inFlight] });
+  // Like drain: a task whose interface proofs do not verify is never selected.
+  const selected = W.selectWave(state.snapshot, {
+    limit: remaining,
+    inFlight: [...state.inFlight],
+    availability: await waves.waveAvailability(state.ctx, state.snapshot),
+    now: (state.ctx.clock ?? (() => new Date().toISOString()))(),
+  });
   need(Array.isArray(selected), 'wave_ports_invalid');
   for (const taskId of selected) {
     if (state.briefs.length >= limit) return;

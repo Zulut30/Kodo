@@ -7,7 +7,15 @@ import { execute } from './command.mjs';
 import { inspectCurrentSource } from './ci-graph.mjs';
 import { readConfig, validateCommandTimeouts } from './config.mjs';
 import { resolveMode } from './modes.mjs';
-import { gateRepairInScope, integrationBranch } from './project-integration.mjs';
+import {
+  gateRange,
+  gateRepairInScope,
+  integrationBranch,
+  integrationHeadOf,
+  mergeOnBranch,
+  treesDiffer,
+} from './project-integration.mjs';
+import { integrationLeaseHeld } from './project-integration-lease.mjs';
 
 const fail = code => {
   throw Object.assign(new Error(`Project ${code}`), { code: `project_${code}` });
@@ -255,20 +263,73 @@ async function assertLogs(engine, run, rows, kind) {
 const contains = async (cwd, commit, head) =>
   (await execute('git', ['merge-base', '--is-ancestor', commit, head], { cwd, allowFailure: true })).code === 0;
 
-// A recorded merge of a task Run is on the integration branch and merges exactly its verified head.
+// A recorded merge of a task Run is still on the integration branch: reachable from its current
+// head, with exactly the recorded `before` (first) and the verified head (second) as parents.
 async function assertTaskMerge(snapshot, run) {
   if (run.integration?.status !== 'merged') return;
-  const branch = integrationBranch(snapshot.project.projectId),
-    commit = run.integration.mergeCommit;
+  const projectId = snapshot.project.projectId;
   requireValue(
-    run.integration.branch === branch && (await contains(run.project, commit, `refs/heads/${branch}`)),
+    run.integration.branch === integrationBranch(projectId) &&
+      run.integration.mergedHead === run.headSha &&
+      (await mergeOnBranch({
+        cwd: run.project,
+        branchHead: await integrationHeadOf({ cwd: run.project, projectId }),
+        mergeCommit: run.integration.mergeCommit,
+        before: run.integration.before,
+        mergedHead: run.headSha,
+      })),
     'integration_invalid',
   );
-  const parents = await execute('git', ['rev-list', '--parents', '-n', '1', commit], {
-    cwd: run.project,
-    allowFailure: true,
-  });
-  requireValue(parents.code === 0 && parents.stdout.trim().split(' ')[2] === run.headSha, 'integration_invalid');
+}
+
+// The gate manifest artifact: intact, in the gate Run's evidence, on the gate head, and equal to
+// the manifest of the covered tasks whose SHA-256 the gate input (run.task) binds.
+async function assertGateManifest({ engine, contracts, snapshot, run, gate, tasks, options }) {
+  const ref = run.gateManifest;
+  requireValue(
+    typeof contracts.buildGateManifest === 'function' && ref?.headSha === gate.headSha,
+    'gate_manifest_invalid',
+  );
+  await verifyRef(engine, { kind: 'gate-manifest', path: ref.path, sha256: ref.sha256, headSha: ref.headSha }, run);
+  const envelope = JSON.parse(await readFile(ref.path, 'utf8'));
+  const { manifest } = contracts.buildGateManifest({ project: snapshot.project, gate, tasks }, options);
+  requireValue(
+    envelope.kind === 'gate-manifest' &&
+      envelope.baseSha === gate.baseSha &&
+      isDeepStrictEqual(envelope.value, manifest),
+    'gate_manifest_invalid',
+  );
+}
+
+// The gate's range and everything it accepts are on the integration branch now (the caller holds
+// lease project-integration until the transition commits): the reviewed range
+// gate.baseSha..run.headSha is non-empty and holds every covered merge, each covered merge is
+// still its task Run's recorded merge on the branch, and the verified head is in the branch.
+async function assertGateOnBranch({ store, snapshot, run, gate }) {
+  const cwd = run.project,
+    mergeCommits = gate.merges.map(merge => merge.mergeCommit);
+  requireValue(
+    run.baseSha === gate.baseSha &&
+      (await gateRange({ cwd, baseSha: gate.baseSha, headSha: gate.headSha, mergeCommits })) &&
+      (await treesDiffer({ cwd, from: gate.baseSha, to: run.headSha })),
+    'gate_range_invalid',
+  );
+  const branchHead = await integrationHeadOf({ cwd, projectId: snapshot.project.projectId });
+  const onBranch = branchHead && (await gateRange({ cwd, baseSha: gate.baseSha, headSha: branchHead, mergeCommits }));
+  requireValue(onBranch && (await contains(cwd, run.headSha, branchHead)), 'integration_invalid');
+  for (const merge of gate.merges) {
+    const taskRun = storedRun(store, merge.runId),
+      integration = taskRun?.integration,
+      [first, second] = onBranch.get(merge.mergeCommit);
+    requireValue(
+      integration?.status === 'merged' &&
+        integration.mergeCommit === merge.mergeCommit &&
+        integration.mergedHead === taskRun.headSha &&
+        first === integration.before &&
+        second === taskRun.headSha,
+      'integration_invalid',
+    );
+  }
 }
 
 // Wave Runs: a task Run (native or of an external chat, always profile task-fast)
@@ -307,22 +368,11 @@ async function validateWaveRun({ store, engine, contracts, snapshot, run, gate }
       await gateRepairInScope({ worktree: run.cwd, from: gate.headSha, to: run.headSha, writePaths }),
       'gate_scope',
     );
+    await assertGateManifest({ engine, contracts, snapshot, run, gate, tasks, options });
     // Nothing is accepted that the integration branch does not contain (mergeBackGate first).
-    requireValue(
-      await contains(run.project, run.headSha, `refs/heads/${integrationBranch(snapshot.project.projectId)}`),
-      'integration_invalid',
-    );
+    await assertGateOnBranch({ store, snapshot, run, gate });
   }
   requireValue((await inspectCurrentSource({ project: run.cwd, headSha: run.headSha })) === 'clean', 'head_changed');
-}
-
-async function integrationHeadOf(project) {
-  const found = await execute(
-    'git',
-    ['rev-parse', '--verify', '--quiet', `refs/heads/${integrationBranch(project.projectId)}^{commit}`],
-    { cwd: project.root, allowFailure: true },
-  );
-  return found.code === 0 ? found.stdout.trim() : null;
 }
 
 // The Run a wave transition is decided by: the task Run of the current attempt
@@ -334,7 +384,10 @@ async function waveInput(store, snapshot, action) {
     requireValue(gates.length === 1, 'binding_invalid');
     const run = storedRun(store, gates[0].runId);
     requireValue(run, 'binding_invalid');
-    const integrationHead = action.kind === 'project' ? await integrationHeadOf(snapshot.project) : undefined;
+    const integrationHead =
+      action.kind === 'project'
+        ? await integrationHeadOf({ cwd: snapshot.project.root, projectId: snapshot.project.projectId })
+        : undefined;
     return { run, gate: gates[0], integrationHead };
   }
   if (!['attempt', 'task'].includes(action.kind) || action.to === 'ready') return { run: null };
@@ -347,8 +400,17 @@ async function waveInput(store, snapshot, action) {
   return { run };
 }
 
+// Wave proof that reads the integration branch (a task's merge, a gate's range and head) is
+// checked under lease `project-integration:<id>`, which the caller holds until the project
+// store commits the transition: no Kodo merge or merge-back moves the branch in between.
+const readsBranch = action =>
+  action.to === 'accepted' || (['attempt', 'task'].includes(action.kind) && action.to === 'integrated');
+
 async function authorizeWave({ store, engine, A, evaluator, command, snapshot, options }) {
-  const action = command.action;
+  const action = command.action,
+    projectId = snapshot.project.projectId;
+  const leased = readsBranch(action);
+  if (leased) requireValue(integrationLeaseHeld(store, projectId), 'integration_lease_required');
   const { run, gate, integrationHead } = await waveInput(store, snapshot, action);
   const evaluate =
     evaluator?.evaluateWaveTransition ?? (await import('./project-wave-evidence.mjs')).evaluateWaveTransition;
@@ -372,6 +434,13 @@ async function authorizeWave({ store, engine, A, evaluator, command, snapshot, o
     },
   );
   requireValue(result?.eligibleStates?.includes(action.to), 'transition_blocked');
+  // The project is accepted only on the branch head that is still current after every check.
+  if (integrationHead !== undefined)
+    requireValue(
+      (await integrationHeadOf({ cwd: snapshot.project.root, projectId })) === integrationHead,
+      'integration_head_changed',
+    );
+  if (leased) requireValue(integrationLeaseHeld(store, projectId), 'integration_lease_required');
 }
 
 // Installed only by explicit Project composition. Store remains the CAS owner;

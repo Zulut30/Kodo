@@ -6,6 +6,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { redact, workerEnvironment } from './security.mjs';
 import { execute } from './command.mjs';
 import { assertPrivateArtifactPath } from './progress.mjs';
+import { gateRange } from './project-integration.mjs';
 
 const fail = code => {
   throw Object.assign(new Error('Project ' + code), { code: 'project_' + code });
@@ -135,11 +136,26 @@ async function migrate(store) {
   });
 }
 
-/** Additive Project Director repository on the existing legacy Store connection. */
-export async function openProjectStore({ store, contracts, authorizeTransition } = {}) {
+// The Git range of a wave gate reservation in the project root (the default `gateRange` port).
+const gitGateRange = async ({ root, baseSha, headSha, mergeCommits }) =>
+  (await gateRange({ cwd: root, baseSha, headSha, mergeCommits })) !== null;
+
+/** Additive Project Director repository on the existing legacy Store connection.
+ * `gateRange({ root, baseSha, headSha, mergeCommits })` (default: Git in the project root)
+ * checks the commit range of a wave gate reservation before its transaction.
+ * @param {{ store?: any, contracts?: any, authorizeTransition?: any,
+ *   gateRange?: (input: { root: string, baseSha: string, headSha: string, mergeCommits: string[] }) => Promise<boolean> }} [options]
+ */
+export async function openProjectStore({
+  store,
+  contracts,
+  authorizeTransition,
+  gateRange: range = gitGateRange,
+} = {}) {
   requireValue(store?.db && typeof store.createRun === 'function', 'store_invalid');
 
   requireValue(authorizeTransition === undefined || typeof authorizeTransition === 'function', 'authorizer_invalid');
+  requireValue(typeof range === 'function', 'store_invalid');
 
   contracts ??= await import('./project-contracts.mjs');
 
@@ -173,6 +189,7 @@ export async function openProjectStore({ store, contracts, authorizeTransition }
     store,
     contracts,
     authorizeTransition,
+    gateRange: range,
     options,
     db,
     validationCache,
@@ -821,15 +838,38 @@ function storedRun(ctx, runId) {
 }
 const runState = (ctx, runId) => storedRun(ctx, runId)?.state ?? null;
 
+// The gate range is never empty: its base is the recorded first parent (`integration.before`)
+// of a covered merge, and Git ancestry (checked before the transaction) makes every covered
+// merge a strict descendant of it, so the base precedes the earliest covered merge.
+function assertGateBase(ctx, action) {
+  const befores = new Set(action.merges.map(merge => storedRun(ctx, merge.runId)?.integration?.before));
+  requireValue(
+    action.baseSha !== action.headSha &&
+      befores.has(action.baseSha) &&
+      action.merges.every(merge => merge.mergeCommit !== action.baseSha),
+    'gate_invalid',
+  );
+}
+
+// A new gate for the same narrowest container replaces the latest one only when it is
+// a retry of a settled failure, an uninstalled reservation whose head went stale, or a
+// project gate whose verified head the integration branch has since moved past.
+function replaceable(ctx, latest, action) {
+  const state = runState(ctx, latest.runId);
+  if (!latest.installed) return state === null && latest.headSha !== action.headSha;
+  if (action.retry && retryStates.has(state)) return true;
+  return latest.containers[0].kind === 'project' && state === 'succeeded' && latest.headSha !== action.headSha;
+}
+
 function applyReserveGate(ctx, { action, project, projectId, now }, change) {
   requireValue(isWave(ctx, project), 'gate_unsupported');
   control(ctx, project);
   const s = readSnapshot(ctx, projectId);
   complete(ctx, s);
   assertGateMerges(ctx, s, action.containers, action.merges);
+  assertGateBase(ctx, action);
   const latest = latestGate(s, action.containers[0]);
-  // A new gate for the same narrowest container is only a retry of a settled failure.
-  if (latest) requireValue(action.retry && retryStates.has(runState(ctx, latest.runId)), 'gate_exists');
+  if (latest) requireValue(replaceable(ctx, latest, action), 'gate_exists');
   change.kind = 'gate';
   change.record = {
     schemaVersion: 1,
@@ -845,7 +885,33 @@ function applyReserveGate(ctx, { action, project, projectId, now }, change) {
     createdAt: now,
     updatedAt: now,
   };
+  // The stale reservation stays in history, marked with its successor; it is never installed.
+  if (latest && !latest.installed) put(ctx, 'gate', { ...latest, supersededBy: change.record.id, updatedAt: now });
   put(ctx, 'gate', change.record, true);
+}
+
+// Git facts of a reservation, checked before its transaction (commits are immutable): every
+// covered merge lies on the first-parent history of the head after the base, and the earliest
+// one has the base as its first parent, so every merge strictly descends from the base.
+async function assertGateAncestry(ctx, command) {
+  let project;
+  try {
+    project = get(ctx, command.projectId, 'project', command.projectId);
+  } catch {
+    return; // The transaction reports a missing project.
+  }
+  if (!isWave(ctx, project)) return; // The transaction refuses it (gate_unsupported).
+  const { baseSha, headSha, merges } = command.action;
+  requireValue(
+    baseSha !== headSha &&
+      (await ctx.gateRange({
+        root: project.root,
+        baseSha,
+        headSha,
+        mergeCommits: merges.map(merge => merge.mergeCommit),
+      })) === true,
+    'gate_invalid',
+  );
 }
 
 const operations = {
@@ -874,6 +940,7 @@ async function apply(ctx, input) {
   const payloadHash = recordHash(ctx, 'command', command);
   const prior = replay(ctx, namespace, command.commandId, payloadHash);
   if (prior) return prior;
+  if (action.op === 'reserveGate') await assertGateAncestry(ctx, command);
   let authorizedSnapshot = null;
   if (action.op === 'transition' && forwardStates.has(action.to)) {
     requireValue(typeof ctx.authorizeTransition === 'function', 'authorization_required');
@@ -1088,6 +1155,23 @@ const nodeOf = merge => ({
   attemptId: merge.attemptId,
 });
 
+// The gate manifest artifact lies in the Run's own evidence directory, content-addressed
+// (`gate-manifest-<sha256>.json`) and bound to the gate head; validators check its bytes.
+function validManifestRef(runDraft, gate) {
+  const ref = runDraft.gateManifest;
+  return Boolean(
+    ref &&
+    typeof ref === 'object' &&
+    typeof ref.path === 'string' &&
+    path.isAbsolute(ref.path) &&
+    typeof ref.sha256 === 'string' &&
+    /^[a-f0-9]{64}$/.test(ref.sha256) &&
+    path.dirname(ref.path) === path.join(runDraft.artifacts, 'evidence') &&
+    path.basename(ref.path) === `gate-manifest-${ref.sha256}.json` &&
+    ref.headSha === gate.headSha,
+  );
+}
+
 // Shape of a fresh gate Run draft: the legacy draft fields, but it starts on the
 // gate head with exactly the covered tasks planned and integrated at their
 // recorded merge commits, and it runs the full (unprofiled) verification.
@@ -1095,6 +1179,7 @@ function validGateRunDraft(runDraft, gate, tasks) {
   const { completed, nodes, plan, ...rest } = runDraft;
   return Boolean(
     validRunDraft({ ...rest, completed: {}, nodes: {} }) &&
+    validManifestRef(runDraft, gate) &&
     runDraft.baseSha === gate.baseSha &&
     runDraft.headSha === gate.headSha &&
     runDraft.verificationProfile === undefined &&
@@ -1161,7 +1246,10 @@ async function installGateRun(ctx, input) {
       return saved;
     }
     // Fresh install: still the latest gate for its container, with current merges.
-    requireValue(!gate.installed && latestGate(s, gate.containers[0])?.id === gate.id, 'binding_conflict');
+    requireValue(
+      !gate.installed && gate.supersededBy === undefined && latestGate(s, gate.containers[0])?.id === gate.id,
+      'binding_conflict',
+    );
     assertGateMerges(ctx, s, gate.containers, gate.merges);
     control(ctx, s.project);
     requireValue(validGateRunDraft(runDraft, gate, tasks), 'run_draft_invalid');

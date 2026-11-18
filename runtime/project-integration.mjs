@@ -159,6 +159,113 @@ async function assertCommit(worktree, commit) {
   if (found.code !== 0 || found.stdout.trim() !== commit) fail('integration_invalid');
 }
 
+/**
+ * The head of the project's integration branch `kodo/project/<projectId>` (null when absent).
+ * @param {{ cwd: string, projectId: string }} options
+ */
+export async function integrationHeadOf({ cwd, projectId }) {
+  const found = await execute(
+    'git',
+    ['rev-parse', '--verify', '--quiet', `refs/heads/${integrationBranch(projectId)}^{commit}`],
+    { cwd, allowFailure: true },
+  );
+  return found.code === 0 && sha(found.stdout.trim()) ? found.stdout.trim() : null;
+}
+
+async function parentsOf(cwd, commit) {
+  const found = await execute('git', ['rev-list', '--parents', '-n', '1', commit], { cwd, allowFailure: true });
+  return found.code === 0 ? found.stdout.trim().split(' ').slice(1) : null;
+}
+
+const parseParents = text =>
+  text
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map(line => {
+      const [commit, ...parents] = line.trim().split(' ');
+      return { commit, parents };
+    });
+
+/**
+ * Whether a task merge recorded by its Run is still on the integration branch: `mergeCommit`
+ * is reachable from `branchHead` and its parents are exactly `before` (first) and `mergedHead`.
+ * @param {{ cwd: string, branchHead: string, mergeCommit: string, before: string, mergedHead: string }} options
+ */
+export async function mergeOnBranch({ cwd, branchHead, mergeCommit, before, mergedHead }) {
+  if (![branchHead, mergeCommit, before, mergedHead].every(sha)) return false;
+  const parents = await parentsOf(cwd, mergeCommit);
+  return Boolean(
+    parents?.length === 2 &&
+    parents[0] === before &&
+    parents[1] === mergedHead &&
+    (await ancestor(cwd, mergeCommit, branchHead)),
+  );
+}
+
+/**
+ * The parents of every merge of a gate when `baseSha..headSha` is its range: each merge lies on
+ * the first-parent history of `headSha` after `baseSha`, and the earliest of them has `baseSha`
+ * as its first parent, so the range is non-empty and contains all of them. Null otherwise.
+ * One Git call. `headSha` may also be a later head of the integration branch.
+ * @param {{ cwd: string, baseSha: string, headSha: string, mergeCommits: string[] }} options
+ * @returns {Promise<Map<string, string[]> | null>}
+ */
+export async function gateRange({ cwd, baseSha, headSha, mergeCommits }) {
+  if (!sha(baseSha) || !sha(headSha) || baseSha === headSha || !Array.isArray(mergeCommits) || !mergeCommits.length)
+    return null;
+  if (!mergeCommits.every(sha)) return null;
+  const found = await execute('git', ['rev-list', '--first-parent', '--parents', headSha, `^${baseSha}`], {
+    cwd,
+    allowFailure: true,
+  });
+  const history = found.code === 0 ? parseParents(found.stdout) : [];
+  const parents = new Map(history.map(row => [row.commit, row.parents]));
+  const earliest = history.at(-1);
+  if (
+    !earliest ||
+    !mergeCommits.includes(earliest.commit) ||
+    earliest.parents[0] !== baseSha ||
+    !mergeCommits.every(commit => parents.get(commit)?.length === 2)
+  )
+    return null;
+  return new Map(mergeCommits.map(commit => [commit, parents.get(commit)]));
+}
+
+/**
+ * The base of a gate over `mergeCommits` on `headSha`: the first parent of the earliest of them
+ * on the first-parent history of the head (see gateRange); anything else is refused.
+ * @param {{ cwd: string, headSha: string, mergeCommits: string[] }} options
+ */
+export async function gateBase({ cwd, headSha, mergeCommits }) {
+  if (!sha(headSha) || !Array.isArray(mergeCommits) || !mergeCommits.length || !mergeCommits.every(sha))
+    fail('integration_invalid');
+  const found = await execute('git', ['rev-list', '--no-walk=unsorted', '--parents', '--stdin'], {
+    cwd,
+    input: `${mergeCommits.join('\n')}\n`,
+    allowFailure: true,
+  });
+  const rows = found.code === 0 ? parseParents(found.stdout) : [];
+  if (rows.length !== new Set(mergeCommits).size || rows.some(row => row.parents.length !== 2))
+    fail('integration_invalid');
+  // The oldest first parent: merges on one first-parent history have ordered first parents.
+  let base = null;
+  for (const parent of new Set(rows.map(row => row.parents[0])))
+    if (!base || (await ancestor(cwd, parent, base))) base = parent;
+  if (!(await gateRange({ cwd, baseSha: base, headSha, mergeCommits }))) fail('integration_invalid');
+  return base;
+}
+
+/**
+ * Whether the trees of `from` and `to` differ (a non-empty diff to review).
+ * @param {{ cwd: string, from: string, to: string }} options
+ */
+export async function treesDiffer({ cwd, from, to }) {
+  if (!sha(from) || !sha(to)) fail('integration_invalid');
+  const found = await execute('git', ['diff', '--quiet', '--no-ext-diff', from, to], { cwd, allowFailure: true });
+  if (![0, 1].includes(found.code)) fail('integration_invalid');
+  return found.code === 1;
+}
+
 /** @param {{ worktree: string, mergeCommits?: string[] }} options */
 export async function waveFrontier({ worktree, mergeCommits = [] }) {
   if (!Array.isArray(mergeCommits)) fail('frontier_integration_missing');

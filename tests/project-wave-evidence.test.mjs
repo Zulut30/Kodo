@@ -127,7 +127,7 @@ function gateRun(gate, headSha = gate.headSha) {
       headSha,
       results: [{ kind: 'test', command, exitCode: 0 }],
     },
-    review: { passed: true, headSha },
+    review: { passed: true, headSha, diffHash: 'd'.repeat(64) },
     behavior: {
       schemaVersion: BEHAVIOR_GATE_VERSION,
       headSha,
@@ -425,6 +425,24 @@ for (const [name, act, blocker] of [
     f => {
       const run = gateRun(f.gate);
       delete run.review;
+      return accept(f, 'task', 'first', 'first-done', { run });
+    },
+    'wave_gate_proof_missing',
+  ],
+  [
+    // Review finding F1: a gate whose base is its head reviewed an empty diff.
+    'a gate with an empty range (base = head)',
+    f => {
+      f.gate.baseSha = f.gate.headSha;
+      return accept(f, 'task', 'first', 'first-done');
+    },
+    'wave_gate_missing',
+  ],
+  [
+    'a gate whose review covered an empty diff',
+    f => {
+      const run = gateRun(f.gate);
+      run.review.diffHash = createHash('sha256').update('').digest('hex');
       return accept(f, 'task', 'first', 'first-done', { run });
     },
     'wave_gate_proof_missing',

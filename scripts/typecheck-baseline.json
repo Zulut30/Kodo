@@ -438,24 +438,6 @@
     "count": 1
   },
   {
-    "file": "runtime/project-store.mjs",
-    "code": "TS2339",
-    "message": "Property 'authorizeTransition' does not exist on type '{}'.",
-    "count": 1
-  },
-  {
-    "file": "runtime/project-store.mjs",
-    "code": "TS2339",
-    "message": "Property 'contracts' does not exist on type '{}'.",
-    "count": 1
-  },
-  {
-    "file": "runtime/project-store.mjs",
-    "code": "TS2339",
-    "message": "Property 'store' does not exist on type '{}'.",
-    "count": 1
-  },
-  {
     "file": "runtime/providers.mjs",
     "code": "TS2339",
     "message": "Property 'metrics' does not exist on type 'Error'.",

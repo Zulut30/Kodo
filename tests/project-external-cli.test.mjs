@@ -164,7 +164,15 @@ test('Project CLI delegates next-wave and complete-task to the pull protocol', a
   };
   const next = await projectCli(['next-wave', waveId, '--host', 'orca', '--limit', '2', '--json'], { ...base, wave });
   assert.equal(next.exitCode, 0, next.output);
-  assert.deepEqual(selected, [{ limit: 2, inFlight: [] }]);
+  // Like drain, the selection sees which tasks have verified interface proofs.
+  assert.deepEqual(
+    selected.map(({ limit, inFlight, availability }) => ({
+      limit,
+      inFlight,
+      availability: availability.map(row => [row.taskId, row.interfacesVerified]),
+    })),
+    [{ limit: 2, inFlight: [], availability: [['task-a', true]] }],
+  );
   const [brief] = next.report.result.briefs;
   assert.equal(brief.taskId, 'task-a');
   assert.equal(brief.role, 'architect');

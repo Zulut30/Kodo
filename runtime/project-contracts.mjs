@@ -28,7 +28,7 @@ const PREFIX =
 const MAX_GATE_BYTES = 64 * 1024;
 const MAX_REOPENED = 100;
 const GATE_PREFIX =
-  'Verify only this integration gate. Check the combined behavior of the merged tasks below; do not implement other backlog work.\n';
+  'Verify only this integration gate. Check the combined behavior of the merged tasks of its plan; the gate manifest below binds their frozen contracts. Do not implement other backlog work.\n';
 const executionModes = { task: 'frontier', wave: 'branch' };
 
 function fail(code = 'project_schema') {
@@ -411,8 +411,11 @@ const gateFields = {
   createdAt: timestamp,
   updatedAt: timestamp,
 };
+// A reservation replaced before its install (its head went stale) names its successor.
+const gateOptional = { supersededBy: uuid };
 function gateRecord(value) {
-  const g = dated(object(value, gateFields));
+  const g = dated(extended(value, gateFields, gateOptional));
+  if (g.supersededBy !== undefined && (g.installed || g.supersededBy === g.id)) fail('project_gate_invalid');
   if (g.containers.some(c => c.kind === 'project' && c.id !== g.projectId)) fail('project_identity');
   return g;
 }
@@ -738,7 +741,7 @@ const normalize = {
     if (input.projectContext.projectId !== input.task.projectId) fail('project_identity');
     return input;
   },
-  gateRunInput: v => {
+  gateManifest: v => {
     const input = object(v, {
       schemaVersion: one,
       projectContext: v => object(v, projectContextFields),
@@ -754,6 +757,14 @@ const normalize = {
     if (input.tasks.some(t => t.projectId !== input.projectContext.projectId)) fail('project_identity');
     return input;
   },
+  gateRunInput: v =>
+    object(v, {
+      schemaVersion: v => int(v, 2, 2),
+      projectId: uuid,
+      gate: v => object(v, { containers: gateContainers, baseSha: sha, headSha: sha }),
+      taskCount: v => int(v, 1, MAX_ITEMS),
+      manifest: v => object(v, { kind: member(['gate-manifest']), sha256: digest, bytes: v => int(v, 1, MAX_BYTES) }),
+    }),
 };
 
 export function normalizeDirectorRecord(kind, input, options) {
@@ -832,9 +843,33 @@ function contextOf(project) {
     architectureRefs: project.architectureRefs,
   };
 }
-/** Exact Run task text for a wave integration gate: frozen contracts of the
- * covered tasks in `gate.merges` order. Options default to no known values. */
+/** The gate manifest: frozen contracts of every covered task in `gate.merges` order with the
+ * project context and the gate range. It is kept as an immutable evidence artifact of the
+ * gate Run (kind `gate-manifest`); `sha256` covers its canonical bytes and is bound into
+ * the gate input. Returns `{ manifest, sha256, bytes }`. */
+export function buildGateManifest(input, options = { knownValues: [] }) {
+  const body = gateManifestBody(input, options);
+  const encoded = directorBytes('gateManifest', body, options);
+  return {
+    manifest: JSON.parse(encoded.toString('utf8')),
+    sha256: createHash('sha256').update(encoded).digest('hex'),
+    bytes: encoded.length,
+  };
+}
+/** Exact Run task text for a wave integration gate: a compact summary (containers, task count,
+ * base/head) bound to the gate manifest by its SHA-256. Options default to no known values. */
 export function buildGateInput(input, options = { knownValues: [] }) {
+  const { manifest, sha256, bytes } = buildGateManifest(input, options);
+  const body = {
+    schemaVersion: 2,
+    projectId: manifest.projectContext.projectId,
+    gate: manifest.gate,
+    taskCount: manifest.tasks.length,
+    manifest: { kind: 'gate-manifest', sha256, bytes },
+  };
+  return GATE_PREFIX + directorBytes('gateRunInput', body, options).toString('utf8');
+}
+function gateManifestBody(input, options) {
   assertDirectorSafe(input, options);
   const { project, gate, tasks } = object(input, {
     project: v => normalizeDirectorRecord('project', v, options),
@@ -856,13 +891,12 @@ export function buildGateInput(input, options = { knownValues: [] }) {
     gate.merges.some(m => !byId.has(m.taskId))
   )
     fail('project_identity');
-  const body = {
+  return {
     schemaVersion: 1,
     projectContext: contextOf(project),
     gate: { containers: gate.containers, baseSha: gate.baseSha, headSha: gate.headSha },
     tasks: gate.merges.map(m => contract(byId.get(m.taskId))),
   };
-  return GATE_PREFIX + directorBytes('gateRunInput', body, options).toString('utf8');
 }
 /** Install binding for a gate Run; mergesHash covers the canonical merges JSON. */
 export function gateBindingFor(input, options = { knownValues: [] }) {

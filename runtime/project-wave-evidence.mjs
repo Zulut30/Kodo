@@ -165,9 +165,12 @@ function containerProgress({ snapshot, action, record }) {
   return result(eligible, eligible.includes(action.to) ? [] : ['container_progress_unverified']);
 }
 
+// SHA-256 of an empty diff: a review receipt with it reviewed nothing.
+const EMPTY_DIFF = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
+
 // The binding keeps the gate head; repairs may move run.headSha to a verified
 // descendant (checked with Git by the trusted validateRun port). Every receipt
-// below is about that verified head.
+// below is about that verified head, over the non-empty range gate.baseSha..run.headSha.
 function boundGate(gate, run, gates, snapshot, contracts) {
   if (!gate || !run || typeof contracts.gateBindingFor !== 'function') return false;
   const stored = gates.find(row => row.id === gate.id);
@@ -185,6 +188,9 @@ function boundGate(gate, run, gates, snapshot, contracts) {
     sha(gate.headSha) &&
     sha(run.headSha) &&
     run.baseSha === gate.baseSha &&
+    gate.baseSha !== gate.headSha &&
+    run.headSha !== gate.baseSha &&
+    gate.supersededBy === undefined &&
     // Byte-for-byte: the same schema-order binding the gate run was installed with.
     JSON.stringify(run.directorBinding) === JSON.stringify(contracts.gateBindingFor(gate))
   );
@@ -261,6 +267,8 @@ function gateRunCurrent(run) {
     integrated(run) &&
     run.review?.passed === true &&
     run.review.headSha === run.headSha &&
+    typeof run.review.diffHash === 'string' &&
+    run.review.diffHash !== EMPTY_DIFF &&
     isCurrentBehaviorReceipt(run.behavior, { headSha: run.headSha, baseSha: run.baseSha, config: run.config }) &&
     gatesCurrent(run) &&
     smokeComplete(run)

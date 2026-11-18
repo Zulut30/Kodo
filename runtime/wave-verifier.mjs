@@ -19,11 +19,13 @@ import { resolveMode } from './modes.mjs';
 import { normalizeWatchdogConfig, resolveBlocker } from './watchdog.mjs';
 import { currentBlocker } from './engine.mjs';
 import { runFastChecks } from './task-fast-checks.mjs';
-import { buildGateInput, gateBindingFor } from './project-contracts.mjs';
-import { gateRepairInScope, integrationBranch } from './project-integration.mjs';
+import { buildGateInput, buildGateManifest, gateBindingFor } from './project-contracts.mjs';
+import { gateRange, gateRepairInScope, integrationHeadOf } from './project-integration.mjs';
 
 /** The watchdog of a wave gate when the project sets none. */
 export const GATE_WATCHDOG = Object.freeze({ stalledRounds: 2, rejectUnchanged: true });
+/** The fewest repair rounds of a gate Run in any mode (a repair is verified again). */
+export const GATE_MIN_REPAIR_ROUNDS = 2;
 const shaPattern = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 const runIdPattern = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,100}$/;
 const budgetKeys = ['researchBudget', 'repairRounds', 'concurrency', 'maxTasks'];
@@ -42,11 +44,8 @@ export function gateMergesHash(merges) {
   return createHash('sha256').update(JSON.stringify(rows)).digest('hex');
 }
 
-const contains = async (cwd, commit, head) =>
-  (await execute('git', ['merge-base', '--is-ancestor', commit, head], { cwd, allowFailure: true })).code === 0;
-
-/** The head the task's own Run recorded for this merge; its merge commit's second parent must be that head. */
-async function assertMergeOfAttempt(engine, root, merge) {
+/** The merge the task's own Run recorded: its parents are exactly the recorded `before` and verified head. */
+function assertMergeOfAttempt(engine, parents, merge) {
   let run = null;
   try {
     run = engine.store.getRun(merge.runId);
@@ -58,19 +57,16 @@ async function assertMergeOfAttempt(engine, root, merge) {
     integration?.status !== 'merged' ||
     integration.mergeCommit !== merge.mergeCommit ||
     !shaPattern.test(run.headSha) ||
+    !shaPattern.test(integration.before) ||
     integration.mergedHead !== run.headSha
   )
     throw invalid(`merge ${merge.taskId} is not the recorded integration of its attempt`);
-  const parents = await execute('git', ['rev-list', '--parents', '-n', '1', merge.mergeCommit], {
-    cwd: root,
-    allowFailure: true,
-  });
-  const [, , second, ...extra] = parents.code === 0 ? parents.stdout.trim().split(' ') : [];
-  if (second !== run.headSha || extra.length)
+  const [first, second] = parents.get(merge.mergeCommit) ?? [];
+  if (first !== integration.before || second !== run.headSha)
     throw invalid(`merge ${merge.taskId} does not merge the head of its attempt`);
 }
 
-/** The covered tasks of a gate, in merge order; the gate head must contain its base and every merge. */
+/** The covered tasks of a gate, in merge order; its range must hold every merge of their attempts. */
 async function coveredTasks({ engine, project, gate, tasks }) {
   if (!gate || typeof gate !== 'object' || gate.schemaVersion !== 1) throw invalid('schemaVersion');
   if (!nonEmpty(gate.id) || !nonEmpty(gate.projectId)) throw invalid('id');
@@ -96,22 +92,47 @@ async function coveredTasks({ engine, project, gate, tasks }) {
       throw invalid(`merge ${String(merge?.taskId).slice(0, 80)}`);
     covered.push({ task, merge });
   }
-  for (const commit of [gate.baseSha, ...gate.merges.map(merge => merge.mergeCommit)])
-    if (!(await contains(project.root, commit, gate.headSha)))
-      throw invalid(`${commit.slice(0, 12)} is not contained in the gate head`);
-  for (const merge of gate.merges) await assertMergeOfAttempt(engine, project.root, merge);
+  // The reviewed range is gate.baseSha..gate.headSha: the base is the first parent of the
+  // earliest covered merge on the branch history, so the range holds every covered merge.
+  const parents = await gateRange({
+    cwd: project.root,
+    baseSha: gate.baseSha,
+    headSha: gate.headSha,
+    mergeCommits: gate.merges.map(merge => merge.mergeCommit),
+  });
+  if (!parents) throw invalid('baseSha is not the parent of the earliest covered merge on the gate head');
+  for (const merge of gate.merges) assertMergeOfAttempt(engine, parents, merge);
   return covered;
 }
 
 /** The gate head must still be the head of the project integration branch (under its lease). */
 async function assertIntegrationHead(project, gate) {
-  const found = await execute(
-    'git',
-    ['rev-parse', '--verify', '--quiet', `refs/heads/${integrationBranch(gate.projectId)}^{commit}`],
-    { cwd: project.root, allowFailure: true },
-  );
-  if (found.code !== 0 || found.stdout.trim() !== gate.headSha)
+  if ((await integrationHeadOf({ cwd: project.root, projectId: gate.projectId })) !== gate.headSha)
     throw fail('Голова интеграционной ветки проекта не равна head гейта', 'gate_head_stale');
+}
+
+/** An installed gate's Run, replayed through the store before any head check (null when none). */
+async function installedRun({ engine, project, gate, tasks, installGateRun }) {
+  let stored = null;
+  try {
+    stored = engine.store.getRun(gate.runId);
+  } catch {
+    return null;
+  }
+  if (!stored) return null;
+  const byId = new Map((tasks || []).map(task => [task?.id, task]));
+  const covered = (Array.isArray(gate.merges) ? gate.merges : []).map(merge => byId.get(merge?.taskId));
+  if (!covered.length || covered.some(task => !task)) return null; // coveredTasks reports it.
+  // The store returns its saved Run only for this exact binding and gate input.
+  return installGateRun({
+    binding: gateBindingFor(gate),
+    runDraft: {
+      id: gate.runId,
+      project: project.root,
+      task: buildGateInput({ project, gate, tasks: covered }),
+      directorBinding: gateBindingFor(gate),
+    },
+  });
 }
 
 const acceptance = task => {
@@ -149,6 +170,9 @@ export async function createGateRunDraft({
   if (withLease === undefined && leaseHeld !== true)
     throw fail('Черновик гейта требует lease project-integration проекта', 'gate_lease_required');
   const work = async () => {
+    // An exact repeat of a finished install returns its Run even after the branch moved on.
+    const replayed = await installedRun({ engine, project, gate, tasks, installGateRun });
+    if (replayed) return replayed;
     const covered = await coveredTasks({ engine, project, gate, tasks });
     await assertIntegrationHead(project, gate);
     const runDraft = await gateDraft({ engine, project, gate, covered, input });
@@ -179,6 +203,8 @@ async function gateDraft({ engine, project, gate, covered, input }) {
     watchdog: normalizeWatchdogConfig(project.execution?.watchdog ?? GATE_WATCHDOG),
   };
   for (const key of budgetKeys) config[key] = executionMode.profile[key];
+  // A repair needs a re-verification round: even quick mode gets two.
+  config.repairRounds = Math.max(GATE_MIN_REPAIR_ROUNDS, config.repairRounds);
   const draft = {
     ...prepared,
     config,
@@ -218,6 +244,10 @@ async function gateDraft({ engine, project, gate, covered, input }) {
     research: { items: [], requests: 0, errors: [], cache: [] },
   };
   await engine.initializeRun(draft);
+  // The full list and contracts of the covered tasks: an immutable evidence artifact whose
+  // canonical SHA-256 the gate input (draft.task) already binds.
+  const { manifest } = buildGateManifest({ project, gate, tasks: covered.map(({ task }) => task) }, { knownValues });
+  draft.gateManifest = await engine.persistEvidence(draft, 'gate-manifest', manifest, { headSha: gate.headSha });
   return draft;
 }
 

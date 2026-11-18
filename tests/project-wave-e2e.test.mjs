@@ -342,6 +342,32 @@ test(
   },
 );
 
+test('drain --retry-failed never executes natively a task an external chat abandoned', { timeout: 600000 }, async t => {
+  // F2 open question: the retry went to the drain, which re-ran the external task natively.
+  const f = await fixture(t, { epics: ['e1'], tasks: [task('ext')] });
+  const next = await f.cli(['next-wave', f.id, '--host', 't3']);
+  assert.equal(next.exitCode, 0, next.output);
+  const [brief] = next.report.result.briefs;
+  const abandoned = await f.cli(['complete-task', f.id, 'ext', '--head', brief.baseSha, '--abandon']);
+  assert.equal(abandoned.report.result.status, 'abandoned', abandoned.output);
+  const drained = await f.cli(['drain', f.id, '--retry-failed']);
+  assert.equal(drained.report.result.status, 'blocked', drained.output);
+  assert.ok(
+    drained.report.result.blockers.some(row => row.code === 'wave_retry_executor' && row.id === 'ext'),
+    drained.output,
+  );
+  assert.deepEqual(f.calls.worker, [], 'the drain never executed the external task');
+  assert.equal(f.taskRuns().length, 1, 'no native Run was installed');
+  const retried = await f.cli(['next-wave', f.id, '--host', 't3', '--retry-failed']);
+  assert.equal(retried.exitCode, 0, retried.output);
+  assert.deepEqual(
+    retried.report.result.briefs.map(row => row.taskId),
+    ['ext'],
+  );
+  assert.notEqual(retried.report.result.briefs[0].runId, brief.runId);
+  assert.deepEqual(f.store.getRun(retried.report.result.briefs[0].runId).executor, { kind: 'external', host: 't3' });
+});
+
 test('A reservation without a Run is resumed only by its own executor', { timeout: 600000 }, async t => {
   const f = await fixture(t, { epics: ['e1'], tasks: [task('ext'), task('own')] });
   // Crashes between reserveAttempt and the Run install: one for host t3, one for the drain.

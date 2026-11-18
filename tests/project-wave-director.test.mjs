@@ -12,6 +12,8 @@ import * as A from '../runtime/project-contracts.mjs';
 import { openProjectStore } from '../runtime/project-store.mjs';
 import { createProjectDirector, createProjectTransitionAuthorizer } from '../runtime/project-director.mjs';
 import { createWaveContext, selectWave } from '../runtime/project-director-waves.mjs';
+import { withIntegrationLease } from '../runtime/project-integration-lease.mjs';
+import { evaluateWaveTransition } from '../runtime/project-wave-evidence.mjs';
 
 // Wave execution through the real Engine with fake subscription providers, a real
 // temporary Git repository and the production transition authorizer.
@@ -135,6 +137,8 @@ async function fixture(
     files = {},
     execution = wave,
     hooks = {},
+    wrapRepo = repo => repo,
+    evaluator,
   } = {},
 ) {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'kodo-wave-director-'));
@@ -208,7 +212,7 @@ async function fixture(
   const repo = await openProjectStore({
     store,
     contracts: A,
-    authorizeTransition: createProjectTransitionAuthorizer({ store, engine, contracts: A }),
+    authorizeTransition: createProjectTransitionAuthorizer({ store, engine, contracts: A, evaluator }),
   });
   const epicIds = [...new Set(tasks.map(row => row.epicId))];
   const spec = {
@@ -235,7 +239,7 @@ async function fixture(
     action,
   });
   const id = (await repo.apply(command(null, { op: 'create', spec }))).projectId;
-  const director = createProjectDirector({ repo, engine });
+  const director = createProjectDirector({ repo: wrapRepo(repo), engine });
   const user = () => ({
     head: git(root, 'rev-parse', 'HEAD'),
     branch: git(root, 'branch', '--show-current'),
@@ -246,7 +250,41 @@ async function fixture(
       .split('\n')
       .filter(Boolean);
   const runs = () => store.listRuns(root);
-  return { directory, root, home, flag, store, engine, repo, id, director, calls, command, user, merges, runs };
+  const branch = `refs/heads/kodo/project/${id}`;
+  const branchHead = () => git(root, 'rev-parse', branch);
+  // The private integration worktree of the project branch (another writer commits there).
+  const integrationWorktree = () =>
+    git(root, 'worktree', 'list', '--porcelain')
+      .split(/\r?\n\r?\n/)
+      .find(block => block.includes(`branch ${branch}`))
+      .split(/\r?\n/)[0]
+      .slice('worktree '.length);
+  const commitOnBranch = async (name, text) => {
+    const worktree = integrationWorktree();
+    await writeFile(path.join(worktree, name), text);
+    git(worktree, 'add', '-A');
+    git(worktree, 'commit', '-m', `Another writer adds ${name}`);
+    return git(worktree, 'rev-parse', 'HEAD');
+  };
+  return {
+    directory,
+    root,
+    home,
+    flag,
+    store,
+    engine,
+    repo,
+    id,
+    director,
+    calls,
+    command,
+    user,
+    merges,
+    runs,
+    branchHead,
+    integrationWorktree,
+    commitOnBranch,
+  };
 }
 
 const statuses = rows => Object.fromEntries(rows.map(row => [row.id ?? row.taskId, row.status]));
@@ -524,3 +562,166 @@ test('drain refuses a legacy project and invalid bounds', async t => {
   for (const options of [{ maxWaves: 0 }, { maxWaves: 101 }, { concurrency: 6 }, { concurrency: 1.5 }])
     await assert.rejects(f.director.drain(f.id, options), { code: 'project_drain_invalid' });
 });
+
+test(
+  'integrated is authorized only under the integration lease, by a merge still on the branch with its recorded parents',
+  { timeout: 300000 },
+  async t => {
+    // Review finding F1-2a: a stored merge receipt was enough after the branch had moved; the
+    // Git checks ran outside the lease and the first parent was never compared.
+    let captured = null;
+    const f = await fixture(t, {
+      tasks: [task('alpha')],
+      wrapRepo: repo => ({
+        ...repo,
+        apply: async command => {
+          const action = command.action;
+          if (!captured && action.op === 'transition' && action.kind === 'attempt' && action.to === 'integrated') {
+            captured = command;
+            throw Object.assign(new Error('Owned stop before the integrated transition'), { code: 'fixture_stop' });
+          }
+          return repo.apply(command);
+        },
+      }),
+    });
+    const stopped = await f.director.drain(f.id);
+    assert.equal(stopped.status, 'blocked', JSON.stringify(stopped));
+    const run = f.store.getRun(captured.action.evidence[0].runId);
+    const integration = run.integration;
+    assert.equal(integration.status, 'merged');
+    const again = () => ({ ...captured, commandId: randomUUID(), expectedRevision: f.repo.snapshot(f.id).revision });
+    const leased = work => withIntegrationLease(f.store, f.id, work);
+    // Outside the lease a merge or merge-back may move the branch before the commit.
+    await assert.rejects(f.repo.apply(again()), { code: 'project_integration_lease_required' });
+    // A receipt whose `before` is not the merge's first parent proves nothing.
+    f.store.updateRun(run.id, { integration: { ...integration, before: run.headSha } });
+    await assert.rejects(
+      leased(() => f.repo.apply(again())),
+      { code: 'project_transition_blocked' },
+      'first parent',
+    );
+    f.store.updateRun(run.id, { integration });
+    // After the merge is rolled back the saved receipt proves nothing either.
+    const worktree = f.integrationWorktree();
+    git(worktree, 'reset', '--hard', integration.before);
+    await assert.rejects(
+      leased(() => f.repo.apply(again())),
+      { code: 'project_transition_blocked' },
+      'rollback',
+    );
+    git(worktree, 'reset', '--hard', integration.mergeCommit);
+    // Under the lease, with the merge on the branch, the transition commits.
+    await leased(() => f.repo.apply(again()));
+    assert.equal(f.repo.snapshot(f.id).currentAttempts[0].status, 'integrated');
+    const result = await f.director.drain(f.id);
+    assert.equal(result.status, 'accepted', JSON.stringify(result));
+  },
+);
+
+test(
+  'The project is accepted only on a head still current after every check; a moved branch gets a project gate',
+  { timeout: 300000 },
+  async t => {
+    // Review finding F1-2c: the integration head was read before the asynchronous proof, so a
+    // branch moved during the check let the project be accepted on a stale head.
+    let moved = null,
+      f;
+    f = await fixture(t, {
+      tasks: [task('alpha')],
+      evaluator: {
+        evaluateWaveTransition: async (input, ports) => {
+          const result = await evaluateWaveTransition(input, ports);
+          const action = input.command.action;
+          if (!moved && action.kind === 'project' && action.to === 'accepted')
+            moved = await f.commitOnBranch('late.txt', 'late writer\n');
+          return result;
+        },
+      },
+    });
+    const result = await f.director.drain(f.id);
+    assert.equal(result.status, 'accepted', JSON.stringify(result));
+    assert.ok(moved, 'the branch moved while the project proof was checked');
+    const snapshot = f.repo.snapshot(f.id);
+    assert.deepEqual(
+      snapshot.gates.map(gate => gate.containers.map(row => row.kind)),
+      [['epic', 'milestone', 'project'], ['project']],
+    );
+    const projectGate = snapshot.gates[1];
+    assert.equal(projectGate.headSha, moved, 'the project gate verified the moved head');
+    assert.equal(f.store.getRun(projectGate.runId).headSha, f.branchHead());
+    assert.equal(git(f.root, 'show', `${f.branchHead()}:late.txt`), 'late writer');
+  },
+);
+
+test(
+  'When the branch moves after an epic gate covering the project, drain reserves a project gate on the current head',
+  { timeout: 300000 },
+  async t => {
+    // F2 open question: the project stayed `integrated` with wave_project_head_mismatch.
+    let moved = null,
+      f;
+    f = await fixture(t, {
+      tasks: [task('alpha'), task('beta')],
+      hooks: {
+        onReview: async () => {
+          if (!moved) moved = await f.commitOnBranch('late.txt', 'late writer\n');
+        },
+      },
+    });
+    const result = await f.director.drain(f.id, { concurrency: 2 });
+    assert.equal(result.status, 'accepted', JSON.stringify(result));
+    const snapshot = f.repo.snapshot(f.id);
+    assert.equal(snapshot.project.status, 'accepted');
+    assert.deepEqual(statuses(snapshot.tasks), { alpha: 'accepted', beta: 'accepted' });
+    const [epicGate, projectGate] = snapshot.gates;
+    assert.deepEqual(
+      epicGate.containers.map(row => row.kind),
+      ['epic', 'milestone', 'project'],
+    );
+    assert.notEqual(f.store.getRun(epicGate.runId).headSha, moved, 'the epic gate verified the earlier head');
+    assert.deepEqual(projectGate.containers, [{ kind: 'project', id: f.id }]);
+    assert.equal(projectGate.headSha, moved);
+    assert.equal(projectGate.baseSha, epicGate.baseSha, 'the project gate reviews the whole project range');
+    assert.equal(projectGate.merges.length, 2);
+    assert.equal(f.calls.review, 2, 'the epic gate and the project gate');
+  },
+);
+
+test(
+  'drain replaces a gate reservation whose install was interrupted and whose head went stale',
+  { timeout: 300000 },
+  async t => {
+    // Review finding F1-3a: the stale reservation stayed blocked with gate_head_stale.
+    let crash = true;
+    const f = await fixture(t, {
+      tasks: [task('alpha')],
+      wrapRepo: repo => ({
+        ...repo,
+        installGateRun: async input => {
+          if (crash) {
+            crash = false;
+            throw Object.assign(new Error('Owned crash before the gate install'), { code: 'fixture_crash' });
+          }
+          return repo.installGateRun(input);
+        },
+      }),
+    });
+    await assert.rejects(f.director.drain(f.id), /Owned crash before the gate install/);
+    assert.deepEqual(
+      f.repo.snapshot(f.id).gates.map(gate => gate.installed),
+      [false],
+    );
+    const moved = await f.commitOnBranch('late.txt', 'late writer\n');
+    const result = await f.director.drain(f.id);
+    assert.equal(result.status, 'accepted', JSON.stringify(result));
+    const gates = f.repo.snapshot(f.id).gates;
+    assert.deepEqual(
+      gates.map(gate => [gate.number, gate.installed, gate.supersededBy ?? null]),
+      [
+        [1, false, gates[1].id],
+        [2, true, null],
+      ],
+    );
+    assert.equal(gates[1].headSha, moved);
+  },
+);
