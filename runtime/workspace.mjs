@@ -93,10 +93,13 @@ export async function collectFiles(cwd, task, secrets = {}) {
 }
 export async function changedFiles(cwd, base) {
   // NUL-separated raw names: Git quotes non-ASCII names in line mode, and redaction must not
-  // rewrite a path before it is matched against the task's write scope.
-  return (await git(cwd, ['diff', '--no-renames', '--name-only', '-z', base], { rawOutput: true }))
-    .split('\0')
-    .filter(Boolean);
+  // rewrite a path before it is matched against the task's write scope. Never trimmed: a
+  // NUL-separated name may begin with whitespace or U+FEFF.
+  const { stdout } = await execute('git', ['diff', '--no-renames', '--name-only', '-z', base], {
+    cwd,
+    rawOutput: true,
+  });
+  return stdout.split('\0').filter(Boolean);
 }
 export async function commitChanges(cwd, message, paths) {
   if (paths === undefined) await git(cwd, ['add', '-A']);

@@ -16,6 +16,7 @@ import { createProjectDirector, createProjectTransitionAuthorizer } from '../run
 import { withIntegrationLease } from '../runtime/project-integration-lease.mjs';
 import {
   TASK_FAST_PROFILE,
+  nodeArguments,
   nodeTestOutcome,
   passedTests,
   planFastChecks,
@@ -800,8 +801,25 @@ test('--test=value starts the runner and a selecting option makes the count unre
   const tap = '# tests 1\n# suites 0\n# pass 1\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0\n';
   // `--test=true` is Node's test runner: its zero-test protection applies.
   assert.deepEqual(nodeTestOutcome({ command: 'node', args: ['--test=true'] }, tap), { tests: 1 });
-  assert.equal(nodeTestOutcome({ command: 'node', args: ['--test=false'] }, tap), null);
+  // Node 24 starts the runner for --test=false as well: it is counted like --test.
+  assert.deepEqual(nodeTestOutcome({ command: 'node', args: ['--test=false', '--test-reporter=tap'] }, tap), {
+    tests: 1,
+  });
   // A filter without matches can report the file itself as one passed test: never counted.
   for (const option of ['--test-name-pattern=nothing', '--test-skip-pattern=x', '--test-only', '--test-shard=1/2'])
     assert.deepEqual(nodeTestOutcome({ command: 'node', args: ['--test', option] }, tap), { tests: null }, option);
+});
+
+test('Node arguments are parsed like Node: underscores, values, the script and -- are respected', () => {
+  const tap = '# tests 1\n# suites 0\n# pass 1\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0\n';
+  // Node accepts _ for - in option names: a selecting option in that form is still selecting.
+  assert.deepEqual(nodeTestOutcome({ command: 'node', args: ['--test=true', '--test_name_pattern=missing'] }, tap), {
+    tests: null,
+  });
+  // After the script, arguments belong to the script: this is not Node's test runner.
+  assert.equal(nodeTestOutcome({ command: 'node', args: ['verify.mjs', '--test=true'] }, tap), null);
+  // A known value option consumes its value; an unknown option without = makes the count unknown.
+  assert.deepEqual(nodeTestOutcome({ command: 'node', args: ['--import', 'x.mjs', '--test'] }, tap), { tests: 1 });
+  assert.deepEqual(nodeTestOutcome({ command: 'node', args: ['--mystery', '--test'] }, tap), { tests: null });
+  assert.deepEqual(nodeArguments(['--test', '--', 'a.test.mjs']).positionals, ['a.test.mjs']);
 });

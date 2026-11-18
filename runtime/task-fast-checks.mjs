@@ -48,61 +48,133 @@ export function fastCheckTimeout(run) {
   return value;
 }
 
-// Options that change which tests run: narrowed, they may run none at all.
-const selectionOption = /^--(?:test-shard|test-name-pattern|test-skip-pattern|test-only)(?:=|$)/;
-// Options that change the summary the narrowed run is counted by.
-const reporterOption = /^--test-reporter(?:-destination)?(?:=|$)/;
-// Node's built-in reporters whose final summary on stdout gives the pass count (`ℹ`/`#` lines).
-// `dot`, `junit`, `lcov`, custom reporters and any destination give no countable summary.
+// Options that change which tests run: a filter without matches can report the file itself as one
+// passed test, so a selecting command never gives a countable summary.
+const selectionNames = new Set(['test-shard', 'test-name-pattern', 'test-skip-pattern', 'test-only']);
+// Kept for diagnostics: reporter arguments as written.
+const reporterOption = /^--test[-_]reporter(?:[-_]destination)?(?:=|$)/;
+// Node's built-in reporters whose final summary on stdout gives the pass count (ℹ/# lines).
+// dot, junit, lcov, custom reporters and any destination give no countable summary.
 const countableReporters = ['spec', 'tap'];
 const nodeCommand = command => command === process.execPath || /(?:^|[\\/])node(?:\.exe)?$/i.test(command);
-// `--test` or `--test=<value>` (other than false) starts Node's test runner.
-const testFlag = arg => typeof arg === 'string' && /^--test(?:=(?!false$).*)?$/.test(arg);
-/** Whether a configured command is Node's own test runner (`node --test`). */
-export const nodeTestCommand = ({ command, args = [] }) => nodeCommand(command) && args.some(testFlag);
-/** Reporter names and destinations in both forms: `--test-reporter=tap` and `--test-reporter tap`. */
-function reporterSpecs(args = []) {
-  const names = [],
-    destinations = [];
+// Node options that take the next argument as their value unless written as --name=value.
+const valueOptions = new Set([
+  'test-reporter',
+  'test-reporter-destination',
+  'test-name-pattern',
+  'test-skip-pattern',
+  'test-shard',
+  'test-concurrency',
+  'test-timeout',
+  'test-isolation',
+  'test-coverage-include',
+  'test-coverage-exclude',
+  'test-coverage-branches',
+  'test-coverage-functions',
+  'test-coverage-lines',
+  'test-global-setup',
+  'import',
+  'require',
+  'r',
+  'loader',
+  'experimental-loader',
+  'conditions',
+  'C',
+  'env-file',
+  'env-file-if-exists',
+  'input-type',
+  'title',
+  'watch-path',
+  'redirect-warnings',
+  'disable-warning',
+]);
+// Options known to take no value. Any other option without "=" is ambiguous: Kodo cannot tell
+// whether the next argument is its value, a test pattern or the script.
+const booleanOption = name =>
+  /^(?:test|test-only|test-force-exit|test-update-snapshots|watch|no-.+|experimental-.+|enable-.+|trace-.+|pending-deprecation|preserve-symlinks|preserve-symlinks-main|throw-deprecation|abort-on-uncaught-exception|expose-gc|frozen-intrinsics|insecure-http-parser)$/.test(
+    name,
+  );
+
+/**
+ * Node's own command line: its options up to the script, `--` or (in test mode) the test
+ * patterns. Names are normalized (`_` as `-`, as Node accepts both). After a script, the
+ * remaining arguments belong to the script and are never read as Node options.
+ * @param {string[]} [args]
+ */
+export function nodeArguments(args = []) {
+  const options = [],
+    positionals = [];
+  let ambiguous = false,
+    separated = false,
+    script = null;
   for (let index = 0; index < args.length; index++) {
-    const match = /^--test-reporter(-destination)?(?:=(.*))?$/.exec(args[index]);
-    if (match) (match[1] ? destinations : names).push(match[2] ?? args[index + 1]);
+    const arg = String(args[index]);
+    const testMode = options.some(option => option.name === 'test');
+    if (arg === '--') {
+      separated = true;
+      if (testMode) positionals.push(...args.slice(index + 1).map(String));
+      else script = args[index + 1] ?? null;
+      break;
+    }
+    if (!arg.startsWith('-') || arg === '-') {
+      if (!testMode) {
+        script = arg;
+        break;
+      }
+      positionals.push(arg);
+      continue;
+    }
+    const match = /^--?([^=]+)(?:=([\s\S]*))?$/.exec(arg);
+    const name = match ? match[1].replaceAll('_', '-') : arg;
+    let value = match?.[2];
+    const inline = value !== undefined;
+    if (!inline && valueOptions.has(name)) value = args[++index] === undefined ? undefined : String(args[index]);
+    else if (!inline && !booleanOption(name)) ambiguous = true;
+    options.push({ name, value, inline });
   }
-  return { names, destinations };
+  const testMode = options.some(option => option.name === 'test');
+  return { options, positionals, script, testMode, ambiguous, separated };
 }
-// The default reporter, or exactly one spec/tap reporter written to stdout (either argument form).
-const countableReporter = (args = []) => {
-  const { names, destinations } = reporterSpecs(args);
+const parsed = step => nodeArguments(step.args || []);
+/** Whether a configured command is Node's own test runner (`node --test`, any value). */
+export const nodeTestCommand = step => nodeCommand(step.command) && parsed(step).testMode;
+// The default reporter, or exactly one spec/tap reporter written to stdout.
+const countableReporter = ({ options }) => {
+  const names = options.filter(option => option.name === 'test-reporter').map(option => option.value);
+  const destinations = options.filter(option => option.name === 'test-reporter-destination');
   return !destinations.length && (!names.length || (names.length === 1 && countableReporters.includes(names[0])));
 };
-// A `node --test` command whose summary says how many tests passed. A selecting option makes the
-// count unreliable (a filter without matches can report the file itself as one passed test).
-const countedRunner = step =>
-  nodeTestCommand(step) && countableReporter(step.args) && !step.args.some(arg => selectionOption.test(arg));
+const selecting = ({ options }) => options.some(option => selectionNames.has(option.name));
+// A `node --test` command whose summary says how many tests passed.
+const countedRunner = step => {
+  if (!nodeCommand(step.command)) return false;
+  const node = parsed(step);
+  return node.testMode && !node.ambiguous && countableReporter(node) && !selecting(node);
+};
 
 /**
  * Only Node's own test runner can be narrowed to the affected files. Its options must
- * survive the narrowing (`--name=value` only, none that selects tests or changes the
- * reporter); a positional path limits which test files run.
+ * survive the narrowing (written as --name=value or known flags, none that selects tests or
+ * changes the reporter); a positional path limits which test files run.
  * @param {{ command: string, args?: string[] }[]} commands
  */
 function nodeTestRunner(commands) {
   if (commands.length !== 1) return { reason: commands.length ? 'runner-multiple-commands' : 'runner-not-configured' };
   const [{ command, args = [] }] = commands;
-  if (!nodeCommand(command) || !args.some(testFlag)) return { reason: 'runner-not-node-test' };
-  const flags = [],
+  const node = nodeArguments(args);
+  if (!nodeCommand(command) || !node.testMode) return { reason: 'runner-not-node-test' };
+  if (selecting(node)) return { reason: 'runner-selection' };
+  if (!countableReporter(node)) return { reason: 'runner-reporter' };
+  if (node.ambiguous || node.separated || node.options.some(option => !option.inline && valueOptions.has(option.name)))
+    return { reason: 'runner-options' };
+  const flags = args.filter(arg => String(arg).startsWith('-')),
     scopes = [];
-  for (const arg of args) {
-    if (selectionOption.test(arg)) return { reason: 'runner-selection' };
-    if (reporterOption.test(arg) && !countableReporter(args)) return { reason: 'runner-reporter' };
-    if (testFlag(arg) || /^--[a-z][a-z0-9-]*=/.test(arg)) flags.push(arg);
-    else if (arg.startsWith('-') || /[*?[\]{}]/.test(arg)) return { reason: 'runner-options' };
-    else {
-      const scope = path.posix.normalize(arg.replaceAll('\\', '/')).replace(/\/+$/, '');
-      if (path.posix.isAbsolute(scope) || /^[a-z]:/i.test(scope) || scope === '..' || scope.startsWith('../'))
-        return { reason: 'runner-options' };
-      scopes.push(scope);
-    }
+  for (const arg of node.positionals) {
+    if (/[*?[\]{}]/.test(arg)) return { reason: 'runner-options' };
+    const scope = path.posix.normalize(arg.replaceAll('\\', '/')).replace(/\/+$/, '');
+    if (path.posix.isAbsolute(scope) || /^[a-z]:/i.test(scope) || scope === '..' || scope.startsWith('../'))
+      return { reason: 'runner-options' };
+    scopes.push(scope);
   }
   return { flags, scopes };
 }

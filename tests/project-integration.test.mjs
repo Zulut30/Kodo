@@ -657,3 +657,16 @@ test('Changed paths are raw names: a non-ASCII file inside the write scope is ow
   assert.deepEqual(files, ['docs/заметка.md']);
   assert.equal(ownsPath(['docs'], files[0]), true);
 });
+
+test('A changed name that begins with U+FEFF is kept whole: NUL-separated names are never trimmed', async t => {
+  const f = await fixture(t);
+  const base = await git(f.root, ['rev-parse', 'HEAD']);
+  await f.taskHead('bom', base, { '﻿ordinary.txt': 'x\n' });
+  const worktree = path.join(f.directory, 'tasks', 'bom');
+  const { changedFiles } = await import('../runtime/workspace.mjs');
+  const { ownsPath } = await import('../runtime/contracts.mjs');
+  const files = await changedFiles(worktree, base);
+  assert.deepEqual(files, ['﻿ordinary.txt']);
+  // A scope for the trimmed name does not own the real file.
+  assert.equal(ownsPath(['ordinary.txt'], files[0]), false);
+});
