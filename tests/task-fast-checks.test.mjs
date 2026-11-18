@@ -795,3 +795,13 @@ test('Both reporter argument forms are counted: --test-reporter=tap and --test-r
   ])
     assert.deepEqual(nodeTestOutcome({ command: 'node', args }, tap), { tests: null }, args.join(' '));
 });
+
+test('--test=value starts the runner and a selecting option makes the count unreliable', () => {
+  const tap = '# tests 1\n# suites 0\n# pass 1\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0\n';
+  // `--test=true` is Node's test runner: its zero-test protection applies.
+  assert.deepEqual(nodeTestOutcome({ command: 'node', args: ['--test=true'] }, tap), { tests: 1 });
+  assert.equal(nodeTestOutcome({ command: 'node', args: ['--test=false'] }, tap), null);
+  // A filter without matches can report the file itself as one passed test: never counted.
+  for (const option of ['--test-name-pattern=nothing', '--test-skip-pattern=x', '--test-only', '--test-shard=1/2'])
+    assert.deepEqual(nodeTestOutcome({ command: 'node', args: ['--test', option] }, tap), { tests: null }, option);
+});

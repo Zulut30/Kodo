@@ -56,8 +56,10 @@ const reporterOption = /^--test-reporter(?:-destination)?(?:=|$)/;
 // `dot`, `junit`, `lcov`, custom reporters and any destination give no countable summary.
 const countableReporters = ['spec', 'tap'];
 const nodeCommand = command => command === process.execPath || /(?:^|[\\/])node(?:\.exe)?$/i.test(command);
+// `--test` or `--test=<value>` (other than false) starts Node's test runner.
+const testFlag = arg => typeof arg === 'string' && /^--test(?:=(?!false$).*)?$/.test(arg);
 /** Whether a configured command is Node's own test runner (`node --test`). */
-export const nodeTestCommand = ({ command, args = [] }) => nodeCommand(command) && args.includes('--test');
+export const nodeTestCommand = ({ command, args = [] }) => nodeCommand(command) && args.some(testFlag);
 /** Reporter names and destinations in both forms: `--test-reporter=tap` and `--test-reporter tap`. */
 function reporterSpecs(args = []) {
   const names = [],
@@ -73,8 +75,10 @@ const countableReporter = (args = []) => {
   const { names, destinations } = reporterSpecs(args);
   return !destinations.length && (!names.length || (names.length === 1 && countableReporters.includes(names[0])));
 };
-// A `node --test` command whose summary says how many tests passed.
-const countedRunner = step => nodeTestCommand(step) && countableReporter(step.args);
+// A `node --test` command whose summary says how many tests passed. A selecting option makes the
+// count unreliable (a filter without matches can report the file itself as one passed test).
+const countedRunner = step =>
+  nodeTestCommand(step) && countableReporter(step.args) && !step.args.some(arg => selectionOption.test(arg));
 
 /**
  * Only Node's own test runner can be narrowed to the affected files. Its options must
@@ -85,13 +89,13 @@ const countedRunner = step => nodeTestCommand(step) && countableReporter(step.ar
 function nodeTestRunner(commands) {
   if (commands.length !== 1) return { reason: commands.length ? 'runner-multiple-commands' : 'runner-not-configured' };
   const [{ command, args = [] }] = commands;
-  if (!nodeCommand(command) || !args.includes('--test')) return { reason: 'runner-not-node-test' };
+  if (!nodeCommand(command) || !args.some(testFlag)) return { reason: 'runner-not-node-test' };
   const flags = [],
     scopes = [];
   for (const arg of args) {
     if (selectionOption.test(arg)) return { reason: 'runner-selection' };
     if (reporterOption.test(arg) && !countableReporter(args)) return { reason: 'runner-reporter' };
-    if (arg === '--test' || /^--[a-z][a-z0-9-]*=/.test(arg)) flags.push(arg);
+    if (testFlag(arg) || /^--[a-z][a-z0-9-]*=/.test(arg)) flags.push(arg);
     else if (arg.startsWith('-') || /[*?[\]{}]/.test(arg)) return { reason: 'runner-options' };
     else {
       const scope = path.posix.normalize(arg.replaceAll('\\', '/')).replace(/\/+$/, '');
