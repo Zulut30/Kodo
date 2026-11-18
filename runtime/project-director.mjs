@@ -19,8 +19,8 @@ const settled = value => ['accepted', 'released'].includes(value);
 const retryable = value => ['blocked', 'failed', 'cancelled'].includes(value);
 const stages = ['ready', 'running', 'verifying', 'integrated', 'accepted', 'released'];
 const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
-const known = engine => Object.values(engine.secrets || {}).filter(value => typeof value === 'string');
-const bindingFor = attempt => ({
+export const known = engine => Object.values(engine.secrets || {}).filter(value => typeof value === 'string');
+export const bindingFor = attempt => ({
   schemaVersion: 1,
   projectId: attempt.projectId,
   taskId: attempt.taskId,
@@ -50,7 +50,7 @@ function control(snapshot, allowReleased = false) {
     'control_blocked',
   );
 }
-function storedRun(store, id) {
+export function storedRun(store, id) {
   // Missing is distinguished from a corrupt/closed Store. No raw DB access.
   try {
     return store.getRun(id);
@@ -65,7 +65,7 @@ async function contractsFor(contracts) {
 async function evidenceFor(evaluator) {
   return evaluator || (await import('./project-evidence.mjs'));
 }
-async function verifyRef(engine, ref, run, container = false) {
+export async function verifyRef(engine, ref, run, container = false) {
   requireValue(typeof engine.assertEvidence === 'function');
   if (run && ref.kind !== 'interface') {
     const root = await realpath(path.join(run.artifacts, 'evidence')),
@@ -87,7 +87,7 @@ async function verifyRef(engine, ref, run, container = false) {
     );
   }
 }
-function observation(run, kind) {
+export function observation(run, kind) {
   if (kind === 'acceptance')
     return { directorBinding: run.directorBinding, task: run.task, checks: run.checks, review: run.review };
   if (kind === 'contract') return { directorBinding: run.directorBinding, task: run.task };
@@ -252,18 +252,44 @@ async function assertLogs(engine, run, rows, kind) {
   }
 }
 
-// Wave Runs: a task Run carries the task-fast receipt; a gate Run is bound to its
-// gate record, carries the full receipts and smoke logs, and its verified head
-// descends from the gate head inside the covered tasks' write paths.
+const contains = async (cwd, commit, head) =>
+  (await execute('git', ['merge-base', '--is-ancestor', commit, head], { cwd, allowFailure: true })).code === 0;
+
+// A recorded merge of a task Run is on the integration branch and merges exactly its verified head.
+async function assertTaskMerge(snapshot, run) {
+  if (run.integration?.status !== 'merged') return;
+  const branch = integrationBranch(snapshot.project.projectId),
+    commit = run.integration.mergeCommit;
+  requireValue(
+    run.integration.branch === branch && (await contains(run.project, commit, `refs/heads/${branch}`)),
+    'integration_invalid',
+  );
+  const parents = await execute('git', ['rev-list', '--parents', '-n', '1', commit], {
+    cwd: run.project,
+    allowFailure: true,
+  });
+  requireValue(parents.code === 0 && parents.stdout.trim().split(' ')[2] === run.headSha, 'integration_invalid');
+}
+
+// Wave Runs: a task Run (native or of an external chat, always profile task-fast)
+// carries the task-fast receipt once it succeeded; before that it proves only its
+// binding and source, and the evaluator grants it at most running/verifying. A gate
+// Run is bound to its gate record, carries the full receipts and smoke logs, its
+// verified head descends from the gate head inside the covered tasks' write paths
+// and is already contained in the integration branch.
 async function validateWaveRun({ store, engine, contracts, snapshot, run, gate }) {
   const options = { knownValues: known(engine) };
   contracts.assertDirectorSafe(run, options);
   requireValue(isDeepStrictEqual(run, store.getRun(run.id)), 'run_changed');
   if (!gate) {
     assertAttemptBinding({ contracts, snapshot, run, options });
+    requireValue(run.verificationProfile === 'task-fast', 'checks_stale');
     await assertRunSource(snapshot, run);
-    requireValue(run.checks?.profile === 'task-fast' && Array.isArray(run.checks.results), 'checks_stale');
-    await assertLogs(engine, run, run.checks.results, 'fast-check');
+    if (run.state === 'succeeded') {
+      requireValue(run.checks?.profile === 'task-fast' && Array.isArray(run.checks.results), 'checks_stale');
+      await assertLogs(engine, run, run.checks.results, 'fast-check');
+      await assertTaskMerge(snapshot, run);
+    }
   } else {
     const tasks = gate.merges.map(merge => snapshot.tasks.find(row => row.id === merge.taskId));
     requireValue(
@@ -280,6 +306,11 @@ async function validateWaveRun({ store, engine, contracts, snapshot, run, gate }
     requireValue(
       await gateRepairInScope({ worktree: run.cwd, from: gate.headSha, to: run.headSha, writePaths }),
       'gate_scope',
+    );
+    // Nothing is accepted that the integration branch does not contain (mergeBackGate first).
+    requireValue(
+      await contains(run.project, run.headSha, `refs/heads/${integrationBranch(snapshot.project.projectId)}`),
+      'integration_invalid',
     );
   }
   requireValue((await inspectCurrentSource({ project: run.cwd, headSha: run.headSha })) === 'clean', 'head_changed');
@@ -409,6 +440,7 @@ export function createProjectDirector({
     plan: (...args) => plan(ctx, ...args),
     run: (...args) => foreground(ctx, ...args),
     resume: (...args) => resume(ctx, ...args),
+    drain: (...args) => drainProject(ctx, ...args),
     cancel: (...args) => cancel(ctx, ...args),
     pause: (...args) => pause(ctx, ...args),
     reprioritize: (...args) => reprioritize(ctx, ...args),
@@ -552,7 +584,7 @@ async function frontier(ctx, snapshot, task) {
   return selected;
 }
 
-async function priorRetryRun(ctx, snapshot, attempt) {
+export async function priorRetryRun(ctx, snapshot, attempt) {
   if (attempt.number === 1) return null;
   // Only metadata is examined. Never replay old provider/gate sessions. The
   // atomic reservation events order predecessors even across an install crash.
@@ -587,7 +619,7 @@ async function priorRetryRun(ctx, snapshot, attempt) {
   fail('retry_history_incomplete');
 }
 
-async function retrySettings(ctx, snapshot, previous) {
+export async function retrySettings(ctx, snapshot, previous) {
   if (!previous) return null;
   (await ports(ctx)).contracts.assertDirectorSafe(previous, { knownValues: known(ctx.engine) });
   requireValue((await canonical(previous.project)) === snapshot.project.projectKey, 'retry_binding_invalid');
@@ -1046,6 +1078,14 @@ async function cancel(ctx, id, options = {}) {
       if (typeof ctx.engine.cancel === 'function') await ctx.engine.cancel(run.id);
     }
   }
+  // Wave gates: unfinished gate Runs are cancelled too. Legacy snapshots have no gates.
+  for (const gate of snapshot.gates ?? []) {
+    const run = storedRun(ctx.store, gate.runId);
+    if (run && !['succeeded', 'blocked', 'failed', 'cancelled'].includes(run.state)) {
+      ctx.store.updateRun(run.id, { cancelRequested: true });
+      if (typeof ctx.engine.cancel === 'function') await ctx.engine.cancel(run.id);
+    }
+  }
   return { status: 'cancelled' };
 }
 
@@ -1054,18 +1094,44 @@ async function pause(ctx, id, options = {}) {
   return apply(ctx, snapshot, { op: 'setPaused', paused: options.paused ?? true }, options);
 }
 
-// Wave projects run through the wave drain (next stage), never through this
-// one-task foreground loop, whose acceptance comes from the task's own Run.
+const isWave = async snapshot => (await contractsFor()).isWaveProject(snapshot.project) === true;
+
+// Wave projects never run through this one-task foreground loop, whose acceptance
+// comes from the task's own Run: `run` refuses, `resume` drains one wave.
 async function refuseWave(snapshot) {
-  if ((await contractsFor()).isWaveProject(snapshot.project) === true) fail('wave_drain_required');
+  if (await isWave(snapshot)) fail('wave_drain_required');
+}
+
+const waveContext = (ctx, W) =>
+  W.createWaveContext({ repo: ctx.repo, engine: ctx.engine, store: ctx.store, clock: ctx.clock });
+
+// `resume` of a wave project is a drain of exactly one wave of one task.
+async function waveResume(ctx, id, options) {
+  const W = await import('./project-director-waves.mjs');
+  const result = await W.drain(waveContext(ctx, W), id, {
+    maxWaves: 1,
+    concurrency: 1,
+    retryFailed: options.retryFailed === true,
+    signal: options.signal,
+    commandId: options.commandId,
+  });
+  return {
+    ...result,
+    status: ['accepted', 'max_waves'].includes(result.status) ? 'succeeded' : result.status,
+    drainStatus: result.status,
+  };
+}
+
+async function drainProject(ctx, id, options = {}) {
+  const W = await import('./project-director-waves.mjs');
+  return W.drain(waveContext(ctx, W), id, options);
 }
 
 async function resume(ctx, id, options = {}) {
   const snapshot = await snapshotFor(ctx, id);
-  await refuseWave(snapshot);
   requireValue(!['cancelled', 'failed'].includes(snapshot.project.status), 'control_blocked');
   if (snapshot.project.paused) await apply(ctx, snapshot, { op: 'setPaused', paused: false }, optionsFor(ctx, options));
-  return foreground(ctx, id, options);
+  return (await isWave(snapshot)) ? waveResume(ctx, id, options) : foreground(ctx, id, options);
 }
 
 async function reprioritize(ctx, id, taskId, options = {}) {

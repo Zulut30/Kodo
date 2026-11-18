@@ -46,6 +46,8 @@ const priority = [
   'tests/task-fast-checks.test.mjs', // ~167000 ms
   'tests/wave-verifier.test.mjs', // ~72000 ms
   'tests/engine-fast-profile.test.mjs', // ~38000 ms
+  // Wave drain: sum of case durations from one local Windows run (Node 24), not a receipt.
+  'tests/project-wave-director.test.mjs', // ~320000 ms
 ];
 
 // `npm run test:fast`: unit-level files measured at a few seconds each on
@@ -80,6 +82,7 @@ export const fastTests = [
   'tests/project-evidence.test.mjs',
   'tests/project-planner.test.mjs',
   'tests/project-progress.test.mjs',
+  'tests/project-wave-cli.test.mjs',
   'tests/project-wave-contracts.test.mjs',
   'tests/project-wave-evidence.test.mjs',
   'tests/project-wave-planner.test.mjs',

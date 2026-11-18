@@ -80,6 +80,7 @@ async function pins() {
     'progress.mjs',
     'project-integration.mjs',
     'project-wave-evidence.mjs',
+    'project-director-waves.mjs',
   ];
   const lock = new URL('../package-lock.json', import.meta.url);
   const urls = [

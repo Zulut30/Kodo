@@ -83,6 +83,8 @@ export async function projectCli(argv, ports = {}) {
     exitCode = 0,
     safety,
     phase = 'arguments';
+  if (Array.isArray(argv) && argv[0] === 'drain')
+    return (await import('./project-cli-wave.mjs')).projectWaveCli(argv, ports);
   try {
     options = argumentsFor(argv); // No credentials, state, file or providers before strict parsing.
     phase = 'credentials';

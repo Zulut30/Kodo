@@ -485,13 +485,10 @@ test('Full validators reject a profiled receipt even with full logs and the lega
 test('A wave project is never run by the legacy director nor accepted by its own task Run', async t => {
   const f = await directorFixture(t, { wave: true });
   f.engine.run = verifiedRunner(f);
+  // `resume` of a wave project is a one-wave drain (tests/project-wave-director.test.mjs).
   await assert.rejects(() => f.director.run(f.id), { code: 'project_wave_drain_required' });
-  await f.director.pause(f.id);
-  await assert.rejects(() => f.director.resume(f.id), { code: 'project_wave_drain_required' });
   let snapshot = f.repo.snapshot(f.id);
-  assert.equal(snapshot.project.paused, true, 'resume leaves a paused wave project paused');
   assert.equal(snapshot.currentAttempts.length, 0, 'no task Run was started');
-  await f.repo.apply(f.c(snapshot, { op: 'setPaused', paused: false }));
 
   // The review scenario: a fully checked and reviewed task Run of its own, no gate at all.
   snapshot = f.repo.snapshot(f.id);

@@ -11,6 +11,7 @@ kodo project create --file SPEC [--command-id UUID] [--json]
 kodo project status PROJECT_ID [--json]
 kodo project plan PROJECT_ID [--limit 1..24] [--dry-run] [--json]
 kodo project resume PROJECT_ID [--retry-failed] [--command-id UUID] [--json]
+kodo project drain PROJECT_ID [--max-waves 1..100] [--concurrency 1..5] [--retry-failed] [--command-id UUID] [--json]
 kodo project cancel|pause PROJECT_ID [--command-id UUID] [--json]
 kodo project reprioritize PROJECT_ID TASK_ID --priority 0..100 [--command-id UUID] [--json]
 kodo project approve-risk PROJECT_ID TASK_ID --reason TEXT [--command-id UUID] [--json]
@@ -20,7 +21,7 @@ kodo project approve-risk PROJECT_ID TASK_ID --reason TEXT [--command-id UUID] [
 
 `plan` всегда dry-run, с флагом `--dry-run` и без него: не резервирует Attempt и не запускает Engine. Команды offline/control не открывают provider sessions. Они лениво создают Project composition и могут инициализировать Store/миграцию: это не обещание filesystem read-only. Coordinator-only known values загружаются перед hash/write/output; нужны явные отдельные `KODO_HOME` и `KODO_CREDENTIAL_HOME` для безопасной проверки примеров.
 
-Project CLI **не принимает** `--project`, `--mode`, `--model`, `--prepare` или `--concurrency`. Root берётся из ProjectSpec. `executionMode`, `client`, `primaryModel`, разрешённые `models`, команды, gates и delivery задаются в `<root>/kodo.config.json`, по [правилам runtime](RUNTIME.md#режимы-исполнения). Режим исполнения quick/standard/deep не является игровым форматом Standard/Wild/Battlegrounds. Пример отдельного ограничения для offline planning:
+Project CLI **не принимает** `--project`, `--mode`, `--model` и `--prepare`; `--concurrency` принимает только `drain` волнового проекта. Root берётся из ProjectSpec. `executionMode`, `client`, `primaryModel`, разрешённые `models`, команды, gates и delivery задаются в `<root>/kodo.config.json`, по [правилам runtime](RUNTIME.md#режимы-исполнения). Режим исполнения quick/standard/deep не является игровым форматом Standard/Wild/Battlegrounds. Пример отдельного ограничения для offline planning:
 
 ```json
 {"schemaVersion":1,"client":"codex","executionMode":"quick","maxTasks":1,"researchBudget":0,"repairRounds":1,"concurrency":1}
@@ -59,6 +60,7 @@ Bounds: до1000 элементов в typed collections, глубина16 и ra
 | `project-director`: `createProjectTransitionAuthorizer({store,engine,contracts,evaluator})` | Свежая проверка фактического Run/head/config/gates/evidence перед разрешением перехода; wave-проект (`isWaveProject`) идёт в `evaluateWaveTransition`, остальные — прежним путём |
 | `project-director`: `createProjectDirector({repo,engine,planner,evaluator,clock})` | `plan/run/resume/cancel/pause/reprioritize/approveRisk`, переиспользование Engine; `run`/`resume` wave-проекта — `project_wave_drain_required` |
 | `project-progress`: `buildProjectProgress(snapshot)`; `project-cli`: `projectCli(argv,ports)` | Bounded counts-only сводка; strict CLI и `{report,exitCode,output}` |
+| `project-director-waves`: `createWaveContext`, `selectWave`, `integrateAndAdvance`, `runPendingGates`, `drain` | Исполнение волнового проекта, см. «Волновой режим: исполнение» |
 
 Snapshot: `{schemaVersion,project,revision,milestones,epics,tasks,currentAttempts,riskApprovals,completeness}`. Каждая count-запись содержит `total/returned/complete` из одной SQL read transaction; incomplete не доказывает полноту. `currentAttempts` включает последнюю settled попытку каждой задачи; старые попытки/approvals сохранены в истории, current approvals соответствуют Task.revision. Events читаются отдельно: history возвращает `events,total,complete,nextAfter` после cursor, limit1–1000.
 
@@ -108,7 +110,46 @@ Snapshot wave-проекта содержит `gates` (все гейты по `n
 
 **Авторизатор и директор.** `createProjectTransitionAuthorizer` маршрутизирует по `isWaveProject(snapshot.project)`: wave → `evaluateWaveTransition` (инжектированный `evaluator.evaluateWaveTransition`, иначе модуль), остальное — прежний путь без изменений. Для wave Run выбирается так: `task → ready` — без Run; `accepted` — единственный гейт снапшота, чей `runId` назван в `evidence`, и его Run (иначе `project_binding_invalid`), для `project` ещё и `integrationHead` из Git; attempt/task до `integrated` — Run текущей попытки; контейнеры до `integrated` — без Run. Доверенный `validateRun` wave: Run совпадает с сохранённым, binding (задачи — как в legacy; гейта — `gateBindingFor` + `buildGateInput`), root/config, чистый head; у задачи — журналы `fast-check` каждой строки; у гейта — полные checks/ревью/гейты как в legacy, журналы `smoke` и `gateRepairInScope(gate.headSha → run.headSha)` (порт бросает `project_gate_scope`, evaluator даёт `trusted_proof_invalid`). Прежние `run`/`resume` для wave-проекта отказывают кодом `project_wave_drain_required` (до снятия паузы и без старта Run): волновое исполнение — следующий этап.
 
-**Профили проверки.** Задача волны проходит `task-fast` (затронутые тесты, behaviour gate, без гейтов и LLM-ревью), эпик — один gate Run с полной проверкой, smoke и ревью: [VERIFICATION.md](VERIFICATION.md). Исполнение волн (`drain`, внешние чаты T3) — следующий этап.
+**Профили проверки.** Задача волны проходит `task-fast` (затронутые тесты, behaviour gate, без гейтов и LLM-ревью), эпик — один gate Run с полной проверкой, smoke и ревью: [VERIFICATION.md](VERIFICATION.md). Исполнение волн описано в следующем разделе; внешние чаты T3 — следующий этап.
+
+## Волновой режим: исполнение (drain)
+
+`kodo project drain PROJECT_ID` исполняет wave-проект до приёмки или остановки: по умолчанию до 10 волн по 3 задачи (`--max-waves 1..100`, `--concurrency 1..5`). Аргументы разбираются строго, до чтения credentials и state. Exit0 — `accepted` или `max_waves`, exit1 — неверный ввод, exit2 — остальные статусы и ошибки, в том числе legacy-проект (`project_wave_not_enabled`). `--command-id` относится к первой резервации, как у `resume`.
+
+Цикл `drain` (`runtime/project-director-waves.mjs`) идёт под lease `project:<id>` с опросом отмены, как `resume`:
+
+1. **Восстановление.** Открытые нативные попытки после сбоя или квоты продолжают тот же Run; завершённый Run только интегрируется. С `--retry-failed` для задач с blocked/failed/cancelled попыткой резервируется по одной новой попытке: не больше `concurrency` и без пересечения writePaths.
+2. **Гейты.** `runPendingGates` запускает гейт эпика, когда все его задачи integrated, а их зависимости вне эпика accepted.
+3. **Волна.** `selectWave` берёт задачи горизонта планировщика без пересечения writePaths (`scopesOverlap`) между собой и с задачами внешних чатов. Для каждой задачи: task → ready, `reserveAttempt` и Run от головы интеграционной ветки (`waveFrontier`). Run получает `verificationProfile: 'task-fast'`, режим quick без research и Gemini, выключенную доставку, `config.watchdog` из `execution.watchdog` или `{stalledRounds: 2, rejectUnchanged: true}` и `config.concurrency` из `--concurrency`. Worktree создаются по одному, затем `Engine.run` всех задач волны идёт параллельно. Завершившиеся задачи интегрируются по одной.
+4. После волны снова идут гейты, затем следующая волна.
+
+**Интеграция** (`integrateAndAdvance`) выполняется под lease `project-integration:<id>`. Голова Run сливается в `kodo/project/<id>`, `run.integration` переходит из `pending` в `merged`. Директор сохраняет evidence `acceptance`, `contract` и `checks` Run задачи и проводит attempt и task до `integrated`. Контейнер доходит до integrated, когда там все его дети. Повтор после сбоя восстанавливает записанное или уже сделанное слияние, второго merge-коммита нет. Конфликт или выход за writePaths переводит попытку в blocked; дальше нужен `--retry-failed`, новая попытка начинается от текущей головы ветки.
+
+**Гейт эпика.** Контейнеры: эпик; milestone, если остальные его эпики приняты; project, если приняты все остальные эпики проекта. `merges` — текущие попытки задач самого широкого контейнера в порядке задач снапшота. База — точка перед первым из этих слияний, head — голова ветки. После успешного gate Run его коммиты возвращаются в ветку (`mergeBackGate`), директор сохраняет evidence `acceptance`, `contract`, `checks` и `review` гейта. Затем задачи (attempt и task), эпик и покрытые milestone и project переходят в accepted. Неудачный гейт повторяется только с `--retry-failed`: резервируется новый гейт с `retry: true`.
+
+Результат: `{status, waves, integrated, gates: [{gateId, runId, state}], blockers: [{code, kind, id}], revision, code?}`.
+
+| `status` | Когда |
+| --- | --- |
+| `accepted` | Проект принят |
+| `max_waves` | Выполнено `--max-waves` волн |
+| `waiting_limits` | Квота Run задачи или гейта; следующий `drain` продолжает тот же Run |
+| `blocked` | `code`: блокер Run или сторожа (например, `no_verified_progress`), `project_integration_conflict`, `risk_approval_required`, если горизонт закрыт только risk approval, иначе первый блокер |
+| `paused` | Активные Run доходят до конца, интеграция ждёт следующего запуска |
+| `cancelled` | Проект отменён |
+
+`resume` волнового проекта — это `drain` с `maxWaves: 1` и `concurrency: 1`: ровно одна задача (или продолжение одной открытой попытки) и гейты, которые она открыла. `status: succeeded` при `accepted` или `max_waves`, исходный статус — в `drainStatus`. `cancel` также ставит `cancelRequested` незавершённым gate Run. `released` для волнового проекта не поддерживается: `project_wave_delivery_unsupported`.
+
+Внешний хост (чаты T3) использует те же функции: `createWaveContext`, `selectWave`, `integrateAndAdvance`, `runPendingGates`. Ветка авторизатора — `authorizeWaveTransition` с проверкой Run `validateWaveRun`.
+
+Ограничения:
+
+- Гейт с ремонтными коммитами возвращает их в ветку, но принять задачи не может (`wave_gate_head_changed`): evaluator привязывает приёмку к голове резервирования гейта, а Store не даёт зарезервировать новый гейт после успешного.
+- `installGateRun` принимает только черновик без `nodes` и `completed`. Директор устанавливает гейт без них и сразу восстанавливает integrated-узлы; после сбоя восстановление повторяется.
+- Зарезервированная, но ещё не установленная попытка считается нативной. Внешний хост резервирует и устанавливает свой Run так, чтобы `drain` не застал промежуточное состояние.
+- Гейт с milestone или project включает контракты всех задач контейнера и ограничен 64 KiB (`project_gate_too_large`).
+
+Проверка: `tests/project-wave-director.test.mjs` (реальный Engine с fake-провайдерами, временный Git) и `tests/project-wave-cli.test.mjs`.
 
 ## Lifecycle и текущие ограничения
 
@@ -116,9 +157,9 @@ Snapshot wave-проекта содержит `gates` (все гейты по `n
 
 Accepted требует exact frozen task, фактические checks и независимый review текущего clean head, criterion mappings и свежие enabled gates. Disabled — neutral. Released дополнительно требует проверенную publication chain; Project release требует released у `releaseRequired` milestones. Accepted history не понижается.
 
-Epic/Milestone/Project требуют полный набор принятых children **и собственные** criterion evidence/mappings. Автоматическая Task success observation не является собственным proof контейнера. В текущем CLI нет ввода/amend evidence и mappings контейнера или произвольных backlog edits; это trusted repository integration. Поэтому даже все принятые Task могут оставить `resume` blocked (`own_proof_missing`, неоднозначный bound Run и другие причины). Шаблоны ниже не обходят эту границу и не обещают end-to-end project acceptance.
+Epic/Milestone/Project требуют полный набор принятых children **и собственные** criterion evidence/mappings. Автоматическая Task success observation не является собственным proof контейнера. В текущем CLI нет ввода/amend evidence и mappings контейнера или произвольных backlog edits; это trusted repository integration. Поэтому даже все принятые Task могут оставить `resume` blocked (`own_proof_missing`, неоднозначный bound Run и другие причины). Шаблоны ниже не обходят эту границу и не обещают end-to-end project acceptance. К волновым проектам это не относится: их контейнеры принимает gate Run, evidence которого и есть собственное доказательство контейнера.
 
-`resume` — явная foreground команда: обрабатывает одну Task/Attempt через существующий Engine и возвращается; не постоянный daemon и не drain-loop всего backlog. Единственная project lease не допускает второго foreground controller. Restart/quota возобновляют ту же reservation/Run с прежними sessions и limits; `--retry-failed` явно создаёт следующую попытку для blocked/failed/cancelled Attempt, сохраняя историю. Это не `--retry-failed` цикла legacy Run. Несколько retry candidates требуют разрешения неоднозначности; отменённый Project не возобновляется.
+`resume` — явная foreground команда: обрабатывает одну Task/Attempt через существующий Engine и возвращается; не постоянный daemon и не drain-loop всего backlog. Для волнового проекта `resume` и `drain` описаны в разделе «Волновой режим: исполнение». Единственная project lease не допускает второго foreground controller. Restart/quota возобновляют ту же reservation/Run с прежними sessions и limits; `--retry-failed` явно создаёт следующую попытку для blocked/failed/cancelled Attempt, сохраняя историю. Это не `--retry-failed` цикла legacy Run. Несколько retry candidates требуют разрешения неоднозначности; отменённый Project не возобновляется.
 
 `pause` сохраняет флаг и блокирует следующие starts/advancement, сохраняя уже активный Run/session; `resume` снимает pause. `cancel` сначала сохраняет Project как cancelled, переводит активные Attempts в cancelled и устанавливает `cancelRequested` связанного Run до передачи отмены Engine. Исторические blocked/failed/cancelled Attempts сохраняют статус, Task revision, contractHash и evidence даже после reprioritize Task; accepted/released не затрагиваются. Повторный cancel, включая повтор после открытия SQLite, возвращает cancelled и повторно передаёт отмену связанного Run без переписывания terminal history. Явная отмена/потеря lease/abort сохраняют cancellation semantics. Sophisticated prioritization UI, daemon, generic framework и автоматический container evidence importer отложены.
 
