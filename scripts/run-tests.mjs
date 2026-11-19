@@ -16,6 +16,9 @@ const defaultPattern = `**/{test,test/**/*,test-*,*[._-]test}.{${extensions}}`;
 // Scheduling has only a case-work lower bound; retain lighter prior entries.
 // See docs/archive/WINDOWS-TEST-SPEED.md for provenance and the incomplete full check.
 const priority = [
+  // Final offline scenarios A, C, E1–E4, F (stage 13): the longest file, so it starts first. One local
+  // Windows run of the whole file (Node 24.19.0; Scenario C ~828000 ms), not part of the receipt below.
+  'tests/final-scenarios.test.mjs', // ~1274000 ms
   'tests/delivery.test.mjs', // 434779.5897 ms
   'tests/project-director.test.mjs', // 375928.3714 ms
   'tests/architecture-gate-integration.test.mjs', // 314342.0235 ms
