@@ -366,6 +366,7 @@ test('Epic gate verifies once with review, executes smoke and records it', async
   const result = await runEpicGate({ engine: e.engine, run });
   assert.equal(result.state, 'succeeded', result.error?.message);
   assert.equal(e.services.calls.review.length, 1, 'one independent review of the whole epic diff');
+  assert.ok(!e.services.calls.review[0].prompt.includes('own repair rounds'), 'no repair note without a repair');
   assert.equal(result.review.passed, true);
   assert.equal(result.checks.profile, undefined);
   assert.equal(result.checks.complete, true);
@@ -432,6 +433,11 @@ test('A repaired gate is accepted on its verified head and merges back to the in
   assert.equal(result.directorBinding.headSha, gate.headSha, 'the binding keeps the gate head');
   assert.equal(git(result.cwd, 'merge-base', '--is-ancestor', gate.headSha, result.headSha), '');
   assert.equal(result.smoke.headSha, result.headSha);
+  // The reviewer of the repaired head learns that the commits after the pinned gate head are the
+  // gate's own in-scope repairs under review, not work outside the gate.
+  const last = e.services.calls.review.at(-1);
+  assert.ok(last.prompt.includes('own repair rounds'), last.prompt.slice(0, 2000));
+  assert.ok(last.prompt.includes(gate.headSha) && last.prompt.includes(result.headSha));
   const accepted = await acceptByGate(e, e.store.getRun(result.id));
   assert.deepEqual(accepted.blockers, []);
   assert.ok(
