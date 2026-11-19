@@ -27,12 +27,12 @@
 
 ## Матрица доказательств
 
-| Уровень | Наблюдение на коммите этого файла |
+| Уровень | Наблюдение и его источник |
 | --- | --- |
 | local | Windows 11, Node 24.19: `npm run check` на `3fadb71` — exit 0, 2381 тестов, 2370 pass, 0 fail, 11 skipped (44 мин); `4e7f973` отличается файлом сценариев (вне `npm run check`), текстом справки и документацией. Целевые тесты исправлений 1–5 и находок ревью падали на прежнем коде и проходили после правки. Local L2 через `scripts/ci.mjs`: security — `tool_missing` (Semgrep и Gitleaks на машине не установлены), на загруженной машине полный check прервался по пределу 40 мин без упавших тестов |
 | CI | Голова PR `4e7f973`, run 44598107494: `check (ubuntu-latest, 24)` и `check (windows-latest, 24)` — success; в каждом L2 (`npm run check` + Semgrep и Gitleaks — passed), шаг `npm run test:final` и проверка установленного пакета — success. Windows L2 на `3fadb71` — 38 мин 46 с из предела 40 мин |
 | native | Codex CLI 0.170.0 и Claude Code по подпискам: 5 Run (`kodo run`) и 5 gate Run пилота (19 сессий Codex, ~82 мин сессий, 11,65 млн токенов, из них 10,17 млн из кэша) |
-| installed | Скачанный `gh release download` архив: SHA-256 совпал с `SHA256SUMS` и с архивом, проверенным перед публикацией; `npm install -g --prefix <чистый каталог> --ignore-scripts`: `kodo --help` — exit 0; `validate --json` — exit 0, version 1.0.0, 34 компонента; `doctor --json` — Codex и Claude Code по подписке `ok`, exit 2 из-за ненастроенных необязательных ключей исследования; `report --project <пилот>` — exit 0 (5 гейтов, 1 блокер); `report <неизвестный Run>` — `report_not_found`. Справка проектных команд — в `kodo --help` (есть `project gates`); `kodo project --help` отвечает `project_arguments` |
+| installed | Архив выпуска `v1.0.0` (собран из `3708333`), скачанный `gh release download`: SHA-256 совпал с `SHA256SUMS` и с архивом, проверенным перед публикацией; `npm install -g --prefix <чистый каталог> --ignore-scripts`: `kodo --help` — exit 0; `validate --json` — exit 0, version 1.0.0, 34 компонента; `doctor --json` — Codex и Claude Code по подписке `ok`, exit 2 из-за ненастроенных необязательных ключей исследования; `report --project <пилот>` — exit 0 (5 гейтов, 1 блокер); `report <неизвестный Run>` — `report_not_found`. Справка проектных команд — в `kodo --help` (есть `project gates`); `kodo project --help` отвечает `project_arguments` |
 | published | GitHub Release `v1.0.0` (тег на `3708333`), ассеты `zulut30-kodo-1.0.0.tgz` и `SHA256SUMS`; digest ассета в GitHub — `sha256:13d56ff4…c99e` |
 | deployed | not_configured |
 
