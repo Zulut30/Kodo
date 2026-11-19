@@ -10,46 +10,41 @@ import { countTestEvents, countingArguments, executeCheck, nodeTestOutcome } fro
 // file without tests and a `describe` named like a file gave wrong counts. Kodo now counts the
 // events of its own reporter (runtime/test-count-reporter.mjs).
 
+// Kodo's reporter records no names or paths: only what the count needs.
 const event = (fields = {}) => ({
   type: 'test:pass',
   kind: 'test',
   nesting: 1,
-  name: 'works',
-  file: path.resolve('a.test.mjs'),
   line: 3,
   column: 5,
   skip: false,
   todo: false,
   ...fields,
 });
-const lines = (...events) => [...events, { type: 'end' }].map(row => `${JSON.stringify(row)}\n`).join('');
+const lines = (...events) =>
+  [...events, { type: 'end' }]
+    .map(
+      row => `${JSON.stringify(row)}
+`,
+    )
+    .join('');
 const destination = path.resolve(os.tmpdir(), 'kodo-test-events-x', 'events.jsonl');
 const observed = (step, testEvents, args = countingArguments(step.args, destination)) => ({
   executed: { command: step.command, args },
   testEvents,
 });
 
-test('countTestEvents counts passed tests only: no suites, skips, todos, failures or synthetic file tests', () => {
-  assert.equal(countTestEvents(lines(event(), event({ name: 'other', line: 4 }))), 2);
-  assert.equal(countTestEvents(lines(event({ kind: 'suite', nesting: 0, name: 'index.mjs', line: 1 }))), 0);
+test('countTestEvents counts passed tests only: no suites, skips, todos, failures or placeholder tests', () => {
+  assert.equal(countTestEvents(lines(event(), event({ line: 4 }))), 2);
+  assert.equal(countTestEvents(lines(event({ kind: 'suite', nesting: 0, line: 1, column: 1 }))), 0);
   assert.equal(countTestEvents(lines(event({ skip: true }), event({ todo: true }))), 0);
   assert.equal(countTestEvents(lines(event({ type: 'test:fail' }))), 0);
-  // A file without tests: one top-level test named after the file, at 1:1.
-  const file = path.resolve('tests', 'empty.test.mjs');
-  assert.equal(countTestEvents(lines(event({ nesting: 0, name: 'empty.test.mjs', file, line: 1, column: 1 }))), 0);
-  // Node names it by its path as the runner resolved it: relative to its directory, with `..`, or absolute.
-  for (const name of [path.join('tests', 'empty.test.mjs'), path.join('..', 'tests', 'empty.test.mjs'), file])
-    assert.equal(countTestEvents(lines(event({ nesting: 0, name, file, line: 1, column: 1 }))), 0, name);
-  assert.equal(
-    countTestEvents(lines(event({ nesting: 0, name: path.join('other', 'empty.test.mjs'), file, line: 1, column: 1 }))),
-    1,
-    'a path that names another file',
-  );
-  // A directory resolved to its index.js is reported under the directory's name.
-  const directory = path.resolve('tests');
-  assert.equal(countTestEvents(lines(event({ nesting: 0, name: 'tests', file: directory, line: 1, column: 1 }))), 0);
-  // A real top-level test is counted, even one named like its file but declared elsewhere.
-  assert.equal(countTestEvents(lines(event({ nesting: 0, name: 'empty.test.mjs', file, line: 2, column: 1 }))), 1);
+  // Node's placeholder for a file or directory without tests (however the path was given,
+  // including ../ from a subdirectory): a top-level test at 1:1.
+  assert.equal(countTestEvents(lines(event({ nesting: 0, line: 1, column: 1 }))), 0);
+  // A real top-level test is counted when it is not at 1:1.
+  assert.equal(countTestEvents(lines(event({ nesting: 0, line: 2, column: 1 }))), 1);
+  assert.equal(countTestEvents(lines(event({ nesting: 1, line: 1, column: 1 }))), 1, 'nested at 1:1 is real');
   assert.equal(countTestEvents(lines()), 0);
 });
 
@@ -214,4 +209,32 @@ test('A receipt from Kodo installed elsewhere is still recognized: only the repo
   // A different module name is not Kodo's reporter.
   const foreign = counting.with(2, '--test-reporter=file:///D:/other/install/runtime/my-reporter.mjs');
   assert.deepEqual(nodeTestOutcome(step, observed(step, one, foreign)), { tests: null });
+});
+
+test('Review findings: ../ from a subdirectory, masked names and an in-project TEMP', async t => {
+  const root = await project(t, {
+    'parent/index.js': '',
+    'parent/child/keep.txt': '',
+    'named.test.mjs': `${imports}test('rejects Bearer bad\\\\', () => {});\n`,
+    'tmp.test.mjs':
+      "import test from 'node:test';\nimport assert from 'node:assert/strict';\nimport os from 'node:os';\n" +
+      "import { readdirSync } from 'node:fs';\ntest('temp is empty', () => assert.deepEqual(readdirSync(os.tmpdir()), []));\n",
+  });
+  // An empty parent directory run as ../ from a subdirectory is Node's placeholder, not a test.
+  assert.equal((await counted(path.join(root, 'parent', 'child'), ['--test', '../'])).tests, 0);
+  // The event file holds no test names: masking it cannot change the count.
+  const { redact } = await import('../runtime/security.mjs');
+  const named = await counted(root, ['--test', 'named.test.mjs']);
+  assert.equal(named.tests, 1);
+  assert.ok(!named.testEvents.includes('Bearer'), 'no names are recorded');
+  assert.equal(countTestEvents(redact(named.testEvents, {})), 1);
+  // The tests' TEMP is left alone, even inside the project or relative: the event file lives in Kodo's state home.
+  await mkdir(path.join(root, '.tmp'));
+  const inside = path.join(root, '.tmp');
+  assert.equal(
+    (await counted(root, ['--test', 'tmp.test.mjs'], { TEMP: inside, TMP: inside, TMPDIR: inside })).tests,
+    1,
+  );
+  await mkdir(path.join(root, 'tmp'));
+  assert.equal((await counted(root, ['--test', 'tmp.test.mjs'], { TEMP: 'tmp', TMP: 'tmp', TMPDIR: 'tmp' })).tests, 1);
 });

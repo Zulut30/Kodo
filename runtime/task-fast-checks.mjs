@@ -9,16 +9,15 @@
  * `commands.test` in full. The receipt is never a full-check receipt: its
  * fingerprint and evidence kind differ, and it carries `profile: 'task-fast'`.
  */
-import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { lstat, mkdtemp, readFile, realpath, rm, stat } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readFile, realpath, rm, stat } from 'node:fs/promises';
 import { isDeepStrictEqual } from 'node:util';
 import { performance } from 'node:perf_hooks';
 import { execute } from './command.mjs';
 import { git } from './workspace.mjs';
 import { validateCommandTimeouts } from './config.mjs';
-import { workerEnvironment } from './security.mjs';
+import { stateHome, workerEnvironment } from './security.mjs';
 import { inspectCurrentSource, planAffected } from './ci-graph.mjs';
 import { cacheFingerprint, readCheckCache, writeCheckCache } from './ci-cache.mjs';
 
@@ -29,7 +28,7 @@ export const FAST_CHECK_TIMEOUT_MS = 120000;
  * (`runtime/test-count-reporter.mjs`), never the text of the summary. Part of the task-fast cache key
  * and of every counted receipt row; a receipt or cache entry of another version is never reused.
  */
-export const TEST_COUNT_VERSION = 2;
+export const TEST_COUNT_VERSION = 3;
 const REPORTER_URL = new URL('./test-count-reporter.mjs', import.meta.url).href;
 // Kodo's own reporter module, at any install location.
 const kodoReporterArgument = /^--test-reporter=file:\/\/\/.+\/runtime\/test-count-reporter\.mjs$/;
@@ -360,35 +359,14 @@ const validEvent = event =>
   eventTypes.has(event.type) &&
   textOrNull(event.kind) &&
   integerOrNull(event.nesting) &&
-  textOrNull(event.name) &&
-  textOrNull(event.file) &&
   integerOrNull(event.line) &&
   integerOrNull(event.column) &&
   typeof event.skip === 'boolean' &&
   typeof event.todo === 'boolean';
-// Whether `name` is a path naming `file`, as Node names the test of a whole file: the path as the
-// runner resolved it, relative to its working directory (`tests\a.test.mjs`, `..\x.test.mjs`,
-// `tests` for a directory) or absolute. Leading `..` segments cannot be checked without that
-// directory: the remaining segments must end the path of `file`.
-const namesFile = (name, file) => {
-  if (path.isAbsolute(name)) return path.resolve(name) === path.resolve(file);
-  const parts = path
-    .normalize(name)
-    .split(path.sep)
-    .filter(part => part && part !== '.');
-  while (parts[0] === '..') parts.shift();
-  const fileParts = path.resolve(file).split(path.sep);
-  return parts.length > 0 && parts.every((part, index) => fileParts[fileParts.length - parts.length + index] === part);
-};
-// Node reports a file (or directory) that registers no test as one top-level test named by its
-// path, located at 1:1: it is not a test.
-const syntheticTest = event =>
-  event.nesting === 0 &&
-  event.file !== null &&
-  event.name !== null &&
-  event.line === 1 &&
-  event.column === 1 &&
-  namesFile(event.name, event.file);
+// Node's placeholder test of a file or directory that registered no test sits at the top level at
+// position 1:1. Recognized by position alone (names and paths are not recorded): a real top-level
+// test written at 1:1 is not counted either, which can only lower the count.
+const syntheticTest = event => event.nesting === 0 && event.line === 1 && event.column === 1;
 
 /**
  * Tests a `node --test` run passed, from the event file of Kodo's reporter
@@ -448,10 +426,24 @@ export function nodeTestOutcome(step, observed) {
   return { tests: exact ? countTestEvents(observed.testEvents) : null };
 }
 
+/** A fresh private directory for one event file, under Kodo's state home and outside the project. */
+async function eventDirectory(cwd) {
+  // Kodo's own state home, not TEMP: the tests' temporary directory stays untouched, and a relative
+  // or in-project TEMP can neither break the reporter nor place the file inside the project.
+  const root = path.resolve(stateHome(), 'test-events');
+  const project = path.resolve(cwd ?? process.cwd());
+  const relative = path.relative(project, root);
+  if (relative === '' || (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)))
+    throw Object.assign(new Error('Kodo state home lies inside the project'), { code: 'fast_check_events_location' });
+  await mkdir(root, { recursive: true, mode: 0o700 });
+  return mkdtemp(path.join(root, 'run-'));
+}
+
 /**
  * Execute one check command. A counted `node --test` command (countedRunner) runs with Kodo's
- * reporters (countingArguments); its event file lives in a fresh private directory outside the
- * project, is read back as `testEvents` (null when missing or too large) and is then removed.
+ * reporters (countingArguments); its event file lives in a fresh private directory under Kodo's
+ * state home, outside the project and the command's temporary directory, is read back as
+ * `testEvents` (null when missing or too large) and is then removed.
  * Never throws for the command itself: a stopped execution is returned as `error`.
  * @param {{ command: string, args?: string[] }} step
  * @param {Record<string, any>} options `execute` options
@@ -466,7 +458,7 @@ export async function executeCheck(step, options, counted) {
     }
   };
   if (!counted) return run(step.command, step.args ?? []);
-  const directory = await mkdtemp(path.join(os.tmpdir(), 'kodo-test-events-'));
+  const directory = await eventDirectory(options.cwd);
   const file = path.join(directory, 'events.jsonl');
   const executed = { command: step.command, args: countingArguments(step.args, file) };
   try {
