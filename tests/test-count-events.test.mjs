@@ -343,3 +343,30 @@ test('Directories that differ only by a Unicode case fold are different director
     process.env.KODO_HOME = previous;
   }
 });
+
+test('A counting run that cannot be prepared leaves the npm result in place with an unknown count', async t => {
+  const { countingPlan, countNpmScript, npmCountOutcome } = await import('../runtime/task-fast-checks.mjs');
+  const root = await project(t, { 'e.test.mjs': `${imports}test('e', () => {});\n` });
+  const plan = countingPlan(
+    { command: 'npm', args: ['test'] },
+    { packageText: JSON.stringify({ scripts: { test: 'node --test' } }), npmrc: false },
+  )?.npm;
+  assert.ok(plan, 'a simple npm script has a counting plan');
+  // Kodo's state home where test-events is a file: the event directory cannot be created.
+  const home = await mkdtemp(path.join(os.tmpdir(), 'kodo-count-blocked-'));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  await writeFile(path.join(home, 'test-events'), 'not a directory');
+  const previous = process.env.KODO_HOME;
+  process.env.KODO_HOME = home;
+  try {
+    const counted = await countNpmScript(plan, { cwd: root, env: env({}), allowFailure: true, timeoutMs: 60000 }, []);
+    assert.equal(counted.error, null);
+    assert.deepEqual(counted.count, { resolved: plan.resolved, executed: null, exitCode: null, tests: null });
+    assert.match(counted.logged.unavailable, /^count_unavailable:[A-Z_]+$/i);
+    assert.deepEqual(npmCountOutcome(plan, counted.logged), { tests: null });
+    // Anything else in such a record is not accepted.
+    assert.equal(npmCountOutcome(plan, { ...counted.logged, tests: 3 }), null);
+  } finally {
+    process.env.KODO_HOME = previous;
+  }
+});

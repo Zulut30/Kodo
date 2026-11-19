@@ -562,9 +562,23 @@ function exactExecution(step, executed) {
  * @returns {{ tests: number | null } | null}
  */
 export function npmCountOutcome(plan, logged) {
-  if (!isDeepStrictEqual(logged?.resolved, plan.resolved) || !exactExecution(plan.step, logged.executed)) return null;
+  if (!isDeepStrictEqual(logged?.resolved, plan.resolved)) return null;
+  // The counting run could not be prepared (its event directory): no count, npm's exit code decides.
+  if (unavailableCount(logged)) return { tests: null };
+  if (!exactExecution(plan.step, logged.executed)) return null;
   return { tests: logged.exitCode === 0 ? countTestEvents(logged.testEvents) : null };
 }
+
+// A preparation failure of the counting run, recorded by a constant code only.
+const countUnavailable = failure =>
+  `count_unavailable:${/^[a-z_]{1,48}$/i.test(String(failure?.code ?? '')) ? String(failure.code) : 'error'}`;
+const unavailableCount = logged =>
+  typeof logged?.unavailable === 'string' &&
+  /^count_unavailable:[a-z_]{1,48}$/i.test(logged.unavailable) &&
+  logged.executed === null &&
+  logged.exitCode === null &&
+  logged.tests === null &&
+  logged.testEvents === null;
 
 /** The real path of `target`, or that of its nearest existing ancestor followed by the rest. */
 async function canonicalPath(target) {
@@ -659,7 +673,16 @@ const stopReason = error => (executionReasons.includes(error.code) ? error.code 
  * @param {string[]} [roots]
  */
 export async function countNpmScript(plan, options, roots = []) {
-  const { result, error, executed, testEvents } = await executeCheck(plan.step, options, true, roots);
+  let prepared;
+  try {
+    prepared = await executeCheck(plan.step, options, true, roots);
+  } catch (failure) {
+    // After npm passed, a counting run that cannot even be prepared leaves npm's result in place.
+    const count = { resolved: plan.resolved, executed: null, exitCode: null, tests: null };
+    const unavailable = countUnavailable(failure);
+    return { count, logged: { ...count, unavailable, stdout: '', stderr: '', testEvents: null }, error: null };
+  }
+  const { result, error, executed, testEvents } = prepared;
   const output = result ?? error?.result ?? {};
   const exitCode = result ? result.code : null;
   const tests = npmCountOutcome(plan, { resolved: plan.resolved, executed, exitCode, testEvents })?.tests ?? null;
