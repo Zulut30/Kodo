@@ -14,6 +14,7 @@ import { createProjectDirector, createProjectTransitionAuthorizer } from '../run
 import { NATIVE_RESERVER, externalReserver } from '../runtime/project-director-waves.mjs';
 import { projectCli } from '../runtime/project-cli.mjs';
 import { withIntegrationLease } from '../runtime/project-integration-lease.mjs';
+import { TEST_COUNT_VERSION } from '../runtime/task-fast-checks.mjs';
 import { confirmedCriteria } from './helpers/gate-review.mjs';
 
 // End to end without fake ports: the real Store, project store, production
@@ -133,7 +134,7 @@ const check =
   "if (existsSync('left.txt') && existsSync('right.txt') && !readFileSync('left.txt', 'utf8').includes('fixed')) {\n" +
   "  console.error('left and right disagree');\n  process.exit(1);\n}\n";
 
-async function fixture(t, { epics, tasks, hooks = {}, epicAcceptance = {} }) {
+async function fixture(t, { epics, tasks, hooks = {}, epicAcceptance = {}, configure = config => config, files = {} }) {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'kodo-wave-e2e-'));
   const root = path.join(directory, 'repo'),
     home = path.join(directory, 'state'),
@@ -165,23 +166,26 @@ async function fixture(t, { epics, tasks, hooks = {}, epicAcceptance = {} }) {
   });
   await writeFile(
     path.join(root, 'kodo.config.json'),
-    JSON.stringify({
-      schemaVersion: 1,
-      client: 'codex',
-      // Task Runs are always quick; the gate takes this mode (repairs need a re-verification round).
-      executionMode: 'standard',
-      maxTasks: 2,
-      concurrency: 1,
-      researchBudget: 0,
-      repairRounds: 3,
-      commands: { test: [{ command: process.execPath, args: ['check.mjs'] }], build: [], deploy: [], smoke: [] },
-      delivery: { enabled: false, release: false },
-      uiVerification: { enabled: false },
-      security: { enabled: false },
-      architecture: { enabled: false },
-    }),
+    JSON.stringify(
+      configure({
+        schemaVersion: 1,
+        client: 'codex',
+        // Task Runs are always quick; the gate takes this mode (repairs need a re-verification round).
+        executionMode: 'standard',
+        maxTasks: 2,
+        concurrency: 1,
+        researchBudget: 0,
+        repairRounds: 3,
+        commands: { test: [{ command: process.execPath, args: ['check.mjs'] }], build: [], deploy: [], smoke: [] },
+        delivery: { enabled: false, release: false },
+        uiVerification: { enabled: false },
+        security: { enabled: false },
+        architecture: { enabled: false },
+      }),
+    ),
   );
   await writeFile(path.join(root, 'check.mjs'), check);
+  for (const [name, text] of Object.entries(files)) await writeFile(path.join(root, name), text);
   await writeFile(path.join(root, '.gitattributes'), '* text=auto eol=lf\n');
   git(root, 'init', '-b', 'main');
   git(root, 'config', 'user.name', 'Kodo Wave E2E');
@@ -895,6 +899,204 @@ test(
     // The genuine receipt is still accepted.
     f.store.updateRun(gate.id, { checks: gate.checks });
     await authorizeByGate(f, f.store.getRun(gate.id));
+  },
+);
+
+// The default commands.test (`npm test`) whose package script is a plain `node --test`.
+const defaultNpmTest = async (cwd, scripts = { test: 'node --test' }) => {
+  await writeFile(path.join(cwd, 'package.json'), JSON.stringify({ name: 'wave', private: true, scripts }, null, 2));
+  await editConfig(cwd, ({ commands: _, ...config }) => config);
+};
+
+test(
+  'The default npm test running node --test without test files never lets the gate accept the project',
+  { timeout: 600000 },
+  async t => {
+    // Review finding: `npm test` -> `node --test` without tests logged `tests 0`, `pass 0`, exit 0 and the
+    // project was accepted: Kodo counted only a direct `node --test` and judged `npm test` by exit code.
+    const paths = ['kodo.config.json', 'package.json', 'npmzero.txt'];
+    const f = await fixture(t, {
+      epics: ['e1'],
+      tasks: [task('npmzero', { writePaths: paths })],
+      hooks: { writePaths: { npmzero: paths }, onWorker: (id, calls, request) => defaultNpmTest(request.cwd) },
+    });
+    const result = await createProjectDirector({ repo: f.repo, engine: f.engine }).drain(f.id);
+    assert.equal(result.status, 'blocked', JSON.stringify(result));
+    const snapshot = f.repo.snapshot(f.id);
+    assert.notEqual(snapshot.project.status, 'accepted');
+    assert.equal(snapshot.tasks[0].status, 'integrated');
+    const gate = f.store.getRun(snapshot.gates[0].runId);
+    assert.notEqual(gate.state, 'succeeded');
+    assert.deepEqual(gate.config.commands.test, [{ command: 'npm', args: ['test'] }], 'the default commands.test');
+    const [row] = gate.checks.results;
+    assert.deepEqual(row.command, { command: 'npm', args: ['test'] }, 'the receipt keeps the configured command');
+    assert.deepEqual(row.resolved, { script: 'test', text: 'node --test' });
+    assert.equal(row.executed.command, process.execPath, 'Kodo ran Node itself, not npm');
+    assert.deepEqual(row.executed.args.slice(4), ['--test']);
+    assert.deepEqual([row.exitCode, row.tests], [0, 0], 'the runner exited 0 after passing no test');
+    assert.match(gate.error.message, /node --test/);
+  },
+);
+
+test(
+  'The default npm test with one node --test test is accepted with tests: 1, and the validator binds the script',
+  { timeout: 600000 },
+  async t => {
+    const paths = ['kodo.config.json', 'package.json', 'npmone.txt', 'npmone.test.mjs'];
+    const f = await fixture(t, {
+      epics: ['e1'],
+      tasks: [task('npmone', { writePaths: paths })],
+      hooks: {
+        writePaths: { npmone: paths },
+        onWorker: async (id, calls, request) => {
+          await writeFile(
+            path.join(request.cwd, 'npmone.test.mjs'),
+            ["import test from 'node:test';", "test('npm one', () => {});", ''].join('\n'),
+          );
+          await defaultNpmTest(request.cwd);
+        },
+      },
+    });
+    const result = await createProjectDirector({ repo: f.repo, engine: f.engine }).drain(f.id);
+    assert.equal(result.status, 'accepted', JSON.stringify(result));
+    const gate = f.store.getRun(f.repo.snapshot(f.id).gates[0].runId);
+    const [row] = gate.checks.results;
+    assert.deepEqual(row.command, { command: 'npm', args: ['test'] });
+    assert.deepEqual(row.resolved, { script: 'test', text: 'node --test' });
+    assert.equal(row.tests, 1);
+    const log = JSON.parse(await readFile(row.outputPath, 'utf8'));
+    assert.deepEqual(log.value.resolved, row.resolved, 'the evidence log keeps the resolution');
+    await authorizeByGate(f, gate);
+    // The receipt must name exactly the script of the verified commit's package.json.
+    for (const resolved of [
+      { script: 'test', text: 'node --test npmone.test.mjs' },
+      { script: 'unit', text: 'node --test' },
+      undefined,
+    ]) {
+      const results = gate.checks.results.map((item, index) => (index ? item : { ...item, resolved }));
+      f.store.updateRun(gate.id, { checks: { ...gate.checks, results } });
+      await assert.rejects(() => authorizeByGate(f, f.store.getRun(gate.id)), {
+        code: 'project_gate_tests_uncounted',
+      });
+    }
+    // A log whose resolution or executed command differs from the resolution of that script proves nothing.
+    const executed = { ...log.value.executed, args: [...log.value.executed.args, 'npmone.test.mjs'] };
+    for (const value of [
+      { ...log.value, resolved: { script: 'test', text: 'node --test npmone.test.mjs' } },
+      { ...log.value, executed },
+      { ...log.value, executed: { ...log.value.executed, command: 'node' } },
+    ]) {
+      const evidence = await f.engine.persistEvidence(gate, 'check', value, { headSha: gate.headSha });
+      const results = gate.checks.results.map((item, index) =>
+        index ? item : { ...item, outputPath: evidence.path, outputHash: evidence.sha256 },
+      );
+      f.store.updateRun(gate.id, { checks: { ...gate.checks, results } });
+      await assert.rejects(() => authorizeByGate(f, f.store.getRun(gate.id)), {
+        code: 'project_gate_tests_uncounted',
+      });
+    }
+    // The genuine receipt is still accepted.
+    f.store.updateRun(gate.id, { checks: gate.checks });
+    await authorizeByGate(f, f.store.getRun(gate.id));
+  },
+);
+
+// The production authorizer of a task transition with an evaluator that only runs the trusted
+// validator (validateWaveRun) of the task Run, so its own refusal code is observable.
+function authorizeTask(f, run) {
+  const authorize = createProjectTransitionAuthorizer({
+    store: f.store,
+    engine: f.engine,
+    contracts: A,
+    evaluator: {
+      evaluateWaveTransition: async (input, ports) => {
+        await ports.validateRun(input.run);
+        return { eligibleStates: [input.command.action.to] };
+      },
+    },
+  });
+  const snapshot = f.repo.snapshot(f.id);
+  const ref = {
+    kind: 'checks',
+    runId: run.id,
+    headSha: run.headSha,
+    path: run.checks.results[0].outputPath,
+    sha256: 'a'.repeat(64),
+  };
+  const command = f.command(snapshot, {
+    op: 'transition',
+    kind: 'task',
+    id: run.directorBinding.taskId,
+    to: 'verifying',
+    evidence: [ref],
+    mappings: [],
+  });
+  return withIntegrationLease(f.store, f.id, () => authorize({ command, snapshot }));
+}
+const withoutCommands = ({ commands: _, ...config }) => config;
+const npmManifest = JSON.stringify({ name: 'wave', private: true, scripts: { test: 'node --test' } });
+
+test(
+  'apply-spec -> drain never accepts a project whose default npm test runs node --test without test files',
+  { timeout: 600000 },
+  async t => {
+    // Review finding (reproduced on Node 24.19.0): the default commands.test (`npm test`) and
+    // `"test": "node --test"` without test files logged `tests 0`, exit 0, and drain accepted the project.
+    const f = await fixture(t, {
+      epics: ['e1'],
+      tasks: [task('alpha')],
+      configure: withoutCommands,
+      files: { 'package.json': npmManifest },
+    });
+    const result = await createProjectDirector({ repo: f.repo, engine: f.engine }).drain(f.id);
+    assert.notEqual(result.status, 'accepted', JSON.stringify(result));
+    const snapshot = f.repo.snapshot(f.id);
+    assert.notEqual(snapshot.project.status, 'accepted');
+    assert.ok(!['integrated', 'accepted'].includes(snapshot.tasks[0].status), snapshot.tasks[0].status);
+    const [run] = f.taskRuns();
+    assert.deepEqual(run.config.commands.test, [{ command: 'npm', args: ['test'] }]);
+    assert.equal(run.checks.complete, false, 'no green receipt for zero passed tests');
+    const [row] = run.checks.results;
+    assert.deepEqual(
+      [row.command, row.args, row.resolved, row.exitCode, row.tests],
+      ['npm', ['test'], { script: 'test', text: 'node --test' }, 0, 0],
+    );
+  },
+);
+
+test(
+  'A task Run of the default npm test counts its node --test, and its validator binds the script of its head',
+  { timeout: 600000 },
+  async t => {
+    const f = await fixture(t, {
+      epics: ['e1'],
+      tasks: [task('alpha')],
+      configure: withoutCommands,
+      files: {
+        'package.json': npmManifest,
+        'base.test.mjs': ["import test from 'node:test';", "test('base', () => {});", ''].join('\n'),
+      },
+    });
+    const result = await createProjectDirector({ repo: f.repo, engine: f.engine }).drain(f.id);
+    assert.equal(result.status, 'accepted', JSON.stringify(result));
+    const [run] = f.taskRuns();
+    const [row] = run.checks.results;
+    assert.deepEqual(
+      [row.command, row.args, row.resolved, row.tests, row.countVersion],
+      ['npm', ['test'], { script: 'test', text: 'node --test' }, 1, TEST_COUNT_VERSION],
+    );
+    const gate = f.store.getRun(f.repo.snapshot(f.id).gates[0].runId);
+    assert.deepEqual([gate.checks.results[0].resolved, gate.checks.results[0].tests], [row.resolved, 1]);
+    await authorizeTask(f, run);
+    for (const resolved of [{ script: 'test', text: 'node --test base.test.mjs' }, undefined]) {
+      const results = run.checks.results.map((item, index) => (index ? item : { ...item, resolved }));
+      f.store.updateRun(run.id, { checks: { ...run.checks, results } });
+      await assert.rejects(() => authorizeTask(f, f.store.getRun(run.id)), {
+        code: 'project_fast_tests_uncounted',
+      });
+    }
+    f.store.updateRun(run.id, { checks: run.checks });
+    await authorizeTask(f, f.store.getRun(run.id));
   },
 );
 

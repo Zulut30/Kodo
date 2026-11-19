@@ -21,7 +21,9 @@ import {
   fastEnvironment,
   nodeArguments,
   nodeTestOutcome,
+  npmScript,
   planFastChecks,
+  resolveNpmScript,
   runFastChecks,
 } from '../runtime/task-fast-checks.mjs';
 import { fixture, git } from './helpers/engine-fixture.mjs';
@@ -1016,4 +1018,239 @@ test('Env files and NODE_OPTIONS cannot add a test filter to a counted run', () 
     if (previous === undefined) delete process.env.NODE_OPTIONS;
     else process.env.NODE_OPTIONS = previous;
   }
+});
+
+// Event files go under Kodo's state home: the npm script tests below use a private one.
+async function privateStateHome(t) {
+  const home = await mkdtemp(path.join(os.tmpdir(), 'kodo-npm-state-'));
+  const previous = process.env.KODO_HOME;
+  process.env.KODO_HOME = home;
+  t.after(async () => {
+    if (previous === undefined) delete process.env.KODO_HOME;
+    else process.env.KODO_HOME = previous;
+    await rm(home, { recursive: true, force: true });
+  });
+}
+const npmManifest = scripts => JSON.stringify({ name: 'fixture', private: true, scripts }, null, 2);
+const npm = (...args) => ({ command: 'npm', args });
+
+test('Only an npm script that is a plain, countable node --test without pre/post scripts resolves to Node', () => {
+  const resolve = (step, scripts) => resolveNpmScript(step, npmManifest(scripts));
+  const node = args => ({ command: process.execPath, args });
+  for (const step of [npm('test'), npm('t'), npm('tst'), npm('run', 'test'), npm('run-script', 'test')])
+    assert.deepEqual(
+      resolve(step, { test: 'node --test' }),
+      { resolved: { script: 'test', text: 'node --test' }, step: node(['--test']) },
+      JSON.stringify(step),
+    );
+  assert.deepEqual(resolve(npm('run', 'test:unit'), { 'test:unit': 'node --test  --test-reporter=tap tests/' }), {
+    resolved: { script: 'test:unit', text: 'node --test  --test-reporter=tap tests/' },
+    step: node(['--test', '--test-reporter=tap', 'tests/']),
+  });
+  assert.equal(npmScript(npm('run', 'test:unit')), 'test:unit');
+  // npm ignores a byte order mark; `npm.cmd` is npm only on Windows.
+  assert.ok(resolveNpmScript(npm('test'), `\uFEFF${npmManifest({ test: 'node --test' })}`));
+  assert.equal(
+    Boolean(resolve({ command: 'npm.cmd', args: ['test'] }, { test: 'node --test' })),
+    process.platform === 'win32',
+  );
+  // npm options, script arguments and other tools are never resolved.
+  for (const step of [
+    npm('test', '--', '--test-name-pattern=a'),
+    npm('--silent', 'test'),
+    npm('test', '--if-present'),
+    npm('run'),
+    npm('run', '--if-present'),
+    npm('install'),
+    { command: '/usr/local/bin/npm', args: ['test'] },
+    { command: 'npx', args: ['test'] },
+    { command: 'pnpm', args: ['test'] },
+    { command: process.execPath, args: ['npm', 'test'] },
+  ])
+    assert.equal(resolve(step, { test: 'node --test' }), null, JSON.stringify(step));
+  // Shell operators, substitutions, quotes, globs, other runners and uncountable options keep the exit code.
+  for (const text of [
+    'node --test && node -e 0',
+    'node --test || node -e 0',
+    'node --test; node -e 0',
+    'node --test | node -e 0',
+    'node --test > log.txt',
+    'node --test < input.txt',
+    'node --test & node -e 0',
+    'node --test `echo tests`',
+    'node --test $(echo tests)',
+    'node --test $TESTS',
+    'node --test %TESTS%',
+    'node --test "tests/a.test.mjs"',
+    "node --test 'tests/a.test.mjs'",
+    'node --test tests/*.test.mjs',
+    'node --test ~/tests',
+    'node --test (tests)',
+    'node --test\ttests/',
+    'node --test\nnode -e 0',
+    ' node --test',
+    'node --test ',
+    'NODE_OPTIONS=--test-only node --test',
+    'cross-env CI=1 node --test',
+    'vitest run',
+    'jest',
+    'node',
+    'node tests/run.mjs',
+    'node --test --test-name-pattern=a',
+    'node --test --test-only',
+    'node --test --watch',
+    'node --test --env-file=test.env',
+    'node --test --mystery',
+  ])
+    assert.equal(resolve(npm('test'), { test: text }), null, text);
+  // A pre or post script of the resolved name runs around it: never resolved.
+  for (const scripts of [
+    { test: 'node --test', pretest: 'node -e 0' },
+    { test: 'node --test', posttest: 'node -e 0' },
+    { test: 'node --test', pretest: '' },
+  ])
+    assert.equal(resolve(npm('test'), scripts), null, JSON.stringify(scripts));
+  assert.ok(resolve(npm('test'), { test: 'node --test', preunit: 'node -e 0' }));
+  assert.equal(resolve(npm('run', 'unit'), { unit: 'node --test', preunit: 'node -e 0' }), null);
+  // No script, no scripts object or no readable package.json: nothing to resolve.
+  for (const text of [
+    null,
+    undefined,
+    '',
+    '{',
+    '[]',
+    'null',
+    npmManifest({ unit: 'node --test' }),
+    JSON.stringify({ scripts: [] }),
+    JSON.stringify({ scripts: { test: ['node --test'] } }),
+  ])
+    assert.equal(resolveNpmScript(npm('test'), text), null, String(text));
+});
+
+test('Task-fast full fallback counts an npm script that is a plain node --test and keeps other scripts by exit code', async t => {
+  await privateStateHome(t);
+  const { engine, run, commit } = await workspace(t, {
+    commands: { test: [npm('test')], build: [], deploy: [], smoke: [] },
+  });
+  await commit({ 'package.json': npmManifest({ test: 'node --test' }) });
+  const counted = await runFastChecks({ engine, run });
+  assert.equal(counted.complete, true);
+  assert.equal(counted.plan.fallback, true);
+  assert.ok(counted.plan.reasons.includes('runner-not-node-test'), JSON.stringify(counted.plan.reasons));
+  const [row] = counted.results;
+  assert.deepEqual(
+    [row.command, row.args, row.resolved, row.exitCode, row.tests, row.countVersion],
+    ['npm', ['test'], { script: 'test', text: 'node --test' }, 0, 3, TEST_COUNT_VERSION],
+  );
+  assert.equal(row.executed.command, process.execPath, 'Kodo ran Node itself, not npm');
+  assert.deepEqual(row.executed.args.slice(4), ['--test']);
+  const value = (await log(row)).value;
+  assert.deepEqual(value.resolved, row.resolved);
+  const resolution = resolveNpmScript(npm('test'), npmManifest({ test: 'node --test' }));
+  assert.deepEqual(nodeTestOutcome(resolution.step, value), { tests: 3 });
+  // The review finding: the same script without test files passed with `tests 0`.
+  await rm(path.join(run.cwd, 'tests'), { recursive: true });
+  await commit({});
+  await assert.rejects(() => runFastChecks({ engine, run }), { code: 'fast_check_no_tests' });
+  assert.equal(run.checks.complete, false);
+  assert.deepEqual(
+    run.checks.results.map(item => [item.exitCode, item.tests, item.resolved?.text]),
+    [[0, 0, 'node --test']],
+  );
+  // On Windows `npm.cmd` is the same npm script.
+  if (process.platform === 'win32') {
+    run.config.commands.test = [{ command: 'npm.cmd', args: ['run', 'test'] }];
+    engine.save(run);
+    await assert.rejects(() => runFastChecks({ engine, run }), { code: 'fast_check_no_tests' });
+    assert.deepEqual(run.checks.results[0].resolved, { script: 'test', text: 'node --test' });
+    run.config.commands.test = [npm('test')];
+    engine.save(run);
+  }
+  // A shell chain or a pre/post script is not resolved: npm runs it and its exit code decides, as before.
+  for (const scripts of [
+    { test: 'node --test && node -e 0' },
+    { test: 'node --test', pretest: 'node -e 0' },
+    { test: 'node --test', posttest: 'node -e 0' },
+  ]) {
+    await commit({ 'package.json': npmManifest(scripts) });
+    const other = await runFastChecks({ engine, run });
+    assert.equal(other.complete, true, JSON.stringify(scripts));
+    const [item] = other.results;
+    assert.deepEqual([item.exitCode, item.tests, item.resolved, item.executed], [0, undefined, undefined, undefined]);
+    assert.match((await log(item)).value.stdout, /tests 0/, 'npm ran the script and its runner passed nothing');
+  }
+});
+
+test('Gate checks count an npm script by its node --test and reuse only receipts with the same resolution', async t => {
+  await privateStateHome(t);
+  const unit = npm('run', 'unit');
+  const { store, engine, run, commit } = await workspace(t, {
+    commands: { test: [unit], build: [], deploy: [], smoke: [] },
+  });
+  run.directorBinding = { kind: 'gate' };
+  engine.save(run);
+  const both = 'node --test tests/a.test.mjs tests/b.test.mjs';
+  await commit({ 'package.json': npmManifest({ unit: both }) });
+  await engine.checks(run);
+  const [row] = run.checks.results;
+  assert.deepEqual(
+    [row.command, row.exitCode, row.tests, row.countVersion, row.resolved],
+    [unit, 0, 3, TEST_COUNT_VERSION, { script: 'unit', text: both }],
+  );
+  assert.deepEqual(row.executed.args.slice(4), ['--test', 'tests/a.test.mjs', 'tests/b.test.mjs']);
+  const reused = async () => {
+    const before = store.events(run.id).length;
+    await engine.checks(run);
+    return store
+      .events(run.id)
+      .slice(before)
+      .some(event => event.type === 'checks_reused');
+  };
+  assert.equal(await reused(), true, 'the current receipt is reused');
+  // A receipt of the previous algorithm judged the npm script by its exit code: it runs again.
+  run.checks = {
+    ...run.checks,
+    results: run.checks.results.map(({ resolved: _r, executed: _e, countVersion: _c, tests: _t, ...rest }) => rest),
+  };
+  engine.save(run);
+  assert.equal(await reused(), false);
+  // A receipt naming another resolution of the script runs again too.
+  run.checks = {
+    ...run.checks,
+    results: run.checks.results.map(item => ({ ...item, resolved: { script: 'unit', text: 'node --test' } })),
+  };
+  engine.save(run);
+  assert.equal(await reused(), false);
+  assert.deepEqual(run.checks.results[0].resolved, row.resolved);
+  // An uncountable script (a selecting option) keeps its exit code.
+  await commit({ 'package.json': npmManifest({ unit: 'node --test --test-skip-pattern=x' }) });
+  await engine.checks(run);
+  assert.deepEqual(
+    run.checks.results.map(item => [item.exitCode, item.tests, item.resolved]),
+    [[0, undefined, undefined]],
+  );
+  // The script passes no test: the gate refuses it although npm would have exited 0.
+  await rm(path.join(run.cwd, 'tests'), { recursive: true });
+  await commit({ 'package.json': npmManifest({ unit: 'node --test' }) });
+  await assert.rejects(() => engine.checks(run), { code: 'gate_check_no_tests' });
+  assert.deepEqual(
+    run.checks.results.map(item => [item.exitCode, item.tests, item.resolved?.text]),
+    [[0, 0, 'node --test']],
+  );
+  // A shell chain keeps its exit code, as before.
+  await commit({ 'package.json': npmManifest({ unit: 'node --test && node -e 0' }) });
+  await engine.checks(run);
+  assert.deepEqual(
+    run.checks.results.map(item => [item.exitCode, item.tests, item.resolved, item.executed]),
+    [[0, undefined, undefined, undefined]],
+  );
+  // A legacy Run never resolves an npm script.
+  run.directorBinding = undefined;
+  engine.save(run);
+  await commit({ 'package.json': npmManifest({ unit: 'node --test' }) });
+  await engine.checks(run);
+  assert.deepEqual(
+    run.checks.results.map(item => [item.exitCode, item.tests, item.resolved, item.executed]),
+    [[0, undefined, undefined, undefined]],
+  );
 });

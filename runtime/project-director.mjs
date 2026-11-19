@@ -18,7 +18,7 @@ import {
 import { integrationLeaseHeld } from './project-integration-lease.mjs';
 import { WAVE_POLICY_FIELDS, assertWavePolicy } from './wave-policy.mjs';
 import { isCurrentBehaviorReceipt } from './behavior-gate.mjs';
-import { TEST_COUNT_VERSION, nodeTestOutcome } from './task-fast-checks.mjs';
+import { TEST_COUNT_VERSION, nodeTestOutcome, packageJsonFor, resolveNpmScript } from './task-fast-checks.mjs';
 
 const fail = code => {
   throw Object.assign(new Error(`Project ${code}`), { code: `project_${code}` });
@@ -397,14 +397,27 @@ async function validateWaveTask({ engine, contracts, snapshot, run, options }) {
 
 // Each `node --test` row of a wave receipt holds the count of its own evidence log, recounted from
 // the event file of Kodo's reporter that the log keeps (never from stdout), by the current counting
-// algorithm; the caller checked the log's integrity. A gate Run requires a positive count for each
-// full `node --test` command (`gate_tests_uncounted`); a task-fast row only an equal, known one
-// (`fast_tests_uncounted`): its runtime decides on zero.
+// algorithm; the caller checked the log's integrity. An npm script command counts as the Node command
+// its script resolves to in the raw package.json of the verified commit (read from Git): the row and
+// its log name exactly that script (`resolved`), and the log's `executed` is that resolution's. A
+// gate Run requires a positive count for each full counted command (`gate_tests_uncounted`); a
+// task-fast row only an equal, known one (`fast_tests_uncounted`): its runtime decides on zero.
 async function assertTestCounts(run, { step, positive, code }) {
-  for (const row of run.checks.results) {
-    if (row.kind !== 'test') continue;
+  const tests = run.checks.results.filter(row => row.kind === 'test');
+  let packageText = null;
+  try {
+    packageText = await packageJsonFor(run.project, run.headSha, tests.map(step));
+  } catch {
+    fail(code);
+  }
+  for (const row of tests) {
     const log = JSON.parse(await readFile(row.outputPath, 'utf8'));
-    const outcome = nodeTestOutcome(step(row), log.value);
+    const resolution = resolveNpmScript(step(row), packageText);
+    requireValue(
+      isDeepStrictEqual(row.resolved, resolution?.resolved) && isDeepStrictEqual(log.value.resolved, row.resolved),
+      code,
+    );
+    const outcome = nodeTestOutcome(resolution?.step ?? step(row), log.value);
     requireValue(
       !outcome ||
         (Number.isSafeInteger(outcome.tests) &&

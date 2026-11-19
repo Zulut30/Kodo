@@ -119,6 +119,20 @@
 
 Ограничение: настоящий тест верхнего уровня, объявленный в позиции 1:1 с именем-путём своего файла, считается синтетическим и не засчитывается.
 
+## Исправление по ревью фабрики: `npm test` → `node --test`
+
+Ревью (head `fc76715`, Node 24.19.0) воспроизвело: волновой проект с `commands.test` по умолчанию (`npm test`) и `"scripts": { "test": "node --test" }` без тестовых файлов проходил `apply-spec` → `drain` до `accepted` — журнал гейта `tests 0`, `pass 0`, exit 0. Kodo считал тесты только у прямого `node --test`, а `npm test` оценивал по коду выхода. E2E-тесты и тесты task-fast/gate падали на `fc76715` по поведению (проект принят, в строке квитанции нет `resolved` и `tests`), модульный тест правил разрешения — на отсутствии новых экспортов; после исправления все проходят.
+
+| Находка | Исправление | Тест |
+| --- | --- | --- |
+| major: `npm test` → `node --test` без тестов принимался по exit 0 | В task-fast и полном прогоне gate Run команда npm одного скрипта (`npm test`/`t`/`tst`, `npm run <имя>`, `npm.cmd` на Windows) разрешается в `node` (`process.execPath`) с аргументами скрипта, если скрипт в `package.json` проверяемого коммита (сырые байты из Git) — простой `node …` без операторов shell, подстановок и кавычек, без `pre`/`post`-скриптов, и `countedRunner` его засчитывает (`resolveNpmScript`, `countingPlan`, `packageJsonAt` в `task-fast-checks.mjs`). Kodo исполняет его со своими репортёрами и считает по событиям: ноль — `fast_check_no_tests` / `gate_check_no_tests` | `tests/project-wave-e2e.test.mjs` (гейт и `drain` по умолчанию без тестов не принимают проект; с одним тестом — `accepted`, `tests: 1`), `tests/task-fast-checks.test.mjs` |
+| Валидатор не мог проверить, что разрешение соответствует коммиту | `assertTestCounts` читает `package.json` проверенного коммита из Git, разрешает команду по тем же правилам и требует совпадения `resolved` строки и журнала и `executed` журнала; иначе `project_gate_tests_uncounted` / `project_fast_tests_uncounted` | `tests/project-wave-e2e.test.mjs` (подмена `resolved.text`, `resolved.script`, удаление `resolved`, другой `executed` в журнале — для гейта и задачи) |
+| Прежние квитанции и кэш | `TEST_COUNT_VERSION = 4`; повтор квитанции gate Run требует той же `resolved` | `tests/task-fast-checks.test.mjs` |
+
+Скрипт другого вида (vitest, jest, цепочка `&&`, `pre`/`post`-скрипт, опции отбора) по-прежнему оценивается по коду выхода — явное ограничение в [VERIFICATION.md](../VERIFICATION.md) («npm-скрипт `node --test`»); тесты `&&`, `pretest`, `posttest` фиксируют прежнее поведение. Legacy Run не меняется.
+
+Изменённые контракты: новые экспорты `npmScript`, `resolveNpmScript`, `packageJsonAt`, `packageJsonFor`, `countingPlan` (`task-fast-checks.mjs`); поле `resolved: { script, text }` в строке квитанции и журнале evidence разрешённого npm-скрипта (task-fast и gate Run); `TEST_COUNT_VERSION` 3 → 4.
+
 ## Границы
 
 - Все мутации wave-проекта (`drain`, `next-wave`, `complete-task`) сериализует lease `project:<id>`; pull-команды во время `drain` отвечают `project_busy`. Переходы, чьё доказательство читает интеграционную ветку, — ещё и lease `project-integration:<id>` до фиксации.

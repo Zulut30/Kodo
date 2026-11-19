@@ -19,11 +19,12 @@ import { contentHash, packSessionEvidence, evidencePrompt } from './engine-core.
 import {
   TASK_FAST_PROFILE,
   TEST_COUNT_VERSION,
-  countedRunner,
+  countingPlan,
   executeCheck,
   fastEnvironment,
   nodeTestCommand,
   nodeTestOutcome,
+  packageJsonFor,
   runFastChecks,
 } from './task-fast-checks.mjs';
 
@@ -140,10 +141,26 @@ function assertGateTests(counted) {
 }
 
 /**
- * Whether the complete full-check receipt of the Run is for this head and command list. A gate
- * Run's `node --test` rows must also hold a positive count of the current counting algorithm.
+ * How a check command of a Run is counted (countingPlan): only a test command of a wave gate Run, a
+ * countable `node --test` or an npm script the checked commit's package.json resolves to one.
  */
-const reusableChecks = (run, headSha, fingerprint, expected) =>
+const gateCounting = (run, kind, command, packageText) =>
+  run.directorBinding?.kind === 'gate' && kind === 'test' ? countingPlan(command, packageText) : null;
+
+/**
+ * A reusable row of a gate Run's counted command (or of its `node --test` Kodo cannot count) holds a
+ * positive count of the current algorithm and the same npm script resolution; others hold none.
+ */
+const countedRow = (run, row, plan) =>
+  plan || gateTestCommand(run, row.kind, row.command)
+    ? row.tests > 0 && row.countVersion === TEST_COUNT_VERSION && isDeepStrictEqual(row.resolved, plan?.resolved)
+    : row.resolved === undefined;
+
+/**
+ * Whether the complete full-check receipt of the Run is for this head and command list. A gate
+ * Run's counted rows must also hold a positive count of the current counting algorithm.
+ */
+const reusableChecks = (run, headSha, fingerprint, expected, plans) =>
   run.config.commands.test.length &&
   run.checks?.schemaVersion === 2 &&
   // A profiled receipt (task-fast) never stands in for the full checks, whatever else it claims.
@@ -158,7 +175,7 @@ const reusableChecks = (run, headSha, fingerprint, expected) =>
       row.exitCode === 0 &&
       row.kind === expected[index].kind &&
       isDeepStrictEqual(row.command, expected[index].command) &&
-      (!gateTestCommand(run, row.kind, row.command) || (row.tests > 0 && row.countVersion === TEST_COUNT_VERSION)),
+      countedRow(run, row, plans[index]),
   );
 
 export class EngineVerification extends EngineExecution {
@@ -267,7 +284,11 @@ export class EngineVerification extends EngineExecution {
       expected,
       runtime: { node: process.version, abi: process.versions.modules, platform: process.platform, arch: process.arch },
     });
-    if (reusableChecks(run, headSha, fingerprint, expected)) {
+    const gate = run.directorBinding?.kind === 'gate';
+    // A gate Run counts an npm script command as the plain `node --test` of this head's package.json.
+    const packageText = gate ? await packageJsonFor(run.cwd, headSha, run.config.commands.test) : null;
+    const plans = expected.map(({ kind, command }) => gateCounting(run, kind, command, packageText));
+    if (reusableChecks(run, headSha, fingerprint, expected, plans)) {
       for (const reference of this.checkEvidenceReferences(run)) await this.assertEvidence(reference);
       this.log(run, 'checks_reused', { headSha, fingerprint, checks: expected.length });
       return;
@@ -275,27 +296,36 @@ export class EngineVerification extends EngineExecution {
     const results = [];
     run.checks = { schemaVersion: 2, headSha, fingerprint, complete: false, results };
     this.save(run);
+    let index = 0;
     for (const kind of ['test', 'build'])
       for (const command of run.config.commands[kind]) {
         this.checkCancelled(run, signal);
         this.log(run, 'check_started', { kind, command });
-        const counting = gateTestCommand(run, kind, command) && countedRunner(command);
+        const counting = plans[index++];
         const { result, error, executed, testEvents } = await executeCheck(
-          command,
+          counting?.step ?? command,
           {
             cwd: run.cwd,
             signal,
             // A wave gate counts its node --test runs: an inherited runner context would hide them.
-            env: run.directorBinding?.kind === 'gate' ? fastEnvironment() : workerEnvironment(),
+            env: gate ? fastEnvironment() : workerEnvironment(),
             secrets: this.secrets,
             timeoutMs: command.timeoutMs,
             allowFailure: true,
           },
-          counting,
+          Boolean(counting),
           [run.project],
         );
-        // A counted command keeps its configured `command`; the receipt also records what ran.
-        const observed = counting ? { executed, countVersion: TEST_COUNT_VERSION, testEvents } : {};
+        // A counted command keeps its configured `command`; the receipt also records the npm script
+        // it resolved (`resolved`) and what ran (`executed`).
+        const recorded = counting
+          ? {
+              ...(counting.resolved ? { resolved: counting.resolved } : {}),
+              executed,
+              countVersion: TEST_COUNT_VERSION,
+            }
+          : {};
+        const observed = counting ? { ...recorded, testEvents } : {};
         if (error) {
           // Stopped execution is never a passing check, even when the actual
           // child exit happens to be zero. Persist only the diagnostic contract;
@@ -363,12 +393,13 @@ export class EngineVerification extends EngineExecution {
           { kind, command, exitCode: result.code, stdout: result.stdout, stderr: result.stderr, ...observed },
           { headSha },
         );
-        const counted = gateTestCommand(run, kind, command) ? nodeTestOutcome(command, observed) : null;
+        const counted =
+          counting || gateTestCommand(run, kind, command) ? nodeTestOutcome(counting?.step ?? command, observed) : null;
         results.push({
           kind,
           command,
           exitCode: result.code,
-          ...(counting ? { executed, countVersion: TEST_COUNT_VERSION } : {}),
+          ...recorded,
           ...(counted ? { tests: counted.tests } : {}),
           output: (result.stdout + result.stderr).slice(-24000),
           outputPath: evidence.path,
