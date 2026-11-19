@@ -18,7 +18,13 @@ import {
 import { integrationLeaseHeld } from './project-integration-lease.mjs';
 import { WAVE_POLICY_FIELDS, assertWavePolicy } from './wave-policy.mjs';
 import { isCurrentBehaviorReceipt } from './behavior-gate.mjs';
-import { TEST_COUNT_VERSION, nodeTestOutcome, packageJsonFor, resolveNpmScript } from './task-fast-checks.mjs';
+import {
+  TEST_COUNT_VERSION,
+  countingPlan,
+  nodeTestOutcome,
+  npmContextFor,
+  npmCountOutcome,
+} from './task-fast-checks.mjs';
 
 const fail = code => {
   throw Object.assign(new Error(`Project ${code}`), { code: `project_${code}` });
@@ -397,27 +403,31 @@ async function validateWaveTask({ engine, contracts, snapshot, run, options }) {
 
 // Each `node --test` row of a wave receipt holds the count of its own evidence log, recounted from
 // the event file of Kodo's reporter that the log keeps (never from stdout), by the current counting
-// algorithm; the caller checked the log's integrity. An npm script command counts as the Node command
-// its script resolves to in the raw package.json of the verified commit (read from Git): the row and
-// its log name exactly that script (`resolved`), and the log's `executed` is that resolution's. A
+// algorithm; the caller checked the log's integrity and that the configured command exited 0. A
 // gate Run requires a positive count for each full counted command (`gate_tests_uncounted`); a
 // task-fast row only an equal, known one (`fast_tests_uncounted`): its runtime decides on zero.
+// An npm script command is judged by its own exit code; when it is simple in the verified commit
+// (read from Git: the script resolves, no `.npmrc`, no `workspaces`, see countingPlan) the row and
+// its log must hold its counting run (assertNpmCount), otherwise neither holds one.
 async function assertTestCounts(run, { step, positive, code }) {
   const tests = run.checks.results.filter(row => row.kind === 'test');
-  let packageText = null;
+  let context = null;
   try {
-    packageText = await packageJsonFor(run.project, run.headSha, tests.map(step));
+    context = await npmContextFor(run.project, run.headSha, tests.map(step));
   } catch {
     fail(code);
   }
   for (const row of tests) {
     const log = JSON.parse(await readFile(row.outputPath, 'utf8'));
-    const resolution = resolveNpmScript(step(row), packageText);
-    requireValue(
-      isDeepStrictEqual(row.resolved, resolution?.resolved) && isDeepStrictEqual(log.value.resolved, row.resolved),
-      code,
-    );
-    const outcome = nodeTestOutcome(resolution?.step ?? step(row), log.value);
+    // Rows of the previous algorithm (an npm script replaced by Node) are no proof.
+    requireValue(row.resolved === undefined && log.value.resolved === undefined, code);
+    const plan = countingPlan(step(row), context);
+    if (plan?.npm) {
+      assertNpmCount(row, log.value, plan.npm, code);
+      continue;
+    }
+    requireValue(row.count === undefined && log.value.count === undefined, code);
+    const outcome = nodeTestOutcome(step(row), log.value);
     requireValue(
       !outcome ||
         (Number.isSafeInteger(outcome.tests) &&
@@ -427,6 +437,31 @@ async function assertTestCounts(run, { step, positive, code }) {
       code,
     );
   }
+}
+
+// The counting run of a simple npm script: the log's `count` names that resolution and exactly Kodo's
+// counting command; `tests` is recounted from its events (a run that did not exit 0 has none) and the
+// row holds the same `count` of the current algorithm. A confirmed zero is never accepted.
+function assertNpmCount(row, value, plan, code) {
+  const logged = value.count;
+  const outcome = npmCountOutcome(plan, logged);
+  requireValue(
+    outcome !== null &&
+      outcome.tests !== 0 &&
+      (logged.exitCode === null || Number.isSafeInteger(logged.exitCode)) &&
+      logged.tests === outcome.tests &&
+      row.countVersion === TEST_COUNT_VERSION &&
+      value.countVersion === TEST_COUNT_VERSION &&
+      row.tests === undefined &&
+      row.executed === undefined &&
+      isDeepStrictEqual(row.count, {
+        resolved: plan.resolved,
+        executed: logged.executed,
+        exitCode: logged.exitCode,
+        tests: outcome.tests,
+      }),
+    code,
+  );
 }
 
 // A gate Run is bound to its gate record and the manifest of its covered tasks and containers,

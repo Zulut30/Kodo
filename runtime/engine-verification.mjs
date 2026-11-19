@@ -20,11 +20,12 @@ import {
   TASK_FAST_PROFILE,
   TEST_COUNT_VERSION,
   countingPlan,
-  executeCheck,
+  executeCounted,
   fastEnvironment,
   nodeTestCommand,
   nodeTestOutcome,
-  packageJsonFor,
+  npmContextFor,
+  npmLaunch,
   runFastChecks,
 } from './task-fast-checks.mjs';
 
@@ -142,19 +143,29 @@ function assertGateTests(counted) {
 
 /**
  * How a check command of a Run is counted (countingPlan): only a test command of a wave gate Run, a
- * countable `node --test` or an npm script the checked commit's package.json resolves to one.
+ * countable `node --test` or a simple npm script whose plain `node --test` Kodo also counts.
  */
-const gateCounting = (run, kind, command, packageText) =>
-  run.directorBinding?.kind === 'gate' && kind === 'test' ? countingPlan(command, packageText) : null;
+const gateCounting = (run, kind, command, context) =>
+  run.directorBinding?.kind === 'gate' && kind === 'test' ? countingPlan(command, context) : null;
 
 /**
- * A reusable row of a gate Run's counted command (or of its `node --test` Kodo cannot count) holds a
- * positive count of the current algorithm and the same npm script resolution; others hold none.
+ * A reusable row of a gate Run: a counted `node --test` (or one Kodo cannot count) holds a positive
+ * count of the current algorithm; a simple npm script holds the counting run (`count`) of the same
+ * resolution and algorithm without a confirmed zero; every other row holds no count.
  */
-const countedRow = (run, row, plan) =>
-  plan || gateTestCommand(run, row.kind, row.command)
-    ? row.tests > 0 && row.countVersion === TEST_COUNT_VERSION && isDeepStrictEqual(row.resolved, plan?.resolved)
-    : row.resolved === undefined;
+const countedRow = (run, row, plan) => {
+  if (row.resolved !== undefined) return false;
+  if (plan?.npm)
+    return (
+      row.countVersion === TEST_COUNT_VERSION &&
+      isDeepStrictEqual(row.count?.resolved, plan.npm.resolved) &&
+      row.count.tests !== 0
+    );
+  if (row.count !== undefined) return false;
+  return plan || gateTestCommand(run, row.kind, row.command)
+    ? row.tests > 0 && row.countVersion === TEST_COUNT_VERSION
+    : true;
+};
 
 /**
  * Whether the complete full-check receipt of the Run is for this head and command list. A gate
@@ -285,9 +296,9 @@ export class EngineVerification extends EngineExecution {
       runtime: { node: process.version, abi: process.versions.modules, platform: process.platform, arch: process.arch },
     });
     const gate = run.directorBinding?.kind === 'gate';
-    // A gate Run counts an npm script command as the plain `node --test` of this head's package.json.
-    const packageText = gate ? await packageJsonFor(run.cwd, headSha, run.config.commands.test) : null;
-    const plans = expected.map(({ kind, command }) => gateCounting(run, kind, command, packageText));
+    // A gate Run also counts a simple npm script command by the plain `node --test` of this head's package.json.
+    const context = gate ? await npmContextFor(run.cwd, headSha, run.config.commands.test) : null;
+    const plans = expected.map(({ kind, command }) => gateCounting(run, kind, command, context));
     if (reusableChecks(run, headSha, fingerprint, expected, plans)) {
       for (const reference of this.checkEvidenceReferences(run)) await this.assertEvidence(reference);
       this.log(run, 'checks_reused', { headSha, fingerprint, checks: expected.length });
@@ -302,30 +313,23 @@ export class EngineVerification extends EngineExecution {
         this.checkCancelled(run, signal);
         this.log(run, 'check_started', { kind, command });
         const counting = plans[index++];
-        const { result, error, executed, testEvents } = await executeCheck(
-          counting?.step ?? command,
-          {
-            cwd: run.cwd,
-            signal,
-            // A wave gate counts its node --test runs: an inherited runner context would hide them.
-            env: gate ? fastEnvironment() : workerEnvironment(),
-            secrets: this.secrets,
-            timeoutMs: command.timeoutMs,
-            allowFailure: true,
-          },
-          Boolean(counting),
+        const options = {
+          cwd: run.cwd,
+          signal,
+          // A wave gate counts its node --test runs: an inherited runner context would hide them.
+          env: gate ? fastEnvironment() : workerEnvironment(),
+          secrets: this.secrets,
+          timeoutMs: command.timeoutMs,
+          allowFailure: true,
+        };
+        // A counted command keeps its configured `command`; the receipt also records what ran
+        // (`executed`) or, after an npm script passed as configured, its counting run (`count`).
+        const { result, error, npm, recorded, observed } = await executeCounted(
+          gate ? npmLaunch(command) : command,
+          counting,
+          options,
           [run.project],
         );
-        // A counted command keeps its configured `command`; the receipt also records the npm script
-        // it resolved (`resolved`) and what ran (`executed`).
-        const recorded = counting
-          ? {
-              ...(counting.resolved ? { resolved: counting.resolved } : {}),
-              executed,
-              countVersion: TEST_COUNT_VERSION,
-            }
-          : {};
-        const observed = counting ? { ...recorded, testEvents } : {};
         if (error) {
           // Stopped execution is never a passing check, even when the actual
           // child exit happens to be zero. Persist only the diagnostic contract;
@@ -394,7 +398,9 @@ export class EngineVerification extends EngineExecution {
           { headSha },
         );
         const counted =
-          counting || gateTestCommand(run, kind, command) ? nodeTestOutcome(counting?.step ?? command, observed) : null;
+          counting?.step || gateTestCommand(run, kind, command)
+            ? nodeTestOutcome(counting?.step ?? command, observed)
+            : null;
         results.push({
           kind,
           command,
@@ -409,7 +415,9 @@ export class EngineVerification extends EngineExecution {
         if (comparison) run.checks.comparison = comparison;
         this.save(run);
         if (result.code !== 0) throw failedCheck(run, kind, result, comparison);
-        assertGateTests(counted);
+        if (npm?.error?.code === 'cancelled') throw npm.error;
+        // Only a confirmed zero of an npm script's counting run fails; otherwise npm's exit code decided.
+        assertGateTests(npm ? (npm.count.tests === 0 ? npm.count : null) : counted);
       }
     if (!run.config.commands.test.length) throw new Error('Не настроена команда проверки результата');
     const comparison = compareWithBaseline(currentBaseline(run), results);

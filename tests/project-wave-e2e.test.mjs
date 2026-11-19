@@ -930,16 +930,20 @@ test(
     assert.deepEqual(gate.config.commands.test, [{ command: 'npm', args: ['test'] }], 'the default commands.test');
     const [row] = gate.checks.results;
     assert.deepEqual(row.command, { command: 'npm', args: ['test'] }, 'the receipt keeps the configured command');
-    assert.deepEqual(row.resolved, { script: 'test', text: 'node --test' });
-    assert.equal(row.executed.command, process.execPath, 'Kodo ran Node itself, not npm');
-    assert.deepEqual(row.executed.args.slice(4), ['--test']);
-    assert.deepEqual([row.exitCode, row.tests], [0, 0], 'the runner exited 0 after passing no test');
+    assert.deepEqual(row.count.resolved, { script: 'test', text: 'node --test' });
+    assert.equal(row.count.executed.command, process.execPath, 'the counting run is Node itself');
+    assert.deepEqual(row.count.executed.args.slice(4), ['--test']);
+    assert.deepEqual(
+      [row.exitCode, row.count.exitCode, row.count.tests],
+      [0, 0, 0],
+      'npm and its counting run exited 0 after passing no test',
+    );
     assert.match(gate.error.message, /node --test/);
   },
 );
 
 test(
-  'The default npm test with one node --test test is accepted with tests: 1, and the validator binds the script',
+  'The default npm test with one node --test test is accepted with a count of 1, and the validator binds the count',
   { timeout: 600000 },
   async t => {
     const paths = ['kodo.config.json', 'package.json', 'npmone.txt', 'npmone.test.mjs'];
@@ -962,29 +966,50 @@ test(
     const gate = f.store.getRun(f.repo.snapshot(f.id).gates[0].runId);
     const [row] = gate.checks.results;
     assert.deepEqual(row.command, { command: 'npm', args: ['test'] });
-    assert.deepEqual(row.resolved, { script: 'test', text: 'node --test' });
-    assert.equal(row.tests, 1);
+    assert.deepEqual([row.exitCode, row.countVersion, row.tests], [0, TEST_COUNT_VERSION, undefined]);
+    assert.deepEqual(
+      [row.count.resolved, row.count.exitCode, row.count.tests],
+      [{ script: 'test', text: 'node --test' }, 0, 1],
+    );
     const log = JSON.parse(await readFile(row.outputPath, 'utf8'));
-    assert.deepEqual(log.value.resolved, row.resolved, 'the evidence log keeps the resolution');
+    assert.match(log.value.stdout, /tests 1/, 'npm ran the configured script');
+    assert.deepEqual(log.value.count.resolved, row.count.resolved, 'the evidence log keeps the counting run');
     await authorizeByGate(f, gate);
-    // The receipt must name exactly the script of the verified commit's package.json.
-    for (const resolved of [
-      { script: 'test', text: 'node --test npmone.test.mjs' },
-      { script: 'unit', text: 'node --test' },
-      undefined,
+    // The receipt must hold exactly the counting run of the verified commit's script (forged counts).
+    const count = row.count;
+    for (const change of [
+      { count: { ...count, resolved: { script: 'test', text: 'node --test npmone.test.mjs' } } },
+      { count: { ...count, resolved: { script: 'unit', text: 'node --test' } } },
+      { count: { ...count, tests: 2 } },
+      { count: { ...count, tests: 0 } },
+      { count: { ...count, tests: null } },
+      { count: { ...count, exitCode: 1 } },
+      { count: undefined },
+      { countVersion: 4 },
+      { tests: 1 },
+      { resolved: count.resolved },
     ]) {
-      const results = gate.checks.results.map((item, index) => (index ? item : { ...item, resolved }));
+      const results = gate.checks.results.map((item, index) => (index ? item : { ...item, ...change }));
       f.store.updateRun(gate.id, { checks: { ...gate.checks, results } });
-      await assert.rejects(() => authorizeByGate(f, f.store.getRun(gate.id)), {
-        code: 'project_gate_tests_uncounted',
-      });
+      await assert.rejects(
+        () => authorizeByGate(f, f.store.getRun(gate.id)),
+        { code: 'project_gate_tests_uncounted' },
+        JSON.stringify(change),
+      );
     }
-    // A log whose resolution or executed command differs from the resolution of that script proves nothing.
-    const executed = { ...log.value.executed, args: [...log.value.executed.args, 'npmone.test.mjs'] };
+    // A log whose counting run differs from that script's resolution, is not Kodo's exact counting
+    // command, lost its events or its count, or recounts to another number proves nothing.
+    const logged = log.value.count;
+    const executed = { ...logged.executed, args: [...logged.executed.args, 'npmone.test.mjs'] };
     for (const value of [
-      { ...log.value, resolved: { script: 'test', text: 'node --test npmone.test.mjs' } },
-      { ...log.value, executed },
-      { ...log.value, executed: { ...log.value.executed, command: 'node' } },
+      { ...log.value, count: { ...logged, resolved: { script: 'test', text: 'node --test npmone.test.mjs' } } },
+      { ...log.value, count: { ...logged, executed } },
+      { ...log.value, count: { ...logged, executed: { ...logged.executed, command: 'node' } } },
+      { ...log.value, count: { ...logged, testEvents: logged.testEvents.replace(/\{"type":"end"\}\n$/, '') } },
+      { ...log.value, count: { ...logged, testEvents: '{"type":"end"}\n' } },
+      { ...log.value, count: undefined },
+      { ...log.value, countVersion: 4 },
+      { ...log.value, resolved: count.resolved },
     ]) {
       const evidence = await f.engine.persistEvidence(gate, 'check', value, { headSha: gate.headSha });
       const results = gate.checks.results.map((item, index) =>
@@ -1058,8 +1083,8 @@ test(
     assert.equal(run.checks.complete, false, 'no green receipt for zero passed tests');
     const [row] = run.checks.results;
     assert.deepEqual(
-      [row.command, row.args, row.resolved, row.exitCode, row.tests],
-      ['npm', ['test'], { script: 'test', text: 'node --test' }, 0, 0],
+      [row.command, row.args, row.exitCode, row.count.resolved, row.count.exitCode, row.count.tests],
+      ['npm', ['test'], 0, { script: 'test', text: 'node --test' }, 0, 0],
     );
   },
 );
@@ -1082,21 +1107,78 @@ test(
     const [run] = f.taskRuns();
     const [row] = run.checks.results;
     assert.deepEqual(
-      [row.command, row.args, row.resolved, row.tests, row.countVersion],
-      ['npm', ['test'], { script: 'test', text: 'node --test' }, 1, TEST_COUNT_VERSION],
+      [row.command, row.args, row.exitCode, row.countVersion, row.count.resolved, row.count.tests],
+      ['npm', ['test'], 0, TEST_COUNT_VERSION, { script: 'test', text: 'node --test' }, 1],
     );
     const gate = f.store.getRun(f.repo.snapshot(f.id).gates[0].runId);
-    assert.deepEqual([gate.checks.results[0].resolved, gate.checks.results[0].tests], [row.resolved, 1]);
+    assert.deepEqual(
+      [gate.checks.results[0].count.resolved, gate.checks.results[0].count.tests],
+      [row.count.resolved, 1],
+    );
     await authorizeTask(f, run);
-    for (const resolved of [{ script: 'test', text: 'node --test base.test.mjs' }, undefined]) {
-      const results = run.checks.results.map((item, index) => (index ? item : { ...item, resolved }));
+    for (const change of [
+      { count: { ...row.count, resolved: { script: 'test', text: 'node --test base.test.mjs' } } },
+      { count: { ...row.count, tests: 0 } },
+      { count: undefined },
+      { resolved: row.count.resolved },
+    ]) {
+      const results = run.checks.results.map((item, index) => (index ? item : { ...item, ...change }));
       f.store.updateRun(run.id, { checks: { ...run.checks, results } });
-      await assert.rejects(() => authorizeTask(f, f.store.getRun(run.id)), {
-        code: 'project_fast_tests_uncounted',
-      });
+      await assert.rejects(
+        () => authorizeTask(f, f.store.getRun(run.id)),
+        { code: 'project_fast_tests_uncounted' },
+        JSON.stringify(change),
+      );
     }
     f.store.updateRun(run.id, { checks: run.checks });
     await authorizeTask(f, f.store.getRun(run.id));
+  },
+);
+
+test(
+  'apply-spec -> drain accepts a project whose tests need npm: the npm exit code decides when the counting run fails',
+  { timeout: 600000 },
+  async t => {
+    // Review finding (Windows, Node 24.19.0): a test using `npm_package_version` passed through npm but
+    // failed when Kodo replaced `npm test` by Node. npm decides now; the counting run only adds evidence.
+    const f = await fixture(t, {
+      epics: ['e1'],
+      tasks: [task('alpha')],
+      configure: withoutCommands,
+      files: {
+        'package.json': JSON.stringify({
+          name: 'wave',
+          version: '7.7.7-kodo',
+          private: true,
+          scripts: { test: 'node --test' },
+        }),
+        'version.test.mjs': [
+          "import test from 'node:test';",
+          "import assert from 'node:assert/strict';",
+          "test('npm sets the version', () => assert.equal(process.env.npm_package_version, '7.7.7-kodo'));",
+          '',
+        ].join('\n'),
+      },
+    });
+    const result = await createProjectDirector({ repo: f.repo, engine: f.engine }).drain(f.id);
+    assert.equal(result.status, 'accepted', JSON.stringify(result));
+    const [run] = f.taskRuns();
+    const gate = f.store.getRun(f.repo.snapshot(f.id).gates[0].runId);
+    for (const row of [run.checks.results[0], gate.checks.results[0]])
+      assert.deepEqual(
+        [row.exitCode, row.count.resolved, row.count.exitCode, row.count.tests],
+        [0, { script: 'test', text: 'node --test' }, 1, null],
+      );
+    await authorizeTask(f, run);
+    await authorizeByGate(f, gate);
+    // A forged count still is no proof: the log's counting run exited 1 and recounts to nothing.
+    const results = gate.checks.results.map((item, index) =>
+      index ? item : { ...item, count: { ...item.count, exitCode: 0, tests: 1 } },
+    );
+    f.store.updateRun(gate.id, { checks: { ...gate.checks, results } });
+    await assert.rejects(() => authorizeByGate(f, f.store.getRun(gate.id)), {
+      code: 'project_gate_tests_uncounted',
+    });
   },
 );
 

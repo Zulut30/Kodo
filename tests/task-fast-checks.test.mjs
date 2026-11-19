@@ -18,9 +18,11 @@ import {
   TASK_FAST_PROFILE,
   TEST_COUNT_VERSION,
   countingArguments,
+  countingPlan,
   fastEnvironment,
   nodeArguments,
   nodeTestOutcome,
+  npmCountOutcome,
   npmScript,
   planFastChecks,
   resolveNpmScript,
@@ -1112,6 +1114,21 @@ test('Only an npm script that is a plain, countable node --test without pre/post
     assert.equal(resolve(npm('test'), scripts), null, JSON.stringify(scripts));
   assert.ok(resolve(npm('test'), { test: 'node --test', preunit: 'node -e 0' }));
   assert.equal(resolve(npm('run', 'unit'), { unit: 'node --test', preunit: 'node -e 0' }), null);
+  // npm may run the script in every workspace: never simple, whatever the workspaces are.
+  for (const workspaces of [[], ['packages/*'], { packages: ['a'] }, null])
+    assert.equal(
+      resolveNpmScript(npm('test'), JSON.stringify({ scripts: { test: 'node --test' }, workspaces })),
+      null,
+      JSON.stringify(workspaces),
+    );
+  // A project .npmrc of the checked commit (node-options, workspaces, script-shell...) makes no script simple.
+  const simple = { packageText: npmManifest({ test: 'node --test' }), npmrc: false };
+  assert.deepEqual(countingPlan(npm('test'), simple), {
+    npm: { resolved: { script: 'test', text: 'node --test' }, step: node(['--test']) },
+  });
+  assert.equal(countingPlan(npm('test'), { ...simple, npmrc: true }), null);
+  assert.equal(countingPlan(npm('test'), null), null);
+  assert.deepEqual(countingPlan(node(['--test']), null), { step: node(['--test']) });
   // No script, no scripts object or no readable package.json: nothing to resolve.
   for (const text of [
     null,
@@ -1127,7 +1144,7 @@ test('Only an npm script that is a plain, countable node --test without pre/post
     assert.equal(resolveNpmScript(npm('test'), text), null, String(text));
 });
 
-test('Task-fast full fallback counts an npm script that is a plain node --test and keeps other scripts by exit code', async t => {
+test('Task-fast full fallback runs an npm script as configured and counts a simple node --test script separately', async t => {
   await privateStateHome(t);
   const { engine, run, commit } = await workspace(t, {
     commands: { test: [npm('test')], build: [], deploy: [], smoke: [] },
@@ -1139,49 +1156,69 @@ test('Task-fast full fallback counts an npm script that is a plain node --test a
   assert.ok(counted.plan.reasons.includes('runner-not-node-test'), JSON.stringify(counted.plan.reasons));
   const [row] = counted.results;
   assert.deepEqual(
-    [row.command, row.args, row.resolved, row.exitCode, row.tests, row.countVersion],
-    ['npm', ['test'], { script: 'test', text: 'node --test' }, 0, 3, TEST_COUNT_VERSION],
+    [row.command, row.args, row.exitCode, row.countVersion, row.count.resolved, row.count.exitCode, row.count.tests],
+    ['npm', ['test'], 0, TEST_COUNT_VERSION, { script: 'test', text: 'node --test' }, 0, 3],
   );
-  assert.equal(row.executed.command, process.execPath, 'Kodo ran Node itself, not npm');
-  assert.deepEqual(row.executed.args.slice(4), ['--test']);
+  // The receipt's own exit code is npm's; the counting run is a separate part of the row.
+  assert.deepEqual([row.tests, row.executed, row.resolved], [undefined, undefined, undefined]);
+  assert.equal(row.count.executed.command, process.execPath, 'the counting run is Node itself');
+  assert.deepEqual(row.count.executed.args.slice(4), ['--test']);
   const value = (await log(row)).value;
-  assert.deepEqual(value.resolved, row.resolved);
-  const resolution = resolveNpmScript(npm('test'), npmManifest({ test: 'node --test' }));
-  assert.deepEqual(nodeTestOutcome(resolution.step, value), { tests: 3 });
+  assert.match(value.stdout, /tests 3/, 'npm ran the configured script');
+  const { testEvents, stdout: _stdout, stderr: _stderr, ...logged } = value.count;
+  assert.deepEqual(logged, row.count);
+  assert.equal(typeof testEvents, 'string');
+  const plan = countingPlan(npm('test'), { packageText: npmManifest({ test: 'node --test' }), npmrc: false });
+  assert.deepEqual(npmCountOutcome(plan.npm, value.count), { tests: 3 });
+  assert.equal(npmCountOutcome(plan.npm, { ...value.count, resolved: { script: 'test', text: 'node' } }), null);
+  assert.deepEqual(npmCountOutcome(plan.npm, { ...value.count, exitCode: 1 }), { tests: null });
   // The review finding: the same script without test files passed with `tests 0`.
   await rm(path.join(run.cwd, 'tests'), { recursive: true });
   await commit({});
   await assert.rejects(() => runFastChecks({ engine, run }), { code: 'fast_check_no_tests' });
   assert.equal(run.checks.complete, false);
   assert.deepEqual(
-    run.checks.results.map(item => [item.exitCode, item.tests, item.resolved?.text]),
-    [[0, 0, 'node --test']],
+    run.checks.results.map(item => [item.exitCode, item.count?.exitCode, item.count?.tests]),
+    [[0, 0, 0]],
   );
-  // On Windows `npm.cmd` is the same npm script.
+  // On Windows `npm.cmd` runs the same npm script (Node cannot spawn it without a shell: Kodo launches npm).
   if (process.platform === 'win32') {
     run.config.commands.test = [{ command: 'npm.cmd', args: ['run', 'test'] }];
     engine.save(run);
     await assert.rejects(() => runFastChecks({ engine, run }), { code: 'fast_check_no_tests' });
-    assert.deepEqual(run.checks.results[0].resolved, { script: 'test', text: 'node --test' });
+    assert.deepEqual(
+      run.checks.results.map(item => [item.command, item.exitCode, item.count?.resolved, item.count?.tests]),
+      [['npm.cmd', 0, { script: 'test', text: 'node --test' }, 0]],
+    );
     run.config.commands.test = [npm('test')];
     engine.save(run);
   }
-  // A shell chain or a pre/post script is not resolved: npm runs it and its exit code decides, as before.
-  for (const scripts of [
-    { test: 'node --test && node -e 0' },
-    { test: 'node --test', pretest: 'node -e 0' },
-    { test: 'node --test', posttest: 'node -e 0' },
+  // Not simple (a shell chain, a pre/post script, workspaces or a project .npmrc): npm runs it, its exit
+  // code alone decides, and no counting run can refuse it.
+  for (const files of [
+    { 'package.json': npmManifest({ test: 'node --test && node -e 0' }) },
+    { 'package.json': npmManifest({ test: 'node --test', pretest: 'node -e 0' }) },
+    { 'package.json': npmManifest({ test: 'node --test', posttest: 'node -e 0' }) },
+    {
+      'package.json': JSON.stringify({
+        name: 'fixture',
+        private: true,
+        scripts: { test: 'node --test' },
+        workspaces: [],
+      }),
+    },
+    { 'package.json': npmManifest({ test: 'node --test' }), '.npmrc': 'fund=false\n' },
   ]) {
-    await commit({ 'package.json': npmManifest(scripts) });
+    await commit(files);
     const other = await runFastChecks({ engine, run });
-    assert.equal(other.complete, true, JSON.stringify(scripts));
+    assert.equal(other.complete, true, JSON.stringify(files));
     const [item] = other.results;
-    assert.deepEqual([item.exitCode, item.tests, item.resolved, item.executed], [0, undefined, undefined, undefined]);
+    assert.deepEqual([item.exitCode, item.count, item.countVersion, item.tests], [0, undefined, undefined, undefined]);
     assert.match((await log(item)).value.stdout, /tests 0/, 'npm ran the script and its runner passed nothing');
   }
 });
 
-test('Gate checks count an npm script by its node --test and reuse only receipts with the same resolution', async t => {
+test('Gate checks run an npm script as configured, count a simple one separately and reuse only the same count', async t => {
   await privateStateHome(t);
   const unit = npm('run', 'unit');
   const { store, engine, run, commit } = await workspace(t, {
@@ -1194,10 +1231,12 @@ test('Gate checks count an npm script by its node --test and reuse only receipts
   await engine.checks(run);
   const [row] = run.checks.results;
   assert.deepEqual(
-    [row.command, row.exitCode, row.tests, row.countVersion, row.resolved],
-    [unit, 0, 3, TEST_COUNT_VERSION, { script: 'unit', text: both }],
+    [row.command, row.exitCode, row.countVersion, row.count.resolved, row.count.exitCode, row.count.tests],
+    [unit, 0, TEST_COUNT_VERSION, { script: 'unit', text: both }, 0, 3],
   );
-  assert.deepEqual(row.executed.args.slice(4), ['--test', 'tests/a.test.mjs', 'tests/b.test.mjs']);
+  assert.deepEqual([row.tests, row.executed, row.resolved], [undefined, undefined, undefined]);
+  assert.deepEqual(row.count.executed.args.slice(4), ['--test', 'tests/a.test.mjs', 'tests/b.test.mjs']);
+  assert.match(row.output, /tests 3/, 'npm ran the configured script');
   const reused = async () => {
     const before = store.events(run.id).length;
     await engine.checks(run);
@@ -1207,50 +1246,154 @@ test('Gate checks count an npm script by its node --test and reuse only receipts
       .some(event => event.type === 'checks_reused');
   };
   assert.equal(await reused(), true, 'the current receipt is reused');
-  // A receipt of the previous algorithm judged the npm script by its exit code: it runs again.
+  // A receipt of the previous algorithm (Node ran in place of npm) runs again.
   run.checks = {
     ...run.checks,
-    results: run.checks.results.map(({ resolved: _r, executed: _e, countVersion: _c, tests: _t, ...rest }) => rest),
+    results: run.checks.results.map(({ count, countVersion: _, ...rest }) => ({
+      ...rest,
+      resolved: count.resolved,
+      executed: count.executed,
+      countVersion: 4,
+      tests: count.tests,
+    })),
   };
   engine.save(run);
   assert.equal(await reused(), false);
-  // A receipt naming another resolution of the script runs again too.
-  run.checks = {
-    ...run.checks,
-    results: run.checks.results.map(item => ({ ...item, resolved: { script: 'unit', text: 'node --test' } })),
-  };
-  engine.save(run);
-  assert.equal(await reused(), false);
-  assert.deepEqual(run.checks.results[0].resolved, row.resolved);
-  // An uncountable script (a selecting option) keeps its exit code.
+  // So does a receipt whose count names another resolution, another algorithm, a zero or nothing.
+  for (const change of [
+    item => ({ ...item, count: { ...item.count, resolved: { script: 'unit', text: 'node --test' } } }),
+    item => ({ ...item, countVersion: 4 }),
+    item => ({ ...item, count: { ...item.count, tests: 0 } }),
+    ({ count: _, ...item }) => item,
+  ]) {
+    run.checks = { ...run.checks, results: run.checks.results.map(change) };
+    engine.save(run);
+    assert.equal(await reused(), false, String(change));
+    assert.deepEqual(run.checks.results[0].count, { ...row.count, executed: run.checks.results[0].count.executed });
+  }
+  // An uncountable script (a selecting option) runs through npm alone.
   await commit({ 'package.json': npmManifest({ unit: 'node --test --test-skip-pattern=x' }) });
   await engine.checks(run);
   assert.deepEqual(
-    run.checks.results.map(item => [item.exitCode, item.tests, item.resolved]),
+    run.checks.results.map(item => [item.exitCode, item.count, item.tests]),
     [[0, undefined, undefined]],
   );
-  // The script passes no test: the gate refuses it although npm would have exited 0.
+  // npm passes, but the script passes no test: the gate refuses it.
   await rm(path.join(run.cwd, 'tests'), { recursive: true });
   await commit({ 'package.json': npmManifest({ unit: 'node --test' }) });
   await assert.rejects(() => engine.checks(run), { code: 'gate_check_no_tests' });
   assert.deepEqual(
-    run.checks.results.map(item => [item.exitCode, item.tests, item.resolved?.text]),
-    [[0, 0, 'node --test']],
+    run.checks.results.map(item => [item.exitCode, item.count?.exitCode, item.count?.tests]),
+    [[0, 0, 0]],
   );
   // A shell chain keeps its exit code, as before.
   await commit({ 'package.json': npmManifest({ unit: 'node --test && node -e 0' }) });
   await engine.checks(run);
   assert.deepEqual(
-    run.checks.results.map(item => [item.exitCode, item.tests, item.resolved, item.executed]),
-    [[0, undefined, undefined, undefined]],
+    run.checks.results.map(item => [item.exitCode, item.count, item.tests]),
+    [[0, undefined, undefined]],
   );
-  // A legacy Run never resolves an npm script.
+  // A legacy Run never counts an npm script.
   run.directorBinding = undefined;
   engine.save(run);
   await commit({ 'package.json': npmManifest({ unit: 'node --test' }) });
   await engine.checks(run);
   assert.deepEqual(
-    run.checks.results.map(item => [item.exitCode, item.tests, item.resolved, item.executed]),
+    run.checks.results.map(item => [item.exitCode, item.count, item.countVersion, item.tests]),
     [[0, undefined, undefined, undefined]],
   );
+});
+
+// Review findings (reproduced on Windows, Node 24.19.0): replacing `npm test` by a direct `node` run
+// lost workspaces (`.npmrc` workspaces + include-workspace-root: a failing package script made npm exit 1,
+// Kodo exit 0), the project `.npmrc` (`node-options` adding a failing test) and npm's environment
+// (`npm_package_version`: green under npm, red under Kodo). The configured npm command decides each one.
+const npmSemantics = [
+  {
+    name: 'workspaces',
+    passes: false,
+    files: {
+      'package.json': JSON.stringify({
+        name: 'fixture',
+        private: true,
+        scripts: { test: 'node --test' },
+        workspaces: ['packages/a'],
+      }),
+      '.npmrc': 'workspaces=true\ninclude-workspace-root=true\n',
+      'packages/a/package.json': JSON.stringify({ name: 'a', version: '1.0.0', scripts: { test: 'node fail.mjs' } }),
+      'packages/a/fail.mjs': 'process.exit(1);\n',
+    },
+  },
+  {
+    name: 'node-options',
+    passes: false,
+    files: {
+      'package.json': npmManifest({ test: 'node --test' }),
+      '.npmrc': 'node-options=--import=./kodo-setup.mjs\n',
+      'kodo-setup.mjs':
+        "import test from 'node:test';\ntest('setup fails', () => {\n  throw new Error('setup');\n});\n",
+    },
+  },
+  {
+    name: 'npm_package_version',
+    passes: true,
+    files: {
+      'package.json': JSON.stringify({
+        name: 'fixture',
+        version: '7.7.7-kodo',
+        private: true,
+        scripts: { test: 'node --test' },
+      }),
+      'tests/version.test.mjs':
+        "import test from 'node:test';\nimport assert from 'node:assert/strict';\n" +
+        "test('npm sets the version', () => assert.equal(process.env.npm_package_version, '7.7.7-kodo'));\n",
+    },
+  },
+];
+
+test('An npm script keeps npm semantics: workspaces, .npmrc node-options and npm_package_* decide by npm', async t => {
+  await privateStateHome(t);
+  const { store, engine, run, commit } = await workspace(t, {
+    commands: { test: [npm('test')], build: [], deploy: [], smoke: [] },
+  });
+  for (const { name, passes, files: changes } of npmSemantics) {
+    for (const added of ['.npmrc', 'packages', 'kodo-setup.mjs', 'tests/version.test.mjs'])
+      await rm(path.join(run.cwd, added), { recursive: true, force: true });
+    await commit(changes);
+    for (const gate of [false, true]) {
+      run.directorBinding = gate ? { kind: 'gate' } : undefined;
+      engine.save(run);
+      const check = () => (gate ? engine.checks(run) : runFastChecks({ engine, run }));
+      const label = `${name} ${gate ? 'gate' : 'task-fast'}`;
+      if (!passes) {
+        await assert.rejects(check, { code: 'check_failed' }, label);
+        assert.deepEqual(
+          run.checks.results.map(item => [item.exitCode, item.count]),
+          [[1, undefined]],
+          label,
+        );
+        continue;
+      }
+      await check();
+      assert.equal(run.checks.complete, true, label);
+      const [row] = run.checks.results;
+      // npm passed; the counting run without npm's environment failed, so npm's exit code decided.
+      assert.deepEqual(
+        [row.exitCode, row.count.resolved, row.count.exitCode, row.count.tests],
+        [0, { script: 'test', text: 'node --test' }, 1, null],
+        label,
+      );
+      if (gate) {
+        const before = store.events(run.id).length;
+        await engine.checks(run);
+        assert.ok(
+          store
+            .events(run.id)
+            .slice(before)
+            .some(event => event.type === 'checks_reused'),
+          'a receipt decided by npm is reused',
+        );
+      }
+    }
+  }
 });

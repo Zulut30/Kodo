@@ -25,11 +25,13 @@ export const TASK_FAST_PROFILE = 'task-fast';
 export const FAST_CHECK_TIMEOUT_MS = 120000;
 /**
  * The algorithm that counts passed `node --test` tests: the events of Kodo's own reporter
- * (`runtime/test-count-reporter.mjs`), never the text of the summary; since 4 also an npm script
- * command whose script is a plain `node --test` (resolveNpmScript). Part of the task-fast cache key
- * and of every counted receipt row; a receipt or cache entry of another version is never reused.
+ * (`runtime/test-count-reporter.mjs`), never the text of the summary. Since 5 an npm script command
+ * always runs as configured and its exit code decides; a simple script (resolveNpmScript, no `.npmrc`)
+ * gets a separate counting run of its `node --test` (`count`), whose confirmed zero fails the check.
+ * Part of the task-fast cache key and of every counted receipt row; a receipt or cache entry of
+ * another version is never reused.
  */
-export const TEST_COUNT_VERSION = 4;
+export const TEST_COUNT_VERSION = 5;
 const REPORTER_URL = new URL('./test-count-reporter.mjs', import.meta.url).href;
 // Kodo's own reporter module, at any install location.
 const kodoReporterArgument = /^--test-reporter=file:\/\/\/.+\/runtime\/test-count-reporter\.mjs$/;
@@ -325,9 +327,9 @@ export function npmScript(step) {
 /**
  * The Node command an npm script command (npmScript) is equivalent to in the raw `package.json` of
  * the checked commit: the script is a plain `node …` (plainNodeScript, no shell operator or
- * substitution) that Kodo can count (countedRunner), and neither `pre<name>` nor `post<name>` exists.
- * Kodo then runs Node itself (`process.execPath`) with the script's arguments. Anything else is null:
- * another runner, a shell chain or a pre/post script keeps being judged by its exit code.
+ * substitution) that Kodo can count (countedRunner), neither `pre<name>` nor `post<name>` exists and
+ * the manifest declares no `workspaces`. Anything else is null: another runner, a shell chain, a
+ * pre/post script or workspaces are judged by the exit code of npm alone.
  * @param {{ command: string, args?: string[] }} step
  * @param {string | null | undefined} packageText
  * @returns {{ resolved: { script: string, text: string }, step: { command: string, args: string[] } } | null}
@@ -344,6 +346,8 @@ export function resolveNpmScript(step, packageText) {
   }
   const scripts = manifest?.scripts;
   if (!scripts || typeof scripts !== 'object' || Array.isArray(scripts)) return null;
+  // npm may run the script in every workspace too.
+  if (Object.hasOwn(manifest, 'workspaces')) return null;
   const text = Object.hasOwn(scripts, script) ? scripts[script] : undefined;
   if (typeof text !== 'string' || !plainNodeScript.test(text)) return null;
   if (Object.hasOwn(scripts, `pre${script}`) || Object.hasOwn(scripts, `post${script}`)) return null;
@@ -352,41 +356,63 @@ export function resolveNpmScript(step, packageText) {
 }
 
 /**
- * The raw `package.json` of `commit` beside `cwd` (as `git ls-tree` names it there), or null when the
- * commit has none or it is not a regular file. Read from Git, never from the working tree.
+ * What npm reads from the root of `commit` beside `cwd`: the raw `package.json` (null when the commit
+ * has none or it is not a regular file) and whether a project `.npmrc` exists (an entry of that name
+ * in any letter case and of any type: it can set `node-options`, `workspaces`, `script-shell` and
+ * more). Read from Git, never from the working tree.
  * @param {string} cwd
  * @param {string} commit
- * @returns {Promise<string | null>}
+ * @returns {Promise<{ packageText: string | null, npmrc: boolean }>}
  */
-export async function packageJsonAt(cwd, commit) {
+export async function npmContextAt(cwd, commit) {
   const options = { cwd, env: workerEnvironment(), rawOutput: true, timeoutMs: 30000 };
-  const listed = await execute('git', ['ls-tree', '-z', commit, '--', 'package.json'], options);
-  const blob = /^(?:100644|100755) blob ([a-f0-9]+)\tpackage\.json\0$/.exec(listed.stdout)?.[1];
-  return blob ? (await execute('git', ['cat-file', 'blob', blob], options)).stdout : null;
+  const listed = (await execute('git', ['ls-tree', '-z', commit], options)).stdout;
+  const entries = listed
+    .split('\0')
+    .filter(Boolean)
+    .map(row => /^(\d+) (\w+) ([a-f0-9]+)\t([\s\S]+)$/.exec(row));
+  if (entries.some(entry => !entry)) throw fail('Malformed Git tree listing', 'configuration');
+  const manifest = entries.find(
+    ([, mode, type, , name]) => name === 'package.json' && type === 'blob' && /^100(?:644|755)$/.test(mode),
+  );
+  return {
+    packageText: manifest ? (await execute('git', ['cat-file', 'blob', manifest[3]], options)).stdout : null,
+    npmrc: entries.some(entry => entry[4].toLowerCase() === '.npmrc'),
+  };
 }
 
 /**
- * How Kodo counts a configured test command of a wave project: a countable `node --test` runs as
- * configured; an npm script command runs its resolved Node command (resolveNpmScript) and records
- * `resolved`. Null for anything else (its exit code decides).
- * @param {{ command: string, args?: string[] }} step
- * @param {string | null | undefined} packageText
- * @returns {{ step: { command: string, args?: string[] }, resolved?: { script: string, text: string } } | null}
- */
-export function countingPlan(step, packageText) {
-  if (countedRunner(step)) return { step };
-  const resolution = resolveNpmScript(step, packageText);
-  return resolution && { step: resolution.step, resolved: resolution.resolved };
-}
-
-/**
- * The raw package.json of `headSha`, read only when one of the test `commands` runs an npm script.
+ * The npm context of `headSha` (npmContextAt), read only when one of the test `commands` runs an npm script.
  * @param {string} cwd
  * @param {string} headSha
  * @param {{ command: string, args?: string[] }[]} commands
  */
-export const packageJsonFor = async (cwd, headSha, commands) =>
-  commands.some(step => npmScript(step)) ? packageJsonAt(cwd, headSha) : null;
+export const npmContextFor = async (cwd, headSha, commands) =>
+  commands.some(step => npmScript(step)) ? npmContextAt(cwd, headSha) : null;
+
+/**
+ * How Kodo counts a configured test command of a wave project: a countable `node --test` runs as
+ * configured with Kodo's reporters (`{ step }`). An npm script command always runs as configured and
+ * its exit code decides; when it is simple (its script resolves, see resolveNpmScript, and the checked
+ * commit has no `.npmrc`) Kodo also counts the equivalent Node command in a separate run
+ * (`{ npm: { resolved, step } }`, see countNpmScript). Null for anything else (its exit code decides).
+ * @param {{ command: string, args?: string[] }} step
+ * @param {{ packageText: string | null, npmrc: boolean } | null | undefined} context npmContextAt
+ * @returns {{ step?: { command: string, args?: string[] }, npm?: { resolved: { script: string, text: string }, step: { command: string, args: string[] } } } | null}
+ */
+export function countingPlan(step, context) {
+  if (countedRunner(step)) return { step };
+  const npm = context && !context.npmrc ? resolveNpmScript(step, context.packageText) : null;
+  return npm ? { npm } : null;
+}
+
+/**
+ * The command Kodo launches for a configured check of a wave project: an npm command named `npm.cmd`
+ * on Windows (which Node cannot spawn without a shell) runs as `npm`, through Node and npm's own CLI.
+ * @param {{ command: string, args?: string[] }} step
+ */
+export const npmLaunch = step =>
+  step.command !== 'npm' && npmCommand(step.command) ? { ...step, command: 'npm' } : step;
 
 /**
  * Only Node's own test runner can be narrowed to the affected files. Its options must survive
@@ -501,21 +527,43 @@ export function countTestEvents(text) {
 export function nodeTestOutcome(step, observed) {
   if (!nodeTestCommand(step)) return null;
   if (!countedRunner(step)) return { tests: null };
-  const executed = observed?.executed;
+  return { tests: exactExecution(step, observed?.executed) ? countTestEvents(observed.testEvents) : null };
+}
+
+/**
+ * Whether `executed` is exactly the counted execution of `step` (countingArguments) into an absolute
+ * event file. The receipt names Kodo's reporter by the location Kodo ran from; a later Kodo installed
+ * elsewhere still recognizes it as its own reporter module.
+ * @param {{ command: string, args?: string[] }} step
+ * @param {{ command?: string, args?: string[] } | null | undefined} executed
+ */
+function exactExecution(step, executed) {
   const destination = Array.isArray(executed?.args)
     ? /^--test-reporter-destination=([\s\S]+)$/.exec(String(executed.args[3] ?? ''))?.[1]
     : undefined;
-  // The receipt names Kodo's reporter by the location Kodo ran from; a later Kodo installed
-  // elsewhere still recognizes it as its own reporter module.
   const expected = countingArguments(step.args, destination);
   if (Array.isArray(executed?.args) && kodoReporterArgument.test(String(executed.args[2] ?? '')))
     expected[2] = String(executed.args[2]);
-  const exact =
+  return (
     destination !== undefined &&
     path.isAbsolute(destination) &&
     executed.command === step.command &&
-    isDeepStrictEqual(executed.args, expected);
-  return { tests: exact ? countTestEvents(observed.testEvents) : null };
+    isDeepStrictEqual(executed.args, expected)
+  );
+}
+
+/**
+ * The outcome of the counting run of a simple npm script (countingPlan `npm`) from its logged `count`:
+ * null when the log is not that run (another resolution, or not exactly Kodo's counting command);
+ * otherwise `{ tests }` — the event count (countTestEvents) of a run that exited 0, and `null` for a
+ * run that failed, stopped or left no complete event file (the exit code of npm decides then).
+ * @param {{ resolved: { script: string, text: string }, step: { command: string, args: string[] } }} plan
+ * @param {{ resolved?: unknown, executed?: { command?: string, args?: string[] }, exitCode?: unknown, testEvents?: unknown } | null | undefined} logged
+ * @returns {{ tests: number | null } | null}
+ */
+export function npmCountOutcome(plan, logged) {
+  if (!isDeepStrictEqual(logged?.resolved, plan.resolved) || !exactExecution(plan.step, logged.executed)) return null;
+  return { tests: logged.exitCode === 0 ? countTestEvents(logged.testEvents) : null };
 }
 
 /** The real path of `target`, or that of its nearest existing ancestor followed by the rest. */
@@ -596,6 +644,61 @@ export async function executeCheck(step, options, counted, roots = []) {
   } finally {
     await rm(directory, { recursive: true, force: true }).catch(() => {});
   }
+}
+
+const stopReason = error => (executionReasons.includes(error.code) ? error.code : 'execution_failed');
+
+/**
+ * The separate counting run of a simple npm script (countingPlan `npm`) after its configured npm
+ * command passed: the equivalent Node command runs with Kodo's reporters (executeCheck) and never
+ * replaces npm. `count` is the receipt row part `{ resolved, executed, exitCode, tests }` (npmCountOutcome);
+ * `logged` adds the reason of a stopped run, the tail of its output and `testEvents` for the evidence
+ * log; `error` is the stop of the run, if any.
+ * @param {{ resolved: { script: string, text: string }, step: { command: string, args: string[] } }} plan
+ * @param {Record<string, any>} options `execute` options
+ * @param {string[]} [roots]
+ */
+export async function countNpmScript(plan, options, roots = []) {
+  const { result, error, executed, testEvents } = await executeCheck(plan.step, options, true, roots);
+  const output = result ?? error?.result ?? {};
+  const exitCode = result ? result.code : null;
+  const tests = npmCountOutcome(plan, { resolved: plan.resolved, executed, exitCode, testEvents })?.tests ?? null;
+  const count = { resolved: plan.resolved, executed, exitCode, tests };
+  const tail = value => (typeof value === 'string' ? value.slice(-24000) : '');
+  return {
+    count,
+    logged: {
+      ...count,
+      ...(error ? { reason: stopReason(error) } : {}),
+      stdout: tail(output.stdout),
+      stderr: tail(output.stderr),
+      testEvents,
+    },
+    error,
+  };
+}
+
+/**
+ * Execute one check command of a wave project by its counting plan (countingPlan): a countable
+ * `node --test` with Kodo's reporters, anything else as `launch` (the configured command, see
+ * npmLaunch); after a simple npm script passed, also its counting run (countNpmScript, `npm`).
+ * `recorded` is the counting part of the receipt row (`executed` and `countVersion`, or `countVersion`
+ * and `count`), `observed` that of its evidence log (with `testEvents`).
+ * @param {{ command: string, args?: string[] }} launch
+ * @param {ReturnType<typeof countingPlan>} counting
+ * @param {Record<string, any>} options `execute` options
+ * @param {string[]} roots
+ */
+export async function executeCounted(launch, counting, options, roots) {
+  const direct = counting?.step;
+  const execution = await executeCheck(direct ?? launch, options, Boolean(direct), roots);
+  const npm = counting?.npm && execution.result?.code === 0 ? await countNpmScript(counting.npm, options, roots) : null;
+  if (direct) {
+    const recorded = { executed: execution.executed, countVersion: TEST_COUNT_VERSION };
+    return { ...execution, npm, recorded, observed: { ...recorded, testEvents: execution.testEvents } };
+  }
+  const recorded = npm ? { countVersion: TEST_COUNT_VERSION, count: npm.count } : {};
+  return { ...execution, npm, recorded, observed: npm ? { ...recorded, count: npm.logged } : {} };
 }
 
 /**
@@ -739,11 +842,13 @@ const rowBase = step => ({ kind: step.kind, command: step.command, args: step.ar
 
 /**
  * One command of the plan: a cached receipt, or its execution with persisted evidence.
- * A `counting` step (a countable `node --test` command or an npm script resolved to one, see
- * countingPlan) runs its Node command with Kodo's reporters (executeCheck): its row keeps the
- * planned `command`/`args`, adds `resolved` (an npm script), the `executed` command, `countVersion`
- * and how many tests passed by the event file (`row.tests`); its log also holds `resolved`,
- * `executed` and `testEvents`. Passing none is `noTests`, never cached.
+ * A countable `node --test` step (countingPlan `step`) runs with Kodo's reporters (executeCheck): its
+ * row keeps the planned `command`/`args`, adds the `executed` command, `countVersion` and how many
+ * tests passed by the event file (`row.tests`); its log also holds `executed` and `testEvents`.
+ * Passing none is `noTests`, never cached. An npm script command always runs as configured (its exit
+ * code decides); after it passed, a simple one (countingPlan `npm`) gets its counting run
+ * (countNpmScript): the row adds `countVersion` and `count`, the log `count` with `testEvents`, and a
+ * confirmed zero fails the check (`fast_check_no_tests`).
  */
 async function runStep({ engine, run, step, headSha, env, cache, counting, signal }) {
   const base = rowBase(step);
@@ -762,19 +867,16 @@ async function runStep({ engine, run, step, headSha, env, cache, counting, signa
   const hit = input && (await cachedRow(engine, step, input, headSha));
   if (hit) return { row: hit };
   const started = performance.now();
-  const { result, error, executed, testEvents } = await executeCheck(
-    counting?.step ?? step,
-    { cwd: run.cwd, signal, env, secrets: engine.secrets, timeoutMs: step.timeoutMs, allowFailure: true },
-    Boolean(counting),
-    [run.project],
-  );
-  const counted = counting
-    ? { ...(counting.resolved ? { resolved: counting.resolved } : {}), executed, countVersion: TEST_COUNT_VERSION }
-    : {};
+  const options = { cwd: run.cwd, signal, env, secrets: engine.secrets, timeoutMs: step.timeoutMs, allowFailure: true };
+  const direct = counting?.step;
+  // The configured npm command decides; only after it passed is its script counted separately (`npm`).
+  const { result, error, npm, recorded, observed } = await executeCounted(npmLaunch(step), counting, options, [
+    run.project,
+  ]);
   const durationMs = Math.round(performance.now() - started);
   const output = result ?? error?.result ?? {};
   const exitCode = result ? result.code : null;
-  const reason = error ? (executionReasons.includes(error.code) ? error.code : 'execution_failed') : undefined;
+  const reason = error ? stopReason(error) : undefined;
   const value = {
     ...base,
     exitCode,
@@ -782,7 +884,7 @@ async function runStep({ engine, run, step, headSha, env, cache, counting, signa
     durationMs,
     stdout: typeof output.stdout === 'string' ? output.stdout : '',
     stderr: typeof output.stderr === 'string' ? output.stderr : '',
-    ...(counting ? { ...counted, testEvents } : {}),
+    ...observed,
   };
   let evidence = null;
   try {
@@ -797,7 +899,7 @@ async function runStep({ engine, run, step, headSha, env, cache, counting, signa
     exitCode,
     durationMs,
     ...(reason ? { reason } : {}),
-    ...counted,
+    ...recorded,
     ...(evidence
       ? {
           evidence: { path: evidence.path, sha256: evidence.sha256, bytes: evidence.bytes, headSha },
@@ -826,10 +928,21 @@ async function runStep({ engine, run, step, headSha, env, cache, counting, signa
         'check_failed',
       ),
     };
-  if (counting) {
+  if (npm?.error?.code === 'cancelled') return { row, error: npm.error };
+  // npm passed, but its plain `node --test` passed no test by Kodo's events: not a pass. A counting run
+  // that failed, stopped or gave no complete event file leaves the decision to npm's exit code.
+  if (npm?.count.tests === 0)
+    return {
+      row,
+      error: fail(
+        `Скрипт npm ${npm.count.resolved.script} завершился успешно, но его node --test не выполнил успешно ни одного теста (по событиям репортёра Kodo 0)`,
+        'fast_check_no_tests',
+      ),
+    };
+  if (direct) {
     // Exit 0 after passing nothing (only skip/todo, no tests, no complete event file) is not a pass:
     // never cache it.
-    row.tests = nodeTestOutcome(counting.step, { executed, testEvents })?.tests ?? null;
+    row.tests = nodeTestOutcome(direct, observed)?.tests ?? null;
     if (!(row.tests > 0)) return { row, noTests: true, unknown: row.tests === null };
   }
   if (input)
@@ -943,11 +1056,12 @@ async function executePlan({ engine, run, plan, headSha, signal }) {
   const env = fastEnvironment();
   const cache = plan.fallback ? null : await cacheContext(run, plan, headSha, env);
   const tests = plan.commands.filter(step => step.kind === 'test');
-  // An npm script command counts as the plain `node --test` of the checked commit's package.json.
-  const packageText = await packageJsonFor(run.cwd, headSha, tests);
-  const plans = plan.commands.map(step => (step.kind === 'test' ? countingPlan(step, packageText) : null));
-  // The full suite is judged by its counts only when every test command is counted by Kodo.
-  const judged = plan.commands.every((step, index) => step.kind !== 'test' || plans[index]);
+  // A simple npm script command is also counted by the plain `node --test` of the checked commit's package.json.
+  const context = await npmContextFor(run.cwd, headSha, tests);
+  const plans = plan.commands.map(step => (step.kind === 'test' ? countingPlan(step, context) : null));
+  // The full suite is judged by its sum only when every test command is a `node --test` counted by
+  // Kodo; an npm script's counting run is extra evidence that fails on its own zero only.
+  const judged = plan.commands.every((step, index) => step.kind !== 'test' || plans[index]?.step);
   let passed = 0;
   for (const [index, step] of plan.commands.entries()) {
     engine.checkCancelled(run, signal);
@@ -969,7 +1083,7 @@ async function executePlan({ engine, run, plan, headSha, signal }) {
     if (noTests && !plan.fallback) return { results, noTests: true };
     // A full `node --test` run whose outcome is unknown proves nothing (see summaryUnknown).
     if (plan.fallback && step.kind === 'test' && (unknown || (!counting && nodeTestCommand(step))))
-      throw summaryUnknown(Boolean(counting));
+      throw summaryUnknown(Boolean(counting?.step));
     passed += row.tests ?? 0;
   }
   if (plan.fallback && judged && passed === 0)
