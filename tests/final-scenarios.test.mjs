@@ -940,8 +940,11 @@ test(
       hooks: {
         onWorker: async (id, calls) => {
           for (let i = 0; i < 1200 && calls.active < 2; i++) await delay(25);
-          // The second drain is interrupted while gamma and delta are inside their sessions.
-          if (id === 'gamma' && calls.worker.filter(name => name === 'gamma').length === 1) controller.abort();
+          const first = calls.worker.filter(name => name === id).length === 1;
+          // The second drain is interrupted while gamma and delta are inside their sessions: delta's
+          // first session ends only after the abort, so neither can finish first on any platform.
+          if (id === 'gamma' && first) controller.abort();
+          if (id === 'delta' && first) for (let i = 0; i < 1200 && !controller.signal.aborted; i++) await delay(25);
         },
       },
     });
