@@ -2,7 +2,7 @@
 
 Дата: 2026-11-19. Программа: этапы 01–13 roadmap и фабрика проектов F1–F3 (решения пользователя 2026-11-17, см. [phase-13](phase-13.md)). Отчёт различает уровни доказательства: **local** (Windows 11, Node 24.19, эта машина), **CI** (GitHub Actions, Linux и Windows), **native** (реальные подписочные клиенты), **installed** (установленный `.tgz`), **published** (GitHub Release), **deployed**. Нет наблюдения — `NOT RUN` или `unknown`, а не PASS.
 
-На коммите этого файла наблюдались только уровни local и native. CI этапа 13, опубликованный `.tgz` с SHA-256 и проверка скачанного и установленного пакета на этот момент **ожидаются**: они появятся в PR этапа 13 и в заметках GitHub Release `v1.0.0`, а после выпуска вносятся в этот файл отдельным изменением. До этого подтверждённым выпуском остаётся 0.2.6 (README).
+Квитанции выпуска внесены после публикации: PR #24 влит в `main` как `3708333` (дерево идентично проверенной голове PR `4e7f973`), тег `v1.0.0` указывает на `3708333`, GitHub Release `v1.0.0` опубликован, скачанный архив проверен и установлен.
 
 ## Требования
 
@@ -11,7 +11,7 @@
 | Этапы 01–11 (baseline, качество, CI/кэш, архитектура, знания, Project Director, оркестрация, проверки, behaviour gate, сторож прогресса, журнал доставки) | ACCEPTED | PR #10–#21, CI обеих ОС; [progress.md](progress.md) |
 | 12 Операционный отчёт `kodo report` | ACCEPTED | PR #22 (`a72326f`), CI обеих ОС; гейты волнового режима — исправление 5 этапа 13 |
 | F1–F3 Фабрика проектов: волны, интеграционная ветка, gate Run, хост T3, чертёж, extend | ACCEPTED | PR #23 (`b12eed4`), 15 раундов независимого ревью, CI обеих ОС |
-| 13① Офлайн-сценарии A, C, E, F | PASS local на `45092e0`; PASS CI на `3fadb71`; на голове PR — ожидается | `tests/final-scenarios.mjs` — отдельная команда `npm run test:final`, не входит в `npm run check` и L2. Local: 7/7 на `45092e0` (два прогона, 1274 с и 1337 с), E4 на `8a52f91` (240 с) и `1cf84db` (272 с). CI: отдельный шаг на Linux и Windows — 8/8 (7 сценариев и проверка песочницы) на `3fadb71`. После последней правки барьера E4 — шаг CI на голове PR |
+| 13① Офлайн-сценарии A, C, E, F | PASS local; PASS CI | `tests/final-scenarios.mjs` — отдельная команда `npm run test:final`, не входит в `npm run check` и L2. Local: 7/7 на `45092e0` (1274 с и 1337 с), E4 на `8a52f91`, `1cf84db` и `4e7f973` (240–272 с). CI: отдельный шаг на Linux и Windows — 8/8 (7 сценариев и проверка песочницы) на `3fadb71`, success на `4e7f973` (run 44598107494) |
 | 13① B (mini Rust/Git), D (Hearthstone) | NOT RUN | Исключены решением пользователя |
 | 13② Нативные Codex и Claude | PASS native | Run `cfb6ffba` (Codex, после исправлений 1–2), `19a9b9ff` (Claude) |
 | 13② Отмена и продолжение | PASS native | Run `346684f0`: `cancelled` за ~1 с, `resume` → `succeeded` |
@@ -22,18 +22,18 @@
 | Orca | NOT RUN | Протокол общий с T3, хост не проверялся |
 | TokenEconomizer (hooks/injection, экономия) | unknown | Нет наблюдения поддерживаемого пути |
 | Лицензии | PASS local на `f42ffca` | 13 закреплённых навыков: 12 MIT, 1 CC-BY-SA-4.0 (`skills/differential-review`, trailofbits/skills); файлы лицензий на месте, SHA-256 совпадают с `third-party-skills.lock.json`. Пакет Kodo `private: true`, без поля `license` |
-| Выпуск: GitHub Release `.tgz` + SHA-256 | ожидается | Версия 1.0.0 в `package.json`, `package-lock.json`, `registry.json`; публикации в npm нет (решение) |
+| Выпуск: GitHub Release `.tgz` + SHA-256 | PASS published, installed | [Release v1.0.0](https://github.com/Zulut30/Kodo/releases/tag/v1.0.0): `zulut30-kodo-1.0.0.tgz` (1 194 353 байт), SHA-256 `13d56ff42d7b0ed897921edf6dd083c2ae7bee7cd24430d4149d9984ee70c99e`, `SHA256SUMS`; публикации в npm нет (решение) |
 | Развёртывание | not_configured | У Kodo нет целевой среды развёртывания |
 
 ## Матрица доказательств
 
 | Уровень | Наблюдение на коммите этого файла |
 | --- | --- |
-| local | Наблюдалось при разработке: целевые тесты исправлений 1–5 и находок ревью падали на прежнем коде и проходили после правки (исправление 6, справка CLI, — без теста); офлайн-сценарии 7/7 на `45092e0`; E4 на `8a52f91`. Отдельных квитанций этих прогонов в репозитории нет: итоговая квитанция всех наборов — полный `npm run check` + security (L2) на голове PR этапа 13 (ожидается, в PR) и CI |
-| CI | Ожидается: обязательные `check (ubuntu-latest, 24)` и `check (windows-latest, 24)` с проверкой установленного пакета в PR этапа 13 |
+| local | Windows 11, Node 24.19: `npm run check` на `3fadb71` — exit 0, 2381 тестов, 2370 pass, 0 fail, 11 skipped (44 мин); `4e7f973` отличается файлом сценариев (вне `npm run check`), текстом справки и документацией. Целевые тесты исправлений 1–5 и находок ревью падали на прежнем коде и проходили после правки. Local L2 через `scripts/ci.mjs`: security — `tool_missing` (Semgrep и Gitleaks на машине не установлены), на загруженной машине полный check прервался по пределу 40 мин без упавших тестов |
+| CI | Голова PR `4e7f973`, run 44598107494: `check (ubuntu-latest, 24)` и `check (windows-latest, 24)` — success; в каждом L2 (`npm run check` + Semgrep и Gitleaks — passed), шаг `npm run test:final` и проверка установленного пакета — success. Windows L2 на `3fadb71` — 38 мин 46 с из предела 40 мин |
 | native | Codex CLI 0.170.0 и Claude Code по подпискам: 5 Run (`kodo run`) и 5 gate Run пилота (19 сессий Codex, ~82 мин сессий, 11,65 млн токенов, из них 10,17 млн из кэша) |
-| installed | Ожидается: установка скачанного `.tgz` в чистый prefix и `kodo --help`, `validate --json`, `doctor`, `report`, `project --help` |
-| published | Ожидается: GitHub Release `v1.0.0` с `.tgz` и `SHA256SUMS`; SHA-256 скачанного файла сверяется с проверенным пакетом |
+| installed | Скачанный `gh release download` архив: SHA-256 совпал с `SHA256SUMS` и с архивом, проверенным перед публикацией; `npm install -g --prefix <чистый каталог> --ignore-scripts`: `kodo --help` — exit 0; `validate --json` — exit 0, version 1.0.0, 34 компонента; `doctor --json` — Codex и Claude Code по подписке `ok`, exit 2 из-за ненастроенных необязательных ключей исследования; `report --project <пилот>` — exit 0 (5 гейтов, 1 блокер); `report <неизвестный Run>` — `report_not_found`. Справка проектных команд — в `kodo --help` (есть `project gates`); `kodo project --help` отвечает `project_arguments` |
+| published | GitHub Release `v1.0.0` (тег на `3708333`), ассеты `zulut30-kodo-1.0.0.tgz` и `SHA256SUMS`; digest ассета в GitHub — `sha256:13d56ff4…c99e` |
 | deployed | not_configured |
 
 ## Найдено и исправлено в этапе 13
