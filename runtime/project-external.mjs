@@ -604,18 +604,22 @@ export async function runProjectGates(ctx, input) {
   const C = await contractsOf(ctx);
   need(C.isWaveProject((await snapshotOf(ctx, projectId)).project), 'wave_required');
   return withProjectLease(storeOf(ctx), projectId, async () => {
-    const snapshot = await snapshotOf(ctx, projectId);
     // The same control states complete-task refuses: a gate pass never reports success for them.
-    if (snapshot.project.paused || ['cancelled', 'failed', 'blocked'].includes(snapshot.project.status))
+    const controlled = project => project.paused || ['cancelled', 'failed', 'blocked'].includes(project.status);
+    const snapshot = await snapshotOf(ctx, projectId);
+    if (controlled(snapshot.project))
       return { status: 'blocked', code: 'project_control_blocked', revision: snapshot.revision };
     if (signal?.aborted) return { status: 'blocked', code: 'project_cancelled', revision: snapshot.revision };
     const W = wavePorts(input.ports, ['createWaveContext', 'runPendingGates']);
     const gates = await runGates(W, waveContextOf(ctx, C, W), projectId, signal, retryFailed === true);
-    const revision = (await snapshotOf(ctx, projectId)).revision;
-    // An interrupted pass may return before any gate ran: never `passed`.
-    if (signal?.aborted) return { status: 'blocked', code: 'project_cancelled', gates, revision };
+    // A pause, cancel or block during the pass (`project pause` takes no gate lease) or an
+    // interrupted pass may stop the gates before any ran: never `passed`.
+    const after = await snapshotOf(ctx, projectId);
+    if (controlled(after.project))
+      return { status: 'blocked', code: 'project_control_blocked', gates, revision: after.revision };
+    if (signal?.aborted) return { status: 'blocked', code: 'project_cancelled', gates, revision: after.revision };
     const status = Array.isArray(gates.blocked) && gates.blocked.length ? 'blocked' : 'passed';
-    return { status, gates, revision };
+    return { status, gates, revision: after.revision };
   });
 }
 

@@ -11,7 +11,7 @@
 | Этапы 01–11 (baseline, качество, CI/кэш, архитектура, знания, Project Director, оркестрация, проверки, behaviour gate, сторож прогресса, журнал доставки) | ACCEPTED | PR #10–#21, CI обеих ОС; [progress.md](progress.md) |
 | 12 Операционный отчёт `kodo report` | ACCEPTED | PR #22 (`a72326f`), CI обеих ОС; гейты волнового режима — исправление 5 этапа 13 |
 | F1–F3 Фабрика проектов: волны, интеграционная ветка, gate Run, хост T3, чертёж, extend | ACCEPTED | PR #23 (`b12eed4`), 15 раундов независимого ревью, CI обеих ОС |
-| 13① Офлайн-сценарии A, C, E, F | PASS local; CI ожидается | `tests/final-scenarios.test.mjs` 7/7 (два прогона, 1274 с и 1337 с) |
+| 13① Офлайн-сценарии A, C, E, F | PASS local на `45092e0`; на голове PR — ожидается | `tests/final-scenarios.test.mjs` 7/7 на `45092e0` (два прогона, 1274 с и 1337 с); после усиления изоляции и проверок E4 — E4 на `8a52f91` (240 с); полный прогон на голове PR — в local L2 и CI |
 | 13① B (mini Rust/Git), D (Hearthstone) | NOT RUN | Исключены решением пользователя |
 | 13② Нативные Codex и Claude | PASS native | Run `cfb6ffba` (Codex, после исправлений 1–2), `19a9b9ff` (Claude) |
 | 13② Отмена и продолжение | PASS native | Run `346684f0`: `cancelled` за ~1 с, `resume` → `succeeded` |
@@ -21,7 +21,7 @@
 | 13③ `extend` вживую | NOT RUN | Нужен принятый проект; сценарий F — PASS local |
 | Orca | NOT RUN | Протокол общий с T3, хост не проверялся |
 | TokenEconomizer (hooks/injection, экономия) | unknown | Нет наблюдения поддерживаемого пути |
-| Лицензии | PASS local | 13 закреплённых навыков: 12 MIT, 1 CC-BY-SA-4.0 (`skills/differential-review`, trailofbits/skills); файлы лицензий на месте, SHA-256 совпадают с `third-party-skills.lock.json`. Пакет Kodo `private: true`, без поля `license` |
+| Лицензии | PASS local на `f42ffca` | 13 закреплённых навыков: 12 MIT, 1 CC-BY-SA-4.0 (`skills/differential-review`, trailofbits/skills); файлы лицензий на месте, SHA-256 совпадают с `third-party-skills.lock.json`. Пакет Kodo `private: true`, без поля `license` |
 | Выпуск: GitHub Release `.tgz` + SHA-256 | ожидается | Версия 1.0.0 в `package.json`, `package-lock.json`, `registry.json`; публикации в npm нет (решение) |
 | Развёртывание | not_configured | У Kodo нет целевой среды развёртывания |
 
@@ -29,7 +29,7 @@
 
 | Уровень | Наблюдение на коммите этого файла |
 | --- | --- |
-| local | Полный `npm run check` + security (L2) на замороженном head этапа 13 — в PR этапа; целевые наборы каждого исправления RED → GREEN; офлайн-сценарии 7/7 |
+| local | Наблюдалось: целевые наборы каждого исправления RED → GREEN на коммитах ветки; офлайн-сценарии 7/7 на `45092e0`. Ожидается: полный `npm run check` + security (L2) на голове PR этапа 13 (квитанция — в PR) |
 | CI | Ожидается: обязательные `check (ubuntu-latest, 24)` и `check (windows-latest, 24)` с проверкой установленного пакета в PR этапа 13 |
 | native | Codex CLI 0.170.0 и Claude Code по подпискам: 5 Run (`kodo run`) и 5 gate Run пилота (19 сессий Codex, ~82 мин сессий, 11,65 млн токенов, из них 10,17 млн из кэша) |
 | installed | Ожидается: установка скачанного `.tgz` в чистый prefix и `kodo --help`, `validate --json`, `doctor`, `report`, `project --help` |

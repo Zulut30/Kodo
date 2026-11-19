@@ -67,6 +67,7 @@ const gitRedirects = [
   'GIT_CONFIG_SYSTEM',
   'GIT_CONFIG_PARAMETERS',
   'GIT_CONFIG_COUNT',
+  'GIT_TEMPLATE_DIR',
 ];
 
 function git(cwd, ...args) {
@@ -89,10 +90,13 @@ async function sandbox(t, prefix) {
   const stores = new Set();
   // Registered before anything else: a failed setup still restores the environment and removes the directory.
   t.after(async () => {
-    for (const store of stores) store.close();
-    for (const [key, value] of Object.entries(previous)) {
-      if (value === undefined) delete process.env[key];
-      else process.env[key] = value;
+    try {
+      for (const store of stores) store.close();
+    } finally {
+      for (const [key, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
     }
     assert.equal(path.dirname(directory), path.resolve(parent));
     assert.match(path.basename(directory), new RegExp(`^kodo-final-${prefix}-`));
@@ -101,16 +105,27 @@ async function sandbox(t, prefix) {
   const root = path.join(directory, 'repo'),
     home = path.join(directory, 'state'),
     isolated = path.join(directory, 'empty-home'),
-    temp = path.join(directory, 'tmp');
+    temp = path.join(directory, 'tmp'),
+    template = path.join(isolated, 'git-template'),
+    hooks = path.join(isolated, 'git-hooks');
   await mkdir(root);
   await mkdir(isolated);
   await mkdir(temp);
-  await writeFile(path.join(isolated, 'gitconfig'), '');
+  await mkdir(template);
+  await mkdir(hooks);
+  // Every Git process of the scenario (the helper and Kodo's) reads only this config: no inherited
+  // template is copied by `git init` and no hook runs.
+  const forward = value => value.split(path.sep).join('/');
+  await writeFile(
+    path.join(isolated, 'gitconfig'),
+    `[init]\n\ttemplateDir = ${forward(template)}\n[core]\n\thooksPath = ${forward(hooks)}\n`,
+  );
   for (const key of gitRedirects) delete process.env[key];
   Object.assign(process.env, {
     TMP: temp,
     TEMP: temp,
     TMPDIR: temp,
+    GIT_TEMPLATE_DIR: template,
     HOME: isolated,
     USERPROFILE: isolated,
     KODO_HOME: home,
@@ -129,7 +144,8 @@ async function commitBaseline(root, files) {
     await mkdir(path.dirname(path.join(root, name)), { recursive: true });
     await writeFile(path.join(root, name), text);
   }
-  git(root, 'init', '-b', 'main');
+  // An explicit empty template: an inherited hook can never reach the scenario repository.
+  git(root, 'init', `--template=${process.env.GIT_TEMPLATE_DIR}`, '-b', 'main');
   git(root, 'config', 'user.name', 'Kodo Final Scenarios');
   git(root, 'config', 'user.email', 'kodo-final@example.invalid');
   git(root, 'config', 'core.autocrlf', 'false');

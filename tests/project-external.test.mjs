@@ -692,6 +692,24 @@ test('gates never reports success for a blocked project or an aborted pass', asy
   const late = await runProjectGates(f.ctx, { projectId: f.projectId, ports: f.ports, signal: during.signal });
   assert.deepEqual([late.status, late.code], ['blocked', 'project_cancelled']);
   assert.equal(f.calls.gates.length, 1);
+
+  // Paused during the pass (`project pause` takes no gate lease): the gates stop, never `passed`.
+  f.ports.runPendingGates = async (waveCtx, input) => {
+    f.calls.gates.push(input);
+    await f.repo.apply({
+      schemaVersion: 1,
+      commandId: randomUUID(),
+      projectId: f.projectId,
+      expectedRevision: f.repo.snapshot(f.projectId).revision,
+      actor: 'owner',
+      reason: 'Pause during a gate pass',
+      action: { op: 'setPaused', paused: true },
+    });
+    return { gates: [], accepted: [], blocked: [] };
+  };
+  const pausedDuring = await runProjectGates(f.ctx, { projectId: f.projectId, ports: f.ports });
+  assert.deepEqual([pausedDuring.status, pausedDuring.code], ['blocked', 'project_control_blocked']);
+  assert.equal(f.calls.gates.length, 2);
 });
 
 test('gates requires a wave project', async t => {
