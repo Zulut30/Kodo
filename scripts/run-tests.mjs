@@ -112,6 +112,7 @@ export const fastTests = [
   'tests/task-context.test.mjs',
   'tests/task-scheduler.test.mjs',
   'tests/telemetry.test.mjs',
+  'tests/test-count-events.test.mjs',
   'tests/test-git-environment.test.mjs',
   'tests/test-schedule.test.mjs',
   'tests/tools.test.mjs',

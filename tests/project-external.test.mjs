@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdtemp, mkdir, realpath, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { Store } from '../runtime/store.mjs';
@@ -433,6 +433,84 @@ test('complete-task integrates once, runs pending gates unless deferred and repl
   }
   snapshot = await f.snapshot();
   assert.equal(snapshot.tasks.find(row => row.id === 'task-d').status, 'running');
+});
+
+test('A task-fast receipt is integrated only with the test count its own event log proves', async t => {
+  // Review finding (major): node --test was counted from the text of its summary. The validator of a
+  // wave task Run recounts each node --test row from the event file of Kodo's reporter in its log.
+  const f = await fixture(t);
+  const cut = text => `${text.split('\n').slice(0, -2).join('\n')}\n`;
+  const forgeries = {
+    // A receipt row that claims one more test than its events.
+    'task-a': async (run, row) => ({ ...row, tests: row.tests + 1 }),
+    // A new log whose stdout claims more tests while its events are incomplete.
+    'task-b': async (run, row) => {
+      const log = JSON.parse(await readFile(row.outputPath, 'utf8'));
+      const value = { ...log.value, stdout: '# tests 9\n# pass 9\n', testEvents: cut(log.value.testEvents) };
+      const evidence = await f.engine.persistEvidence(run, 'fast-check', value, { headSha: run.headSha });
+      const reference = { path: evidence.path, sha256: evidence.sha256, bytes: evidence.bytes, headSha: run.headSha };
+      return { ...row, tests: 9, evidence: reference, outputPath: evidence.path, outputHash: evidence.sha256 };
+    },
+  };
+  // The production authorizer with an evaluator that only runs its trusted validator
+  // (validateWaveRun), so the validator's own refusal code is observable.
+  const authorize = createProjectTransitionAuthorizer({
+    store: f.store,
+    engine: f.engine,
+    contracts,
+    evaluator: {
+      evaluateWaveTransition: async (input, ports) => {
+        await ports.validateRun(input.run);
+        return { eligibleStates: [input.command.action.to] };
+      },
+    },
+  });
+  const validated = async (taskId, run) => {
+    const snapshot = await f.snapshot();
+    const ref = { kind: 'checks', runId: run.id, headSha: run.headSha, path: run.checks.results[0].outputPath };
+    const action = { op: 'transition', kind: 'task', id: taskId, to: 'verifying', mappings: [] };
+    const command = {
+      schemaVersion: 1,
+      commandId: randomUUID(),
+      projectId: f.projectId,
+      expectedRevision: snapshot.revision,
+      actor: 'test',
+      reason: 'Validate a task-fast receipt',
+      action: { ...action, evidence: [{ ...ref, sha256: 'a'.repeat(64) }] },
+    };
+    return authorize({ command, snapshot }).then(
+      () => 'valid',
+      error => error.code,
+    );
+  };
+  const codes = [];
+  f.ports.integrateAndAdvance = async (waveCtx, input) => {
+    f.calls.integrate.push(input.taskId);
+    const stored = f.store.getRun(input.run.id);
+    assert.equal(stored.checks.results.filter(row => row.kind === 'test' && row.tests > 0).length, 1);
+    const genuine = await validated(input.taskId, stored);
+    const results = [];
+    for (const row of stored.checks.results)
+      results.push(row.kind === 'test' ? await forgeries[input.taskId](stored, row) : row);
+    f.store.updateRun(stored.id, { checks: { ...stored.checks, results } });
+    codes.push([input.taskId, genuine, await validated(input.taskId, f.store.getRun(stored.id))]);
+    return integrate(f, { ...input, run: f.store.getRun(stored.id) });
+  };
+  const wave = await f.wave({ limit: 3 });
+  for (const [taskId, change] of [
+    ['task-a', { 'src/a.mjs': 'export const a = 2;\n' }],
+    ['task-b', { 'src/b.mjs': 'export const b = 2;\n' }],
+  ]) {
+    const head = await commit(brief(wave, taskId).worktree, change);
+    await assert.rejects(() => f.complete(taskId, head), { code: 'project_transition_blocked' }, taskId);
+    const snapshot = await f.snapshot();
+    assert.notEqual(snapshot.tasks.find(row => row.id === taskId).status, 'integrated');
+  }
+  assert.deepEqual(codes, [
+    ['task-a', 'valid', 'project_fast_tests_uncounted'],
+    ['task-b', 'valid', 'project_fast_tests_uncounted'],
+  ]);
+  assert.deepEqual(f.calls.integrate, ['task-a', 'task-b']);
 });
 
 test('abandon blocks the attempt and cancels its Run; retry-failed reserves a new attempt', async t => {

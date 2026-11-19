@@ -18,7 +18,7 @@ import {
 import { integrationLeaseHeld } from './project-integration-lease.mjs';
 import { WAVE_POLICY_FIELDS, assertWavePolicy } from './wave-policy.mjs';
 import { isCurrentBehaviorReceipt } from './behavior-gate.mjs';
-import { nodeTestOutcome } from './task-fast-checks.mjs';
+import { TEST_COUNT_VERSION, nodeTestOutcome } from './task-fast-checks.mjs';
 
 const fail = code => {
   throw Object.assign(new Error(`Project ${code}`), { code: `project_${code}` });
@@ -391,17 +391,28 @@ async function validateWaveTask({ engine, contracts, snapshot, run, options }) {
   if (!succeeded) return;
   requireValue(run.checks?.profile === 'task-fast' && Array.isArray(run.checks.results), 'checks_stale');
   await assertLogs(engine, run, run.checks.results, 'fast-check');
+  await assertTestCounts(run, { step: row => row, positive: false, code: 'fast_tests_uncounted' });
   await assertTaskMerge(snapshot, run);
 }
 
-// Each full `node --test` command of a gate Run passed a parsed, non-zero number of tests: its
-// receipt row (`tests`) is the summary of its evidence log (assertFullReceipts checked the log).
-async function assertGateTestCounts(run) {
+// Each `node --test` row of a wave receipt holds the count of its own evidence log, recounted from
+// the event file of Kodo's reporter that the log keeps (never from stdout), by the current counting
+// algorithm; the caller checked the log's integrity. A gate Run requires a positive count for each
+// full `node --test` command (`gate_tests_uncounted`); a task-fast row only an equal, known one
+// (`fast_tests_uncounted`): its runtime decides on zero.
+async function assertTestCounts(run, { step, positive, code }) {
   for (const row of run.checks.results) {
     if (row.kind !== 'test') continue;
     const log = JSON.parse(await readFile(row.outputPath, 'utf8'));
-    const outcome = nodeTestOutcome(row.command, log.value?.stdout ?? '');
-    requireValue(!outcome || (outcome.tests > 0 && row.tests === outcome.tests), 'gate_tests_uncounted');
+    const outcome = nodeTestOutcome(step(row), log.value);
+    requireValue(
+      !outcome ||
+        (Number.isSafeInteger(outcome.tests) &&
+          (!positive || outcome.tests > 0) &&
+          row.tests === outcome.tests &&
+          row.countVersion === TEST_COUNT_VERSION),
+      code,
+    );
   }
 }
 
@@ -422,7 +433,7 @@ async function validateWaveGate({ store, engine, contracts, snapshot, run, gate,
   await assertRunSource(snapshot, run, true);
   await assertWavePolicy({ run, policyCommit: gate.headSha, headSha: run.headSha, secrets: engine.secrets });
   await assertFullReceipts(engine, run);
-  await assertGateTestCounts(run);
+  await assertTestCounts(run, { step: row => row.command, positive: true, code: 'gate_tests_uncounted' });
   requireValue(
     isCurrentBehaviorReceipt(run.behavior, { headSha: run.headSha, baseSha: run.baseSha, config: run.config }),
     'behavior_stale',

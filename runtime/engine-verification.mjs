@@ -16,7 +16,16 @@ import {
 import { EngineExecution } from './engine-execution.mjs';
 import { normalizeWatchdogConfig, observeRun, watchdogStep } from './watchdog.mjs';
 import { contentHash, packSessionEvidence, evidencePrompt } from './engine-core.mjs';
-import { TASK_FAST_PROFILE, fastEnvironment, nodeTestOutcome, runFastChecks } from './task-fast-checks.mjs';
+import {
+  TASK_FAST_PROFILE,
+  TEST_COUNT_VERSION,
+  countedRunner,
+  executeCheck,
+  fastEnvironment,
+  nodeTestCommand,
+  nodeTestOutcome,
+  runFastChecks,
+} from './task-fast-checks.mjs';
 
 const gateReviewSchemas = new Map();
 /**
@@ -110,24 +119,47 @@ function failedCheck(run, kind, result, comparison) {
   );
 }
 /**
- * The test count of a full `node --test` command of a wave gate Run (`directorBinding.kind ===
- * 'gate'`), null for any other Run or command: a gate never accepts a run that passed no test or
- * whose summary cannot be parsed. Legacy Runs keep their checks unchanged.
+ * Whether a check command of a Run is a full `node --test` command of a wave gate Run
+ * (`directorBinding.kind === 'gate'`): its passed tests are counted by the events of Kodo's
+ * reporter, and the gate never accepts a run that passed no test or whose count is unknown.
+ * Legacy Runs keep their checks unchanged.
  */
-const gateTestCount = (run, kind, command, stdout) =>
-  run.directorBinding?.kind === 'gate' && kind === 'test' ? nodeTestOutcome(command, stdout) : null;
+const gateTestCommand = (run, kind, command) =>
+  run.directorBinding?.kind === 'gate' && kind === 'test' && nodeTestCommand(command);
 
 function assertGateTests(counted) {
   if (!counted || counted.tests > 0) return;
   throw Object.assign(
     new Error(
       counted.tests === 0
-        ? 'Полный прогон node --test гейта не выполнил успешно ни одного теста (tests/pass 0)'
-        : 'Полный прогон node --test гейта не дал разбираемого итога: используй репортёр spec или tap на stdout',
+        ? 'Полный прогон node --test гейта не выполнил успешно ни одного теста (по событиям репортёра 0)'
+        : 'Полный прогон node --test гейта не дал подсчитываемого итога: опция отбора тестов, неизвестная опция или неполный журнал событий',
     ),
     { code: counted.tests === 0 ? 'gate_check_no_tests' : 'gate_check_summary_unknown' },
   );
 }
+
+/**
+ * Whether the complete full-check receipt of the Run is for this head and command list. A gate
+ * Run's `node --test` rows must also hold a positive count of the current counting algorithm.
+ */
+const reusableChecks = (run, headSha, fingerprint, expected) =>
+  run.config.commands.test.length &&
+  run.checks?.schemaVersion === 2 &&
+  // A profiled receipt (task-fast) never stands in for the full checks, whatever else it claims.
+  run.checks.profile === undefined &&
+  run.checks.complete === true &&
+  run.checks.headSha === headSha &&
+  run.checks.fingerprint === fingerprint &&
+  Array.isArray(run.checks.results) &&
+  run.checks.results.length === expected.length &&
+  run.checks.results.every(
+    (row, index) =>
+      row.exitCode === 0 &&
+      row.kind === expected[index].kind &&
+      isDeepStrictEqual(row.command, expected[index].command) &&
+      (!gateTestCommand(run, row.kind, row.command) || (row.tests > 0 && row.countVersion === TEST_COUNT_VERSION)),
+  );
 
 export class EngineVerification extends EngineExecution {
   /**
@@ -235,24 +267,7 @@ export class EngineVerification extends EngineExecution {
       expected,
       runtime: { node: process.version, abi: process.versions.modules, platform: process.platform, arch: process.arch },
     });
-    if (
-      run.config.commands.test.length &&
-      run.checks?.schemaVersion === 2 &&
-      // A profiled receipt (task-fast) never stands in for the full checks, whatever else it claims.
-      run.checks.profile === undefined &&
-      run.checks.complete === true &&
-      run.checks.headSha === headSha &&
-      run.checks.fingerprint === fingerprint &&
-      Array.isArray(run.checks.results) &&
-      run.checks.results.length === expected.length &&
-      run.checks.results.every(
-        (row, index) =>
-          row.exitCode === 0 &&
-          row.kind === expected[index].kind &&
-          isDeepStrictEqual(row.command, expected[index].command) &&
-          (!gateTestCount(run, row.kind, row.command, '') || row.tests > 0),
-      )
-    ) {
+    if (reusableChecks(run, headSha, fingerprint, expected)) {
       for (const reference of this.checkEvidenceReferences(run)) await this.assertEvidence(reference);
       this.log(run, 'checks_reused', { headSha, fingerprint, checks: expected.length });
       return;
@@ -264,9 +279,10 @@ export class EngineVerification extends EngineExecution {
       for (const command of run.config.commands[kind]) {
         this.checkCancelled(run, signal);
         this.log(run, 'check_started', { kind, command });
-        let result;
-        try {
-          result = await execute(command.command, command.args, {
+        const counting = gateTestCommand(run, kind, command) && countedRunner(command);
+        const { result, error, executed, testEvents } = await executeCheck(
+          command,
+          {
             cwd: run.cwd,
             signal,
             // A wave gate counts its node --test runs: an inherited runner context would hide them.
@@ -274,8 +290,12 @@ export class EngineVerification extends EngineExecution {
             secrets: this.secrets,
             timeoutMs: command.timeoutMs,
             allowFailure: true,
-          });
-        } catch (error) {
+          },
+          counting,
+        );
+        // A counted command keeps its configured `command`; the receipt also records what ran.
+        const observed = counting ? { executed, countVersion: TEST_COUNT_VERSION, testEvents } : {};
+        if (error) {
           // Stopped execution is never a passing check, even when the actual
           // child exit happens to be zero. Persist only the diagnostic contract;
           // errors, stacks, arguments and environment are not output evidence.
@@ -339,14 +359,15 @@ export class EngineVerification extends EngineExecution {
         const evidence = await this.persistEvidence(
           run,
           'check',
-          { kind, command, exitCode: result.code, stdout: result.stdout, stderr: result.stderr },
+          { kind, command, exitCode: result.code, stdout: result.stdout, stderr: result.stderr, ...observed },
           { headSha },
         );
-        const counted = gateTestCount(run, kind, command, result.stdout);
+        const counted = gateTestCommand(run, kind, command) ? nodeTestOutcome(command, observed) : null;
         results.push({
           kind,
           command,
           exitCode: result.code,
+          ...(counting ? { executed, countVersion: TEST_COUNT_VERSION } : {}),
           ...(counted ? { tests: counted.tests } : {}),
           output: (result.stdout + result.stderr).slice(-24000),
           outputPath: evidence.path,

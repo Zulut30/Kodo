@@ -865,6 +865,36 @@ test(
         code: 'project_gate_tests_uncounted',
       });
     }
+    // The validator recounts the event file the log keeps, never stdout: a log whose stdout claims
+    // more tests, whose events are incomplete or whose executed command differs proves no count.
+    const log = JSON.parse(await readFile(gate.checks.results[0].outputPath, 'utf8'));
+    const stdout = log.value.stdout.replace(/^# (tests|pass) 1$/gm, '# $1 5');
+    assert.notEqual(stdout, log.value.stdout);
+    const executed = { ...log.value.executed, args: [...log.value.executed.args, '--test-name-pattern=counted'] };
+    for (const [value, tests] of [
+      [{ ...log.value, stdout }, 5],
+      [{ ...log.value, testEvents: log.value.testEvents.replace(/\{"type":"end"\}\n$/, '') }, 1],
+      [{ ...log.value, testEvents: undefined }, 1],
+      [{ ...log.value, executed }, 1],
+    ]) {
+      const evidence = await f.engine.persistEvidence(gate, 'check', value, { headSha: gate.headSha });
+      const results = gate.checks.results.map((row, index) =>
+        index ? row : { ...row, tests, outputPath: evidence.path, outputHash: evidence.sha256 },
+      );
+      f.store.updateRun(gate.id, { checks: { ...gate.checks, results } });
+      await assert.rejects(() => authorizeByGate(f, f.store.getRun(gate.id)), {
+        code: 'project_gate_tests_uncounted',
+      });
+    }
+    // A receipt row of an older counting algorithm is no proof either.
+    const results = gate.checks.results.map(({ countVersion: _, ...row }) => row);
+    f.store.updateRun(gate.id, { checks: { ...gate.checks, results } });
+    await assert.rejects(() => authorizeByGate(f, f.store.getRun(gate.id)), {
+      code: 'project_gate_tests_uncounted',
+    });
+    // The genuine receipt is still accepted.
+    f.store.updateRun(gate.id, { checks: gate.checks });
+    await authorizeByGate(f, f.store.getRun(gate.id));
   },
 );
 

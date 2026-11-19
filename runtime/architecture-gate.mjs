@@ -74,6 +74,7 @@ async function pins() {
     'watchdog.mjs',
     'engine-verification.mjs',
     'task-fast-checks.mjs',
+    'test-count-reporter.mjs',
     'wave-verifier.mjs',
     'security.mjs',
     'toolchains.mjs',

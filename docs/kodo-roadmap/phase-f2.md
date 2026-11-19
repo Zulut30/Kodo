@@ -100,6 +100,23 @@
 - Имена файлов в выводе Git с разделителем NUL не обрезаются (`trim` срезал начальный U+FEFF). Тест: `tests/project-integration.test.mjs`.
 - Не исправлялось: «пустой майлстоун в базе, созданной промежуточным коммитом» — волновые проекты ещё не выпускались, такие базы существуют только у разработчика.
 
+## Исправления по седьмому ревью фабрики: подсчёт тестов по событиям
+
+Ревью (head `b11894e`, Node 24.19.0) показало, что счёт `node --test` по тексту итоговой сводки на stdout ненадёжен. Тесты пропущенных находок падали на `b11894e` по поведению (неверный счёт, квитанция или повтор), проходят после исправления.
+
+| Находка | Исправление | Тест |
+| --- | --- | --- |
+| `node --test tests/` с пустым `tests/index.js` засчитывался как `tests: 1` (синтетическая запись `✔ tests` без расширения) | Счёт идёт по событиям собственного репортёра Kodo (`runtime/test-count-reporter.mjs`): `test:pass` с `kind: 'test'`, без skip/todo и без синтетического теста файла — `nesting` 0, позиция 1:1, имя — путь файла, как его разрешил раннер (относительный к cwd или абсолютный; не только basename) | `tests/test-count-events.test.mjs`, `tests/task-fast-checks.test.mjs` (полный fallback и gate) |
+| Вывод теста без перевода строки (`process.stdout.write('loading... ')`) склеивался с синтетической записью, и она засчитывалась | Текст stdout в счёте не участвует; FORCE_COLOR/NO_COLOR не влияют | те же |
+| `describe('index.mjs', () => it('works'))` обнулял настоящий прогон вычитанием по имени | `describe` — событие `kind: 'suite'`, не тест; вложенный `it` засчитывается | те же |
+| Кэш `task-fast` переиспользовал квитанцию, посчитанную прежним алгоритмом | Версия алгоритма `TEST_COUNT_VERSION = 2`: `countVersion` в ключе кэша (вместо `passedTests: true`), в `fingerprint` квитанции task-fast и в каждой засчитанной строке; кэшированный журнал перед повтором пересчитывается по событиям; квитанция gate Run переиспользуется только с текущим `countVersion` | `tests/task-fast-checks.test.mjs` |
+
+Как исполняется засчитываемая команда (`countingArguments`, `executeCheck`): опции репортёра команды удаляются, добавляются диагностический `spec`/`tap` на stdout и репортёр Kodo в файл событий в приватном временном каталоге вне проекта; файл читается, сохраняется в журнале evidence строки (`testEvents`) и удаляется. Квитанция хранит настроенную команду (`command`/`args`) и исполненную (`executed`). Валидатор волнового Run пересчитывает `tests` по `testEvents` журнала и сверяет `executed` с нормализованной командой: gate — `project_gate_tests_uncounted` (как раньше), строка task-fast — новый `project_fast_tests_uncounted`. Подмена stdout журнала или файла событий (обрезанный, без событий, другая исполненная команда) ловится (`tests/project-wave-e2e.test.mjs`, `tests/project-external.test.mjs`). Опции репортёра больше не мешают сужению и подсчёту (причина `runner-reporter` удалена); неполный журнал событий (например, `process.exit` при `--test-isolation=none`) — неизвестный счёт: `fast_check_summary_unknown` / `gate_check_summary_unknown`.
+
+Изменённые контракты: `nodeTestOutcome(step, observed)` — второй аргумент теперь наблюдение (значение журнала с `executed` и `testEvents`), а не stdout; удалён `passedTests`; новые экспорты `TEST_COUNT_VERSION`, `countedRunner`, `countingArguments`, `countTestEvents`, `executeCheck` (`task-fast-checks.mjs`); модуль `runtime/test-count-reporter.mjs` (в `pins()` архитектурного гейта и в источниках бенчмарка); строки квитанций `executed`, `countVersion`; поля журнала `executed`, `countVersion`, `testEvents`; ключ кэша task-fast `gateConfig.countVersion`; код `project_fast_tests_uncounted`. Legacy Run исполняет команды как записаны, без репортёров Kodo.
+
+Ограничение: настоящий тест верхнего уровня, объявленный в позиции 1:1 с именем-путём своего файла, считается синтетическим и не засчитывается.
+
 ## Границы
 
 - Все мутации wave-проекта (`drain`, `next-wave`, `complete-task`) сериализует lease `project:<id>`; pull-команды во время `drain` отвечают `project_busy`. Переходы, чьё доказательство читает интеграционную ветку, — ещё и lease `project-integration:<id>` до фиксации.

@@ -9,9 +9,11 @@
  * `commands.test` in full. The receipt is never a full-check receipt: its
  * fingerprint and evidence kind differ, and it carries `profile: 'task-fast'`.
  */
+import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { lstat, realpath } from 'node:fs/promises';
+import { lstat, mkdtemp, readFile, realpath, rm, stat } from 'node:fs/promises';
+import { isDeepStrictEqual } from 'node:util';
 import { performance } from 'node:perf_hooks';
 import { execute } from './command.mjs';
 import { git } from './workspace.mjs';
@@ -22,6 +24,15 @@ import { cacheFingerprint, readCheckCache, writeCheckCache } from './ci-cache.mj
 
 export const TASK_FAST_PROFILE = 'task-fast';
 export const FAST_CHECK_TIMEOUT_MS = 120000;
+/**
+ * The algorithm that counts passed `node --test` tests: 2 = the events of Kodo's own reporter
+ * (`runtime/test-count-reporter.mjs`), never the text of the summary. Part of the task-fast cache key
+ * and of every counted receipt row; a receipt or cache entry of another version is never reused.
+ */
+export const TEST_COUNT_VERSION = 2;
+const REPORTER_URL = new URL('./test-count-reporter.mjs', import.meta.url).href;
+// An event file larger than this is not read: its count is unknown.
+const EVENTS_LIMIT = 64 * 1024 * 1024;
 const LIST_LIMIT = 1000;
 const REASON_LIMIT = 100;
 const sha256 = value => createHash('sha256').update(value).digest('hex');
@@ -115,13 +126,14 @@ const valueOptions = [
 const optionKinds = new Map();
 for (const name of flagOptions) optionKinds.set(name, 'flag');
 for (const name of valueOptions) optionKinds.set(name, 'value');
-// The options a countable `node --test` may carry: they neither select tests nor move the summary
-// off stdout nor change which tests run. Anything else (a filter, a rerun state file, a tag filter,
-// watch mode, an unknown option) gives no countable summary: a filter without matches can report
-// the file itself as one passed test.
+// The options a countable `node --test` may carry: they neither select tests nor change which tests
+// run. Reporter options are allowed because Kodo replaces them (countingArguments). Anything else (a
+// filter, a rerun state file, a tag filter, watch mode, an unknown option) gives no countable count:
+// a filter without matches can report the file itself as one passed test.
 const countableOptions = new Set([
   'test',
   'test-reporter',
+  'test-reporter-destination',
   'test-force-exit',
   'test-randomize',
   'test-concurrency',
@@ -174,10 +186,10 @@ const selectionNames = new Set([
 ]);
 // A whole-suite threshold (coverage) cannot be judged on the affected files alone.
 const coverageOption = name => name === 'experimental-test-coverage' || name.startsWith('test-coverage-');
-// Kept for diagnostics: reporter arguments as written.
-const reporterOption = /^--test[-_]reporter(?:[-_]destination)?(?:=|$)/;
-// Node's built-in reporters whose final summary on stdout gives the pass count (ℹ/# lines).
-const countableReporters = ['spec', 'tap'];
+// Reporter options: Kodo removes them from a counted command and sets its own.
+const reporterNames = new Set(['test-reporter', 'test-reporter-destination']);
+// The built-in reporters a counted command keeps on stdout for diagnostics.
+const diagnosticReporters = ['spec', 'tap'];
 const nodeCommand = command => command === process.execPath || /(?:^|[\\/])node(?:\.exe)?$/i.test(command);
 const optionName = arg => {
   const match = /^--?([^=]+)(?:=([\s\S]*))?$/.exec(arg);
@@ -230,32 +242,64 @@ export function nodeArguments(args = []) {
 const parsed = step => nodeArguments(step.args || []);
 /** Whether a configured command is Node's own test runner (`node --test`, any value). */
 export const nodeTestCommand = step => nodeCommand(step.command) && parsed(step).testMode;
-// The default reporter, or exactly one spec/tap reporter written to stdout.
-const countableReporter = ({ options }) => {
-  const names = options.filter(option => option.name === 'test-reporter').map(option => option.value);
-  const destinations = options.filter(option => option.name === 'test-reporter-destination');
-  return !destinations.length && (!names.length || (names.length === 1 && countableReporters.includes(names[0])));
-};
 const selecting = ({ options }) => options.some(option => selectionNames.has(option.name));
-// A `node --test` command whose summary says how many tests passed: every option is known and
-// allowed, no test is selected away and the summary goes to stdout in a countable form.
-const countedRunner = step => {
+/**
+ * A `node --test` command whose passed tests Kodo can count: every option is known and allowed and
+ * no test is selected away. Kodo executes it with its own reporters (countingArguments).
+ * @param {{ command: string, args?: string[] }} step
+ */
+export const countedRunner = step => {
   if (!nodeCommand(step.command)) return false;
   const node = parsed(step);
   return (
     node.testMode &&
     !node.ambiguous &&
     node.options.every(option => countableOptions.has(option.name)) &&
-    countableReporter(node) &&
     !selecting(node)
   );
 };
 
 /**
+ * The arguments Kodo executes for a counted `node --test` command: the command's own reporter
+ * options removed, then one diagnostic reporter on stdout (the command's single `spec` or `tap`
+ * reporter, otherwise `spec`) and Kodo's event reporter into `destination`, before the command's
+ * remaining arguments in their order.
+ * @param {string[] | undefined} args
+ * @param {string} destination
+ * @returns {string[]}
+ */
+export function countingArguments(args = [], destination) {
+  const list = args.map(String),
+    kept = [],
+    names = [];
+  for (let index = 0; index < list.length; index++) {
+    const arg = list[index];
+    if (arg === '--') {
+      kept.push(...list.slice(index));
+      break;
+    }
+    const option = arg.startsWith('-') && arg !== '-' ? optionName(arg) : null;
+    const separate = option && option.value === undefined && optionKinds.get(option.name) === 'value';
+    const value = separate ? list[index + 1] : option?.value;
+    if (option?.name === 'test-reporter') names.push(value);
+    if (!option || !reporterNames.has(option.name)) kept.push(...(separate ? [arg, list[index + 1]] : [arg]));
+    if (separate) index++;
+  }
+  const diagnostic = names.length === 1 && diagnosticReporters.includes(names[0]) ? names[0] : 'spec';
+  return [
+    `--test-reporter=${diagnostic}`,
+    '--test-reporter-destination=stdout',
+    `--test-reporter=${REPORTER_URL}`,
+    `--test-reporter-destination=${destination}`,
+    ...kept.filter(arg => arg !== undefined),
+  ];
+}
+
+/**
  * Only Node's own test runner can be narrowed to the affected files. Its options must survive
- * the narrowing (written as --name=value or known flags, none that selects tests, changes the
- * reporter or judges the whole suite such as a coverage threshold); a positional path limits which
- * test files run.
+ * the narrowing (written as --name=value or known flags, none that selects tests or judges the whole
+ * suite such as a coverage threshold); a positional path limits which test files run. Reporter
+ * options do not matter: Kodo replaces them when it executes the command (countingArguments).
  * @param {{ command: string, args?: string[] }[]} commands
  */
 function nodeTestRunner(commands) {
@@ -265,7 +309,6 @@ function nodeTestRunner(commands) {
   const node = nodeArguments(args);
   if (!nodeCommand(step.command) || !node.testMode) return { reason: 'runner-not-node-test' };
   if (selecting(node)) return { reason: 'runner-selection' };
-  if (!countableReporter(node)) return { reason: 'runner-reporter' };
   if (
     !countedRunner(step) ||
     node.separated ||
@@ -306,58 +349,128 @@ const fullCommands = (configured, timeoutMs) =>
     timeoutMs: Math.min(own ?? timeoutMs, timeoutMs),
   }));
 
-const summaryLine = /^(?:ℹ|#) (tests|suites|pass|fail|cancelled|skipped|todo|duration_ms) (\d+(?:\.\d+)?)\r?$/u;
-const outcomes = ['pass', 'fail', 'cancelled', 'skipped', 'todo'];
+const eventTypes = new Set(['test:pass', 'test:fail']);
+const textOrNull = value => value === null || typeof value === 'string';
+const integerOrNull = value => value === null || Number.isSafeInteger(value);
+const validEvent = event =>
+  event !== null &&
+  typeof event === 'object' &&
+  eventTypes.has(event.type) &&
+  textOrNull(event.kind) &&
+  integerOrNull(event.nesting) &&
+  textOrNull(event.name) &&
+  textOrNull(event.file) &&
+  integerOrNull(event.line) &&
+  integerOrNull(event.column) &&
+  typeof event.skip === 'boolean' &&
+  typeof event.todo === 'boolean';
+// Whether `name` is a path naming `file`, as Node names the test of a whole file: the path as the
+// runner resolved it, relative to its working directory (`tests\a.test.mjs`, `..\x.test.mjs`,
+// `tests` for a directory) or absolute. Leading `..` segments cannot be checked without that
+// directory: the remaining segments must end the path of `file`.
+const namesFile = (name, file) => {
+  if (path.isAbsolute(name)) return path.resolve(name) === path.resolve(file);
+  const parts = path
+    .normalize(name)
+    .split(path.sep)
+    .filter(part => part && part !== '.');
+  while (parts[0] === '..') parts.shift();
+  const fileParts = path.resolve(file).split(path.sep);
+  return parts.length > 0 && parts.every((part, index) => fileParts[fileParts.length - parts.length + index] === part);
+};
+// Node reports a file (or directory) that registers no test as one top-level test named by its
+// path, located at 1:1: it is not a test.
+const syntheticTest = event =>
+  event.nesting === 0 &&
+  event.file !== null &&
+  event.name !== null &&
+  event.line === 1 &&
+  event.column === 1 &&
+  namesFile(event.name, event.file);
 
 /**
- * Tests a `node --test` run passed, from the runner's final summary on stdout (spec `ℹ`
- * or TAP `#` lines): its `pass` count, which excludes skipped and todo tests. The last
- * `tests` line opens that summary, so test output printed earlier cannot replace it.
- * `null` when there is no complete, consistent summary.
- * @param {string} stdout
+ * Tests a `node --test` run passed, from the event file of Kodo's reporter
+ * (`runtime/test-count-reporter.mjs`): the `test:pass` events of tests (not suites) that are neither
+ * skipped nor todo, without the synthetic test of a file without tests. `null` when the file is
+ * missing, malformed or incomplete (no final `end` line).
+ * @param {unknown} text
  * @returns {number | null}
  */
-export function passedTests(stdout) {
-  // Colour codes (FORCE_COLOR) around summary lines are not part of the summary.
-  const lines = String(stdout).replace(ansiSequence, '').split('\n');
-  const start = lines.findLastIndex(line => summaryLine.exec(line)?.[1] === 'tests');
-  if (start < 0) return null;
-  /** @type {Record<string, number>} */
-  const counts = {};
-  for (const line of lines.slice(start)) {
-    const match = summaryLine.exec(line);
-    if (!match || match[1] in counts) break;
-    counts[match[1]] = Number(match[2]);
+export function countTestEvents(text) {
+  if (typeof text !== 'string' || !text.endsWith('\n')) return null;
+  const lines = text.slice(0, -1).split('\n');
+  let tests = 0;
+  for (const [index, line] of lines.entries()) {
+    let event;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      return null;
+    }
+    if (index === lines.length - 1) return isDeepStrictEqual(event, { type: 'end' }) ? tests : null;
+    if (!validEvent(event)) return null;
+    if (event.type === 'test:pass' && event.kind === 'test' && !event.skip && !event.todo && !syntheticTest(event))
+      tests++;
   }
-  if (outcomes.some(name => !Number.isSafeInteger(counts[name]))) return null;
-  if (outcomes.reduce((sum, name) => sum + counts[name], 0) !== counts.tests) return null;
-  // A file that registers no test is reported as one passed test named after the file: not a test.
-  return Math.max(0, counts.pass - lines.slice(0, start).filter(fileLevelPass).length);
+  return null;
 }
 
-const ansiSequence = /\u001b\[[0-?]*[ -/]*[@-~]/g;
-// A top-level passed point (TAP `ok N - name` without a directive, spec `✔ name (…ms)`) whose
-// name is a script file: the synthetic test of a file without tests.
-const scriptName = name => /\.(?:[cm]?[jt]s|[jt]sx)$/i.test(name.trim());
-const fileLevelPass = line => {
-  const tap = /^ok \d+ - (.+?)\r?$/.exec(line);
-  if (tap) return !/\s#\s*(?:SKIP|TODO)\b/i.test(tap[1]) && scriptName(tap[1]);
-  const spec = /^✔ (.+?) \(\d[\d.]*m?s\)\r?$/u.exec(line);
-  return Boolean(spec) && scriptName(spec[1]);
-};
-
 /**
- * The outcome of one full `node --test` command, judged like the task-fast fallback: null for a
- * command that is not Node's test runner; otherwise `{ tests }`, the pass count of its countable
- * summary (default, `spec` or `tap` reporter on stdout), or `tests: null` when there is none.
+ * The outcome of one `node --test` command from its observed execution (the value of its evidence
+ * log): null for a command that is not Node's test runner; otherwise `{ tests }`, the count of its
+ * event file (countTestEvents), or `tests: null` when the command cannot be counted (a selecting or
+ * unknown option), was not executed with exactly Kodo's counting arguments (`executed`) or its event
+ * file (`testEvents`) is missing, malformed or incomplete. stdout is never counted.
  * A wave gate Run requires `tests > 0` for each of its full `node --test` commands.
  * @param {{ command: string, args?: string[] }} step
- * @param {string} stdout
+ * @param {{ executed?: { command?: string, args?: string[] }, testEvents?: unknown } | null | undefined} observed
  * @returns {{ tests: number | null } | null}
  */
-export function nodeTestOutcome(step, stdout) {
+export function nodeTestOutcome(step, observed) {
   if (!nodeTestCommand(step)) return null;
-  return { tests: countedRunner(step) ? passedTests(stdout) : null };
+  if (!countedRunner(step)) return { tests: null };
+  const executed = observed?.executed;
+  const destination = Array.isArray(executed?.args)
+    ? /^--test-reporter-destination=([\s\S]+)$/.exec(String(executed.args[3] ?? ''))?.[1]
+    : undefined;
+  const exact =
+    destination !== undefined &&
+    path.isAbsolute(destination) &&
+    executed.command === step.command &&
+    isDeepStrictEqual(executed.args, countingArguments(step.args, destination));
+  return { tests: exact ? countTestEvents(observed.testEvents) : null };
+}
+
+/**
+ * Execute one check command. A counted `node --test` command (countedRunner) runs with Kodo's
+ * reporters (countingArguments); its event file lives in a fresh private directory outside the
+ * project, is read back as `testEvents` (null when missing or too large) and is then removed.
+ * Never throws for the command itself: a stopped execution is returned as `error`.
+ * @param {{ command: string, args?: string[] }} step
+ * @param {Record<string, any>} options `execute` options
+ * @param {boolean} counted
+ */
+export async function executeCheck(step, options, counted) {
+  const run = async (command, args) => {
+    try {
+      return { result: await execute(command, args, options), error: null };
+    } catch (error) {
+      return { result: null, error };
+    }
+  };
+  if (!counted) return run(step.command, step.args ?? []);
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'kodo-test-events-'));
+  const file = path.join(directory, 'events.jsonl');
+  const executed = { command: step.command, args: countingArguments(step.args, file) };
+  try {
+    const outcome = await run(executed.command, executed.args);
+    const info = await stat(file).catch(() => null);
+    const testEvents =
+      info?.isFile() && info.size <= EVENTS_LIMIT ? await readFile(file, 'utf8').catch(() => null) : null;
+    return { ...outcome, executed, testEvents };
+  } finally {
+    await rm(directory, { recursive: true, force: true }).catch(() => {});
+  }
 }
 
 /**
@@ -463,7 +576,7 @@ async function cacheContext(run, plan, headSha, env) {
   }
 }
 
-async function cachedRow(engine, base, input, headSha) {
+async function cachedRow(engine, step, input, headSha) {
   const hit = await readCheckCache({
     home: engine.store.home,
     fingerprint: cacheFingerprint(input),
@@ -473,29 +586,41 @@ async function cachedRow(engine, base, input, headSha) {
   });
   const file = hit?.evidence?.[0];
   if (!file) return null;
+  let logged, outcome;
   try {
     await engine.assertEvidence({ path: file.path, sha256: file.sha256, headSha });
+    // The cached log must still prove its count by its own events, with the current algorithm.
+    logged = JSON.parse(await readFile(file.path, 'utf8')).value;
+    outcome = nodeTestOutcome(step, logged);
   } catch {
     return null;
   }
+  if (!(outcome?.tests > 0)) return null;
   return {
-    ...base,
+    ...rowBase(step),
     exitCode: 0,
     durationMs: 0,
     cached: true,
+    executed: logged.executed,
+    countVersion: TEST_COUNT_VERSION,
+    tests: outcome.tests,
     evidence: { path: file.path, sha256: file.sha256, bytes: file.bytes, headSha },
     outputPath: file.path,
     outputHash: file.sha256,
   };
 }
 
+const rowBase = step => ({ kind: step.kind, command: step.command, args: step.args });
+
 /**
  * One command of the plan: a cached receipt, or its execution with persisted evidence.
- * A `counted` step (a `node --test` command) records how many tests passed (`row.tests`);
- * passing none is `noTests`, never cached.
+ * A `counted` step (a `node --test` command) runs with Kodo's reporters (executeCheck): its row
+ * keeps the planned `command`/`args`, adds the `executed` arguments, `countVersion` and how many
+ * tests passed by the event file (`row.tests`); its log also holds `executed` and `testEvents`.
+ * Passing none is `noTests`, never cached.
  */
 async function runStep({ engine, run, step, headSha, env, cache, counted, signal }) {
-  const base = { kind: step.kind, command: step.command, args: step.args };
+  const base = rowBase(step);
   const input =
     cache && step.kind === 'test'
       ? {
@@ -503,26 +628,20 @@ async function runStep({ engine, run, step, headSha, env, cache, counted, signal
           kind: 'test',
           command: step.command,
           args: step.args,
-          // `passedTests`: only runs that passed a test (not skip/todo) are cached; older entries never match.
-          gateConfig: { profile: TASK_FAST_PROFILE, timeoutMs: step.timeoutMs, passedTests: true },
+          // Only runs that passed a test (not skip/todo) by the events of the current counting
+          // algorithm are cached; entries of older algorithms (`passedTests`, `executedTests`) never match.
+          gateConfig: { profile: TASK_FAST_PROFILE, timeoutMs: step.timeoutMs, countVersion: TEST_COUNT_VERSION },
         }
       : null;
-  const hit = input && (await cachedRow(engine, base, input, headSha));
+  const hit = input && (await cachedRow(engine, step, input, headSha));
   if (hit) return { row: hit };
   const started = performance.now();
-  let result, error;
-  try {
-    result = await execute(step.command, step.args, {
-      cwd: run.cwd,
-      signal,
-      env,
-      secrets: engine.secrets,
-      timeoutMs: step.timeoutMs,
-      allowFailure: true,
-    });
-  } catch (caught) {
-    error = caught;
-  }
+  const { result, error, executed, testEvents } = await executeCheck(
+    step,
+    { cwd: run.cwd, signal, env, secrets: engine.secrets, timeoutMs: step.timeoutMs, allowFailure: true },
+    counted,
+  );
+  const counting = counted ? { executed, countVersion: TEST_COUNT_VERSION } : {};
   const durationMs = Math.round(performance.now() - started);
   const output = result ?? error?.result ?? {};
   const exitCode = result ? result.code : null;
@@ -534,6 +653,7 @@ async function runStep({ engine, run, step, headSha, env, cache, counted, signal
     durationMs,
     stdout: typeof output.stdout === 'string' ? output.stdout : '',
     stderr: typeof output.stderr === 'string' ? output.stderr : '',
+    ...(counted ? { ...counting, testEvents } : {}),
   };
   let evidence = null;
   try {
@@ -548,6 +668,7 @@ async function runStep({ engine, run, step, headSha, env, cache, counted, signal
     exitCode,
     durationMs,
     ...(reason ? { reason } : {}),
+    ...counting,
     ...(evidence
       ? {
           evidence: { path: evidence.path, sha256: evidence.sha256, bytes: evidence.bytes, headSha },
@@ -577,8 +698,9 @@ async function runStep({ engine, run, step, headSha, env, cache, counted, signal
       ),
     };
   if (counted) {
-    // Exit 0 after passing nothing (only skip/todo, no tests, no summary) is not a pass: never cache it.
-    row.tests = passedTests(value.stdout);
+    // Exit 0 after passing nothing (only skip/todo, no tests, no complete event file) is not a pass:
+    // never cache it.
+    row.tests = nodeTestOutcome(step, { executed, testEvents })?.tests ?? null;
     if (!(row.tests > 0)) return { row, noTests: true, unknown: row.tests === null };
   }
   if (input)
@@ -642,14 +764,16 @@ export async function runFastChecks({ engine, run, signal }) {
 }
 
 /**
- * A full `node --test` run passed with an unknown outcome: its reporter gives no countable summary
- * (`dot`, `junit`, `lcov`, a custom reporter or a destination other than stdout) or the summary is
- * missing or inconsistent. Like zero passed tests, it is never a green receipt.
- * @param {{ args: string[] }} step
+ * A full `node --test` run passed with an unknown outcome: the command cannot be counted (a
+ * selecting or unknown option, see countedRunner) or the event file of Kodo's reporter is missing,
+ * malformed or incomplete. Like zero passed tests, it is never a green receipt.
+ * @param {{ command: string, args?: string[] }} step
  */
 const summaryUnknown = step =>
   fail(
-    `Полный прогон node --test не дал разбираемого итога (${step.args.filter(arg => reporterOption.test(arg)).join(' ') || 'нет сводки'}): используй репортёр spec или tap`,
+    countedRunner(step)
+      ? 'Полный прогон node --test не дал полного журнала событий репортёра Kodo: число пройденных тестов неизвестно'
+      : 'Полный прогон node --test нельзя подсчитать: у команды есть опция отбора тестов, watch-режим или неизвестная опция',
     'fast_check_summary_unknown',
   );
 
@@ -666,6 +790,7 @@ async function executePlan({ engine, run, plan, headSha, signal }) {
         profile: TASK_FAST_PROFILE,
         headSha,
         commands: plan.commands,
+        countVersion: TEST_COUNT_VERSION,
         runtime: {
           node: process.version,
           abi: process.versions.modules,
@@ -688,7 +813,7 @@ async function executePlan({ engine, run, plan, headSha, signal }) {
   engine.save(run);
   const env = fastEnvironment();
   const cache = plan.fallback ? null : await cacheContext(run, plan, headSha, env);
-  // The full suite is judged by its summaries only when every test command is Node's own runner.
+  // The full suite is judged by its counts only when every test command is Node's own runner.
   const judged = plan.commands.every(step => step.kind !== 'test' || countedRunner(step));
   let passed = 0;
   for (const step of plan.commands) {

@@ -1,9 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { Engine } from '../runtime/engine.mjs';
 import { Store } from '../runtime/store.mjs';
 import { contentHash } from '../runtime/engine-core.mjs';
@@ -16,10 +16,11 @@ import { createProjectDirector, createProjectTransitionAuthorizer } from '../run
 import { withIntegrationLease } from '../runtime/project-integration-lease.mjs';
 import {
   TASK_FAST_PROFILE,
+  TEST_COUNT_VERSION,
+  countingArguments,
   fastEnvironment,
   nodeArguments,
   nodeTestOutcome,
-  passedTests,
   planFastChecks,
   runFastChecks,
 } from '../runtime/task-fast-checks.mjs';
@@ -581,26 +582,27 @@ test('A wave project is never run by the legacy director nor accepted by its own
   });
 });
 
-const summary = (mark, counts) =>
-  ['tests', 'suites', 'pass', 'fail', 'cancelled', 'skipped', 'todo', 'duration_ms']
-    .map(name => `${mark} ${name} ${counts[name] ?? 0}\n`)
-    .join('');
-
-test('passedTests counts passed tests without skip and todo from the final spec or TAP summary', () => {
-  assert.equal(passedTests(summary('ℹ', { tests: 3, pass: 1, skipped: 1, todo: 1, duration_ms: 1.5 })), 1);
-  assert.equal(passedTests(summary('ℹ', { tests: 1, todo: 1 })), 0, 'a todo test is not a passed test');
-  assert.equal(passedTests(summary('ℹ', { tests: 2, skipped: 2 })), 0, 'a skipped test is not a passed test');
-  assert.equal(passedTests(summary('#', { tests: 4, pass: 4 }).replaceAll('\n', '\r\n')), 4);
-  assert.equal(passedTests(summary('ℹ', {})), 0);
-  // Test output printed before the runner's own summary cannot replace it.
-  assert.equal(
-    passedTests(`# pass 77\n${summary('ℹ', { tests: 9, pass: 9 })}${summary('ℹ', { tests: 1, todo: 1 })}`),
-    0,
-  );
-  assert.equal(passedTests(summary('ℹ', { tests: 2, pass: 1 })), null, 'an inconsistent summary is no summary');
-  assert.equal(passedTests('ℹ tests 1\nℹ pass 1\n'), null, 'an incomplete summary is no summary');
-  assert.equal(passedTests('ok 1 - a\n'), null);
-});
+// One observed execution of `step` whose event file (Kodo's reporter) records `tests` passed tests.
+const observed = (step, tests = 1) => {
+  const destination = path.resolve(os.tmpdir(), 'kodo-test-events-x', 'events.jsonl');
+  const pass = index =>
+    JSON.stringify({
+      type: 'test:pass',
+      kind: 'test',
+      nesting: 0,
+      name: `case ${index}`,
+      file: path.resolve('a.test.mjs'),
+      line: index + 2,
+      column: 1,
+      skip: false,
+      todo: false,
+    });
+  return {
+    executed: { command: step.command, args: countingArguments(step.args, destination) },
+    testEvents: [...Array.from({ length: tests }, (_, index) => pass(index)), '{"type":"end"}', ''].join('\n'),
+  };
+};
+const outcomeOf = args => nodeTestOutcome({ command: 'node', args }, observed({ command: 'node', args }));
 
 test('Task-fast checks never accept todo or skipped tests as executed tests', async t => {
   const { store, engine, run, commit } = await workspace(t);
@@ -696,8 +698,6 @@ test('Task-fast checks never keep a green receipt for a narrowed run that execut
     [['--test', '--test-name-pattern=a is'], 'runner-selection'],
     [['--test', '--test-skip-pattern=a is'], 'runner-selection'],
     [['--test', '--test-only'], 'runner-selection'],
-    [['--test', '--test-reporter=dot'], 'runner-reporter'],
-    [['--test', '--test-reporter-destination=stdout'], 'runner-reporter'],
     [['--test', '--experimental-test-tag-filter=unit'], 'runner-selection'],
     // A whole-suite coverage threshold cannot be judged on the affected files alone.
     [['--test', '--experimental-test-coverage', '--test-coverage-lines=80'], 'runner-options'],
@@ -713,6 +713,18 @@ test('Task-fast checks never keep a green receipt for a narrowed run that execut
       plan.commands.map(row => row.args),
       [args],
     );
+  }
+  // Reporter options do not prevent narrowing: Kodo replaces them when it counts.
+  for (const args of [
+    ['--test', '--test-reporter=dot'],
+    ['--test', '--test-reporter-destination=stdout'],
+  ]) {
+    const custom = {
+      ...run,
+      config: { ...run.config, commands: { ...run.config.commands, test: [{ command: process.execPath, args }] } },
+    };
+    const plan = await planFastChecks({ run: custom, cwd: run.cwd, baseSha: run.baseSha, headSha });
+    assert.equal(plan.fallback, false, `${args.join(' ')}: ${JSON.stringify(plan.reasons)}`);
   }
   // The affected test file only skips: the narrowed run executes nothing, so the full suite runs.
   const checks = await runFastChecks({ engine, run });
@@ -734,7 +746,7 @@ test('Task-fast checks never keep a green receipt for a narrowed run that execut
   assert.equal(narrowed.results.find(row => row.kind === 'test').tests, 3);
 });
 
-test('Task-fast checks count the tap and spec reporters and refuse a full run with an unknown summary', async t => {
+test('Task-fast checks run node --test with Kodo reporters and refuse a full run with an incomplete event file', async t => {
   // Review finding (major): `node --test --test-reporter=tap` with one skipped test gave `# pass 0`
   // and still a complete receipt, and the project was accepted.
   const reporter = (...extra) => [{ command: process.execPath, args: ['--test', ...extra] }];
@@ -742,130 +754,260 @@ test('Task-fast checks count the tap and spec reporters and refuse a full run wi
     commands: { test: reporter('--test-reporter=tap'), build: [], deploy: [], smoke: [] },
   });
   const passing = testSource('a', [...aCases, ['a is finite', 'assert.ok(Number.isFinite(a))']]);
-  // tap and spec summaries are countable: the narrowed run keeps the reporter and counts passed tests.
   await commit({ 'tests/a.test.mjs': passing });
   const narrowed = await runFastChecks({ engine, run });
   assert.equal(narrowed.plan.fallback, false, JSON.stringify(narrowed.plan.reasons));
-  assert.deepEqual(narrowed.results.find(row => row.kind === 'test').args, [
-    '--test',
-    '--test-reporter=tap',
-    'tests/a.test.mjs',
-  ]);
-  assert.equal(narrowed.results.find(row => row.kind === 'test').tests, 3);
-  // Only skipped tests: the TAP summary confirms zero passed tests, never a green receipt.
+  const row = narrowed.results.find(item => item.kind === 'test');
+  // The receipt keeps the planned command and records the one executed with Kodo's reporters.
+  assert.deepEqual(row.args, ['--test', '--test-reporter=tap', 'tests/a.test.mjs']);
+  assert.equal(row.executed.command, process.execPath);
+  assert.deepEqual(row.executed.args.slice(0, 2), ['--test-reporter=tap', '--test-reporter-destination=stdout']);
+  assert.match(row.executed.args[2], /^--test-reporter=file:.+test-count-reporter\.mjs$/);
+  assert.deepEqual(row.executed.args.slice(4), ['--test', 'tests/a.test.mjs']);
+  assert.equal(row.countVersion, TEST_COUNT_VERSION);
+  assert.equal(row.tests, 3);
+  const value = (await log(row)).value;
+  assert.deepEqual(value.executed, row.executed);
+  assert.match(value.stdout, /^ok \d+ - a is one/m, 'the diagnostic TAP output stays on stdout');
+  assert.deepEqual(nodeTestOutcome(row, value), { tests: 3 }, 'the log proves the count by its events');
+  // Only skipped tests: zero passed tests by the events, never a green receipt.
   const skipped = "import test from 'node:test';\ntest.skip('skipped', () => {});\n";
   await commit({ 'tests/a.test.mjs': skipped, 'tests/b.test.mjs': skipped });
   await assert.rejects(() => runFastChecks({ engine, run }), { code: 'fast_check_no_tests' });
   assert.equal(store.getRun(run.id).checks.complete, false);
   assert.deepEqual(store.getRun(run.id).checks.plan.reasons, ['no-tests-executed'], 'the narrowed run passed none');
   assert.deepEqual(
-    store.getRun(run.id).checks.results.map(row => [row.args, row.tests]),
+    store.getRun(run.id).checks.results.map(item => [item.args, item.tests]),
     [[['--test', '--test-reporter=tap'], 0]],
   );
-  // A reporter without a countable summary falls back to the full run, whose unknown outcome is refused.
+  // Any reporter of the command is replaced: dot, a destination file or junit count the same way.
   await commit({ 'tests/a.test.mjs': passing, 'tests/b.test.mjs': files['tests/b.test.mjs'] });
-  for (const args of [['--test-reporter=dot'], ['--test-reporter=spec', '--test-reporter-destination=stdout']]) {
+  for (const args of [['--test-reporter=dot'], ['--test-reporter=junit', '--test-reporter-destination=report.xml']]) {
     run.config.commands.test = reporter(...args);
     engine.save(run);
-    await assert.rejects(() => runFastChecks({ engine, run }), { code: 'fast_check_summary_unknown' }, args.join(' '));
-    const saved = store.getRun(run.id).checks;
-    assert.equal(saved.complete, false);
-    assert.ok(saved.plan.reasons.includes('runner-reporter'), JSON.stringify(saved.plan.reasons));
-    assert.deepEqual(
-      saved.results.map(row => row.exitCode),
-      [0],
-      'the suite passed, but its count is unknown',
-    );
+    const checks = await runFastChecks({ engine, run });
+    assert.equal(checks.complete, true, args.join(' '));
+    assert.equal(checks.plan.fallback, false, JSON.stringify(checks.plan.reasons));
+    assert.equal(checks.results.find(item => item.kind === 'test').tests, 3, args.join(' '));
   }
-  // The spec reporter alone is countable again.
-  run.config.commands.test = reporter('--test-reporter=spec');
+  // A run that ends before Kodo's reporter completes its event file has no count: never green.
+  run.config.commands.test = reporter('--test-isolation=none');
   engine.save(run);
-  const spec = await runFastChecks({ engine, run });
-  assert.equal(spec.complete, true);
-  assert.equal(spec.plan.fallback, false, JSON.stringify(spec.plan.reasons));
-  assert.equal(spec.results.find(row => row.kind === 'test').tests, 3);
+  await commit({
+    'tests/a.test.mjs': "import test from 'node:test';\ntest('a', () => {});\ntest('exits', () => process.exit(0));\n",
+  });
+  await assert.rejects(() => runFastChecks({ engine, run }), { code: 'fast_check_summary_unknown' });
+  const saved = store.getRun(run.id).checks;
+  assert.equal(saved.complete, false);
+  assert.deepEqual(saved.plan.reasons, ['no-tests-executed']);
+  assert.deepEqual(
+    saved.results.map(item => [item.exitCode, item.tests]),
+    [[0, null]],
+    'the suite exited 0, but its count is unknown',
+  );
 });
 
-test('Both reporter argument forms are counted: --test-reporter=tap and --test-reporter tap', () => {
-  const tap = '# tests 1\n# suites 0\n# pass 1\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0\n';
+test('Task-fast full runs count by events: an empty tests/index.js, glued output, a describe named like a file', async t => {
+  // Review finding (major): the count came from the text of the summary on stdout. `node --test
+  // tests/` with an empty tests/index.js counted 1, output without a newline glued to the synthetic
+  // line of a file without tests counted it, and a describe named like a file hid its real test.
+  const full = (...args) => ({ test: [{ command: process.execPath, args: ['--test', ...args] }] });
+  const { engine, run, commit } = await workspace(t, {
+    commands: { ...full('tests/'), build: [], deploy: [], smoke: [] },
+  });
+  await commit({
+    'vitest.config.mjs': 'export default {};\n',
+    'tests/index.js': '',
+    'tests/glued.test.mjs': "process.stdout.write('loading... ');\n",
+    'tests/suite.test.mjs':
+      "import { describe, it } from 'node:test';\ndescribe('index.mjs', () => {\n  it('works', () => {});\n});\n",
+    'tests/empty.test.mjs': 'export const value = 1;\n',
+  });
+  const counted = async (...args) => {
+    Object.assign(run.config.commands, full(...args));
+    engine.save(run);
+    const checks = await runFastChecks({ engine, run });
+    assert.equal(checks.plan.fallback, true);
+    return checks.results.map(row => row.tests);
+  };
+  // tests/ runs tests/index.js: an empty one is no passed test.
+  await assert.rejects(() => runFastChecks({ engine, run }), { code: 'fast_check_no_tests' });
+  assert.deepEqual(
+    run.checks.results.map(row => [row.exitCode, row.tests]),
+    [[0, 0]],
+  );
+  assert.deepEqual(await counted('tests/glued.test.mjs', 'tests/b.test.mjs'), [1]);
+  assert.deepEqual(await counted('--test-reporter=tap', 'tests/glued.test.mjs', 'tests/b.test.mjs'), [1]);
+  assert.deepEqual(await counted('tests/suite.test.mjs'), [1]);
+  // FORCE_COLOR colours the diagnostic output, never the count.
+  const previous = process.env.FORCE_COLOR;
+  process.env.FORCE_COLOR = '1';
+  try {
+    assert.deepEqual(await counted('tests/empty.test.mjs', 'tests/suite.test.mjs', 'tests/a.test.mjs'), [3]);
+  } finally {
+    if (previous === undefined) delete process.env.FORCE_COLOR;
+    else process.env.FORCE_COLOR = previous;
+  }
+});
+
+// The private cache's own key encoding (runtime/ci-cache.mjs): sorted keys, SHA-256 hex.
+const canonicalKey = value =>
+  Array.isArray(value)
+    ? value.map(canonicalKey)
+    : value && typeof value === 'object'
+      ? Object.fromEntries(
+          Object.keys(value)
+            .sort()
+            .map(key => [key, canonicalKey(value[key])]),
+        )
+      : value;
+const keyDigest = value =>
+  createHash('sha256')
+    .update(JSON.stringify(canonicalKey(value)))
+    .digest('hex');
+
+test('Task-fast cache entries of an older counting algorithm are never reused', async t => {
+  const { engine, run, commit } = await workspace(t);
+  await commit({ 'src/a.mjs': 'export const a = 1;\nexport const extra = true;\n' });
+  const first = await runFastChecks({ engine, run });
+  const row = first.results.find(item => item.kind === 'test');
+  assert.deepEqual([row.cached, row.tests, row.countVersion], [undefined, 2, TEST_COUNT_VERSION]);
+  assert.equal((await runFastChecks({ engine, run })).results.find(item => item.kind === 'test').cached, true);
+  // The same entry re-keyed as the summary algorithm wrote it (`passedTests: true`, no countVersion):
+  // same head, command, context and intact log. The current algorithm never looks it up.
+  const directory = path.join(engine.store.home, 'ci-check-cache-v1');
+  const [name] = (await readdir(directory)).filter(file => file.endsWith('.json'));
+  const envelope = JSON.parse(await readFile(path.join(directory, name), 'utf8'));
+  const context = {
+    ...envelope.context,
+    gateConfigHash: keyDigest({ profile: TASK_FAST_PROFILE, timeoutMs: 120000, passedTests: true }),
+  };
+  const fingerprint = keyDigest(context);
+  const legacy = {
+    ...envelope,
+    fingerprint,
+    context,
+    integrityHash: keyDigest({ context, receipt: envelope.receipt }),
+  };
+  await rm(path.join(directory, name));
+  await writeFile(path.join(directory, `${fingerprint}.json`), `${JSON.stringify(canonicalKey(legacy))}\n`, {
+    mode: 0o600,
+  });
+  const third = await runFastChecks({ engine, run });
+  const fresh = third.results.find(item => item.kind === 'test');
+  assert.equal(fresh.cached, undefined, 'an entry of the summary algorithm is not reused');
+  assert.deepEqual([fresh.tests, fresh.countVersion], [2, TEST_COUNT_VERSION]);
+  // A log without its events proves no count: such a cached log is never reused either.
+  const value = (await log(fresh)).value;
+  assert.deepEqual(nodeTestOutcome(fresh, value), { tests: 2 });
+  assert.deepEqual(nodeTestOutcome(fresh, { ...value, testEvents: undefined }), { tests: null });
+});
+
+test('Gate checks count node --test by events and reuse only receipts of the current counting version', async t => {
+  const tap = { command: process.execPath, args: ['--test', '--test-reporter=tap'] };
+  const { store, engine, run, commit } = await workspace(t, {
+    commands: { test: [tap], build: [], deploy: [], smoke: [] },
+  });
+  run.directorBinding = { kind: 'gate' };
+  engine.save(run);
+  await commit({
+    'tests/glued.test.mjs': "process.stdout.write('loading... ');\n",
+    'tests/suite.test.mjs':
+      "import { describe, it } from 'node:test';\ndescribe('index.mjs', () => {\n  it('works', () => {});\n});\n",
+  });
+  await engine.checks(run);
+  const [row] = run.checks.results;
+  // a.test.mjs (2) + b.test.mjs (1) + the describe's test (1); the file without tests is not one.
+  assert.deepEqual([row.exitCode, row.tests, row.countVersion], [0, 4, TEST_COUNT_VERSION]);
+  assert.deepEqual(row.command, tap);
+  assert.deepEqual(row.executed.args.slice(4), ['--test']);
+  const value = JSON.parse(await readFile(row.outputPath, 'utf8')).value;
+  assert.deepEqual(nodeTestOutcome(row.command, value), { tests: 4 });
+  const reused = async () => {
+    const before = store.events(run.id).length;
+    await engine.checks(run);
+    return store
+      .events(run.id)
+      .slice(before)
+      .some(event => event.type === 'checks_reused');
+  };
+  assert.equal(await reused(), true, 'the current receipt is reused');
+  // A receipt counted by an older algorithm (no countVersion) runs the checks again.
+  run.checks = { ...run.checks, results: run.checks.results.map(({ countVersion: _, ...rest }) => rest) };
+  engine.save(run);
+  assert.equal(await reused(), false);
+  assert.equal(run.checks.results[0].countVersion, TEST_COUNT_VERSION);
+  // An empty tests/index.js run as `node --test tests/` passes no test: the gate refuses it.
+  run.config.commands.test = [{ command: process.execPath, args: ['--test', 'tests/'] }];
+  engine.save(run);
+  await commit({ 'tests/index.js': '' });
+  await assert.rejects(() => engine.checks(run), { code: 'gate_check_no_tests' });
+  assert.deepEqual(
+    run.checks.results.map(item => [item.exitCode, item.tests]),
+    [[0, 0]],
+  );
+  // A legacy Run keeps its checks: no counting, no Kodo reporters.
+  run.directorBinding = undefined;
+  engine.save(run);
+  await engine.checks(run);
+  assert.equal(run.checks.complete, true);
+  assert.deepEqual(
+    run.checks.results.map(item => [item.tests, item.executed, item.countVersion]),
+    [[undefined, undefined, undefined]],
+  );
+});
+
+test('Both reporter argument forms are replaced and counted: --test-reporter=tap and --test-reporter tap', () => {
   for (const args of [
     ['--test', '--test-reporter=tap'],
     ['--test', '--test-reporter', 'tap'],
-  ])
-    assert.deepEqual(nodeTestOutcome({ command: 'node', args }, tap), { tests: 1 }, args.join(' '));
-  // A destination file or an uncountable reporter gives no summary on stdout, in either form.
-  for (const args of [
     ['--test', '--test-reporter', 'dot'],
     ['--test', '--test-reporter', 'tap', '--test-reporter-destination', 'out.tap'],
   ])
-    assert.deepEqual(nodeTestOutcome({ command: 'node', args }, tap), { tests: null }, args.join(' '));
+    assert.deepEqual(outcomeOf(args), { tests: 1 }, args.join(' '));
+  // The observation must be the counting command: the command as configured is not one.
+  const step = { command: 'node', args: ['--test', '--test-reporter', 'tap'] };
+  assert.deepEqual(nodeTestOutcome(step, { ...observed(step), executed: { command: 'node', args: step.args } }), {
+    tests: null,
+  });
 });
 
 test('--test=value starts the runner and a selecting option makes the count unreliable', () => {
-  const tap = '# tests 1\n# suites 0\n# pass 1\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0\n';
   // `--test=true` is Node's test runner: its zero-test protection applies.
-  assert.deepEqual(nodeTestOutcome({ command: 'node', args: ['--test=true'] }, tap), { tests: 1 });
+  assert.deepEqual(outcomeOf(['--test=true']), { tests: 1 });
   // Node 24 starts the runner for --test=false as well: it is counted like --test.
-  assert.deepEqual(nodeTestOutcome({ command: 'node', args: ['--test=false', '--test-reporter=tap'] }, tap), {
-    tests: 1,
-  });
+  assert.deepEqual(outcomeOf(['--test=false', '--test-reporter=tap']), { tests: 1 });
   // A filter without matches can report the file itself as one passed test: never counted.
   for (const option of ['--test-name-pattern=nothing', '--test-skip-pattern=x', '--test-only', '--test-shard=1/2'])
-    assert.deepEqual(nodeTestOutcome({ command: 'node', args: ['--test', option] }, tap), { tests: null }, option);
+    assert.deepEqual(outcomeOf(['--test', option]), { tests: null }, option);
 });
 
 test('Node arguments are parsed like Node: underscores, values, the script and -- are respected', () => {
-  const tap = '# tests 1\n# suites 0\n# pass 1\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0\n';
   // Node accepts _ for - in option names: a selecting option in that form is still selecting.
-  assert.deepEqual(nodeTestOutcome({ command: 'node', args: ['--test=true', '--test_name_pattern=missing'] }, tap), {
-    tests: null,
-  });
+  assert.deepEqual(outcomeOf(['--test=true', '--test_name_pattern=missing']), { tests: null });
   // After the script, arguments belong to the script: this is not Node's test runner.
-  assert.equal(nodeTestOutcome({ command: 'node', args: ['verify.mjs', '--test=true'] }, tap), null);
+  assert.equal(outcomeOf(['verify.mjs', '--test=true']), null);
   // A known value option consumes its value; an unknown option without = makes the count unknown.
-  assert.deepEqual(nodeTestOutcome({ command: 'node', args: ['--import', 'x.mjs', '--test'] }, tap), { tests: 1 });
-  assert.deepEqual(nodeTestOutcome({ command: 'node', args: ['--mystery', '--test'] }, tap), { tests: null });
+  assert.deepEqual(outcomeOf(['--import', 'x.mjs', '--test']), { tests: 1 });
+  assert.deepEqual(outcomeOf(['--mystery', '--test']), { tests: null });
   assert.deepEqual(nodeArguments(['--test', '--', 'a.test.mjs']).positionals, ['a.test.mjs']);
 });
 
-test('Only known, allowed node --test options give a countable summary', () => {
-  const tap = '# tests 1\n# suites 0\n# pass 1\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0\n';
-  const outcome = args => nodeTestOutcome({ command: 'node', args }, tap);
+test('Only known, allowed node --test options give a countable count', () => {
   // A known value option consumes its value; --test after it is still the runner.
-  assert.deepEqual(outcome(['--unhandled-rejections', 'strict', '--test']), { tests: 1 });
+  assert.deepEqual(outcomeOf(['--unhandled-rejections', 'strict', '--test']), { tests: 1 });
   // An unknown option before --test: the parse is ambiguous and --test may still run.
-  assert.deepEqual(outcome(['--mystery', 'strict', '--test']), { tests: null });
+  assert.deepEqual(outcomeOf(['--mystery', 'strict', '--test']), { tests: null });
   // Tag filters and rerun state files select tests: never counted.
-  assert.deepEqual(outcome(['--test', '--experimental-test-tag-filter=missing']), { tests: null });
-  assert.deepEqual(outcome(['--test', '--test-rerun-failures=rerun.json']), { tests: null });
+  assert.deepEqual(outcomeOf(['--test', '--experimental-test-tag-filter=missing']), { tests: null });
+  assert.deepEqual(outcomeOf(['--test', '--test-rerun-failures=rerun.json']), { tests: null });
   // Order-only options stay countable.
-  assert.deepEqual(outcome(['--test', '--test-randomize']), { tests: 1 });
+  assert.deepEqual(outcomeOf(['--test', '--test-randomize']), { tests: 1 });
 });
 
-test('A file without tests is not a passed test; colour codes and env files cannot fake a summary', () => {
-  const summary = (pass, tests = pass) =>
-    `# tests ${tests}\n# suites 0\n# pass ${pass}\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0\n`;
-  // Node reports a file that registered no test as one passed test named after the file.
-  assert.equal(
-    passedTests(`TAP version 13\n# Subtest: matrix.test.mjs\nok 1 - matrix.test.mjs\n1..1\n${summary(1)}`),
-    0,
-  );
-  assert.equal(
-    passedTests(
-      `ok 1 - matrix.test.mjs\nok 2 - real\nok 3 - skipped.mjs # SKIP\n1..3\n${summary(2, 3).replace('# skipped 0', '# skipped 1')}`,
-    ),
-    1,
-  );
-  const spec =
-    '✔ C:\tmp\matrix.test.mjs (70.5ms)\n✔ real (0.7ms)\nℹ tests 2\nℹ suites 0\nℹ pass 2\nℹ fail 0\nℹ cancelled 0\nℹ skipped 0\nℹ todo 0\n';
-  assert.equal(passedTests(spec), 1);
-  // FORCE_COLOR wraps summary lines in ANSI sequences: they are not part of the summary.
-  const coloured = spec.replace(/^(ℹ .*)$/gmu, '\u001b[34m$1\u001b[39m');
-  assert.equal(passedTests(coloured), 1);
+test('Env files and NODE_OPTIONS cannot add a test filter to a counted run', () => {
   // An env file may set NODE_OPTIONS with a test filter: never counted; NODE_OPTIONS is not inherited.
-  assert.deepEqual(nodeTestOutcome({ command: 'node', args: ['--test', '--env-file=test.env'] }, summary(1)), {
-    tests: null,
-  });
+  assert.deepEqual(outcomeOf(['--test', '--env-file=test.env']), { tests: null });
   const previous = process.env.NODE_OPTIONS;
   process.env.NODE_OPTIONS = '--test-name-pattern=missing';
   try {
