@@ -72,8 +72,10 @@ function canonical(value, { root, projectKey }) {
   const ids = new Map();
   const walk = (item, key) => {
     if (typeof item === 'string') {
-      if (item === root) return '<root>';
-      if (item === projectKey) return '<key>';
+      // By field, not by value: on Linux the project key equals the display root (Windows lowercases
+      // it), so a value-only mapping gave platform-dependent hashes.
+      if (key === 'projectKey' && item === projectKey) return '<key>';
+      if (item === root || item === projectKey) return '<root>';
       if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(item)) return '<time>';
       if (['contractHash', 'previousHash', 'nextHash'].includes(key)) return '<hash>';
       if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(item)) {
