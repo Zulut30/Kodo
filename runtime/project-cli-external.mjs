@@ -1,6 +1,6 @@
 import { isPullHost } from './job-contracts.mjs';
 
-// `kodo project next-wave|complete-task`: the pull protocol of external worker
+// `kodo project next-wave|complete-task|gates`: the pull protocol of external worker
 // chats (docs/T3-HOST.md). Strict parsing precedes credentials, state and Git.
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 const slug = /^[a-z][a-z0-9-]{0,47}$/;
@@ -9,6 +9,7 @@ const booleans = ['--json', '--retry-failed', '--defer-gate', '--abandon'];
 const flagsFor = {
   'next-wave': ['--json', '--host', '--limit', '--retry-failed'],
   'complete-task': ['--json', '--head', '--defer-gate', '--abandon', '--command-id', '--attempt'],
+  gates: ['--json', '--retry-failed'],
 };
 // Constant codes of the protocol itself; never data, paths or provider output.
 const reported = new Set([
@@ -66,12 +67,13 @@ function argumentsFor(argv) {
       flags[arg] = value;
     }
   }
-  const next = action === 'next-wave';
-  if (positional.length !== (next ? 1 : 2) || !uuid.test(positional[0]) || (!next && !slug.test(positional[1])))
+  const next = action === 'next-wave',
+    complete = action === 'complete-task';
+  if (positional.length !== (complete ? 2 : 1) || !uuid.test(positional[0]) || (complete && !slug.test(positional[1])))
     invalid();
   if (next && (!isPullHost(flags['--host']) || (flags['--limit'] !== undefined && !/^[1-5]$/.test(flags['--limit']))))
     invalid();
-  if (!next && (!sha.test(flags['--head'] ?? '') || (flags['--defer-gate'] && flags['--abandon']))) invalid();
+  if (complete && (!sha.test(flags['--head'] ?? '') || (flags['--defer-gate'] && flags['--abandon']))) invalid();
   if (flags['--command-id'] !== undefined && !uuid.test(flags['--command-id'])) invalid();
   if (flags['--attempt'] !== undefined && !uuid.test(flags['--attempt'])) invalid();
   // An abandon names the attempt it stops: a late repeat can never stop a newer attempt.
@@ -131,6 +133,14 @@ async function operate(options, ports, safety) {
         ports: ports.wave,
       });
       success = result.briefs.length > 0;
+    } else if (options.action === 'gates') {
+      result = await external.runProjectGates(ctx, {
+        projectId: options.projectId,
+        retryFailed: flags['--retry-failed'] === true,
+        ports: ports.wave,
+        ...(ports.signal ? { signal: ports.signal } : {}),
+      });
+      success = result.status === 'passed';
     } else {
       result = await external.completeTask(ctx, {
         projectId: options.projectId,

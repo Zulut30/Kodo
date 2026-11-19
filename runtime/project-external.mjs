@@ -586,10 +586,32 @@ async function abandonTarget(ctx, { snapshot, attempt, run }, input) {
   return abandonAttempt(ctx, snapshot, attempt, run, input);
 }
 
-async function runGates(W, waveCtx, projectId, signal) {
-  const gates = await W.runPendingGates(waveCtx, { projectId, signal, retryFailed: false });
+async function runGates(W, waveCtx, projectId, signal, retryFailed = false) {
+  const gates = await W.runPendingGates(waveCtx, { projectId, signal, retryFailed });
   need(gates && typeof gates === 'object', 'wave_ports_invalid');
   return gates;
+}
+
+/**
+ * Run the pending epic gates of a wave project outside a task completion. A blocked gate is
+ * retried (a new gate reservation) only with `retryFailed`: the T3 host's way to continue after
+ * the cause of a blocked gate was fixed. Holds lease `project:<id>` like `completeTask`.
+ * @param {{ repo: any, engine: any, store?: any, contracts?: any }} ctx
+ * @param {{ projectId: string, retryFailed?: boolean, ports?: any, signal?: AbortSignal }} input
+ */
+export async function runProjectGates(ctx, input) {
+  const { projectId, retryFailed = false, signal } = input;
+  const C = await contractsOf(ctx);
+  need(C.isWaveProject((await snapshotOf(ctx, projectId)).project), 'wave_required');
+  return withProjectLease(storeOf(ctx), projectId, async () => {
+    const snapshot = await snapshotOf(ctx, projectId);
+    if (snapshot.project.paused || ['cancelled', 'failed'].includes(snapshot.project.status))
+      return { status: 'blocked', code: 'project_control_blocked', revision: snapshot.revision };
+    const W = wavePorts(input.ports, ['createWaveContext', 'runPendingGates']);
+    const gates = await runGates(W, waveContextOf(ctx, C, W), projectId, signal, retryFailed === true);
+    const status = Array.isArray(gates.blocked) && gates.blocked.length ? 'blocked' : 'passed';
+    return { status, gates, revision: (await snapshotOf(ctx, projectId)).revision };
+  });
 }
 
 function waveContextOf(ctx, C, W) {

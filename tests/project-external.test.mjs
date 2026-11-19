@@ -12,7 +12,7 @@ import { openProjectStore } from '../runtime/project-store.mjs';
 import { scopesOverlap } from '../runtime/contracts.mjs';
 import { ensureIntegration, mergeTask } from '../runtime/project-integration.mjs';
 import { withIntegrationLease } from '../runtime/project-integration-lease.mjs';
-import { completeTask, nextWave } from '../runtime/project-external.mjs';
+import { completeTask, nextWave, runProjectGates } from '../runtime/project-external.mjs';
 import { createProjectTransitionAuthorizer } from '../runtime/project-director.mjs';
 import { workerRole, WORKER_ROLES } from '../runtime/worker-roles.mjs';
 
@@ -618,6 +618,56 @@ test('next-wave --retry-failed retries only attempts of its own host', async t =
     ['task-a'],
   );
   assert.notEqual(brief(own, 'task-a').runId, a.runId);
+});
+
+test('gates runs the pending epic gates outside a completion and retries a blocked gate only on request', async t => {
+  const f = await fixture(t);
+  const gates = input => runProjectGates(f.ctx, { projectId: f.projectId, ports: f.ports, ...input });
+  const passed = await gates();
+  assert.equal(passed.status, 'passed', JSON.stringify(passed));
+  assert.deepEqual(passed.gates, { gates: [], accepted: [], blocked: [] });
+  assert.equal(passed.revision, (await f.snapshot()).revision);
+  assert.deepEqual(
+    f.calls.gates.map(row => [row.projectId, row.retryFailed]),
+    [[f.projectId, false]],
+  );
+
+  const blocked = {
+    gates: [{ gateId: 'g', runId: 'r', state: 'blocked' }],
+    accepted: [],
+    blocked: [{ code: 'error' }],
+  };
+  f.ports.runPendingGates = async (waveCtx, input) => {
+    f.calls.gates.push(input);
+    return blocked;
+  };
+  const stopped = await gates({ retryFailed: true });
+  assert.equal(stopped.status, 'blocked');
+  assert.deepEqual(stopped.gates, blocked);
+  assert.equal(f.calls.gates.at(-1).retryFailed, true, 'only an explicit retry reserves a new gate');
+  assert.deepEqual(f.calls.integrate, [], 'a gate pass integrates no task');
+
+  await f.repo.apply({
+    schemaVersion: 1,
+    commandId: randomUUID(),
+    projectId: f.projectId,
+    expectedRevision: (await f.snapshot()).revision,
+    actor: 'owner',
+    reason: 'Pause before a gate pass',
+    action: { op: 'setPaused', paused: true },
+  });
+  const paused = await gates({ retryFailed: true });
+  assert.deepEqual([paused.status, paused.code], ['blocked', 'project_control_blocked']);
+  assert.equal(f.calls.gates.length, 2, 'a paused project runs no gate');
+});
+
+test('gates requires a wave project', async t => {
+  const f = await fixture(t, { wave: false });
+  await assert.rejects(
+    runProjectGates(f.ctx, { projectId: f.projectId, ports: f.ports }),
+    error => error.code === 'project_wave_required',
+  );
+  assert.deepEqual(f.calls.gates, []);
 });
 
 test('next-wave and complete-task require a pull host, a bound limit and a wave project', async t => {
