@@ -426,17 +426,41 @@ export function nodeTestOutcome(step, observed) {
   return { tests: exact ? countTestEvents(observed.testEvents) : null };
 }
 
-/** A fresh private directory for one event file, under Kodo's state home and outside the project. */
-async function eventDirectory(cwd) {
-  // Kodo's own state home, not TEMP: the tests' temporary directory stays untouched, and a relative
-  // or in-project TEMP can neither break the reporter nor place the file inside the project.
+/** The real path of `target`, or that of its nearest existing ancestor followed by the rest. */
+async function canonicalPath(target) {
+  const resolved = path.resolve(target);
+  try {
+    return await realpath(resolved);
+  } catch (error) {
+    const parent = path.dirname(resolved);
+    if (error?.code !== 'ENOENT' || parent === resolved) throw error;
+    return path.join(await canonicalPath(parent), path.basename(resolved));
+  }
+}
+const inside = (outer, inner) => {
+  const relative = path.relative(outer, inner);
+  return relative === '' || (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+};
+
+/**
+ * A fresh private directory for one event file, under Kodo's state home (not TEMP: the tests'
+ * temporary directory stays untouched) and outside every project root: the command's working
+ * directory and the project's source checkout. Real paths are compared before and after the
+ * directory is created, so a junction or symlink cannot place it inside a project.
+ * @param {string[]} roots
+ */
+async function eventDirectory(roots) {
   const root = path.resolve(stateHome(), 'test-events');
-  const project = path.resolve(cwd ?? process.cwd());
-  const relative = path.relative(project, root);
-  if (relative === '' || (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)))
-    throw Object.assign(new Error('Kodo state home lies inside the project'), { code: 'fast_check_events_location' });
+  const projects = await Promise.all(roots.filter(Boolean).map(canonicalPath));
+  const refuse = () =>
+    Object.assign(new Error('Kodo state home lies inside the project'), { code: 'fast_check_events_location' });
+  if (projects.some(project => inside(project, root))) throw refuse();
+  const before = await canonicalPath(root);
+  if (projects.some(project => inside(project, before))) throw refuse();
   await mkdir(root, { recursive: true, mode: 0o700 });
-  return mkdtemp(path.join(root, 'run-'));
+  const actual = await realpath(root);
+  if (projects.some(project => inside(project, actual))) throw refuse();
+  return mkdtemp(path.join(actual, 'run-'));
 }
 
 /**
@@ -448,8 +472,9 @@ async function eventDirectory(cwd) {
  * @param {{ command: string, args?: string[] }} step
  * @param {Record<string, any>} options `execute` options
  * @param {boolean} counted
+ * @param {string[]} [roots] Project roots besides `options.cwd` (the source checkout of a worktree).
  */
-export async function executeCheck(step, options, counted) {
+export async function executeCheck(step, options, counted, roots = []) {
   const run = async (command, args) => {
     try {
       return { result: await execute(command, args, options), error: null };
@@ -458,7 +483,7 @@ export async function executeCheck(step, options, counted) {
     }
   };
   if (!counted) return run(step.command, step.args ?? []);
-  const directory = await eventDirectory(options.cwd);
+  const directory = await eventDirectory([options.cwd, ...roots]);
   const file = path.join(directory, 'events.jsonl');
   const executed = { command: step.command, args: countingArguments(step.args, file) };
   try {
@@ -639,6 +664,7 @@ async function runStep({ engine, run, step, headSha, env, cache, counted, signal
     step,
     { cwd: run.cwd, signal, env, secrets: engine.secrets, timeoutMs: step.timeoutMs, allowFailure: true },
     counted,
+    [run.project],
   );
   const counting = counted ? { executed, countVersion: TEST_COUNT_VERSION } : {};
   const durationMs = Math.round(performance.now() - started);

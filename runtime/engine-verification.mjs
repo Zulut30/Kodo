@@ -292,6 +292,7 @@ export class EngineVerification extends EngineExecution {
             allowFailure: true,
           },
           counting,
+          [run.project],
         );
         // A counted command keeps its configured `command`; the receipt also records what ran.
         const observed = counting ? { executed, countVersion: TEST_COUNT_VERSION, testEvents } : {};

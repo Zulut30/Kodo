@@ -238,3 +238,33 @@ test('Review findings: ../ from a subdirectory, masked names and an in-project T
   await mkdir(path.join(root, 'tmp'));
   assert.equal((await counted(root, ['--test', 'tmp.test.mjs'], { TEMP: 'tmp', TMP: 'tmp', TMPDIR: 'tmp' })).tests, 1);
 });
+
+test('The event directory is never created inside the project: the source checkout or through a link', async t => {
+  const root = await project(t, { 'a.test.mjs': `${imports}test('a', () => {});\n` });
+  const outside = await project(t, { 'b.test.mjs': `${imports}test('b', () => {});\n` });
+  const step = { command: process.execPath, args: ['--test', 'b.test.mjs'] };
+  const run = (home, roots) =>
+    executeCheck(step, { cwd: outside, env: env({}), allowFailure: true, timeoutMs: 60000 }, true, roots);
+  const previous = process.env.KODO_HOME;
+  t.after(() => {
+    if (previous === undefined) delete process.env.KODO_HOME;
+    else process.env.KODO_HOME = previous;
+  });
+  // Kodo's state home inside the source checkout, the check running in an external worktree.
+  process.env.KODO_HOME = path.join(root, '.kodo-state');
+  await assert.rejects(() => run(process.env.KODO_HOME, [root]), { code: 'fast_check_events_location' });
+  await assert.rejects(() => access(path.join(root, '.kodo-state', 'test-events')), { code: 'ENOENT' });
+  // A link outside the project that points into it is resolved to its real place.
+  const { symlink } = await import('node:fs/promises');
+  await mkdir(path.join(root, 'state'));
+  const link = path.join(outside, '..', `kodo-link-${path.basename(outside)}`);
+  await symlink(path.join(root, 'state'), link, 'junction');
+  t.after(() => rm(link, { force: true, recursive: false }).catch(() => {}));
+  process.env.KODO_HOME = link;
+  await assert.rejects(() => run(link, [root]), { code: 'fast_check_events_location' });
+  // An ordinary state home outside both roots works.
+  process.env.KODO_HOME = await mkdtemp(path.join(os.tmpdir(), 'kodo-count-home-'));
+  t.after(() => rm(process.env.KODO_HOME ?? '', { recursive: true, force: true }));
+  const fine = await run(process.env.KODO_HOME, [root]);
+  assert.equal(nodeTestOutcome(step, fine)?.tests, 1);
+});
