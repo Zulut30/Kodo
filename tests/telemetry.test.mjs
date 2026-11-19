@@ -779,13 +779,67 @@ test('project report keeps future wave gates only when the snapshot has them', (
   const gates = [{ id: 'wave-1', status: 'passed', extra: { nested: 'dropped' } }];
   const snapshot = projectSnapshot([], [], { gates, project: { projectId: 'p-1', status: 'proposed', paused: true } });
   const report = buildProjectReport(snapshot, new Map(), {}, { now: NOW });
-  assert.deepEqual(report.gates, [{ id: 'wave-1', status: 'passed' }]);
+  // A gate without a Run keeps a status of its own record; nested data never leaks.
+  assert.deepEqual(report.gates, [{ id: 'wave-1', status: 'passed', runId: null, containers: [], sessions: null }]);
+  assert.deepEqual(
+    { gates: report.totals.gates.gates, runs: report.totals.gates.runs, sessions: report.totals.gates.sessions },
+    { gates: 1, runs: 0, sessions: 0 },
+  );
   assert.deepEqual(report.totals.tasks, 0);
   assert.equal(report.totals.wallMs, null);
   assert.equal(report.totals.usage.sessions, 0);
   assert.deepEqual(report.blockers, [
     { taskId: null, runId: null, code: 'project_paused', scope: 'project', occurrences: null },
   ]);
+});
+
+test('project report reads wave gates from their gate Runs; only a current blocked gate is a blocker', () => {
+  const gateRun = (id, state, extra = {}) =>
+    finishedRun({
+      id,
+      state,
+      sessionAttempts: [session('review', 'completed', measured(3000)), session('repair', 'completed', measured(4000))],
+      ...extra,
+    });
+  const blocked = { current: { code: 'repair_budget_exhausted', scope: 'run', occurrences: 1 }, history: [] };
+  const runs = new Map([
+    ['gate-run-1', gateRun('gate-run-1', 'blocked', { blocker: blocked })],
+    ['gate-run-2', gateRun('gate-run-2', 'succeeded')],
+    ['gate-run-3', gateRun('gate-run-3', 'blocked', { blocker: blocked })],
+  ]);
+  const gate = (id, number, runId, epic) => ({
+    id,
+    number,
+    runId,
+    containers: [{ kind: 'epic', id: epic }],
+    installed: true,
+  });
+  const gates = [
+    gate('g-1', 1, 'gate-run-1', 'foundation'),
+    gate('g-2', 2, 'gate-run-2', 'foundation'),
+    gate('g-3', 3, 'gate-run-3', 'core'),
+    gate('g-4', 4, 'gate-run-missing', 'cli'),
+  ];
+  const report = buildProjectReport(projectSnapshot([], [], { gates }), runs, {}, { now: NOW });
+  assert.deepEqual(
+    report.gates.map(row => [row.id, row.status, row.runId, row.containers, row.sessions]),
+    [
+      ['g-1', 'blocked', 'gate-run-1', ['epic:foundation'], 2],
+      ['g-2', 'succeeded', 'gate-run-2', ['epic:foundation'], 2],
+      ['g-3', 'blocked', 'gate-run-3', ['epic:core'], 2],
+      ['g-4', 'unknown', 'gate-run-missing', ['epic:cli'], null],
+    ],
+  );
+  // A blocked gate a later gate of the same container replaced is history, not a blocker.
+  assert.deepEqual(report.blockers, [
+    { taskId: null, runId: 'gate-run-3', code: 'repair_budget_exhausted', scope: 'gate', occurrences: 1 },
+  ]);
+  assert.deepEqual(
+    { gates: report.totals.gates.gates, runs: report.totals.gates.runs, sessions: report.totals.gates.sessions },
+    { gates: 4, runs: 3, sessions: 6 },
+  );
+  assert.equal(report.totals.gates.observedUsage.sessions, 6);
+  assert.equal(report.totals.sessions, 0, 'task totals keep their meaning');
 });
 
 test('reports are pure: same input and clock give the same report', () => {

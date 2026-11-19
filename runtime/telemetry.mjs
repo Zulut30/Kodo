@@ -697,6 +697,70 @@ function projectBlockers(snapshot, rows) {
   return blockers;
 }
 
+/**
+ * Wave gates with the state of their gate Runs: a gate record has no status of its own. A gate
+ * whose Run is not found keeps `unknown` (or a status the record itself carries).
+ */
+function gateRows(snapshot, runsById, eventsByRun, options) {
+  return list(snapshot.gates)
+    .filter(record)
+    .map(gate => {
+      const runId = typeof gate.runId === 'string' ? gate.runId : null;
+      const run = runId ? lookup(runsById, runId) : undefined;
+      const report = record(run)
+        ? buildRunReport(run, list(lookup(eventsByRun, runId)), {
+            now: options.now,
+            jobEvents: list(lookup(options.jobEvents, runId)),
+          })
+        : null;
+      const containers = list(gate.containers)
+        .filter(record)
+        .map(item => `${code(item.kind, 'unknown')}:${slug(item.id)}`);
+      return {
+        row: {
+          id: slug(gate.id),
+          status: report ? code(run.state, 'unknown') : code(gate.status, 'unknown'),
+          runId: runId === null ? null : slug(runId),
+          containers,
+          sessions: report ? report.attempts.sessions : null,
+        },
+        number: integer(gate.number),
+        key: containers[0] ?? null,
+        run: report ? run : null,
+        report,
+      };
+    });
+}
+
+// A blocked or failed gate Run is a blocker until a later gate of the same container replaces it.
+function gateBlockers(gates) {
+  return gates
+    .filter(
+      gate =>
+        ['blocked', 'failed'].includes(gate.row.status) &&
+        !gates.some(other => other.key === gate.key && (other.number ?? 0) > (gate.number ?? 0)),
+    )
+    .map(gate => ({
+      taskId: null,
+      runId: gate.row.runId,
+      code: gate.report?.blocker?.code ?? 'gate_blocked',
+      scope: 'gate',
+      occurrences: gate.report?.blocker?.occurrences ?? null,
+    }));
+}
+
+// Gate Runs are counted apart from the task totals, whose meaning stays per task attempt.
+function gateTotals(gates) {
+  const found = gates.filter(gate => gate.report);
+  return {
+    gates: gates.length,
+    runs: found.length,
+    complete: found.length === gates.length,
+    sessions: total(found.map(gate => gate.row.sessions)).value ?? (found.length ? null : 0),
+    observedUsage: usageOf(found.flatMap(gate => list(gate.run.sessionAttempts))),
+  };
+}
+
 function projectTotals(rows, runs, attemptReports) {
   const count = statuses => rows.filter(row => statuses.includes(row.status)).length;
   const tried = rows.filter(row => row.attempts > 0);
@@ -793,6 +857,10 @@ export function buildProjectReport(
   // A total over an incomplete attempt history (a missing Run, an unknown session count, or a Run
   // continued from an older one without its earlier sessions) is unknown.
   if (totals.sessions !== null && found.every(report => report.usage !== null)) totals.usage = totals.observedUsage;
+  const waveGates = Object.hasOwn(snapshot, 'gates')
+    ? gateRows(snapshot, runsById, eventsByRun, { now, jobEvents })
+    : null;
+  if (waveGates) totals.gates = gateTotals(waveGates);
   const attemptsTotal = totals.attempts;
   const completeness = {
     ...snapshotCompleteness(snapshot),
@@ -823,14 +891,8 @@ export function buildProjectReport(
     tasks: rows.map(item => item.row),
     attempts: attemptRows.map(item => item.row),
     totals,
-    ...(Object.hasOwn(snapshot, 'gates')
-      ? {
-          gates: list(snapshot.gates)
-            .filter(record)
-            .map(gate => ({ id: slug(gate.id), status: code(gate.status, 'unknown') })),
-        }
-      : {}),
-    blockers: projectBlockers(snapshot, rows),
+    ...(waveGates ? { gates: waveGates.map(gate => gate.row) } : {}),
+    blockers: [...projectBlockers(snapshot, rows), ...(waveGates ? gateBlockers(waveGates) : [])],
     completeness,
     provenance: {
       source: 'kodo-state',
