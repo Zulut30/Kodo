@@ -324,6 +324,14 @@
       "description": "Стандарт Kodo spec kit",
       "entry": "SKILL.md",
       "requires": []
+    },
+    {
+      "id": "skills/kodo-project-director",
+      "type": "skill",
+      "version": "0.2.0",
+      "description": "Фабрика проектов Kodo из главного чата с чертежом волнами и воркер-чатами",
+      "entry": "SKILL.md",
+      "requires": ["skills/kodo-build-feature"]
     }
   ]
 }

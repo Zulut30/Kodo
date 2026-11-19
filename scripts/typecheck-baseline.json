@@ -84,18 +84,6 @@
     "count": 2
   },
   {
-    "file": "runtime/config.mjs",
-    "code": "TS2339",
-    "message": "Property 'executionMode' does not exist on type '{ schemaVersion: number; repository: any; baseBranch: string; client: string; primaryModel: any; concurrency: number; repairRounds: number; researchBudget: number; uiVerification: { enabled: any; cases: any[]; autoInstall: any; maxSteps: any; timeoutMs: any; }; ... 5 more ...; delivery: any; }'.",
-    "count": 1
-  },
-  {
-    "file": "runtime/config.mjs",
-    "code": "TS2339",
-    "message": "Property 'maxTasks' does not exist on type '{ schemaVersion: number; repository: any; baseBranch: string; client: string; primaryModel: any; concurrency: number; repairRounds: number; researchBudget: number; uiVerification: { enabled: any; cases: any[]; autoInstall: any; maxSteps: any; timeoutMs: any; }; ... 5 more ...; delivery: any; }'.",
-    "count": 4
-  },
-  {
     "file": "runtime/context-pack.mjs",
     "code": "TS2339",
     "message": "Property 'analysis' does not exist on type '{}'.",
@@ -213,12 +201,6 @@
     "file": "runtime/engine-core.mjs",
     "code": "TS2339",
     "message": "Property 'binding' does not exist on type '{}'.",
-    "count": 1
-  },
-  {
-    "file": "runtime/engine-core.mjs",
-    "code": "TS2339",
-    "message": "Property 'executionMode' does not exist on type '{ schemaVersion: number; repository: any; baseBranch: string; client: string; primaryModel: any; concurrency: number; repairRounds: number; researchBudget: number; uiVerification: { enabled: any; cases: any[]; autoInstall: any; maxSteps: any; timeoutMs: any; }; ... 5 more ...; delivery: any; }'.",
     "count": 1
   },
   {
@@ -386,8 +368,8 @@
   {
     "file": "runtime/project-contracts.mjs",
     "code": "TS2739",
-    "message": "Type '{ [k: string]: any; }' is missing the following properties from type '{ epics: any; milestones: any; tasks: any; }': epics, milestones, tasks",
-    "count": 2
+    "message": "Type '{ [k: string]: any; }' is missing the following properties from type '{ milestones: boolean; epics: boolean; tasks: boolean; }': milestones, epics, tasks",
+    "count": 1
   },
   {
     "file": "runtime/project-director.mjs",
@@ -433,24 +415,6 @@
   },
   {
     "file": "runtime/project-director.mjs",
-    "code": "TS2339",
-    "message": "Property 'store' does not exist on type '{}'.",
-    "count": 1
-  },
-  {
-    "file": "runtime/project-store.mjs",
-    "code": "TS2339",
-    "message": "Property 'authorizeTransition' does not exist on type '{}'.",
-    "count": 1
-  },
-  {
-    "file": "runtime/project-store.mjs",
-    "code": "TS2339",
-    "message": "Property 'contracts' does not exist on type '{}'.",
-    "count": 1
-  },
-  {
-    "file": "runtime/project-store.mjs",
     "code": "TS2339",
     "message": "Property 'store' does not exist on type '{}'.",
     "count": 1

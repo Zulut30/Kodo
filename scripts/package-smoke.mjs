@@ -78,7 +78,7 @@ async function smoke() {
     const policy = await import(pathToFileURL(path.join(installedRoot, 'runtime', 'skill-policy.mjs')).href);
     const { lock } = await policy.verifyDefaultSkillPins();
     const ids = new Set(catalog.map(component => component.id));
-    for (const id of [...policy.defaultSkillIds, 'skills/kodo-build-feature'])
+    for (const id of [...policy.defaultSkillIds, 'skills/kodo-build-feature', 'skills/kodo-project-director'])
       assert.ok(ids.has(id), `installed catalog missing ${id}`);
     assert.equal(lock.components.length, 13);
     console.log(

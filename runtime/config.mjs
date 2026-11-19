@@ -66,6 +66,15 @@ export async function readConfig(project, overrides = {}) {
   } catch (error) {
     if (error.code !== 'ENOENT') throw error;
   }
+  return normalizeConfig(file, overrides);
+}
+/**
+ * The validated configuration of a parsed `kodo.config.json` (`{}` when the file is absent),
+ * exactly as `readConfig` returns it. Wave Runs use it for the file of a commit.
+ * @param {any} file
+ * @param {any} [overrides]
+ */
+export function normalizeConfig(file, overrides = {}) {
   const config = {
     ...defaults,
     ...file,

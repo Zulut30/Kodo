@@ -1,5 +1,6 @@
+import { dependencySatisfied } from './project-contracts.mjs';
+
 const sets = ['milestones', 'epics', 'tasks', 'currentAttempts', 'riskApprovals'];
-const accepted = status => status === 'accepted' || status === 'released';
 const compareId = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 const invalid = () =>
   Object.assign(new Error('Invalid project horizon input or pure contract ports'), { code: 'invalid_project_horizon' });
@@ -166,7 +167,7 @@ export function planProjectHorizon(input, ports) {
     const witnesses = byId
       .get(id)
       .dependsOn.flatMap(parent => [
-        ...(!accepted(byId.get(parent).status) ? [parent] : []),
+        ...(!dependencySatisfied(project, byId.get(parent).status) ? [parent] : []),
         ...(unaccepted.has(parent) ? [unaccepted.get(parent)] : []),
       ])
       .sort(compareId);
@@ -176,7 +177,10 @@ export function planProjectHorizon(input, ports) {
     let downstream = 0n;
     for (const child of children.get(id)) if (path.get(child) > downstream) downstream = path.get(child);
     // Individual efforts are safe integers; a whole path can exceed that range.
-    path.set(id, (accepted(byId.get(id).status) ? 0n : BigInt(byId.get(id).estimatedEffort)) + downstream);
+    path.set(
+      id,
+      (dependencySatisfied(project, byId.get(id).status) ? 0n : BigInt(byId.get(id).estimatedEffort)) + downstream,
+    );
   }
   const ranked = [...tasks].sort(
     (a, b) =>

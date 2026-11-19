@@ -46,7 +46,7 @@ function run(...args) {
 }
 
 test('Catalog validates all shipped components and resolves unique dependencies before consumers', () => {
-  assert.equal(catalog.registry.components.length, 33);
+  assert.equal(catalog.registry.components.length, 34);
   const resolved = resolveComponents(catalog.registry, ['pipelines/fix-bug', 'pipelines/build-feature']);
   const ids = resolved.map(item => item.id);
   assert.equal(new Set(ids).size, ids.length);
@@ -358,6 +358,7 @@ test('CLI supports catalog queries, pipeline plans and JSON dry run from another
       'skills/composition-patterns',
       'skills/ce-compound',
       'skills/spec-kit',
+      'skills/kodo-project-director',
     ],
   );
   const show = run('show', 'agents/designer', '--json');

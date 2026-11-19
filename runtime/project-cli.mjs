@@ -72,17 +72,33 @@ function human(report) {
   return heading + '\n' + JSON.stringify(result, null, 2);
 }
 
+// Wave and blueprint commands keep their own strict parsers: drain, the pull protocol of
+// external chats, and the project factory (bootstrap, apply-spec, extend, append-milestone).
+const blueprintActions = new Set(['bootstrap', 'apply-spec', 'extend', 'append-milestone']);
+/** Read-only alias: `project report PROJECT_ID [--json]` is `report --project PROJECT_ID [--json]`. */
+async function reportAlias(argv, ports) {
+  const { reportCli } = await import('./report-cli.mjs');
+  const rest = argv.slice(1),
+    at = rest.findIndex(arg => typeof arg === 'string' && !arg.startsWith('-'));
+  return reportCli(at < 0 ? rest : [...rest.slice(0, at), '--project', ...rest.slice(at)], ports);
+}
+
+async function waveCommand(argv) {
+  const action = Array.isArray(argv) ? argv[0] : undefined;
+  if (action === 'report') return reportAlias;
+  if (action === 'drain') return (await import('./project-cli-wave.mjs')).projectWaveCli;
+  if (action === 'next-wave' || action === 'complete-task')
+    return (await import('./project-cli-external.mjs')).projectExternalCli;
+  if (blueprintActions.has(action)) return (await import('./project-cli-blueprint.mjs')).projectBlueprintCli;
+  return null;
+}
+
 /** Explicit, lazy Project composition. Only resume enters foreground Engine.run.
  * Ports belong to the coordinator/test harness, never to decoded CLI data.
  */
 export async function projectCli(argv, ports = {}) {
-  // Read-only alias: `project report PROJECT_ID [--json]` is `report --project PROJECT_ID [--json]`.
-  if (Array.isArray(argv) && argv[0] === 'report') {
-    const { reportCli } = await import('./report-cli.mjs');
-    const rest = argv.slice(1),
-      at = rest.findIndex(arg => typeof arg === 'string' && !arg.startsWith('-'));
-    return reportCli(at < 0 ? rest : [...rest.slice(0, at), '--project', ...rest.slice(at)], ports);
-  }
+  const wave = await waveCommand(argv);
+  if (wave) return wave(argv, ports);
   let options,
     store,
     ownedStore = false,

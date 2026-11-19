@@ -10,6 +10,8 @@ Run `npm run check` for changes to executable behavior. Real provider checks are
 
 Keep the stable intake chat `Kodo · Диспетчер задач` active. When the host client supports visible worker chats, the coordinator assigns actual scoped work to clearly named chats in the project's Codex/Claude Code client. Use supported host tools; native CLI sessions do not automatically appear as visible chats. After verifying results, archive/clean up only worker chats created for this work through the client's supported mechanism. Archive preserves recovery and is not permanent deletion. Never edit client databases or remove unrelated history. The CLI has no generic desktop chat backend; the available Codex desktop workflow uses coordinator app tools. See `skills/kodo-build-feature/SKILL.md`.
 
+Large projects and the project factory (blueprint, waves, worker chats, new milestones) follow `skills/kodo-project-director/SKILL.md`.
+
 Routine commit/push/PR/merge/release and configured deployment/smoke within the assigned task are already authorized. The coordinator owns them and must respect branch protections and current checks; workers do not perform delivery or start more agents. Do not request repeated permission for those authorized stages.
 
 Optional tool setup and UI/security gates belong to the coordinator. Read `docs/UI-TOOLS.md` and `docs/SECURITY.md`; preserve subscription-only GPT/Claude, private owned profiles/endpoints, and keys outside workers/app processes. `disabled` is neutral evidence, not PASS. Enabled gates require current head/config/pins and intact evidence before review/delivery. Workers run scoped checks; the coordinator runs the full integrated `npm run check` and delivery gates.

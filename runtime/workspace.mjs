@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { readFile, lstat, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { execute } from './command.mjs';
-import { secretFile, redact } from './security.mjs';
+import { secretFile, redact, stateHome, worktreeHome } from './security.mjs';
 export async function git(cwd, args, options = {}) {
   return (await execute('git', args, { cwd, ...options })).stdout.trim();
 }
@@ -14,6 +14,20 @@ export async function diffHash(cwd, baseSha, headSha = 'HEAD') {
       ).stdout.trimEnd(),
     )
     .digest('hex');
+}
+// Private run worktrees never live in the user's checkout. An explicit
+// KODO_WORKTREE_HOME wins; a state home inside Git keeps worktrees beside its
+// temporary artifact home; the default state home uses the default worktree home.
+/** @param {{ storeHome: string, stateInGit?: boolean, artifactHome?: string }} options */
+export function worktreeHomeFor({ storeHome, stateInGit = false, artifactHome }) {
+  return (
+    process.env.KODO_WORKTREE_HOME ||
+    (stateInGit
+      ? `${artifactHome}-worktrees`
+      : path.resolve(storeHome) === stateHome()
+        ? worktreeHome()
+        : `${storeHome}-worktrees`)
+  );
 }
 export async function inspectProject(project) {
   const root = await git(project, ['rev-parse', '--show-toplevel']);
@@ -78,7 +92,14 @@ export async function collectFiles(cwd, task, secrets = {}) {
   return { files, omitted: names.length - files.length, bytes: size };
 }
 export async function changedFiles(cwd, base) {
-  return (await git(cwd, ['diff', '--no-renames', '--name-only', base])).split('\n').filter(Boolean);
+  // NUL-separated raw names: Git quotes non-ASCII names in line mode, and redaction must not
+  // rewrite a path before it is matched against the task's write scope. Never trimmed: a
+  // NUL-separated name may begin with whitespace or U+FEFF.
+  const { stdout } = await execute('git', ['diff', '--no-renames', '--name-only', '-z', base], {
+    cwd,
+    rawOutput: true,
+  });
+  return stdout.split('\0').filter(Boolean);
 }
 export async function commitChanges(cwd, message, paths) {
   if (paths === undefined) await git(cwd, ['add', '-A']);

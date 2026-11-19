@@ -121,6 +121,22 @@ node cli/index.mjs install skills/kodo-build-feature --client codex --client cla
 
 OpenCode может загрузить тот же навык и передать выполнение настроенному backend Codex или Claude Code. Собственный backend дешёвых моделей OpenCode относится к будущему этапу.
 
+## Фабрика проектов
+
+Большой проект ведёт постоянный чат `Kodo · Диспетчер задач` по навыку `kodo-project-director` (`kodo init` ставит его вместе с `kodo-build-feature`). Главный чат пишет файловый чертёж `.kodo/blueprint/` с Волной 0, Kodo проверяет и регистрирует его волновым проектом, задачи исполняются волнами в интеграционной ветке `kodo/project/<id>`, а эпики принимает один gate Run.
+
+```powershell
+kodo project bootstrap "Сервис заметок с поиском" --root "D:\Projects\notes" --prepare --json
+kodo project apply-spec --root "D:\Projects\notes" --json
+kodo project next-wave <projectId> --host t3 --limit 3 --json      # брифы для видимых воркер-чатов T3
+kodo project complete-task <projectId> <taskId> --head <SHA> --json
+kodo project drain <projectId> --concurrency 2 --json               # без T3: волны нативными сессиями
+kodo project extend <projectId> "Теги заметок" --prepare --json
+kodo project append-milestone <projectId> --file <bundle>\milestone.json --json
+```
+
+Формат чертежа и проверки — [BLUEPRINT.md](docs/BLUEPRINT.md), протокол воркер-чатов — [T3-HOST.md](docs/T3-HOST.md), решения — [ADR-0014](docs/decisions/0014-wave-factory.md) и [ADR-0015](docs/decisions/0015-t3-pull-host.md).
+
 ## Каталог компонентов
 
 ```powershell

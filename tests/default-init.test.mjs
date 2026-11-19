@@ -81,7 +81,7 @@ test('CLI init installs all default skills and the chat entry for Codex Claude C
   const initialized = JSON.parse(result.stdout);
   assert.equal(initialized.configCreated, true);
   assert.deepEqual(initialized.clients, ['codex', 'claude-code', 'opencode']);
-  for (const slug of [...slugs, 'kodo-build-feature']) {
+  for (const slug of [...slugs, 'kodo-build-feature', 'kodo-project-director']) {
     assert.ok(initialized.components.includes(`skills/${slug}`), slug);
     const original = await text(path.join(root, 'skills', slug, 'SKILL.md'));
     assert.equal(await text(path.join(project, '.agents/skills', slug, 'SKILL.md')), original);

@@ -6,6 +6,7 @@ import path from 'node:path';
 import { Engine } from '../../runtime/engine.mjs';
 import { Store } from '../../runtime/store.mjs';
 import { makeWorktree } from '../../runtime/workspace.mjs';
+import { confirmedCriteria } from './gate-review.mjs';
 
 const read = filename => readFile(filename, 'utf8');
 
@@ -145,7 +146,10 @@ function fakeServices({ plan = featurePlan(), onWorker, onReview, onDiscover } =
         calls.review.push(request);
         return onReview
           ? onReview(request, calls)
-          : { sessionId: `review-${calls.review.length}`, output: { passed: true, findings: [] } };
+          : {
+              sessionId: `review-${calls.review.length}`,
+              output: { passed: true, findings: [], ...confirmedCriteria(request.schema) },
+            };
       }
       const role = /Complete this (developer|tester|documenter) task/.exec(request.prompt)?.[1];
       const call = { ...request, role };

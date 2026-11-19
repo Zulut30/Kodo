@@ -157,7 +157,7 @@ test('RTK pins only verified OSS archives without changing component or skill co
   const pin = toolCatalog.find(t => t.id === 'rtk');
   assert.ok(pin);
   assert.equal(toolCatalog.length, 16);
-  assert.equal(registry.components.length, 33);
+  assert.equal(registry.components.length, 34);
   assert.equal(defaultSkillIds.length, 13);
   assert.deepEqual(
     new Set(toolCatalog.map(tool => tool.id)),

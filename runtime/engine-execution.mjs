@@ -17,7 +17,10 @@ import { contentHash, evidencePrompt, lstatSafe } from './engine-core.mjs';
 export class EngineExecution extends EnginePlanning {
   async checkScope(cwd, baseSha, scopes) {
     const tracked = await changedFiles(cwd, baseSha);
-    const untracked = (await git(cwd, ['ls-files', '--others', '--exclude-standard', '-z']))
+    // Never trimmed: a NUL-separated name may begin with whitespace or U+FEFF.
+    const untracked = (
+      await execute('git', ['ls-files', '--others', '--exclude-standard', '-z'], { cwd, rawOutput: true })
+    ).stdout
       .split('\0')
       .filter(Boolean);
     const files = [...new Set([...tracked, ...untracked])];

@@ -16,6 +16,8 @@
 
 - [Исполнение задач](RUNTIME.md) — подготовка проекта, режимы, план, маршрутизация, сбои, аудит и доставка.
 - [Project Director](PROJECTS.md) — offline backlog и foreground execution.
+- [Чертёж проекта](BLUEPRINT.md) — фабрика проектов: `.kodo/blueprint/`, `bootstrap`, `apply-spec`, `extend`, `append-milestone`.
+- [Pull-хост T3](T3-HOST.md) — видимые воркер-чаты: `next-wave` и `complete-task`.
 - [Durable jobs](JOBS.md) — очередь заданий с арендами, восстановлением и однократной интеграцией.
 - [Независимая проверка поведения](VERIFICATION.md) — защита тестов, оракулы проекта, политика по типу изменения и базовый прогон.
 - [Доставка без повторных внешних действий](DELIVERY-RECOVERY.md) — аудит доставки, журнал операций, привязка проверки установленного пакета, восстановление.
@@ -51,6 +53,8 @@
 - [0011 — behaviour gate](decisions/0011-behavior-gate.md)
 - [0012 — сторож прогресса и текущий блокер](decisions/0012-progress-watchdog.md)
 - [0013 — журнал операций доставки](decisions/0013-delivery-operation-journal.md)
+- [0014 — волновая фабрика проектов](decisions/0014-wave-factory.md)
+- [0015 — pull-хост для воркер-чатов T3](decisions/0015-t3-pull-host.md)
 
 ## Архив проверок и журнал разработки
 

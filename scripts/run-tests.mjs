@@ -41,6 +41,21 @@ const priority = [
   'tests/ci-cli.test.mjs', // 62405.4714 ms; retained lighter priority
   'tests/project-director-oracle.test.mjs', // 22760.5585 ms; retained lighter priority
   'tests/architecture-acceptance.test.mjs', // 17840.1058 ms; retained lighter priority
+  // Two-level wave verification: sums of case durations from one local Windows run of the
+  // four new files in parallel (Node 24.19.0), not a receipt and no speed claim.
+  'tests/task-fast-checks.test.mjs', // ~167000 ms
+  'tests/wave-verifier.test.mjs', // ~72000 ms
+  'tests/engine-fast-profile.test.mjs', // ~38000 ms
+  // Wave drain: sum of case durations from one local Windows run (Node 24), not a receipt.
+  'tests/project-wave-director.test.mjs', // ~320000 ms
+  // External pull protocol: one local Windows run (Node 24), not a receipt and no speed claim.
+  'tests/project-external.test.mjs', // ~69000 ms
+  // Wave end to end (drain, T3 pull path, reservation ownership): one local Windows run (Node 24), not a receipt.
+  'tests/project-wave-e2e.test.mjs', // ~165000 ms
+  // Project factory CLI: sum of case durations from one local Windows run (Node 24), not a receipt.
+  'tests/project-cli-blueprint.test.mjs', // ~16000 ms
+  // Factory end to end (apply-spec, drain, append-milestone, drain): one local Windows run (Node 24), not a receipt.
+  'tests/project-factory-e2e.test.mjs', // ~100000 ms
 ];
 
 // `npm run test:fast`: unit-level files measured at a few seconds each on
@@ -61,6 +76,7 @@ export const fastTests = [
   'tests/fast-path.test.mjs',
   'tests/job-cli.test.mjs',
   'tests/job-contracts.test.mjs',
+  'tests/job-pull-hosts.test.mjs',
   'tests/job-store.test.mjs',
   'tests/knowledge-claims.test.mjs',
   'tests/knowledge-context.test.mjs',
@@ -69,11 +85,18 @@ export const fastTests = [
   'tests/modes.test.mjs',
   'tests/package-pins.test.mjs',
   'tests/progress.test.mjs',
+  'tests/project-blueprint.test.mjs',
+  'tests/project-bootstrap.test.mjs',
   'tests/project-cancel.test.mjs',
   'tests/project-contracts.test.mjs',
   'tests/project-evidence.test.mjs',
   'tests/project-planner.test.mjs',
   'tests/project-progress.test.mjs',
+  'tests/project-wave-cli.test.mjs',
+  'tests/project-wave-contracts.test.mjs',
+  'tests/project-wave-evidence.test.mjs',
+  'tests/project-wave-planner.test.mjs',
+  'tests/project-wave-store.test.mjs',
   'tests/providers.test.mjs',
   'tests/quality-cli.test.mjs',
   'tests/quality-parsers.test.mjs',
@@ -89,6 +112,7 @@ export const fastTests = [
   'tests/task-context.test.mjs',
   'tests/task-scheduler.test.mjs',
   'tests/telemetry.test.mjs',
+  'tests/test-count-events.test.mjs',
   'tests/test-git-environment.test.mjs',
   'tests/test-schedule.test.mjs',
   'tests/tools.test.mjs',

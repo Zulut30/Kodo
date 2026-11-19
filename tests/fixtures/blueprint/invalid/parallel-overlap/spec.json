@@ -1,0 +1,371 @@
+{
+  "schemaVersion": 1,
+  "id": "notes",
+  "root": "C:/Kodo-Blueprint-Fixture/notes",
+  "title": "Заметки: маленький сервис заметок",
+  "definitionOfDone": [
+    {
+      "id": "notes-done",
+      "text": "Сценарий создать, найти и удалить заметку проходит через HTTP и страницу.",
+      "evidenceKinds": [
+        "acceptance",
+        "checks",
+        "review"
+      ]
+    }
+  ],
+  "constraints": [
+    "Только Node.js 24 и встроенные модули; без сетевых сервисов и учётных записей."
+  ],
+  "businessContext": "Личный локальный сервис заметок для одного пользователя.",
+  "architectureRefs": [],
+  "execution": {
+    "cadence": "wave",
+    "integration": "branch"
+  },
+  "milestones": [
+    {
+      "id": "foundation",
+      "title": "Волна 0: каркас",
+      "acceptance": [
+        {
+          "id": "foundation-done",
+          "text": "Каркас, линтеры, стенд проверки и интерфейсы готовы.",
+          "evidenceKinds": [
+            "checks",
+            "review"
+          ]
+        }
+      ],
+      "releaseRequired": false
+    },
+    {
+      "id": "mvp",
+      "title": "MVP заметок",
+      "acceptance": [
+        {
+          "id": "mvp-done",
+          "text": "Модули storage, api и web работают вместе.",
+          "evidenceKinds": [
+            "acceptance",
+            "checks"
+          ]
+        }
+      ],
+      "releaseRequired": false
+    }
+  ],
+  "epics": [
+    {
+      "id": "foundation-setup",
+      "milestoneId": "foundation",
+      "title": "Каркас, линтеры, стенд проверки",
+      "acceptance": [
+        {
+          "id": "setup-done",
+          "text": "npm test и lint запускаются на пустом каркасе.",
+          "evidenceKinds": [
+            "checks"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "storage",
+      "milestoneId": "mvp",
+      "title": "Хранение заметок",
+      "acceptance": [
+        {
+          "id": "storage-done",
+          "text": "storage соответствует интерфейсу.",
+          "evidenceKinds": [
+            "checks"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "api",
+      "milestoneId": "mvp",
+      "title": "HTTP API",
+      "acceptance": [
+        {
+          "id": "api-done",
+          "text": "api соответствует интерфейсу.",
+          "evidenceKinds": [
+            "checks"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "web",
+      "milestoneId": "mvp",
+      "title": "Веб-страница",
+      "acceptance": [
+        {
+          "id": "web-done",
+          "text": "Страница работает со списком и поиском.",
+          "evidenceKinds": [
+            "checks"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "release-review",
+      "milestoneId": "mvp",
+      "title": "Независимое ревью MVP",
+      "acceptance": [
+        {
+          "id": "review-done",
+          "text": "Ревью без блокирующих замечаний.",
+          "evidenceKinds": [
+            "review"
+          ]
+        }
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "scaffold",
+      "epicId": "foundation-setup",
+      "title": "Каркас пакета и общие интерфейсы",
+      "description": "Создать package.json (type module), скрипты test и lint, конфигурацию линтеров. Интерфейсы storage, api и web заморожены в чертеже.",
+      "owner": "architect",
+      "dependsOn": [],
+      "writePaths": [
+        "package.json",
+        "tooling"
+      ],
+      "acceptance": [
+        {
+          "id": "scaffold-done",
+          "text": "npm test и npm run lint завершаются успешно.",
+          "evidenceKinds": [
+            "checks"
+          ]
+        }
+      ],
+      "interfaceRefs": [
+        {
+          "kind": "interface",
+          "path": "interfaces/storage.md"
+        },
+        {
+          "kind": "interface",
+          "path": "interfaces/api.md"
+        },
+        {
+          "kind": "interface",
+          "path": "interfaces/web.md"
+        }
+      ],
+      "priority": 90,
+      "userValue": 3,
+      "risk": 1,
+      "estimatedEffort": 1,
+      "riskApprovalRequired": false
+    },
+    {
+      "id": "test-bench",
+      "epicId": "foundation-setup",
+      "title": "Стенд проверки",
+      "description": "Общие тестовые помощники: временный каталог данных и запуск HTTP-сервера на свободном порту.",
+      "owner": "developer",
+      "dependsOn": [
+        "scaffold"
+      ],
+      "writePaths": [
+        "tests/support"
+      ],
+      "acceptance": [
+        {
+          "id": "bench-done",
+          "text": "Помощники покрыты собственными тестами.",
+          "evidenceKinds": [
+            "checks"
+          ]
+        }
+      ],
+      "interfaceRefs": [],
+      "priority": 85,
+      "userValue": 2,
+      "risk": 1,
+      "estimatedEffort": 1,
+      "riskApprovalRequired": false
+    },
+    {
+      "id": "storage-module",
+      "epicId": "storage",
+      "title": "Модуль storage",
+      "description": "Реализовать createNote, findNotes и deleteNote по интерфейсу storage с хранением в JSON-файле.",
+      "owner": "developer",
+      "dependsOn": [
+        "test-bench"
+      ],
+      "writePaths": [
+        "src/storage"
+      ],
+      "acceptance": [
+        {
+          "id": "storage-proof",
+          "text": "Тесты storage проходят на временном каталоге.",
+          "evidenceKinds": [
+            "checks"
+          ]
+        }
+      ],
+      "interfaceRefs": [
+        {
+          "kind": "interface",
+          "path": "interfaces/storage.md"
+        }
+      ],
+      "priority": 70,
+      "userValue": 4,
+      "risk": 1,
+      "estimatedEffort": 2,
+      "riskApprovalRequired": false
+    },
+    {
+      "id": "api-module",
+      "epicId": "api",
+      "title": "Модуль api",
+      "description": "HTTP-маршруты POST, GET и DELETE /notes по интерфейсу api; storage только через его интерфейс.",
+      "owner": "developer",
+      "dependsOn": [
+        "test-bench"
+      ],
+      "writePaths": [
+        "src/api",
+        "src/storage/index.mjs"
+      ],
+      "acceptance": [
+        {
+          "id": "api-proof",
+          "text": "HTTP-тесты проходят для успешных и ошибочных запросов.",
+          "evidenceKinds": [
+            "checks"
+          ]
+        }
+      ],
+      "interfaceRefs": [
+        {
+          "kind": "interface",
+          "path": "interfaces/api.md"
+        },
+        {
+          "kind": "interface",
+          "path": "interfaces/storage.md"
+        }
+      ],
+      "priority": 70,
+      "userValue": 4,
+      "risk": 2,
+      "estimatedEffort": 2,
+      "riskApprovalRequired": false
+    },
+    {
+      "id": "web-module",
+      "epicId": "web",
+      "title": "Модуль web",
+      "description": "Статическая страница со списком, поиском и удалением заметок через api.",
+      "owner": "developer",
+      "dependsOn": [
+        "test-bench"
+      ],
+      "writePaths": [
+        "src/web"
+      ],
+      "acceptance": [
+        {
+          "id": "web-proof",
+          "text": "Страница отдаётся сервером и вызывает только маршруты api.",
+          "evidenceKinds": [
+            "checks"
+          ]
+        }
+      ],
+      "interfaceRefs": [
+        {
+          "kind": "interface",
+          "path": "interfaces/web.md"
+        },
+        {
+          "kind": "interface",
+          "path": "interfaces/api.md"
+        }
+      ],
+      "priority": 60,
+      "userValue": 4,
+      "risk": 1,
+      "estimatedEffort": 2,
+      "riskApprovalRequired": false
+    },
+    {
+      "id": "web-ui-qa",
+      "epicId": "web",
+      "title": "UI-проверка страницы",
+      "description": "Сценарий в браузере: создать, найти и удалить заметку; проверить пустое состояние.",
+      "owner": "ui-qa",
+      "dependsOn": [
+        "web-module"
+      ],
+      "writePaths": [
+        "tests/ui"
+      ],
+      "acceptance": [
+        {
+          "id": "ui-proof",
+          "text": "Сценарий проходит в браузере на собранной странице.",
+          "evidenceKinds": [
+            "checks"
+          ]
+        }
+      ],
+      "interfaceRefs": [
+        {
+          "kind": "interface",
+          "path": "interfaces/web.md"
+        }
+      ],
+      "priority": 50,
+      "userValue": 3,
+      "risk": 1,
+      "estimatedEffort": 1,
+      "riskApprovalRequired": false
+    },
+    {
+      "id": "mvp-review",
+      "epicId": "release-review",
+      "title": "Независимое ревью MVP",
+      "description": "Проверить соответствие модулей интерфейсам и критериям готовности; записать замечания.",
+      "owner": "reviewer",
+      "dependsOn": [
+        "storage-module",
+        "api-module",
+        "web-ui-qa"
+      ],
+      "writePaths": [
+        "docs/review"
+      ],
+      "acceptance": [
+        {
+          "id": "review-proof",
+          "text": "Отчёт ревью без блокирующих замечаний.",
+          "evidenceKinds": [
+            "review"
+          ]
+        }
+      ],
+      "interfaceRefs": [],
+      "priority": 40,
+      "userValue": 3,
+      "risk": 1,
+      "estimatedEffort": 1,
+      "riskApprovalRequired": false
+    }
+  ]
+}

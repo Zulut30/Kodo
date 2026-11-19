@@ -140,6 +140,9 @@ function checksCurrent(run) {
   const receipt = run.checks;
   return (
     receipt?.schemaVersion === 2 &&
+    // A profiled receipt (task-fast) never stands in for the full checks.
+    !Object.hasOwn(receipt, 'profile') &&
+    run.verificationProfile === undefined &&
     receipt.complete === true &&
     receipt.headSha === run.headSha &&
     Array.isArray(receipt.results) &&
@@ -406,3 +409,25 @@ export async function evaluateProjectTransition(input, ports = {}) {
     return blocked(record, 'project_transition_evidence_invalid');
   }
 }
+
+// Shared, unchanged helpers for the wave evaluator (project-wave-evidence.mjs).
+export {
+  lifecycle,
+  settled,
+  sha,
+  result,
+  history,
+  blocked,
+  forward,
+  immutable,
+  prepare,
+  verify,
+  references,
+  mapped,
+  hasProof,
+  checksCurrent,
+  gatesCurrent,
+  integrated,
+  controls,
+  bindingMatches,
+};

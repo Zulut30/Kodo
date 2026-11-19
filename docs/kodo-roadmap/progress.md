@@ -17,10 +17,10 @@ MVP Project Director реализован. Фактическая приёмка
 | 09 Verification/evolution | **ACCEPTED**, [PR #19](https://github.com/Zulut30/Kodo/pull/19) MERGED `907e6cb` 2026-11-10; CI обеих ОС и `kodo/review` SUCCESS | Behaviour gate, защита тестов по именам кейсов. [Phase09](phase-09.md) |
 | 10 Progress/maintenance | **ACCEPTED**, [PR #20](https://github.com/Zulut30/Kodo/pull/20) MERGED `3d71958` 2026-11-10; CI обеих ОС и `kodo/review` SUCCESS | Watchdog и текущий блокер. [Phase10](phase-10.md) |
 | 11 Merge/release | **ACCEPTED**, [PR #21](https://github.com/Zulut30/Kodo/pull/21) MERGED `55fc4ba` 2026-11-10; CI обеих ОС и `kodo/review` SUCCESS | Журнал операций доставки, привязка проверки пакета к SHA-256. [Phase11](phase-11.md) |
-| 12 Observability | **IN PROGRESS**, ветка `kodo/12-observability`: read-only `kodo report` по Run/Project | [Phase12](phase-12.md); приёмка — после CI и merge PR этапа |
-| F1 Wave foundations | NOT STARTED | Поле `execution` (cadence wave), `appendMilestone`, gate-записи, профиль `task-fast`, интеграционная ветка `kodo/project/<id>` |
-| F2 Wave director + T3 host | NOT STARTED | `kodo project drain`, `next-wave`/`complete-task` для воркер-чатов T3 |
-| F3 Bootstrap/extend | NOT STARTED | Чертёж `.kodo/blueprint/`, `bootstrap`/`apply-spec`/`extend`/`append-milestone`, навык `kodo-project-director` |
+| 12 Observability | **ACCEPTED**, [PR #22](https://github.com/Zulut30/Kodo/pull/22) MERGED `a72326f` 2026-11-18; CI обеих ОС и `kodo/review` SUCCESS, независимое ревью PASS с 8-го раунда | Read-only `kodo report` по Run/Project. [Phase12](phase-12.md) |
+| F1 Wave foundations | **CANDIDATE**, ветка `kodo/f2-wave-execution` (вместе с F2–F3) | Поле `execution` (cadence wave), `appendMilestone`, gate-записи, профиль `task-fast`, интеграционная ветка `kodo/project/<id>`. [PhaseF1](phase-f1.md) |
+| F2 Wave director + T3 host | **CANDIDATE**, та же ветка | `kodo project drain`, `next-wave`/`complete-task` для воркер-чатов T3. [PhaseF2](phase-f2.md) |
+| F3 Bootstrap/extend | **CANDIDATE**, та же ветка | Чертёж `.kodo/blueprint/`, `bootstrap`/`apply-spec`/`extend`/`append-milestone`, навык `kodo-project-director`. [PhaseF3](phase-f3.md) |
 | 13 Final acceptance | NOT STARTED | После 12 и F1–F3: офлайн-сценарии A/C/E/F, ограниченный живой пилот фабрики, выпуск v1.0.0 |
 
 [Baseline](BASELINE.md), [приёмка01](phase-01.md), [изменения и evidence02](phase-02.md). Исторические [local](../../tests/fixtures/roadmap-baseline/local-baseline.json) и [CI](../../tests/fixtures/roadmap-baseline/ci-baseline.json) receipts не перезаписываются. Published0.2.6 является прежним выпуском; новый release запланирован на фазе13.
