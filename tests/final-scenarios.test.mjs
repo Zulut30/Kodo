@@ -47,6 +47,26 @@ const envKeys = [
   'GIT_CONFIG_NOSYSTEM',
   'GIT_CONFIG_GLOBAL',
   'GIT_TERMINAL_PROMPT',
+  'TMP',
+  'TEMP',
+  'TMPDIR',
+];
+// Variables that point Git at another repository, index, object store or configuration: removed
+// for the whole scenario, including the Git processes Kodo starts.
+const gitRedirects = [
+  'GIT_DIR',
+  'GIT_WORK_TREE',
+  'GIT_INDEX_FILE',
+  'GIT_OBJECT_DIRECTORY',
+  'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+  'GIT_COMMON_DIR',
+  'GIT_NAMESPACE',
+  'GIT_CEILING_DIRECTORIES',
+  'GIT_DISCOVERY_ACROSS_FILESYSTEM',
+  'GIT_CONFIG',
+  'GIT_CONFIG_SYSTEM',
+  'GIT_CONFIG_PARAMETERS',
+  'GIT_CONFIG_COUNT',
 ];
 
 function git(cwd, ...args) {
@@ -58,17 +78,39 @@ function git(cwd, ...args) {
 const statuses = rows => Object.fromEntries(rows.map(row => [row.id, row.status]));
 const containersOf = gate => gate.containers.map(row => `${row.kind}:${row.kind === 'project' ? '' : row.id}`);
 
-/** A temporary directory with an isolated HOME, KODO_HOME, credentials, worktrees and Git config. */
+/**
+ * A temporary directory with an isolated HOME, KODO_HOME, credentials, worktrees, temporary files
+ * and Git config, and no Git redirection inherited from the caller.
+ */
 async function sandbox(t, prefix) {
-  const directory = await mkdtemp(path.join(os.tmpdir(), `kodo-final-${prefix}-`));
+  const parent = os.tmpdir();
+  const directory = await mkdtemp(path.join(parent, `kodo-final-${prefix}-`));
+  const previous = Object.fromEntries([...envKeys, ...gitRedirects].map(key => [key, process.env[key]]));
+  const stores = new Set();
+  // Registered before anything else: a failed setup still restores the environment and removes the directory.
+  t.after(async () => {
+    for (const store of stores) store.close();
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    assert.equal(path.dirname(directory), path.resolve(parent));
+    assert.match(path.basename(directory), new RegExp(`^kodo-final-${prefix}-`));
+    await rm(directory, { recursive: true, force: true });
+  });
   const root = path.join(directory, 'repo'),
     home = path.join(directory, 'state'),
-    isolated = path.join(directory, 'empty-home');
+    isolated = path.join(directory, 'empty-home'),
+    temp = path.join(directory, 'tmp');
   await mkdir(root);
   await mkdir(isolated);
+  await mkdir(temp);
   await writeFile(path.join(isolated, 'gitconfig'), '');
-  const previous = Object.fromEntries(envKeys.map(key => [key, process.env[key]]));
+  for (const key of gitRedirects) delete process.env[key];
   Object.assign(process.env, {
+    TMP: temp,
+    TEMP: temp,
+    TMPDIR: temp,
     HOME: isolated,
     USERPROFILE: isolated,
     KODO_HOME: home,
@@ -77,17 +119,6 @@ async function sandbox(t, prefix) {
     GIT_CONFIG_NOSYSTEM: '1',
     GIT_CONFIG_GLOBAL: path.join(isolated, 'gitconfig'),
     GIT_TERMINAL_PROMPT: '0',
-  });
-  const stores = new Set();
-  t.after(async () => {
-    for (const store of stores) store.close();
-    for (const [key, value] of Object.entries(previous)) {
-      if (value === undefined) delete process.env[key];
-      else process.env[key] = value;
-    }
-    assert.equal(path.dirname(directory), path.resolve(os.tmpdir()));
-    assert.match(path.basename(directory), new RegExp(`^kodo-final-${prefix}-`));
-    await rm(directory, { recursive: true, force: true });
   });
   return { directory, root, home, stores };
 }
@@ -884,6 +915,15 @@ test(
     );
     assert.deepEqual([statuses(snapshot.tasks).alpha, statuses(snapshot.tasks).beta], ['integrated', 'integrated']);
     assert.equal(f.merges(id).length, 2, 'the recovery made no second merge commit');
+    // The aborted attempts of gamma and delta are settled and not integrated: a plain drain would not
+    // continue them, only --retry-failed opens new attempts.
+    const abortedAttempts = Object.fromEntries(
+      ['gamma', 'delta'].map(taskId => [taskId, snapshot.currentAttempts.find(row => row.taskId === taskId)]),
+    );
+    for (const [taskId, attempt] of Object.entries(abortedAttempts)) {
+      assert.ok(attempt, `${taskId} has an attempt`);
+      assert.ok(['cancelled', 'blocked', 'failed'].includes(attempt.status), `${taskId}: ${attempt.status}`);
+    }
 
     // 3. A repeated drain continues: the cancelled attempts are retried, the project is accepted.
     controller = new AbortController();
@@ -894,6 +934,12 @@ test(
     assert.equal(snapshot.project.status, 'accepted');
     assert.ok(snapshot.tasks.every(row => row.status === 'accepted'));
     assertMergedOnce(f, id, ['alpha', 'beta', 'gamma', 'delta']);
+    for (const [taskId, attempt] of Object.entries(abortedAttempts)) {
+      const current = snapshot.currentAttempts.find(row => row.taskId === taskId);
+      assert.notEqual(current.id, attempt.id, `${taskId} was retried by a new attempt`);
+      assert.ok(current.number > attempt.number, `${taskId}: attempt ${current.number} after ${attempt.number}`);
+      assert.equal(current.status, 'accepted');
+    }
     const runsOf = taskId => f.taskRuns().filter(run => run.directorBinding.taskId === taskId);
     assert.equal(runsOf('alpha').length, 1, 'the crashed integration reused its Run');
     assert.equal(runsOf('beta').length, 1);

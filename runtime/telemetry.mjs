@@ -749,14 +749,15 @@ function gateBlockers(gates) {
     }));
 }
 
-// Gate Runs are counted apart from the task totals, whose meaning stays per task attempt.
+// Gate Runs are counted apart from the task totals, whose meaning stays per task attempt. A gate
+// whose Run is missing makes the session total unknown; `observedUsage` keeps what was found.
 function gateTotals(gates) {
   const found = gates.filter(gate => gate.report);
   return {
     gates: gates.length,
     runs: found.length,
     complete: found.length === gates.length,
-    sessions: total(found.map(gate => gate.row.sessions)).value ?? (found.length ? null : 0),
+    sessions: gates.length ? total(gates.map(gate => gate.row.sessions)).value : 0,
     observedUsage: usageOf(found.flatMap(gate => list(gate.run.sessionAttempts))),
   };
 }

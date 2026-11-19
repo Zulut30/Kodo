@@ -6,10 +6,10 @@ Kodo объединяет каталог навыков и локальный и
 
 ## Установка CLI
 
-Пакет распространяется через [GitHub Release 1.0.0](https://github.com/Zulut30/Kodo/releases/tag/v1.0.0), без публикации в npm:
+Пакет распространяется через [GitHub Release 0.2.6](https://github.com/Zulut30/Kodo/releases/tag/v0.2.6), без публикации в npm:
 
 ```powershell
-npm install -g "https://github.com/Zulut30/Kodo/releases/download/v1.0.0/zulut30-kodo-1.0.0.tgz"
+npm install -g "https://github.com/Zulut30/Kodo/releases/download/v0.2.6/zulut30-kodo-0.2.6.tgz"
 kodo init
 kodo doctor --json
 ```
@@ -89,7 +89,7 @@ node cli/index.mjs ui verify --project "D:\Projects\my-app" --json
 node cli/index.mjs security verify --project "D:\Projects\my-app" --json
 ```
 
-У старых проектов UI/security по умолчанию выключены; в конфигурации самого Kodo включены Semgrep/Gitleaks, UI выключен как неприменимый к CLI. `disabled` сохраняется как `passed:null`. Включённые проверки выполняет координатор после build/test и до review/delivery, с привязкой к head/config/pins и приватным evidence. `tools doctor --live` проверяет только локальные версии/import metadata, без модели или UI. [Pins, лицензии, setup, JSON и границы](docs/UI-TOOLS.md), [реальные квитанции и проверки](docs/archive/VALIDATION.md#интеграция-ui-security-и-контекста). UI/security gates входят в выпуски с 0.2.6, текущий — 1.0.0; изменения `main` после него попадают в пакет только со следующим выпуском.
+У старых проектов UI/security по умолчанию выключены; в конфигурации самого Kodo включены Semgrep/Gitleaks, UI выключен как неприменимый к CLI. `disabled` сохраняется как `passed:null`. Включённые проверки выполняет координатор после build/test и до review/delivery, с привязкой к head/config/pins и приватным evidence. `tools doctor --live` проверяет только локальные версии/import metadata, без модели или UI. [Pins, лицензии, setup, JSON и границы](docs/UI-TOOLS.md), [реальные квитанции и проверки](docs/archive/VALIDATION.md#интеграция-ui-security-и-контекста). UI/security gates входят в выпуск 0.2.6; изменения `main` после него попадают в пакет только со следующим выпуском.
 
 Для работы в desktop host сохраняй постоянный чат `Kodo · Диспетчер задач`. Координатор поручает реальную работу понятно названным видимым чатам через доступные app tools и после проверки архивирует только собственные завершённые worker-чаты. Диспетчер остаётся активным. CLI-native сессии сохраняются отдельно и автоматически видимыми чатами не становятся; универсальный desktop backend в CLI не заявляется. [Контракт чат-входа](skills/kodo-build-feature/SKILL.md).
 
@@ -103,7 +103,7 @@ kodo audit $runId
 kodo audit $runId --json
 ```
 
-Из текущих исходников: `node cli/index.mjs audit $runId --json`. Команда входит в выпуск 1.0.0.
+Из текущих исходников: `node cli/index.mjs audit $runId --json`. Команда входит в выпуск 0.2.6.
 
 Аудит читает только локальное состояние: `init`, конфигурация проекта, ключи, авторизация клиентов и Git не нужны. Текст показывает запуск, состояние, отсутствующие и некорректные этапы, число и список применимых навыков, сохранённые PR и релиз; JSON содержит ограниченный набор полей схемы 1.
 

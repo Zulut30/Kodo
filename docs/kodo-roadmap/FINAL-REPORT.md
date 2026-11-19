@@ -2,7 +2,7 @@
 
 Дата: 2026-11-19. Программа: этапы 01–13 roadmap и фабрика проектов F1–F3 (решения пользователя 2026-11-17, см. [phase-13](phase-13.md)). Отчёт различает уровни доказательства: **local** (Windows 11, Node 24.19, эта машина), **CI** (GitHub Actions, Linux и Windows), **native** (реальные подписочные клиенты), **installed** (установленный `.tgz`), **published** (GitHub Release), **deployed**. Нет наблюдения — `NOT RUN` или `unknown`, а не PASS.
 
-Доказательства выпуска (CI этапа 13, независимое ревью, SHA-256 опубликованного `.tgz`, проверка скачанного и установленного пакета) фиксируются в PR этапа 13 и в заметках GitHub Release `v1.0.0` — они появляются после коммита этого файла.
+На коммите этого файла наблюдались только уровни local и native. CI этапа 13, опубликованный `.tgz` с SHA-256 и проверка скачанного и установленного пакета на этот момент **ожидаются**: они появятся в PR этапа 13 и в заметках GitHub Release `v1.0.0`, а после выпуска вносятся в этот файл отдельным изменением. До этого подтверждённым выпуском остаётся 0.2.6 (README).
 
 ## Требования
 
@@ -11,7 +11,7 @@
 | Этапы 01–11 (baseline, качество, CI/кэш, архитектура, знания, Project Director, оркестрация, проверки, behaviour gate, сторож прогресса, журнал доставки) | ACCEPTED | PR #10–#21, CI обеих ОС; [progress.md](progress.md) |
 | 12 Операционный отчёт `kodo report` | ACCEPTED | PR #22 (`a72326f`), CI обеих ОС; гейты волнового режима — исправление 5 этапа 13 |
 | F1–F3 Фабрика проектов: волны, интеграционная ветка, gate Run, хост T3, чертёж, extend | ACCEPTED | PR #23 (`b12eed4`), 15 раундов независимого ревью, CI обеих ОС |
-| 13① Офлайн-сценарии A, C, E, F | PASS local | `tests/final-scenarios.test.mjs` 7/7 (два прогона, 1274 с и 1337 с); CI — в PR этапа |
+| 13① Офлайн-сценарии A, C, E, F | PASS local; CI ожидается | `tests/final-scenarios.test.mjs` 7/7 (два прогона, 1274 с и 1337 с) |
 | 13① B (mini Rust/Git), D (Hearthstone) | NOT RUN | Исключены решением пользователя |
 | 13② Нативные Codex и Claude | PASS native | Run `cfb6ffba` (Codex, после исправлений 1–2), `19a9b9ff` (Claude) |
 | 13② Отмена и продолжение | PASS native | Run `346684f0`: `cancelled` за ~1 с, `resume` → `succeeded` |
@@ -22,18 +22,18 @@
 | Orca | NOT RUN | Протокол общий с T3, хост не проверялся |
 | TokenEconomizer (hooks/injection, экономия) | unknown | Нет наблюдения поддерживаемого пути |
 | Лицензии | PASS local | 13 закреплённых навыков: 12 MIT, 1 CC-BY-SA-4.0 (`skills/differential-review`, trailofbits/skills); файлы лицензий на месте, SHA-256 совпадают с `third-party-skills.lock.json`. Пакет Kodo `private: true`, без поля `license` |
-| Выпуск: GitHub Release `.tgz` + SHA-256 | см. Release `v1.0.0` | Публикация в npm — нет (решение) |
+| Выпуск: GitHub Release `.tgz` + SHA-256 | ожидается | Версия 1.0.0 в `package.json`, `package-lock.json`, `registry.json`; публикации в npm нет (решение) |
 | Развёртывание | not_configured | У Kodo нет целевой среды развёртывания |
 
 ## Матрица доказательств
 
-| Уровень | Что наблюдалось |
+| Уровень | Наблюдение на коммите этого файла |
 | --- | --- |
 | local | Полный `npm run check` + security (L2) на замороженном head этапа 13 — в PR этапа; целевые наборы каждого исправления RED → GREEN; офлайн-сценарии 7/7 |
-| CI | Обязательные `check (ubuntu-latest, 24)` и `check (windows-latest, 24)` с проверкой установленного пакета — в PR этапа 13 |
+| CI | Ожидается: обязательные `check (ubuntu-latest, 24)` и `check (windows-latest, 24)` с проверкой установленного пакета в PR этапа 13 |
 | native | Codex CLI 0.170.0 и Claude Code по подпискам: 5 Run (`kodo run`) и 5 gate Run пилота (19 сессий Codex, ~82 мин сессий, 11,65 млн токенов, из них 10,17 млн из кэша) |
-| installed | Установка скачанного `.tgz` в чистый prefix и `kodo --help`, `validate --json`, `doctor`, `report`, `project --help` — в заметках выпуска |
-| published | GitHub Release `v1.0.0`: `.tgz`, `SHA256SUMS`; SHA-256 скачанного файла сверяется с проверенным пакетом |
+| installed | Ожидается: установка скачанного `.tgz` в чистый prefix и `kodo --help`, `validate --json`, `doctor`, `report`, `project --help` |
+| published | Ожидается: GitHub Release `v1.0.0` с `.tgz` и `SHA256SUMS`; SHA-256 скачанного файла сверяется с проверенным пакетом |
 | deployed | not_configured |
 
 ## Найдено и исправлено в этапе 13

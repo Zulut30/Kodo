@@ -605,12 +605,17 @@ export async function runProjectGates(ctx, input) {
   need(C.isWaveProject((await snapshotOf(ctx, projectId)).project), 'wave_required');
   return withProjectLease(storeOf(ctx), projectId, async () => {
     const snapshot = await snapshotOf(ctx, projectId);
-    if (snapshot.project.paused || ['cancelled', 'failed'].includes(snapshot.project.status))
+    // The same control states complete-task refuses: a gate pass never reports success for them.
+    if (snapshot.project.paused || ['cancelled', 'failed', 'blocked'].includes(snapshot.project.status))
       return { status: 'blocked', code: 'project_control_blocked', revision: snapshot.revision };
+    if (signal?.aborted) return { status: 'blocked', code: 'project_cancelled', revision: snapshot.revision };
     const W = wavePorts(input.ports, ['createWaveContext', 'runPendingGates']);
     const gates = await runGates(W, waveContextOf(ctx, C, W), projectId, signal, retryFailed === true);
+    const revision = (await snapshotOf(ctx, projectId)).revision;
+    // An interrupted pass may return before any gate ran: never `passed`.
+    if (signal?.aborted) return { status: 'blocked', code: 'project_cancelled', gates, revision };
     const status = Array.isArray(gates.blocked) && gates.blocked.length ? 'blocked' : 'passed';
-    return { status, gates, revision: (await snapshotOf(ctx, projectId)).revision };
+    return { status, gates, revision };
   });
 }
 

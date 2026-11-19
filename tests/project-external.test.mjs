@@ -661,6 +661,39 @@ test('gates runs the pending epic gates outside a completion and retries a block
   assert.equal(f.calls.gates.length, 2, 'a paused project runs no gate');
 });
 
+test('gates never reports success for a blocked project or an aborted pass', async t => {
+  const f = await fixture(t);
+  f.ports.runPendingGates = async (waveCtx, input) => {
+    f.calls.gates.push(input);
+    return { gates: [], accepted: [], blocked: [] };
+  };
+  // A project whose own status is blocked (as complete-task refuses it).
+  const real = f.repo.snapshot.bind(f.repo);
+  const blockedRepo = Object.create(f.repo, {
+    snapshot: { value: id => ({ ...real(id), project: { ...real(id).project, status: 'blocked' } }) },
+  });
+  const refused = await runProjectGates({ ...f.ctx, repo: blockedRepo }, { projectId: f.projectId, ports: f.ports });
+  assert.deepEqual([refused.status, refused.code], ['blocked', 'project_control_blocked']);
+  assert.deepEqual(f.calls.gates, [], 'a blocked project runs no gate');
+
+  const before = new AbortController();
+  before.abort();
+  const early = await runProjectGates(f.ctx, { projectId: f.projectId, ports: f.ports, signal: before.signal });
+  assert.deepEqual([early.status, early.code], ['blocked', 'project_cancelled']);
+  assert.deepEqual(f.calls.gates, [], 'an aborted pass starts no gate');
+
+  // Aborted while the gates ran: the pass returned without a blocked gate but is not a success.
+  const during = new AbortController();
+  f.ports.runPendingGates = async (waveCtx, input) => {
+    f.calls.gates.push(input);
+    during.abort();
+    return { gates: [], accepted: [], blocked: [] };
+  };
+  const late = await runProjectGates(f.ctx, { projectId: f.projectId, ports: f.ports, signal: during.signal });
+  assert.deepEqual([late.status, late.code], ['blocked', 'project_cancelled']);
+  assert.equal(f.calls.gates.length, 1);
+});
+
 test('gates requires a wave project', async t => {
   const f = await fixture(t, { wave: false });
   await assert.rejects(

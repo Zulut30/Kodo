@@ -783,7 +783,7 @@ test('project report keeps future wave gates only when the snapshot has them', (
   assert.deepEqual(report.gates, [{ id: 'wave-1', status: 'passed', runId: null, containers: [], sessions: null }]);
   assert.deepEqual(
     { gates: report.totals.gates.gates, runs: report.totals.gates.runs, sessions: report.totals.gates.sessions },
-    { gates: 1, runs: 0, sessions: 0 },
+    { gates: 1, runs: 0, sessions: null },
   );
   assert.deepEqual(report.totals.tasks, 0);
   assert.equal(report.totals.wallMs, null);
@@ -836,9 +836,15 @@ test('project report reads wave gates from their gate Runs; only a current block
   ]);
   assert.deepEqual(
     { gates: report.totals.gates.gates, runs: report.totals.gates.runs, sessions: report.totals.gates.sessions },
-    { gates: 4, runs: 3, sessions: 6 },
+    { gates: 4, runs: 3, sessions: null },
+    'a gate without its Run makes the session total unknown',
   );
-  assert.equal(report.totals.gates.observedUsage.sessions, 6);
+  assert.equal(report.totals.gates.complete, false);
+  assert.equal(report.totals.gates.observedUsage.sessions, 6, 'observed sessions of the found Runs');
+  const found = buildProjectReport(projectSnapshot([], [], { gates: gates.slice(0, 3) }), runs, {}, { now: NOW });
+  assert.deepEqual([found.totals.gates.sessions, found.totals.gates.complete], [6, true]);
+  const none = buildProjectReport(projectSnapshot([], [], { gates: [] }), runs, {}, { now: NOW });
+  assert.equal(none.totals.gates.sessions, 0, 'no gates: zero, not unknown');
   assert.equal(report.totals.sessions, 0, 'task totals keep their meaning');
 });
 

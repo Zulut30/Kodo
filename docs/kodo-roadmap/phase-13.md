@@ -56,6 +56,19 @@
 | 5 | `kodo report --project` показывал гейты `unknown`, не считал их сессии и не видел заблокированный гейт | Состояние гейта из его gate Run, `totals.gates`, блокер `scope: gate` для незаменённого гейта | `tests/telemetry.test.mjs` |
 | 6 | Справка CLI обещала повтор `--client` | Текст справки | — |
 
+### Независимое ревью этапа
+
+Ревью Codex (gpt-6.2-sol) диффа `b12eed4..516e2e3`: FAIL, 3 major и 3 minor, все исправлены.
+
+| Находка | Исправление | Тест |
+| --- | --- | --- |
+| major: `gates` отвечал `passed` для заблокированного проекта и отменённого прохода | Те же состояния, что отклоняет `complete-task`, — `project_control_blocked`; отмена до или во время прохода — `project_cancelled` | `tests/project-external.test.mjs` |
+| major: сценарии не очищали `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE` и другие переменные перенаправления Git | `sandbox()` удаляет их на время сценария, направляет временные файлы в каталог сценария и регистрирует очистку сразу после `mkdtemp` | `tests/final-scenarios.test.mjs` |
+| major: отчёты и README заявляли выпуск 1.0.0 до квитанций | README ссылается на подтверждённый 0.2.6; CI, установка и публикация в FINAL-REPORT — «ожидается» | — |
+| minor: сессии гейтов давали `0` при пропущенном Run | `totals.gates.sessions` — `null`, если Run гейта не найден | `tests/telemetry.test.mjs` |
+| minor: тест ACL принял бы правило только с `Synchronize` | Тест требует `ReadAndExecute` и наследование на файлы и каталоги; с ослабленным правом падает | `tests/efficiency-engine.test.mjs` |
+| minor: E4 не проверял попытки после отмены | Попытки `gamma` и `delta` после отмены завершены и не интегрированы; после `--retry-failed` — новые попытки с большим номером, `accepted` | `tests/final-scenarios.test.mjs` |
+
 ## Известные ограничения после этапа
 
 - Брифы `next-wave` вызывают `kodo` по имени: если на PATH другая версия Kodo, чем у диспетчера, самопроверку нужно запускать тем же CLI (в пилоте глобальная 0.2.6 заменялась локальным `node cli/index.mjs`).
