@@ -928,6 +928,10 @@ test(
   { timeout: 900000 },
   async t => {
     let controller = new AbortController();
+    /** @type {'crash' | 'abort' | 'retry'} */
+    let phase = 'crash';
+    /** @type {string | null} */
+    let barrierFailure = null;
     const tasks = [
       task('alpha', { priority: 90 }),
       task('beta', { priority: 80 }),
@@ -939,12 +943,18 @@ test(
       tasks,
       hooks: {
         onWorker: async (id, calls) => {
-          for (let i = 0; i < 1200 && calls.active < 2; i++) await delay(25);
-          const first = calls.worker.filter(name => name === id).length === 1;
-          // The second drain is interrupted while gamma and delta are inside their sessions: delta's
-          // first session ends only after the abort, so neither can finish first on any platform.
-          if (id === 'gamma' && first) controller.abort();
-          if (id === 'delta' && first) for (let i = 0; i < 1200 && !controller.signal.aborted; i++) await delay(25);
+          // The second drain is interrupted while gamma and delta are both inside their first
+          // sessions: delta's session ends only after the abort, so neither can finish first on any
+          // platform. A barrier that times out fails the scenario instead of weakening it.
+          const barrier = phase === 'abort' && ['gamma', 'delta'].includes(id);
+          for (let i = 0; i < (barrier ? 4800 : 1200) && calls.active < 2; i++) await delay(25);
+          if (!barrier) return;
+          if (calls.active < 2) barrierFailure ??= `${id} entered its session without the other one`;
+          if (id === 'gamma') controller.abort();
+          else {
+            for (let i = 0; i < 4800 && !controller.signal.aborted; i++) await delay(25);
+            if (!controller.signal.aborted) barrierFailure ??= 'delta waited 120 s without the abort';
+          }
         },
       },
     });
@@ -968,7 +978,9 @@ test(
     assert.equal(f.merges(id).length, 2, 'both merge commits exist, one of them unrecorded');
 
     // 2. The next drain recovers the unrecorded merge, starts gamma and delta and is aborted.
+    phase = 'abort';
     const aborted = await f.director().drain(id, { concurrency: 2, signal: controller.signal });
+    assert.equal(barrierFailure, null, 'both sessions were in flight when the drain was aborted');
     assert.equal(aborted.status, 'cancelled', JSON.stringify(aborted));
     let snapshot = f.repo.snapshot(id);
     assert.ok(
@@ -988,6 +1000,7 @@ test(
     }
 
     // 3. A repeated drain continues: the cancelled attempts are retried, the project is accepted.
+    phase = 'retry';
     controller = new AbortController();
     const resumed = await f.cli(['drain', id, '--concurrency', '2', '--retry-failed']);
     assert.equal(resumed.exitCode, 0, resumed.output);
