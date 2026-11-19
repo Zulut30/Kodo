@@ -203,3 +203,15 @@ test('Kodo replaces the reporters of a counted run and removes its private event
   assert.ok(path.isAbsolute(destination) && !destination.startsWith(root), destination);
   await assert.rejects(() => access(path.dirname(destination)), { code: 'ENOENT' }, 'the event directory is removed');
 });
+
+test('A receipt from Kodo installed elsewhere is still recognized: only the reporter location differs', () => {
+  const step = { command: 'node', args: ['--test'] };
+  const one = lines(event());
+  const counting = countingArguments(step.args, destination);
+  // The same reporter module of another Kodo install (an upgrade or a moved checkout).
+  const moved = counting.with(2, '--test-reporter=file:///D:/other/install/runtime/test-count-reporter.mjs');
+  assert.deepEqual(nodeTestOutcome(step, observed(step, one, moved)), { tests: 1 });
+  // A different module name is not Kodo's reporter.
+  const foreign = counting.with(2, '--test-reporter=file:///D:/other/install/runtime/my-reporter.mjs');
+  assert.deepEqual(nodeTestOutcome(step, observed(step, one, foreign)), { tests: null });
+});

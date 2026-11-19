@@ -31,6 +31,8 @@ export const FAST_CHECK_TIMEOUT_MS = 120000;
  */
 export const TEST_COUNT_VERSION = 2;
 const REPORTER_URL = new URL('./test-count-reporter.mjs', import.meta.url).href;
+// Kodo's own reporter module, at any install location.
+const kodoReporterArgument = /^--test-reporter=file:\/\/\/.+\/runtime\/test-count-reporter\.mjs$/;
 // An event file larger than this is not read: its count is unknown.
 const EVENTS_LIMIT = 64 * 1024 * 1024;
 const LIST_LIMIT = 1000;
@@ -433,11 +435,16 @@ export function nodeTestOutcome(step, observed) {
   const destination = Array.isArray(executed?.args)
     ? /^--test-reporter-destination=([\s\S]+)$/.exec(String(executed.args[3] ?? ''))?.[1]
     : undefined;
+  // The receipt names Kodo's reporter by the location Kodo ran from; a later Kodo installed
+  // elsewhere still recognizes it as its own reporter module.
+  const expected = countingArguments(step.args, destination);
+  if (Array.isArray(executed?.args) && kodoReporterArgument.test(String(executed.args[2] ?? '')))
+    expected[2] = String(executed.args[2]);
   const exact =
     destination !== undefined &&
     path.isAbsolute(destination) &&
     executed.command === step.command &&
-    isDeepStrictEqual(executed.args, countingArguments(step.args, destination));
+    isDeepStrictEqual(executed.args, expected);
   return { tests: exact ? countTestEvents(observed.testEvents) : null };
 }
 
