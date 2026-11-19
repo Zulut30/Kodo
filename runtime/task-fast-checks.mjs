@@ -437,9 +437,13 @@ async function canonicalPath(target) {
     return path.join(await canonicalPath(parent), path.basename(resolved));
   }
 }
+// Both paths are canonical (real paths in their stored case): compared segment by segment, exactly.
+// path.relative folds case on Windows with Unicode rules, which would merge distinct directories
+// such as `Repo-K` and `Repo-K` (Kelvin sign).
 const inside = (outer, inner) => {
-  const relative = path.relative(outer, inner);
-  return relative === '' || (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+  const parts = value => value.split(path.sep).filter(Boolean);
+  const [container, contained] = [parts(outer), parts(inner)];
+  return container.length <= contained.length && container.every((segment, index) => segment === contained[index]);
 };
 
 /**

@@ -318,3 +318,28 @@ test('Without a working directory the process directory is the project: no event
     process.env.KODO_HOME = previous.home;
   }
 });
+
+test('Directories that differ only by a Unicode case fold are different directories', async t => {
+  const scratch = await project(t, {});
+  const { symlink } = await import('node:fs/promises');
+  const [ascii, kelvin, worktree, events] = ['Repo-K', 'Repo-K', 'worktree', 'events-outside'].map(name =>
+    path.join(scratch, name),
+  );
+  for (const directory of [ascii, kelvin, worktree, events]) await mkdir(directory);
+  await writeFile(path.join(worktree, 'd.test.mjs'), `${imports}test('d', () => {});\n`);
+  await symlink(events, path.join(kelvin, 'test-events'), 'junction');
+  const previous = process.env.KODO_HOME;
+  process.env.KODO_HOME = kelvin;
+  try {
+    const step = { command: process.execPath, args: ['--test', 'd.test.mjs'] };
+    const outcome = await executeCheck(
+      step,
+      { cwd: worktree, env: env({}), allowFailure: true, timeoutMs: 60000 },
+      true,
+      [ascii],
+    );
+    assert.equal(nodeTestOutcome(step, outcome)?.tests, 1);
+  } finally {
+    process.env.KODO_HOME = previous;
+  }
+});
