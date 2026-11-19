@@ -316,14 +316,20 @@ test('Codex isolation overrides disable configured MCPs and plugins without rewr
   await mkdir(path.join(project, '.codex'), { recursive: true });
   await mkdir(path.join(project, '.git'));
   const userConfig =
-    '[windows]\nsandbox="elevated"\n[mcp_servers."source.with.dot"]\ncommand="some-client"\n[plugins."some-plugin@market"]\nenabled=true\n';
+    '[windows]\nsandbox="elevated"\n[mcp_servers."remote-tools"]\nurl="https://example.invalid/mcp"\n[mcp_servers.local]\ncommand="some-client"\n[plugins."some-plugin@market"]\nenabled=true\n';
   const projectConfig = '[mcp_servers.project]\ncommand="project-server"\n';
   await writeFile(path.join(home, 'config.toml'), userConfig);
   await writeFile(path.join(project, '.codex/config.toml'), projectConfig);
   const args = await codexIsolationOverrides(project, { CODEX_HOME: home });
-  assert.ok(args.includes('mcp_servers."source.with.dot".enabled=false'));
-  assert.ok(args.includes('mcp_servers."project".enabled=false'));
-  assert.ok(args.includes('plugins."some-plugin@market".enabled=false'));
+  // Codex splits the -c key path on dots literally: a quoted segment names a different, incomplete server.
+  assert.ok(args.includes('mcp_servers.remote-tools.enabled=false'));
+  assert.ok(args.includes('mcp_servers.local.enabled=false'));
+  assert.ok(args.includes('mcp_servers.project.enabled=false'));
+  assert.ok(args.includes('plugins.some-plugin@market.enabled=false'));
+  assert.equal(
+    args.some(value => value.includes('"') && value !== 'notify=[]'),
+    false,
+  );
   assert.ok(args.includes('notify=[]'));
   assert.equal(
     args.some(value => value.includes('sandbox_mode')),
@@ -331,6 +337,26 @@ test('Codex isolation overrides disable configured MCPs and plugins without rewr
   );
   assert.equal(await readFile(path.join(home, 'config.toml'), 'utf8'), userConfig);
   assert.equal(await readFile(path.join(project, '.codex/config.toml'), 'utf8'), projectConfig);
+});
+
+test('Codex isolation refuses MCP and plugin names that a -c key path cannot address', async t => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'kodo-isolation-test-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const project = path.join(directory, 'project');
+  await mkdir(path.join(project, '.git'), { recursive: true });
+  for (const [index, table] of [
+    'mcp_servers."source.with.dot"',
+    'mcp_servers."with space"',
+    'plugins."a=b"',
+  ].entries()) {
+    const home = path.join(directory, `home-${index}`);
+    await mkdir(home);
+    await writeFile(path.join(home, 'config.toml'), `[${table}]\nenabled=true\n`);
+    await assert.rejects(
+      codexIsolationOverrides(project, { CODEX_HOME: home }),
+      error => /запуск инструментов не начат/.test(error.message) && !error.message.includes(table),
+    );
+  }
 });
 
 test('Provider event parser requires completion, exact output contract and session identity', () => {

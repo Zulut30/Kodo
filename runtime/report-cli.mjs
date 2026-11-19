@@ -131,7 +131,12 @@ async function projectReport(state, projectId, secrets, now) {
   const runs = new Map(),
     events = new Map(),
     jobEvents = new Map();
-  for (const { runId } of attempts) {
+  // Task attempt Runs and, in a wave project, the gate Runs of its gates.
+  const gateRuns = (snapshot.gates ?? [])
+    .map(gate => ({ runId: gate.runId }))
+    .filter(row => typeof row.runId === 'string');
+  for (const { runId } of [...attempts, ...gateRuns]) {
+    if (runs.has(runId)) continue;
     const row = state.tables.has('runs') && state.db.prepare('SELECT body FROM runs WHERE id=?').get(runId);
     if (!row) continue;
     runs.set(runId, JSON.parse(String(row.body)));

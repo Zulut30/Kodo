@@ -87,7 +87,7 @@ async function waveCommand(argv) {
   const action = Array.isArray(argv) ? argv[0] : undefined;
   if (action === 'report') return reportAlias;
   if (action === 'drain') return (await import('./project-cli-wave.mjs')).projectWaveCli;
-  if (action === 'next-wave' || action === 'complete-task')
+  if (action === 'next-wave' || action === 'complete-task' || action === 'gates')
     return (await import('./project-cli-external.mjs')).projectExternalCli;
   if (blueprintActions.has(action)) return (await import('./project-cli-blueprint.mjs')).projectBlueprintCli;
   return null;

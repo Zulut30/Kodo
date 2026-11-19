@@ -39,6 +39,7 @@ description: Веди большой проект через фабрику Kodo
    - `integrated` — задача влита в `kodo/project/<projectId>`; гейт эпика запускается автоматически, итог в `result.gates`.
    - `checks_failed` — передай `result.code` и `result.message` в тот же воркер-чат (тот же worktree) и повтори `complete-task` с новым SHA. Если исправление невозможно (например, конфликт интеграции) — `brief.abandonCommand` с подстановкой SHA и `--json`, затем `next-wave ... --retry-failed` (шаг 3).
    - `blocked` — покажи код пользователю; `project_busy` — другой контроллер держит проект, повтори позже.
+   - В `result.gates.blocked` есть гейт — покажи пользователю находки его gate Run (`kodo status <runId> --json`, поле `review.findings`). Гейт не повторяется сам. Когда причина устранена, выполни `kodo project gates <projectId> --retry-failed --json` — новый гейт на текущей голове интеграционной ветки.
 6. Повторяй шаги 1–5, пока `kodo project status <projectId> --json` не покажет проект `accepted` или блокер, который нужно показать пользователю.
 
 Принятие (`accepted`) даёт только gate Run эпика, майлстоуна или проекта. Не помечай задачи принятыми сам и не обходи проверки.

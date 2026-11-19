@@ -38,6 +38,14 @@ test('Invalid next-wave/complete-task arguments fail before credentials or state
     ['complete-task', id, 'task-a', '--head', head, '--command-id', 'x'],
     ['complete-task', id, 'task-a', '--head', head, '--abandon', '--abandon'],
     ['complete-task', id, 'task-a', '--head', head, '\u0001'],
+    ['gates'],
+    ['gates', 'not-a-uuid'],
+    ['gates', id, 'task-a'],
+    ['gates', id, '--host', 't3'],
+    ['gates', id, '--head', head],
+    ['gates', id, '--limit', '1'],
+    ['gates', id, '--retry-failed', '--retry-failed'],
+    ['gates', id, '--defer-gate'],
   ];
   let calls = 0;
   const ports = {
@@ -153,6 +161,9 @@ test('Project CLI delegates next-wave and complete-task to the pull protocol', a
   const refused = await projectCli(['next-wave', legacy, '--host', 't3', '--json'], base);
   assert.equal(refused.exitCode, 1);
   assert.deepEqual(refused.report.result, { status: 'invalid', code: 'project_wave_required' });
+  const noGates = await projectCli(['gates', legacy, '--json'], base);
+  assert.equal(noGates.exitCode, 1);
+  assert.deepEqual(noGates.report.result, { status: 'invalid', code: 'project_wave_required' });
 
   const waveId = await created('wave');
   const selected = [];
@@ -173,6 +184,20 @@ test('Project CLI delegates next-wave and complete-task to the pull protocol', a
     })),
     [{ limit: 2, inFlight: [], availability: [['task-a', true]] }],
   );
+  const gateCalls = [];
+  const gatePorts = {
+    ...wave,
+    createWaveContext: input => ({ ...input }),
+    runPendingGates: async (waveCtx, input) => {
+      gateCalls.push(input.retryFailed);
+      return { gates: [], accepted: [], blocked: [] };
+    },
+  };
+  const gated = await projectCli(['gates', waveId, '--retry-failed', '--json'], { ...base, wave: gatePorts });
+  assert.equal(gated.exitCode, 0, gated.output);
+  assert.equal(gated.report.result.status, 'passed');
+  assert.deepEqual(gateCalls, [true]);
+
   const [brief] = next.report.result.briefs;
   assert.equal(brief.taskId, 'task-a');
   assert.equal(brief.role, 'architect');

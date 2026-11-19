@@ -65,6 +65,7 @@ kodo project apply-spec --root PATH [--file SPEC_JSON] [--command-id UUID] [--js
 kodo project drain PROJECT_ID [--max-waves 1..100] [--concurrency 1..5] [--retry-failed] [--command-id UUID] [--json]
 kodo project next-wave PROJECT_ID --host t3|orca [--limit 1..5] [--retry-failed] [--json]
 kodo project complete-task PROJECT_ID TASK_ID --head SHA [--defer-gate|--abandon] [--command-id UUID] [--json]
+kodo project gates PROJECT_ID [--retry-failed] [--json]
 kodo project extend PROJECT_ID "FEATURE" [--prepare] [--client codex|claude-code] [--model MODEL] [--command-id UUID] [--json]
 kodo project append-milestone PROJECT_ID --file MILESTONE_JSON [--command-id UUID] [--json]
 ```

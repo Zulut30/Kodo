@@ -67,6 +67,7 @@ kodo project complete-task --head ►  проверка commit, task-fast,
 kodo project next-wave PROJECT_ID --host t3|orca [--limit 1..5] [--retry-failed] [--json]
 kodo project complete-task PROJECT_ID TASK_ID --head SHA [--defer-gate] [--attempt UUID] [--command-id UUID] [--json]
 kodo project complete-task PROJECT_ID TASK_ID --head SHA --abandon --attempt UUID [--command-id UUID] [--json]
+kodo project gates PROJECT_ID [--retry-failed] [--json]
 ```
 
 Аргументы разбираются строго до чтения учётных данных, состояния и Git; любая ошибка — exit 1, `project_arguments`. `--abandon` без `--attempt` — тоже `project_arguments`. `--limit` по умолчанию 3.
@@ -76,6 +77,8 @@ kodo project complete-task PROJECT_ID TASK_ID --head SHA --abandon --attempt UUI
 | `next-wave` | `{projectId, revision, briefs, blocked:[{taskId, code}]}` | 0 — есть брифы, 2 — пусто |
 | `complete-task` | `integrated` (`integration`, `gates`), `abandoned` | 0 |
 | `complete-task` | `checks_failed` (`code`, `message`), `blocked` (`code`) | 2 |
+| `gates` | `passed` (`gates`) | 0 |
+| `gates` | `blocked` (`gates` с заблокированными гейтами или `code`) | 2 |
 
 Ошибки отчёта — константные коды: собственные коды протокола (`project_wave_required`, `project_host_unsupported`, `project_busy`, `project_attempt_not_external` и др.) или `project_invalid`/`project_blocked`. Пути, аргументы и вывод провайдеров в ошибки не попадают.
 
@@ -112,7 +115,8 @@ kodo project complete-task PROJECT_ID TASK_ID --head SHA --abandon --attempt UUI
 - Конфликт при интеграции оставляет попытку `running` со статусом `blocked`. Rebase на новую голову интеграционной ветки протоколом не поддерживается: diff от старой базы захватит чужие изменения и не пройдёт проверку scope. Выход — `--abandon` и `next-wave --retry-failed`.
 - `next-wave` и `complete-task` держат lease `project:<id>`, как `drain` и foreground-директор: пока его держит другой контроллер (например, идущий `drain`), ответ — `project_busy`, команду повторяют позже. Проверку дополнительно сериализует lease `run:<id>`, слияния и переходы, чьё доказательство читает интеграционную ветку (`integrated`, `accepted`), — lease `project-integration:<id>`, который держится до фиксации перехода ([PROJECTS.md](PROJECTS.md), «Lease до фиксации»).
 - `--command-id` используется только для перехода `--abandon`; команды интеграции директор строит сам.
-- Gate Run эпика и принятие задач (`accepted`) выполняет директор (`runPendingGates`) внутри `complete-task` или `drain`.
+- Gate Run эпика и принятие задач (`accepted`) выполняет директор (`runPendingGates`) внутри `complete-task`, `gates` или `drain`.
+- Заблокированный gate Run сам не повторяется: `complete-task` запускает только ожидающие гейты. После устранения причины (например, задача исправлена новой попыткой или починено окружение) хост вызывает `kodo project gates PROJECT_ID --retry-failed`: директор резервирует новый гейт на текущей голове интеграционной ветки и проходит его под lease `project:<id>`. Без `--retry-failed` команда лишь выполняет ожидающие гейты. Проект на паузе, отменённый, проваленный или заблокированный — `blocked`, `project_control_blocked` (те же состояния отклоняет `complete-task`); отменённый проход — `blocked`, `project_cancelled`, даже если гейты не успели заблокироваться; не-wave проект — `project_wave_required`.
 - Kodo не создаёт, не читает и не архивирует чаты хоста; это делает главный чат своими инструментами.
 - Orca использует тот же протокол (`--host orca`), но с Orca он не проверялся.
 - Функции директора (`selectWave`, `createWaveContext`, `integrateAndAdvance`, `runPendingGates`) берутся из `runtime/project-director-waves.mjs`; модульные тесты протокола подменяют их fake-портами, сквозной `tests/project-wave-e2e.test.mjs` идёт без подмен.

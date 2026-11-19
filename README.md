@@ -130,6 +130,7 @@ kodo project bootstrap "Сервис заметок с поиском" --root "D
 kodo project apply-spec --root "D:\Projects\notes" --json
 kodo project next-wave <projectId> --host t3 --limit 3 --json      # брифы для видимых воркер-чатов T3
 kodo project complete-task <projectId> <taskId> --head <SHA> --json
+kodo project gates <projectId> --retry-failed --json                # повтор заблокированного гейта после исправления
 kodo project drain <projectId> --concurrency 2 --json               # без T3: волны нативными сессиями
 kodo project extend <projectId> "Теги заметок" --prepare --json
 kodo project append-milestone <projectId> --file <bundle>\milestone.json --json

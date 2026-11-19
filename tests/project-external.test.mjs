@@ -12,7 +12,7 @@ import { openProjectStore } from '../runtime/project-store.mjs';
 import { scopesOverlap } from '../runtime/contracts.mjs';
 import { ensureIntegration, mergeTask } from '../runtime/project-integration.mjs';
 import { withIntegrationLease } from '../runtime/project-integration-lease.mjs';
-import { completeTask, nextWave } from '../runtime/project-external.mjs';
+import { completeTask, nextWave, runProjectGates } from '../runtime/project-external.mjs';
 import { createProjectTransitionAuthorizer } from '../runtime/project-director.mjs';
 import { workerRole, WORKER_ROLES } from '../runtime/worker-roles.mjs';
 
@@ -618,6 +618,107 @@ test('next-wave --retry-failed retries only attempts of its own host', async t =
     ['task-a'],
   );
   assert.notEqual(brief(own, 'task-a').runId, a.runId);
+});
+
+test('gates runs the pending epic gates outside a completion and retries a blocked gate only on request', async t => {
+  const f = await fixture(t);
+  const gates = input => runProjectGates(f.ctx, { projectId: f.projectId, ports: f.ports, ...input });
+  const passed = await gates();
+  assert.equal(passed.status, 'passed', JSON.stringify(passed));
+  assert.deepEqual(passed.gates, { gates: [], accepted: [], blocked: [] });
+  assert.equal(passed.revision, (await f.snapshot()).revision);
+  assert.deepEqual(
+    f.calls.gates.map(row => [row.projectId, row.retryFailed]),
+    [[f.projectId, false]],
+  );
+
+  const blocked = {
+    gates: [{ gateId: 'g', runId: 'r', state: 'blocked' }],
+    accepted: [],
+    blocked: [{ code: 'error' }],
+  };
+  f.ports.runPendingGates = async (waveCtx, input) => {
+    f.calls.gates.push(input);
+    return blocked;
+  };
+  const stopped = await gates({ retryFailed: true });
+  assert.equal(stopped.status, 'blocked');
+  assert.deepEqual(stopped.gates, blocked);
+  assert.equal(f.calls.gates.at(-1).retryFailed, true, 'only an explicit retry reserves a new gate');
+  assert.deepEqual(f.calls.integrate, [], 'a gate pass integrates no task');
+
+  await f.repo.apply({
+    schemaVersion: 1,
+    commandId: randomUUID(),
+    projectId: f.projectId,
+    expectedRevision: (await f.snapshot()).revision,
+    actor: 'owner',
+    reason: 'Pause before a gate pass',
+    action: { op: 'setPaused', paused: true },
+  });
+  const paused = await gates({ retryFailed: true });
+  assert.deepEqual([paused.status, paused.code], ['blocked', 'project_control_blocked']);
+  assert.equal(f.calls.gates.length, 2, 'a paused project runs no gate');
+});
+
+test('gates never reports success for a blocked project or an aborted pass', async t => {
+  const f = await fixture(t);
+  f.ports.runPendingGates = async (waveCtx, input) => {
+    f.calls.gates.push(input);
+    return { gates: [], accepted: [], blocked: [] };
+  };
+  // A project whose own status is blocked (as complete-task refuses it).
+  const real = f.repo.snapshot.bind(f.repo);
+  const blockedRepo = Object.create(f.repo, {
+    snapshot: { value: id => ({ ...real(id), project: { ...real(id).project, status: 'blocked' } }) },
+  });
+  const refused = await runProjectGates({ ...f.ctx, repo: blockedRepo }, { projectId: f.projectId, ports: f.ports });
+  assert.deepEqual([refused.status, refused.code], ['blocked', 'project_control_blocked']);
+  assert.deepEqual(f.calls.gates, [], 'a blocked project runs no gate');
+
+  const before = new AbortController();
+  before.abort();
+  const early = await runProjectGates(f.ctx, { projectId: f.projectId, ports: f.ports, signal: before.signal });
+  assert.deepEqual([early.status, early.code], ['blocked', 'project_cancelled']);
+  assert.deepEqual(f.calls.gates, [], 'an aborted pass starts no gate');
+
+  // Aborted while the gates ran: the pass returned without a blocked gate but is not a success.
+  const during = new AbortController();
+  f.ports.runPendingGates = async (waveCtx, input) => {
+    f.calls.gates.push(input);
+    during.abort();
+    return { gates: [], accepted: [], blocked: [] };
+  };
+  const late = await runProjectGates(f.ctx, { projectId: f.projectId, ports: f.ports, signal: during.signal });
+  assert.deepEqual([late.status, late.code], ['blocked', 'project_cancelled']);
+  assert.equal(f.calls.gates.length, 1);
+
+  // Paused during the pass (`project pause` takes no gate lease): the gates stop, never `passed`.
+  f.ports.runPendingGates = async (waveCtx, input) => {
+    f.calls.gates.push(input);
+    await f.repo.apply({
+      schemaVersion: 1,
+      commandId: randomUUID(),
+      projectId: f.projectId,
+      expectedRevision: f.repo.snapshot(f.projectId).revision,
+      actor: 'owner',
+      reason: 'Pause during a gate pass',
+      action: { op: 'setPaused', paused: true },
+    });
+    return { gates: [], accepted: [], blocked: [] };
+  };
+  const pausedDuring = await runProjectGates(f.ctx, { projectId: f.projectId, ports: f.ports });
+  assert.deepEqual([pausedDuring.status, pausedDuring.code], ['blocked', 'project_control_blocked']);
+  assert.equal(f.calls.gates.length, 2);
+});
+
+test('gates requires a wave project', async t => {
+  const f = await fixture(t, { wave: false });
+  await assert.rejects(
+    runProjectGates(f.ctx, { projectId: f.projectId, ports: f.ports }),
+    error => error.code === 'project_wave_required',
+  );
+  assert.deepEqual(f.calls.gates, []);
 });
 
 test('next-wave and complete-task require a pull host, a bound limit and a wave project', async t => {

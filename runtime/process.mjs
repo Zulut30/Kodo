@@ -200,8 +200,15 @@ export async function codexIsolationOverrides(cwd, environment = process.env) {
     for (const name of Object.keys(config.plugins || {})) pluginNames.add(name);
   }
   const args = ['-c', 'notify=[]', '-c', 'plugins._default.enabled=false'];
-  for (const name of [...serverNames].sort()) args.push('-c', `mcp_servers.${JSON.stringify(name)}.enabled=false`);
+  for (const name of [...serverNames].sort()) args.push('-c', `mcp_servers.${codexKeySegment(name)}.enabled=false`);
   for (const name of [...pluginNames].filter(name => name !== '_default').sort())
-    args.push('-c', `plugins.${JSON.stringify(name)}.enabled=false`);
+    args.push('-c', `plugins.${codexKeySegment(name)}.enabled=false`);
   return args;
+}
+
+// Codex splits a `-c` key path on dots literally and keeps quotes, so a quoted segment would name a
+// different, incomplete entry. A name it cannot address leaves the tool enabled: refuse to start.
+function codexKeySegment(name) {
+  if (/^[^.\s="'\\[\]]+$/.test(name)) return name;
+  throw new Error('Codex не позволяет отключить MCP-сервер или плагин с таким именем; запуск инструментов не начат');
 }

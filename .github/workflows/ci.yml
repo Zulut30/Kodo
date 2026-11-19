@@ -112,6 +112,10 @@ jobs:
         env:
           KODO_TOOL_HOME: ${{ runner.temp }}/kodo-security-tools
         run: node scripts/ci.mjs run --tier L2 --json
+      # About 20 minutes of real Engine, Git and director work: run on its own, outside the fixed
+      # deadline of one L2 command (runtime/ci-cli.mjs CI_COMMAND_TIMEOUT_MS).
+      - name: Final acceptance scenarios
+        run: npm run test:final
       - name: Verify installed CLI package
         env:
           KODO_TOOL_HOME: ${{ runner.temp }}/kodo-security-tools

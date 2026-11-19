@@ -145,7 +145,10 @@ async function readEvidence(filename, expectedHead) {
         '-NoProfile',
         '-NonInteractive',
         '-Command',
-        '[Console]::InputEncoding=[Text.UTF8Encoding]::new($false); $p=[Console]::In.ReadToEnd(); $a=[IO.Directory]::GetAccessControl($p); if (!$a.AreAccessRulesProtected) {exit 1}; $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value; foreach($r in $a.Access) {if($r.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -notin @($sid,"S-1-5-18")){exit 2}}',
+        // Owner and SYSTEM only, plus read and execute (no write, delete or ACL change) inherited by files and
+        // subdirectories for the local Codex sandbox group when it exists:
+        // native Codex sessions run as its members and must read the evidence their prompt references.
+        '[Console]::InputEncoding=[Text.UTF8Encoding]::new($false); $p=[Console]::In.ReadToEnd(); $a=[IO.Directory]::GetAccessControl($p); if (!$a.AreAccessRulesProtected) {exit 1}; $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value; $sb=$null; try { $sb=[Security.Principal.NTAccount]::new([Environment]::MachineName,"CodexSandboxUsers").Translate([Security.Principal.SecurityIdentifier]).Value } catch {}; $seen=$false; foreach($r in $a.Access) { $v=$r.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value; if ($v -in @($sid,"S-1-5-18")) {continue}; if ($sb -and $v -eq $sb -and "$($r.AccessControlType)" -eq "Allow" -and (([int]$r.FileSystemRights -band 0xD0156) -eq 0) -and (([int]$r.FileSystemRights -band 0x200A9) -eq 0x200A9) -and (([int]$r.InheritanceFlags -band 3) -eq 3)) {$seen=$true; continue}; exit 2 }; if ($sb -and !$seen) {exit 3}',
       ],
       { input: path.dirname(filename) },
     );

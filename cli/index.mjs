@@ -31,6 +31,7 @@ kodo project reprioritize PROJECT_ID TASK_ID --priority 0..100 [--command-id UUI
 kodo project approve-risk PROJECT_ID TASK_ID --reason TEXT [--command-id UUID] [--json]
 kodo project next-wave PROJECT_ID --host t3|orca [--limit 1..5] [--retry-failed] [--json]
 kodo project complete-task PROJECT_ID TASK_ID --head SHA [--defer-gate|--abandon] [--command-id UUID] [--json]
+kodo project gates PROJECT_ID [--retry-failed] [--json]
 kodo project bootstrap "IDEA" --root PATH [--prepare] [--client codex|claude-code] [--model MODEL] [--json]
 kodo project apply-spec --root PATH [--file SPEC_JSON] [--command-id UUID] [--json]
 kodo project extend PROJECT_ID "FEATURE" [--prepare] [--client codex|claude-code] [--model MODEL] [--command-id UUID] [--json]
@@ -56,7 +57,7 @@ kodo security verify [--project PATH] [--json]
 kodo resume RUN_ID --plan FILE
 kodo migrate --target PROJECT
 
-Клиенты: codex, claude-code, opencode. --client можно повторять.
+Клиенты: codex, claude-code, opencode. В install и init --preset --client можно повторять или указать all; init без пресета принимает один --client (или all); run, doctor, benchmark run, project bootstrap и extend — один --client, обе подписки в run — --providers both.
 Установка локальная; MCP устанавливаются как шаблоны, без подключения.
 run выполняет задачу через клиенты по подписке. plan показывает каталог пайплайнов.`;
 

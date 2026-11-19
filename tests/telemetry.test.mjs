@@ -779,12 +779,90 @@ test('project report keeps future wave gates only when the snapshot has them', (
   const gates = [{ id: 'wave-1', status: 'passed', extra: { nested: 'dropped' } }];
   const snapshot = projectSnapshot([], [], { gates, project: { projectId: 'p-1', status: 'proposed', paused: true } });
   const report = buildProjectReport(snapshot, new Map(), {}, { now: NOW });
-  assert.deepEqual(report.gates, [{ id: 'wave-1', status: 'passed' }]);
+  // A gate without a Run keeps a status of its own record; nested data never leaks.
+  assert.deepEqual(report.gates, [{ id: 'wave-1', status: 'passed', runId: null, containers: [], sessions: null }]);
+  assert.deepEqual(
+    { gates: report.totals.gates.gates, runs: report.totals.gates.runs, sessions: report.totals.gates.sessions },
+    { gates: 1, runs: 0, sessions: null },
+  );
   assert.deepEqual(report.totals.tasks, 0);
   assert.equal(report.totals.wallMs, null);
   assert.equal(report.totals.usage.sessions, 0);
   assert.deepEqual(report.blockers, [
     { taskId: null, runId: null, code: 'project_paused', scope: 'project', occurrences: null },
+  ]);
+});
+
+test('project report reads wave gates from their gate Runs; only a current blocked gate is a blocker', () => {
+  const gateRun = (id, state, extra = {}) =>
+    finishedRun({
+      id,
+      state,
+      sessionAttempts: [session('review', 'completed', measured(3000)), session('repair', 'completed', measured(4000))],
+      ...extra,
+    });
+  const blocked = { current: { code: 'repair_budget_exhausted', scope: 'run', occurrences: 1 }, history: [] };
+  const runs = new Map([
+    ['gate-run-1', gateRun('gate-run-1', 'blocked', { blocker: blocked })],
+    ['gate-run-2', gateRun('gate-run-2', 'succeeded')],
+    ['gate-run-3', gateRun('gate-run-3', 'blocked', { blocker: blocked })],
+  ]);
+  const gate = (id, number, runId, epic) => ({
+    id,
+    number,
+    runId,
+    containers: [{ kind: 'epic', id: epic }],
+    installed: true,
+  });
+  const gates = [
+    gate('g-1', 1, 'gate-run-1', 'foundation'),
+    gate('g-2', 2, 'gate-run-2', 'foundation'),
+    gate('g-3', 3, 'gate-run-3', 'core'),
+    gate('g-4', 4, 'gate-run-missing', 'cli'),
+  ];
+  const report = buildProjectReport(projectSnapshot([], [], { gates }), runs, {}, { now: NOW });
+  assert.deepEqual(
+    report.gates.map(row => [row.id, row.status, row.runId, row.containers, row.sessions]),
+    [
+      ['g-1', 'blocked', 'gate-run-1', ['epic:foundation'], 2],
+      ['g-2', 'succeeded', 'gate-run-2', ['epic:foundation'], 2],
+      ['g-3', 'blocked', 'gate-run-3', ['epic:core'], 2],
+      ['g-4', 'unknown', 'gate-run-missing', ['epic:cli'], null],
+    ],
+  );
+  // A blocked gate a later gate of the same container replaced is history, not a blocker.
+  assert.deepEqual(report.blockers, [
+    { taskId: null, runId: 'gate-run-3', code: 'repair_budget_exhausted', scope: 'gate', occurrences: 1 },
+  ]);
+  assert.deepEqual(
+    { gates: report.totals.gates.gates, runs: report.totals.gates.runs, sessions: report.totals.gates.sessions },
+    { gates: 4, runs: 3, sessions: null },
+    'a gate without its Run makes the session total unknown',
+  );
+  assert.equal(report.totals.gates.complete, false);
+  assert.equal(report.totals.gates.observedUsage.sessions, 6, 'observed sessions of the found Runs');
+  const found = buildProjectReport(projectSnapshot([], [], { gates: gates.slice(0, 3) }), runs, {}, { now: NOW });
+  assert.deepEqual([found.totals.gates.sessions, found.totals.gates.complete], [6, true]);
+  const none = buildProjectReport(projectSnapshot([], [], { gates: [] }), runs, {}, { now: NOW });
+  assert.equal(none.totals.gates.sessions, 0, 'no gates: zero, not unknown');
+  assert.equal(report.totals.sessions, 0, 'task totals keep their meaning');
+
+  // A gate waiting for subscription limits or cancelled has not accepted anything: a blocker too,
+  // with its Run blocker code when there is one and a state code otherwise.
+  const quota = { current: { code: 'quota', scope: 'run', occurrences: 2 }, history: [] };
+  const stopped = new Map([
+    ['gate-run-5', gateRun('gate-run-5', 'waiting_limits', { blocker: quota })],
+    ['gate-run-6', gateRun('gate-run-6', 'cancelled')],
+  ]);
+  const halted = buildProjectReport(
+    projectSnapshot([], [], { gates: [gate('g-5', 1, 'gate-run-5', 'core'), gate('g-6', 2, 'gate-run-6', 'cli')] }),
+    stopped,
+    {},
+    { now: NOW },
+  );
+  assert.deepEqual(halted.blockers, [
+    { taskId: null, runId: 'gate-run-5', code: 'quota', scope: 'gate', occurrences: 2 },
+    { taskId: null, runId: 'gate-run-6', code: 'gate_cancelled', scope: 'gate', occurrences: null },
   ]);
 });
 

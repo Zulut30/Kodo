@@ -293,6 +293,13 @@ try {
   foreach($sid in @($user,[Security.Principal.SecurityIdentifier]::new('S-1-5-18'))) {
     $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid,[Security.AccessControl.FileSystemRights]::FullControl,$inherit,[Security.AccessControl.PropagationFlags]::None,[Security.AccessControl.AccessControlType]::Allow))
   }
+  # Native Codex sessions run in the elevated sandbox as members of this local group. They must read
+  # the evidence their prompt references; write access stays with the owner.
+  $sandbox=$null
+  try { $sandbox=[Security.Principal.NTAccount]::new([Environment]::MachineName,'CodexSandboxUsers').Translate([Security.Principal.SecurityIdentifier]) } catch {}
+  if ($sandbox) {
+    $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sandbox,[Security.AccessControl.FileSystemRights]::ReadAndExecute,$inherit,[Security.AccessControl.PropagationFlags]::None,[Security.AccessControl.AccessControlType]::Allow))
+  }
   [IO.Directory]::SetAccessControl($target,$acl)
 } catch { exit 1 }`;
       await execute(
