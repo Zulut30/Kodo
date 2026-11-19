@@ -80,6 +80,23 @@ const statuses = rows => Object.fromEntries(rows.map(row => [row.id, row.status]
 const containersOf = gate => gate.containers.map(row => `${row.kind}:${row.kind === 'project' ? '' : row.id}`);
 
 /**
+ * Write the isolated global Git config through `git config --file`, which quotes the values:
+ * a path containing `#` or `;` is never cut at what Git would otherwise read as a comment.
+ */
+function writeGitConfig(file, { template, hooks }) {
+  for (const [key, value] of [
+    ['init.templateDir', template],
+    ['core.hooksPath', hooks],
+  ]) {
+    const result = spawnSync('git', ['config', '--file', file, key, value.split(path.sep).join('/')], {
+      encoding: 'utf8',
+      windowsHide: true,
+    });
+    assert.equal(result.status, 0, result.stderr);
+  }
+}
+
+/**
  * A temporary directory with an isolated HOME, KODO_HOME, credentials, worktrees, temporary files
  * and Git config, and no Git redirection inherited from the caller.
  */
@@ -88,19 +105,27 @@ async function sandbox(t, prefix) {
   const directory = await mkdtemp(path.join(parent, `kodo-final-${prefix}-`));
   const previous = Object.fromEntries([...envKeys, ...gitRedirects].map(key => [key, process.env[key]]));
   const stores = new Set();
-  // Registered before anything else: a failed setup still restores the environment and removes the directory.
+  // Registered before anything else: every store is closed, the environment restored and the
+  // directory removed even when one of these steps fails; the failures are reported afterwards.
   t.after(async () => {
-    try {
-      for (const store of stores) store.close();
-    } finally {
-      for (const [key, value] of Object.entries(previous)) {
-        if (value === undefined) delete process.env[key];
-        else process.env[key] = value;
+    const errors = [];
+    for (const store of stores)
+      try {
+        store.close();
+      } catch (error) {
+        errors.push(error);
       }
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
     }
-    assert.equal(path.dirname(directory), path.resolve(parent));
-    assert.match(path.basename(directory), new RegExp(`^kodo-final-${prefix}-`));
-    await rm(directory, { recursive: true, force: true });
+    if (
+      path.dirname(directory) === path.resolve(parent) &&
+      path.basename(directory).startsWith(`kodo-final-${prefix}-`)
+    )
+      await rm(directory, { recursive: true, force: true }).catch(error => errors.push(error));
+    else errors.push(new Error('Refusing to remove a directory outside the scenario temp root'));
+    if (errors.length) throw new AggregateError(errors, 'Scenario cleanup failed');
   });
   const root = path.join(directory, 'repo'),
     home = path.join(directory, 'state'),
@@ -115,11 +140,8 @@ async function sandbox(t, prefix) {
   await mkdir(hooks);
   // Every Git process of the scenario (the helper and Kodo's) reads only this config: no inherited
   // template is copied by `git init` and no hook runs.
-  const forward = value => value.split(path.sep).join('/');
-  await writeFile(
-    path.join(isolated, 'gitconfig'),
-    `[init]\n\ttemplateDir = ${forward(template)}\n[core]\n\thooksPath = ${forward(hooks)}\n`,
-  );
+  await writeFile(path.join(isolated, 'gitconfig'), '');
+  writeGitConfig(path.join(isolated, 'gitconfig'), { template, hooks });
   for (const key of gitRedirects) delete process.env[key];
   Object.assign(process.env, {
     TMP: temp,
@@ -137,6 +159,27 @@ async function sandbox(t, prefix) {
   });
   return { directory, root, home, stores };
 }
+
+test('Final scenario sandbox: the isolated Git config keeps template and hook paths with # and ;', async t => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'kodo-final-gitconfig-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const odd = path.join(directory, 'a#b;c'),
+    template = path.join(odd, 'git-template'),
+    hooks = path.join(odd, 'git-hooks'),
+    file = path.join(directory, 'gitconfig');
+  await mkdir(template, { recursive: true });
+  await mkdir(hooks, { recursive: true });
+  await writeFile(file, '');
+  writeGitConfig(file, { template, hooks });
+  const read = key => {
+    const result = spawnSync('git', ['config', '--file', file, '--get', key], { encoding: 'utf8', windowsHide: true });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout.trim();
+  };
+  const forward = value => value.split(path.sep).join('/');
+  assert.equal(read('init.templateDir'), forward(template));
+  assert.equal(read('core.hooksPath'), forward(hooks));
+});
 
 /** Write `files` into `root`, then commit them as the user's baseline on `main`. */
 async function commitBaseline(root, files) {

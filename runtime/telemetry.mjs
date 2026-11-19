@@ -732,18 +732,20 @@ function gateRows(snapshot, runsById, eventsByRun, options) {
     });
 }
 
-// A blocked or failed gate Run is a blocker until a later gate of the same container replaces it.
+// A gate Run that stopped without acceptance (blocked, failed, waiting for subscription limits or
+// cancelled) is a blocker until a later gate of the same container replaces it.
+const stoppedGateStates = ['blocked', 'failed', 'waiting_limits', 'cancelled'];
 function gateBlockers(gates) {
   return gates
     .filter(
       gate =>
-        ['blocked', 'failed'].includes(gate.row.status) &&
+        stoppedGateStates.includes(gate.row.status) &&
         !gates.some(other => other.key === gate.key && (other.number ?? 0) > (gate.number ?? 0)),
     )
     .map(gate => ({
       taskId: null,
       runId: gate.row.runId,
-      code: gate.report?.blocker?.code ?? 'gate_blocked',
+      code: gate.report?.blocker?.code ?? `gate_${gate.row.status}`,
       scope: 'gate',
       occurrences: gate.report?.blocker?.occurrences ?? null,
     }));

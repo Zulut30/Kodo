@@ -846,6 +846,24 @@ test('project report reads wave gates from their gate Runs; only a current block
   const none = buildProjectReport(projectSnapshot([], [], { gates: [] }), runs, {}, { now: NOW });
   assert.equal(none.totals.gates.sessions, 0, 'no gates: zero, not unknown');
   assert.equal(report.totals.sessions, 0, 'task totals keep their meaning');
+
+  // A gate waiting for subscription limits or cancelled has not accepted anything: a blocker too,
+  // with its Run blocker code when there is one and a state code otherwise.
+  const quota = { current: { code: 'quota', scope: 'run', occurrences: 2 }, history: [] };
+  const stopped = new Map([
+    ['gate-run-5', gateRun('gate-run-5', 'waiting_limits', { blocker: quota })],
+    ['gate-run-6', gateRun('gate-run-6', 'cancelled')],
+  ]);
+  const halted = buildProjectReport(
+    projectSnapshot([], [], { gates: [gate('g-5', 1, 'gate-run-5', 'core'), gate('g-6', 2, 'gate-run-6', 'cli')] }),
+    stopped,
+    {},
+    { now: NOW },
+  );
+  assert.deepEqual(halted.blockers, [
+    { taskId: null, runId: 'gate-run-5', code: 'quota', scope: 'gate', occurrences: 2 },
+    { taskId: null, runId: 'gate-run-6', code: 'gate_cancelled', scope: 'gate', occurrences: null },
+  ]);
 });
 
 test('reports are pure: same input and clock give the same report', () => {
