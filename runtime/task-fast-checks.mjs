@@ -450,13 +450,18 @@ const inside = (outer, inner) => {
  * @param {string[]} roots
  */
 async function eventDirectory(roots) {
-  const root = path.resolve(stateHome(), 'test-events');
-  const projects = await Promise.all(roots.filter(Boolean).map(canonicalPath));
+  const home = path.resolve(stateHome());
+  const root = path.join(home, 'test-events');
+  const projects = await Promise.all(roots.map(canonicalPath));
   const refuse = () =>
     Object.assign(new Error('Kodo state home lies inside the project'), { code: 'fast_check_events_location' });
-  if (projects.some(project => inside(project, root))) throw refuse();
-  const before = await canonicalPath(root);
-  if (projects.some(project => inside(project, before))) throw refuse();
+  // Only real paths are compared: how a path is written (a link inside the project leading
+  // outside, or the reverse) never decides. Kodo's home and its test-events must both be outside.
+  const outside = async target => {
+    const real = await canonicalPath(target);
+    return !projects.some(project => inside(project, real));
+  };
+  if (!(await outside(home)) || !(await outside(root))) throw refuse();
   await mkdir(root, { recursive: true, mode: 0o700 });
   const actual = await realpath(root);
   if (projects.some(project => inside(project, actual))) throw refuse();
@@ -483,7 +488,7 @@ export async function executeCheck(step, options, counted, roots = []) {
     }
   };
   if (!counted) return run(step.command, step.args ?? []);
-  const directory = await eventDirectory([options.cwd, ...roots]);
+  const directory = await eventDirectory([options.cwd ?? process.cwd(), ...roots]);
   const file = path.join(directory, 'events.jsonl');
   const executed = { command: step.command, args: countingArguments(step.args, file) };
   try {

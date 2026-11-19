@@ -1,9 +1,19 @@
-import test from 'node:test';
+import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { access, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { countTestEvents, countingArguments, executeCheck, nodeTestOutcome } from '../runtime/task-fast-checks.mjs';
+
+// Event files go under Kodo's state home: every test here uses a private one, never the real one.
+const isolatedHome = await mkdtemp(path.join(os.tmpdir(), 'kodo-count-state-'));
+const originalHome = process.env.KODO_HOME;
+process.env.KODO_HOME = isolatedHome;
+after(async () => {
+  if (originalHome === undefined) delete process.env.KODO_HOME;
+  else process.env.KODO_HOME = originalHome;
+  await rm(isolatedHome, { recursive: true, force: true });
+});
 
 // Review finding (major): `node --test` was counted from the text of its summary on stdout. A
 // directory with an empty index.js, user output without a newline glued to the synthetic line of a
@@ -240,31 +250,71 @@ test('Review findings: ../ from a subdirectory, masked names and an in-project T
 });
 
 test('The event directory is never created inside the project: the source checkout or through a link', async t => {
-  const root = await project(t, { 'a.test.mjs': `${imports}test('a', () => {});\n` });
-  const outside = await project(t, { 'b.test.mjs': `${imports}test('b', () => {});\n` });
+  const root = await project(t, {
+    'a.test.mjs': `${imports}test('a', () => {});
+`,
+  });
+  const outside = await project(t, {
+    'b.test.mjs': `${imports}test('b', () => {});
+`,
+  });
+  const scratch = await project(t, {});
   const step = { command: process.execPath, args: ['--test', 'b.test.mjs'] };
-  const run = (home, roots) =>
+  const run = roots =>
     executeCheck(step, { cwd: outside, env: env({}), allowFailure: true, timeoutMs: 60000 }, true, roots);
+  // Every KODO_HOME below is a path this test created; the original value is only restored.
   const previous = process.env.KODO_HOME;
   t.after(() => {
     if (previous === undefined) delete process.env.KODO_HOME;
     else process.env.KODO_HOME = previous;
   });
+  const { symlink } = await import('node:fs/promises');
+  const link = async (target, name) => {
+    const at = path.join(scratch, name);
+    await symlink(target, at, 'junction');
+    return at;
+  };
   // Kodo's state home inside the source checkout, the check running in an external worktree.
   process.env.KODO_HOME = path.join(root, '.kodo-state');
-  await assert.rejects(() => run(process.env.KODO_HOME, [root]), { code: 'fast_check_events_location' });
+  await assert.rejects(() => run([root]), { code: 'fast_check_events_location' });
   await assert.rejects(() => access(path.join(root, '.kodo-state', 'test-events')), { code: 'ENOENT' });
   // A link outside the project that points into it is resolved to its real place.
-  const { symlink } = await import('node:fs/promises');
   await mkdir(path.join(root, 'state'));
-  const link = path.join(outside, '..', `kodo-link-${path.basename(outside)}`);
-  await symlink(path.join(root, 'state'), link, 'junction');
-  t.after(() => rm(link, { force: true, recursive: false }).catch(() => {}));
-  process.env.KODO_HOME = link;
-  await assert.rejects(() => run(link, [root]), { code: 'fast_check_events_location' });
+  process.env.KODO_HOME = await link(path.join(root, 'state'), 'into-source');
+  await assert.rejects(() => run([root]), { code: 'fast_check_events_location' });
+  // A path written inside the project whose real place is outside is accepted: only real paths count.
+  const real = path.join(scratch, 'real-home');
+  await mkdir(real);
+  await symlink(real, path.join(root, 'state-link'), 'junction');
+  process.env.KODO_HOME = path.join(root, 'state-link');
+  assert.equal(nodeTestOutcome(step, await run([root]))?.tests, 1);
+  // A real home inside the project stays refused even when its test-events link leads outside.
+  const events = path.join(scratch, 'events');
+  await mkdir(events);
+  await mkdir(path.join(root, 'inner-home'));
+  await symlink(events, path.join(root, 'inner-home', 'test-events'), 'junction');
+  process.env.KODO_HOME = await link(path.join(root, 'inner-home'), 'to-inner');
+  await assert.rejects(() => run([root]), { code: 'fast_check_events_location' });
   // An ordinary state home outside both roots works.
-  process.env.KODO_HOME = await mkdtemp(path.join(os.tmpdir(), 'kodo-count-home-'));
-  t.after(() => rm(process.env.KODO_HOME ?? '', { recursive: true, force: true }));
-  const fine = await run(process.env.KODO_HOME, [root]);
-  assert.equal(nodeTestOutcome(step, fine)?.tests, 1);
+  process.env.KODO_HOME = path.join(scratch, 'home');
+  assert.equal(nodeTestOutcome(step, await run([root]))?.tests, 1);
+});
+
+test('Without a working directory the process directory is the project: no event file is written inside it', async t => {
+  const root = await project(t, {
+    'c.test.mjs': `${imports}test('c', () => {});
+`,
+  });
+  const previous = { cwd: process.cwd(), home: process.env.KODO_HOME };
+  const step = { command: process.execPath, args: ['--test', 'c.test.mjs'] };
+  // Restored before the project directory is removed (Windows refuses to remove the current directory).
+  process.chdir(root);
+  try {
+    process.env.KODO_HOME = './state';
+    await assert.rejects(() => executeCheck(step, { env: env({}) }, true), { code: 'fast_check_events_location' });
+    await assert.rejects(() => access(path.join(root, 'state')), { code: 'ENOENT' });
+  } finally {
+    process.chdir(previous.cwd);
+    process.env.KODO_HOME = previous.home;
+  }
 });
