@@ -57,7 +57,7 @@ kodo security verify [--project PATH] [--json]
 kodo resume RUN_ID --plan FILE
 kodo migrate --target PROJECT
 
-Клиенты: codex, claude-code, opencode. В install и init --preset --client можно повторять или указать all; init без пресета принимает один --client (или all); run, benchmark run, project bootstrap и extend — один --client, обе подписки в run — --providers both.
+Клиенты: codex, claude-code, opencode. В install и init --preset --client можно повторять или указать all; init без пресета принимает один --client (или all); run, doctor, benchmark run, project bootstrap и extend — один --client, обе подписки в run — --providers both.
 Установка локальная; MCP устанавливаются как шаблоны, без подключения.
 run выполняет задачу через клиенты по подписке. plan показывает каталог пайплайнов.`;
 

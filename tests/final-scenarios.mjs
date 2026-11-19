@@ -932,6 +932,10 @@ test(
     let phase = 'crash';
     /** @type {string | null} */
     let barrierFailure = null;
+    // Sessions of the second drain that reached the barrier. The set keeps an entry after its session
+    // returns, so a late wake-up never mistakes a finished session for a missing one.
+    const entered = new Set();
+    const bothEntered = () => entered.has('gamma') && entered.has('delta');
     const tasks = [
       task('alpha', { priority: 90 }),
       task('beta', { priority: 80 }),
@@ -946,10 +950,14 @@ test(
           // The second drain is interrupted while gamma and delta are both inside their first
           // sessions: delta's session ends only after the abort, so neither can finish first on any
           // platform. A barrier that times out fails the scenario instead of weakening it.
-          const barrier = phase === 'abort' && ['gamma', 'delta'].includes(id);
-          for (let i = 0; i < (barrier ? 4800 : 1200) && calls.active < 2; i++) await delay(25);
-          if (!barrier) return;
-          if (calls.active < 2) barrierFailure ??= `${id} entered its session without the other one`;
+          if (phase !== 'abort' || !['gamma', 'delta'].includes(id)) {
+            for (let i = 0; i < 1200 && calls.active < 2; i++) await delay(25);
+            return;
+          }
+          entered.add(id);
+          for (let i = 0; i < 4800 && !bothEntered(); i++) await delay(25);
+          if (!bothEntered()) barrierFailure ??= `${id} waited 120 s for the other session`;
+          // Gamma aborts only after delta entered; delta returns only after the abort.
           if (id === 'gamma') controller.abort();
           else {
             for (let i = 0; i < 4800 && !controller.signal.aborted; i++) await delay(25);
