@@ -6,7 +6,7 @@
 
 ## ① Офлайн-сценарии
 
-`tests/final-scenarios.test.mjs` (имя без `-acceptance`, файл не заморожен): реальные Store, project store, авторизатор, Engine, директор волн, CLI и временный Git; поддельные только подписочные клиенты; у каждого сценария свои `KODO_HOME`, `HOME`, каталог worktree и Git-конфиг. Файл первым стоит в `priority` `scripts/run-tests.mjs`: на этой машине он идёт около 21 минуты.
+`tests/final-scenarios.mjs` (`npm run test:final`; имя без `-acceptance`, файл не заморожен): реальные Store, project store, авторизатор, Engine, директор волн, CLI и временный Git; поддельные только подписочные клиенты; у каждого сценария свои `KODO_HOME`, `HOME`, каталог worktree и Git-конфиг. Файл идёт около 20 минут, поэтому он не входит в общий набор `npm run check`: внутри L2 он выталкивал полный check на Windows CI за фиксированный предел одной команды (40 минут, `CI_COMMAND_TIMEOUT_MS`, закреплён oracle-тестом). CI запускает его отдельным шагом `npm run test:final` на обеих ОС после L2.
 
 | Сценарий | Что доказано |
 | --- | --- |
@@ -63,20 +63,20 @@
 | Находка | Исправление | Тест |
 | --- | --- | --- |
 | major: `gates` отвечал `passed` для заблокированного проекта и отменённого прохода | Те же состояния, что отклоняет `complete-task`, — `project_control_blocked`; отмена до или во время прохода — `project_cancelled` | `tests/project-external.test.mjs` |
-| major: сценарии не очищали `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE` и другие переменные перенаправления Git | `sandbox()` удаляет их на время сценария, направляет временные файлы в каталог сценария и регистрирует очистку сразу после `mkdtemp` | `tests/final-scenarios.test.mjs` |
+| major: сценарии не очищали `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE` и другие переменные перенаправления Git | `sandbox()` удаляет их на время сценария, направляет временные файлы в каталог сценария и регистрирует очистку сразу после `mkdtemp` | `tests/final-scenarios.mjs` |
 | major: отчёты и README заявляли выпуск 1.0.0 до квитанций | README ссылается на подтверждённый 0.2.6; CI, установка и публикация в FINAL-REPORT — «ожидается» | — |
 | minor: сессии гейтов давали `0` при пропущенном Run | `totals.gates.sessions` — `null`, если Run гейта не найден | `tests/telemetry.test.mjs` |
 | minor: тест ACL принял бы правило только с `Synchronize` | Тест требует `ReadAndExecute` и наследование на файлы и каталоги; с ослабленным правом падает | `tests/efficiency-engine.test.mjs` |
-| minor: E4 не проверял попытки после отмены | Попытки `gamma` и `delta` после отмены завершены и не интегрированы; после `--retry-failed` — новые попытки с большим номером, `accepted` | `tests/final-scenarios.test.mjs` |
+| minor: E4 не проверял попытки после отмены | Попытки `gamma` и `delta` после отмены завершены и не интегрированы; после `--retry-failed` — новые попытки с большим номером, `accepted` | `tests/final-scenarios.mjs` |
 
 Повторные ревью (новые делегаты, те же условия):
 
 | Раунд | Находка | Исправление | Тест |
 | --- | --- | --- | --- |
 | 2, major | `gates` отвечал `passed`, если проект поставили на паузу во время прохода (`project pause` не берёт lease гейтов) | Состояние проекта перечитывается и после прохода | `tests/project-external.test.mjs` |
-| 2, major | Песочница сценариев наследовала шаблон `git init` и хуки | Пустой шаблон (`GIT_TEMPLATE_DIR`, `init.templateDir`, `git init --template`) и пустой `core.hooksPath` для всех Git-процессов сценария | `tests/final-scenarios.test.mjs` |
+| 2, major | Песочница сценариев наследовала шаблон `git init` и хуки | Пустой шаблон (`GIT_TEMPLATE_DIR`, `init.templateDir`, `git init --template`) и пустой `core.hooksPath` для всех Git-процессов сценария | `tests/final-scenarios.mjs` |
 | 2, minor | Локальные квитанции FINAL-REPORT не привязаны к коммитам | Указаны коммиты наблюдений | — |
-| 3, major | Git обрезает значения конфига на `#` и `;` — путь хуков с `#` указывал бы за пределы сценария | Конфиг пишется через `git config --file` (значения в кавычках) | `tests/final-scenarios.test.mjs` (путь `a#b;c`) |
+| 3, major | Git обрезает значения конфига на `#` и `;` — путь хуков с `#` указывал бы за пределы сценария | Конфиг пишется через `git config --file` (значения в кавычках) | `tests/final-scenarios.mjs` (путь `a#b;c`) |
 | 3, minor | Сбой `store.close()` пропускал закрытие остальных хранилищ и удаление каталога | Каждый шаг очистки выполняется, ошибки собираются и сообщаются в конце | — |
 | 3, minor | Гейт в `waiting_limits` или `cancelled` не попадал в `blockers` отчёта | Блокер для любого гейта, остановленного без приёмки | `tests/telemetry.test.mjs` |
 | 3, minor | Справка `--client` | Повтор и `all` — в `install`/`init`; `run` — один `--client` | — |

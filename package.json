@@ -20,7 +20,8 @@
     "test": "node scripts/run-tests.mjs",
     "test:fast": "node scripts/run-tests.mjs --fast",
     "test:coverage": "node scripts/run-tests.mjs --coverage",
-    "check": "npm run validate && npm run format:check && npm run lint && npm run typecheck && npm test"
+    "check": "npm run validate && npm run format:check && npm run lint && npm run typecheck && npm test",
+    "test:final": "node --test --test-reporter=spec tests/final-scenarios.mjs"
   },
   "files": [
     "cli",

@@ -11,7 +11,7 @@
 | Этапы 01–11 (baseline, качество, CI/кэш, архитектура, знания, Project Director, оркестрация, проверки, behaviour gate, сторож прогресса, журнал доставки) | ACCEPTED | PR #10–#21, CI обеих ОС; [progress.md](progress.md) |
 | 12 Операционный отчёт `kodo report` | ACCEPTED | PR #22 (`a72326f`), CI обеих ОС; гейты волнового режима — исправление 5 этапа 13 |
 | F1–F3 Фабрика проектов: волны, интеграционная ветка, gate Run, хост T3, чертёж, extend | ACCEPTED | PR #23 (`b12eed4`), 15 раундов независимого ревью, CI обеих ОС |
-| 13① Офлайн-сценарии A, C, E, F | PASS local на `45092e0`; на голове PR — ожидается | `tests/final-scenarios.test.mjs` 7/7 на `45092e0` (два прогона, 1274 с и 1337 с); после усиления изоляции и проверок E4 — E4 на `8a52f91` (240 с); полный прогон на голове PR — в local L2 и CI |
+| 13① Офлайн-сценарии A, C, E, F | PASS local на `45092e0`; на голове PR — ожидается | `tests/final-scenarios.mjs` (`npm run test:final`, отдельный шаг CI) 7/7 на `45092e0` (два прогона, 1274 с и 1337 с); после усиления изоляции и проверок E4 — E4 на `8a52f91` (240 с); полный прогон на голове PR — в local L2 и CI |
 | 13① B (mini Rust/Git), D (Hearthstone) | NOT RUN | Исключены решением пользователя |
 | 13② Нативные Codex и Claude | PASS native | Run `cfb6ffba` (Codex, после исправлений 1–2), `19a9b9ff` (Claude) |
 | 13② Отмена и продолжение | PASS native | Run `346684f0`: `cancelled` за ~1 с, `resume` → `succeeded` |
