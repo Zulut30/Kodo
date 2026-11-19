@@ -370,3 +370,22 @@ test('A counting run that cannot be prepared leaves the npm result in place with
     process.env.KODO_HOME = previous;
   }
 });
+
+test('A refused event location is not recorded as an unknown count of an npm counting run', async t => {
+  const { countingPlan, countNpmScript } = await import('../runtime/task-fast-checks.mjs');
+  const root = await project(t, { 'f.test.mjs': `${imports}test('f', () => {});\n` });
+  const plan = countingPlan(
+    { command: 'npm', args: ['test'] },
+    { packageText: JSON.stringify({ scripts: { test: 'node --test' } }), npmrc: false },
+  )?.npm;
+  const previous = process.env.KODO_HOME;
+  process.env.KODO_HOME = path.join(root, '.kodo-state');
+  try {
+    await assert.rejects(
+      () => countNpmScript(plan, { cwd: root, env: env({}), allowFailure: true, timeoutMs: 60000 }, []),
+      { code: 'fast_check_events_location' },
+    );
+  } finally {
+    process.env.KODO_HOME = previous;
+  }
+});

@@ -677,6 +677,8 @@ export async function countNpmScript(plan, options, roots = []) {
   try {
     prepared = await executeCheck(plan.step, options, true, roots);
   } catch (failure) {
+    // A refused location is a configuration error, never an unknown count.
+    if (failure?.code === 'fast_check_events_location') throw failure;
     // After npm passed, a counting run that cannot even be prepared leaves npm's result in place.
     const count = { resolved: plan.resolved, executed: null, exitCode: null, tests: null };
     const unavailable = countUnavailable(failure);
