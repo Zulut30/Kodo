@@ -483,6 +483,43 @@ const eventOf = line => {
 const jsonLine = line => eventOf(line) !== undefined;
 
 /**
+ * The executable of a passed login check, shared by the run when `cache` is given.
+ * @param {Map<string, Promise<any>> | undefined} cache
+ * @param {string} client
+ * @param {() => Promise<any>} check
+ */
+async function subscribedExecutable(cache, client, check) {
+  const { executable } = (await checkedSubscription(cache, client, check)) ?? {};
+  // A shared check that passed without an executable cannot start the client: check here.
+  return executable ?? (await check()).executable;
+}
+
+/**
+ * Settles a failed start: only a first silence (no event, no earlier restart) may start again, and
+ * only once the caller admits it (its session budget). Otherwise the failure is thrown.
+ * @param {any} error
+ * @param {{ answered: boolean, aborted?: boolean, client: string, startupTimeoutMs: number, onStartupRetry?: (details: { reason: string }) => unknown }} state
+ */
+async function restartAfterSilence(error, { answered, aborted, client, startupTimeoutMs, onStartupRetry }) {
+  if (error?.code !== 'KODO_STARTUP_TIMEOUT' || aborted) throw error;
+  // A client that never answered did no work. A second silence, or a silence after events, fails
+  // the session as unavailable, which spends no repair round.
+  if (answered)
+    throw Object.assign(
+      new ProviderError(`Клиент ${client} не прислал первое событие за ${startupTimeoutMs} мс`, 'unavailable'),
+      { startupTimeout: true },
+    );
+  // Every native start is admitted by the caller; a refusal keeps its reason.
+  try {
+    await onStartupRetry?.({ reason: 'startup_timeout' });
+  } catch (refusal) {
+    throw refusal instanceof ProviderError
+      ? refusal
+      : new ProviderError(redact(refusal?.message ?? String(refusal)), refusal?.code || 'unavailable');
+  }
+}
+
+/**
  * @param {SessionRequest} request
  * @param {ProcessDeps & { nowImpl?: () => number }} [deps]
  */
@@ -513,10 +550,9 @@ export async function runSession(
     startupRetries = 0;
   const environment = subscriptionEnvironment(env);
   try {
-    const check = () => subscriptionStatus(client, { env: environment, processImpl, resolveClientImpl });
-    let { executable } = (await checkedSubscription(subscriptionChecks, client, check)) ?? {};
-    // A shared check that passed without an executable cannot start the client: check here.
-    executable ??= (await check()).executable;
+    const executable = await subscribedExecutable(subscriptionChecks, client, () =>
+      subscriptionStatus(client, { env: environment, processImpl, resolveClientImpl }),
+    );
     directory = await mkdtemp(path.join(os.tmpdir(), 'kodo-provider-'));
     const schemaPath = schema ? path.join(directory, 'output.schema.json') : undefined;
     if (schema) await writeFile(schemaPath, JSON.stringify(providerSchema(schema)), { mode: 0o600 });
@@ -555,22 +591,13 @@ export async function runSession(
         });
         break;
       } catch (error) {
-        if (error?.code !== 'KODO_STARTUP_TIMEOUT' || signal?.aborted) throw error;
-        // A client that never answered did no work: start it once more. A second silence, or a
-        // silence after events, fails the session as unavailable, which spends no repair round.
-        if (events.length || startupRetries)
-          throw Object.assign(
-            new ProviderError(`Клиент ${client} не прислал первое событие за ${startupTimeoutMs} мс`, 'unavailable'),
-            { startupTimeout: true },
-          );
-        // Every native start is admitted by the caller (its session budget); a refusal keeps its reason.
-        try {
-          await onStartupRetry?.({ reason: 'startup_timeout' });
-        } catch (refusal) {
-          throw refusal instanceof ProviderError
-            ? refusal
-            : new ProviderError(redact(refusal?.message ?? String(refusal)), refusal?.code || 'unavailable');
-        }
+        await restartAfterSilence(error, {
+          answered: events.length > 0 || startupRetries > 0,
+          aborted: signal?.aborted,
+          client,
+          startupTimeoutMs,
+          onStartupRetry,
+        });
         startupRetries++;
       }
     }
