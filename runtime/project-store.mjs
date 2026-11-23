@@ -788,7 +788,7 @@ const containerChildren = (s, item) =>
 // Tasks covered by the widest container of a valid epic ⊂ milestone ⊂ project chain.
 // A milestone or project joins the chain only when every child outside the chain
 // is already accepted: one gate never verifies a sibling it does not merge.
-function gateTasks(ctx, s, containers) {
+function gateTasks(ctx, s, containers, merges) {
   for (const [index, item] of containers.entries()) {
     const next = containers[index + 1],
       inner = containers[index - 1];
@@ -796,7 +796,22 @@ function gateTasks(ctx, s, containers) {
       requireValue(item.id === s.project.projectId && !closedStates.has(s.project.status), 'gate_invalid');
     else {
       const record = (item.kind === 'epic' ? s.epics : s.milestones).find(row => row.id === item.id);
-      requireValue(record && !closedStates.has(record.status), 'gate_invalid');
+      requireValue(record, 'gate_invalid');
+      if (closedStates.has(record.status)) {
+        // A failed gate may already have accepted the inner container. Only the
+        // same verified task set and chain, with an open parent, may retry it.
+        const previous = s.gates.findLast(
+          gate => gate.installed && isDeepStrictEqual(gate.containers[0], containers[0]),
+        );
+        requireValue(
+          next &&
+            previous &&
+            isDeepStrictEqual(previous.containers, containers) &&
+            isDeepStrictEqual(previous.merges, merges) &&
+            retryStates.has(runState(ctx, previous.runId)),
+          'gate_invalid',
+        );
+      }
       if (item.kind === 'epic' && next) requireValue(record.milestoneId === next.id, 'gate_invalid');
     }
     if (item.kind !== 'epic')
@@ -816,7 +831,7 @@ function gateTasks(ctx, s, containers) {
 // attempt, and each mergeCommit is the one the attempt's own Run recorded for
 // its verified head (never a caller-chosen older commit).
 function assertGateMerges(ctx, s, containers, merges) {
-  const tasks = gateTasks(ctx, s, containers);
+  const tasks = gateTasks(ctx, s, containers, merges);
   const covered = new Map(tasks.map(task => [task.id, task]));
   requireValue(merges.length === covered.size, 'gate_invalid');
   for (const merge of merges) {
