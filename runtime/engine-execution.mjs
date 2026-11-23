@@ -19,14 +19,16 @@ export class EngineExecution extends EnginePlanning {
   /**
    * A fast-path diff may contain only the proof's named files, compared literally (a scope check by
    * prefix would also accept the contents of a directory named like a file), and a named file stays
-   * a regular file: deleting it, or replacing it with a directory, is refused. `extra` are the
-   * coordinator's own version-metadata files that a commit may also carry.
+   * a regular file of the same Git mode: deleting it, replacing it with a directory, a link or a
+   * submodule, or changing its mode, is refused. `extra` are the coordinator's own version-metadata
+   * files that a commit may also carry.
    * @param {any} run
    * @param {string} cwd
+   * @param {string} base
    * @param {string[]} files
    * @param {string[]} [extra]
    */
-  async assertFastPathDiff(run, cwd, files, extra = []) {
+  async assertFastPathDiff(run, cwd, base, files, extra = []) {
     if (run.executionMode?.source !== 'fast-path') return files;
     const listed = new Set(fastPathScope(run.fastPath));
     const outside = files.filter(name => !listed.has(name) && !extra.includes(name));
@@ -34,7 +36,18 @@ export class EngineExecution extends EnginePlanning {
       throw Object.assign(new Error(`Изменены файлы вне списка быстрого пути: ${outside.join(', ')}`), {
         code: 'scope_conflict',
       });
-    for (const name of files.filter(item => listed.has(item)))
+    const named = files.filter(item => listed.has(item));
+    if (named.length) {
+      const { stdout } = await execute('git', ['diff', '--raw', '--no-renames', base, '--', ...named], { cwd });
+      for (const line of stdout.split('\n').filter(Boolean)) {
+        const [, from, to, name] = /^:(\d{6}) (\d{6}) \S+ \S+ \S+\t(.*)$/.exec(line) ?? [];
+        if (to !== '000000' && (from !== to || !/^100(?:644|755)$/.test(to)))
+          throw Object.assign(new Error(`Режим файла быстрого пути изменён: ${name} ${from} → ${to}`), {
+            code: 'scope_conflict',
+          });
+      }
+    }
+    for (const name of named)
       if (!(await lstatSafe(path.join(cwd, name)))?.isFile())
         throw Object.assign(new Error(`Файл быстрого пути удалён или заменён: ${name}`), { code: 'scope_conflict' });
     return files;
@@ -45,7 +58,7 @@ export class EngineExecution extends EnginePlanning {
    * changes are not counted as the executor's.
    */
   async checkRunScope(run, cwd, base, scopes, extra = []) {
-    return this.assertFastPathDiff(run, cwd, await this.checkScope(cwd, base, scopes), extra);
+    return this.assertFastPathDiff(run, cwd, base, await this.checkScope(cwd, base, scopes), extra);
   }
   async checkScope(cwd, baseSha, scopes) {
     const tracked = await changedFiles(cwd, baseSha);
@@ -358,10 +371,16 @@ export class EngineExecution extends EnginePlanning {
       const beforeMerge = await git(run.cwd, ['rev-parse', 'HEAD']);
       run.pendingMerge = { kind: 'node', sha: node.headSha, nodeId: task.id };
       this.save(run);
+      // The recorded commit, never a later tip of the node branch. A fast-path merge is not committed
+      // by Git: it passes the same exact check as conflicts before the coordinator commits it.
+      const fastPath = run.executionMode?.source === 'fast-path';
       const merged = mergeInProgress
         ? { code: 1 }
-        : await execute('git', ['merge', '--no-ff', '--no-edit', node.branch], { cwd: run.cwd, allowFailure: true });
-      if (merged.code) {
+        : await execute('git', ['merge', '--no-ff', ...(fastPath ? ['--no-commit'] : []), '--no-edit', node.headSha], {
+            cwd: run.cwd,
+            allowFailure: true,
+          });
+      if (merged.code || fastPath) {
         const conflicts = (await git(run.cwd, ['diff', '--name-only', '--diff-filter=U'])).split('\n').filter(Boolean);
         const pending =
           (await execute('git', ['rev-parse', '--verify', 'MERGE_HEAD'], { cwd: run.cwd, allowFailure: true })).code ===
@@ -488,14 +507,18 @@ export class EngineExecution extends EnginePlanning {
     run.architectureChecks = null;
     run.pendingMerge = { kind: 'base', sha: base, baseSha: base };
     this.save(run);
+    // A fast-path merge of the incoming base is not committed by Git: its result is checked against
+    // the named files before it is committed and before the new base is saved.
+    const fastPath = run.executionMode?.source === 'fast-path';
     const merged =
       pending.code === 0
         ? { code: 1 }
-        : await execute('git', ['merge', '--no-edit', `origin/${run.config.baseBranch}`], {
-            cwd: run.cwd,
-            allowFailure: true,
-          });
-    if (merged.code) {
+        : await execute(
+            'git',
+            ['merge', ...(fastPath ? ['--no-ff', '--no-commit'] : []), '--no-edit', `origin/${run.config.baseBranch}`],
+            { cwd: run.cwd, allowFailure: true },
+          );
+    if (merged.code || fastPath) {
       const conflicts = (await git(run.cwd, ['diff', '--name-only', '--diff-filter=U'])).split('\n').filter(Boolean);
       if (
         (await execute('git', ['rev-parse', '--verify', 'MERGE_HEAD'], { cwd: run.cwd, allowFailure: true })).code !== 0
@@ -516,12 +539,14 @@ export class EngineExecution extends EnginePlanning {
         );
         if (!result.output.complete) throw new Error('Конфликт целевой ветки не разрешён');
       }
+      // Known limitation: with an assigned release version the version files are in scope whole.
+      const metadata = run.releaseAssignment?.version ? ['package.json', 'package-lock.json', 'registry.json'] : [];
       await this.checkRunScope(
         run,
         run.cwd,
         base,
-        [...run.plan.tasks.flatMap(task => task.writePaths), ...conflicts],
-        run.releaseAssignment?.version ? ['package.json', 'package-lock.json', 'registry.json'] : [],
+        [...run.plan.tasks.flatMap(task => task.writePaths), ...conflicts, ...(fastPath ? metadata : [])],
+        metadata,
       );
       await git(run.cwd, ['add', '-A']);
       await execute(

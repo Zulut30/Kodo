@@ -154,8 +154,12 @@ export class EnginePlanning extends EngineCore {
    */
   async revokeOutdatedFastPath(run, signal) {
     if (run.executionMode?.source !== 'fast-path' || !fastPathOutdated(run.fastPath)) return;
+    // A started session counts, whatever the counters say after quota or a retry cycle.
     if (
-      Object.values(run.nodes || {}).some(node => node.attempt > 0 || ['completed', 'integrated'].includes(node.status))
+      (run.sessionAttempts || []).some(attempt => attempt.node) ||
+      Object.values(run.nodes || {}).some(
+        node => node.attempt > 0 || node.previousAttempts > 0 || ['completed', 'integrated'].includes(node.status),
+      )
     )
       throw Object.assign(
         new Error(

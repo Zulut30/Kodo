@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { readConfig } from '../runtime/config.mjs';
 import { manifestFreshness } from '../runtime/context-manifest.mjs';
@@ -347,4 +347,70 @@ test('A broken or forbidden host plan is refused without revoking the fast path'
   assert.deepEqual([oversized.state, oversized.error.code], ['blocked', 'task_contract_too_large']);
   assert.deepEqual([oversized.executionMode.source, oversized.fastPath.revoked], ['fast-path', undefined]);
   assert.ok(!fx.calls.includes('assessment'), 'no assessment, analysis or research was spent on it');
+});
+
+test('A clean merge of the target branch is checked against the named files before the base is saved', async t => {
+  const fx = await fixture(t);
+  const origin = path.join(fx.root, 'origin.git');
+  git(fx.root, 'init', '--bare', origin);
+  git(fx.project, 'remote', 'add', 'origin', origin);
+  git(fx.project, 'push', '-u', 'origin', 'main');
+  const run = await fx.engine.create('Set the exported value to one in value.mjs', { project: fx.project });
+  const result = await fx.engine.run(run.id);
+  assert.deepEqual([result.state, result.fastPath.reason], ['succeeded', 'small_local'], result.error?.message);
+  // Upstream renames the named file: Git carries the change into the new name without a conflict.
+  git(fx.project, 'mv', 'value.mjs', 'lib.mjs');
+  git(fx.project, 'commit', '-m', 'Rename upstream');
+  git(fx.project, 'push', 'origin', 'main');
+  await assert.rejects(fx.engine.synchronizeBase(fx.store.getRun(run.id)), error => error.code === 'scope_conflict');
+  assert.equal(fx.store.getRun(run.id).baseSha, result.baseSha, 'the new base was not saved');
+});
+
+test('Integration merges the recorded node commit, not a later tip of the node branch', async t => {
+  const fx = await styled(t);
+  const integrate = fx.engine.integrateNode.bind(fx.engine);
+  fx.engine.integrateNode = async (run, node, signal) => {
+    const state = run.nodes[node.id];
+    await writeFile(path.join(state.cwd, 'extra.mjs'), 'export const extra = 1;\n');
+    git(state.cwd, 'add', 'extra.mjs');
+    git(state.cwd, 'commit', '-m', 'A later commit on the node branch');
+    return integrate(run, node, signal);
+  };
+  const result = await fx.engine.run((await fx.engine.create(cssTask, { project: fx.project })).id);
+  assert.equal(result.state, 'succeeded', result.error?.message);
+  assert.deepEqual(git(result.cwd, 'diff', '--name-only', result.baseSha, result.headSha).split('\n'), [css]);
+});
+
+test('A fast-path diff may not change the Git mode of a named file', async t => {
+  const fx = await styled(t);
+  const session = fx.provider.runSession;
+  fx.provider.runSession = async request => {
+    const result = await session(request);
+    if (!request.schema.properties.tasks && !request.schema.properties.passed) {
+      await chmod(path.join(request.cwd, css), 0o755);
+      git(request.cwd, 'update-index', '--chmod=+x', css);
+    }
+    return result;
+  };
+  const result = await fx.engine.run((await fx.engine.create(cssTask, { project: fx.project })).id);
+  assert.notEqual(result.state, 'succeeded', 'a mode change must not pass');
+  assert.match(Object.values(result.nodes)[0].error ?? '', /режим/i);
+});
+
+test('An outdated code proof whose node already started a session stops the run, after quota and retry too', async t => {
+  const fx = await fixture(t, { failedWorker: true });
+  const run = await fx.engine.create('Set the exported value to one in value.mjs', { project: fx.project });
+  const waiting = await fx.engine.run(run.id);
+  assert.equal(waiting.state, 'waiting_limits');
+  assert.equal(Object.values(waiting.nodes)[0].attempt, 0, 'quota gave the attempt back');
+  fx.store.updateRun(run.id, {
+    fastPath: { version: 2, files: ['value.mjs'], reason: 'small_local', budgets: waiting.fastPath.budgets },
+  });
+  const sessions = fx.sessions.length;
+  for (const options of [{}, { retryFailed: true }]) {
+    const blocked = await fx.engine.run(run.id, options);
+    assert.deepEqual([blocked.state, blocked.error.code], ['blocked', 'fast_path_outdated'], JSON.stringify(options));
+    assert.equal(blocked.fastPath.revoked, undefined, 'the plan the session worked on is not replaced');
+  }
+  assert.equal(fx.sessions.length, sessions, 'no new session');
 });
