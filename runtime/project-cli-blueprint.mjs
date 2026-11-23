@@ -213,6 +213,7 @@ async function bootstrap(ctx) {
       ...inputs,
     });
     const target = path.join(bundle.summary.root, '.kodo', 'blueprint');
+    const apply = `${ctx.cli} project apply-spec --root ${quotePath(bundle.summary.root)} --json`;
     return envelope(null, null, {
       status: 'prepared',
       bundle: { id: bundle.id, dir: bundle.dir, files: bundle.files },
@@ -222,8 +223,9 @@ async function bootstrap(ctx) {
         `Прочитай context.md, rules.md и templates/ в ${bundle.dir}.`,
         `Напиши чертёж только в ${target}: PROJECT.md, interfaces/<module>.md, spec.json (root = ${bundle.summary.root}).`,
         'Перед регистрацией root — корень Git-репозитория с коммитом; всё вне .kodo/blueprint закоммичено или в .gitignore.',
-        `Проверь и зарегистрируй проект: ${ctx.cli} project apply-spec --root ${quotePath(bundle.summary.root)} --json`,
+        `Проверь и зарегистрируй проект: ${apply}`,
       ],
+      commands: [{ command: apply, why: 'После записи чертежа и коммита: проверить и зарегистрировать проект' }],
     });
   }
   const generated = await bootstrapModule.generateBlueprint({
@@ -241,14 +243,14 @@ async function bootstrap(ctx) {
   });
   const extra = { bundle: { id: generated.id }, session: generated.session, scopeChecked: generated.scopeChecked };
   if (!generated.ok) return findingsReport(generated.findings, extra);
+  const apply = `${ctx.cli} project apply-spec --root ${quotePath(generated.spec.root)} --json`;
   return envelope(null, null, {
     status: 'compiled',
     ...extra,
     blueprint: path.join(generated.spec.root, '.kodo', 'blueprint'),
     modules: moduleMap(generated.spec),
-    next: [
-      `Проверь чертёж и зарегистрируй проект: ${ctx.cli} project apply-spec --root ${quotePath(generated.spec.root)} --json`,
-    ],
+    next: [`Проверь чертёж и зарегистрируй проект: ${apply}`],
+    commands: [{ command: apply, why: 'После проверки чертежа и коммита: зарегистрировать проект' }],
   });
 }
 
@@ -327,6 +329,11 @@ async function applySpec(ctx) {
     action: { op: 'create', spec: bound.spec },
   });
   const snapshot = await repo.snapshot(created.projectId);
+  // Workers' self-check (ci feedback) lints JS/TS with the managed oxlint (TypeScript also needs
+  // typescript); without it the feedback is blocked, never feedback_ready. Installing is the
+  // coordinator's step, not a worker's.
+  const tool = id => `${ctx.cli} tools install ${id} --project ${quotePath(snapshot.project.root)} --json`;
+  const wave = `${ctx.cli} project next-wave ${created.projectId} --host t3 --limit 3 --json`;
   return envelope(created.projectId, snapshot.revision, {
     status: created.replayed ? 'replayed' : 'created',
     replayed: created.replayed === true,
@@ -334,10 +341,13 @@ async function applySpec(ctx) {
     interfaces: bound.interfaces.map(item => ({ module: item.module, sha256: item.sha256 })),
     modules: moduleMap(snapshot),
     next: [
-      // Workers' self-check (ci feedback) lints JS/TS with the managed oxlint; without it the
-      // feedback is blocked, never passed. Installing is the coordinator's step, not a worker's.
-      `Перед первой волной установи управляемый линтер самопроверки воркеров (один раз на машину, нужна сеть): ${ctx.cli} tools install oxlint --project ${quotePath(snapshot.project.root)} --json — для JS/TS, для TypeScript ещё typescript. Без него ci feedback воркера отвечает blocked, а не feedback_ready.`,
-      `Запусти волну: ${ctx.cli} project next-wave ${created.projectId} --host t3 --limit 3 --json`,
+      `Перед первой волной установи управляемый линтер самопроверки воркеров (один раз на машину, нужна сеть): ${tool('oxlint')} — для JS/TS, для TypeScript ещё typescript. Без него ci feedback воркера отвечает blocked, а не feedback_ready.`,
+      `Запусти волну: ${wave}`,
+    ],
+    commands: [
+      { command: tool('oxlint'), why: 'JS/TS-проект: линтер самопроверки воркеров, один раз на машину, нужна сеть' },
+      { command: tool('typescript'), why: 'Только TypeScript-проект: проверка типов в самопроверке воркеров' },
+      { command: wave, why: 'Первая волна для воркер-чатов T3' },
     ],
   });
 }
@@ -400,9 +410,15 @@ async function extend(ctx) {
     ...(await contextInputs(ctx, root, options.idea)),
   };
   if (options.prepare) {
-    const bundle = await bootstrapModule.prepareExtend(common);
+    // The hint's milestone file is checked before its bundle directory exists (a junction in
+    // Kodo home may resolve elsewhere): an unusable path writes no bundle.
+    const bundle = await bootstrapModule.prepareExtend({
+      ...common,
+      checkDir: dir => quotePath(path.join(dir, 'milestone.json')),
+    });
     const template = path.join(bundle.dir, 'templates', 'milestone.json');
     const file = path.join(bundle.dir, 'milestone.json');
+    const append = `${ctx.cli} project append-milestone ${options.projectId} --file ${quotePath(file)} --json`;
     return envelope(options.projectId, snapshot.revision, {
       status: 'prepared',
       bundle: { id: bundle.id, dir: bundle.dir, files: bundle.files },
@@ -411,8 +427,9 @@ async function extend(ctx) {
       next: [
         `Прочитай context.md и rules.md в ${bundle.dir}; форма майлстоуна — ${template}.`,
         `Запиши майлстоун в ${file} (вне репозитория).`,
-        `Проверь и добавь: ${ctx.cli} project append-milestone ${options.projectId} --file ${quotePath(file)} --json`,
+        `Проверь и добавь: ${append}`,
       ],
+      commands: [{ command: append, why: 'После записи milestone.json: проверить и добавить майлстоун' }],
     });
   }
   const generated = await bootstrapModule.generateMilestone({

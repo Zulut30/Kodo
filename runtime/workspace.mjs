@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
-import { readFile, lstat, mkdir } from 'node:fs/promises';
+import { readFile, lstat, mkdir, realpath } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { execute } from './command.mjs';
 import { secretFile, redact, stateHome, worktreeHome } from './security.mjs';
@@ -28,6 +29,18 @@ export function worktreeHomeFor({ storeHome, stateInGit = false, artifactHome })
         ? worktreeHome()
         : `${storeHome}-worktrees`)
   );
+}
+/**
+ * The worktree home a new Run of this state home gets (Engine.initializeRun), before the
+ * Run exists: the same `worktreeHomeFor` priority, with a fixed name standing in for the
+ * random temporary artifact home of a state home inside Git.
+ * @param {string} storeHome
+ */
+export async function plannedWorktreeHome(storeHome) {
+  const stateInGit =
+    (await execute('git', ['rev-parse', '--show-toplevel'], { cwd: storeHome, allowFailure: true })).code === 0;
+  const artifactHome = stateInGit ? path.join(await realpath(os.tmpdir()), 'kodo-artifacts-planned') : storeHome;
+  return path.resolve(worktreeHomeFor({ storeHome, stateInGit, artifactHome }));
 }
 export async function inspectProject(project) {
   const root = await git(project, ['rev-parse', '--show-toplevel']);

@@ -18,12 +18,9 @@
  * `project-director-waves.mjs`. Kodo never starts or archives the host's chats.
  */
 import { randomUUID } from 'node:crypto';
-import { realpath } from 'node:fs/promises';
-import os from 'node:os';
-import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { execute } from './command.mjs';
-import { git, makeWorktree, worktreeHomeFor } from './workspace.mjs';
+import { git, makeWorktree, plannedWorktreeHome } from './workspace.mjs';
 import { scopesOverlap } from './contracts.mjs';
 import { redact } from './security.mjs';
 import { isPullHost } from './job-contracts.mjs';
@@ -382,16 +379,6 @@ async function reserveSelected(state, limit, ports) {
   }
 }
 
-// The directory of new Runs' worktrees, as Engine.initializeRun chooses it (a state home
-// inside Git keeps them beside a temporary artifact home), checked for brief commands.
-async function plannedWorktreeHome(store) {
-  if (typeof store?.home !== 'string') return;
-  const inGit =
-    (await execute('git', ['rev-parse', '--show-toplevel'], { cwd: store.home, allowFailure: true })).code === 0;
-  const home = inGit ? await realpath(os.tmpdir()) : worktreeHomeFor({ storeHome: store.home });
-  quotePath(path.resolve(home));
-}
-
 /**
  * Reserve the next wave for an external host: the briefs of this host's running
  * attempts, then new non-overlapping tasks up to `limit` (1..5). `cli` is the command
@@ -408,8 +395,10 @@ export async function nextWave(ctx, input) {
     store = storeOf(ctx);
   const options = { knownValues: known(ctx.engine) };
   C.assertDirectorSafe(cli, options);
-  // Every brief command names its worktree: an unusable directory is refused before any reservation.
-  await plannedWorktreeHome(ctx.engine.store ?? store);
+  // Every brief command names its worktree: the directory new Runs get (the Engine's own
+  // priority, KODO_WORKTREE_HOME first) is refused before the lease or any reservation.
+  const home = (ctx.engine.store ?? store)?.home;
+  if (typeof home === 'string') quotePath(await plannedWorktreeHome(home));
   const snapshot = await snapshotOf(ctx, projectId);
   need(C.isWaveProject(snapshot.project), 'wave_required');
   controlOf(snapshot);

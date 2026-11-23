@@ -316,7 +316,9 @@ function redactContext(text, { contracts = projectContracts, knownValues = [] } 
  * inside the project root: the repository is not changed by preparation. Every
  * file is redacted (redactContext) before the first write.
  * @returns {Promise<{ id: string, dir: string, files: string[], redacted: boolean }>} */
-async function writeBundle({ home, root, kind, now, files: raw, safety }) {
+// `checkDir(dir)` sees the final bundle directory (Kodo home and its bootstrap folder resolved)
+// before it is created: a caller that quotes a bundle path refuses an unusable one first.
+async function writeBundle({ home, root, kind, now, files: raw, safety, checkDir = undefined }) {
   const checked = raw.map(([name, content]) => [name, redactContext(content, safety)]);
   const files = checked.map(([name, item]) => [name, item.text]);
   if (typeof home !== 'string' || !path.isAbsolute(home))
@@ -331,6 +333,7 @@ async function writeBundle({ home, root, kind, now, files: raw, safety }) {
     throw failure('bootstrap_home_inside_root', 'Контекст-пакет не создаётся внутри каталога проекта');
   const id = `${kind}-${isoTime(now).replace(/[-:.]/g, '')}-${randomBytes(4).toString('hex')}`;
   const dir = path.join(realBase, id);
+  checkDir?.(dir);
   await mkdir(dir, { mode: 0o700 });
   for (const [name, content] of files) {
     const target = path.join(dir, ...name.split('/'));
@@ -795,6 +798,7 @@ export async function prepareExtend(options = {}) {
   const { redacted, ...bundle } = await writeBundle({
     home,
     root: real,
+    checkDir: options.checkDir,
     kind: 'extend',
     now: at,
     safety: { contracts, knownValues },

@@ -198,3 +198,97 @@ test('A valid native child plan outside the frozen ProjectTask scope cannot star
   await assert.rejects(() => access(path.join(result.cwd, 'unowned.txt')));
   await assert.rejects(() => access(path.join(f.project, 'unowned.txt')));
 });
+
+/** A reserved Director task Run whose frozen ProjectTask owns `writePaths`. */
+async function directorRun(f, engine, store, writePaths) {
+  const projectId = randomUUID(),
+    now = new Date().toISOString(),
+    root = await realpath(f.project);
+  const criterion = { id: 'owned-proof', text: 'Only the owned scope may change', evidenceKinds: ['acceptance'] };
+  const meta = { schemaVersion: 1, projectId, revision: 1, status: 'ready', createdAt: now, updatedAt: now };
+  const project = {
+    ...meta,
+    evidence: [],
+    mappings: [],
+    id: 'owned-project',
+    root,
+    projectKey: process.platform === 'win32' ? root.toLowerCase() : root,
+    title: 'Owned task boundary',
+    definitionOfDone: [criterion],
+    constraints: ['Only assigned scope'],
+    businessContext: '',
+    architectureRefs: [],
+    paused: false,
+  };
+  const task = {
+    ...meta,
+    evidence: [],
+    mappings: [],
+    id: 'owned-task',
+    epicId: 'owned-epic',
+    title: 'Update the owned scope',
+    description: 'Update files of the owned scope',
+    owner: 'developer',
+    dependsOn: [],
+    writePaths,
+    acceptance: [criterion],
+    interfaceRefs: [],
+    priority: 50,
+    userValue: 1,
+    risk: 1,
+    estimatedEffort: 1,
+    riskApprovalRequired: false,
+  };
+  const binding = {
+    schemaVersion: 1,
+    projectId,
+    taskId: task.id,
+    taskRevision: 1,
+    attemptId: randomUUID(),
+    runId: randomUUID(),
+    contractHash: directorContractHash(task, { knownValues: [] }),
+  };
+  return engine.createReserved(
+    buildDirectorTaskInput({ project, task }, { knownValues: [] }),
+    { project: f.project, mode: 'quick', model: 'gpt-6.1-sol' },
+    { binding, installRun: async ({ runDraft }) => store.createRun(runDraft) },
+  );
+}
+
+test('A child plan never widens a `dir/**` ProjectTask scope to the directory path itself', async t => {
+  const f = await fixture(t),
+    store = f.openStore(),
+    engine = new Engine({ store, secrets: {} });
+  const run = await directorRun(f, engine, store, ['lib/**']);
+  const planned = writePaths => ({
+    ...run,
+    plan: { summary: 'Owned', tasks: [node('owned', 'developer', writePaths)] },
+  });
+  // `lib/**` owns files below lib/, never a file named lib (ownsPath(['lib/**'], 'lib') is false).
+  for (const scope of ['lib', 'other/lib'])
+    await assert.rejects(engine.assertProjectPlan(planned([scope])), { code: 'project_scope_violation' }, scope);
+  for (const scope of ['lib/a.mjs', 'lib/**', 'lib/sub/**']) await engine.assertProjectPlan(planned([scope]));
+});
+
+test('A task-fast change is checked against the frozen ProjectTask scope, not only the node scope', async t => {
+  const f = await fixture(t),
+    store = f.openStore(),
+    engine = new Engine({ store, secrets: {} });
+  const run = await directorRun(f, engine, store, ['lib/**']);
+  const base = (await import('node:child_process'))
+    .execFileSync('git', ['rev-parse', 'HEAD'], { cwd: f.project, encoding: 'utf8' })
+    .trim();
+  t.after(() => rm(path.join(f.project, 'lib'), { force: true }));
+  // A file named lib: inside the node scope `lib`, outside the task's `lib/**`.
+  await writeFile(path.join(f.project, 'lib'), 'not a directory of the task\n');
+  const fast = { ...run, verificationProfile: 'task-fast' };
+  await assert.rejects(engine.checkTaskScope(fast, f.project, base, ['lib']), { code: 'scope_conflict' });
+  // An ordinary Run keeps its node scope check alone.
+  assert.deepEqual(await engine.checkTaskScope({ ...run, verificationProfile: 'standard' }, f.project, base, ['lib']), [
+    'lib',
+  ]);
+  await rm(path.join(f.project, 'lib'));
+  await writeFile(path.join(f.project, 'lib.mjs'), 'export {};\n');
+  t.after(() => rm(path.join(f.project, 'lib.mjs'), { force: true }));
+  await assert.rejects(engine.checkTaskScope(fast, f.project, base, ['lib.mjs']), { code: 'scope_conflict' });
+});

@@ -14,7 +14,11 @@ const UNSAFE = /["`$%!\u2018-\u201f]/;
 const CONTROL = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
 
 export const PATH_UNSAFE_MESSAGE =
-  'Путь нельзя одинаково безопасно подставить в команду PowerShell, cmd и bash (кавычки, ` $ % !, управляющие символы, двойной или конечный обратный слеш, относительный путь): переименуйте или переместите каталог проекта, Kodo home или KODO_WORKTREE_HOME.';
+  'Путь нельзя одинаково безопасно подставить в команду PowerShell, cmd и bash (кавычки, ` $ % !, управляющие символы, двойной или конечный обратный слеш, относительный путь): переименуйте или переместите каталог проекта, Kodo home или KODO_WORKTREE_HOME. Сетевой путь (\\\\сервер\\папка), корень диска или путь без буквы диска не подходят: перенесите проект в подкаталог локального диска, например D:\\Projects\\<имя>.';
+
+// Windows: a fully qualified local path, drive letter and separator (`/x` is relative to the
+// current drive; a UNC share and a drive root fail the backslash rule below).
+const qualified = value => process.platform !== 'win32' || /^[A-Za-z]:\\/.test(value);
 
 /** An absolute path that a double-quoted argument carries literally in PowerShell, cmd and bash. */
 export function commandPathSafe(value) {
@@ -24,6 +28,7 @@ export function commandPathSafe(value) {
     value.length <= 4096 &&
     value.isWellFormed() &&
     path.isAbsolute(value) &&
+    qualified(value) &&
     !CONTROL.test(value) &&
     !UNSAFE.test(value) &&
     // bash folds `\\` and `\"` inside double quotes: no doubled or final backslash.

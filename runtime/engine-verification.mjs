@@ -575,7 +575,7 @@ export class EngineVerification extends EngineExecution {
       this.save(run);
     }
     this.checkCancelled(run, signal);
-    await this.checkScope(run.cwd, pending.headSha, scopes);
+    await this.checkTaskScope(run, run.cwd, pending.headSha, scopes);
     await commitChanges(run.cwd, `Kodo repair checks ${cycle.attempt}`);
     delete cycle.pendingRepair;
     run.checks = null;

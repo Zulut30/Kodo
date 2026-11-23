@@ -121,7 +121,7 @@ async function integrateLeased(f, { projectId, taskId, run }) {
   };
 }
 
-async function fixture(t, { wave = true } = {}) {
+async function fixture(t, { wave = true, stateInGit = false } = {}) {
   const temp = await realpath(await mkdtemp(path.join(os.tmpdir(), 'kodo-external-')));
   const stores = [];
   t.after(async () => {
@@ -247,6 +247,9 @@ async function fixture(t, { wave = true } = {}) {
   f.complete = (taskId, head, input = {}) =>
     completeTask(f.ctx, { projectId: f.projectId, taskId, head, ports: f.ports, ...input });
   f.snapshot = () => repo.snapshot(f.projectId);
+  // A state home that became a Git work tree after its project store was created: the Engine
+  // then keeps Run artifacts and worktrees beside a temporary home unless KODO_WORKTREE_HOME is set.
+  if (stateInGit) git(home, 'init', '-b', 'main');
   f.integrationHead = () => git(root, 'rev-parse', `refs/heads/kodo/project/${f.projectId}`);
   return f;
 }
@@ -389,6 +392,19 @@ test('next-wave refuses a worktree home or CLI path a shell would expand, before
   await assert.rejects(f.wave({ cli: `node "${path.join(f.temp, 'wt "q', 'index.mjs')}"` }), {
     code: 'project_cli_invalid',
   });
+  // Windows: only a fully qualified local path (drive letter, colon, separator); a network share, a drive root or a path
+  // without a drive letter is refused with the advice to move the project below a local drive.
+  if (process.platform === 'win32')
+    for (const location of [
+      '/tools/cli/index.mjs',
+      path.win32.join('//server/share', 'cli', 'index.mjs'),
+      path.win32.resolve('C:/'),
+    ])
+      await assert.rejects(
+        f.wave({ cli: `node "${location}"` }),
+        error => error.code === 'project_path_unsafe' && /подкаталог локального диска/.test(error.message),
+        location,
+      );
   const after = await f.snapshot();
   assert.equal(after.revision, before.revision);
   assert.deepEqual(after.currentAttempts, []);
@@ -396,6 +412,25 @@ test('next-wave refuses a worktree home or CLI path a shell would expand, before
   process.env.KODO_WORKTREE_HOME = path.join(f.temp, 'рабочие копии');
   const wave = await f.wave({ limit: 1 });
   assert.ok(wave.briefs[0].selfCheck.includes(`--project "${wave.briefs[0].worktree}" --json`));
+  assert.ok(wave.briefs[0].worktree.startsWith(path.join(f.temp, 'рабочие копии')));
+});
+
+test('next-wave checks an explicit KODO_WORKTREE_HOME of a state home inside Git before any reservation', async t => {
+  const f = await fixture(t, { stateInGit: true });
+  const saved = process.env.KODO_WORKTREE_HOME;
+  t.after(() => {
+    if (saved === undefined) delete process.env.KODO_WORKTREE_HOME;
+    else process.env.KODO_WORKTREE_HOME = saved;
+  });
+  const before = await f.snapshot();
+  // The Engine puts worktrees in an explicit KODO_WORKTREE_HOME first, even for a state home in Git.
+  process.env.KODO_WORKTREE_HOME = path.join(f.temp, 'wt %PATH%');
+  await assert.rejects(f.wave(), { code: 'project_path_unsafe' });
+  const after = await f.snapshot();
+  assert.equal(after.revision, before.revision);
+  assert.deepEqual(after.currentAttempts, []);
+  process.env.KODO_WORKTREE_HOME = path.join(f.temp, 'рабочие копии');
+  const wave = await f.wave({ limit: 1 });
   assert.ok(wave.briefs[0].worktree.startsWith(path.join(f.temp, 'рабочие копии')));
 });
 

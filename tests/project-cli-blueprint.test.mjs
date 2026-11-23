@@ -3,7 +3,19 @@ import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { access, cp, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises';
+import {
+  access,
+  cp,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  realpath,
+  rename,
+  rm,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -339,6 +351,19 @@ test('bootstrap --prepare writes the context bundle only to KODO_HOME', async t 
   const bare = /\bkodo project\b/;
   assert.ok(bare.test('Проверь: kodo project apply-spec --json'), 'the check sees a bare kodo command');
   assert.ok(report.result.next.every(line => !bare.test(line)));
+  // The machine field holds only the command: it runs as is in the platform shell.
+  const apply = `node "${cli}" project apply-spec --root "${root}" --json`;
+  assert.deepEqual(
+    report.result.commands.map(item => item.command),
+    [apply],
+  );
+  assert.ok(report.result.commands.every(item => typeof item.why === 'string' && item.why.length > 0));
+  const env = { ...f.env };
+  const pathKey = Object.keys(env).find(key => key.toUpperCase() === 'PATH') ?? 'PATH';
+  env[pathKey] = [path.dirname(process.execPath), env[pathKey]].filter(Boolean).join(path.delimiter);
+  const ran = spawnSync(apply, { shell: true, cwd: root, env, encoding: 'utf8', timeout: 60000, windowsHide: true });
+  assert.equal(ran.status, 1, ran.stdout + ran.stderr);
+  assert.equal(JSON.parse(ran.stdout).result.code, 'blueprint_findings', 'apply-spec ran and found no blueprint yet');
   assert.deepEqual(await tree(root), before, 'the repository is unchanged');
 });
 
@@ -404,6 +429,14 @@ test('apply-spec creates a wave project with verifiable interfaces and replays b
     );
   hint(`${prefix} tools install oxlint --project "${root}" --json`);
   hint(`${prefix} project next-wave ${report.projectId} --host t3 --limit 3 --json`);
+  assert.deepEqual(
+    report.result.commands.map(item => item.command),
+    [
+      `${prefix} tools install oxlint --project "${root}" --json`,
+      `${prefix} tools install typescript --project "${root}" --json`,
+      `${prefix} project next-wave ${report.projectId} --host t3 --limit 3 --json`,
+    ],
+  );
   // ci feedback succeeds with feedback_ready; a missing tool is a blocker, never a success.
   assert.ok(
     report.result.next.some(line => line.includes('blocked') && line.includes('feedback_ready')),
@@ -552,6 +585,12 @@ test('extend prepares a feature bundle from the snapshot or appends a session mi
     bundle.report.result.next.some(line =>
       line.includes(`node "${cli}" project append-milestone ${prepared.projectId} --file "`),
     ),
+  );
+  assert.deepEqual(
+    bundle.report.result.commands.map(item => item.command),
+    [
+      `node "${cli}" project append-milestone ${prepared.projectId} --file "${path.join(bundle.report.result.bundle.dir, 'milestone.json')}" --json`,
+    ],
   );
   assert.equal(bundle.report.projectId, prepared.projectId);
   assert.equal(bundle.report.revision, prepared.snapshot.revision);
@@ -702,4 +741,19 @@ test('bootstrap and apply-spec refuse a root a shell would expand and an unusabl
   assert.equal(refused.exitCode, 2);
   assert.equal(refused.report.result.reason, 'project_cli_invalid');
   await assert.rejects(access(f.home), 'no bundle, evidence or Store was written');
+});
+
+test('extend --prepare checks the milestone file of its bundle before creating the bundle directory', async t => {
+  const f = await fixture(t);
+  const prepared = await acceptedProject(f);
+  // Kodo home itself is safe, but its bundle folder resolves into a directory cmd would expand.
+  const target = path.join(f.dir, 'bundles %PATH%');
+  await mkdir(target);
+  await symlink(target, path.join(f.home, 'bootstrap'), 'junction');
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const result = await f.run(['extend', prepared.projectId, 'Теги', '--prepare']);
+    assert.equal(result.exitCode, 1, JSON.stringify(result.report));
+    assert.equal(result.report.result.reason, 'project_path_unsafe');
+    assert.deepEqual(await readdir(target), [], 'no bundle is written, a repeat adds none');
+  }
 });

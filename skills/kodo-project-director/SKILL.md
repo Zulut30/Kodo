@@ -9,7 +9,7 @@ description: Веди большой проект через фабрику Kodo
 
 1. Проверь возможность, а не номер версии: `kodo project --help --json` (или локальный `node "<абсолютный путь к Kodo>/cli/index.mjs" project --help --json`) должен завершиться с кодом 0 и `result.status: "help"`. Так отвечает только CLI, который выдаёт брифы с собственным префиксом; 0.2.6 не знает `project`, а 1.0.0 отвечает `project_arguments`.
 2. Проверка не прошла — используй локальный `node "<…>/cli/index.mjs"`, если он её проходит; иначе скажи пользователю обновить Kodo и не продолжай с устаревшим CLI.
-3. Дальше `kodo` в этом навыке — выбранный CLI. Ответы `next-wave` дают его префикс в `result.cli`, а команды в брифах (`selfCheck`, `completeCommand`, `abandonCommand`) и в `result.next` уже вызывают тот же пакет: `node "<абсолютный путь к cli/index.mjs>" …`. Выполняй их как есть и не заменяй префикс на `kodo` с PATH. `--json` добавляй только к `completeCommand` и `abandonCommand`: в `selfCheck` и строках `result.next` он уже есть, повтор флага парсер отклоняет. `project_path_unsafe` — в пути проекта, Kodo home или `KODO_WORKTREE_HOME` есть символы, которые оболочка раскрыла бы (`$`, `` ` ``, `%`, `!`, кавычки): попроси пользователя переименовать или переместить каталог. Справка: `kodo project --help`, `kodo project <действие> --help`.
+3. Дальше `kodo` в этом навыке — выбранный CLI. Ответы `next-wave` дают его префикс в `result.cli`, а команды в брифах (`selfCheck`, `completeCommand`, `abandonCommand`) и в поле `command` элементов `result.commands` (ответы `bootstrap`, `apply-spec`, `extend --prepare`) уже вызывают тот же пакет: `node "<абсолютный путь к cli/index.mjs>" …`. В оболочке выполняй только эти поля, как есть, и не заменяй префикс на `kodo` с PATH; `result.next` — пояснения для чтения, строку оттуда оболочке не передавай, а `why` объясняет, когда нужна команда. `--json` добавляй только к `completeCommand` и `abandonCommand`: в `selfCheck` и `result.commands[].command` он уже есть, повтор флага парсер отклоняет. `project_path_unsafe` — в пути проекта, Kodo home или `KODO_WORKTREE_HOME` есть символы, которые оболочка раскрыла бы (`$`, `` ` ``, `%`, `!`, кавычки), либо это сетевой путь, корень диска или путь без буквы диска: попроси пользователя переименовать каталог или перенести проект в подкаталог локального диска. Справка: `kodo project --help`, `kodo project <действие> --help`.
 
 ## 1. Чертёж проекта
 
@@ -27,7 +27,7 @@ description: Веди большой проект через фабрику Kodo
 5. `kodo project apply-spec --root <root> --command-id <новый UUID> --json`.
    - Exit 1 и `result.code: "blueprint_findings"` — исправь чертёж по каждому `findings[].code` и повтори. `split_required` — раздроби перечисленные задачи на меньшие с отдельными `writePaths` и зависимостями; `blueprint_parallel_overlap` — разведи пути пары или добавь зависимость; `blueprint_epic_cycle` — перенеси задачи между перечисленными эпиками или объедини их; `blueprint_git_required` — выполни шаг 4.
    - Успех: сохрани `projectId`; `result.modules` — майлстоуны, эпики и `waveZero`.
-6. Выполни шаги `result.next` из ответа `apply-spec`: перед первой волной установи управляемый oxlint для самопроверки воркеров (`… tools install oxlint --project "<root>" --json`, один раз на машину, нужна сеть; для TypeScript ещё `typescript`). Установку делаешь ты, не воркер. Успех самопроверки — `feedback_ready`; `blocked` в `ci feedback` воркера из-за отсутствующего инструмента — не успех: установи инструмент и попроси воркера повторить самопроверку в том же чате.
+6. Выполни нужные команды `result.commands` из ответа `apply-spec` по их `why`: перед первой волной установи управляемый oxlint для самопроверки воркеров (команда `tools install oxlint`, один раз на машину, нужна сеть; для TypeScript-проекта ещё команда `tools install typescript`), затем первая волна. Установку делаешь ты, не воркер. Успех самопроверки — `feedback_ready`; `blocked` в `ci feedback` воркера из-за отсутствующего инструмента — не успех: установи инструмент и попроси воркера повторить самопроверку в том же чате.
 
 ## 2. Цикл волн в T3
 
@@ -67,7 +67,7 @@ description: Веди большой проект через фабрику Kodo
 
 1. `kodo project extend <projectId> "<фича>" --prepare --json`; прочитай пакет и шаблон `result.template`.
 2. Запиши майлстоун в `<result.bundle.dir>/milestone.json`: новый майлстоун, его эпики, 1–6 задач; зависимости — только на новые или уже принятые задачи; `writePaths` не пересекаются с параллельными и незакрытыми задачами.
-3. `kodo project append-milestone <projectId> --file <путь к milestone.json> --json`. Findings — исправь файл и повтори. Прежние майлстоуны, эпики и задачи не меняются; проект снова `running`.
+3. Выполни `result.commands[].command` ответа `extend --prepare` — это `append-milestone <projectId> --file "<путь к milestone.json>" --json`. Findings — исправь файл и повтори. Прежние майлстоуны, эпики и задачи не меняются; проект снова `running`.
 4. Дальше — тот же цикл волн.
 
 ## Правила

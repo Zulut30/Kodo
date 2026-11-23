@@ -16,6 +16,16 @@ import { contentHash, evidencePrompt, lstatSafe } from './engine-core.mjs';
 
 /** Node execution, integration and base synchronization stages. */
 export class EngineExecution extends EnginePlanning {
+  /** The node (or repair) scope check; a wave task Run (task-fast) also keeps its actual
+   * changes inside the frozen ProjectTask writePaths, not only inside the plan's node scopes. */
+  async checkTaskScope(run, cwd, baseSha, scopes) {
+    const files = await this.checkScope(cwd, baseSha, scopes);
+    if (run.verificationProfile !== TASK_FAST_PROFILE || !run.directorBinding) return files;
+    const { directorTaskWritePaths } = await import('./project-contracts.mjs');
+    const knownValues = Object.values(this.secrets || {}).filter(value => typeof value === 'string');
+    await this.checkScope(cwd, baseSha, directorTaskWritePaths(run.task, { knownValues }));
+    return files;
+  }
   async checkScope(cwd, baseSha, scopes) {
     const tracked = await changedFiles(cwd, baseSha);
     // Never trimmed: a NUL-separated name may begin with whitespace or U+FEFF.
@@ -94,7 +104,7 @@ export class EngineExecution extends EnginePlanning {
         allowFailure: true,
       });
       if (pending.code !== 0 && included.code === 0) {
-        await this.checkScope(node.cwd, target, task.writePaths);
+        await this.checkTaskScope(run, node.cwd, target, task.writePaths);
         node.baseSha = target;
         delete node.pendingRefresh;
         this.save(run);
@@ -102,7 +112,7 @@ export class EngineExecution extends EnginePlanning {
       }
       let merged = { code: 1 };
       if (pending.code !== 0) {
-        await this.checkScope(node.cwd, node.baseSha, task.writePaths);
+        await this.checkTaskScope(run, node.cwd, node.baseSha, task.writePaths);
         await commitChanges(node.cwd, `Kodo preserve ${task.id} before base refresh`);
         node.pendingRefresh = { headSha: target, model: selected.id };
         this.save(run);
@@ -147,7 +157,7 @@ export class EngineExecution extends EnginePlanning {
           state.sessionId = result.sessionId;
           this.save(run);
         }
-        await this.checkScope(node.cwd, target, task.writePaths);
+        await this.checkTaskScope(run, node.cwd, target, task.writePaths);
         await git(node.cwd, ['add', '-A']);
         await execute(
           'git',
@@ -162,7 +172,7 @@ export class EngineExecution extends EnginePlanning {
         );
         await commitChanges(node.cwd, `Kodo refresh ${task.id}`);
       }
-      await this.checkScope(node.cwd, target, task.writePaths);
+      await this.checkTaskScope(run, node.cwd, target, task.writePaths);
       node.baseSha = target;
       delete node.pendingRefresh;
       this.save(run);
@@ -249,9 +259,9 @@ export class EngineExecution extends EnginePlanning {
         // A wave task checks its worktree first: a write outside writePaths is its blocker
         // even when the worker reports an incomplete result.
         if (run.verificationProfile === TASK_FAST_PROFILE)
-          await this.checkScope(node.cwd, node.baseSha, task.writePaths);
+          await this.checkTaskScope(run, node.cwd, node.baseSha, task.writePaths);
         if (!node.result.complete) throw new Error(`Исполнитель не завершил задачу: ${node.result.summary}`);
-        node.changedFiles = await this.checkScope(node.cwd, node.baseSha, task.writePaths);
+        node.changedFiles = await this.checkTaskScope(run, node.cwd, node.baseSha, task.writePaths);
         if (normalizeWatchdogConfig(run.config.watchdog).rejectUnchanged && (await unchanged(node.cwd, node.baseSha)))
           throw new Error('Узел ничего не изменил: его рабочее дерево совпадает с базой');
         node.headSha = await commitChanges(node.cwd, `Kodo ${task.id}: ${run.task.slice(0, 100)}`);
