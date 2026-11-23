@@ -76,7 +76,7 @@ kodo project gates PROJECT_ID [--retry-failed] [--json]
 
 | Команда | Результат | Exit |
 | --- | --- | --- |
-| `next-wave` | `{projectId, revision, cli, briefs, blocked:[{taskId, code}]}` | 0 — есть брифы, 2 — пусто |
+| `next-wave` | `{projectId, revision, cli, code?, briefs, blocked}` (см. «Почему задачи ждут») | 0 — есть брифы, 2 — пусто |
 | `complete-task` | `integrated` (`integration`, `gates`), `abandoned` | 0 |
 | `complete-task` | `checks_failed` (`code`, `message`), `blocked` (`code`) | 2 |
 | `gates` | `passed` (`gates`) | 0 |
@@ -84,9 +84,20 @@ kodo project gates PROJECT_ID [--retry-failed] [--json]
 
 Ошибки отчёта — константные коды: собственные коды протокола (`project_wave_required`, `project_host_unsupported`, `project_busy`, `project_attempt_not_external` и др.) или `project_invalid`/`project_blocked`. Пути, аргументы и вывод провайдеров в ошибки не попадают.
 
+Строки `gates.blocked` (ответы `complete-task` и `gates`) — `{code, kind, id, gateId, runId, state?}`: `gateId` и `runId` называют гейт и его gate Run. Причину читают в `kodo status <runId> --json`: `blocker.current` (`code`, `message`), упавшие проверки `checks.results[]` с `exitCode` ≠ 0 (`kind`, хвост `output`, журнал `outputPath`) и `review.findings` — только если ревью дошло до конца (при провале проверок `review: null`). У `wave_project_head_mismatch` одного гейта нет.
+
+### Почему задачи ждут
+
+`blocked` ответа `next-wave` называет, почему остальные задачи не выданы; пустой список означает, что ждать нечего, кроме идущих попыток.
+
+- Задачи — `{taskId, code}`: отказ резерва (`project_write_conflict`, `project_dependency_unsatisfied`, `project_retry_executor` и др.) и причины планировщика, по которым хост может действовать: `project_risk_unapproved` — нужно одобрение риска (`kodo project approve-risk`, решение пользователя), `project_retry_required` — попытка брошена или упала, новую создаёт `next-wave --retry-failed`, `project_interface_unverified` — evidence интерфейса не проверяется, `project_split_required` — вход задачи больше лимита. Ожидание зависимости, идущей работы или лимита пачки блокером не считается.
+- Гейты — `{code, kind, id, gateId?, runId?, state?}` (`gateHolds` директора, только чтение): остановленный gate Run эпика или проекта (код его блокера, `quota` при `waiting_limits`; после устранения причины — `kodo project gates PROJECT_ID --retry-failed`) или `project_gate_pending` — гейт готов, но не выполнен (например, после `--defer-gate`): его выполняет `kodo project gates PROJECT_ID`.
+
+Принятый проект отвечает `code: "project_accepted"` (`project_released`) с пустыми `briefs` и `blocked`, exit 2, без lease и Git. Пауза, отмена, провал и блокировка проекта — по-прежнему ошибка `project_control_blocked`.
+
 ### Проверки complete-task
 
-Дефект, который воркер может исправить, даёт `checks_failed`; попытка остаётся `running`, воркер присылает новый head.
+Дефект, который воркер может исправить, даёт `checks_failed`; попытка остаётся `running`, воркер присылает новый head. У каждого отказа `external_*` есть `message` — что исправить; главный чат передаёт `code` и `message` в тот же воркер-чат.
 
 | Код | Условие |
 | --- | --- |
@@ -114,7 +125,7 @@ kodo project gates PROJECT_ID [--retry-failed] [--json]
 
 ## Ограничения
 
-- Конфликт при интеграции оставляет попытку `running` со статусом `blocked`. Rebase на новую голову интеграционной ветки протоколом не поддерживается: diff от старой базы захватит чужие изменения и не пройдёт проверку scope. Выход — `--abandon` и `next-wave --retry-failed`.
+- Конфликт при интеграции (`blocked`, `project_integration_conflict`) переводит попытку в `blocked`; Run остаётся `succeeded` на проверенном head, задача — `running`. Rebase на новую голову интеграционной ветки протоколом не поддерживается: diff от старой базы захватит чужие изменения и не пройдёт проверку scope. Выход — `--abandon --attempt` этой попытки (ответ `abandoned` с `replayed: true`, Run отменяется) и `next-wave --retry-failed`; до повтора `next-wave` показывает задачу как `project_retry_required`.
 - `next-wave` и `complete-task` держат lease `project:<id>`, как `drain` и foreground-директор: пока его держит другой контроллер (например, идущий `drain`), ответ — `project_busy`, команду повторяют позже. Проверку дополнительно сериализует lease `run:<id>`, слияния и переходы, чьё доказательство читает интеграционную ветку (`integrated`, `accepted`), — lease `project-integration:<id>`, который держится до фиксации перехода ([PROJECTS.md](PROJECTS.md), «Lease до фиксации»).
 - `--command-id` используется только для перехода `--abandon`; команды интеграции директор строит сам.
 - Gate Run эпика и принятие задач (`accepted`) выполняет директор (`runPendingGates`) внутри `complete-task`, `gates` или `drain`.

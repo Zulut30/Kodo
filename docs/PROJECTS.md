@@ -59,7 +59,7 @@ Bounds: до1000 элементов в typed collections, глубина16 и ra
 | `project-evidence`: `evaluateProjectAttempt`, `evaluateProjectTransition` | Await trusted `verifyRef`/`validateRun`; eligibility/blockers не дают права записывать terminal state |
 | `project-director`: `createProjectTransitionAuthorizer({store,engine,contracts,evaluator})` | Свежая проверка фактического Run/head/config/gates/evidence перед разрешением перехода; wave-проект (`isWaveProject`) идёт в `evaluateWaveTransition`, остальные — прежним путём |
 | `project-director`: `createProjectDirector({repo,engine,planner,evaluator,clock})` | `plan/run/resume/drain/cancel/pause/reprioritize/approveRisk`, переиспользование Engine; `run` wave-проекта — `project_wave_drain_required`, `resume` — `drain` одной волны |
-| `project-progress`: `buildProjectProgress(snapshot)`; `project-cli`: `projectCli(argv,ports)` | Bounded counts-only сводка; strict CLI и `{report,exitCode,output}` |
+| `project-progress`: `buildProjectProgress(snapshot, blockers?)`; `project-cli`: `projectCli(argv,ports)` | Bounded counts-only сводка (с `blockers` — строка числа блокеров по кодам); strict CLI и `{report,exitCode,output}`. `project status --json`: `{status, paused, completeness, blockers, progress}`, `blockers` — те же строки, что у `kodo report --project` ([OBSERVABILITY.md](OBSERVABILITY.md)) |
 | `project-director-waves`: `createWaveContext`, `selectWave`, `integrateAndAdvance`, `runPendingGates`, `drain`, `attemptExecutor`, `integrationOf` | Исполнение волнового проекта, см. «Волновой режим: исполнение» |
 | `project-external`: `nextWave`, `completeTask`; `worker-roles`: `workerRole` | Pull-протокол внешних воркер-чатов, см. [T3-HOST.md](T3-HOST.md) |
 
@@ -146,7 +146,7 @@ Snapshot wave-проекта содержит `gates` (все гейты по `n
 
 **Гейт проекта.** Если все milestone приняты, а проект нет — ветка ушла дальше проверенной головы гейта, покрывшего проект (например, сдвиг во время гейта эпика или во время проверки приёмки), — `runPendingGates` резервирует гейт `[project]` на текущей голове ветки: merges всех задач, база — первый родитель самого раннего слияния, то есть ревью всего проекта. После успеха он принимает проект. Если ветка снова ушла во время этого гейта, в том же проходе резервируется ещё один (Store разрешает новый гейт проекта при `succeeded` прежнем с другой головой); после второго подряд — блокер `wave_project_head_mismatch`.
 
-Результат: `{status, waves, integrated, gates: [{gateId, runId, state}], blockers: [{code, kind, id}], revision, code?}`.
+Результат: `{status, waves, integrated, gates: [{gateId, runId, state}], blockers: [{code, kind, id}], revision, code?}`. Блокер гейта дополнительно называет его `gateId` и `runId` (и `state` остановленного gate Run).
 
 | `status` | Когда |
 | --- | --- |
