@@ -49,6 +49,8 @@ function fixture(t) {
     'tests/app.test.mjs': "import '../src/app.mjs';\n",
     'index.html': '<h1>Title</h1>\n',
     'verify.cjs': "require('node:assert');\n",
+    'runtime/metrics.mjs': 'export const metrics = 1;\n',
+    'runtime/config.mjs': 'export const config = 1;\n',
     'dist/app.js': 'export {};\n',
     'notes.md': '# Notes\n',
     '.config/hidden.css': 'x {}\n',
@@ -219,6 +221,26 @@ test('A named file reached through a linked directory is outside the worktree', 
     fastPath: false,
     reason: 'path_outside',
   });
+});
+
+test('A path is a write target only in the clause of an edit verb', async t => {
+  const cwd = fixture(t);
+  assert.deepEqual(await classifyLocalTask({ cwd, task: 'Edit runtime/config.mjs' }), code('runtime/config.mjs'));
+  // The four examples of the review: another role, a negation, an unknown role, deleting an obsolete file.
+  for (const [task, reason] of [
+    ['Read runtime/metrics.mjs and edit runtime/config.mjs', 'ambiguous'],
+    ['Edit runtime/config.mjs but never edit runtime/metrics.mjs', 'ambiguous'],
+    ['Fix runtime/config.mjs, then eslint runtime/metrics.mjs', 'ambiguous'],
+    ['Delete obsolete runtime/metrics.mjs', 'risk_marker'],
+    // The same roles in other words.
+    ['Compare runtime/metrics.mjs with runtime/config.mjs and fix runtime/config.mjs', 'ambiguous'],
+    ['Исправь runtime/config.mjs, но не меняй логику, посмотри runtime/metrics.mjs', 'ambiguous'],
+    ['Прочитай runtime/metrics.mjs и исправь runtime/config.mjs', 'ambiguous'],
+    ['Fix runtime/config.mjs; you must not edit runtime/metrics.mjs', 'ambiguous'],
+    ['runtime/metrics.mjs', 'ambiguous'],
+    ['Удали устаревший runtime/metrics.mjs', 'risk_marker'],
+  ])
+    assert.deepEqual(await classifyLocalTask({ cwd, task }), { fastPath: false, reason }, task);
 });
 
 test('Every ambiguity is doubt, not a guess', async t => {

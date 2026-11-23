@@ -90,7 +90,34 @@ const option = /^--?[A-Za-z][\w-]*(?:=\S*)?$/;
 const conjunction = /^(?:and|then|after|before|but|и|а|но|затем|потом|после|перед)$/i;
 const deleteVerb = /^(?:delete|remove|drop|erase|rm|удали(?:те)?|удалить|сотри(?:те)?|стереть|стери)$/i;
 const createVerb = /^(?:add|create|new|touch|создай(?:те)?|создать|добавь(?:те)?|добавить|нов(?:ый|ая|ое|ые))$/i;
-const filler = /^(?:the|this|that|a|an|file|files|module|файл|файлы|модуль|-\S*)$/i;
+const filler =
+  /^(?:the|this|that|a|an|file|files|module|obsolete|old|stale|unused|файл|файлы|модуль|устаревш\S*|стар\S*|-\S*)$/i;
+/** Verbs that make the path after them a target to edit (a removal inside a file is an edit). */
+const editVerb =
+  /^(?:edit|change|fix|update|make|set|adjust|style|restyle|recolou?r|darken|lighten|tweak|modify|correct|replace|remove|delete|add|use|cover|rename|implement|rewrite|refine|improve|format|align|cent(?:er|re)|increase|decrease|reduce|enlarge|shrink|apply|swap)$|^(?:измен|исправ|поменя|сдела|обнов|добав|убер|удал|замен|поправ|покрас|перекрас|настро|увелич|уменьш|выровня|отредактир|перепиш|реализ|использ|затемн|осветл|покро)/i;
+/** Verbs and tools that read, compare, check or run the path after them: never a target. */
+const otherVerb =
+  /^(?:read|open|see|view|check|compare|review|inspect|lint|test|verify|validate|look|study|consult|refer|reference|examine|analy[sz]e|understand|run|execute|eslint|prettier|tsc|jest|vitest|mocha|stylelint)$|^(?:прочит|прочт|посмотр|откр|провер|сравн|изуч|просмотр|глян|заглян|ознаком|запуст|выполн)/i;
+const negation = /^(?:never|not|t|don|doesn|mustn|cannot|can|нельзя|запрещено|не|никогда)$/i;
+const sequence = /^(?:then|after|afterwards|but|however|затем|потом|после|но|однако)$/i;
+
+/**
+ * The role of the path at `index`: the nearest verb before it, over other words and paths of the
+ * same list, decides. `edit` only after an edit verb that is not negated; a reading or checking
+ * verb, a negation, a sequence or contrast word before any verb, or no verb at all are not edits.
+ */
+function role(list, index) {
+  for (let item = index - 1; item >= 0; item--) {
+    const word = list[item].word;
+    if (sequence.test(word)) return 'unknown';
+    if (otherVerb.test(word)) return 'other';
+    if (editVerb.test(word))
+      return [list[item - 1]?.word, list[item - 2]?.word].some(before => before && negation.test(before))
+        ? 'negated'
+        : 'edit';
+  }
+  return 'unknown';
+}
 
 /** The last word of a command that starts at `start`: before a conjunction, at sentence end, a comma or a line break. */
 function commandEnd(list, task, start) {
@@ -233,6 +260,7 @@ export async function classifyLocalTask({ cwd, task, requested }) {
   const named = [];
   let selectors = 0;
   const targets = list.filter((item, index) => !inside.has(index) && fileLike(item.word)).map(item => item.word);
+  const roles = list.map((item, index) => (!inside.has(index) && fileLike(item.word) ? role(list, index) : null));
   for (const word of new Set(targets)) {
     if (configName.test(word)) return doubt('non_style_path');
     // A class selector is not a file; it never counts as one and proves nothing by itself.
@@ -244,6 +272,9 @@ export async function classifyLocalTask({ cwd, task, requested }) {
     named.push(word);
   }
   if (!named.length) return doubt('no_paths');
+  // A named file is a target only where an edit verb governs it, at every mention outside commands.
+  if (list.some((item, index) => named.includes(item.word) && roles[index] !== null && roles[index] !== 'edit'))
+    return doubt('ambiguous');
   const style = named.every(name => STYLE_EXTENSIONS.includes(path.extname(name).toLowerCase()));
   // A selector is read as one only next to style files: elsewhere it may hide a requested file.
   if (selectors && !style) return doubt('non_style_path');
