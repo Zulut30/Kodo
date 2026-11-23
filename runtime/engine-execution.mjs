@@ -19,14 +19,15 @@ export class EngineExecution extends EnginePlanning {
   /** The node (or repair) scope check; a wave task Run (task-fast) also keeps its actual
    * changes inside the frozen ProjectTask writePaths, not only inside the plan's node scopes. */
   async checkTaskScope(run, cwd, baseSha, scopes) {
-    const files = await this.checkScope(cwd, baseSha, scopes);
-    if (run.verificationProfile !== TASK_FAST_PROFILE || !run.directorBinding) return files;
+    if (run.verificationProfile !== TASK_FAST_PROFILE || !run.directorBinding)
+      return this.checkScope(cwd, baseSha, scopes);
     const { directorTaskWritePaths } = await import('./project-contracts.mjs');
     const knownValues = Object.values(this.secrets || {}).filter(value => typeof value === 'string');
-    await this.checkScope(cwd, baseSha, directorTaskWritePaths(run.task, { knownValues }));
-    return files;
+    return this.checkScope(cwd, baseSha, scopes, directorTaskWritePaths(run.task, { knownValues }));
   }
-  async checkScope(cwd, baseSha, scopes) {
+  /** One scan of the changes since baseSha; every file must be inside `scopes` and, when
+   * given, inside the frozen task scope too. */
+  async checkScope(cwd, baseSha, scopes, frozen = null) {
     const tracked = await changedFiles(cwd, baseSha);
     // Never trimmed: a NUL-separated name may begin with whitespace or U+FEFF.
     const untracked = (
@@ -35,7 +36,9 @@ export class EngineExecution extends EnginePlanning {
       .split('\0')
       .filter(Boolean);
     const files = [...new Set([...tracked, ...untracked])];
-    const outside = files.filter(name => !ownsPath(scopes, name) || secretFile(name));
+    const outside = files.filter(
+      name => !ownsPath(scopes, name) || (frozen && !ownsPath(frozen, name)) || secretFile(name),
+    );
     if (outside.length)
       throw Object.assign(new Error(`Изменены файлы вне области задачи: ${outside.join(', ')}`), {
         code: 'scope_conflict',
@@ -153,6 +156,9 @@ export class EngineExecution extends EnginePlanning {
             undefined,
             state,
           );
+          // A wave task checks the resolver's actual diff before its completion report.
+          if (run.verificationProfile === TASK_FAST_PROFILE)
+            await this.checkTaskScope(run, node.cwd, target, task.writePaths);
           if (!result.output.complete) throw new Error('Конфликт обновления задачи не разрешён');
           state.sessionId = result.sessionId;
           this.save(run);
@@ -257,11 +263,13 @@ export class EngineExecution extends EnginePlanning {
         node.sessionId = result.sessionId;
         node.result = validate(resultSchema, result.output);
         // A wave task checks its worktree first: a write outside writePaths is its blocker
-        // even when the worker reports an incomplete result.
-        if (run.verificationProfile === TASK_FAST_PROFILE)
-          await this.checkTaskScope(run, node.cwd, node.baseSha, task.writePaths);
+        // even when the worker reports an incomplete result. The one scan is reused below.
+        const scanned =
+          run.verificationProfile === TASK_FAST_PROFILE
+            ? await this.checkTaskScope(run, node.cwd, node.baseSha, task.writePaths)
+            : null;
         if (!node.result.complete) throw new Error(`Исполнитель не завершил задачу: ${node.result.summary}`);
-        node.changedFiles = await this.checkTaskScope(run, node.cwd, node.baseSha, task.writePaths);
+        node.changedFiles = scanned ?? (await this.checkTaskScope(run, node.cwd, node.baseSha, task.writePaths));
         if (normalizeWatchdogConfig(run.config.watchdog).rejectUnchanged && (await unchanged(node.cwd, node.baseSha)))
           throw new Error('Узел ничего не изменил: его рабочее дерево совпадает с базой');
         node.headSha = await commitChanges(node.cwd, `Kodo ${task.id}: ${run.task.slice(0, 100)}`);

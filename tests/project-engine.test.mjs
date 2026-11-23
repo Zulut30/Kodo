@@ -282,7 +282,15 @@ test('A task-fast change is checked against the frozen ProjectTask scope, not on
   // A file named lib: inside the node scope `lib`, outside the task's `lib/**`.
   await writeFile(path.join(f.project, 'lib'), 'not a directory of the task\n');
   const fast = { ...run, verificationProfile: 'task-fast' };
+  // One scan of the diff checks both the node scope and the frozen task scope.
+  const scans = [],
+    scan = engine.checkScope.bind(engine);
+  engine.checkScope = async (...args) => {
+    scans.push(args[0]);
+    return scan(...args);
+  };
   await assert.rejects(engine.checkTaskScope(fast, f.project, base, ['lib']), { code: 'scope_conflict' });
+  assert.deepEqual(scans, [f.project]);
   // An ordinary Run keeps its node scope check alone.
   assert.deepEqual(await engine.checkTaskScope({ ...run, verificationProfile: 'standard' }, f.project, base, ['lib']), [
     'lib',

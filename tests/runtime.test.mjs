@@ -230,6 +230,12 @@ test('Plan contracts reject malformed graphs and forbidden scopes while overlap 
     ['.env.local'],
   ])
     assert.throws(() => validatePlan({ ...plan, tasks: [{ ...plan.tasks[0], writePaths: scopes }] }));
+  // `dir/` owns nothing (ownsPath(['src/'], 'src/a') is false): a directory scope is `dir/**`.
+  assert.equal(ownsPath(['src/'], 'src/feature.mjs'), false);
+  assert.throws(
+    () => validatePlan({ ...plan, tasks: [{ ...plan.tasks[0], writePaths: ['src/'] }] }),
+    /не может заканчиваться «\/».*src\/\*\*/,
+  );
   assert.throws(() => validatePlan({ ...plan, tasks: [{ ...plan.tasks[0], dependsOn: ['missing'] }] }), /Неизвестная/);
   assert.throws(() => validatePlan({ ...plan, tasks: [{ ...plan.tasks[0], dependsOn: ['one'] }] }), /Цикл/);
   assert.throws(() => validatePlan({ ...plan, tasks: [plan.tasks[0], plan.tasks[0]] }), /Повторные/);
