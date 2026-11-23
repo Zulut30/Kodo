@@ -859,8 +859,9 @@ try {
             ...(run.config.startupTimeoutMs !== undefined ? { startupTimeoutMs: run.config.startupTimeoutMs } : {}),
             // The client sent nothing before the startup limit: that start is a failed attempt of its
             // own, and the restart needs its own admission. Neither is a repair attempt of the node.
-            onStartupRetry: ({ reason = 'startup_timeout' } = {}) => {
-              const silent = attempt,
+            onStartupRetry: details => {
+              const reason = details?.reason ?? 'startup_timeout',
+                silent = attempt,
                 elapsed = performance.now() - started;
               silent.status = 'failed';
               silent.errorCode = reason;

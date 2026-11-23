@@ -449,7 +449,12 @@ export function parseSessionEvents(
   };
 }
 
-/** One login check per client and cache; only a passed check (`available: true`) is remembered. */
+/**
+ * One login check per client and cache; only a passed check (`available: true`) is remembered.
+ * @param {Map<string, Promise<any>> | undefined} cache
+ * @param {string} client
+ * @param {() => any} check
+ */
 function checkedSubscription(cache, client, check) {
   if (!(cache instanceof Map)) return check();
   if (!cache.has(client)) {
