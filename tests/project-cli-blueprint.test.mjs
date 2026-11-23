@@ -343,16 +343,15 @@ test('bootstrap --prepare writes the context bundle only to KODO_HOME', async t 
   assert.equal(report.result.summary.root, root);
   assert.equal(report.result.blueprint, path.join(root, '.kodo', 'blueprint'));
   // The hints call the CLI that issued them, by its absolute entry.
-  assert.ok(
-    report.result.next.includes(
-      `Проверь и зарегистрируй проект: node "${cli}" project apply-spec --root "${root}" --json`,
-    ),
-  );
+  const apply = report.result.commands[0].command;
+  const commandId = / --command-id ([a-f0-9-]{36}) --json$/.exec(apply)?.[1];
+  assert.ok(commandId, apply);
+  assert.equal(apply, `node "${cli}" project apply-spec --root "${root}" --command-id ${commandId} --json`);
+  assert.ok(report.result.next.includes(`Проверь и зарегистрируй проект: ${apply}`));
   const bare = /\bkodo project\b/;
   assert.ok(bare.test('Проверь: kodo project apply-spec --json'), 'the check sees a bare kodo command');
   assert.ok(report.result.next.every(line => !bare.test(line)));
   // The machine field holds only the command: it runs as is in the platform shell.
-  const apply = `node "${cli}" project apply-spec --root "${root}" --json`;
   assert.deepEqual(
     report.result.commands.map(item => item.command),
     [apply],
@@ -391,6 +390,7 @@ test('bootstrap runs one native session through the Engine provider and compiles
     ['foundation', 'mvp'],
   );
   assert.ok(report.result.next.some(line => line.includes('apply-spec')));
+  assert.match(report.result.commands[0].command, / --command-id [a-f0-9-]{36} --json$/);
   assert.equal((await compileBlueprint(root)).ok, true);
 
   const empty = await f.root();
@@ -416,10 +416,20 @@ test('apply-spec creates a wave project with verifiable interfaces and replays b
   const f = await fixture(t);
   const root = await f.root();
   const dir = await writeBlueprint(root);
-  const commandId = randomUUID();
   const prefix = `node "${cli}"`;
-  const { exitCode, report } = await f.run(['apply-spec', '--root', root, '--command-id', commandId], { cli: prefix });
-  assert.equal(exitCode, 0, JSON.stringify(report));
+  const prepared = await f.run(['bootstrap', 'Notes', '--root', root, '--prepare'], { cli: prefix });
+  assert.equal(prepared.exitCode, 0);
+  const apply = prepared.report.result.commands[0].command;
+  const env = { ...f.env };
+  const pathKey = Object.keys(env).find(key => key.toUpperCase() === 'PATH') ?? 'PATH';
+  env[pathKey] = [path.dirname(process.execPath), env[pathKey]].filter(Boolean).join(path.delimiter);
+  const runApply = () => {
+    const ran = spawnSync(apply, { shell: true, cwd: root, env, encoding: 'utf8', timeout: 60000, windowsHide: true });
+    assert.equal(ran.error, undefined);
+    assert.equal(ran.status, 0, ran.stdout + ran.stderr);
+    return JSON.parse(ran.stdout);
+  };
+  const report = runApply();
   assert.equal(report.result.status, 'created');
   // Next steps with the caller's CLI: the managed linter for workers' self-check, then the first wave.
   const hint = text =>
@@ -494,11 +504,10 @@ test('apply-spec creates a wave project with verifiable interfaces and replays b
     assert.ok(!reasons.includes('interfaces_unverified'));
   }
 
-  const again = await f.run(['apply-spec', '--root', root, '--command-id', commandId]);
-  assert.equal(again.exitCode, 0);
-  assert.equal(again.report.projectId, projectId);
-  assert.equal(again.report.result.status, 'replayed');
-  assert.equal(again.report.result.replayed, true);
+  const again = runApply();
+  assert.equal(again.projectId, projectId);
+  assert.equal(again.result.status, 'replayed');
+  assert.equal(again.result.replayed, true);
   assert.equal(repo.snapshot(projectId).revision, snapshot.revision);
 });
 

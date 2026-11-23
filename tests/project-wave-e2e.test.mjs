@@ -96,7 +96,11 @@ function providers(hooks) {
         calls.reviews.push(request);
         return {
           sessionId: `review-${calls.review}`,
-          output: hooks.onReview?.(request) ?? { passed: true, findings: [], ...confirmedCriteria(request.schema) },
+          output: (await hooks.onReview?.(request)) ?? {
+            passed: true,
+            findings: [],
+            ...confirmedCriteria(request.schema),
+          },
         };
       }
       if (/Repair confirmed failures/.test(request.prompt)) {
@@ -1224,5 +1228,45 @@ test(
       [2, 'blocked', 'project_integration_missing'],
       late.output,
     );
+  },
+);
+
+test(
+  'A standalone epic gate lets the T3 host submit and reserve siblings during review',
+  { timeout: 600000 },
+  async t => {
+    const observed = [];
+    let betaHead;
+    const hooks = { onReview: undefined };
+    const f = await fixture(t, { epics: ['e1', 'e2'], tasks: [task('alpha'), task('beta', { epicId: 'e2' })], hooks });
+    const submit = (brief, head) =>
+      f.cli(['complete-task', f.id, brief.taskId, '--head', head, '--attempt', brief.attemptId, '--defer-gate']);
+    const [alpha, beta] = (await f.cli(['next-wave', f.id, '--host', 't3'])).report.result.briefs;
+    for (const brief of [alpha, beta]) {
+      await writeFile(path.join(brief.worktree, brief.taskId + '.txt'), brief.taskId);
+      git(brief.worktree, 'add', '-A');
+      git(brief.worktree, 'commit', '-m', 'Implement ' + brief.taskId);
+      const head = git(brief.worktree, 'rev-parse', 'HEAD');
+      if (brief === alpha) assert.equal((await submit(alpha, head)).report.result.status, 'integrated');
+      else betaHead = head;
+    }
+    assert.equal(f.repo.snapshot(f.id).gates.length, 0);
+    hooks.onReview = async () => {
+      if (!observed.length) {
+        observed.push((await f.cli(['next-wave', f.id, '--host', 't3'])).report.result);
+        observed.push((await submit(beta, betaHead)).report.result);
+        observed.push((await f.cli(['gates', f.id])).report.result);
+      }
+    };
+    const gated = await f.cli(['gates', f.id]);
+    assert.deepEqual(
+      observed[0]?.briefs?.map(brief => brief.taskId),
+      ['beta'],
+      JSON.stringify(observed),
+    );
+    assert.equal(observed[1].status, 'integrated');
+    assert.equal(observed[2].code, 'project_busy');
+    assert.equal(gated.report.result.status, 'passed', gated.output);
+    assert.equal(f.repo.snapshot(f.id).project.status, 'accepted');
   },
 );

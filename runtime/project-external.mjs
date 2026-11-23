@@ -34,7 +34,8 @@ import {
 import { withIntegrationLease } from './project-integration-lease.mjs';
 import { bindingFor, known, storedRun, verifyRef } from './project-director.mjs';
 import * as waves from './project-director-waves.mjs';
-import { verifyTaskFastOnce } from './wave-verifier.mjs';
+import { withPullLease } from './project-controller-lease.mjs';
+import { runEpicGate, verifyTaskFastOnce } from './wave-verifier.mjs';
 import { workerRole } from './worker-roles.mjs';
 import { applyWavePolicy } from './wave-policy.mjs';
 import { DEFAULT_CLI, assertCliPrefix, quotePath } from './cli-command.mjs';
@@ -100,26 +101,6 @@ async function ancestor(cwd, base, head) {
   return result.code === 0;
 }
 
-// Lease `project:<id>` held for one protocol call, renewed while long checks run.
-async function withProjectLease(store, projectId, work) {
-  const token = store.acquireLease(`project:${projectId}`, randomUUID(), { ttlMs: 60000, limit: 1 });
-  need(token, 'busy');
-  const timer = setInterval(() => {
-    try {
-      store.renewLease(token);
-    } catch {
-      /* A lost renewal surfaces on the next acquisition. */
-    }
-  }, 10000);
-  timer.unref();
-  try {
-    return await work(token);
-  } finally {
-    clearInterval(timer);
-    store.releaseLease(token);
-  }
-}
-
 // Merge commits of integrated tasks; the frontier must contain each of them.
 function integratedMerges(snapshot, store) {
   const merges = [];
@@ -139,7 +120,7 @@ function workerContract(run, writePaths, selfCheck) {
     '- Do not delete, skip or weaken existing tests; add tests for new behaviour.',
     `- Commit your work on ${run.branch}. Do not push, open pull requests, merge or rebase onto other branches.`,
     `- Before finishing run the self-check: ${selfCheck}`,
-    '- Finish with a clean worktree and report the full SHA of the final commit (git rev-parse HEAD).',
+    `- Finish with a clean worktree and report the full SHA of the final commit (git -C ${quotePath(run.cwd)} rev-parse HEAD).`,
   ].join('\n');
 }
 
@@ -156,7 +137,7 @@ function briefFor(state, attempt, task, run) {
     taskId: task.id,
     attemptId: attempt.id,
     runId: run.id,
-    chatTitle: `Kodo · [${task.epicId}] ${task.title}`,
+    chatTitle: `Kodo · [${task.epicId}] ${task.title} · попытка ${attempt.number}`,
     role,
     roleInstructions: instructions,
     writePaths: [...task.writePaths],
@@ -166,7 +147,7 @@ function briefFor(state, attempt, task, run) {
     interfaces: task.interfaceRefs.map(ref => ref.path),
     prompt: `${input}\n\n${workerContract(run, task.writePaths, selfCheck)}`,
     selfCheck,
-    completeCommand: `${cli} project complete-task ${project.projectId} ${task.id} --head <SHA>`,
+    completeCommand: `${cli} project complete-task ${project.projectId} ${task.id} --head <SHA> --attempt ${attempt.id} --defer-gate`,
     abandonCommand: `${cli} project complete-task ${project.projectId} ${task.id} --head <SHA> --abandon --attempt ${attempt.id}`,
   };
   C.assertDirectorSafe(brief, options);
@@ -606,7 +587,8 @@ async function runGates(W, waveCtx, projectId, signal, retryFailed = false) {
 /**
  * Run the pending epic gates of a wave project outside a task completion. A blocked gate is
  * retried (a new gate reservation) only with `retryFailed`: the T3 host's way to continue after
- * the cause of a blocked gate was fixed. Holds lease `project:<id>` like `completeTask`.
+ * the cause of a blocked gate was fixed. Project mutations are serialized; verification in the
+ * gate's own worktree leaves the pull protocol available.
  * @param {{ repo: any, engine: any, store?: any, contracts?: any }} ctx
  * @param {{ projectId: string, retryFailed?: boolean, ports?: any, signal?: AbortSignal }} input
  */
@@ -614,7 +596,7 @@ export async function runProjectGates(ctx, input) {
   const { projectId, retryFailed = false, signal } = input;
   const C = await contractsOf(ctx);
   need(C.isWaveProject((await snapshotOf(ctx, projectId)).project), 'wave_required');
-  return withProjectLease(storeOf(ctx), projectId, async () => {
+  return withPullLease(storeOf(ctx), projectId, true, async outsideLease => {
     // The same control states complete-task refuses: a gate pass never reports success for them.
     const controlled = project => project.paused || ['cancelled', 'failed', 'blocked'].includes(project.status);
     const snapshot = await snapshotOf(ctx, projectId);
@@ -622,7 +604,11 @@ export async function runProjectGates(ctx, input) {
       return { status: 'blocked', code: 'project_control_blocked', revision: snapshot.revision };
     if (signal?.aborted) return { status: 'blocked', code: 'project_cancelled', revision: snapshot.revision };
     const W = wavePorts(input.ports, ['createWaveContext', 'runPendingGates']);
-    const gates = await runGates(W, waveContextOf(ctx, C, W), projectId, signal, retryFailed === true);
+    const waveCtx = {
+      ...waveContextOf(ctx, C, W),
+      runGate: input => outsideLease(() => runEpicGate(input)),
+    };
+    const gates = await runGates(W, waveCtx, projectId, signal, retryFailed === true);
     // A pause, cancel or block during the pass (`project pause` takes no gate lease) or an
     // interrupted pass may stop the gates before any ran: never `passed`.
     const after = await snapshotOf(ctx, projectId);
@@ -766,7 +752,7 @@ export async function completeTask(ctx, input) {
   need(attemptId === undefined || uuidPattern.test(attemptId), 'arguments');
   const C = await contractsOf(ctx);
   await externalAttempt(ctx, C, projectId, taskId);
-  return withProjectLease(storeOf(ctx), projectId, async () => {
+  return withPullLease(storeOf(ctx), projectId, !deferGate && !abandon, async () => {
     const current = await externalAttempt(ctx, C, projectId, taskId);
     const { snapshot, task, attempt, run } = current;
     if (abandon) return abandonTarget(ctx, current, { head, attemptId, commandId });

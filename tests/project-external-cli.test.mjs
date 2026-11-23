@@ -204,7 +204,7 @@ test('Project CLI delegates next-wave and complete-task to the pull protocol', a
   const [brief] = next.report.result.briefs;
   assert.equal(brief.taskId, 'task-a');
   assert.equal(brief.role, 'architect');
-  assert.equal(brief.chatTitle, 'Kodo · [e] Task a');
+  assert.equal(brief.chatTitle, 'Kodo · [e] Task a · попытка 1');
   assert.deepEqual(JSON.parse(next.output), next.report);
   // Without a CLI context (a library caller) the commands keep the `kodo` prefix.
   assert.equal(next.report.result.cli, 'kodo');
@@ -214,7 +214,7 @@ test('Project CLI delegates next-wave and complete-task to the pull protocol', a
   assert.equal(human.exitCode, 0);
   assert.match(
     human.output,
-    /^Project: [0-9a-f-]{36}; revision: \d+\n- Kodo · \[e\] Task a \(architect\)\n {2}worktree: /,
+    /^Project: [0-9a-f-]{36}; revision: \d+\n- Kodo · \[e\] Task a · попытка 1 \(architect\)\n {2}worktree: /,
   );
   assert.ok(human.output.includes(brief.completeCommand));
   const other = await projectCli(['next-wave', waveId, '--host', 't3', '--json'], { ...base, wave });
@@ -297,7 +297,16 @@ test(
     assert.equal(next.report.result.cli, prefix);
     const [brief] = next.report.result.briefs;
     assert.equal(brief.selfCheck, `${prefix} ci feedback --base ${brief.baseSha} --project "${brief.worktree}" --json`);
-    assert.equal(brief.completeCommand, `${prefix} project complete-task ${projectId} task-a --head <SHA>`);
+    const shaCommand = /\(git -C "[^"]+" rev-parse HEAD\)/.exec(brief.prompt)?.[0].slice(1, -1);
+    assert.equal(shaCommand, `git -C "${brief.worktree}" rev-parse HEAD`);
+    assert.equal(
+      spawnSync(shaCommand, { shell: true, cwd: temp, env, encoding: 'utf8', windowsHide: true }).stdout.trim(),
+      brief.baseSha,
+    );
+    assert.equal(
+      brief.completeCommand,
+      `${prefix} project complete-task ${projectId} task-a --head <SHA> --attempt ${brief.attemptId} --defer-gate`,
+    );
     assert.equal(
       brief.abandonCommand,
       `${prefix} project complete-task ${projectId} task-a --head <SHA> --abandon --attempt ${brief.attemptId}`,
@@ -333,4 +342,25 @@ test('next-wave refuses an unusable CLI prefix port before the Store opens', asy
     assert.equal(result.report.result.code, code, String(cli));
     if (code === 'project_path_unsafe') assert.match(result.report.result.message, /переименуйте или переместите/);
   }
+});
+
+test('Pull CLI reports known operation errors without leaking exception details', async t => {
+  for (const code of [
+    'project_integration_branch_busy',
+    'project_frontier_integration_missing',
+    'project_wave_policy_invalid',
+    'project_wave_policy_unsafe',
+    'project_entity_not_found',
+  ])
+    await t.test(code, async () => {
+      const result = await projectExternalCli(['gates', id, '--json'], {
+        secrets: {},
+        openStore: () => {
+          throw Object.assign(new Error('private detail'), { code });
+        },
+      });
+      assert.equal(result.report.result.code, code);
+      assert.equal(result.exitCode, code === 'project_entity_not_found' ? 1 : 2);
+      assert.ok(!result.output.includes('private detail'));
+    });
 });

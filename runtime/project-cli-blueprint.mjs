@@ -213,7 +213,7 @@ async function bootstrap(ctx) {
       ...inputs,
     });
     const target = path.join(bundle.summary.root, '.kodo', 'blueprint');
-    const apply = `${ctx.cli} project apply-spec --root ${quotePath(bundle.summary.root)} --json`;
+    const apply = `${ctx.cli} project apply-spec --root ${quotePath(bundle.summary.root)} --command-id ${randomUUID()} --json`;
     return envelope(null, null, {
       status: 'prepared',
       bundle: { id: bundle.id, dir: bundle.dir, files: bundle.files },
@@ -243,7 +243,7 @@ async function bootstrap(ctx) {
   });
   const extra = { bundle: { id: generated.id }, session: generated.session, scopeChecked: generated.scopeChecked };
   if (!generated.ok) return findingsReport(generated.findings, extra);
-  const apply = `${ctx.cli} project apply-spec --root ${quotePath(generated.spec.root)} --json`;
+  const apply = `${ctx.cli} project apply-spec --root ${quotePath(generated.spec.root)} --command-id ${randomUUID()} --json`;
   return envelope(null, null, {
     status: 'compiled',
     ...extra,

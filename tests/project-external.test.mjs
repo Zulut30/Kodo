@@ -298,9 +298,12 @@ test('next-wave reserves non-overlapping tasks on the integration head; a repeat
     assert.equal(git(row.worktree, 'rev-parse', 'HEAD'), head);
     assert.equal(git(row.worktree, 'branch', '--show-current'), `kodo/${row.runId}`);
     assert.equal(row.branch, `kodo/${row.runId}`);
-    assert.equal(row.chatTitle, `Kodo · [e] Task ${row.taskId}`);
+    assert.equal(row.chatTitle, `Kodo · [e] Task ${row.taskId} · попытка 1`);
     assert.deepEqual(row.writePaths, task.writePaths);
-    assert.equal(row.completeCommand, `kodo project complete-task ${f.projectId} ${row.taskId} --head <SHA>`);
+    assert.equal(
+      row.completeCommand,
+      `kodo project complete-task ${f.projectId} ${row.taskId} --head <SHA> --attempt ${row.attemptId} --defer-gate`,
+    );
     assert.equal(row.selfCheck, `kodo ci feedback --base ${head} --project "${row.worktree}" --json`);
     assert.ok(
       row.prompt.startsWith(contracts.buildDirectorTaskInput({ project: snapshot.project, task }, { knownValues: [] })),
@@ -346,7 +349,10 @@ test('next-wave briefs call the CLI of their caller; a library call keeps the ko
   assert.equal(result.cli, cli);
   const [row] = result.briefs;
   assert.equal(row.selfCheck, `${cli} ci feedback --base ${row.baseSha} --project "${row.worktree}" --json`);
-  assert.equal(row.completeCommand, `${cli} project complete-task ${f.projectId} ${row.taskId} --head <SHA>`);
+  assert.equal(
+    row.completeCommand,
+    `${cli} project complete-task ${f.projectId} ${row.taskId} --head <SHA> --attempt ${row.attemptId} --defer-gate`,
+  );
   assert.equal(
     row.abandonCommand,
     `${cli} project complete-task ${f.projectId} ${row.taskId} --head <SHA> --abandon --attempt ${row.attemptId}`,
@@ -673,6 +679,7 @@ test('abandon blocks the attempt and cancels its Run; retry-failed reserves a ne
   const fresh = brief(retried, 'task-a');
   assert.ok(fresh, JSON.stringify(retried));
   assert.notEqual(fresh.attemptId, a.attemptId);
+  assert.equal(fresh.chatTitle, 'Kodo · [e] Task task-a · попытка 2');
   assert.notEqual(fresh.runId, a.runId);
   assert.notEqual(fresh.worktree, a.worktree);
   snapshot = await f.snapshot();

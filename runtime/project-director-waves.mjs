@@ -37,6 +37,7 @@ import {
   mergeTask,
   waveFrontier,
 } from './project-integration.mjs';
+import { withGateController } from './project-controller-lease.mjs';
 import { withIntegrationLease as withLease } from './project-integration-lease.mjs';
 import { GATE_WATCHDOG, createGateRunDraft, runEpicGate } from './wave-verifier.mjs';
 import { normalizeWatchdogConfig } from './watchdog.mjs';
@@ -718,7 +719,7 @@ async function epicGate(ctx, snapshot, epic, retryFailed, out) {
 
 // Execute an installed gate Run once, then accept what it verified.
 async function runAndAccept(ctx, projectId, { gate, run }, signal, out, entity) {
-  if (run.state !== 'succeeded') run = await runEpicGate({ engine: ctx.engine, run, signal });
+  if (run.state !== 'succeeded') run = await (ctx.runGate ?? runEpicGate)({ engine: ctx.engine, run, signal });
   if (run.state !== 'succeeded') {
     out.gates.push({ gateId: gate.id, runId: run.id, state: run.state });
     out.blocked.push({
@@ -1190,7 +1191,15 @@ export async function drain(ctx, projectId, options = {}) {
     requireValue(early !== 'blocked', 'control_blocked');
     return finish(ctx, projectId, state, early);
   }
-  return withProjectControl(ctx, projectId, signal, control =>
-    drainLoop(ctx, projectId, { maxWaves, concurrency, retryFailed: retryFailed === true, commandId }, control, state),
+  return withGateController(ctx.store, projectId, () =>
+    withProjectControl(ctx, projectId, signal, control =>
+      drainLoop(
+        ctx,
+        projectId,
+        { maxWaves, concurrency, retryFailed: retryFailed === true, commandId },
+        control,
+        state,
+      ),
+    ),
   );
 }
