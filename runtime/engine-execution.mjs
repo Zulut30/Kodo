@@ -12,9 +12,26 @@ import { executeDurableTasks } from './engine-jobs.mjs';
 import { normalizeWatchdogConfig, unchanged } from './watchdog.mjs';
 import { EnginePlanning } from './engine-planning.mjs';
 import { contentHash, evidencePrompt, lstatSafe } from './engine-core.mjs';
+import { fastPathScope } from './fast-path.mjs';
 
 /** Node execution, integration and base synchronization stages. */
 export class EngineExecution extends EnginePlanning {
+  /**
+   * A fast-path diff may contain only the proof's listed paths, compared literally: a scope check
+   * by prefix would also accept a new directory named like a listed test file.
+   * @param {any} run
+   * @param {string[]} files
+   */
+  assertFastPathDiff(run, files) {
+    if (run.executionMode?.source !== 'fast-path') return files;
+    const listed = new Set(fastPathScope(run.fastPath));
+    const outside = files.filter(name => !listed.has(name));
+    if (outside.length)
+      throw Object.assign(new Error(`Изменены файлы вне списка быстрого пути: ${outside.join(', ')}`), {
+        code: 'scope_conflict',
+      });
+    return files;
+  }
   async checkScope(cwd, baseSha, scopes) {
     const tracked = await changedFiles(cwd, baseSha);
     // Never trimmed: a NUL-separated name may begin with whitespace or U+FEFF.
@@ -246,7 +263,10 @@ export class EngineExecution extends EnginePlanning {
         node.sessionId = result.sessionId;
         node.result = validate(resultSchema, result.output);
         if (!node.result.complete) throw new Error(`Исполнитель не завершил задачу: ${node.result.summary}`);
-        node.changedFiles = await this.checkScope(node.cwd, node.baseSha, task.writePaths);
+        node.changedFiles = this.assertFastPathDiff(
+          run,
+          await this.checkScope(node.cwd, node.baseSha, task.writePaths),
+        );
         if (normalizeWatchdogConfig(run.config.watchdog).rejectUnchanged && (await unchanged(node.cwd, node.baseSha)))
           throw new Error('Узел ничего не изменил: его рабочее дерево совпадает с базой');
         node.headSha = await commitChanges(node.cwd, `Kodo ${task.id}: ${run.task.slice(0, 100)}`);

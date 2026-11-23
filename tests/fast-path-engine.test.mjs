@@ -4,7 +4,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { readConfig } from '../runtime/config.mjs';
 import { manifestFreshness } from '../runtime/context-manifest.mjs';
-import { FAST_PATH_TEST_SCOPES } from '../runtime/fast-path.mjs';
+import { regressionTestPaths } from '../runtime/fast-path.mjs';
 import { buildAuditReport } from '../runtime/audit.mjs';
 import { fixture, git, task } from './helpers/mode-engine-fixture.mjs';
 
@@ -95,11 +95,47 @@ test('A small local code task plans locally, allows a regression test and runs t
     ['quick', 'fast-path', 'small_local'],
   );
   assert.deepEqual(result.fastPath.files, ['value.mjs']);
+  const listed = ['value.mjs', ...regressionTestPaths('value.mjs')];
+  assert.deepEqual(result.fastPath.writePaths, listed, 'the proof records its one write list');
   assert.equal(result.planSource, 'fast-path');
-  assert.deepEqual(result.plan.tasks[0].writePaths, ['value.mjs', ...FAST_PATH_TEST_SCOPES]);
+  assert.deepEqual(result.plan.tasks[0].writePaths, listed, 'the plan uses the same list');
   assert.match(fx.sessions[0].prompt, /regression test/, 'the worker is asked for a regression test');
   assert.equal(result.review.passed, true);
   assert.equal(buildAuditReport(result).skills.complete, true);
+});
+
+test('The actual diff of a code fast path may touch only the listed paths, exactly', async t => {
+  const code = 'Set the exported value to one in value.mjs';
+  for (const [name, extra, succeeds] of [
+    ['a derived regression test', 'tests/value.test.mjs', true],
+    ['a test helper', 'tests/helpers/fixture.mjs', false],
+    ['a test configuration', 'tsconfig.test.json', false],
+    ['a directory named like a listed test', 'tests/value.test.mjs/evil.json', false],
+  ])
+    await t.test(name, async subtest => {
+      const fx = await fixture(subtest);
+      const session = fx.provider.runSession;
+      fx.provider.runSession = async request => {
+        const result = await session(request);
+        if (!request.schema.properties.tasks && !request.schema.properties.passed) {
+          await mkdir(path.dirname(path.join(request.cwd, extra)), { recursive: true });
+          await writeFile(path.join(request.cwd, extra), 'export {};\n');
+        }
+        return result;
+      };
+      const result = await fx.engine.run((await fx.engine.create(code, { project: fx.project })).id);
+      assert.equal(result.fastPath.reason, 'small_local');
+      if (succeeds) {
+        assert.equal(result.state, 'succeeded', result.error?.message);
+        assert.deepEqual(
+          git(result.cwd, 'diff', '--name-only', result.baseSha, result.headSha).split('\n').toSorted(),
+          [extra, 'value.mjs'],
+        );
+      } else {
+        assert.notEqual(result.state, 'succeeded', `${extra} must not pass the scope check`);
+        assert.match(Object.values(result.nodes)[0].error ?? '', /вне области|быстрого пути/);
+      }
+    });
 });
 
 test('Doubt takes the ordinary route: a non-style path, a risk word or an explicit wider mode', async t => {

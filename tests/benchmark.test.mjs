@@ -520,8 +520,8 @@ test('Production benchmark executes actual Engine worktrees review and checks us
   assert.equal(stages.filter(item => item === 'review').length, 2);
   assert.equal(stages.filter(item => item === 'developer').length, 2);
   assert.equal(homes.size, 2);
-  // The CSS fixture names only its stylesheet and its verifier: a proven fast path plans locally
-  // (developer and review). The other fixture is not proven and also runs the native planner.
+  // The CSS fixture edits only its stylesheet (`node verify.cjs` is a command to run): a proven style
+  // fast path plans locally (developer and review). The other fixture is not proven and runs the planner.
   assert.deepEqual(
     Object.fromEntries(
       report.trials.filter(item => item.condition === 'kodo').map(item => [item.fixture, item.metrics.sessions]),
