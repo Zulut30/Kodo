@@ -136,7 +136,7 @@ export class EnginePlanning extends EngineCore {
     return true;
   }
   async prepare(run, signal) {
-    await makeWorktree(run.project, run.cwd, run.branch, run.baseSha);
+    await makeWorktree(run.project, run.cwd, run.branch, run.baseSha, { signal });
     let bundle;
     if (!run.executionMode) {
       if (run.completed.analysis) {

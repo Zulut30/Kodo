@@ -2,7 +2,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { lstat, realpath } from 'node:fs/promises';
 import { execute, gitBoundary } from './command.mjs';
-import { git, makeWorktree } from './workspace.mjs';
+import { git, makeWorktree, withWorktreeLock } from './workspace.mjs';
 import { ownsPath } from './contracts.mjs';
 import { secretFile } from './security.mjs';
 
@@ -88,7 +88,7 @@ export async function ensureIntegration({ root, projectId, worktreeHome }) {
   if (found.some(record => record.prunable)) {
     // A registered directory is gone; drop only stale registrations and attach the
     // surviving branch again below.
-    await git(checkout, ['worktree', 'prune']);
+    await withWorktreeLock(checkout, () => git(checkout, ['worktree', 'prune']));
     found = await holders();
   }
   for (const record of found)

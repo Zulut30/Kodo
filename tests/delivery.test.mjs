@@ -10,6 +10,7 @@ import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import os from 'node:os';
 import path from 'node:path';
+import { assertWorktreeLockHeld } from './helpers/worktree-lock.mjs';
 import Ajv from 'ajv';
 import {
   deliver,
@@ -868,7 +869,7 @@ test('Clearing the delivery deadline before readiness suppresses its callback', 
   await new Promise(resolve => schedule(resolve, 1));
   clearTimeout(timer);
   ready.resolve();
-  await new Promise(resolve => setImmediate(resolve));
+  await new Promise(resolve => schedule(resolve, 10));
   assert.equal(fired, false);
 });
 
@@ -968,10 +969,7 @@ for (const mode of ['timeout', 'abort']) {
         if (mode === 'timeout') gateTreeDeadline(t, tree.ready, options.timeoutMs);
       }
       if (command === 'git' && args[0] === 'worktree') {
-        assert.equal(
-          await readFile(path.join(ctx.run.project, '.git', 'kodo-worktree.lock'), 'utf8'),
-          String(process.pid),
-        );
+        assertWorktreeLockHeld(path.join(ctx.run.project, '.git'));
       }
       if (command === 'git' && args[0] === 'worktree' && args[1] === 'remove') {
         await assertStopped(pids);

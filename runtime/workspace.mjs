@@ -1,6 +1,5 @@
 import { createHash } from 'node:crypto';
-import { readFile, lstat, mkdir } from 'node:fs/promises';
-import { closeSync, lstatSync, openSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { readFile, lstat, mkdir, realpath } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 import path from 'node:path';
 import { execute } from './command.mjs';
@@ -38,67 +37,47 @@ export async function inspectProject(project) {
   const branches = await git(root, ['worktree', 'list', '--porcelain']);
   return { root, head, dirty, worktrees: branches };
 }
-// All participants hold the short SQLite writer lock while inspecting/replacing
-// the PID file. A second reaper therefore cannot unlink the successor of a
-// dead owner. The OS releases the writer lock if a process dies mid-publication.
-function deadWorktreeOwner(filename) {
-  const info = lstatSync(filename, { throwIfNoEntry: false });
-  if (!info) return false;
-  if (!info.isFile() || info.size > 32) throw new Error('Invalid worktree lock file');
-  const owner = readFileSync(filename, 'utf8');
-  // A crash can leave an incomplete PID record. Give a fresh record time to
-  // settle, but recover an abandoned one within the caller's wait budget.
-  if (!/^[1-9]\d{0,9}$/.test(owner) || Number(owner) > 0x7fffffff) return Date.now() - info.mtimeMs >= 10000;
-  try {
-    process.kill(Number(owner), 0);
-    return false;
-  } catch (error) {
-    if (error.code === 'EPERM') return false;
-    if (error.code === 'ESRCH') return true;
-    throw error;
-  }
-}
+// Hand the next local caller its turn directly; only the head polls SQLite.
+const worktreeQueues = new Map();
 
-function tryWorktreeLock(guard, filename) {
+async function withLocalWorktreeTurn(key, action, remaining, timeoutError, signal) {
+  const queue = worktreeQueues.get(key) ?? new Set();
+  const turn = Promise.withResolvers();
+  queue.add(turn);
+  worktreeQueues.set(key, queue);
   try {
-    guard.exec('BEGIN IMMEDIATE');
-  } catch (error) {
-    if (error.errcode === 5) return false; // SQLITE_BUSY: another publisher or reaper.
-    throw error;
-  }
-  try {
-    if (deadWorktreeOwner(filename)) unlinkSync(filename);
-    const fd = openSync(filename, 'wx', 0o600);
-    try {
-      writeFileSync(fd, String(process.pid));
-    } catch (error) {
-      unlinkSync(filename);
-      throw error;
-    } finally {
-      closeSync(fd);
+    if (queue.size > 1) {
+      const timeout = setTimeout(() => turn.reject(timeoutError()), Math.max(0, remaining()));
+      const abort = () => turn.reject(signal.reason);
+      signal?.addEventListener('abort', abort, { once: true });
+      try {
+        await turn.promise;
+      } finally {
+        clearTimeout(timeout);
+        signal?.removeEventListener('abort', abort);
+      }
     }
-    return true;
-  } catch (error) {
-    // The previous owner can release while we read its PID.
-    if (error.code === 'EEXIST' || error.code === 'ENOENT') return false;
-    throw error;
+    signal?.throwIfAborted();
+    return await action();
   } finally {
-    guard.exec('ROLLBACK');
+    const wasHead = queue.values().next().value === turn;
+    queue.delete(turn);
+    if (!queue.size) worktreeQueues.delete(key);
+    else if (wasHead) queue.values().next().value.resolve();
   }
 }
 
 /**
- * Serialize repository-wide worktree registration across checkouts and processes.
+ * Serialize repository-wide worktree changes across checkouts and processes.
  * @template T
  * @param {string} project
  * @param {() => Promise<T>} action
  * @param {AbortSignal} [signal]
+ * @param {number} [waitMs] Maximum time to acquire the lock, independent of action duration.
  */
-export async function withWorktreeLock(project, action, signal = undefined) {
-  const waitMs = 30000,
-    until = performance.now() + waitMs;
-  let filename,
-    owned = false;
+export async function withWorktreeLock(project, action, signal = undefined, waitMs = 120000) {
+  const started = performance.now();
+  const remaining = () => waitMs - (performance.now() - started);
   try {
     signal?.throwIfAborted();
     const { stdout } = await execute('git', ['rev-parse', '--path-format=absolute', '--git-common-dir'], {
@@ -107,35 +86,56 @@ export async function withWorktreeLock(project, action, signal = undefined) {
       rawOutput: true,
       timeoutMs: waitMs,
     });
-    const common = stdout.replace(/\r?\n$/, '');
-    if (!path.isAbsolute(common)) throw new Error('Git returned a relative common directory');
-    filename = path.join(common, 'kodo-worktree.lock');
-    const { DatabaseSync } = await import('node:sqlite');
-    const guard = new DatabaseSync(path.join(common, 'kodo-worktree-guard.sqlite'));
-    try {
-      while (!owned) {
-        signal?.throwIfAborted();
-        const remaining = until - performance.now();
-        if (remaining <= 0)
-          throw Object.assign(new Error('Timed out waiting for worktree registration'), { code: 'timeout' });
-        owned = tryWorktreeLock(guard, filename);
-        if (!owned) await delay(Math.min(35, remaining), undefined, { signal });
-      }
-    } finally {
-      guard.close();
-    }
+    const directory = stdout.replace(/\r?\n$/, '');
+    if (!path.isAbsolute(directory)) throw new Error('Git returned a relative common directory');
+    const common = await realpath(directory);
+    const key = process.platform === 'win32' ? common.toLowerCase() : common;
+    const timeoutError = () => {
+      const elapsed = Math.round(performance.now() - started);
+      return Object.assign(
+        new Error(`Timed out waiting for worktree lock in ${common} after ${elapsed} ms (limit ${waitMs} ms)`),
+        {
+          code: 'timeout',
+        },
+      );
+    };
     signal?.throwIfAborted();
-    return await action();
+    return await withLocalWorktreeTurn(
+      key,
+      async () => {
+        const { DatabaseSync } = await import('node:sqlite');
+        const guard = new DatabaseSync(path.join(common, 'kodo-worktree-guard.sqlite'), { timeout: 0 });
+        try {
+          for (;;) {
+            signal?.throwIfAborted();
+            try {
+              guard.exec('BEGIN IMMEDIATE');
+              break;
+            } catch (error) {
+              if ((error.errcode & 0xff) !== 5) throw error;
+            }
+            const left = remaining();
+            if (left <= 0) throw timeoutError();
+            await delay(Math.min(35, left), undefined, { signal });
+          }
+          return await action();
+        } finally {
+          // Closing rolls back the transaction. Process death releases the same OS lock.
+          guard.close();
+        }
+      },
+      remaining,
+      timeoutError,
+      signal,
+    );
   } catch (error) {
     if (signal?.aborted && (error === signal.reason || error?.code === 'ABORT_ERR'))
       throw Object.assign(new Error('Worktree registration cancelled', { cause: error }), { code: 'cancelled' });
     throw error;
-  } finally {
-    if (owned) unlinkSync(filename);
   }
 }
 
-/** @param {{signal?: AbortSignal}} [options] */
+/** @param {{signal?: AbortSignal, waitMs?: number}} [options] */
 export async function makeWorktree(project, directory, branch, base, options = {}) {
   const { signal } = options;
   return withWorktreeLock(
@@ -164,6 +164,7 @@ export async function makeWorktree(project, directory, branch, base, options = {
       return directory;
     },
     signal,
+    options.waitMs,
   );
 }
 export async function collectFiles(cwd, task, secrets = {}) {

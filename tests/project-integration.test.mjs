@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile, rm, lstat } from 'node:fs/promises';
+import childProcess from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
+import { assertWorktreeLockHeld } from './helpers/worktree-lock.mjs';
 import os from 'node:os';
 import path from 'node:path';
 import { configureGitTestEnvironment } from '../scripts/git-test-environment.mjs';
@@ -332,7 +335,22 @@ test('An integration branch without a worktree is attached again without resetti
   assert.deepEqual(attached, { ...integration, head: merged.mergeCommit });
   // A directory deleted behind Git's back leaves a prunable registration.
   await rm(attached.worktree, { recursive: true, force: true });
+  const spawn = childProcess.spawn;
+  let prunes = 0;
+  t.mock.method(childProcess, 'spawn', (command, args, options) => {
+    if (command === 'git' && args.includes('prune')) {
+      assertWorktreeLockHeld(path.join(f.root, '.git'));
+      prunes++;
+    }
+    return spawn(command, args, options);
+  });
+  syncBuiltinESMExports();
+  t.after(() => {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+  });
   assert.deepEqual(await ensureIntegration({ root: f.root, projectId, worktreeHome: f.worktreeHome }), attached);
+  assert.equal(prunes, 1);
   assert.deepEqual(await f.user(), user);
 });
 
