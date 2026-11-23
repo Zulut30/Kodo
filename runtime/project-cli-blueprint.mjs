@@ -4,7 +4,7 @@
 // no API fallback. The report envelope matches runtime/project-cli.mjs.
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
-import { DEFAULT_CLI, validCliPrefix } from './cli-command.mjs';
+import { DEFAULT_CLI, PATH_UNSAFE_MESSAGE, assertCliPrefix, quotePath } from './cli-command.mjs';
 
 export const BLUEPRINT_ACTIONS = Object.freeze(['bootstrap', 'apply-spec', 'extend', 'append-milestone']);
 
@@ -21,6 +21,7 @@ const DATA_CODES = [
   'project_entity_not_found',
   'project_task_missing',
   'project_command_conflict',
+  'project_path_unsafe',
 ];
 // positional: [count, kinds]; values/booleans: allowed flags; required flags.
 const GRAMMAR = {
@@ -187,9 +188,18 @@ async function sessionProvider(ctx) {
   return ctx.ports.provider || engine.provider;
 }
 
+// A path that a next hint quotes is checked before anything is written (a missing one is
+// left to its own refusal): runtime/cli-command.mjs.
+async function commandPath(value) {
+  const { realpath } = await import('node:fs/promises');
+  const real = await realpath(value).catch(() => null);
+  if (real) quotePath(real);
+}
+
 async function bootstrap(ctx) {
   const { options, ports } = ctx;
   const root = path.resolve(options.flags['--root']);
+  await commandPath(root);
   const bootstrapModule = await import('./project-bootstrap.mjs');
   const inputs = await contextInputs(ctx, root, options.idea);
   if (options.prepare) {
@@ -212,7 +222,7 @@ async function bootstrap(ctx) {
         `Прочитай context.md, rules.md и templates/ в ${bundle.dir}.`,
         `Напиши чертёж только в ${target}: PROJECT.md, interfaces/<module>.md, spec.json (root = ${bundle.summary.root}).`,
         'Перед регистрацией root — корень Git-репозитория с коммитом; всё вне .kodo/blueprint закоммичено или в .gitignore.',
-        `Проверь и зарегистрируй проект: ${ctx.cli} project apply-spec --root "${bundle.summary.root}" --json`,
+        `Проверь и зарегистрируй проект: ${ctx.cli} project apply-spec --root ${quotePath(bundle.summary.root)} --json`,
       ],
     });
   }
@@ -237,7 +247,7 @@ async function bootstrap(ctx) {
     blueprint: path.join(generated.spec.root, '.kodo', 'blueprint'),
     modules: moduleMap(generated.spec),
     next: [
-      `Проверь чертёж и зарегистрируй проект: ${ctx.cli} project apply-spec --root "${generated.spec.root}" --json`,
+      `Проверь чертёж и зарегистрируй проект: ${ctx.cli} project apply-spec --root ${quotePath(generated.spec.root)} --json`,
     ],
   });
 }
@@ -292,6 +302,7 @@ async function applySpec(ctx) {
   });
   const findings = [...compiled.findings, ...(await gitFindings(options.flags['--root'], finding))];
   if (findings.length) return findingsReport(findings);
+  quotePath(compiled.spec.root); // The root of the next hints, before evidence or the project is written.
   safety(compiled.spec);
   const { engine, repo } = await openState(ctx);
   // Content-addressed private envelopes in Kodo home; the batch prepares ACLs once.
@@ -325,7 +336,7 @@ async function applySpec(ctx) {
     next: [
       // Workers' self-check (ci feedback) lints JS/TS with the managed oxlint; without it the
       // feedback is blocked, never passed. Installing is the coordinator's step, not a worker's.
-      `Перед первой волной установи управляемый линтер самопроверки воркеров (один раз на машину, нужна сеть): ${ctx.cli} tools install oxlint --project "${snapshot.project.root}" --json — для JS/TS, для TypeScript ещё typescript. Без него ci feedback воркера отвечает blocked, а не passed.`,
+      `Перед первой волной установи управляемый линтер самопроверки воркеров (один раз на машину, нужна сеть): ${ctx.cli} tools install oxlint --project ${quotePath(snapshot.project.root)} --json — для JS/TS, для TypeScript ещё typescript. Без него ci feedback воркера отвечает blocked, а не feedback_ready.`,
       `Запусти волну: ${ctx.cli} project next-wave ${created.projectId} --host t3 --limit 3 --json`,
     ],
   });
@@ -371,6 +382,8 @@ async function appendFromFile(ctx, projectId, file, extra = {}) {
 
 async function extend(ctx) {
   const { options, ports, safety } = ctx;
+  // The hint quotes a file of the bundle in Kodo home.
+  if (options.prepare) quotePath(await realHome(ctx.home));
   const { repo } = await openState(ctx);
   const snapshot = await repo.snapshot(options.projectId);
   safety(snapshot);
@@ -398,7 +411,7 @@ async function extend(ctx) {
       next: [
         `Прочитай context.md и rules.md в ${bundle.dir}; форма майлстоуна — ${template}.`,
         `Запиши майлстоун в ${file} (вне репозитория).`,
-        `Проверь и добавь: ${ctx.cli} project append-milestone ${options.projectId} --file "${file}" --json`,
+        `Проверь и добавь: ${ctx.cli} project append-milestone ${options.projectId} --file ${quotePath(file)} --json`,
       ],
     });
   }
@@ -413,6 +426,11 @@ async function extend(ctx) {
   if (!generated.ok)
     return findingsReport(generated.findings, extra, { projectId: options.projectId, revision: snapshot.revision });
   return appendFromFile(ctx, options.projectId, generated.file, extra);
+}
+
+async function realHome(home) {
+  const { realpath } = await import('node:fs/promises');
+  return realpath(path.resolve(home)).catch(() => path.resolve(home));
 }
 
 const HANDLERS = {
@@ -435,6 +453,7 @@ function failureReport(error, phase) {
       status: exitCode === 1 ? 'invalid' : 'blocked',
       code: argumentError ? 'project_arguments' : exitCode === 1 ? 'project_invalid' : 'project_blocked',
       ...(!argumentError && code && code !== 'project_arguments' ? { reason: code } : {}),
+      ...(code === 'project_path_unsafe' ? { message: PATH_UNSAFE_MESSAGE } : {}),
     },
     exitCode,
   );
@@ -466,10 +485,13 @@ export async function projectBlueprintCli(argv, ports = {}) {
       knownValues,
       safety,
       home: ports.home || ports.store?.home || security.stateHome(),
-      cli: ports.cli ?? DEFAULT_CLI,
+      // Only an absent port means a library caller; null or anything else is checked and refused.
+      cli: ports.cli === undefined ? DEFAULT_CLI : ports.cli,
     });
     phase = 'operation';
-    if (!validCliPrefix(ctx.cli)) throw Object.assign(new Error('Invalid CLI prefix'), { code: 'project_cli_invalid' });
+    // Actions with next hints check the prefix before the Store, a bundle or any evidence is written.
+    if (options.action !== 'append-milestone' && (options.action !== 'extend' || options.prepare))
+      safety(assertCliPrefix(ctx.cli));
     outcome = await HANDLERS[options.action](ctx);
     safety(outcome.report); // Guard every output value before either format.
   } catch (error) {

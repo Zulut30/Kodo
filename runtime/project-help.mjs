@@ -12,7 +12,8 @@ export const PROJECT_USAGE = Object.freeze([
   'kodo project reprioritize PROJECT_ID TASK_ID --priority 0..100 [--command-id UUID] [--json]',
   'kodo project approve-risk PROJECT_ID TASK_ID --reason TEXT [--command-id UUID] [--json]',
   'kodo project next-wave PROJECT_ID --host t3|orca [--limit 1..5] [--retry-failed] [--json]',
-  'kodo project complete-task PROJECT_ID TASK_ID --head SHA [--defer-gate|--abandon] [--command-id UUID] [--json]',
+  'kodo project complete-task PROJECT_ID TASK_ID --head SHA [--defer-gate] [--attempt UUID] [--command-id UUID] [--json]',
+  'kodo project complete-task PROJECT_ID TASK_ID --head SHA --abandon --attempt UUID [--command-id UUID] [--json]',
   'kodo project gates PROJECT_ID [--retry-failed] [--json]',
   'kodo project bootstrap "IDEA" --root PATH [--prepare] [--client codex|claude-code] [--model MODEL] [--json]',
   'kodo project apply-spec --root PATH [--file SPEC_JSON] [--command-id UUID] [--json]',
@@ -27,7 +28,9 @@ const asked = argv => Array.isArray(argv) && (argv[0] === 'help' || argv.some(ar
 /** The help outcome when argv asks for it, otherwise null. Exit 0; `--json` gives the report. */
 export function projectHelp(argv) {
   if (!asked(argv)) return null;
-  const own = PROJECT_USAGE.filter(line => line.split(' ')[2].split('|').includes(argv[0]));
+  // `project help ACTION` and `project ACTION --help` both name the action.
+  const target = argv[0] === 'help' ? argv[1] : argv[0];
+  const own = PROJECT_USAGE.filter(line => line.split(' ')[2].split('|').includes(target));
   const usage = own.length ? own : [...PROJECT_USAGE];
   const report = { schemaVersion: 1, projectId: null, revision: null, result: { status: 'help', usage } };
   return {

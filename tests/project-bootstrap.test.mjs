@@ -222,6 +222,7 @@ test('prepareBootstrap skips installed agent skill directories and keeps a compl
   const context = await readFile(path.join(result.dir, 'context.md'), 'utf8');
   assert.match(context, /src\/index\.mjs/);
   assert.doesNotMatch(context, /SKILL\.md/);
+  assert.match(context, /клиентов агентов \(\.agents, \.claude, \.codex, \.opencode\)/, 'the caption names them');
 
   // The session scope check still watches these folders: client settings and hooks are not the blueprint.
   for (const client of ['.agents', '.claude', '.codex', '.opencode']) {

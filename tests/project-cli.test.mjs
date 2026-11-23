@@ -640,6 +640,19 @@ test('project --help prints the project command reference before credentials, st
     assert.equal(result.exitCode, 0, args.join(' '));
     assert.equal(result.report.result.status, 'help');
   }
+  // `help <action>` names the action; an abandon names its attempt.
+  const named = await projectCli(['help', 'next-wave'], ports);
+  assert.deepEqual(named.report.result.usage, [
+    'kodo project next-wave PROJECT_ID --host t3|orca [--limit 1..5] [--retry-failed] [--json]',
+  ]);
+  const complete = await projectCli(['complete-task', '--help'], ports);
+  assert.ok(
+    complete.report.result.usage.includes(
+      'kodo project complete-task PROJECT_ID TASK_ID --head SHA --abandon --attempt UUID [--command-id UUID] [--json]',
+    ),
+    complete.output,
+  );
+  assert.ok(complete.report.result.usage.every(line => !line.includes('[--defer-gate|--abandon]')));
 });
 
 test('Legacy catalog commands and help retain their CLI routes', async t => {

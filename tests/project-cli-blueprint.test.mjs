@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { cp, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
+import { access, cp, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -336,7 +336,9 @@ test('bootstrap --prepare writes the context bundle only to KODO_HOME', async t 
       `Проверь и зарегистрируй проект: node "${cli}" project apply-spec --root "${root}" --json`,
     ),
   );
-  assert.ok(report.result.next.every(line => !/kodo project/.test(line)));
+  const bare = /\bkodo project\b/;
+  assert.ok(bare.test('Проверь: kodo project apply-spec --json'), 'the check sees a bare kodo command');
+  assert.ok(report.result.next.every(line => !bare.test(line)));
   assert.deepEqual(await tree(root), before, 'the repository is unchanged');
 });
 
@@ -402,10 +404,12 @@ test('apply-spec creates a wave project with verifiable interfaces and replays b
     );
   hint(`${prefix} tools install oxlint --project "${root}" --json`);
   hint(`${prefix} project next-wave ${report.projectId} --host t3 --limit 3 --json`);
+  // ci feedback succeeds with feedback_ready; a missing tool is a blocker, never a success.
   assert.ok(
-    report.result.next.some(line => line.includes('blocked')),
+    report.result.next.some(line => line.includes('blocked') && line.includes('feedback_ready')),
     'a missing tool is named a blocker',
   );
+  assert.ok(report.result.next.every(line => !line.includes('passed')));
   assert.equal(report.result.replayed, false);
   assert.deepEqual(report.result.execution, wave);
   assert.deepEqual(report.result.modules.waveZero, ['scaffold', 'test-bench']);
@@ -672,4 +676,30 @@ test('apply-spec requires a committed Git root with no changes outside the bluep
   const created = await f.run(['apply-spec', '--root', dirty]);
   assert.equal(created.exitCode, 0, JSON.stringify(created.report));
   assert.equal(created.report.result.status, 'created');
+});
+
+test('bootstrap and apply-spec refuse a root a shell would expand and an unusable CLI port before any state', async t => {
+  const f = await fixture(t);
+  const unsafe = message => assert.match(message, /переименуйте или переместите/);
+  for (const name of ['repo $(calc)', 'repo $x', 'repo %PATH%', 'repo `id`', 'repo !x!']) {
+    const root = path.join(f.dir, name);
+    await mkdir(root);
+    const result = await f.run(['bootstrap', 'Заметки', '--root', root, '--prepare']);
+    assert.equal(result.exitCode, 1, name);
+    assert.equal(result.report.result.reason, 'project_path_unsafe', name);
+    unsafe(result.report.result.message);
+  }
+  // A committed repository moved under such a name: no evidence and no project are written.
+  const moved = path.join(f.dir, 'moved $x');
+  await rename(await f.root(), moved);
+  await writeBlueprint(moved);
+  const applied = await f.run(['apply-spec', '--root', moved]);
+  assert.equal(applied.exitCode, 1, JSON.stringify(applied.report));
+  assert.equal(applied.report.result.reason, 'project_path_unsafe');
+  // A null CLI port is refused, not replaced with kodo.
+  const plain = await f.root();
+  const refused = await f.run(['bootstrap', 'Заметки', '--root', plain, '--prepare'], { cli: null });
+  assert.equal(refused.exitCode, 2);
+  assert.equal(refused.report.result.reason, 'project_cli_invalid');
+  await assert.rejects(access(f.home), 'no bundle, evidence or Store was written');
 });

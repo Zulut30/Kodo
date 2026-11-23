@@ -18,9 +18,12 @@
  * `project-director-waves.mjs`. Kodo never starts or archives the host's chats.
  */
 import { randomUUID } from 'node:crypto';
+import { realpath } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { execute } from './command.mjs';
-import { git, makeWorktree } from './workspace.mjs';
+import { git, makeWorktree, worktreeHomeFor } from './workspace.mjs';
 import { scopesOverlap } from './contracts.mjs';
 import { redact } from './security.mjs';
 import { isPullHost } from './job-contracts.mjs';
@@ -37,7 +40,7 @@ import * as waves from './project-director-waves.mjs';
 import { verifyTaskFastOnce } from './wave-verifier.mjs';
 import { workerRole } from './worker-roles.mjs';
 import { applyWavePolicy } from './wave-policy.mjs';
-import { DEFAULT_CLI, validCliPrefix } from './cli-command.mjs';
+import { DEFAULT_CLI, assertCliPrefix, quotePath } from './cli-command.mjs';
 
 /** The largest batch one `nextWave` call returns. */
 export const MAX_WAVE_LIMIT = 5;
@@ -131,8 +134,6 @@ function integratedMerges(snapshot, store) {
   return merges;
 }
 
-const quote = value => `"${value.replaceAll('"', '\\"')}"`;
-
 function workerContract(run, writePaths, selfCheck) {
   return [
     'Worker contract (Kodo external task):',
@@ -152,7 +153,7 @@ function briefFor(state, attempt, task, run) {
   need(run.task === input, 'binding_invalid');
   const { role, instructions } = workerRole(task.owner);
   // The caller's CLI (`cli`): a chat runs the same Kodo package that issued the brief.
-  const selfCheck = `${cli} ci feedback --base ${run.baseSha} --project ${quote(run.cwd)} --json`;
+  const selfCheck = `${cli} ci feedback --base ${run.baseSha} --project ${quotePath(run.cwd)} --json`;
   const brief = {
     projectId: project.projectId,
     taskId: task.id,
@@ -381,6 +382,16 @@ async function reserveSelected(state, limit, ports) {
   }
 }
 
+// The directory of new Runs' worktrees, as Engine.initializeRun chooses it (a state home
+// inside Git keeps them beside a temporary artifact home), checked for brief commands.
+async function plannedWorktreeHome(store) {
+  if (typeof store?.home !== 'string') return;
+  const inGit =
+    (await execute('git', ['rev-parse', '--show-toplevel'], { cwd: store.home, allowFailure: true })).code === 0;
+  const home = inGit ? await realpath(os.tmpdir()) : worktreeHomeFor({ storeHome: store.home });
+  quotePath(path.resolve(home));
+}
+
 /**
  * Reserve the next wave for an external host: the briefs of this host's running
  * attempts, then new non-overlapping tasks up to `limit` (1..5). `cli` is the command
@@ -392,9 +403,13 @@ export async function nextWave(ctx, input) {
   const { projectId, host, limit = 3, retryFailed = false, ports, cli = DEFAULT_CLI } = input;
   need(isPullHost(host), 'host_unsupported');
   need(Number.isSafeInteger(limit) && limit >= 1 && limit <= MAX_WAVE_LIMIT, 'limit_invalid');
-  need(validCliPrefix(cli), 'cli_invalid');
+  assertCliPrefix(cli);
   const C = await contractsOf(ctx),
     store = storeOf(ctx);
+  const options = { knownValues: known(ctx.engine) };
+  C.assertDirectorSafe(cli, options);
+  // Every brief command names its worktree: an unusable directory is refused before any reservation.
+  await plannedWorktreeHome(ctx.engine.store ?? store);
   const snapshot = await snapshotOf(ctx, projectId);
   need(C.isWaveProject(snapshot.project), 'wave_required');
   controlOf(snapshot);
@@ -413,7 +428,7 @@ export async function nextWave(ctx, input) {
       cli,
       token,
       integration,
-      options: { knownValues: known(ctx.engine) },
+      options,
       snapshot: await snapshotOf(ctx, projectId),
       inFlight: new Set(),
       briefs: [],
@@ -423,7 +438,9 @@ export async function nextWave(ctx, input) {
     if (retryFailed) await reserveRetries(state, limit);
     await reserveSelected(state, limit, ports);
     const revision = (await snapshotOf(ctx, projectId)).revision;
-    return { projectId, revision, cli, briefs: state.briefs, blocked: state.blocked };
+    const result = { projectId, revision, cli, briefs: state.briefs, blocked: state.blocked };
+    C.assertDirectorSafe(result, options);
+    return result;
   } finally {
     store.releaseLease(token);
   }

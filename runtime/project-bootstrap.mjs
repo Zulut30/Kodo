@@ -498,7 +498,7 @@ function bootstrapContext({ prompt, root, at, scan, stack, architecture, knowled
     '## Карта файлов',
     '',
     scan.files.length
-      ? `Показано файлов: ${listed.length}${more ? ' (список неполный)' : ''}. Пропущены каталоги VCS, зависимостей, сборки и .kodo (${scan.skippedDirs}), ссылки (${scan.links}).`
+      ? `Показано файлов: ${listed.length}${more ? ' (список неполный)' : ''}. Пропущены каталоги VCS, зависимостей, сборки, .kodo и клиентов агентов (${AGENT_DIRS.join(', ')}) (${scan.skippedDirs}), ссылки (${scan.links}).`
       : 'Каталог пуст.',
     ...(listed.length ? ['', fenced(listed.join('\n'), 'text')] : []),
     '',

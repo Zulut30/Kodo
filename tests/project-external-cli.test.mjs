@@ -269,7 +269,8 @@ test(
       XDG_CONFIG_HOME: isolated,
       KODO_HOME: path.join(temp, 'state'),
       KODO_CREDENTIAL_HOME: path.join(temp, 'credentials'),
-      KODO_WORKTREE_HOME: path.join(temp, 'worktrees'),
+      // Spaces and Cyrillic: an ordinary quoted argument in every shell.
+      KODO_WORKTREE_HOME: path.join(temp, 'рабочие копии'),
       GIT_CONFIG_NOSYSTEM: '1',
       GIT_CONFIG_GLOBAL: path.join(isolated, 'gitconfig'),
       GIT_TERMINAL_PROMPT: '0',
@@ -301,7 +302,12 @@ test(
       brief.abandonCommand,
       `${prefix} project complete-task ${projectId} task-a --head <SHA> --abandon --attempt ${brief.attemptId}`,
     );
-    // The brief's command runs as written in the platform shell (cmd.exe on Windows, sh elsewhere).
+    assert.ok(brief.worktree.startsWith(path.join(temp, 'рабочие копии')));
+    // The brief's commands run as written in the platform shell (cmd.exe on Windows, sh elsewhere).
+    const shell = command =>
+      spawnSync(command, { shell: true, env, encoding: 'utf8', timeout: 60000, windowsHide: true });
+    const feedback = shell(brief.selfCheck);
+    assert.equal(JSON.parse(feedback.stdout).project, brief.worktree, feedback.stdout + feedback.stderr);
     const abandon = spawnSync(`${brief.abandonCommand.replace('<SHA>', brief.baseSha)} --json`, {
       shell: true,
       env,
@@ -313,3 +319,18 @@ test(
     assert.equal(JSON.parse(abandon.stdout).result.status, 'abandoned');
   },
 );
+
+test('next-wave refuses an unusable CLI prefix port before the Store opens', async () => {
+  const closed = { secrets: {}, openStore: () => assert.fail('the Store stays closed') };
+  for (const [cli, code] of [
+    [null, 'project_cli_invalid'],
+    ['npx kodo', 'project_cli_invalid'],
+    ['node "cli/index.mjs"', 'project_path_unsafe'],
+    [`node "${path.join(os.tmpdir(), 'kodo $(calc)', 'index.mjs')}"`, 'project_path_unsafe'],
+  ]) {
+    const result = await projectCli(['next-wave', id, '--host', 't3', '--json'], { ...closed, cli });
+    assert.equal(result.exitCode, 1, String(cli));
+    assert.equal(result.report.result.code, code, String(cli));
+    if (code === 'project_path_unsafe') assert.match(result.report.result.message, /переименуйте или переместите/);
+  }
+});

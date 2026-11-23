@@ -246,6 +246,10 @@ export class EngineExecution extends EnginePlanning {
         node.model = selected.id;
         node.sessionId = result.sessionId;
         node.result = validate(resultSchema, result.output);
+        // A wave task checks its worktree first: a write outside writePaths is its blocker
+        // even when the worker reports an incomplete result.
+        if (run.verificationProfile === TASK_FAST_PROFILE)
+          await this.checkScope(node.cwd, node.baseSha, task.writePaths);
         if (!node.result.complete) throw new Error(`Исполнитель не завершил задачу: ${node.result.summary}`);
         node.changedFiles = await this.checkScope(node.cwd, node.baseSha, task.writePaths);
         if (normalizeWatchdogConfig(run.config.watchdog).rejectUnchanged && (await unchanged(node.cwd, node.baseSha)))
