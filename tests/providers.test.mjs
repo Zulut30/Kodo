@@ -1213,6 +1213,40 @@ test('A stopped attempt ends only after its processes are confirmed stopped', { 
   );
 });
 
+test(
+  'The first stop reason stays: the startup limit does not replace an output limit',
+  { timeout: 60000 },
+  async () => {
+    // The stop is held past the startup limit, so a startup timer still armed would fire during it.
+    // A cold start slower than the limit reaches no output first: inconclusive, the limit doubles.
+    for (let limit = 1500; ; limit *= 2) {
+      let stoppedAt = null;
+      const spawned = performance.now();
+      const failure = await runProcess({
+        command: process.execPath,
+        args: ['-e', "process.stdout.write('x'.repeat(4096));setInterval(()=>{},1000)"],
+        timeoutMs: 120000,
+        maxOutputBytes: 100,
+        startupTimeoutMs: limit,
+        startedBy: jsonObjectLine,
+        stopImpl: async child => {
+          stoppedAt = performance.now() - spawned;
+          await new Promise(resolve => setTimeout(resolve, Math.max(0, limit - stoppedAt) + 300));
+          child.kill('SIGKILL');
+        },
+      }).then(
+        () => null,
+        error => error,
+      );
+      if (stoppedAt !== null && stoppedAt < limit) {
+        assert.equal(failure?.code, 'KODO_OUTPUT_LIMIT', 'the first reason is kept, no restart is allowed');
+        return;
+      }
+      assert.ok(limit < 12000, 'the client never started within the limit');
+    }
+  },
+);
+
 test('An unconfirmed stop is reported as such and never followed by a restart', { timeout: 60000 }, async t => {
   let client;
   t.after(() => {

@@ -122,9 +122,12 @@ export async function runProcess({
       forced;
     const outcome = () => teardownError ?? terminalError;
     const terminate = error => {
-      if (finished) return;
+      // The first reason of a stop stays (a later timer cannot turn it into a restartable one);
+      // an unconfirmed teardown still takes precedence over it.
+      if (finished || stopping) return;
       terminalError = error;
-      if (stopping) return;
+      clearTimeout(startup);
+      startup = undefined;
       stopping = Promise.resolve()
         .then(() => stopImpl(child))
         .catch(cause => {
