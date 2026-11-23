@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { writeFile } from 'node:fs/promises';
+import { readFile, writeFile } from 'node:fs/promises';
 import { realpathSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { once } from 'node:events';
@@ -527,6 +527,17 @@ test('Engine prepares once and resumes a host plan after reopening state without
   assert.equal(services.calls.planner, 0);
   assert.equal(services.calls.worker.length, 0);
   assert.equal(await exists(path.join(prepared.artifacts, 'plan.schema.json')), true);
+  // Every file docs/RUNTIME.md promises in artifacts for awaiting_plan exists; the analysis is the
+  // `analysis` field and its immutable evidence copy.
+  const runtimeDoc = await readFile(new URL('../docs/RUNTIME.md', import.meta.url), 'utf8');
+  const promised = /В состоянии `awaiting_plan` каталог `artifacts` содержит (.+?)\.\s/.exec(runtimeDoc);
+  assert.ok(promised, 'RUNTIME.md names the awaiting_plan artifacts');
+  const named = [...promised[1].matchAll(/`([\w.-]+\.(?:json|md))`/g)].map(match => match[1]);
+  assert.ok(named.length >= 2, named.join());
+  for (const name of named) assert.equal(await exists(path.join(prepared.artifacts, name)), true, name);
+  assert.ok(prepared.analysis);
+  assert.match(path.basename(prepared.analysisEvidence.path), /^analysis-[a-f0-9]{64}\.json$/);
+  assert.equal(await exists(prepared.analysisEvidence.path), true);
   const planFile = path.join(prepared.artifacts, 'host-plan.json');
   await writeFile(planFile, JSON.stringify(featurePlan()));
   fx.closeStore(firstStore);

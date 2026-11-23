@@ -188,11 +188,28 @@ const wait = item => `${time(item.waitMs)} (${item.known}/${value(item.total)} k
 const failureCodes = rows =>
   rows === null ? 'unknown' : rows.length ? rows.map(item => `${item.code}@${item.scope}`).join(', ') : 'none';
 
-function humanProject(report) {
+const statusCounts = counts => {
+  const rows = Object.entries(counts ?? {}).sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
+  return rows.length ? rows.map(([status, count]) => `${status} ${count}`).join(', ') : 'none';
+};
+// Wave gates only: a legacy project report has no `gates`.
+const gateLines = gates =>
+  Array.isArray(gates)
+    ? [
+        `Gates: ${gates.length || 'none'}`,
+        ...gates.map(
+          row => `  ${row.id} ${row.status} ${row.containers.join(', ') || 'none'} run ${row.runId ?? 'none'}`,
+        ),
+      ]
+    : [];
+
+/** The text summary of a project report (`kodo report --project` without `--json`). */
+export function humanProject(report) {
   const { totals } = report;
   return [
     `Project ${report.projectId} | status ${report.status} | revision ${value(report.revision)}`,
     `Tasks: ${totals.tasks} (accepted ${totals.accepted}, integrated ${totals.integrated}, failed ${totals.failed}, blocked ${totals.blocked}, cancelled ${totals.cancelled}, pending ${totals.pending}); attempts ${totals.attempts}; sessions ${value(totals.sessions)}`,
+    `Epics: ${statusCounts(report.progress?.epics)}`,
     `Wall time: ${time(totals.wallMs)}; verification share: ${value(totals.verificationShare)}; total tokens ${value(totals.usage?.usage.totalTokens)} (observed ${value(totals.observedUsage.usage.totalTokens)})`,
     `Waits: queue ${wait(totals.waits.queue)}, delivery queue ${wait(totals.waits.deliveryQueue)}, CI ${wait(totals.waits.ci)}`,
     ...report.tasks.map(
@@ -204,6 +221,7 @@ function humanProject(report) {
       row =>
         `  ${row.taskId} #${value(row.number)} ${value(row.state)}: queue ${wait(row.waits.queue)}, delivery queue ${wait(row.waits.deliveryQueue)}, CI ${wait(row.waits.ci)}; failures ${failureCodes(row.failures)}`,
     ),
+    ...gateLines(report.gates),
     `Blockers: ${report.blockers.length ? report.blockers.map(item => `${item.code}@${item.taskId ?? item.scope}`).join(', ') : 'none'}`,
     observations(report.provenance),
     caveat,

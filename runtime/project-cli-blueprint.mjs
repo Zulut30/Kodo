@@ -196,6 +196,12 @@ async function commandPath(value) {
   if (real) quotePath(real);
 }
 
+// Wave checks run under kodo.config.json of the committed base (runtime/wave-policy.mjs): without it
+// the defaults apply (client codex, commands.test npm test), whatever the stack or subscription.
+const configStep = (root, template) =>
+  `До apply-spec создай ${path.join(root, 'kodo.config.json')} по шаблону ${template}: client — подписочный клиент гейтов ` +
+  '(codex или claude-code), commands.test — команда тестов стека (rules.md); закоммить его вместе с исходным состоянием.';
+
 async function bootstrap(ctx) {
   const { options, ports } = ctx;
   const root = path.resolve(options.flags['--root']);
@@ -222,6 +228,7 @@ async function bootstrap(ctx) {
       next: [
         `Прочитай context.md, rules.md и templates/ в ${bundle.dir}.`,
         `Напиши чертёж только в ${target}: PROJECT.md, interfaces/<module>.md, spec.json (root = ${bundle.summary.root}).`,
+        configStep(bundle.summary.root, path.join(bundle.dir, 'templates', 'kodo.config.json')),
         'Перед регистрацией root — корень Git-репозитория с коммитом; всё вне .kodo/blueprint закоммичено или в .gitignore.',
         `Проверь и зарегистрируй проект: ${apply}`,
       ],
@@ -249,7 +256,10 @@ async function bootstrap(ctx) {
     ...extra,
     blueprint: path.join(generated.spec.root, '.kodo', 'blueprint'),
     modules: moduleMap(generated.spec),
-    next: [`Проверь чертёж и зарегистрируй проект: ${apply}`],
+    next: [
+      configStep(generated.spec.root, path.join(generated.dir, 'templates', 'kodo.config.json')),
+      `Проверь чертёж и зарегистрируй проект: ${apply}`,
+    ],
     commands: [{ command: apply, why: 'После проверки чертежа и коммита: зарегистрировать проект' }],
   });
 }
@@ -397,6 +407,10 @@ async function extend(ctx) {
   const { repo } = await openState(ctx);
   const snapshot = await repo.snapshot(options.projectId);
   safety(snapshot);
+  // append-milestone admits only an accepted wave project (assertProjectReopen): refuse before a
+  // bundle is written or a session starts.
+  if (!ctx.contracts.isWaveProject(snapshot.project) || !['accepted', 'released'].includes(snapshot.project.status))
+    throw Object.assign(new Error('Project append blocked'), { code: 'project_append_blocked' });
   const root = snapshot.project.root;
   const bootstrapModule = await import('./project-bootstrap.mjs');
   const common = {

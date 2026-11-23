@@ -84,6 +84,20 @@ const MARKERS = [
   [/^Package\.swift$/, 'Swift'],
   [/^kodo\.config\.json$/, 'Kodo config'],
 ];
+// commands.test of the kodo.config.json template, by a manifest in the root (first match). Another
+// recognised stack gets none: the coordinator sets it (an empty commands.test is never a pass).
+/** @type {Array<[RegExp, { command: string, args: string[] }]>} */
+const TEST_COMMANDS = [
+  [/^deno\.jsonc?$/, { command: 'deno', args: ['test'] }],
+  [/^package\.json$/, { command: 'npm', args: ['test'] }],
+  [/^(?:pyproject\.toml|requirements[^/]*\.txt|setup\.py|Pipfile)$/, { command: 'python', args: ['-m', 'pytest'] }],
+  [/^Cargo\.toml$/, { command: 'cargo', args: ['test'] }],
+  [/^go\.mod$/, { command: 'go', args: ['test', './...'] }],
+  [/\.(?:csproj|fsproj|sln)$/, { command: 'dotnet', args: ['test'] }],
+  [/^pom\.xml$/, { command: 'mvn', args: ['test'] }],
+  [/^build\.gradle(?:\.kts)?$/, { command: 'gradle', args: ['test'] }],
+];
+const NOT_A_STACK = ['Docker', 'Kodo config'];
 const FRAMEWORKS = [
   'react',
   'next',
@@ -216,6 +230,18 @@ async function detectStack(root, files) {
     }
   }
   return { labels: [...found.keys()], lines };
+}
+
+/** kodo.config.json for the coordinator to commit before apply-spec: the client of the gate Runs and
+ * the test command of the stack. An empty root gets the Node command of the spec template. */
+function configTemplate(files) {
+  const names = files.filter(file => !file.path.includes('/')).map(file => file.path);
+  const known = TEST_COMMANDS.find(([pattern]) => names.some(name => pattern.test(name)));
+  const stack = MARKERS.some(
+    ([pattern, label]) => !NOT_A_STACK.includes(label) && names.some(name => pattern.test(name)),
+  );
+  const test = known ? [known[1]] : stack ? [] : [{ command: 'npm', args: ['test'] }];
+  return { schemaVersion: 1, client: 'codex', commands: { test, build: [], deploy: [], smoke: [] } };
 }
 
 function fenced(text, info = '') {
@@ -358,10 +384,19 @@ const RULES = `# Правила чертежа Kodo
 1. **Волна 0.** Есть майлстоун или эпик с id \`${FOUNDATION_ID}\`: каркас, линтеры, стенд проверки, общие интерфейсы. Каждая задача вне Волны 0 транзитивно зависит хотя бы от одной её задачи; задачи Волны 0 зависят только друг от друга.
 2. **Параллельные задачи не пересекаются по writePaths.** Две задачи без пути по \`dependsOn\` могут идти одновременно; их \`writePaths\` не должны пересекаться (вложенные пути и glob — тоже пересечение). Добавьте зависимость или разведите пути.
 3. **Не больше ${MAX_TASK_INPUT_BYTES} байт на задачу.** Полный вход задачи (контекст проекта, описание, критерии, пути, ссылки) — до ${MAX_TASK_INPUT_BYTES} байт UTF-8. Kodo задачи не режет: делите их сами на несколько задач с зависимостями.
-4. **Роли через owner:** ${FACTORY_ROLES.map(role => `\`${role}\``).join(', ')}.
+4. **Роли через owner:** ${FACTORY_ROLES.map(role => `\`${role}\``).join(', ')}. Хвостовую задачу \`reviewer\` в эпик не добавляйте: ревью делает gate Run эпика, а лишняя задача — ещё одна волна и чат.
 5. **Интерфейсы.** \`interfaceRefs\` указывают на \`interfaces/<module>.md\`. Короткая форма \`{ "kind": "interface", "path": "interfaces/<module>.md" }\`: Kodo подставит абсолютный путь, \`runId\`/\`headSha\` = null и sha256 текущего файла. Явный sha256 должен совпадать с файлом.
 6. \`root\` — абсолютный путь каталога проекта; id — slug; остальные поля строго по ProjectSpec v1.
 7. **Эпики без циклов.** Если задача эпика X зависит от задачи эпика Y, никакая задача Y не должна зависеть (через задачи любых эпиков) от задач X: гейты эпиков закрываются по порядку.
+8. **Минимальный тест в Волне 0.** Первая задача Волны 0 создаёт минимальный проходящий тест, его путь — в её \`writePaths\`: без тестов проверка задачи ничего не доказывает, а прогон \`node --test\` без единого теста — отказ (\`fast_check_no_tests\`).
+
+## kodo.config.json — до apply-spec
+
+Политику проверки волн (\`commands\` и гейты) Kodo берёт из \`kodo.config.json\` в коммите, от которого стартует проект; правка файла в рабочей копии после регистрации проверку волн не меняет. Поэтому до \`apply-spec\` создайте \`<root>/kodo.config.json\` по \`templates/kodo.config.json\` и закоммитьте его вместе с исходным состоянием.
+
+- \`client\` — подписочный клиент, который исполняет гейты: \`codex\` или \`claude-code\` (есть только подписка Claude Code — \`claude-code\`).
+- \`commands.test\` — команда тестов стека из «Стек»: \`{ "command": "<программа>", "args": [...] }\`. Шаблон заполнен по найденному стеку (Node — \`npm test\`, Python — \`python -m pytest\`, Rust — \`cargo test\`, Go — \`go test ./...\`, .NET — \`dotnet test\`; пустой каталог — \`npm test\`). Выбран другой стек или в шаблоне команды нет — задайте её сами: пустой \`commands.test\` гейт не принимает.
+- \`kodo.config.json\` уже есть — проверьте в нём \`client\` и \`commands.test\`.
 
 ## Коды проверки
 
@@ -474,10 +509,16 @@ function specTemplate(root) {
       { id: 'core', milestoneId: 'mvp', title: '<Модуль core>', acceptance: [criterion('core-done', '<Критерий>')] },
     ],
     tasks: [
-      templateTask('scaffold', 'foundation-setup', 'architect', [], ['package.json', 'src/shared'], ['core']),
+      templateTask(
+        'scaffold',
+        'foundation-setup',
+        'architect',
+        [],
+        ['package.json', 'src/shared', 'tests/smoke'],
+        ['core'],
+      ),
       templateTask('quality-bench', 'foundation-setup', 'developer', ['scaffold'], ['tests/support', 'tooling'], []),
       templateTask('core-module', 'core', 'developer', ['quality-bench'], ['src/core'], ['core']),
-      templateTask('core-review', 'core', 'reviewer', ['core-module'], ['docs/reviews/core.md'], ['core']),
     ],
   };
 }
@@ -540,6 +581,7 @@ export async function prepareBootstrap(options = {}) {
       ['templates/PROJECT.md', PROJECT_TEMPLATE],
       ['templates/interfaces/module.md', INTERFACE_TEMPLATE],
       ['templates/spec.json', `${JSON.stringify(specTemplate(real), null, 2)}\n`],
+      ['templates/kodo.config.json', `${JSON.stringify(configTemplate(scan.files), null, 2)}\n`],
     ],
   });
   return {
@@ -676,12 +718,33 @@ function snapshotOf(snapshot, contracts, knownValues) {
   }
 }
 
-function refLabel(ref) {
-  const name = ref.path.replaceAll('\\', '/').split('/').at(-1);
+function refLabel(ref, labels) {
+  const name = labels.get(ref.path) ?? ref.path.replaceAll('\\', '/').split('/').at(-1);
   return ref.kind === 'interface' ? name : `${ref.kind}:${name}`;
 }
 
-function moduleMap(snapshot) {
+const MAX_EVIDENCE = 1024 * 1024;
+const MODULE = /^[a-z][a-z0-9-]{0,47}$/;
+
+/** `<module>.md` of interface refs that apply-spec bound to evidence envelopes, by path. An envelope
+ * that is missing, unreadable, changed (sha256) or not an interface keeps its file name. */
+async function interfaceLabels(snapshot) {
+  const labels = new Map();
+  for (const ref of snapshot.tasks.flatMap(task => task.interfaceRefs)) {
+    if (ref.kind !== 'interface' || !ref.path.endsWith('.json') || labels.has(ref.path)) continue;
+    try {
+      const file = await readBoundedFile(ref.path, MAX_EVIDENCE);
+      const envelope = file.sha256 === ref.sha256 ? JSON.parse(file.text) : null;
+      const module = envelope?.kind === 'interface' ? envelope.value?.module : undefined;
+      if (typeof module === 'string' && MODULE.test(module)) labels.set(ref.path, `${module}.md`);
+    } catch {
+      // Only a label: the file name stays.
+    }
+  }
+  return labels;
+}
+
+function moduleMap(snapshot, labels) {
   const lines = [];
   for (const milestone of snapshot.milestones) {
     lines.push(`### ${milestone.id} — ${milestone.title} [${milestone.status}]`);
@@ -690,15 +753,15 @@ function moduleMap(snapshot) {
       for (const task of snapshot.tasks.filter(item => item.epicId === epic.id))
         lines.push(
           `  - ${task.id} [${task.status}] owner=${task.owner}; deps: ${task.dependsOn.join(', ') || '—'}; ` +
-            `writePaths: ${task.writePaths.join(', ')}; interfaces: ${task.interfaceRefs.map(refLabel).join(', ') || '—'}`,
+            `writePaths: ${task.writePaths.join(', ')}; interfaces: ${task.interfaceRefs.map(ref => refLabel(ref, labels)).join(', ') || '—'}`,
         );
     }
   }
   return bounded(lines, 48 * 1024);
 }
 
-function extendContext({ prompt, root, at, snapshot, architecture, knowledge }) {
-  const map = moduleMap(snapshot);
+function extendContext({ prompt, root, at, snapshot, labels, architecture, knowledge }) {
+  const map = moduleMap(snapshot, labels);
   const accepted = snapshot.tasks.filter(task => CLOSED.includes(task.status)).map(task => task.id);
   const complete = Object.values(snapshot.completeness).every(item => item.complete);
   return [
@@ -745,11 +808,12 @@ const MILESTONE_RULES = `# Правила нового майлстоуна
 3. dependsOn — только новые задачи или уже принятые (accepted/released) задачи проекта.
 4. writePaths задач, которые могут идти параллельно (новые без пути по dependsOn и незакрытые существующие), не пересекаются.
 5. Вход каждой задачи — до ${MAX_TASK_INPUT_BYTES} байт UTF-8; Kodo задачи не режет.
-6. owner — одна из ролей: ${FACTORY_ROLES.join(', ')}.
+6. owner — одна из ролей: ${FACTORY_ROLES.join(', ')}. Хвостовую задачу reviewer не добавляйте: ревью делает gate Run эпика.
 7. Новые эпики не образуют цикл: если задача эпика X зависит от задачи эпика Y, никакая задача Y не зависит (через задачи любых эпиков) от задач X.
 8. В майлстоуне есть хотя бы один эпик, в каждом новом эпике — хотя бы одна задача.
+9. \`interfaceRefs: []\`. Короткую форму \`interfaces/<module>.md\` привязывает к замороженным интерфейсам только apply-spec, здесь она отклоняется (\`milestone_interface_unbound\`): нужный контракт модуля опишите в description.
 
-Коды: \`milestone_shape\`, \`milestone_task_count\`, \`milestone_id_conflict\`, \`milestone_foreign_parent\`, \`milestone_dependency_unknown\`, \`milestone_dependency_not_accepted\`, \`milestone_snapshot_invalid\`, \`milestone_snapshot_incomplete\`, \`milestone_spec_invalid\`, \`blueprint_owner_unknown\`, \`blueprint_container_empty\`, \`blueprint_epic_cycle\`, \`blueprint_parallel_overlap\`, \`split_required\`.
+Коды: \`milestone_shape\`, \`milestone_task_count\`, \`milestone_id_conflict\`, \`milestone_foreign_parent\`, \`milestone_dependency_unknown\`, \`milestone_dependency_not_accepted\`, \`milestone_interface_unbound\`, \`milestone_snapshot_invalid\`, \`milestone_snapshot_incomplete\`, \`milestone_spec_invalid\`, \`blueprint_owner_unknown\`, \`blueprint_container_empty\`, \`blueprint_epic_cycle\`, \`blueprint_parallel_overlap\`, \`split_required\`.
 `;
 
 function milestoneTemplate(snapshot) {
@@ -773,10 +837,7 @@ function milestoneTemplate(snapshot) {
         acceptance: [criterion('feature-epic-done', '<Критерий>')],
       },
     ],
-    tasks: [
-      task('feature-build', 'developer', accepted ? [accepted] : [], ['src/feature']),
-      task('feature-review', 'reviewer', ['feature-build'], ['docs/reviews/feature.md']),
-    ],
+    tasks: [task('feature-build', 'developer', accepted ? [accepted] : [], ['src/feature'])],
   };
 }
 
@@ -795,6 +856,7 @@ export async function prepareExtend(options = {}) {
   const at = isoTime(now);
   const graph = await architectureSection(architecture);
   const facts = knowledgeSection(knowledge, prompt);
+  const labels = await interfaceLabels(current);
   const { redacted, ...bundle } = await writeBundle({
     home,
     root: real,
@@ -805,7 +867,7 @@ export async function prepareExtend(options = {}) {
     files: [
       [
         'context.md',
-        extendContext({ prompt, root: real, at, snapshot: current, architecture: graph, knowledge: facts }),
+        extendContext({ prompt, root: real, at, snapshot: current, labels, architecture: graph, knowledge: facts }),
       ],
       ['rules.md', MILESTONE_RULES],
       ['templates/milestone.json', `${JSON.stringify(milestoneTemplate(current), null, 2)}\n`],
@@ -962,11 +1024,27 @@ function structuralFindings(input, current) {
         [...open],
       ),
     );
+  const unbound = tasks
+    .filter(task => Array.isArray(task.interfaceRefs) && task.interfaceRefs.some(shortRef))
+    .map(task => String(task.id));
+  if (unbound.length)
+    findings.push(
+      finding(
+        'milestone_interface_unbound',
+        'В майлстоуне interfaceRefs: [] — короткую форму interfaces/<module>.md привязывает только apply-spec; контракт опишите в description',
+        unbound,
+      ),
+    );
   return findings;
 }
 
-// Schema check of the new records alone: foreign parents and external
-// dependencies are reported above and neutralized here.
+// The blueprint short form `{ path: 'interfaces/<module>.md' }`: bound to frozen interface evidence
+// by apply-spec only (bindInterfaceEvidence), never by a new milestone.
+const shortRef = ref =>
+  isPlain(ref) && typeof ref.path === 'string' && !path.isAbsolute(ref.path) && !path.win32.isAbsolute(ref.path);
+
+// Schema check of the new records alone: foreign parents, external dependencies
+// and short interface refs are reported above and neutralized here.
 function normalizeMilestone(input, current, contracts, knownValues) {
   const project = current.project,
     epicIds = new Set(input.epics.filter(isPlain).map(epic => epic.id)),
@@ -991,6 +1069,7 @@ function normalizeMilestone(input, current, contracts, knownValues) {
       if (Object.hasOwn(copy, 'epicId') && !epicIds.has(copy.epicId) && firstEpic !== undefined)
         copy.epicId = firstEpic;
       if (Array.isArray(copy.dependsOn)) copy.dependsOn = copy.dependsOn.filter(id => fresh.has(id));
+      if (Array.isArray(copy.interfaceRefs)) copy.interfaceRefs = copy.interfaceRefs.filter(ref => !shortRef(ref));
       return copy;
     }),
   };

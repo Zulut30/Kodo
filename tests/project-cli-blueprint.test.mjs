@@ -338,8 +338,16 @@ test('bootstrap --prepare writes the context bundle only to KODO_HOME', async t 
     'templates/PROJECT.md',
     'templates/interfaces/module.md',
     'templates/spec.json',
+    'templates/kodo.config.json',
   ]);
   assert.match(await readFile(path.join(bundle.dir, 'context.md'), 'utf8'), /Сервис заметок с поиском/);
+  // The verification policy of every wave comes from the committed kodo.config.json: it is created
+  // and committed (client, commands.test) before apply-spec registers the project.
+  const config = report.result.next.findIndex(line => line.includes('kodo.config.json'));
+  const register = report.result.next.findIndex(line => line.includes('project apply-spec --root'));
+  assert.ok(config >= 0 && config < register, report.result.next.join('\n'));
+  for (const text of ['templates', 'client', 'commands.test', 'закоммить'])
+    assert.ok(report.result.next[config].includes(text), text);
   assert.equal(report.result.summary.root, root);
   assert.equal(report.result.blueprint, path.join(root, '.kodo', 'blueprint'));
   // The hints call the CLI that issued them, by its absolute entry.
@@ -756,4 +764,56 @@ test('extend --prepare checks the milestone file of its bundle before creating t
     assert.equal(result.report.result.reason, 'project_path_unsafe');
     assert.deepEqual(await readdir(target), [], 'no bundle is written, a repeat adds none');
   }
+});
+
+test('extend refuses a project that is not an accepted wave project before any bundle or session', async t => {
+  const f = await fixture(t);
+  const root = await f.root();
+  await writeBlueprint(root);
+  const created = await f.run(['apply-spec', '--root', root]);
+  assert.equal(created.exitCode, 0, JSON.stringify(created.report));
+  let sessions = 0;
+  const provider = {
+    runSession: async () => {
+      sessions++;
+      throw Error('No session before the status check');
+    },
+  };
+  for (const args of [
+    ['extend', created.report.projectId, 'Теги', '--prepare'],
+    ['extend', created.report.projectId, 'Теги', '--client', 'codex'],
+  ]) {
+    const result = await f.run(args, { createEngine: fakeEngine(provider) });
+    assert.equal(result.exitCode, 2, JSON.stringify(result.report));
+    assert.deepEqual(result.report.result, {
+      status: 'blocked',
+      code: 'project_blocked',
+      reason: 'project_append_blocked',
+    });
+  }
+  assert.equal(sessions, 0);
+  assert.equal(existsSync(path.join(f.home, 'bootstrap')), false, 'no context bundle was written');
+});
+
+test('the director skill follows the factory contract for a new project and a new milestone', async () => {
+  const skill = await readFile(
+    fileURLToPath(new URL('../skills/kodo-project-director/SKILL.md', import.meta.url)),
+    'utf8',
+  );
+  const section = (title, next) => skill.slice(skill.indexOf(title), next ? skill.indexOf(next) : undefined);
+  const blueprint = section('## 1. Чертёж проекта', '## 2.');
+  // A missing root is refused (bootstrap_root_missing): a new project's folder is created first.
+  assert.match(blueprint, /bootstrap_root_missing/);
+  assert.match(blueprint, /создай/i);
+  // Data refusals of the factory carry the Kodo code in result.reason (result.code is project_invalid).
+  assert.match(blueprint, /bootstrap_context_unsafe[^\n]*result\.reason/);
+  // kodo.config.json (client, commands.test) is created and committed before apply-spec.
+  const config = blueprint.indexOf('kodo.config.json');
+  assert.ok(config >= 0 && config < blueprint.indexOf('apply-spec --root'), 'config before registration');
+  for (const text of ['commands.test', 'claude-code', 'templates/kodo.config.json'])
+    assert.ok(blueprint.includes(text), text);
+  assert.match(blueprint, /reviewer[^\n]*гейт/);
+  const feature = section('## Новая фича в готовый проект', '## Правила');
+  assert.match(feature, /interfaceRefs: \[\]/);
+  assert.match(feature, /project_append_blocked/);
 });
