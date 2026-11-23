@@ -320,9 +320,12 @@ const PROBE = {
 const LABELS = { milestone: 'майлстоун', epic: 'эпик', task: 'задача' };
 const nameOf = value => (typeof value === 'string' && /^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(value) ? value : null);
 const children = ['milestones', 'epics', 'tasks'];
+// The longest list a ProjectSpec accepts (project-contracts MAX_ITEMS): longer is project_limit.
+const LIST_LIMIT = 1000;
 
-// A minimal valid spec around one record of `kind`; its parent and child are probe records.
-// Known dependencies are checked across records, so a task is probed without them.
+// A minimal valid spec around one record of `kind`; its parent and child are probe records. The
+// task keeps its own `dependsOn` (its shape and repeats are its own) with a probe task for each
+// other id it names; which of them exist is checked across records.
 function probeSpec(kind, record, execution) {
   const milestone =
     kind === 'milestone' ? record : { ...PROBE.milestone, ...(kind === 'epic' ? { id: record.milestoneId } : {}) };
@@ -330,42 +333,48 @@ function probeSpec(kind, record, execution) {
     kind === 'epic'
       ? record
       : { ...PROBE.epic, milestoneId: milestone.id, ...(kind === 'task' ? { id: record.epicId } : {}) };
-  const strings = Array.isArray(record.dependsOn) && record.dependsOn.every(item => typeof item === 'string');
-  const task =
-    kind === 'task' ? { ...record, dependsOn: strings ? [] : record.dependsOn } : { ...PROBE.task, epicId: epic.id };
+  const task = kind === 'task' ? record : { ...PROBE.task, epicId: epic.id };
+  const named = kind === 'task' && Array.isArray(record.dependsOn) ? record.dependsOn : [];
+  const others = [...new Set(named.filter(id => typeof id === 'string' && id !== record.id))];
+  const stubs = others.map((id, index) => ({ ...PROBE.task, id, epicId: epic.id, writePaths: [`probe-${index}`] }));
   return {
     ...(kind === 'spec' ? record : PROBE.spec),
     execution,
     milestones: [milestone],
     epics: [epic],
-    tasks: [task],
+    tasks: [task, ...stubs],
   };
 }
 
+// The field of one record the strict parser refuses: `{detail, field?}`, or null.
 function fieldOf(kind, record, accepts, execution) {
   const sample = PROBE[kind];
-  if (!isPlain(record)) return 'не объект';
+  if (!isPlain(record)) return { detail: 'не объект' };
   const unknown = Object.keys(record).find(key => !Object.hasOwn(sample, key));
-  if (unknown !== undefined) return `лишнее поле ${nameOf(unknown) ?? '(имя вне формата)'}`;
+  if (unknown !== undefined)
+    return { detail: `лишнее поле ${nameOf(unknown) ?? '(имя вне формата)'}`, field: nameOf(unknown) };
   const missing = Object.keys(sample).find(key => !Object.hasOwn(record, key));
-  if (missing) return `нет поля ${missing}`;
+  if (missing) return { detail: `нет поля ${missing}`, field: missing };
   const field = Object.keys(sample).find(
     key => !accepts(probeSpec(kind, { ...sample, [key]: record[key] }, execution)),
   );
-  return field ? `поле ${field}` : null;
+  return field ? { detail: `поле ${field}`, field } : null;
 }
+
+const pathOf = (base, field) => (field ? (base ? `${base}.${field}` : field) : base);
 
 // Links between records (parents, dependencies, unique ids) that each record alone cannot show.
 function referenceOf(spec) {
+  const place = (key, index, record, detail, field) => ({
+    where: `${LABELS[key.slice(0, -1)]} ${nameOf(record.id) ?? ''}`.trim(),
+    detail,
+    path: `${key}[${index}].${field}`,
+    ...(key === 'tasks' && nameOf(record.id) ? { taskId: record.id } : {}),
+  });
   for (const key of children) {
     const seen = new Set();
-    for (const record of spec[key]) {
-      if (seen.has(record.id))
-        return {
-          where: `${LABELS[key.slice(0, -1)]} ${nameOf(record.id) ?? ''}`.trim(),
-          detail: 'повторяющийся id',
-          ...(key === 'tasks' && nameOf(record.id) ? { taskId: record.id } : {}),
-        };
+    for (const [index, record] of spec[key].entries()) {
+      if (seen.has(record.id)) return place(key, index, record, 'повторяющийся id', 'id');
       seen.add(record.id);
     }
   }
@@ -373,36 +382,47 @@ function referenceOf(spec) {
   const milestones = ids('milestones'),
     epics = ids('epics'),
     tasks = ids('tasks');
-  const named = (kind, record, field, label, value) => ({
-    where: `${LABELS[kind]} ${nameOf(record.id) ?? ''}`.trim(),
-    detail: `поле ${field} (нет ${label}${nameOf(value) ? ` ${value}` : ''})`,
-    ...(kind === 'task' && nameOf(record.id) ? { taskId: record.id } : {}),
-  });
-  for (const epic of spec.epics)
-    if (!milestones.has(epic.milestoneId)) return named('epic', epic, 'milestoneId', 'майлстоуна', epic.milestoneId);
-  for (const task of spec.tasks) {
-    if (!epics.has(task.epicId)) return named('task', task, 'epicId', 'эпика', task.epicId);
+  const missing = (label, value) => `(нет ${label}${nameOf(value) ? ` ${value}` : ''})`;
+  for (const [index, epic] of spec.epics.entries())
+    if (!milestones.has(epic.milestoneId))
+      return place('epics', index, epic, `поле milestoneId ${missing('майлстоуна', epic.milestoneId)}`, 'milestoneId');
+  for (const [index, task] of spec.tasks.entries()) {
+    if (!epics.has(task.epicId))
+      return place('tasks', index, task, `поле epicId ${missing('эпика', task.epicId)}`, 'epicId');
     const ghost = task.dependsOn.find(id => !tasks.has(id));
-    if (ghost !== undefined) return named('task', task, 'dependsOn', 'задачи', ghost);
+    if (ghost !== undefined)
+      return place('tasks', index, task, `поле dependsOn ${missing('задачи', ghost)}`, 'dependsOn');
   }
   return null;
 }
 
-// Where the strict parser refused `spec`: `{where, detail, taskId?}` or null when not found.
+// A list longer than the parser accepts, found without parsing any record.
+function overflowOf(spec) {
+  const key = children.find(name => Array.isArray(spec[name]) && spec[name].length > LIST_LIMIT);
+  return key ? { where: 'spec.json', detail: `поле ${key} (больше ${LIST_LIMIT} записей)`, path: key } : null;
+}
+
+// Where the strict parser refused `spec`: `{where, detail, path, taskId?}` or null when not found.
 function locateSpecError(spec, execution, accepts) {
-  if (!accepts(probeSpec('spec', PROBE.spec, execution))) return { where: 'spec.json', detail: 'поле execution' };
+  if (!accepts(probeSpec('spec', PROBE.spec, execution)))
+    return { where: 'spec.json', detail: 'поле execution', path: 'execution' };
   const missing = children.find(key => !Array.isArray(spec[key]));
-  if (missing) return { where: 'spec.json', detail: `поле ${missing}` };
+  if (missing) return { where: 'spec.json', detail: `поле ${missing}`, path: missing };
   const header = Object.fromEntries(
     Object.entries(spec).filter(([key]) => !children.includes(key) && key !== 'execution'),
   );
-  const records = [['spec', header], ...children.flatMap(key => spec[key].map(record => [key.slice(0, -1), record]))];
-  for (const [kind, record] of records) {
+  const records = [
+    ['spec', null, header],
+    ...children.flatMap(key => spec[key].map((record, index) => [key.slice(0, -1), `${key}[${index}]`, record])),
+  ];
+  for (const [kind, base, record] of records) {
     if (isPlain(record) && accepts(probeSpec(kind, record, execution))) continue;
     const id = kind === 'spec' ? null : nameOf(record?.id);
+    const field = fieldOf(kind, record, accepts, execution);
     return {
       where: kind === 'spec' ? 'spec.json' : `${LABELS[kind]} ${id ?? '(id вне формата)'}`,
-      detail: fieldOf(kind === 'spec' ? 'spec' : kind, record, accepts, execution),
+      detail: field?.detail ?? null,
+      path: pathOf(base, field?.field),
       ...(kind === 'task' && id ? { taskId: id } : {}),
     };
   }
@@ -422,7 +442,6 @@ function normalizeFactory(spec, { contracts, knownValues }) {
     return { spec: contracts.normalizeProjectSpec({ ...spec, execution }, { knownValues }), findings };
   } catch (error) {
     const code = errorCode(error);
-    // A refusal for a secret is not probed: only data that passed the safety check is named.
     const accepts = candidate => {
       try {
         contracts.normalizeProjectSpec(candidate, { knownValues });
@@ -431,19 +450,28 @@ function normalizeFactory(spec, { contracts, knownValues }) {
         return false;
       }
     };
+    // An overlong list is named without parsing a record. A refusal for a secret or a size limit is
+    // not probed: the safety scan may have stopped before the data a probe would name.
+    const cycle = { where: 'граф задач', detail: 'цикл в dependsOn', path: 'tasks[].dependsOn' };
+    /** @type {{ where: string, detail: string | null, path: string, taskId?: string } | null} */
     const place =
-      code === 'project_unsafe'
+      overflowOf(spec) ??
+      (['project_unsafe', 'project_limit'].includes(code)
         ? null
-        : (locateSpecError(spec, execution, accepts) ??
-          (code === 'project_dag' ? { where: 'граф задач', detail: 'цикл в dependsOn' } : null));
-    const where = place ? `: ${place.where}${place.detail ? `, ${place.detail}` : ''}` : '';
-    findings.push(
-      finding(
-        'blueprint_spec_invalid',
-        `ProjectSpec отклонён строгой проверкой (${code})${where}; см. docs/PROJECTS.md`,
-        place?.taskId ? [place.taskId] : undefined,
-      ),
-    );
+        : (locateSpecError(spec, execution, accepts) ?? (code === 'project_dag' ? cycle : null)));
+    const bare = `ProjectSpec отклонён строгой проверкой (${code}); см. docs/PROJECTS.md`;
+    const located =
+      place &&
+      `ProjectSpec отклонён строгой проверкой (${code}): ${place.where}${place.detail ? `, ${place.detail}` : ''}; путь ${place.path}; см. docs/PROJECTS.md`;
+    const taskIds = place?.taskId ? [place.taskId] : undefined;
+    // A located message that would name a known value falls back to the bare code.
+    let safe = Boolean(located);
+    try {
+      if (safe) contracts.assertDirectorSafe({ located, taskIds: taskIds ?? [] }, { knownValues });
+    } catch {
+      safe = false;
+    }
+    findings.push(finding('blueprint_spec_invalid', safe ? located : bare, safe ? taskIds : undefined));
     return { spec: null, findings };
   }
 }

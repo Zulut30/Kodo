@@ -12,7 +12,7 @@ import {
   lintFactorySpec,
   readBlueprint,
 } from '../runtime/project-blueprint.mjs';
-import { normalizeProjectSpec } from '../runtime/project-contracts.mjs';
+import * as projectContracts from '../runtime/project-contracts.mjs';
 
 const fixtures = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures', 'blueprint');
 const codes = result => result.findings.map(item => item.code);
@@ -84,7 +84,7 @@ test('valid blueprint compiles into a strict ProjectSpec with wave execution and
     sha256: result.interfaces.find(item => item.module === 'storage').sha256,
   });
   // The compiled spec, `execution` included, is accepted by the strict parser as is.
-  assert.deepEqual(normalizeProjectSpec(result.spec, { knownValues: [] }), result.spec);
+  assert.deepEqual(projectContracts.normalizeProjectSpec(result.spec, { knownValues: [] }), result.spec);
   assert.deepEqual(await tree(root), before, 'compile writes nothing');
   const again = await compileBlueprint(root);
   assert.deepEqual(again, result, 'deterministic');
@@ -285,7 +285,7 @@ test('execution goes through the strict ProjectSpec parser: watchdog is kept, an
   const result = await compileBlueprint(kept.root);
   assert.deepEqual(result.findings, []);
   assert.deepEqual(result.spec.execution, { cadence: 'wave', integration: 'branch', watchdog });
-  assert.deepEqual(normalizeProjectSpec(result.spec, { knownValues: [] }), result.spec);
+  assert.deepEqual(projectContracts.normalizeProjectSpec(result.spec, { knownValues: [] }), result.spec);
   const partial = await blueprint(t, {
     mutate(spec) {
       spec.execution = { cadence: 'wave' };
@@ -348,7 +348,7 @@ test('bindInterfaceEvidence turns blueprint interfaces into immutable evidence r
   ]);
   for (const item of bound.spec.tasks)
     for (const ref of item.interfaceRefs) assert.ok(bound.interfaces.some(row => row.sha256 === ref.sha256));
-  assert.deepEqual(normalizeProjectSpec(bound.spec, { knownValues: [] }), bound.spec);
+  assert.deepEqual(projectContracts.normalizeProjectSpec(bound.spec, { knownValues: [] }), bound.spec);
   assert.equal(task(compiled.spec, 'storage-module').interfaceRefs[0].path, path.join(dir, 'interfaces', 'storage.md'));
 
   // The interface changed between compile and binding: nothing is persisted.
@@ -365,41 +365,109 @@ test('bindInterfaceEvidence turns blueprint interfaces into immutable evidence r
 
 test('blueprint_spec_invalid names the record and the field the strict parser rejects', async t => {
   // Audit finding 8d: the finding quoted only the parser code, so the model could not find its mistake.
+  // Each case: change, message, task ids, path of the strict validator.
   const cases = [
-    [spec => (task(spec, 'api-module').extra = true), /задача api-module, лишнее поле extra/, ['api-module']],
-    [spec => (task(spec, 'web-module').priority = 'high'), /задача web-module, поле priority/, ['web-module']],
-    [spec => delete task(spec, 'scaffold').risk, /задача scaffold, нет поля risk/, ['scaffold']],
+    [
+      spec => (task(spec, 'api-module').extra = true),
+      /задача api-module, лишнее поле extra/,
+      ['api-module'],
+      'tasks[3].extra',
+    ],
+    [
+      spec => (task(spec, 'web-module').priority = 'high'),
+      /задача web-module, поле priority/,
+      ['web-module'],
+      'tasks[4].priority',
+    ],
+    [spec => delete task(spec, 'scaffold').risk, /задача scaffold, нет поля risk/, ['scaffold'], 'tasks[0].risk'],
     [
       spec => (task(spec, 'storage-module').writePaths = ['../x']),
       /задача storage-module, поле writePaths/,
       ['storage-module'],
+      'tasks[2].writePaths',
     ],
     [
       spec => (task(spec, 'api-module').dependsOn = ['ghost']),
       /задача api-module, поле dependsOn \(нет задачи ghost\)/,
       ['api-module'],
+      'tasks[3].dependsOn',
+    ],
+    // Review finding (minor): a repeated existing id in dependsOn was not located.
+    [
+      spec => (task(spec, 'api-module').dependsOn = ['test-bench', 'test-bench']),
+      /задача api-module, поле dependsOn/,
+      ['api-module'],
+      'tasks[3].dependsOn',
     ],
     [
       spec => (task(spec, 'api-module').epicId = 'ghost'),
       /задача api-module, поле epicId \(нет эпика ghost\)/,
       ['api-module'],
+      'tasks[3].epicId',
     ],
-    [spec => (spec.epics[1].title = ''), /эпик storage, поле title/],
-    [spec => (spec.milestones[0].releaseRequired = 'no'), /майлстоун foundation, поле releaseRequired/],
-    [spec => (spec.title = 42), /spec\.json, поле title/],
+    [spec => (spec.epics[1].title = ''), /эпик storage, поле title/, undefined, 'epics[1].title'],
+    [
+      spec => (spec.milestones[0].releaseRequired = 'no'),
+      /майлстоун foundation, поле releaseRequired/,
+      undefined,
+      'milestones[0].releaseRequired',
+    ],
+    [spec => (spec.title = 42), /spec\.json, поле title/, undefined, 'title'],
     [
       spec => (spec.execution = { cadence: 'wave', integration: 'branch', watchdog: { stalledRounds: 9 } }),
       /spec\.json, поле execution/,
+      undefined,
+      'execution',
     ],
   ];
-  for (const [mutate, pattern, taskIds] of cases) {
+  for (const [mutate, pattern, taskIds, at] of cases) {
     const { root } = await blueprint(t, { mutate });
     const result = await compileBlueprint(root);
     assert.deepEqual(codes(result), ['blueprint_spec_invalid'], pattern.source);
     assert.match(result.findings[0].message, pattern);
+    assert.ok(result.findings[0].message.includes(`; путь ${at};`), result.findings[0].message);
     assert.match(result.findings[0].message, /\(project_[a-z_]+\)/, 'the parser code stays named');
     assert.deepEqual(result.findings[0].taskIds, taskIds, pattern.source);
   }
+});
+
+test('blueprint_spec_invalid checks collection limits before any probe and never names unsafe data', async t => {
+  // Review finding (minor): 1001 tasks cost 1011 strict parses before the project_limit answer, and a
+  // probe after a limit refusal could name data the stopped safety scan never reached.
+  const { dir } = await blueprint(t);
+  const base = JSON.parse(await readFile(path.join(dir, 'spec.json'), 'utf8'));
+  for (const row of base.tasks) row.interfaceRefs = [];
+  let parses = 0;
+  const counting = {
+    ...projectContracts,
+    normalizeProjectSpec: (value, options) => {
+      parses++;
+      return projectContracts.normalizeProjectSpec(value, options);
+    },
+  };
+  const many = structuredClone(base);
+  many.tasks = Array.from({ length: 1001 }, (_, index) => ({
+    ...base.tasks[0],
+    id: `bulk-${index}`,
+    writePaths: [`bulk/${index}`],
+  }));
+  const limited = byCode(lintFactorySpec(many, { contracts: counting }), 'blueprint_spec_invalid');
+  assert.match(limited.message, /\(project_limit\): spec\.json, поле tasks \(больше 1000 записей\); путь tasks;/);
+  assert.equal(parses, 1, 'only the strict parse itself');
+
+  // A parser that stopped before scanning everything: the located message is checked against the
+  // known values and falls back to the bare code when it would name one.
+  const secret = 'tok-owned-secret-value';
+  const blind = {
+    ...projectContracts,
+    normalizeProjectSpec: value => projectContracts.normalizeProjectSpec(value, { knownValues: [] }),
+  };
+  const named = structuredClone(base);
+  named.tasks[0][secret] = true;
+  const guarded = byCode(lintFactorySpec(named, { contracts: blind, knownValues: [secret] }), 'blueprint_spec_invalid');
+  assert.ok(!guarded.message.includes(secret), guarded.message);
+  assert.equal(guarded.taskIds, undefined);
+  assert.match(guarded.message, /^ProjectSpec отклонён строгой проверкой \(project_schema\); см\./);
 });
 
 test('roles, strict schema and root binding are enforced', async t => {

@@ -19,6 +19,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
+import { stat } from 'node:fs/promises';
 import { execute } from './command.mjs';
 import { git, makeWorktree, plannedWorktreeHome } from './workspace.mjs';
 import { scopesOverlap } from './contracts.mjs';
@@ -357,11 +358,14 @@ async function reserveSelected(state, limit, ports) {
   const remaining = limit - state.briefs.length;
   if (remaining <= 0) return;
   const W = wavePorts(ports, ['selectWave']);
-  // Like drain: a task whose interface proofs do not verify is never selected.
+  // Like drain: a task whose interface proofs do not verify is never selected. The rows are kept
+  // for the explanation of the same revision; a reservation still checks its proofs right before.
+  const availability = await waves.waveAvailability(state.ctx, state.snapshot);
+  state.availability = { revision: state.snapshot.revision, rows: availability };
   const selected = W.selectWave(state.snapshot, {
     limit: remaining,
     inFlight: [...state.inFlight],
-    availability: await waves.waveAvailability(state.ctx, state.snapshot),
+    availability,
     now: (state.ctx.clock ?? (() => new Date().toISOString()))(),
   });
   need(Array.isArray(selected), 'wave_ports_invalid');
@@ -380,38 +384,50 @@ async function reserveSelected(state, limit, ports) {
   }
 }
 
-// Planner reasons the host can act on, in next-wave's codes. Waiting for a dependency, for work in
+// Planner reasons of a task the host can act on, in next-wave's codes and in this order of
+// preference (a failed task with a failed attempt is retried). Waiting for a dependency, for work in
 // flight or for the wave limit is not a blocker.
-const actionable = {
-  risk_approval_required: 'project_risk_unapproved',
-  retry_required: 'project_retry_required',
-  attempt_revision_mismatch: 'project_retry_required',
-  interfaces_unverified: 'project_interface_unverified',
-  split_required: 'project_split_required',
-};
+const actionable = [
+  ['retry_required', 'project_retry_required'],
+  ['attempt_revision_mismatch', 'project_retry_required'],
+  ['risk_approval_required', 'project_risk_unapproved'],
+  ['interfaces_unverified', 'project_interface_unverified'],
+  ['split_required', 'project_split_required'],
+  ['task_failed', 'project_task_failed'],
+  ['task_blocked', 'project_task_blocked'],
+];
+// A stopped epic or milestone holds every open task inside it: one row names it.
+const stoppedContainer = /^(epic|milestone)_(blocked|failed|cancelled)$/;
+const openTask = task => !['integrated', 'cancelled', ...settled].includes(task.status);
 
 // Why open tasks are not handed out and which gates hold the project, so that a short or empty
 // wave always names its cause. Read-only: nothing is reserved or run here.
 async function explainWave(state, snapshot) {
   const { ctx, C } = state;
+  const availability =
+    state.availability?.revision === snapshot.revision
+      ? state.availability.rows
+      : await waves.waveAvailability(ctx, snapshot);
   const horizon = planProjectHorizon(
-    {
-      snapshot,
-      limit: 24,
-      availability: await waves.waveAvailability(ctx, snapshot),
-      now: (ctx.clock ?? (() => new Date().toISOString()))(),
-    },
+    { snapshot, limit: 24, availability, now: (ctx.clock ?? (() => new Date().toISOString()))() },
     { contracts: C, knownValues: state.options.knownValues },
   );
   const named = new Set([...state.blocked.map(row => row.taskId), ...state.briefs.map(row => row.taskId)]);
+  const containers = [];
   for (const row of horizon.blocked) {
     const task = snapshot.tasks.find(item => item.id === row.taskId);
-    if (!task || named.has(task.id) || task.status === 'cancelled' || settled.has(task.status)) continue;
-    if (task.status === 'integrated' || inFlightStates.has(currentOf(snapshot, task.id)?.status)) continue;
-    const reason = row.reasons.find(item => Object.hasOwn(actionable, item));
-    if (reason) state.blocked.push({ taskId: task.id, code: actionable[reason] });
+    if (!task || !openTask(task)) continue;
+    for (const reason of row.reasons) {
+      const [, kind, status] = stoppedContainer.exec(reason) ?? [];
+      const id = kind === 'epic' ? task.epicId : snapshot.epics.find(epic => epic.id === task.epicId)?.milestoneId;
+      if (kind && !containers.some(item => item.kind === kind && item.id === id))
+        containers.push({ code: `project_${kind}_${status}`, kind, id });
+    }
+    if (named.has(task.id) || inFlightStates.has(currentOf(snapshot, task.id)?.status)) continue;
+    const found = actionable.find(([reason]) => row.reasons.includes(reason));
+    if (found) state.blocked.push({ taskId: task.id, code: found[1] });
   }
-  state.blocked.push(...waves.gateHolds({ store: storeOf(ctx) }, snapshot));
+  state.blocked.push(...containers, ...waves.gateHolds({ store: storeOf(ctx) }, snapshot));
 }
 
 /**
@@ -432,13 +448,10 @@ export async function nextWave(ctx, input) {
     store = storeOf(ctx);
   const options = { knownValues: known(ctx.engine) };
   C.assertDirectorSafe(cli, options);
-  // Every brief command names its worktree: the directory new Runs get (the Engine's own
-  // priority, KODO_WORKTREE_HOME first) is refused before the lease or any reservation.
-  const home = (ctx.engine.store ?? store)?.home;
-  if (typeof home === 'string') quotePath(await plannedWorktreeHome(home));
   const snapshot = await snapshotOf(ctx, projectId);
   need(C.isWaveProject(snapshot.project), 'wave_required');
-  // An accepted project has nothing left to hand out: its own code, never a pause or a stop.
+  // An accepted project has nothing left to hand out (and needs no worktree): its own code,
+  // never a pause or a stop.
   if (settled.has(snapshot.project.status)) {
     const done = {
       projectId,
@@ -452,6 +465,10 @@ export async function nextWave(ctx, input) {
     return done;
   }
   controlOf(snapshot);
+  // Every brief command names its worktree: the directory new Runs get (the Engine's own
+  // priority, KODO_WORKTREE_HOME first) is refused before the lease or any reservation.
+  const home = (ctx.engine.store ?? store)?.home;
+  if (typeof home === 'string') quotePath(await plannedWorktreeHome(home));
   const token = store.acquireLease(`project:${projectId}`, randomUUID(), { ttlMs: 60000, limit: 1 });
   need(token, 'busy');
   try {
@@ -552,6 +569,9 @@ async function inspectSubmission(engine, run, task, head) {
     allowFailure: true,
   });
   if (branch.code !== 0 || branch.stdout.trim() !== head) return problem('external_branch_mismatch');
+  // A deleted worktree directory: git cannot even start there (ENOENT), so it is checked first.
+  const directory = await stat(run.cwd).catch(() => null);
+  if (!directory?.isDirectory()) return problem('external_worktree_missing');
   const worktreeHead = await execute('git', ['rev-parse', 'HEAD'], { cwd: run.cwd, allowFailure: true });
   if (worktreeHead.code !== 0) return problem('external_worktree_missing');
   if (

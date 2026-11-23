@@ -857,7 +857,14 @@ test('project report reads wave gates from their gate Runs; only a current block
   );
   // A blocked gate a later gate of the same container replaced is history, not a blocker.
   assert.deepEqual(report.blockers, [
-    { taskId: null, runId: 'gate-run-3', code: 'repair_budget_exhausted', scope: 'gate', occurrences: 1 },
+    {
+      taskId: null,
+      runId: 'gate-run-3',
+      gateId: 'g-3',
+      code: 'repair_budget_exhausted',
+      scope: 'gate',
+      occurrences: 1,
+    },
   ]);
   assert.deepEqual(
     { gates: report.totals.gates.gates, runs: report.totals.gates.runs, sessions: report.totals.gates.sessions },
@@ -886,8 +893,35 @@ test('project report reads wave gates from their gate Runs; only a current block
     { now: NOW },
   );
   assert.deepEqual(halted.blockers, [
-    { taskId: null, runId: 'gate-run-5', code: 'quota', scope: 'gate', occurrences: 2 },
-    { taskId: null, runId: 'gate-run-6', code: 'gate_cancelled', scope: 'gate', occurrences: null },
+    { taskId: null, runId: 'gate-run-5', gateId: 'g-5', code: 'quota', scope: 'gate', occurrences: 2 },
+    { taskId: null, runId: 'gate-run-6', gateId: 'g-6', code: 'gate_cancelled', scope: 'gate', occurrences: null },
+  ]);
+});
+
+test('project report names a gate Run blocked by its acceptance with its gate and error code', () => {
+  // Review finding (major): a gate Run blocked after a failed acceptance has only `error.code`
+  // (no blocker record); the report showed `gate_blocked` and no gate id.
+  const run = finishedRun({
+    id: 'gate-run-7',
+    state: 'blocked',
+    error: { code: 'wave_gate_proof_missing', message: 'The acceptance proof is missing' },
+  });
+  const gates = [{ id: 'g-7', number: 1, runId: 'gate-run-7', containers: [{ kind: 'epic', id: 'core' }] }];
+  const report = buildProjectReport(
+    projectSnapshot([], [], { gates }),
+    new Map([['gate-run-7', run]]),
+    {},
+    { now: NOW },
+  );
+  assert.deepEqual(report.blockers, [
+    {
+      taskId: null,
+      runId: 'gate-run-7',
+      gateId: 'g-7',
+      code: 'wave_gate_proof_missing',
+      scope: 'gate',
+      occurrences: null,
+    },
   ]);
 });
 

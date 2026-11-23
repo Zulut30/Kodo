@@ -744,6 +744,45 @@ test(
 );
 
 test(
+  'A gate whose install is refused names its reserved Run, the install stage and the diagnosis',
+  { timeout: 300000 },
+  async t => {
+    // Review finding (minor): gate_invalid carried no runId, stage or diagnosis, although the
+    // reservation already names its Run.
+    const refusal = 'Некорректный гейт эпика: owned install refusal';
+    const f = await fixture(t, {
+      tasks: [task('alpha')],
+      wrapRepo: repo => ({
+        ...repo,
+        installGateRun: async () => {
+          throw Object.assign(new Error(refusal), { code: 'gate_invalid' });
+        },
+      }),
+    });
+    await assert.rejects(f.director.drain(f.id), { code: 'gate_invalid' });
+    const [gate] = f.repo.snapshot(f.id).gates;
+    assert.equal(gate.installed, false);
+    assert.equal(typeof gate.runId, 'string');
+    const result = await f.director.drain(f.id);
+    assert.equal(result.status, 'blocked', JSON.stringify(result));
+    assert.deepEqual(
+      result.blockers.filter(row => row.kind === 'epic'),
+      [
+        {
+          code: 'gate_invalid',
+          kind: 'epic',
+          id: 'e1',
+          gateId: gate.id,
+          runId: gate.runId,
+          stage: 'install',
+          message: refusal,
+        },
+      ],
+    );
+  },
+);
+
+test(
   'drain replaces a gate reservation whose install was interrupted and whose head went stale',
   { timeout: 300000 },
   async t => {

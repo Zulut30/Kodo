@@ -25,6 +25,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { execute } from './command.mjs';
 import { makeWorktree, worktreeHomeFor } from './workspace.mjs';
 import { scopesOverlap } from './contracts.mjs';
+import { redact } from './security.mjs';
 import * as projectContracts from './project-contracts.mjs';
 import { planProjectHorizon } from './project-planner.mjs';
 import {
@@ -604,7 +605,17 @@ async function installOrReplace(ctx, snapshot, gate, containers, out) {
   } catch (error) {
     if (error?.code === 'gate_head_stale') return reserveGate(ctx, snapshot, containers, false);
     if (error?.code !== 'gate_invalid') throw error;
-    out.blocked.push({ code: error.code, kind: containers[0].kind, id: containers[0].id, gateId: gate.id });
+    // No gate Run exists yet: the row names the reserved Run, the stage and the install's own
+    // diagnosis (the gate checks of wave-verifier name fields and task ids, never file contents).
+    out.blocked.push({
+      code: error.code,
+      kind: containers[0].kind,
+      id: containers[0].id,
+      gateId: gate.id,
+      ...(typeof gate.runId === 'string' ? { runId: gate.runId } : {}),
+      stage: 'install',
+      message: redact(String(error.message), ctx.engine.secrets ?? {}).slice(0, 500),
+    });
     return null;
   }
 }

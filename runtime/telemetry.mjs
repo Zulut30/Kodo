@@ -759,7 +759,9 @@ function gateBlockers(gates) {
     .map(gate => ({
       taskId: null,
       runId: gate.row.runId,
-      code: gate.report?.blocker?.code ?? `gate_${gate.row.status}`,
+      gateId: gate.row.id,
+      // A gate Run blocked after its acceptance failed has only an error code, no blocker record.
+      code: gate.report?.blocker?.code ?? code(gate.run?.error?.code, `gate_${gate.row.status}`),
       scope: 'gate',
       occurrences: gate.report?.blocker?.occurrences ?? null,
     }));
