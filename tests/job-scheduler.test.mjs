@@ -87,24 +87,31 @@ for (const workers of [1, 2, 4, 8])
     assert.equal(probe.integrated.length, 8);
   });
 
-test('Parallel independent jobs shorten wall time on a controlled fixture', { timeout: 30000 }, async t => {
-  const elapsed = {},
-    work = 120;
+test('Parallel independent jobs finish in two worker intervals instead of eight', async t => {
   for (const workers of [1, 4]) {
     const { jobs, run } = fixture(t);
     jobs.enqueue(
       Q,
       Array.from({ length: 8 }, (_, i) => spec(`j${i}`)),
     );
-    const started = performance.now();
-    // No heartbeats: the fixture measures scheduling, not SQLite commit latency.
-    await run({ execute: () => delay(work) }, { limits: { workers, pools: {} }, heartbeatMs: 3_600_000 });
-    elapsed[workers] = performance.now() - started;
+    // All workers started during one turn finish at the same simulated time.
+    let pending = [],
+      intervals = 0;
+    const execute = () =>
+      new Promise(resolve => {
+        pending.push(resolve);
+        if (pending.length === 1)
+          setImmediate(() => {
+            intervals++;
+            const batch = pending;
+            pending = [];
+            for (const done of batch) done();
+          });
+      });
+    const result = await run({ execute }, { limits: { workers, pools: {} } });
+    assert.deepEqual(result, { status: 'integrated', counts: { integrated: 8 } });
+    assert.equal(intervals, 8 / workers);
   }
-  // Sequential work is 8 x work and four slots need 2 x work. Store overhead is
-  // the same in both runs, so require at least half of the 6 x work saving.
-  assert.ok(elapsed[1] >= 8 * work, `sequential run took ${elapsed[1]} ms`);
-  assert.ok(elapsed[1] - elapsed[4] >= 3 * work, `4 slots: ${elapsed[4]} ms, 1 slot: ${elapsed[1]} ms`);
 });
 
 test('C waits for the integration of A while independent B runs alongside', async t => {

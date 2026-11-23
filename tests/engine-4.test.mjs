@@ -311,8 +311,28 @@ test('Engine prepares once and resumes a host plan after reopening state without
   const planFile = path.join(prepared.artifacts, 'host-plan.json');
   await writeFile(planFile, JSON.stringify(featurePlan()));
   fx.closeStore(firstStore);
-  const engine = new Engine({ store: fx.openStore(), ...services });
+  const store = fx.openStore();
+  // Another coordinator is registering a worktree in this repository.
+  const leaseName = 'worktree:add:' + (process.platform === 'win32' ? run.project.toLowerCase() : run.project);
+  const otherStore = fx.openStore();
+  const held = otherStore.acquireLease(leaseName, 'other-coordinator');
+  const registrations = git(fx.project, 'worktree', 'list', '--porcelain');
+  assert.ok(held);
+  const acquire = store.acquireLease.bind(store);
+  let contended = false;
+  t.mock.method(store, 'acquireLease', (name, ...args) => {
+    const token = acquire(name, ...args);
+    if (name === leaseName && !token && !contended) {
+      contended = true;
+      assert.equal(services.calls.worker.length, 0);
+      assert.equal(git(fx.project, 'worktree', 'list', '--porcelain'), registrations);
+      otherStore.releaseLease(held);
+    }
+    return token;
+  });
+  const engine = new Engine({ store, ...services });
   const result = await engine.run(run.id, { planFile });
+  assert.ok(contended, 'node worktree creation must wait for repository registration');
   assert.equal(result.state, 'succeeded', result.error?.message);
   assert.equal(result.planSource, 'host');
   assert.equal(services.calls.planner, 0);

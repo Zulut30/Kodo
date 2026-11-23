@@ -197,7 +197,15 @@ export class EngineExecution extends EnginePlanning {
         node.cwd = path.join(run.worktreeRoot || path.dirname(run.cwd), task.id);
         node.branch = `kodo/${run.id}-${task.id}`;
       }
-      await makeWorktree(run.project, node.cwd, node.branch, node.baseSha);
+      // Concurrent Git registrations can observe a half-written sibling commondir.
+      const project = process.platform === 'win32' ? run.project.toLowerCase() : run.project;
+      await this.withLease(
+        run,
+        `worktree:add:${project}`,
+        1,
+        () => makeWorktree(run.project, node.cwd, node.branch, node.baseSha),
+        signal,
+      );
       const integratedHead = await git(run.cwd, ['rev-parse', 'HEAD']);
       await this.refreshNode(run, task, node, integratedHead, selected, signal);
       await this.setup(node.cwd, run, signal);

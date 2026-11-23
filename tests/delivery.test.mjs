@@ -852,10 +852,26 @@ for (const mode of ['timeout', 'abort', 'output-limit']) {
       canary.once('error', reject);
     });
     const controller = new AbortController();
+    const timeoutMs = mode === 'timeout' ? 20 : 10000;
+    if (mode === 'timeout') {
+      // Deliver the command's deadline only after all three PIDs are observable.
+      // Only this timer is gated. Teardown helpers keep their real watchdogs.
+      const schedule = globalThis.setTimeout;
+      t.mock.method(
+        globalThis,
+        'setTimeout',
+        (callback, ms) => {
+          assert.equal(ms, timeoutMs);
+          const fire = () => callback();
+          return schedule(() => tree.ready.then(fire, fire), ms);
+        },
+        { times: 1 },
+      );
+    }
     const outcome = execute(process.execPath, [tree.filename, '0', tree.directory], {
       cwd: tree.directory,
       signal: controller.signal,
-      timeoutMs: mode === 'timeout' ? 4000 : 10000,
+      timeoutMs,
       maxOutputBytes: 1024,
     }).then(
       value => ({ value }),

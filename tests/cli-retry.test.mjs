@@ -31,11 +31,20 @@ test('CLI automatic quota retries preserve host preparation and explicit plan fi
       await writeFile(
         hook,
         `import assert from 'node:assert/strict';
+import {mock} from 'node:test';
 import {Engine} from ${JSON.stringify(pathToFileURL(path.join(root, 'runtime/engine.mjs')).href)};
 let calls=0;
 Engine.prototype.run=async function(id,options){
  calls++;
- if(calls===1) return this.store.updateRun(id,{state:'waiting_limits',error:{code:'quota',retryAt:new Date(Date.now()+80).toISOString()}});
+ if(calls===1) {
+   mock.timers.enable({apis:['Date','setTimeout'],now:Date.now()});
+   const retryAt=new Date(Date.now()+80).toISOString();
+   const paused=this.store.updateRun(id,{state:'waiting_limits',error:{code:'quota',retryAt}});
+   setImmediate(()=>mock.timers.tick(80));
+   return paused;
+ }
+ assert.equal(this.store.getRun(id).nextRetryAt, new Date(Date.now()).toISOString());
+ mock.timers.reset();
  assert.equal(calls,2);
  const expected=${JSON.stringify(expected)};
  for(const [key,value] of Object.entries(expected)) assert.equal(options[key],value,'automatic retry lost '+key);
@@ -67,6 +76,7 @@ Engine.prototype.run=async function(id,options){
           },
         },
       );
+      assert.ifError(result.error);
       assert.equal(result.status, 0, result.stderr);
       const value = JSON.parse(result.stdout);
       assert.equal(value.state, prepare ? 'awaiting_plan' : 'succeeded');
