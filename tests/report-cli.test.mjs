@@ -23,7 +23,8 @@ import { openJobStore } from '../runtime/job-store.mjs';
 import { openProjectStore } from '../runtime/project-store.mjs';
 import * as contracts from '../runtime/project-contracts.mjs';
 import { workerEnvironment } from '../runtime/security.mjs';
-import { reportCli } from '../runtime/report-cli.mjs';
+import { humanProject, reportCli } from '../runtime/report-cli.mjs';
+import { buildProjectReport } from '../runtime/telemetry.mjs';
 import {
   createPrivateDirectory,
   trustedRoot,
@@ -334,8 +335,41 @@ test('project report and the project alias read the snapshot and attempt Runs', 
   assert.match(human.output, /task-0/);
   assert.match(human.output, /Waits: queue .*CI/);
   assert.match(human.output, /task-0 #1 blocked: .*failures quota@run, quota@session:developer/);
+  // Epic progress is printed with the task rows: the text report shows what the JSON has.
+  assert.match(human.output, /^Epics: [a-z_]+ 1$/m);
+  assert.doesNotMatch(human.output, /^Gates:/m, 'a legacy project has no wave gates');
 
   assert.deepEqual(await inventory(f.home), before);
+});
+
+test('the text project report prints epic progress and wave gates with their gate Runs', () => {
+  const snapshot = {
+    schemaVersion: 1,
+    project: { projectId: 'p-1', status: 'running', paused: false, revision: 3 },
+    revision: 3,
+    milestones: [{ id: 'm', status: 'running' }],
+    epics: [
+      { id: 'core', status: 'accepted' },
+      { id: 'cli', status: 'running' },
+      { id: 'docs', status: 'running' },
+    ],
+    tasks: [],
+    currentAttempts: [],
+    riskApprovals: [],
+    completeness: {},
+    gates: [
+      { id: 'gate-1', number: 1, runId: 'gate-run-1', containers: [{ kind: 'epic', id: 'core' }] },
+      { id: 'gate-2', number: 2, runId: null, containers: [{ kind: 'epic', id: 'cli' }] },
+    ],
+  };
+  const runs = { 'gate-run-1': { id: 'gate-run-1', state: 'blocked', sessionAttempts: [] } };
+  const text = humanProject(buildProjectReport(snapshot, runs, {}, { now: Date.now() }));
+  assert.match(text, /^Epics: accepted 1, running 2$/m);
+  assert.match(text, /^Gates: 2$/m);
+  assert.match(text, /^  gate-1 blocked epic:core run gate-run-1$/m);
+  assert.match(text, /^  gate-2 unknown epic:cli run none$/m);
+  const none = humanProject(buildProjectReport({ ...snapshot, gates: [] }, {}, {}, { now: Date.now() }));
+  assert.match(none, /^Gates: none$/m);
 });
 
 test('invalid arguments fail before credentials or state are opened', async t => {

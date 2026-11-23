@@ -1041,22 +1041,28 @@ export function gateBindingFor(input, options = { knownValues: [] }) {
   );
 }
 
+/** Whether appendMilestone may reopen the project of a snapshot: a closed (accepted/released),
+ * unpaused wave project with a complete snapshot, settled current attempts and reopens left.
+ * Shared by assertProjectReopen and the early check of `kodo project extend`. */
+export function projectReopenable(s) {
+  const p = s.project;
+  return (
+    isWaveProject(p) &&
+    ['accepted', 'released'].includes(p.status) &&
+    !p.paused &&
+    Object.values(s.completeness).every(c => c.complete) &&
+    s.currentAttempts.every(r => settledStates.includes(r.status)) &&
+    (p.reopened?.length ?? 0) < MAX_REOPENED
+  );
+}
+
 /** Pure appendMilestone check: a closed wave project accepts one new milestone
  * whose epics/tasks are new and whose dependencies are new or closed tasks. */
 export function assertProjectReopen(input) {
   assertDirectorSafe(input, { knownValues: [] });
   const { snapshot: s, action: a } = object(input, { snapshot, action });
   if (a.op !== 'appendMilestone') fail();
-  const p = s.project;
-  if (
-    !isWaveProject(p) ||
-    !['accepted', 'released'].includes(p.status) ||
-    p.paused ||
-    Object.values(s.completeness).some(c => !c.complete) ||
-    s.currentAttempts.some(r => !settledStates.includes(r.status)) ||
-    (p.reopened?.length ?? 0) >= MAX_REOPENED
-  )
-    fail('project_append_blocked');
+  if (!projectReopenable(s)) fail('project_append_blocked');
   const taken = key => new Set(s[key].map(r => r.id));
   const [milestones, epics, tasks] = ['milestones', 'epics', 'tasks'].map(taken);
   if (milestones.has(a.milestone.id) || a.epics.some(e => epics.has(e.id)) || a.tasks.some(t => tasks.has(t.id)))

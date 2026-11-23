@@ -203,7 +203,7 @@ const milestone = (extra = {}) => ({
 });
 
 /** An accepted wave project, staged through real forward transitions. */
-async function acceptedProject(f) {
+async function acceptedProject(f, task = {}) {
   const root = await f.root();
   const { repo } = await f.direct();
   const command = (projectId, action) => ({
@@ -227,7 +227,7 @@ async function acceptedProject(f) {
     execution: { ...wave },
     milestones: [{ id: 'm', title: 'First milestone', acceptance: [proof], releaseRequired: false }],
     epics: [{ id: 'e', milestoneId: 'm', title: 'First epic', acceptance: [proof] }],
-    tasks: [taskSpec('a')],
+    tasks: [taskSpec('a', task)],
   };
   const { projectId } = await repo.apply(command(null, { op: 'create', spec }));
   const drive = async (kind, id, states) => {
@@ -338,8 +338,23 @@ test('bootstrap --prepare writes the context bundle only to KODO_HOME', async t 
     'templates/PROJECT.md',
     'templates/interfaces/module.md',
     'templates/spec.json',
+    'templates/kodo.config.json',
   ]);
   assert.match(await readFile(path.join(bundle.dir, 'context.md'), 'utf8'), /Сервис заметок с поиском/);
+  // The verification policy of every wave comes from the committed kodo.config.json: it is created
+  // and committed (client, commands.test) before apply-spec registers the project.
+  const config = report.result.next.findIndex(line => line.includes('kodo.config.json'));
+  const register = report.result.next.findIndex(line => line.includes('project apply-spec --root'));
+  assert.ok(config >= 0 && config < register, report.result.next.join('\n'));
+  for (const text of [
+    'templates',
+    'проверь существующий',
+    'client',
+    'commands.test',
+    'закоммить',
+    'blueprint_config_missing',
+  ])
+    assert.ok(report.result.next[config].includes(text), text);
   assert.equal(report.result.summary.root, root);
   assert.equal(report.result.blueprint, path.join(root, '.kodo', 'blueprint'));
   // The hints call the CLI that issued them, by its absolute entry.
@@ -392,6 +407,16 @@ test('bootstrap runs one native session through the Engine provider and compiles
   );
   assert.ok(report.result.next.some(line => line.includes('apply-spec')));
   assert.equal((await compileBlueprint(root)).ok, true);
+  // The template of the coordinator's config names the client the session ran with.
+  const template = path.join(
+    await realpath(f.home),
+    'bootstrap',
+    report.result.bundle.id,
+    'templates',
+    'kodo.config.json',
+  );
+  assert.equal(JSON.parse(await readFile(template, 'utf8')).client, 'claude-code');
+  assert.ok(report.result.next.some(line => line.includes('kodo.config.json') && line.includes(template)));
 
   const empty = await f.root();
   const silent = { runSession: async () => ({ output: { status: 'blocked', summary: 'Неясно' } }) };
@@ -756,4 +781,216 @@ test('extend --prepare checks the milestone file of its bundle before creating t
     assert.equal(result.report.result.reason, 'project_path_unsafe');
     assert.deepEqual(await readdir(target), [], 'no bundle is written, a repeat adds none');
   }
+});
+
+test('extend refuses a project that is not an accepted wave project before any bundle or session', async t => {
+  const f = await fixture(t);
+  const root = await f.root();
+  await writeBlueprint(root);
+  const created = await f.run(['apply-spec', '--root', root]);
+  assert.equal(created.exitCode, 0, JSON.stringify(created.report));
+  let sessions = 0;
+  const provider = {
+    runSession: async () => {
+      sessions++;
+      throw Error('No session before the status check');
+    },
+  };
+  for (const args of [
+    ['extend', created.report.projectId, 'Теги', '--prepare'],
+    ['extend', created.report.projectId, 'Теги', '--client', 'codex'],
+  ]) {
+    const result = await f.run(args, { createEngine: fakeEngine(provider) });
+    assert.equal(result.exitCode, 2, JSON.stringify(result.report));
+    assert.deepEqual(result.report.result, {
+      status: 'blocked',
+      code: 'project_blocked',
+      reason: 'project_append_blocked',
+    });
+  }
+  assert.equal(sessions, 0);
+  assert.equal(existsSync(path.join(f.home, 'bootstrap')), false, 'no context bundle was written');
+});
+
+test('the director skill follows the factory contract for a new project and a new milestone', async () => {
+  const skill = await readFile(
+    fileURLToPath(new URL('../skills/kodo-project-director/SKILL.md', import.meta.url)),
+    'utf8',
+  );
+  const section = (title, next) => skill.slice(skill.indexOf(title), next ? skill.indexOf(next) : undefined);
+  const blueprint = section('## 1. Чертёж проекта', '## 2.');
+  // A missing root is refused (bootstrap_root_missing): a new project's folder is created first.
+  assert.match(blueprint, /bootstrap_root_missing/);
+  assert.match(blueprint, /создай/i);
+  // Data refusals of the factory carry the Kodo code in result.reason (result.code is project_invalid).
+  assert.match(blueprint, /bootstrap_context_unsafe[^\n]*result\.reason/);
+  // kodo.config.json (client, commands.test) is created and committed before apply-spec.
+  const config = blueprint.indexOf('kodo.config.json');
+  assert.ok(config >= 0 && config < blueprint.indexOf('apply-spec --root'), 'config before registration');
+  for (const text of ['commands.test', 'claude-code', 'templates/kodo.config.json', 'blueprint_config_missing'])
+    assert.ok(blueprint.includes(text), text);
+  assert.match(blueprint, /reviewer[^\n]*гейт/);
+  const feature = section('## Новая фича в готовый проект', '## Правила');
+  assert.match(feature, /interfaceRefs: \[\]/);
+  assert.match(feature, /project_append_blocked/);
+});
+
+test('a coordinator that runs only result.commands cannot register a project without a committed kodo.config.json', async t => {
+  const f = await fixture(t);
+  const bare = path.join(f.dir, 'bare');
+  await mkdir(bare);
+  const git = (...args) => execFileSync('git', args, { cwd: bare, env: f.env, windowsHide: true });
+  git('init', '-b', 'main');
+  git('config', 'user.name', 'Owned blueprint CLI');
+  git('config', 'user.email', 'blueprint-cli@example.invalid');
+  git('config', 'commit.gpgSign', 'false');
+  await writeFile(path.join(bare, 'README.md'), '# Заметки\n');
+  git('add', '.');
+  git('commit', '-m', 'Owned fixture');
+  const prepared = await f.run(['bootstrap', 'Сервис заметок', '--root', bare, '--prepare'], {
+    cli: `node "${cli}"`,
+  });
+  assert.equal(prepared.exitCode, 0, JSON.stringify(prepared.report));
+  await writeBlueprint(bare);
+  const env = { ...f.env };
+  const pathKey = Object.keys(env).find(key => key.toUpperCase() === 'PATH') ?? 'PATH';
+  env[pathKey] = [path.dirname(process.execPath), env[pathKey]].filter(Boolean).join(path.delimiter);
+  // The consumer executes the machine commands as is, in order, and reads only their JSON.
+  const consume = () =>
+    prepared.report.result.commands.map(item => {
+      const ran = spawnSync(item.command, {
+        shell: true,
+        cwd: bare,
+        env,
+        encoding: 'utf8',
+        timeout: 60000,
+        windowsHide: true,
+      });
+      return { status: ran.status, report: JSON.parse(ran.stdout) };
+    });
+  const [refused] = consume();
+  assert.equal(refused.status, 1, JSON.stringify(refused.report));
+  assert.equal(refused.report.result.code, 'blueprint_findings');
+  assert.deepEqual(
+    refused.report.result.findings.map(item => item.code),
+    ['blueprint_config_missing'],
+  );
+  assert.match(refused.report.result.findings[0].message, /templates\/kodo\.config\.json/);
+  assert.equal(existsSync(path.join(f.home, 'project-interfaces')), false, 'no evidence and no project');
+
+  // The committed config registers the project; the coordinator's file is kept as written.
+  const template = path.join(prepared.report.result.bundle.dir, 'templates', 'kodo.config.json');
+  const config = JSON.parse(await readFile(template, 'utf8'));
+  assert.deepEqual(config.commands.test, [], 'no manifest: the coordinator sets the command');
+  config.client = 'claude-code';
+  config.commands.test = [{ command: 'node', args: ['--test'] }];
+  const text = `${JSON.stringify(config, null, 2)}\n`;
+  await writeFile(path.join(bare, 'kodo.config.json'), text);
+  git('add', 'kodo.config.json');
+  git('commit', '-m', 'Kodo config');
+  const [created] = consume();
+  assert.equal(created.status, 0, JSON.stringify(created.report));
+  assert.equal(created.report.result.status, 'created');
+  assert.equal(await readFile(path.join(bare, 'kodo.config.json'), 'utf8'), text);
+});
+
+test('extend uses the reopen rule of append-milestone: a paused or unsettled accepted project is refused early', async t => {
+  const f = await fixture(t);
+  const accepted = await acceptedProject(f);
+  assert.equal(contracts.projectReopenable(accepted.snapshot), true);
+  const variants = {
+    legacy: s => delete s.project.execution,
+    running: s => (s.project.status = 'running'),
+    paused: s => (s.project.paused = true),
+    incomplete: s => (s.completeness.tasks = { ...s.completeness.tasks, complete: false }),
+    unsettled: s => (s.currentAttempts = s.currentAttempts.map(row => ({ ...row, status: 'running' }))),
+    reopened: s => (s.project.reopened = Array.from({ length: 100 }, () => ({}))),
+  };
+  assert.ok(accepted.snapshot.currentAttempts.length > 0);
+  for (const [name, change] of Object.entries(variants)) {
+    const snapshot = structuredClone(accepted.snapshot);
+    change(snapshot);
+    assert.equal(contracts.projectReopenable(snapshot), false, name);
+  }
+  await accepted.repo.apply({
+    schemaVersion: 1,
+    commandId: randomUUID(),
+    projectId: accepted.projectId,
+    expectedRevision: accepted.repo.snapshot(accepted.projectId).revision,
+    actor: 'owner',
+    reason: 'Pause the accepted project',
+    action: { op: 'setPaused', paused: true },
+  });
+  const result = await f.run(['extend', accepted.projectId, 'Теги', '--prepare']);
+  assert.equal(result.exitCode, 2, JSON.stringify(result.report));
+  assert.equal(result.report.result.reason, 'project_append_blocked');
+  assert.equal(existsSync(path.join(f.home, 'bootstrap')), false, 'no context bundle was written');
+});
+
+test('append-milestone keeps a bound interface Ref copied from the snapshot and refuses one whose evidence fails', async t => {
+  const f = await fixture(t);
+  const { store } = await f.direct();
+  const engine = new Engine({ store, secrets: {} });
+  const text = '# core\n';
+  const value = {
+    schemaVersion: 1,
+    module: 'core',
+    source: 'interfaces/core.md',
+    sha256: 'e'.repeat(64),
+    bytes: 7,
+    text,
+  };
+  const stored = await engine.withEvidenceBatch({ artifacts: path.join(f.home, 'project-interfaces') }, write =>
+    write('interface', value, { headSha: null }),
+  );
+  const bound = { kind: 'interface', runId: null, headSha: null, path: stored.path, sha256: stored.sha256 };
+  await engine.assertEvidence(bound);
+  const file = path.join(f.dir, 'milestone.json');
+
+  // The Ref of an accepted task, copied unchanged: appended, and the new task keeps it for its brief.
+  const valid = await acceptedProject(f, { interfaceRefs: [bound] });
+  const [copied] = valid.snapshot.tasks.find(task => task.id === 'a').interfaceRefs;
+  await writeFile(
+    file,
+    JSON.stringify(milestone({ tasks: [taskSpec('c', { epicId: 'e2', dependsOn: ['a'], interfaceRefs: [copied] })] })),
+  );
+  const appended = await f.run(['append-milestone', valid.projectId, '--file', file]);
+  assert.equal(appended.exitCode, 0, JSON.stringify(appended.report));
+  assert.equal(appended.report.result.status, 'appended');
+  assert.deepEqual(valid.repo.snapshot(valid.projectId).tasks.find(task => task.id === 'c').interfaceRefs, [bound]);
+
+  // A Ref of the snapshot whose evidence does not verify is not carried into new work.
+  const lost = {
+    ...bound,
+    path: path.join(path.dirname(bound.path), `interface-${'f'.repeat(64)}.json`),
+    sha256: 'f'.repeat(64),
+  };
+  const broken = await acceptedProject(f, { interfaceRefs: [lost] });
+  await writeFile(
+    file,
+    JSON.stringify(milestone({ tasks: [taskSpec('c', { epicId: 'e2', dependsOn: ['a'], interfaceRefs: [lost] })] })),
+  );
+  const refused = await f.run(['append-milestone', broken.projectId, '--file', file]);
+  assert.equal(refused.exitCode, 1, JSON.stringify(refused.report));
+  assert.deepEqual(codes(refused.report), ['milestone_interface_unbound']);
+  assert.deepEqual(refused.report.result.findings[0].taskIds, ['c']);
+  assert.equal(broken.repo.snapshot(broken.projectId).revision, broken.snapshot.revision);
+});
+
+test('apply-spec requires kodo.config.json to be a regular file of HEAD, not a directory', async t => {
+  const f = await fixture(t);
+  const root = path.join(f.dir, 'config-directory');
+  await mkdir(path.join(root, 'kodo.config.json'), { recursive: true });
+  await writeFile(path.join(root, 'kodo.config.json', 'settings.json'), '{}');
+  const git = (...args) => execFileSync('git', args, { cwd: root, env: f.env, windowsHide: true });
+  git('init', '-b', 'main');
+  git('config', 'user.name', 'Owned blueprint CLI');
+  git('config', 'user.email', 'blueprint-cli@example.invalid');
+  git('config', 'commit.gpgSign', 'false');
+  git('add', '.');
+  git('commit', '-m', 'A directory named like the config');
+  await writeBlueprint(root);
+  const result = await f.run(['apply-spec', '--root', root]);
+  assert.equal(result.exitCode, 1, JSON.stringify(result.report));
+  assert.deepEqual(codes(result.report), ['blueprint_config_missing']);
 });

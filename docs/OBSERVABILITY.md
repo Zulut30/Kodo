@@ -8,7 +8,7 @@ kodo report --project PROJECT_ID [--json]
 kodo project report PROJECT_ID [--json]   # алиас второй формы
 ```
 
-Без `--json` печатается короткая сводка, с `--json` — один JSON-объект (схема 1). Для дерева исходников: `node cli/index.mjs report RUN_ID --json`.
+Без `--json` печатается короткая сводка (у Project — ещё эпики по статусам и, у волнового проекта, гейты с состоянием их gate Run), с `--json` — один JSON-объект (схема 1). Для дерева исходников: `node cli/index.mjs report RUN_ID --json`.
 
 ## Граница чтения
 
