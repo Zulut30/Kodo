@@ -38,6 +38,7 @@ import { verifyTaskFastOnce } from './wave-verifier.mjs';
 import { workerRole } from './worker-roles.mjs';
 import { applyWavePolicy } from './wave-policy.mjs';
 import { DEFAULT_CLI, assertCliPrefix, quotePath } from './cli-command.mjs';
+import { planProjectHorizon } from './project-planner.mjs';
 
 /** The largest batch one `nextWave` call returns. */
 export const MAX_WAVE_LIMIT = 5;
@@ -379,10 +380,46 @@ async function reserveSelected(state, limit, ports) {
   }
 }
 
+// Planner reasons the host can act on, in next-wave's codes. Waiting for a dependency, for work in
+// flight or for the wave limit is not a blocker.
+const actionable = {
+  risk_approval_required: 'project_risk_unapproved',
+  retry_required: 'project_retry_required',
+  attempt_revision_mismatch: 'project_retry_required',
+  interfaces_unverified: 'project_interface_unverified',
+  split_required: 'project_split_required',
+};
+
+// Why open tasks are not handed out and which gates hold the project, so that a short or empty
+// wave always names its cause. Read-only: nothing is reserved or run here.
+async function explainWave(state, snapshot) {
+  const { ctx, C } = state;
+  const horizon = planProjectHorizon(
+    {
+      snapshot,
+      limit: 24,
+      availability: await waves.waveAvailability(ctx, snapshot),
+      now: (ctx.clock ?? (() => new Date().toISOString()))(),
+    },
+    { contracts: C, knownValues: state.options.knownValues },
+  );
+  const named = new Set([...state.blocked.map(row => row.taskId), ...state.briefs.map(row => row.taskId)]);
+  for (const row of horizon.blocked) {
+    const task = snapshot.tasks.find(item => item.id === row.taskId);
+    if (!task || named.has(task.id) || task.status === 'cancelled' || settled.has(task.status)) continue;
+    if (task.status === 'integrated' || inFlightStates.has(currentOf(snapshot, task.id)?.status)) continue;
+    const reason = row.reasons.find(item => Object.hasOwn(actionable, item));
+    if (reason) state.blocked.push({ taskId: task.id, code: actionable[reason] });
+  }
+  state.blocked.push(...waves.gateHolds({ store: storeOf(ctx) }, snapshot));
+}
+
 /**
  * Reserve the next wave for an external host: the briefs of this host's running
  * attempts, then new non-overlapping tasks up to `limit` (1..5). `cli` is the command
- * prefix of the brief commands and is returned with them (default `kodo`).
+ * prefix of the brief commands and is returned with them (default `kodo`). `blocked` names why
+ * the rest waits: task rows `{taskId, code}` and gate rows `{code, kind, id, gateId?, runId?}`
+ * (`gateHolds`). An accepted project returns `code: 'project_accepted'` and no briefs.
  * @param {{ repo: any, engine: any, store?: any, contracts?: any, clock?: () => string }} ctx
  * @param {{ projectId: string, host: string, limit?: number, retryFailed?: boolean, ports?: any, cli?: string }} input
  */
@@ -401,6 +438,19 @@ export async function nextWave(ctx, input) {
   if (typeof home === 'string') quotePath(await plannedWorktreeHome(home));
   const snapshot = await snapshotOf(ctx, projectId);
   need(C.isWaveProject(snapshot.project), 'wave_required');
+  // An accepted project has nothing left to hand out: its own code, never a pause or a stop.
+  if (settled.has(snapshot.project.status)) {
+    const done = {
+      projectId,
+      revision: snapshot.revision,
+      cli,
+      code: `project_${snapshot.project.status}`,
+      briefs: [],
+      blocked: [],
+    };
+    C.assertDirectorSafe(done, options);
+    return done;
+  }
   controlOf(snapshot);
   const token = store.acquireLease(`project:${projectId}`, randomUUID(), { ttlMs: 60000, limit: 1 });
   need(token, 'busy');
@@ -426,7 +476,9 @@ export async function nextWave(ctx, input) {
     await resumeInFlight(state);
     if (retryFailed) await reserveRetries(state, limit);
     await reserveSelected(state, limit, ports);
-    const revision = (await snapshotOf(ctx, projectId)).revision;
+    const final = await snapshotOf(ctx, projectId);
+    await explainWave(state, final);
+    const revision = final.revision;
     const result = { projectId, revision, cli, briefs: state.briefs, blocked: state.blocked };
     C.assertDirectorSafe(result, options);
     return result;
@@ -444,9 +496,26 @@ async function specialEntries(cwd, base, head) {
     .filter(line => /^:\d{6} (?:120000|160000) /.test(line));
 }
 
+// What the worker chat has to fix for each refusal of the submitted commit (constant text).
+const submissionMessages = {
+  external_branch_mismatch: 'The brief branch does not point at --head: commit on brief.branch and submit its head.',
+  external_worktree_missing: 'The brief worktree is missing or is not a Git work tree.',
+  external_worktree_mismatch:
+    'The brief worktree is not on brief.branch at --head: check out brief.branch there and submit its head.',
+  external_worktree_dirty: 'The brief worktree has uncommitted or untracked files: commit or remove them.',
+  external_no_changes: '--head equals brief.baseSha: commit the change before submitting.',
+  external_not_descendant: 'brief.baseSha is not an ancestor of --head: commit on top of brief.baseSha without rebase.',
+  external_symlink: 'The change adds a symbolic link or a submodule: replace it with regular files.',
+  external_head_changed: 'The worktree head moved while the checks ran: submit the current head again.',
+};
+
 const problem = (code, error, secrets = {}) => ({
   code,
-  ...(error ? { message: redact(String(error.message), secrets).slice(0, 2000) } : {}),
+  ...(error
+    ? { message: redact(String(error.message), secrets).slice(0, 2000) }
+    : submissionMessages[code]
+      ? { message: submissionMessages[code] }
+      : {}),
 });
 
 const historyCodes = {

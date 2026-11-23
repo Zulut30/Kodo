@@ -121,7 +121,7 @@ async function integrateLeased(f, { projectId, taskId, run }) {
   };
 }
 
-async function fixture(t, { wave = true, stateInGit = false } = {}) {
+async function fixture(t, { wave = true, stateInGit = false, edit = () => {} } = {}) {
   const temp = await realpath(await mkdtemp(path.join(os.tmpdir(), 'kodo-external-')));
   const stores = [];
   t.after(async () => {
@@ -203,6 +203,7 @@ async function fixture(t, { wave = true, stateInGit = false } = {}) {
       taskSpec('task-d', { dependsOn: ['task-a'], writePaths: ['src/d.mjs'], priority: 60 }),
     ],
   };
+  edit(spec);
   const created = await repo.apply({
     schemaVersion: 1,
     commandId: randomUUID(),
@@ -482,6 +483,9 @@ test('complete-task rejects a commit outside its write paths, a foreign branch, 
     assert.equal(result.status, 'checks_failed', JSON.stringify(result));
     if (code instanceof RegExp) assert.match(result.code, code);
     else assert.equal(result.code, code);
+    // Every refusal tells the worker chat what to fix (docs/T3-HOST.md: checks_failed has `message`).
+    if (result.code.startsWith('external_'))
+      assert.ok(typeof result.message === 'string' && result.message.trim(), JSON.stringify(result));
     const snapshot = await f.snapshot();
     assert.equal(snapshot.currentAttempts.find(row => row.taskId === 'task-a').status, 'running');
     return result;
@@ -501,6 +505,9 @@ test('complete-task rejects a commit outside its write paths, a foreign branch, 
   await write(a.worktree, 'notes.txt', 'scratch\n');
   await expectFailure(good, 'external_worktree_dirty');
   await rm(path.join(a.worktree, 'notes.txt'));
+  git(a.worktree, 'checkout', '-q', '--detach');
+  await expectFailure(good, 'external_worktree_mismatch');
+  git(a.worktree, 'checkout', '-q', a.branch);
 
   const orphan = git(a.worktree, 'commit-tree', `${good}^{tree}`, '-m', 'Unrelated history');
   git(a.worktree, 'reset', '--hard', orphan);
@@ -722,7 +729,8 @@ test('next-wave never hands out a task whose interface proofs do not verify', as
     selected.briefs.map(row => row.taskId),
     ['task-a'],
   );
-  assert.deepEqual(selected.blocked, [], 'it was never selected, so no attempt was reserved for it');
+  // It was never selected, so no attempt was reserved for it; the wave still names why it waits.
+  assert.deepEqual(selected.blocked, [{ taskId: 'task-b', code: 'project_interface_unverified' }]);
   // Even a selector that ignores availability cannot reserve it.
   const forced = await f.wave({ limit: 3 });
   assert.deepEqual(forced.blocked, [{ taskId: 'task-b', code: 'project_interface_unverified' }]);
@@ -755,6 +763,83 @@ test('next-wave --retry-failed retries only attempts of its own host', async t =
     ['task-a'],
   );
   assert.notEqual(brief(own, 'task-a').runId, a.runId);
+});
+
+test('next-wave names why open tasks wait: a missing risk approval and an abandoned attempt', async t => {
+  // Audit finding 4a: the director's selection dropped the planner's reasons, so an empty or short
+  // wave came back with `blocked: []` and the host could not tell what to do next.
+  const f = await fixture(t, {
+    edit(spec) {
+      spec.tasks.find(row => row.id === 'task-b').riskApprovalRequired = true;
+    },
+  });
+  const sorted = rows => [...rows].sort((x, y) => (x.taskId < y.taskId ? -1 : 1));
+  const first = await f.wave({ limit: 3, ports: undefined });
+  assert.deepEqual(
+    first.briefs.map(row => row.taskId),
+    ['task-a'],
+  );
+  assert.deepEqual(first.blocked, [{ taskId: 'task-b', code: 'project_risk_unapproved' }]);
+  assert.equal(
+    (await f.snapshot()).currentAttempts.some(row => row.taskId === 'task-b'),
+    false,
+    'an explanation reserves nothing',
+  );
+  const a = brief(first, 'task-a');
+  assert.equal((await f.complete('task-a', a.baseSha, { abandon: true, attemptId: a.attemptId })).status, 'abandoned');
+  const second = await f.wave({ limit: 3, ports: undefined });
+  assert.deepEqual(
+    second.briefs.map(row => row.taskId),
+    ['task-c'],
+  );
+  assert.deepEqual(sorted(second.blocked), [
+    { taskId: 'task-a', code: 'project_retry_required' },
+    { taskId: 'task-b', code: 'project_risk_unapproved' },
+  ]);
+  // Waiting for a dependency, an in-flight attempt or the wave limit is not a blocker.
+  const repeat = await f.wave({ limit: 1, ports: undefined });
+  assert.deepEqual(sorted(repeat.blocked), sorted(second.blocked));
+});
+
+test('next-wave names a pending epic gate and answers an accepted project with its own code', async t => {
+  // Audit finding 4a/4b: every task integrated with deferred gates left an empty wave without a
+  // reason, and an accepted project was refused as project_control_blocked like a paused one.
+  const f = await fixture(t, {
+    edit(spec) {
+      spec.tasks = spec.tasks.filter(row => ['task-a', 'task-b'].includes(row.id));
+    },
+  });
+  const wave = await f.wave({ limit: 3, ports: undefined });
+  for (const [taskId, file] of [
+    ['task-a', 'src/a.mjs'],
+    ['task-b', 'src/b.mjs'],
+  ]) {
+    const head = await commit(brief(wave, taskId).worktree, { [file]: `export const ${taskId.at(-1)} = 2;\n` });
+    assert.equal((await f.complete(taskId, head, { deferGate: true })).status, 'integrated');
+  }
+  const pending = await f.wave({ limit: 3, ports: undefined });
+  assert.deepEqual(pending.briefs, []);
+  assert.deepEqual(pending.blocked, [{ code: 'project_gate_pending', kind: 'epic', id: 'e' }]);
+
+  const real = f.repo.snapshot.bind(f.repo);
+  const as = (status, paused = false) =>
+    Object.create(f.repo, {
+      snapshot: { value: id => ({ ...real(id), project: { ...real(id).project, status, paused } }) },
+    });
+  const accepted = await nextWave({ ...f.ctx, repo: as('accepted') }, { projectId: f.projectId, host: 't3' });
+  assert.deepEqual(accepted, {
+    projectId: f.projectId,
+    revision: real(f.projectId).revision,
+    cli: 'kodo',
+    code: 'project_accepted',
+    briefs: [],
+    blocked: [],
+  });
+  await assert.rejects(
+    nextWave({ ...f.ctx, repo: as('running', true) }, { projectId: f.projectId, host: 't3' }),
+    { code: 'project_control_blocked' },
+    'a pause stays a control stop',
+  );
 });
 
 test('gates runs the pending epic gates outside a completion and retries a blocked gate only on request', async t => {

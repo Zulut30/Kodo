@@ -12,6 +12,7 @@ import * as A from '../runtime/project-contracts.mjs';
 import { openProjectStore } from '../runtime/project-store.mjs';
 import { createProjectDirector, createProjectTransitionAuthorizer } from '../runtime/project-director.mjs';
 import { createWaveContext, selectWave } from '../runtime/project-director-waves.mjs';
+import { nextWave } from '../runtime/project-external.mjs';
 import { withIntegrationLease } from '../runtime/project-integration-lease.mjs';
 import { evaluateWaveTransition } from '../runtime/project-wave-evidence.mjs';
 import { confirmedCriteria } from './helpers/gate-review.mjs';
@@ -401,9 +402,22 @@ test(
     assert.equal(snapshot.epics[0].status, 'integrated');
     assert.equal(snapshot.gates.length, 1);
     assert.equal(f.store.getRun(snapshot.gates[0].runId).state, 'blocked');
+    // Audit finding 8a: a gate blocker names its gate and gate Run, the place of its findings.
+    const named = { gateId: snapshot.gates[0].id, runId: snapshot.gates[0].runId };
+    const gateRows = result =>
+      result.blockers.filter(row => row.kind === 'epic').map(({ gateId, runId }) => ({ gateId, runId }));
+    assert.deepEqual(gateRows(blocked), [named]);
+    // Audit finding 4a: the pull protocol names the stopped gate instead of an empty wave.
+    const ctx = { repo: f.repo, engine: f.engine, store: f.store, contracts: A };
+    const waiting = await nextWave(ctx, { projectId: f.id, host: 't3' });
+    assert.deepEqual(waiting.briefs, []);
+    assert.deepEqual(waiting.blocked, [
+      { code: 'no_verified_progress', kind: 'epic', id: 'e1', ...named, state: 'blocked' },
+    ]);
     await rm(f.flag);
     const still = await f.director.drain(f.id);
     assert.equal(still.status, 'blocked', 'a failed gate is retried only explicitly');
+    assert.deepEqual(gateRows(still), [named]);
     assert.equal(f.repo.snapshot(f.id).gates.length, 1);
     const accepted = await f.director.drain(f.id, { retryFailed: true });
     assert.equal(accepted.status, 'accepted', JSON.stringify(accepted));

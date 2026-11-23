@@ -604,7 +604,7 @@ async function installOrReplace(ctx, snapshot, gate, containers, out) {
   } catch (error) {
     if (error?.code === 'gate_head_stale') return reserveGate(ctx, snapshot, containers, false);
     if (error?.code !== 'gate_invalid') throw error;
-    out.blocked.push({ code: error.code, kind: containers[0].kind, id: containers[0].id });
+    out.blocked.push({ code: error.code, kind: containers[0].kind, id: containers[0].id, gateId: gate.id });
     return null;
   }
 }
@@ -708,7 +708,7 @@ async function epicGate(ctx, snapshot, epic, retryFailed, out) {
   if (gate && run && retryStates.includes(run.state)) {
     if (retryFailed) return reserveGate(ctx, snapshot, gateContainers(snapshot, epic), true);
     out.gates.push({ gateId: gate.id, runId: run.id, state: run.state });
-    out.blocked.push({ code: blockerOf(run), kind: 'epic', id: epic.id });
+    out.blocked.push({ code: blockerOf(run), kind: 'epic', id: epic.id, gateId: gate.id, runId: run.id });
     return null;
   }
   if (!gate) return reserveGate(ctx, snapshot, gateContainers(snapshot, epic), false);
@@ -716,7 +716,8 @@ async function epicGate(ctx, snapshot, epic, retryFailed, out) {
   return installOrReplace(ctx, snapshot, gate, gateContainers(snapshot, epic), out);
 }
 
-// Execute an installed gate Run once, then accept what it verified.
+// Execute an installed gate Run once, then accept what it verified. Every blocker of this gate
+// names it (`gateId`, `runId`): the host reads the gate Run behind the code.
 async function runAndAccept(ctx, projectId, { gate, run }, signal, out, entity) {
   if (run.state !== 'succeeded') run = await runEpicGate({ engine: ctx.engine, run, signal });
   if (run.state !== 'succeeded') {
@@ -724,10 +725,13 @@ async function runAndAccept(ctx, projectId, { gate, run }, signal, out, entity) 
     out.blocked.push({
       code: run.state === 'waiting_limits' ? 'quota' : blockerOf(run),
       ...entity,
+      gateId: gate.id,
+      runId: run.id,
       state: run.state,
     });
     return;
   }
+  const before = out.blocked.length;
   try {
     await acceptGate(ctx, projectId, gate, run, out);
   } catch (error) {
@@ -737,6 +741,7 @@ async function runAndAccept(ctx, projectId, { gate, run }, signal, out, entity) 
     // Acceptance may still block the Run (for example a repair history defect): report the saved state.
     const saved = storedRun(ctx.store, run.id) ?? run;
     out.gates.push({ gateId: gate.id, runId: saved.id, state: saved.state });
+    for (const row of out.blocked.slice(before)) Object.assign(row, { gateId: gate.id, runId: saved.id });
   }
 }
 
@@ -757,7 +762,7 @@ async function projectGateRun(ctx, snapshot, { retryFailed, stale }, out) {
   if (!retryStates.includes(run.state)) return { gate, run };
   if (retryFailed) return reserveGate(ctx, snapshot, containers, true);
   out.gates.push({ gateId: gate.id, runId: run.id, state: run.state });
-  out.blocked.push({ code: blockerOf(run), kind: 'project', id: projectId });
+  out.blocked.push({ code: blockerOf(run), kind: 'project', id: projectId, gateId: gate.id, runId: run.id });
   return null;
 }
 
@@ -813,6 +818,39 @@ export async function runPendingGates(ctx, { projectId, signal, retryFailed = fa
   }
   if (!out.blocked.length) await gateProject(ctx, { projectId, signal, retryFailed }, out);
   return out;
+}
+
+const heldGateStates = [...retryStates, 'waiting_limits'];
+
+/**
+ * Read-only: the gates that hold a wave project, rows like `runPendingGates().blocked`. A container
+ * (each epic, then the project) whose latest gate Run stopped without acceptance (blocked, failed,
+ * cancelled; `quota` for waiting_limits) names that gate; one that is ready for a gate that has not
+ * run or finished yet is `project_gate_pending` (`kodo project gates` runs it). Used by next-wave.
+ * @param {{ store: any }} ctx
+ * @param {any} snapshot
+ */
+export function gateHolds(ctx, snapshot) {
+  const rows = [];
+  const hold = (kind, id, ready) => {
+    const gate = latestGate(snapshot, kind, id),
+      run = gate && storedRun(ctx.store, gate.runId);
+    if (run && heldGateStates.includes(run.state))
+      rows.push({
+        code: run.state === 'waiting_limits' ? 'quota' : blockerOf(run),
+        kind,
+        id,
+        gateId: gate.id,
+        runId: run.id,
+        state: run.state,
+      });
+    else if (ready) rows.push({ code: 'project_gate_pending', kind, id });
+  };
+  for (const epic of snapshot.epics) if (!settled(epic.status)) hold('epic', epic.id, gateCandidate(snapshot, epic));
+  const project = snapshot.project;
+  if (!settled(project.status) && snapshot.milestones.every(row => settled(row.status)))
+    hold('project', project.projectId, reached(project.status, 'integrated'));
+  return rows;
 }
 
 // --- drain ------------------------------------------------------------------------------------

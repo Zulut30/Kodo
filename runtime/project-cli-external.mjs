@@ -98,8 +98,9 @@ function human(report) {
       `  self-check: ${brief.selfCheck}`,
       `  complete: ${brief.completeCommand}`,
     );
-  for (const row of result.blocked) lines.push(`- blocked ${row.taskId}: ${row.code}`);
-  if (!result.briefs.length && !result.blocked.length) lines.push('No task is ready for this host.');
+  for (const row of result.blocked) lines.push(`- blocked ${row.taskId ?? `${row.kind} ${row.id}`}: ${row.code}`);
+  if (result.code) lines.push(`Project: ${result.code}`);
+  else if (!result.briefs.length && !result.blocked.length) lines.push('No task is ready for this host.');
   return lines.join('\n');
 }
 

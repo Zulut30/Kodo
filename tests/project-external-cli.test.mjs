@@ -250,6 +250,11 @@ test('Project CLI delegates next-wave and complete-task to the pull protocol', a
     [blocked.report.result.status, blocked.report.result.code],
     ['blocked', 'project_attempt_not_running'],
   );
+  // An empty wave names its cause in both formats: the abandoned attempt waits for --retry-failed.
+  const waiting = await projectCli(['next-wave', waveId, '--host', 'orca'], { ...base, wave });
+  assert.equal(waiting.exitCode, 2);
+  assert.deepEqual(waiting.report.result.blocked, [{ taskId: 'task-a', code: 'project_retry_required' }]);
+  assert.match(waiting.output, /\n- blocked task-a: project_retry_required$/);
 });
 
 test(
