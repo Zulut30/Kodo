@@ -15,7 +15,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { isDeepStrictEqual } from 'node:util';
 import { defaultFixtures, evaluateFixture, materializeFixture } from '../runtime/benchmark-fixtures.mjs';
+import { planSchema, resultSchema, reviewSchema } from '../runtime/contracts.mjs';
 import { Engine } from '../runtime/engine.mjs';
 import { Store } from '../runtime/store.mjs';
 
@@ -25,6 +27,7 @@ export const MAX_RUNS = 100;
 export const DEFAULT_FIXTURE = 'button-color';
 export const DEFAULT_CLIENT = 'codex';
 export const DEFAULT_MODEL = 'gpt-6.1-sol';
+export const DEFAULT_TRIAL_TIMEOUT_MS = 120_000;
 
 export const STAGE_KEYS = Object.freeze([
   'createAndMode',
@@ -46,6 +49,8 @@ const UNEXPECTED_KEYS = Object.freeze([
   'delivery',
   'unknownSession',
   'sessionMismatch',
+  'assessmentMismatch',
+  'discoveryMismatch',
 ]);
 
 const SCRIPT_PATH = fileURLToPath(import.meta.url);
@@ -74,7 +79,6 @@ const ALLOWED_GIT_ENV_KEYS = new Set([
   'USERPROFILE',
   'HOMEDRIVE',
   'HOMEPATH',
-  'GIT_EXEC_PATH',
 ]);
 
 const LIMITATIONS = Object.freeze([
@@ -249,6 +253,8 @@ export function buildTrialEnv(base, box, { platform = process.platform } = {}) {
     ['KODO_CREDENTIAL_HOME', box.credentialsDir],
     ['KODO_WORKTREE_HOME', box.worktreesDir],
     ['KODO_TOOL_HOME', box.toolsDir],
+    // Node 24 automatically forwards NODE_V8_COVERAGE to spawned Node children when omitted.
+    ['NODE_V8_COVERAGE', ''],
   ])
     setEnvVar(env, key, value, caseInsensitive);
   return env;
@@ -375,21 +381,17 @@ const REPAIR_OR_CONFLICT_PROMPT =
   /Repair confirmed failures|Resolve (?:these Git merge |target branch merge )?conflicts/;
 
 /**
- * Strictly classify a mocked session request; unknown schemas or unexpected
- * repair/conflict prompts are reported as `'unknown'` rather than `'developer'`.
+ * Strictly classify a mocked session request by matching the full stage schema
+ * contract (type, required fields and property definitions); any incompatible
+ * schema or repair/conflict prompt is reported as `'unknown'`.
  * @param {any} request
  * @returns {'plan' | 'review' | 'developer' | 'unknown'}
  */
 export function classifySessionRequest(request) {
-  const properties = request?.schema?.properties;
-  if (properties?.tasks) return 'plan';
-  if (properties?.passed) return 'review';
-  if (
-    properties?.complete &&
-    properties?.summary &&
-    properties?.checks &&
-    !REPAIR_OR_CONFLICT_PROMPT.test(String(request?.prompt || ''))
-  )
+  const schema = request?.schema;
+  if (isDeepStrictEqual(schema, planSchema)) return 'plan';
+  if (isDeepStrictEqual(schema, reviewSchema)) return 'review';
+  if (isDeepStrictEqual(schema, resultSchema) && !REPAIR_OR_CONFLICT_PROMPT.test(String(request?.prompt || '')))
     return 'developer';
   return 'unknown';
 }
@@ -408,6 +410,8 @@ export function createInstantServices({ fixture, client, model, now = () => perf
     delivery: 0,
     unknownSession: 0,
     sessionMismatch: 0,
+    assessmentMismatch: 0,
+    discoveryMismatch: 0,
   };
   /** @type {Array<{ stage: string, durationMs: number }>} */
   const sessionCallbacks = [];
@@ -709,6 +713,9 @@ async function executeTrialInProcess({ runIndex, fixture, client, model, root, s
       mockedSequence: services.sessionSequence,
     });
     if (!sequenceCheck.ok) services.unexpectedCalls.sessionMismatch += sequenceCheck.mismatchCount;
+    const expectedCalls = expectedCoordinatorCalls(result.executionMode);
+    services.unexpectedCalls.assessmentMismatch += Math.abs(services.mockedCalls.assessment - expectedCalls.assessment);
+    services.unexpectedCalls.discoveryMismatch += Math.abs(services.mockedCalls.discovery - expectedCalls.discovery);
 
     const totalMs = spanMs(marks.start, marks.finished);
     const stagesMs = buildStagesMs(marks);
@@ -764,16 +771,87 @@ async function executeTrialInProcess({ runIndex, fixture, client, model, root, s
   return report;
 }
 
-function spawnTrialChild({ box, env, payload }) {
+function expectedCoordinatorCalls(executionMode) {
+  const fastPath = executionMode?.source === 'fast-path' || executionMode?.assessment === 'not_requested';
+  return { assessment: fastPath ? 0 : 1, discovery: 1 };
+}
+
+function terminateProcessTree(child, graceMs) {
+  if (!child.pid) return;
+  if (process.platform === 'win32') {
+    const killer = spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], {
+      windowsHide: true,
+      stdio: 'ignore',
+    });
+    killer.on('error', () => child.kill());
+    return;
+  }
+  try {
+    process.kill(-child.pid, 'SIGTERM');
+  } catch {
+    child.kill('SIGTERM');
+  }
+  const hardKill = setTimeout(
+    () => {
+      try {
+        process.kill(-child.pid, 'SIGKILL');
+      } catch {
+        child.kill('SIGKILL');
+      }
+    },
+    Math.min(1000, graceMs),
+  );
+  hardKill.unref();
+  child.once('close', () => clearTimeout(hardKill));
+}
+
+/**
+ * Spawn one isolated trial child process with a hard timeout and bounded
+ * process-tree termination.
+ * @param {{ box: Awaited<ReturnType<typeof createSandbox>>, env: Record<string, string>, payload: object, entryArgs?: string[], timeoutMs?: number, killGraceMs?: number }} options
+ */
+export function spawnTrialChild({
+  box,
+  env,
+  payload,
+  entryArgs = [SCRIPT_PATH, '--internal-trial'],
+  timeoutMs = DEFAULT_TRIAL_TIMEOUT_MS,
+  killGraceMs = 5000,
+}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [SCRIPT_PATH, '--internal-trial'], {
+    const child = spawn(process.execPath, entryArgs, {
       cwd: box.directory,
       env,
+      detached: process.platform !== 'win32',
       windowsHide: true,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     let stdout = '';
     let stderr = '';
+    let settled = false;
+    let timedOut = false;
+    /** @type {NodeJS.Timeout | undefined} */
+    let graceTimer;
+
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutTimer);
+      if (graceTimer) clearTimeout(graceTimer);
+      if (error) reject(error);
+      else resolve(value);
+    };
+
+    const timeoutTimer = setTimeout(() => {
+      timedOut = true;
+      terminateProcessTree(child, killGraceMs);
+      graceTimer = setTimeout(() => {
+        finish(Object.assign(new Error(`Trial child timed out after ${timeoutMs}ms`), { code: 'timeout' }));
+      }, killGraceMs);
+      graceTimer.unref();
+    }, timeoutMs);
+    timeoutTimer.unref();
+
     child.stdout.setEncoding('utf8');
     child.stderr.setEncoding('utf8');
     child.stdout.on('data', chunk => {
@@ -782,8 +860,12 @@ function spawnTrialChild({ box, env, payload }) {
     child.stderr.on('data', chunk => {
       stderr += chunk;
     });
-    child.on('error', reject);
+    child.on('error', error => finish(error));
     child.on('close', code => {
+      if (timedOut) {
+        finish(Object.assign(new Error(`Trial child timed out after ${timeoutMs}ms`), { code: 'timeout' }));
+        return;
+      }
       let parsed;
       try {
         parsed = stdout.trim() ? JSON.parse(stdout) : null;
@@ -791,18 +873,18 @@ function spawnTrialChild({ box, env, payload }) {
         parsed = null;
       }
       if (code === 0 && parsed?.ok && parsed.report) {
-        resolve(parsed.report);
+        finish(null, parsed.report);
         return;
       }
       const detail = parsed?.error || stderr.trim() || `Trial child exited with code ${code}`;
-      reject(new Error(detail));
+      finish(new Error(detail));
     });
     child.stdin.on('error', () => {});
     child.stdin.end(JSON.stringify(payload));
   });
 }
 
-async function executeTrial({ runIndex, fixture, client, model }) {
+async function executeTrial({ runIndex, fixture, client, model, trialTimeoutMs = DEFAULT_TRIAL_TIMEOUT_MS }) {
   const box = await createSandbox();
   let primaryError;
   let report;
@@ -813,6 +895,7 @@ async function executeTrial({ runIndex, fixture, client, model }) {
       box,
       env,
       payload: { runIndex, fixtureId: fixture.id, client, model, root: box.root, stateDir: box.stateDir },
+      timeoutMs: trialTimeoutMs,
     });
   } catch (error) {
     primaryError = error;
@@ -846,15 +929,31 @@ function trialSessionMismatchCount(item) {
   return Math.max(recorded, countDelta);
 }
 
+function trialCoordinatorMismatch(item) {
+  const expected = expectedCoordinatorCalls(item.executionMode);
+  const assessmentDelta = Math.abs((item.mockedCalls?.assessment ?? 0) - expected.assessment);
+  const discoveryDelta = Math.abs((item.mockedCalls?.discovery ?? 0) - expected.discovery);
+  return {
+    assessmentMismatch: Math.max(item.unexpectedCalls?.assessmentMismatch ?? 0, assessmentDelta),
+    discoveryMismatch: Math.max(item.unexpectedCalls?.discoveryMismatch ?? 0, discoveryDelta),
+  };
+}
+
 /**
  * Run the local Kodo overhead benchmark N times and return the structured report.
  * Each trial executes in an isolated child process with an allowlist environment,
  * so the caller's `process.env` is never mutated.
- * @param {{ runs?: number, fixture?: string, client?: string, model?: string }} [options]
+ * @param {{ runs?: number, fixture?: string, client?: string, model?: string, trialTimeoutMs?: number }} [options]
  * @param {{ runTrial?: typeof executeTrial }} [dependencies]
  */
 export async function runOverheadBenchmark(
-  { runs = DEFAULT_RUNS, fixture: fixtureId = DEFAULT_FIXTURE, client = DEFAULT_CLIENT, model = DEFAULT_MODEL } = {},
+  {
+    runs = DEFAULT_RUNS,
+    fixture: fixtureId = DEFAULT_FIXTURE,
+    client = DEFAULT_CLIENT,
+    model = DEFAULT_MODEL,
+    trialTimeoutMs = DEFAULT_TRIAL_TIMEOUT_MS,
+  } = {},
   { runTrial = executeTrial } = {},
 ) {
   if (!Number.isSafeInteger(runs) || runs < 1 || runs > MAX_RUNS)
@@ -864,17 +963,22 @@ export async function runOverheadBenchmark(
 
   const results = [];
   for (let index = 1; index <= runs; index++) {
-    results.push(await runTrial({ runIndex: index, fixture, client, model }));
+    results.push(await runTrial({ runIndex: index, fixture, client, model, trialTimeoutMs }));
   }
 
-  const normalizedUnexpected = results.map(item => ({
-    analyzeGemini: item.unexpectedCalls?.analyzeGemini ?? 0,
-    decideJev: item.unexpectedCalls?.decideJev ?? 0,
-    research: item.unexpectedCalls?.research ?? 0,
-    delivery: item.unexpectedCalls?.delivery ?? 0,
-    unknownSession: item.unexpectedCalls?.unknownSession ?? 0,
-    sessionMismatch: trialSessionMismatchCount(item),
-  }));
+  const normalizedUnexpected = results.map(item => {
+    const coordinator = trialCoordinatorMismatch(item);
+    return {
+      analyzeGemini: item.unexpectedCalls?.analyzeGemini ?? 0,
+      decideJev: item.unexpectedCalls?.decideJev ?? 0,
+      research: item.unexpectedCalls?.research ?? 0,
+      delivery: item.unexpectedCalls?.delivery ?? 0,
+      unknownSession: item.unexpectedCalls?.unknownSession ?? 0,
+      sessionMismatch: trialSessionMismatchCount(item),
+      assessmentMismatch: coordinator.assessmentMismatch,
+      discoveryMismatch: coordinator.discoveryMismatch,
+    };
+  });
 
   const stagesSummary = Object.fromEntries(
     STAGE_KEYS.map(key => [key, summarizeValues(results.map(item => item.stagesMs[key]))]),
