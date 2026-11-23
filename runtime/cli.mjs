@@ -304,10 +304,16 @@ export async function runtimeCli(command, args) {
         retryFailed: Boolean(options['retry-failed']),
       });
       while (result.state === 'waiting_limits' && !controller.signal.aborted) {
-        const parsed = Date.parse(result.error?.retryAt || '');
+        const parsed = Date.parse(result.nextRetryAt || result.error?.retryAt || '');
         const nextRetry = Number.isFinite(parsed) && parsed > Date.now() ? parsed : Date.now() + 15 * 60 * 1000;
         const retryAt = new Date(nextRetry).toISOString();
-        result = store.updateRun(run.id, { nextRetryAt: retryAt });
+        if (result.nextRetryAt !== retryAt) {
+          result = store.updateRun(run.id, { nextRetryAt: retryAt }, { preserveCancellation: true });
+          if (result.state !== 'waiting_limits') {
+            delete result.nextRetryAt;
+            break;
+          }
+        }
         if (options.json || options['no-wait']) {
           result = { ...result, retryAt };
           break;
@@ -316,8 +322,8 @@ export async function runtimeCli(command, args) {
         while (Date.now() < nextRetry && !controller.signal.aborted && !store.getRun(run.id).cancelRequested)
           await new Promise(resolve => setTimeout(resolve, Math.min(1000, nextRetry - Date.now())));
         result = await engine.run(run.id, {
-          prepare: options.prepare,
-          planFile: options.plan,
+          prepare: options.prepare && !result.plan ? true : undefined,
+          planFile: options.plan && !result.plan && !result.pendingPlan ? options.plan : undefined,
           signal: controller.signal,
         });
       }

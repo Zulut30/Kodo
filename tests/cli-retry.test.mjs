@@ -345,6 +345,26 @@ Engine.prototype.selectModels = async function () {
       const paused = JSON.parse(first.stdout);
       assert.equal(paused.state, 'waiting_limits');
       assert.equal(paused.plan, undefined);
+      // Replace with another valid plan and then delete the original file before resume:
+      // resume must execute the snapshotted original plan, neither the replacement nor ENOENT.
+      await writeFile(
+        planFile,
+        JSON.stringify({
+          summary: 'mutated plan that must be ignored',
+          tasks: [
+            {
+              id: 't2',
+              role: 'developer',
+              description: 'Mutated task',
+              dependsOn: [],
+              writePaths: ['baseline.txt'],
+              acceptance: ['mutated'],
+              parallel: false,
+            },
+          ],
+        }),
+      );
+      await rm(planFile, { force: true });
 
       const resumeHook = path.join(directory, 'plan-resume-hook.mjs');
       await writeFile(
@@ -390,4 +410,236 @@ Engine.prototype.verify = async function () {};\n`,
       assert.equal(Object.hasOwn(stored, 'nextRetryAt'), false);
     },
   );
+});
+
+test('Pending plan snapshot, prepare write failure, --prepare --plan priority and atomic waiting_limits nextRetryAt', async t => {
+  await t.test('same-process auto-retry does not re-read deleted --plan after plan was applied', async subtest => {
+    const directory = await makeRepo(subtest);
+    const env = {
+      ...process.env,
+      KODO_HOME: path.join(directory, 'state'),
+      KODO_CREDENTIAL_HOME: path.join(directory, 'credentials'),
+    };
+    const planFile = path.join(directory, 'host-plan.json');
+    await writeFile(
+      planFile,
+      JSON.stringify({
+        summary: 'applied once plan',
+        tasks: [
+          {
+            id: 't1',
+            role: 'developer',
+            description: 'Update baseline',
+            dependsOn: [],
+            writePaths: ['baseline.txt'],
+            acceptance: ['baseline updated'],
+            parallel: false,
+          },
+        ],
+      }),
+    );
+    const hook = path.join(directory, 'same-proc-plan-hook.mjs');
+    await writeFile(
+      hook,
+      `import { rm } from 'node:fs/promises';
+import { mock } from 'node:test';
+import { Engine } from ${JSON.stringify(pathToFileURL(path.join(root, 'runtime/engine.mjs')).href)};
+let execCalls = 0;
+Engine.prototype.selectModels = async function (run) {
+  run.models = [{ id: 'codex:gpt-6.1-sol', client: 'codex', model: 'gpt-6.1-sol', available: true }];
+  this.save(run);
+  return run.models;
+};
+Engine.prototype.baseline = async function () {};
+Engine.prototype.executeTasks = async function (run) {
+  execCalls++;
+  if (execCalls === 1) {
+    await rm(${JSON.stringify(planFile)}, { force: true });
+    mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() });
+    const retryAt = new Date(Date.now() + 80).toISOString();
+    setImmediate(() => mock.timers.tick(80));
+    throw Object.assign(new Error('quota during execute'), { code: 'quota', retryAt });
+  }
+  mock.timers.reset();
+  run.nodes.t1 = { id: 't1', status: 'integrated' };
+};
+Engine.prototype.recoverIntegrationEdits = async function () {};
+Engine.prototype.verify = async function () {};\n`,
+    );
+    const result = spawnSync(
+      process.execPath,
+      [
+        '--import',
+        pathToFileURL(hook).href,
+        path.join(root, 'cli/index.mjs'),
+        'run',
+        'fixture same-proc plan',
+        '--project',
+        directory,
+        '--mode',
+        'quick',
+        '--plan',
+        planFile,
+      ],
+      { cwd: directory, encoding: 'utf8', windowsHide: true, timeout: 30000, env },
+    );
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    const value = JSON.parse(result.stdout);
+    assert.equal(value.state, 'succeeded');
+    assert.equal(value.plan?.summary, 'applied once plan');
+    assert.equal(Object.hasOwn(value, 'nextRetryAt'), false);
+  });
+
+  await t.test('write failure during prepare artifact creation keeps pendingPrepare for next resume', async subtest => {
+    const directory = await makeRepo(subtest);
+    const env = {
+      ...process.env,
+      KODO_HOME: path.join(directory, 'state'),
+      KODO_CREDENTIAL_HOME: path.join(directory, 'credentials'),
+    };
+    const failHook = path.join(directory, 'prepare-write-fail-hook.mjs');
+    await writeFile(
+      failHook,
+      `import { mkdir } from 'node:fs/promises';
+import path from 'node:path';
+import { Engine } from ${JSON.stringify(pathToFileURL(path.join(root, 'runtime/engine.mjs')).href)};
+const orig = Engine.prototype.preparePlanningContext;
+Engine.prototype.preparePlanningContext = async function (run) {
+  await mkdir(path.join(run.artifacts, 'plan.schema.json'), { recursive: true });
+  return orig.call(this, run);
+};\n`,
+    );
+    const first = spawnSync(
+      process.execPath,
+      [
+        '--import',
+        pathToFileURL(failHook).href,
+        path.join(root, 'cli/index.mjs'),
+        'run',
+        'fixture prepare write fail',
+        '--project',
+        directory,
+        '--mode',
+        'quick',
+        '--prepare',
+        '--json',
+      ],
+      { cwd: directory, encoding: 'utf8', windowsHide: true, timeout: 30000, env },
+    );
+    assert.equal(first.status, 2, first.stderr);
+    const blocked = JSON.parse(first.stdout);
+    assert.equal(blocked.state, 'blocked');
+    assert.equal(blocked.pendingPrepare, true);
+    await rm(path.join(blocked.artifacts, 'plan.schema.json'), { recursive: true, force: true });
+
+    const resumeHook = path.join(directory, 'prepare-write-resume-hook.mjs');
+    await writeFile(
+      resumeHook,
+      `import { Engine } from ${JSON.stringify(pathToFileURL(path.join(root, 'runtime/engine.mjs')).href)};
+Engine.prototype.selectModels = async function () {
+  throw new Error('must_not_run_planner_after_prepare_write_error');
+};
+Engine.prototype.plan = async function () {
+  throw new Error('must_not_run_planner_after_prepare_write_error');
+};\n`,
+    );
+    const second = spawnSync(
+      process.execPath,
+      ['--import', pathToFileURL(resumeHook).href, path.join(root, 'cli/index.mjs'), 'resume', blocked.id, '--json'],
+      { cwd: directory, encoding: 'utf8', windowsHide: true, timeout: 30000, env },
+    );
+    assert.equal(second.status, 0, second.stderr || second.stdout);
+    const resumed = JSON.parse(second.stdout);
+    assert.equal(resumed.state, 'awaiting_plan');
+    assert.equal(resumed.pendingPrepare, undefined);
+  });
+
+  await t.test('run --prepare --plan FILE prioritizes --prepare and stops in awaiting_plan', async subtest => {
+    const directory = await makeRepo(subtest);
+    const env = {
+      ...process.env,
+      KODO_HOME: path.join(directory, 'state'),
+      KODO_CREDENTIAL_HOME: path.join(directory, 'credentials'),
+    };
+    const planFile = path.join(directory, 'ignored-during-prepare.json');
+    await writeFile(
+      planFile,
+      JSON.stringify({
+        summary: 'must not execute during prepare',
+        tasks: [
+          {
+            id: 't1',
+            role: 'developer',
+            description: 'Update baseline',
+            dependsOn: [],
+            writePaths: ['baseline.txt'],
+            acceptance: ['baseline updated'],
+            parallel: false,
+          },
+        ],
+      }),
+    );
+    const guardHook = path.join(directory, 'prepare-priority-hook.mjs');
+    await writeFile(
+      guardHook,
+      `import { Engine } from ${JSON.stringify(pathToFileURL(path.join(root, 'runtime/engine.mjs')).href)};
+Engine.prototype.selectModels = async function () {
+  throw new Error('must_not_execute_when_prepare_set');
+};
+Engine.prototype.plan = async function () {
+  throw new Error('must_not_execute_when_prepare_set');
+};\n`,
+    );
+    const result = spawnSync(
+      process.execPath,
+      [
+        '--import',
+        pathToFileURL(guardHook).href,
+        path.join(root, 'cli/index.mjs'),
+        'run',
+        'fixture prepare priority',
+        '--project',
+        directory,
+        '--mode',
+        'quick',
+        '--prepare',
+        '--plan',
+        planFile,
+        '--json',
+      ],
+      { cwd: directory, encoding: 'utf8', windowsHide: true, timeout: 30000, env },
+    );
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    const value = JSON.parse(result.stdout);
+    assert.equal(value.state, 'awaiting_plan');
+    assert.equal(value.plan, undefined);
+  });
+
+  await t.test('Engine sets nextRetryAt atomically on waiting_limits and respects concurrent cancel', async subtest => {
+    const directory = await makeRepo(subtest);
+    const { Store } = await import('../runtime/store.mjs');
+    const { Engine } = await import('../runtime/engine.mjs');
+    const store = new Store(path.join(directory, 'state'), {});
+    try {
+      const engine = new Engine({ store, secrets: {} });
+      const retryAt = '2099-01-01T00:00:00.000Z';
+      engine.prepare = async () => {
+        throw Object.assign(new Error('quota in engine'), { code: 'quota', retryAt });
+      };
+      const run = await engine.create('atomic retry test', { project: directory, mode: 'quick' });
+      const paused = await engine.run(run.id);
+      assert.equal(paused.state, 'waiting_limits');
+      assert.equal(paused.nextRetryAt, retryAt);
+      assert.equal(store.getRun(run.id).nextRetryAt, retryAt);
+
+      // Concurrent cancel must clear nextRetryAt even when preserveCancellation update runs.
+      store.updateRun(run.id, { cancelRequested: true, state: 'cancelled', nextRetryAt: undefined });
+      const raced = store.updateRun(run.id, { nextRetryAt: retryAt }, { preserveCancellation: true });
+      assert.equal(raced.state, 'cancelled');
+      assert.equal(Object.hasOwn(raced, 'nextRetryAt'), false);
+      assert.equal(Object.hasOwn(store.getRun(run.id), 'nextRetryAt'), false);
+    } finally {
+      store.close();
+    }
+  });
 });

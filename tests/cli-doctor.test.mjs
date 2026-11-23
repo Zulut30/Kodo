@@ -160,7 +160,7 @@ test('CLI help documents run --json and standalone resume --no-wait and rejects 
     timeout: 15000,
   });
   assert.equal(helpResult.status, 0, helpResult.stderr);
-  assert.match(helpResult.stdout, /^kodo run [^\n]*--no-wait[^\n]*--json/m);
+  assert.match(helpResult.stdout, /^kodo run [^\n]*--prepare[^\n]*--plan FILE[^\n]*--no-wait[^\n]*--json/m);
   assert.match(helpResult.stdout, /^kodo resume RUN_ID \[--plan FILE\][^\n]*\[--no-wait\][^\n]*\[--json\]/m);
 
   for (const args of [

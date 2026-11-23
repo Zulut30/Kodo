@@ -1,5 +1,6 @@
 import path from 'node:path';
-import { writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { readFile, writeFile } from 'node:fs/promises';
 import { Store } from './store.mjs';
 import { loadSecrets, redact } from './security.mjs';
 import { validateCommandTimeouts } from './config.mjs';
@@ -159,26 +160,28 @@ export class Engine extends EngineVerification {
       this.checkCancelled(run, signal);
       const hadNextRetryAt = Object.hasOwn(run, 'nextRetryAt');
       if (hadNextRetryAt) run.nextRetryAt = undefined;
-      if (planFile) {
-        run.pendingPlanFile = path.resolve(planFile);
-        run.pendingPrepare = undefined;
-      } else if (prepare && !run.plan) {
+      const wantPrepare = Boolean(prepare && !run.plan);
+      if (wantPrepare) {
         run.pendingPrepare = true;
+        run.pendingPlan = undefined;
+      } else if (planFile) {
+        const raw = redact(await readFile(planFile, 'utf8'), this.secrets);
+        JSON.parse(raw);
+        run.pendingPlan = { raw, sha256: createHash('sha256').update(raw).digest('hex') };
+        run.pendingPrepare = undefined;
       }
-      if (hadNextRetryAt || planFile || (prepare && !run.plan)) {
+      if (hadNextRetryAt || wantPrepare || planFile) {
         this.save(run);
         delete run.nextRetryAt;
         if (run.pendingPrepare === undefined) delete run.pendingPrepare;
+        if (run.pendingPlan === undefined) delete run.pendingPlan;
       }
-      const effectivePlanFile = planFile ? path.resolve(planFile) : run.pendingPlanFile;
-      const shouldPrepare = Boolean((prepare || run.pendingPrepare) && !effectivePlanFile && !run.plan);
+      const shouldPrepare = Boolean((wantPrepare || run.pendingPrepare) && !run.plan);
+      const effectivePlan = shouldPrepare ? undefined : run.pendingPlan;
       await this.prepare(run, signal);
       if (shouldPrepare && !run.plan) {
-        run.state = 'awaiting_plan';
-        run.pendingPrepare = undefined;
-        run.nextRetryAt = undefined;
-        run.planningContext = await this.preparePlanningContext(run);
-        await writeFile(path.join(run.artifacts, 'plan-context.md'), run.planningContext);
+        const planningContext = await this.preparePlanningContext(run);
+        await writeFile(path.join(run.artifacts, 'plan-context.md'), planningContext);
         await writeFile(
           path.join(run.artifacts, 'plan.schema.json'),
           JSON.stringify(
@@ -193,6 +196,10 @@ export class Engine extends EngineVerification {
             2,
           ),
         );
+        run.planningContext = planningContext;
+        run.state = 'awaiting_plan';
+        run.pendingPrepare = undefined;
+        run.nextRetryAt = undefined;
         this.save(run);
         delete run.pendingPrepare;
         delete run.nextRetryAt;
@@ -221,7 +228,7 @@ export class Engine extends EngineVerification {
         }
       }
       if (!run.delivery?.mergeCommit) await this.selectModels(run);
-      await this.plan(run, effectivePlanFile, signal);
+      await this.plan(run, effectivePlan, signal);
       await this.assertProjectPlan(run);
       if (!run.delivery?.mergeCommit) {
         if (!run.completed.implementation) {
@@ -328,13 +335,13 @@ export class Engine extends EngineVerification {
       run.error = null;
       run.nextRetryAt = undefined;
       run.pendingPrepare = undefined;
-      run.pendingPlanFile = undefined;
+      run.pendingPlan = undefined;
       run.blocker = resolveBlocker(run.blocker, { at: new Date().toISOString(), outcome: 'succeeded' });
       this.deliverySummary(run);
       this.save(run);
       delete run.nextRetryAt;
       delete run.pendingPrepare;
-      delete run.pendingPlanFile;
+      delete run.pendingPlan;
       this.log(run, 'succeeded', { headSha: run.headSha, pr: run.delivery?.pr, release: run.release });
       await this.policy(run, 'complete');
       run.knowledge = this.store.remember(run);
@@ -360,9 +367,22 @@ export class Engine extends EngineVerification {
       };
       this.deliverySummary(run);
       if (['blocked', 'waiting_limits'].includes(run.state)) run.blocker = currentBlocker(run, error);
-      if (run.state !== 'waiting_limits') run.nextRetryAt = undefined;
-      this.save(run);
-      if (run.state !== 'waiting_limits') delete run.nextRetryAt;
+      if (run.state === 'waiting_limits') {
+        const parsed = Date.parse(run.error?.retryAt || '');
+        const nextRetry = Number.isFinite(parsed) && parsed > Date.now() ? parsed : Date.now() + 15 * 60 * 1000;
+        run.nextRetryAt = new Date(nextRetry).toISOString();
+      } else {
+        run.nextRetryAt = undefined;
+        if (run.plan && run.pendingPlan) run.pendingPlan = undefined;
+      }
+      const saved = this.save(run);
+      if (saved.state === 'cancelled') {
+        run.state = 'cancelled';
+        delete run.nextRetryAt;
+      } else if (run.state !== 'waiting_limits') {
+        delete run.nextRetryAt;
+      }
+      if (run.pendingPlan === undefined) delete run.pendingPlan;
       this.log(run, run.state, run.error);
       return run;
     } finally {

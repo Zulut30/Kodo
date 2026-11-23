@@ -18,7 +18,7 @@ kodo registry stats [--json]
 
 kodo init [--project PATH]
 kodo doctor [--client codex|claude-code] [--mode quick|standard|deep] [--live] [--json]
-kodo run "TASK" --client codex|claude-code [--model MODEL] [--mode quick|standard|deep] [--providers both] [--prepare] [--no-wait] [--delivery none|pr|release] [--json]
+kodo run "TASK" --client codex|claude-code [--model MODEL] [--mode quick|standard|deep] [--providers both] [--prepare] [--plan FILE] [--no-wait] [--delivery none|pr|release] [--json]
 kodo benchmark run --models MODEL,... [--client codex|claude-code] [--mode quick|standard|deep] [--repeats N] [--seed N] [--output ABSOLUTE_DIR] [--json]
 kodo benchmark resume|report PATH [--json]
 kodo status|logs|cancel RUN_ID [--json]
