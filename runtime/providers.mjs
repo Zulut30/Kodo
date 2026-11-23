@@ -452,7 +452,8 @@ export function parseSessionEvents(
 function checkedSubscription(cache, client, check) {
   if (!(cache instanceof Map)) return check();
   if (!cache.has(client)) {
-    const pending = check();
+    // Always a promise, even for a synchronous check, so a failure can be forgotten below.
+    const pending = Promise.resolve().then(check);
     cache.set(client, pending);
     pending.catch(() => {
       if (cache.get(client) === pending) cache.delete(client);
