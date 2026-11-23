@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { redact, secretFile } from './security.mjs';
 import { validate, validatePlan, planSchema, routingSchema, scopesOverlap } from './contracts.mjs';
@@ -235,10 +236,22 @@ export class EnginePlanning extends EngineCore {
       });
     }
   }
-  async plan(run, planFile, signal) {
+  async plan(run, planInput, signal) {
     await this.policy(run, 'plan');
-    if (planFile) {
-      const candidate = JSON.parse(await readFile(planFile, 'utf8'));
+    if (planInput) {
+      let raw;
+      if (typeof planInput === 'string') {
+        raw = await readFile(planInput, 'utf8');
+      } else {
+        if (
+          typeof planInput?.raw !== 'string' ||
+          typeof planInput?.sha256 !== 'string' ||
+          createHash('sha256').update(planInput.raw).digest('hex') !== planInput.sha256
+        )
+          throw Object.assign(new Error('Повреждён снимок ожидающего плана'), { code: 'evidence_integrity' });
+        raw = planInput.raw;
+      }
+      const candidate = JSON.parse(raw);
       // A broken, oversized or forbidden plan is refused before it can change the mode of the run.
       // Only the task count depends on the mode; it is checked after the mode is settled.
       const legacy = Boolean(run.plan && contentHash(candidate) === contentHash(run.plan));
@@ -253,7 +266,11 @@ export class EnginePlanning extends EngineCore {
       this.validateModePlan(run, candidate, { legacy });
       run.plan = candidate;
       run.planSource = 'host';
+      run.pendingPlan = undefined;
+      run.pendingPrepare = undefined;
       this.save(run);
+      delete run.pendingPlan;
+      delete run.pendingPrepare;
     }
     if (run.plan) {
       this.validateModePlan(run, run.plan, { legacy: true });

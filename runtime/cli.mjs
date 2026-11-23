@@ -57,7 +57,7 @@ export async function runtimeCli(command, args) {
     return;
   }
   const options = { positional: [] };
-  const flags = new Set(['--json', '--live', '--prepare', '--retry-failed']);
+  const flags = new Set(['--json', '--live', '--prepare', '--retry-failed', '--no-wait']);
   const values = new Set([
     '--project',
     '--client',
@@ -83,9 +83,21 @@ export async function runtimeCli(command, args) {
   }
   const allowed = {
     init: ['json', 'project', 'target', 'client'],
-    doctor: ['json', 'live', 'project', 'client'],
-    run: ['json', 'prepare', 'project', 'client', 'model', 'mode', 'concurrency', 'providers', 'plan', 'delivery'],
-    resume: ['json', 'plan', 'retry-failed'],
+    doctor: ['json', 'live', 'project', 'client', 'mode'],
+    run: [
+      'json',
+      'prepare',
+      'no-wait',
+      'project',
+      'client',
+      'model',
+      'mode',
+      'concurrency',
+      'providers',
+      'plan',
+      'delivery',
+    ],
+    resume: ['json', 'plan', 'retry-failed', 'no-wait'],
     status: ['json'],
     logs: ['json'],
     cancel: ['json'],
@@ -229,8 +241,16 @@ export async function runtimeCli(command, args) {
   const secrets = await loadSecrets();
   if (command === 'doctor') {
     if (options.positional.length) throw new Error('doctor не принимает аргументы');
-    const config = await readConfig(project, options.client ? { client: options.client } : {});
-    const checks = await doctorProviders({ secrets, config: { ...config, project }, live: Boolean(options.live) });
+    const config = await readConfig(project, {
+      ...(options.client ? { client: options.client } : {}),
+      ...(options.mode ? { executionMode: options.mode } : {}),
+    });
+    const checks = await doctorProviders({
+      secrets,
+      config: { ...config, project },
+      client: options.client,
+      live: Boolean(options.live),
+    });
     print(redact({ checks }, secrets));
     if (checks.some(check => check.ok === false || check.available === false || check.status === 'error'))
       process.exitCode = 2;
@@ -253,7 +273,8 @@ export async function runtimeCli(command, args) {
       const run = store.getRun(id),
         saved = ['succeeded', 'cancelled'].includes(run.state)
           ? run
-          : store.updateRun(id, { cancelRequested: true, state: 'cancelled' });
+          : store.updateRun(id, { cancelRequested: true, state: 'cancelled', nextRetryAt: undefined });
+      delete saved.nextRetryAt;
       writeProgress(saved, { home: saved.artifacts ? path.resolve(saved.artifacts, '../..') : store.home, secrets });
       print(saved);
       return;
@@ -283,17 +304,35 @@ export async function runtimeCli(command, args) {
         retryFailed: Boolean(options['retry-failed']),
       });
       while (result.state === 'waiting_limits' && !controller.signal.aborted) {
-        const parsed = Date.parse(result.error?.retryAt || '');
+        const parsed = Date.parse(result.nextRetryAt || result.error?.retryAt || '');
         const nextRetry = Number.isFinite(parsed) && parsed > Date.now() ? parsed : Date.now() + 15 * 60 * 1000;
-        store.updateRun(run.id, { nextRetryAt: new Date(nextRetry).toISOString() });
-        if (!options.json) process.stderr.write(`waiting_limits: повтор ${new Date(nextRetry).toISOString()}\n`);
+        const retryAt = new Date(nextRetry).toISOString();
+        if (result.nextRetryAt !== retryAt) {
+          result = store.updateRun(run.id, { nextRetryAt: retryAt }, { preserveCancellation: true });
+          if (result.state !== 'waiting_limits') {
+            delete result.nextRetryAt;
+            break;
+          }
+        }
+        if (options.json || options['no-wait']) {
+          result = { ...result, retryAt };
+          break;
+        }
+        process.stderr.write(`waiting_limits: повтор ${retryAt}\n`);
         while (Date.now() < nextRetry && !controller.signal.aborted && !store.getRun(run.id).cancelRequested)
           await new Promise(resolve => setTimeout(resolve, Math.min(1000, nextRetry - Date.now())));
         result = await engine.run(run.id, {
-          prepare: options.prepare,
-          planFile: options.plan,
+          prepare: options.prepare && !result.plan ? true : undefined,
+          planFile: options.plan && !result.plan && !result.pendingPlan ? options.plan : undefined,
           signal: controller.signal,
         });
+      }
+      if (
+        result.state !== 'waiting_limits' &&
+        (result.nextRetryAt !== undefined || store.getRun(run.id).nextRetryAt !== undefined)
+      ) {
+        result = store.updateRun(run.id, { nextRetryAt: undefined });
+        delete result.nextRetryAt;
       }
       print(redact(result, secrets));
       if (!['succeeded', 'awaiting_plan'].includes(result.state)) process.exitCode = 2;

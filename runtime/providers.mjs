@@ -673,39 +673,43 @@ export async function decideJev({ task, models, node, attempt = 0 }, { secrets =
   }
 }
 
-/** @param {{ secrets?: import('./security.mjs').Secrets, config?: Record<string, any>, live?: boolean, signal?: AbortSignal }} [options] */
-export async function doctorProviders({ secrets = {}, config = {}, live = false, signal } = {}) {
-  const checks = [];
-  for (const client of Object.keys(defaults)) {
-    try {
-      await subscriptionStatus(client);
-      checks.push({ provider: client, ok: true, auth: 'subscription', live: false });
-    } catch (error) {
-      checks.push({ provider: client, ok: false, code: error.code, error: redact(error.message, secrets) });
-    }
-  }
-  for (const [provider, name] of Object.entries({
-    gemini: 'GEMINI_API_KEY',
-    jev: 'TYPESAFE_API_KEY',
-    scrape: 'SCRAPEDO_TOKEN',
-    reddit: 'REDDIT_API_KEY',
-    x: 'GETX_API_KEY',
-  }))
-    checks.push({
-      provider,
-      ok: Boolean(secrets[name]),
-      configured: Boolean(secrets[name]),
-      live: false,
-      ...(!secrets[name] ? { code: 'auth', error: `Не настроен ${name}` } : {}),
-    });
-  if (!live) return checks;
-  for (const client of Object.keys(defaults)) {
-    const check = checks.find(item => item.provider === client);
+const doctorProviderKeys = Object.freeze({
+  gemini: 'GEMINI_API_KEY',
+  jev: 'TYPESAFE_API_KEY',
+  scrape: 'SCRAPEDO_TOKEN',
+  reddit: 'REDDIT_API_KEY',
+  x: 'GETX_API_KEY',
+});
+
+function requiredProviderKeys(config = {}) {
+  const uiTools =
+    config.uiVerification?.enabled && Array.isArray(config.uiVerification.cases)
+      ? config.uiVerification.cases.map(item => item?.tool)
+      : [];
+  const uiNeedsGemini = uiTools.some(tool => ['browser-use', 'vibetest', 'jev-ultrafast'].includes(tool));
+  return {
+    gemini: ['standard', 'deep'].includes(config.executionMode) || uiNeedsGemini,
+    jev: uiTools.includes('jev-ultrafast'),
+    scrape: false,
+    reddit: false,
+    x: false,
+  };
+}
+
+const doctorResearchSources = Object.freeze({
+  scrape: ['github', 'hackernews', 'docs'],
+  reddit: ['reddit'],
+  x: ['x'],
+});
+
+async function doctorLiveProviders(checks, { clients, secrets, config, signal }, deps) {
+  for (const selected of clients) {
+    const check = checks.find(item => item.provider === selected);
     if (!check.ok) continue;
     try {
-      const result = await runSession({
-        client,
-        model: config.primaryModels?.[client] || defaults[client][0],
+      const result = await (deps.runSessionImpl || runSession)({
+        client: selected,
+        model: config.primaryModels?.[selected] || defaults[selected][0],
         cwd: config.project || process.cwd(),
         prompt: 'Return only {"ok":true}. Do not use tools, read files or change anything.',
         schema: { type: 'object', properties: { ok: { const: true } }, required: ['ok'], additionalProperties: false },
@@ -713,15 +717,21 @@ export async function doctorProviders({ secrets = {}, config = {}, live = false,
         timeoutMs: 120000,
         signal,
       });
-      Object.assign(check, { live: true, model: result.model, sessionId: result.sessionId });
+      Object.assign(check, { live: true, status: 'ok', ok: true, model: result.model, sessionId: result.sessionId });
     } catch (error) {
-      Object.assign(check, { ok: false, live: true, code: error.code, error: redact(error.message, secrets) });
+      Object.assign(check, {
+        ok: false,
+        status: 'error',
+        live: true,
+        code: error.code,
+        error: redact(error.message, secrets),
+      });
     }
   }
   const gemini = checks.find(item => item.provider === 'gemini');
-  if (gemini.ok) {
+  if (gemini.configured) {
     try {
-      const result = await analyzeGemini(
+      const result = await (deps.analyzeGeminiImpl || analyzeGemini)(
         {
           task: 'Check connectivity only. Analyze the provided tiny text, do not infer any repository.',
           files: [{ path: 'health.txt', content: 'Kodo provider connectivity check.' }],
@@ -729,44 +739,108 @@ export async function doctorProviders({ secrets = {}, config = {}, live = false,
         },
         { secrets },
       );
-      Object.assign(gemini, { live: true, model: result.model });
+      Object.assign(gemini, { live: true, status: 'ok', ok: true, model: result.model });
     } catch (error) {
-      Object.assign(gemini, { ok: false, live: true, code: error.code, error: redact(error.message, secrets) });
+      Object.assign(gemini, {
+        ok: false,
+        status: 'error',
+        live: true,
+        code: error.code,
+        error: redact(error.message, secrets),
+      });
     }
   }
   const jev = checks.find(item => item.provider === 'jev');
-  if (jev.ok) {
-    const result = await decideJev(
+  if (jev.configured) {
+    const primaryClient = clients[0];
+    const primaryModel = config.primaryModels?.[primaryClient] || defaults[primaryClient][0];
+    const result = await (deps.decideJevImpl || decideJev)(
       {
         task: 'Connectivity check',
         node: { id: 'health', writeScope: [] },
-        models: [{ id: 'codex:gpt-6.1-sol', client: 'codex', model: 'gpt-6.1-sol', available: true }],
+        models: [
+          { id: `${primaryClient}:${primaryModel}`, client: primaryClient, model: primaryModel, available: true },
+        ],
       },
       { secrets },
     );
     Object.assign(jev, {
       ok: !result.fallback,
+      status: result.fallback ? 'error' : 'ok',
       live: true,
       model: result.jevModel,
       ...(result.fallback ? { error: result.reason } : {}),
     });
   }
-  // Read-only service health uses the same bounded search path as real runs.
-  const { research } = await import('./research.mjs');
-  const result = await research({ task: 'nodejs sqlite library', budget: 5, signal }, { secrets });
-  for (const [provider, sources] of Object.entries({
-    scrape: ['github', 'hackernews', 'docs'],
-    reddit: ['reddit'],
-    x: ['x'],
-  })) {
-    const check = checks.find(item => item.provider === provider);
-    if (!check.configured) continue;
-    const errors = result.errors.filter(error => sources.includes(error.source));
-    Object.assign(check, {
-      live: true,
-      ok: errors.length === 0,
-      ...(errors.length ? { error: errors.map(error => error.error).join('; ') } : {}),
+  if (
+    Object.keys(doctorResearchSources).some(provider => checks.find(item => item.provider === provider)?.configured)
+  ) {
+    // Read-only service health uses the same bounded search path as real runs.
+    const researchFn = deps.researchImpl || (await import('./research.mjs')).research;
+    const result = await researchFn({ task: 'nodejs sqlite library', budget: 5, signal }, { secrets });
+    for (const [provider, sources] of Object.entries(doctorResearchSources)) {
+      const check = checks.find(item => item.provider === provider);
+      if (!check.configured) continue;
+      const errors = result.errors.filter(error => sources.includes(error.source));
+      Object.assign(check, {
+        live: true,
+        ok: errors.length === 0,
+        status: errors.length === 0 ? 'ok' : 'error',
+        ...(errors.length ? { error: errors.map(error => error.error).join('; ') } : {}),
+      });
+    }
+  }
+}
+
+/**
+ * @param {{ secrets?: import('./security.mjs').Secrets, config?: Record<string, any>, client?: string, live?: boolean, signal?: AbortSignal }} [options]
+ * @param {{
+ *   subscriptionStatusImpl?: (client: string) => Promise<any>,
+ *   runSessionImpl?: typeof runSession,
+ *   analyzeGeminiImpl?: typeof analyzeGemini,
+ *   decideJevImpl?: typeof decideJev,
+ *   researchImpl?: Function,
+ * }} [deps]
+ */
+export async function doctorProviders({ secrets = {}, config = {}, client, live = false, signal } = {}, deps = {}) {
+  const clients = client ? [client] : Object.keys(defaults);
+  for (const selected of clients)
+    if (!Object.hasOwn(defaults, selected)) throw new Error(`Неизвестный клиент: ${selected}`);
+  const checkSubscription = deps.subscriptionStatusImpl || (selected => subscriptionStatus(selected));
+  const checks = [];
+  for (const selected of clients) {
+    try {
+      await checkSubscription(selected);
+      checks.push({ provider: selected, required: true, status: 'ok', ok: true, auth: 'subscription', live: false });
+    } catch (error) {
+      checks.push({
+        provider: selected,
+        required: true,
+        status: 'error',
+        ok: false,
+        code: error.code,
+        error: redact(error.message, secrets),
+      });
+    }
+  }
+  const requiredKeys = requiredProviderKeys(config);
+  for (const [provider, name] of Object.entries(doctorProviderKeys)) {
+    const configured = Boolean(secrets[name]);
+    const required = Boolean(requiredKeys[provider]);
+    checks.push({
+      provider,
+      required,
+      status: configured ? 'ok' : required ? 'error' : 'warning',
+      ok: configured || !required,
+      configured,
+      live: false,
+      ...(!configured
+        ? required
+          ? { code: 'auth', error: `Не настроен ${name}` }
+          : { code: 'auth', warning: `Не настроен ${name} (необязателен для выбранного маршрута)` }
+        : {}),
     });
   }
+  if (live) await doctorLiveProviders(checks, { clients, secrets, config, signal }, deps);
   return checks;
 }
