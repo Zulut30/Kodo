@@ -20,6 +20,9 @@ const priority = [
   // timeout holds 13 of its 14 cases, 1008474.9099 ms in sum, a lower bound for the file. The longest
   // observed file starts first; at its old place after ~26 heavy files it ended the Windows check last.
   'tests/project-wave-director.test.mjs', // >=1008474.9099 ms (13/14 cases, CI)
+  // The same drain workload: one local Windows run (Node 24.19.0) took 486979.1258 ms against the
+  // director's 496030.1322 ms in the same conditions, so about as long on CI. An estimate, not a receipt.
+  'tests/project-wave-e2e.test.mjs', // ~486979 ms local
   'tests/delivery.test.mjs', // 434779.5897 ms
   'tests/project-director.test.mjs', // 375928.3714 ms
   'tests/architecture-gate-integration.test.mjs', // 314342.0235 ms
@@ -52,8 +55,6 @@ const priority = [
   'tests/engine-fast-profile.test.mjs', // ~38000 ms
   // External pull protocol: one local Windows run (Node 24), not a receipt and no speed claim.
   'tests/project-external.test.mjs', // ~69000 ms
-  // Wave end to end (drain, T3 pull path, reservation ownership): one local Windows run (Node 24), not a receipt.
-  'tests/project-wave-e2e.test.mjs', // ~165000 ms
   // Project factory CLI: sum of case durations from one local Windows run (Node 24), not a receipt.
   'tests/project-cli-blueprint.test.mjs', // ~16000 ms
   // Factory end to end (apply-spec, drain, append-milestone, drain): one local Windows run (Node 24), not a receipt.
