@@ -80,6 +80,20 @@ Engine.prototype.run=async function(id,options){
       const value = JSON.parse(result.stdout);
       assert.equal(value.state, prepare ? 'awaiting_plan' : 'succeeded');
       assert.equal(value.retryConfirmed, true);
+      assert.equal(value.nextRetryAt, undefined);
+      const status = spawnSync(process.execPath, [path.join(root, 'cli/index.mjs'), 'status', value.id, '--json'], {
+        cwd: directory,
+        encoding: 'utf8',
+        windowsHide: true,
+        timeout: 30000,
+        env: {
+          ...process.env,
+          KODO_HOME: path.join(directory, 'state'),
+          KODO_CREDENTIAL_HOME: path.join(directory, 'credentials'),
+        },
+      });
+      assert.equal(status.status, 0, status.stderr);
+      assert.equal(Object.hasOwn(JSON.parse(status.stdout), 'nextRetryAt'), false);
     });
 });
 
@@ -200,4 +214,180 @@ test('CLI rejects --no-wait on non-waiting commands', async t => {
   });
   assert.equal(result.status, 1);
   assert.match(result.stderr, /неприменим/i);
+});
+
+test('Two-process resume after waiting_limits preserves --prepare and --plan intent and clears nextRetryAt', async t => {
+  await t.test('run --prepare --json -> waiting_limits -> resume --json -> awaiting_plan', async subtest => {
+    const directory = await makeRepo(subtest);
+    const env = {
+      ...process.env,
+      KODO_HOME: path.join(directory, 'state'),
+      KODO_CREDENTIAL_HOME: path.join(directory, 'credentials'),
+    };
+    const quotaHook = path.join(directory, 'prepare-quota-hook.mjs');
+    await writeFile(
+      quotaHook,
+      `import { Engine } from ${JSON.stringify(pathToFileURL(path.join(root, 'runtime/engine.mjs')).href)};
+Engine.prototype.prepare = async function () {
+  throw Object.assign(new Error('quota during prepare'), { code: 'quota', retryAt: '2099-01-01T00:00:00.000Z' });
+};\n`,
+    );
+    const first = spawnSync(
+      process.execPath,
+      [
+        '--import',
+        pathToFileURL(quotaHook).href,
+        path.join(root, 'cli/index.mjs'),
+        'run',
+        'fixture prepare task',
+        '--project',
+        directory,
+        '--mode',
+        'quick',
+        '--prepare',
+        '--json',
+      ],
+      { cwd: directory, encoding: 'utf8', windowsHide: true, timeout: 30000, env },
+    );
+    assert.equal(first.status, 2, first.stderr);
+    const paused = JSON.parse(first.stdout);
+    assert.equal(paused.state, 'waiting_limits');
+    assert.equal(paused.retryAt, '2099-01-01T00:00:00.000Z');
+
+    const resumeHook = path.join(directory, 'prepare-resume-hook.mjs');
+    await writeFile(
+      resumeHook,
+      `import { Engine } from ${JSON.stringify(pathToFileURL(path.join(root, 'runtime/engine.mjs')).href)};
+Engine.prototype.selectModels = async function () {
+  throw new Error('must_not_run_planner_after_prepare');
+};
+Engine.prototype.plan = async function () {
+  throw new Error('must_not_run_planner_after_prepare');
+};\n`,
+    );
+    const second = spawnSync(
+      process.execPath,
+      ['--import', pathToFileURL(resumeHook).href, path.join(root, 'cli/index.mjs'), 'resume', paused.id, '--json'],
+      { cwd: directory, encoding: 'utf8', windowsHide: true, timeout: 30000, env },
+    );
+    assert.equal(second.status, 0, second.stderr || second.stdout);
+    const resumed = JSON.parse(second.stdout);
+    assert.equal(resumed.state, 'awaiting_plan');
+    assert.equal(Object.hasOwn(resumed, 'nextRetryAt'), false);
+
+    const status = spawnSync(process.execPath, [path.join(root, 'cli/index.mjs'), 'status', paused.id, '--json'], {
+      cwd: directory,
+      encoding: 'utf8',
+      windowsHide: true,
+      timeout: 30000,
+      env,
+    });
+    assert.equal(status.status, 0, status.stderr);
+    const stored = JSON.parse(status.stdout);
+    assert.equal(stored.state, 'awaiting_plan');
+    assert.equal(Object.hasOwn(stored, 'nextRetryAt'), false);
+  });
+
+  await t.test(
+    'run --plan --json -> waiting_limits before plan saved -> resume --json applies host plan',
+    async subtest => {
+      const directory = await makeRepo(subtest);
+      const env = {
+        ...process.env,
+        KODO_HOME: path.join(directory, 'state'),
+        KODO_CREDENTIAL_HOME: path.join(directory, 'credentials'),
+      };
+      const planFile = path.join(directory, 'host-plan.json');
+      await writeFile(
+        planFile,
+        JSON.stringify({
+          summary: 'fixture host plan',
+          tasks: [
+            {
+              id: 't1',
+              role: 'developer',
+              description: 'Update baseline',
+              dependsOn: [],
+              writePaths: ['baseline.txt'],
+              acceptance: ['baseline updated'],
+              parallel: false,
+            },
+          ],
+        }),
+      );
+      const quotaHook = path.join(directory, 'plan-quota-hook.mjs');
+      await writeFile(
+        quotaHook,
+        `import { Engine } from ${JSON.stringify(pathToFileURL(path.join(root, 'runtime/engine.mjs')).href)};
+Engine.prototype.selectModels = async function () {
+  throw Object.assign(new Error('quota before plan'), { code: 'quota', retryAt: '2099-01-01T00:00:00.000Z' });
+};\n`,
+      );
+      const first = spawnSync(
+        process.execPath,
+        [
+          '--import',
+          pathToFileURL(quotaHook).href,
+          path.join(root, 'cli/index.mjs'),
+          'run',
+          'fixture plan task',
+          '--project',
+          directory,
+          '--mode',
+          'quick',
+          '--plan',
+          planFile,
+          '--json',
+        ],
+        { cwd: directory, encoding: 'utf8', windowsHide: true, timeout: 30000, env },
+      );
+      assert.equal(first.status, 2, first.stderr);
+      const paused = JSON.parse(first.stdout);
+      assert.equal(paused.state, 'waiting_limits');
+      assert.equal(paused.plan, undefined);
+
+      const resumeHook = path.join(directory, 'plan-resume-hook.mjs');
+      await writeFile(
+        resumeHook,
+        `import { Engine } from ${JSON.stringify(pathToFileURL(path.join(root, 'runtime/engine.mjs')).href)};
+Engine.prototype.selectModels = async function (run) {
+  run.models = [{ id: 'codex:gpt-6.1-sol', client: 'codex', model: 'gpt-6.1-sol', available: true }];
+  this.save(run);
+  return run.models;
+};
+Engine.prototype.session = async function () {
+  throw new Error('must_not_invoke_native_planner');
+};
+Engine.prototype.baseline = async function () {};
+Engine.prototype.executeTasks = async function (run) {
+  run.nodes.t1 = { id: 't1', status: 'integrated' };
+};
+Engine.prototype.recoverIntegrationEdits = async function () {};
+Engine.prototype.verify = async function () {};\n`,
+      );
+      const second = spawnSync(
+        process.execPath,
+        ['--import', pathToFileURL(resumeHook).href, path.join(root, 'cli/index.mjs'), 'resume', paused.id, '--json'],
+        { cwd: directory, encoding: 'utf8', windowsHide: true, timeout: 30000, env },
+      );
+      assert.equal(second.status, 0, second.stderr || second.stdout);
+      const resumed = JSON.parse(second.stdout);
+      assert.equal(resumed.state, 'succeeded');
+      assert.equal(resumed.planSource, 'host');
+      assert.equal(resumed.plan?.summary, 'fixture host plan');
+      assert.equal(Object.hasOwn(resumed, 'nextRetryAt'), false);
+
+      const status = spawnSync(process.execPath, [path.join(root, 'cli/index.mjs'), 'status', paused.id, '--json'], {
+        cwd: directory,
+        encoding: 'utf8',
+        windowsHide: true,
+        timeout: 30000,
+        env,
+      });
+      assert.equal(status.status, 0, status.stderr);
+      const stored = JSON.parse(status.stdout);
+      assert.equal(stored.state, 'succeeded');
+      assert.equal(Object.hasOwn(stored, 'nextRetryAt'), false);
+    },
+  );
 });

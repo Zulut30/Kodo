@@ -1085,7 +1085,7 @@ test('doctorProviders checks only the selected client and warns on missing optio
   assert.equal(byProvider['claude-code'].required, true);
   assert.equal(byProvider.gemini.ok, true);
   assert.equal(byProvider.gemini.status, 'ok');
-  assert.equal(byProvider.gemini.required, true);
+  assert.equal(byProvider.gemini.required, false);
   for (const optional of ['jev', 'scrape', 'reddit', 'x']) {
     assert.equal(byProvider[optional].ok, true, optional);
     assert.equal(byProvider[optional].status, 'warning', optional);
@@ -1095,17 +1095,30 @@ test('doctorProviders checks only the selected client and warns on missing optio
   }
 });
 
-test('doctorProviders treats missing required route keys as errors and relaxes Gemini in quick mode', async () => {
+test('doctorProviders requires Gemini only for explicit standard/deep or model UI gates, warning in auto and quick', async () => {
   const subscriptionStatusImpl = async selected => ({ client: selected, available: true, auth: 'subscription' });
-  const standardMissing = await doctorProviders(
+  const autoMissing = await doctorProviders(
     { client: 'codex', secrets: {}, config: { client: 'codex' } },
     { subscriptionStatusImpl },
   );
-  const stdGemini = standardMissing.find(item => item.provider === 'gemini');
-  assert.equal(stdGemini.ok, false);
-  assert.equal(stdGemini.status, 'error');
-  assert.equal(stdGemini.required, true);
-  assert.equal(stdGemini.code, 'auth');
+  for (const provider of ['gemini', 'jev', 'scrape', 'reddit', 'x']) {
+    const check = autoMissing.find(item => item.provider === provider);
+    assert.equal(check.ok, true, `auto:${provider}`);
+    assert.equal(check.status, 'warning', `auto:${provider}`);
+    assert.equal(check.required, false, `auto:${provider}`);
+  }
+
+  for (const mode of ['standard', 'deep']) {
+    const explicitMissing = await doctorProviders(
+      { client: 'codex', secrets: {}, config: { client: 'codex', executionMode: mode } },
+      { subscriptionStatusImpl },
+    );
+    const gemini = explicitMissing.find(item => item.provider === 'gemini');
+    assert.equal(gemini.ok, false, mode);
+    assert.equal(gemini.status, 'error', mode);
+    assert.equal(gemini.required, true, mode);
+    assert.equal(gemini.code, 'auth', mode);
+  }
 
   const quickMissing = await doctorProviders(
     { client: 'codex', secrets: {}, config: { client: 'codex', executionMode: 'quick' } },
@@ -1142,7 +1155,6 @@ test('doctorProviders treats missing required route keys as errors and relaxes G
       secrets: {},
       config: {
         client: 'codex',
-        executionMode: 'quick',
         uiVerification: { enabled: true, cases: [{ id: 'ui', tool: 'browser-use' }] },
       },
     },

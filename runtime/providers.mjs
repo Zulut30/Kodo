@@ -688,7 +688,7 @@ function requiredProviderKeys(config = {}) {
       : [];
   const uiNeedsGemini = uiTools.some(tool => ['browser-use', 'vibetest', 'jev-ultrafast'].includes(tool));
   return {
-    gemini: config.executionMode !== 'quick' || uiNeedsGemini,
+    gemini: ['standard', 'deep'].includes(config.executionMode) || uiNeedsGemini,
     jev: uiTools.includes('jev-ultrafast'),
     scrape: false,
     reddit: false,

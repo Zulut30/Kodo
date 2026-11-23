@@ -157,9 +157,26 @@ export class Engine extends EngineVerification {
       validateCommandTimeouts(run.config.commands);
       normalizeArchitectureConfig(run.config.architecture);
       this.checkCancelled(run, signal);
+      const hadNextRetryAt = Object.hasOwn(run, 'nextRetryAt');
+      if (hadNextRetryAt) run.nextRetryAt = undefined;
+      if (planFile) {
+        run.pendingPlanFile = path.resolve(planFile);
+        run.pendingPrepare = undefined;
+      } else if (prepare && !run.plan) {
+        run.pendingPrepare = true;
+      }
+      if (hadNextRetryAt || planFile || (prepare && !run.plan)) {
+        this.save(run);
+        delete run.nextRetryAt;
+        if (run.pendingPrepare === undefined) delete run.pendingPrepare;
+      }
+      const effectivePlanFile = planFile ? path.resolve(planFile) : run.pendingPlanFile;
+      const shouldPrepare = Boolean((prepare || run.pendingPrepare) && !effectivePlanFile && !run.plan);
       await this.prepare(run, signal);
-      if (prepare && !run.plan) {
+      if (shouldPrepare && !run.plan) {
         run.state = 'awaiting_plan';
+        run.pendingPrepare = undefined;
+        run.nextRetryAt = undefined;
         run.planningContext = await this.preparePlanningContext(run);
         await writeFile(path.join(run.artifacts, 'plan-context.md'), run.planningContext);
         await writeFile(
@@ -177,6 +194,8 @@ export class Engine extends EngineVerification {
           ),
         );
         this.save(run);
+        delete run.pendingPrepare;
+        delete run.nextRetryAt;
         return run;
       }
       if (run.verification?.stopped)
@@ -202,7 +221,7 @@ export class Engine extends EngineVerification {
         }
       }
       if (!run.delivery?.mergeCommit) await this.selectModels(run);
-      await this.plan(run, planFile, signal);
+      await this.plan(run, effectivePlanFile, signal);
       await this.assertProjectPlan(run);
       if (!run.delivery?.mergeCommit) {
         if (!run.completed.implementation) {
@@ -307,9 +326,15 @@ export class Engine extends EngineVerification {
       if (!run.release?.published) this.checkCancelled(run, signal);
       run.state = 'succeeded';
       run.error = null;
+      run.nextRetryAt = undefined;
+      run.pendingPrepare = undefined;
+      run.pendingPlanFile = undefined;
       run.blocker = resolveBlocker(run.blocker, { at: new Date().toISOString(), outcome: 'succeeded' });
       this.deliverySummary(run);
       this.save(run);
+      delete run.nextRetryAt;
+      delete run.pendingPrepare;
+      delete run.pendingPlanFile;
       this.log(run, 'succeeded', { headSha: run.headSha, pr: run.delivery?.pr, release: run.release });
       await this.policy(run, 'complete');
       run.knowledge = this.store.remember(run);
@@ -335,7 +360,9 @@ export class Engine extends EngineVerification {
       };
       this.deliverySummary(run);
       if (['blocked', 'waiting_limits'].includes(run.state)) run.blocker = currentBlocker(run, error);
+      if (run.state !== 'waiting_limits') run.nextRetryAt = undefined;
       this.save(run);
+      if (run.state !== 'waiting_limits') delete run.nextRetryAt;
       this.log(run, run.state, run.error);
       return run;
     } finally {

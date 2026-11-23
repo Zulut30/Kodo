@@ -107,15 +107,29 @@ test('kodo doctor --client X checks only X and exits 0 when optional research/Je
   }
 });
 
-test('kodo doctor exits 2 when a required route key or selected client is unavailable, and exits 0 in quick mode', async t => {
+test('kodo doctor warns on missing Gemini in auto/quick mode and exits 2 for explicit standard/deep or unavailable client', async t => {
   const directory = await makeFixture(t);
   const hook = await writeDoctorHook(directory, { loggedInClients: ['claude-code'] });
 
-  const missingGemini = runDoctor(directory, ['--client', 'claude-code', '--json'], { hook });
-  assert.equal(missingGemini.status, 2, missingGemini.stdout);
-  const missingChecks = JSON.parse(missingGemini.stdout).checks;
-  assert.equal(missingChecks.find(item => item.provider === 'gemini').status, 'error');
-  assert.equal(missingChecks.find(item => item.provider === 'gemini').required, true);
+  const autoOk = runDoctor(directory, ['--client', 'claude-code', '--json'], { hook });
+  assert.equal(autoOk.status, 0, autoOk.stderr || autoOk.stdout);
+  const autoChecks = JSON.parse(autoOk.stdout).checks;
+  assert.equal(autoChecks.find(item => item.provider === 'gemini').status, 'warning');
+  assert.equal(autoChecks.find(item => item.provider === 'gemini').required, false);
+
+  for (const mode of ['standard', 'deep']) {
+    const explicitMissing = runDoctor(directory, ['--client', 'claude-code', '--mode', mode, '--json'], { hook });
+    assert.equal(explicitMissing.status, 2, `${mode}: ${explicitMissing.stdout}`);
+    const checks = JSON.parse(explicitMissing.stdout).checks;
+    assert.equal(checks.find(item => item.provider === 'gemini').status, 'error', mode);
+    assert.equal(checks.find(item => item.provider === 'gemini').required, true, mode);
+  }
+
+  const projectStandardDir = await makeFixture(t, { config: { executionMode: 'standard' } });
+  const projectHook = await writeDoctorHook(projectStandardDir, { loggedInClients: ['claude-code'] });
+  const projectStandard = runDoctor(projectStandardDir, ['--client', 'claude-code', '--json'], { hook: projectHook });
+  assert.equal(projectStandard.status, 2, projectStandard.stdout);
+  assert.equal(JSON.parse(projectStandard.stdout).checks.find(item => item.provider === 'gemini').status, 'error');
 
   const quickOk = runDoctor(directory, ['--client', 'claude-code', '--mode', 'quick', '--json'], { hook });
   assert.equal(quickOk.status, 0, quickOk.stderr || quickOk.stdout);
@@ -128,11 +142,38 @@ test('kodo doctor exits 2 when a required route key or selected client is unavai
   assert.equal(JSON.parse(missingClient.stdout).checks.find(item => item.provider === 'codex').status, 'error');
 });
 
-test('kodo-build-feature SKILL.md uses resume --plan --json, report --json and documents delivery none branch transfer', async () => {
+test('kodo-build-feature SKILL.md uses doctor with project/mode, resume --plan --json, report --json and merge-only delivery none transfer', async () => {
   const skill = await readFile(path.join(root, 'skills/kodo-build-feature/SKILL.md'), 'utf8');
+  assert.match(skill, /kodo doctor [^\n]*--client <client>[^\n]*--project <[^>]+>[^\n]*--mode[^\n]*--json/);
   assert.match(skill, /kodo resume <runId> --plan [^\n]+ --json/);
   assert.match(skill, /kodo report <runId> --json/);
   assert.doesNotMatch(skill, /через `status` и `logs`/);
-  assert.match(skill, /kodo\/<runId>/);
+  assert.match(skill, /git merge kodo\/<runId>/);
+  assert.doesNotMatch(skill, /cherry-pick/i);
   assert.match(skill, /delivery.*none|--delivery none/i);
+});
+
+test('CLI help documents run --json and standalone resume --no-wait and rejects extra help arguments', () => {
+  const helpResult = spawnSync(process.execPath, [path.join(root, 'cli/index.mjs'), '--help'], {
+    encoding: 'utf8',
+    windowsHide: true,
+    timeout: 15000,
+  });
+  assert.equal(helpResult.status, 0, helpResult.stderr);
+  assert.match(helpResult.stdout, /^kodo run [^\n]*--no-wait[^\n]*--json/m);
+  assert.match(helpResult.stdout, /^kodo resume RUN_ID \[--plan FILE\][^\n]*\[--no-wait\][^\n]*\[--json\]/m);
+
+  for (const args of [
+    ['help', '--no-wait'],
+    ['--help', '--no-wait'],
+    ['-h', 'extra'],
+  ]) {
+    const bad = spawnSync(process.execPath, [path.join(root, 'cli/index.mjs'), ...args], {
+      encoding: 'utf8',
+      windowsHide: true,
+      timeout: 15000,
+    });
+    assert.equal(bad.status, 1, args.join(' '));
+    assert.match(bad.stderr, /^Ошибка:/);
+  }
 });

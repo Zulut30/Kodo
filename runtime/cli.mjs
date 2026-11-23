@@ -273,7 +273,8 @@ export async function runtimeCli(command, args) {
       const run = store.getRun(id),
         saved = ['succeeded', 'cancelled'].includes(run.state)
           ? run
-          : store.updateRun(id, { cancelRequested: true, state: 'cancelled' });
+          : store.updateRun(id, { cancelRequested: true, state: 'cancelled', nextRetryAt: undefined });
+      delete saved.nextRetryAt;
       writeProgress(saved, { home: saved.artifacts ? path.resolve(saved.artifacts, '../..') : store.home, secrets });
       print(saved);
       return;
@@ -319,6 +320,13 @@ export async function runtimeCli(command, args) {
           planFile: options.plan,
           signal: controller.signal,
         });
+      }
+      if (
+        result.state !== 'waiting_limits' &&
+        (result.nextRetryAt !== undefined || store.getRun(run.id).nextRetryAt !== undefined)
+      ) {
+        result = store.updateRun(run.id, { nextRetryAt: undefined });
+        delete result.nextRetryAt;
       }
       print(redact(result, secrets));
       if (!['succeeded', 'awaiting_plan'].includes(result.state)) process.exitCode = 2;

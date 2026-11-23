@@ -253,7 +253,11 @@ export class EnginePlanning extends EngineCore {
       this.validateModePlan(run, candidate, { legacy });
       run.plan = candidate;
       run.planSource = 'host';
+      run.pendingPlanFile = undefined;
+      run.pendingPrepare = undefined;
       this.save(run);
+      delete run.pendingPlanFile;
+      delete run.pendingPrepare;
     }
     if (run.plan) {
       this.validateModePlan(run, run.plan, { legacy: true });
