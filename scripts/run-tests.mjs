@@ -10,19 +10,19 @@ import { readdirSync, lstatSync } from 'node:fs';
 const extensions = process.features.typescript ? 'js,mjs,cjs,ts,mts,cts' : 'js,mjs,cjs';
 const defaultPattern = `**/{test,test/**/*,test-*,*[._-]test}.{${extensions}}`;
 
-// Source821 Windows/Node24.22.1 receipt c9b54c3c: all completed files >=90000 ms
-// in descending durationMs, not reporter delivery order. Static observations,
-// not runtime weights; environment/overlap differ and no speedup is implied.
-// Scheduling has only a case-work lower bound; retain lighter prior entries.
-// See docs/archive/WINDOWS-TEST-SPEED.md for provenance and the incomplete full check.
 const priority = [
-  // GitHub Actions Windows check, run 44577524507 (Node 24, concurrency 4): the TAP tail before the L2
-  // timeout holds 13 of its 14 cases, 1008474.9099 ms in sum, a lower bound for the file. The longest
-  // observed file starts first; at its old place after ~26 heavy files it ended the Windows check last.
+  // LPT heuristic from the data available before a full Windows CI measurement, not an observed
+  // completion order. project-wave-director: GitHub Actions Windows run 44577524507 (Node 24,
+  // concurrency 4), 13 of its 14 cases in the TAP tail before the L2 timeout, 1008474.9099 ms in sum,
+  // a lower bound for the file. project-wave-e2e: one local Windows run (Node 24.19.0), 486979.1258 ms
+  // against the director's 496030.1322 ms in the same conditions; no CI observation.
   'tests/project-wave-director.test.mjs', // >=1008474.9099 ms (13/14 cases, CI)
-  // The same drain workload: one local Windows run (Node 24.19.0) took 486979.1258 ms against the
-  // director's 496030.1322 ms in the same conditions, so about as long on CI. An estimate, not a receipt.
-  'tests/project-wave-e2e.test.mjs', // ~486979 ms local
+  'tests/project-wave-e2e.test.mjs', // 486979.1258 ms (local)
+  // Source821 Windows/Node24.22.1 receipt c9b54c3c: all completed files >=90000 ms
+  // in descending durationMs, not reporter delivery order. Static observations,
+  // not runtime weights; environment/overlap differ and no speedup is implied.
+  // Scheduling has only a case-work lower bound; retain lighter prior entries.
+  // See docs/archive/WINDOWS-TEST-SPEED.md for provenance and the incomplete full check.
   'tests/delivery.test.mjs', // 434779.5897 ms
   'tests/project-director.test.mjs', // 375928.3714 ms
   'tests/architecture-gate-integration.test.mjs', // 314342.0235 ms

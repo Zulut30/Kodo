@@ -160,23 +160,13 @@ test('Scheduler orders observed file durations longest first and retains every d
   assert.deepEqual(orderTests([...input].reverse(), temp), expected);
 });
 
-test('Scheduler starts the two wave drain files, the longest on Windows CI, before every other file', async () => {
-  const { orderTests } = await import(scheduleUrl);
-  const cwd = path.join(os.tmpdir(), 'kodo-test-order-unused');
-  // GitHub Actions Windows run 44577524507: 13 of the 14 project-wave-director cases took
-  // 1008474.9099 ms, more than any other observed file; project-wave-e2e took as long locally.
-  // Started late, either one ends the whole check last.
-  const files = [
-    'tests/a-unobserved.test.mjs',
-    'tests/engine-fast-profile.test.mjs',
-    'tests/project-wave-e2e.test.mjs',
-    'tests/delivery.test.mjs',
-    'tests/project-director.test.mjs',
-    'tests/project-wave-director.test.mjs',
-  ];
-  const ordered = orderTests(files, cwd).map(file => path.relative(cwd, file).replaceAll('\\', '/'));
+test('Scheduler starts the two wave drain files first in the real discovered suite', async () => {
+  const { discoverTests } = await import(scheduleUrl);
+  // LPT heuristic from the data available before a full Windows CI measurement, not an observed
+  // completion order: 13 of the 14 project-wave-director cases took 1008474.9099 ms in Windows run
+  // 44577524507, and project-wave-e2e took as long as the director in one local Windows run.
+  const ordered = discoverTests(root).map(file => path.relative(root, file).replaceAll('\\', '/'));
   assert.deepEqual(ordered.slice(0, 2), ['tests/project-wave-director.test.mjs', 'tests/project-wave-e2e.test.mjs']);
-  assert.deepEqual([...ordered].sort(), [...files].sort());
 });
 
 test(
