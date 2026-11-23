@@ -224,8 +224,11 @@ export class EnginePlanning extends EngineCore {
       if (run.config.researchBudget > 0) await this.moreResearch(run, analysis.researchQuery || run.task, signal);
       run.analysis = { ...analysis, omitted: bundle.omitted, priorLessons: this.store.lessons(run.project), standards };
       run.completed.analysis = { baseSha: run.baseSha, inputHash: contentHash(bundle.files) };
-      run.analysisEvidence = await this.persistEvidence(run, 'analysis', run.analysis, { headSha: run.baseSha });
-      run.researchEvidence = await this.persistEvidence(run, 'research', run.research, { headSha: run.baseSha });
+      // Back-to-back writes with no worker or project command between them: one protected batch.
+      [run.analysisEvidence, run.researchEvidence] = await this.withEvidenceBatch(run, async persist => [
+        await persist('analysis', run.analysis, { headSha: run.baseSha }),
+        await persist('research', run.research, { headSha: run.baseSha }),
+      ]);
       this.save(run);
       this.log(run, 'analyzed', {
         model: analysis.model,
