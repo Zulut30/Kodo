@@ -376,10 +376,22 @@ export class EngineExecution extends EnginePlanning {
       const fastPath = run.executionMode?.source === 'fast-path';
       const merged = mergeInProgress
         ? { code: 1 }
-        : await execute('git', ['merge', '--no-ff', ...(fastPath ? ['--no-commit'] : []), '--no-edit', node.headSha], {
-            cwd: run.cwd,
-            allowFailure: true,
-          });
+        : await execute(
+            'git',
+            // The subject stays the one of a branch merge: queues and reports recognise merges by it.
+            [
+              'merge',
+              '--no-ff',
+              ...(fastPath ? ['--no-commit'] : []),
+              '-m',
+              `Merge branch '${node.branch}'`,
+              node.headSha,
+            ],
+            {
+              cwd: run.cwd,
+              allowFailure: true,
+            },
+          );
       if (merged.code || fastPath) {
         const conflicts = (await git(run.cwd, ['diff', '--name-only', '--diff-filter=U'])).split('\n').filter(Boolean);
         const pending =

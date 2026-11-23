@@ -131,7 +131,8 @@ async function stopOwnedTree(child) {
         $rootProcess = $owned | Where-Object { $_.Id -eq $root } | Select-Object -First 1
         $taskkill = 0
         if ($null -ne $rootProcess -and !$rootProcess.HasExited) {
-          try { & "$env:SystemRoot\\System32\\taskkill.exe" /PID $root /T /F 2>$null | Out-Null; $taskkill = $LASTEXITCODE } catch { $taskkill = -1 }
+          try { & "$env:SystemRoot\\System32\\taskkill.exe" /PID $root /T /F 2>$null | Out-Null } catch { }
+          if ($null -ne $LASTEXITCODE) { $taskkill = $LASTEXITCODE }
         }
         foreach ($p in $owned) {
           try { if (!$p.HasExited) { $p.Kill() } }
