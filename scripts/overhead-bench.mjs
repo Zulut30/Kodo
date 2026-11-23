@@ -6,14 +6,13 @@
  * zero real Codex/Claude/Gemini/Jev calls, zero network, zero API keys).
  */
 import { spawnSync } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { defaultFixtures, evaluateFixture, materializeFixture } from '../runtime/benchmark-fixtures.mjs';
 import { Engine } from '../runtime/engine.mjs';
-import { workerEnvironment } from '../runtime/security.mjs';
 import { Store } from '../runtime/store.mjs';
 
 export const OVERHEAD_METHODOLOGY = 'local-engine-instant-provider-v1';
@@ -37,6 +36,31 @@ export const STAGE_KEYS = Object.freeze([
 ]);
 
 const SANDBOX_PREFIX = 'kodo-overhead-';
+const NULL_DEVICE = process.platform === 'win32' ? 'NUL' : '/dev/null';
+const ALLOWED_GIT_ENV_KEYS = new Set([
+  'PATH',
+  'PATHEXT',
+  'SYSTEMROOT',
+  'WINDIR',
+  'COMSPEC',
+  'SYSTEMDRIVE',
+  'OS',
+  'NUMBER_OF_PROCESSORS',
+  'PROCESSOR_ARCHITECTURE',
+  'LANG',
+  'LC_ALL',
+  'LC_CTYPE',
+  'TERM',
+  'TZ',
+  'TMP',
+  'TEMP',
+  'TMPDIR',
+  'HOME',
+  'USERPROFILE',
+  'HOMEDRIVE',
+  'HOMEPATH',
+  'GIT_EXEC_PATH',
+]);
 const SANDBOX_ENV_KEYS = [
   'HOME',
   'USERPROFILE',
@@ -48,25 +72,10 @@ const SANDBOX_ENV_KEYS = [
   'GIT_CONFIG_NOSYSTEM',
   'GIT_CONFIG_GLOBAL',
   'GIT_TERMINAL_PROMPT',
+  'GIT_TEMPLATE_DIR',
   'TMP',
   'TEMP',
   'TMPDIR',
-];
-const GIT_REDIRECT_KEYS = [
-  'GIT_DIR',
-  'GIT_WORK_TREE',
-  'GIT_INDEX_FILE',
-  'GIT_OBJECT_DIRECTORY',
-  'GIT_ALTERNATE_OBJECT_DIRECTORIES',
-  'GIT_COMMON_DIR',
-  'GIT_NAMESPACE',
-  'GIT_CEILING_DIRECTORIES',
-  'GIT_DISCOVERY_ACROSS_FILESYSTEM',
-  'GIT_CONFIG',
-  'GIT_CONFIG_SYSTEM',
-  'GIT_CONFIG_PARAMETERS',
-  'GIT_CONFIG_COUNT',
-  'GIT_TEMPLATE_DIR',
 ];
 
 const LIMITATIONS = Object.freeze([
@@ -154,25 +163,69 @@ export function parseArgs(argv) {
 }
 
 /**
- * Clean environment for helper `git` invocations: no credentials/keys and no
- * inherited GIT_* redirections or global/system config overrides.
+ * Strict allowlist environment for helper `git` invocations: permits only safe
+ * OS/runtime variables (matched case-insensitively on Windows), strips all
+ * credentials, SSH keys and GIT_* redirections/config overrides, and pins
+ * GIT_CONFIG_NOSYSTEM=1, GIT_CONFIG_GLOBAL and GIT_TERMINAL_PROMPT=0.
  * @param {NodeJS.ProcessEnv} [base]
+ * @param {{ home?: string, temp?: string, gitConfigGlobal?: string, gitTemplateDir?: string, platform?: NodeJS.Platform }} [options]
  */
-export function sanitizedGitEnv(base = process.env) {
-  const env = workerEnvironment(base);
-  for (const key of [...GIT_REDIRECT_KEYS, 'GIT_CONFIG_GLOBAL']) delete env[key];
-  env.GIT_CONFIG_NOSYSTEM = '1';
-  env.GIT_TERMINAL_PROMPT = '0';
+export function sanitizedGitEnv(
+  base = process.env,
+  { home, temp, gitConfigGlobal, gitTemplateDir, platform = process.platform } = {},
+) {
+  const caseInsensitive = platform === 'win32';
+  /** @type {Record<string, string>} */
+  const env = {};
+  const seen = new Set();
+
+  const deleteVar = key => {
+    const target = caseInsensitive ? key.toUpperCase() : key;
+    for (const existing of Object.keys(env)) {
+      if ((caseInsensitive ? existing.toUpperCase() : existing) === target) delete env[existing];
+    }
+  };
+  const setVar = (key, value) => {
+    deleteVar(key);
+    env[key] = value;
+  };
+
+  for (const [name, value] of Object.entries(base || {})) {
+    if (typeof value !== 'string') continue;
+    const canonical = caseInsensitive ? name.toUpperCase() : name;
+    if (!ALLOWED_GIT_ENV_KEYS.has(canonical)) continue;
+    if (seen.has(canonical)) continue;
+    seen.add(canonical);
+    env[name] = value;
+  }
+
+  if (home !== undefined) {
+    setVar('HOME', home);
+    setVar('USERPROFILE', home);
+    deleteVar('HOMEDRIVE');
+    deleteVar('HOMEPATH');
+  }
+  if (temp !== undefined) {
+    setVar('TMP', temp);
+    setVar('TEMP', temp);
+    setVar('TMPDIR', temp);
+  }
+  if (gitTemplateDir !== undefined) setVar('GIT_TEMPLATE_DIR', gitTemplateDir);
+
+  setVar('GIT_CONFIG_NOSYSTEM', '1');
+  setVar('GIT_CONFIG_GLOBAL', gitConfigGlobal ?? (platform === 'win32' ? 'NUL' : '/dev/null'));
+  setVar('GIT_TERMINAL_PROMPT', '0');
   return env;
 }
 
-function writeIsolatedGitConfig(file, { template, hooks }) {
-  const env = sanitizedGitEnv();
+function writeIsolatedGitConfig(file, { template, hooks, home, temp }) {
+  const env = sanitizedGitEnv(process.env, { home, temp, gitConfigGlobal: file, gitTemplateDir: template });
+  const hooksArg = `core.hooksPath=${hooks.split(path.sep).join('/')}`;
   for (const [key, value] of [
     ['init.templateDir', template],
     ['core.hooksPath', hooks],
   ]) {
-    const result = spawnSync('git', ['config', '--file', file, key, value.split(path.sep).join('/')], {
+    const result = spawnSync('git', ['-c', hooksArg, 'config', '--file', file, key, value.split(path.sep).join('/')], {
       env,
       encoding: 'utf8',
       windowsHide: true,
@@ -182,9 +235,11 @@ function writeIsolatedGitConfig(file, { template, hooks }) {
 }
 
 export async function createSandbox() {
-  const parent = os.tmpdir();
+  const parent = await realpath(os.tmpdir());
   const directory = await mkdtemp(path.join(parent, SANDBOX_PREFIX));
-  const previous = Object.fromEntries([...SANDBOX_ENV_KEYS, ...GIT_REDIRECT_KEYS].map(key => [key, process.env[key]]));
+  const gitEnvKeys = Object.keys(process.env).filter(key => /^GIT_/i.test(key));
+  const trackedKeys = [...new Set([...SANDBOX_ENV_KEYS, ...gitEnvKeys])];
+  const previous = Object.fromEntries(trackedKeys.map(key => [key, process.env[key]]));
   const root = path.join(directory, 'repo');
   const stateDir = path.join(directory, 'state');
   const toolsDir = path.join(directory, 'tools');
@@ -209,8 +264,8 @@ export async function createSandbox() {
     await mkdir(template);
     await mkdir(hooks);
     await writeFile(gitconfig, '');
-    writeIsolatedGitConfig(gitconfig, { template, hooks });
-    for (const key of GIT_REDIRECT_KEYS) delete process.env[key];
+    writeIsolatedGitConfig(gitconfig, { template, hooks, home: isolated, temp });
+    for (const key of gitEnvKeys) delete process.env[key];
     delete process.env.KODO_CODEX_CLIJS;
     Object.assign(process.env, {
       TMP: temp,
@@ -275,12 +330,12 @@ async function applyFixtureSolution(fixtureId, cwd) {
   throw new Error(`No deterministic solution configured for fixture: ${fixtureId}`);
 }
 
-export function createInstantServices({ fixture, client, model }) {
+export function createInstantServices({ fixture, client, model, now = () => performance.now() }) {
   const mockedCalls = {
     assessment: 0,
     discovery: 0,
     sessions: 0,
-    byStage: { plan: 0, developer: 0, review: 0, other: 0 },
+    byStage: { plan: 0, developer: 0, review: 0 },
   };
   const unexpectedCalls = { analyzeGemini: 0, decideJev: 0, research: 0, delivery: 0 };
   /** @type {Array<{ stage: string, durationMs: number }>} */
@@ -315,7 +370,7 @@ export function createInstantServices({ fixture, client, model }) {
       // the mock-work timer so engineExcludingMock never subtracts Kodo's own work.
       request.onEvent?.({ sessionId, stage });
 
-      const started = performance.now();
+      const started = now();
       let output;
       if (isPlan) {
         output = {
@@ -338,7 +393,7 @@ export function createInstantServices({ fixture, client, model }) {
         await applyFixtureSolution(fixture.id, request.cwd);
         output = { complete: true, summary: `Updated ${fixture.implementation}`, checks: ['node verify.cjs'] };
       }
-      sessionCallbacks.push({ stage, durationMs: performance.now() - started });
+      sessionCallbacks.push({ stage, durationMs: now() - started });
       return { sessionId, output };
     },
   };
@@ -367,16 +422,13 @@ function attachRunObserver(store) {
   /** @type {Record<string, number | null>} */
   const marks = {
     start: null,
-    createdEvent: null,
     created: null,
     modeSelected: null,
     analyzed: null,
     planned: null,
-    routed: null,
     nodeWorktreeReady: null,
     nodeCompleted: null,
     integrated: null,
-    checkStarted: null,
     reviewStarted: null,
     succeeded: null,
     finished: null,
@@ -404,12 +456,9 @@ function attachRunObserver(store) {
     const now = performance.now();
     const written = originalEvent(runId, type, data);
     observedEvents.push({ type, at: now });
-    if (type === 'created' && marks.createdEvent === null) marks.createdEvent = now;
     if (type === 'mode_selected' && marks.modeSelected === null) marks.modeSelected = now;
     if (type === 'analyzed' && marks.analyzed === null) marks.analyzed = now;
-    if (type === 'routed' && marks.routed === null) marks.routed = now;
     if (type === 'integrated' && marks.integrated === null) marks.integrated = now;
-    if (type === 'check_started' && marks.checkStarted === null) marks.checkStarted = now;
     if (type === 'succeeded' && marks.succeeded === null) marks.succeeded = now;
     return written;
   };
@@ -464,11 +513,39 @@ function buildStagesMs(marks) {
   };
 }
 
+/**
+ * Always close the SQLite store and run sandbox cleanup even if one throws,
+ * preserving any primary trial error.
+ * @param {{ store?: { close(): void } | null, cleanup: () => Promise<void>, primaryError?: unknown }} resources
+ */
+export async function finalizeTrialResources({ store, cleanup, primaryError }) {
+  let closeError;
+  try {
+    if (store) store.close();
+  } catch (error) {
+    closeError = error;
+  }
+
+  let cleanupError;
+  const cleanupStart = performance.now();
+  try {
+    await cleanup();
+  } catch (error) {
+    cleanupError = error;
+  }
+  const cleanupMs = roundMs(performance.now() - cleanupStart);
+
+  if (primaryError !== undefined) throw primaryError;
+  if (closeError !== undefined) throw closeError;
+  if (cleanupError !== undefined) throw cleanupError;
+  return cleanupMs;
+}
+
 async function executeTrial({ runIndex, fixture, client, model }) {
   const box = await createSandbox();
   /** @type {Store | null} */
   let store = null;
-  let cleanupMs = 0;
+  let primaryError;
   let report;
 
   try {
@@ -564,27 +641,28 @@ async function executeTrial({ runIndex, fixture, client, model }) {
       unexpectedCalls: services.unexpectedCalls,
       events,
     };
-  } finally {
-    if (store) store.close();
-    const cleanupStart = performance.now();
-    await box.cleanup();
-    cleanupMs = roundMs(performance.now() - cleanupStart);
+  } catch (error) {
+    primaryError = error;
   }
 
+  const cleanupMs = await finalizeTrialResources({ store, cleanup: () => box.cleanup(), primaryError });
   report.detailsMs.cleanup = cleanupMs;
   return report;
 }
 
-function repoCommit() {
-  const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-  const result = spawnSync('git', ['rev-parse', 'HEAD'], {
-    cwd: root,
-    env: sanitizedGitEnv(),
+/** @param {{ env?: NodeJS.ProcessEnv, cwd?: string }} [options] */
+export function repoCommit({ env = process.env, cwd } = {}) {
+  const target = cwd || path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const result = spawnSync('git', ['-c', `core.hooksPath=${NULL_DEVICE}`, 'rev-parse', 'HEAD'], {
+    cwd: target,
+    env: sanitizedGitEnv(env),
     encoding: 'utf8',
     windowsHide: true,
   });
   return result.status === 0 ? result.stdout.trim() : null;
 }
+
+const hasUnexpectedCalls = calls => Object.values(calls || {}).some(value => typeof value === 'number' && value > 0);
 
 let benchmarkQueue = Promise.resolve();
 
@@ -609,7 +687,7 @@ async function runOverheadBenchmarkSerial({ runs, fixture, client, model, runTri
   );
   const sessionCounts = summarizeValues(results.map(item => item.nativeSessions.count));
   const byStageSummary = Object.fromEntries(
-    ['plan', 'developer', 'review', 'other'].map(stage => [
+    ['plan', 'developer', 'review'].map(stage => [
       stage,
       summarizeValues(results.map(item => item.mockedCalls.byStage[stage])),
     ]),
@@ -656,9 +734,15 @@ async function runOverheadBenchmarkSerial({ runs, fixture, client, model, runTri
     summary: {
       runs: results.length,
       succeeded: results.filter(item => item.state === 'succeeded').length,
-      allVerified: results.every(
-        item => item.state === 'succeeded' && item.verified.correctnessPassed && item.verified.scopePassed,
-      ),
+      allVerified:
+        !hasUnexpectedCalls(unexpectedTotals) &&
+        results.every(
+          item =>
+            item.state === 'succeeded' &&
+            item.verified.correctnessPassed &&
+            item.verified.scopePassed &&
+            !hasUnexpectedCalls(item.unexpectedCalls),
+        ),
       totalMs: summarizeValues(results.map(item => item.totalMs)),
       nativeSessions: {
         median: sessionCounts.median,
@@ -702,10 +786,14 @@ export function runOverheadBenchmark(
 /** @param {Awaited<ReturnType<typeof runOverheadBenchmark>>} report */
 export function formatTextReport(report) {
   const { summary, options, environment } = report;
+  const unexpectedEntries = Object.entries(report.providerCalls?.unexpected || {}).filter(([, count]) => count > 0);
   const lines = [
     `Kodo overhead benchmark (${options.fixture}, mode=${options.mode}, delivery=${options.delivery}, runs=${options.runs})`,
     `Среда: Node ${environment.node}, ${environment.platform}/${environment.arch}, commit=${environment.commit?.slice(0, 12) ?? 'unknown'}`,
     `Успешно: ${summary.succeeded}/${summary.runs} (verified=${summary.allVerified}), реальных вызовов провайдеров: ${report.realProviderCalls}`,
+    ...(unexpectedEntries.length
+      ? [`Неожиданные вызовы: ${unexpectedEntries.map(([name, count]) => `${name}=${count}`).join(', ')}`]
+      : []),
     `Общее время (Engine.create + Engine.run): медиана ${summary.totalMs.median} мс (min ${summary.totalMs.min}, max ${summary.totalMs.max}, разброс ${summary.totalMs.spread} мс)`,
     `Нативные сессии (подменённые): медиана ${summary.nativeSessions.median} (min ${summary.nativeSessions.min}, max ${summary.nativeSessions.max})`,
     `Время коллбеков подменённого провайдера: медиана ${summary.detailsMs.providerCallback.median} мс`,
@@ -725,19 +813,31 @@ export function formatTextReport(report) {
 
 const USAGE = `Usage: node scripts/overhead-bench.mjs [--runs N] [--fixture button-color|filename-extension] [--json]`;
 
-if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url) {
+/**
+ * Execute the CLI entrypoint and return its exit code (0 on verified success, 1 otherwise).
+ * @param {string[]} argv
+ * @param {{ runBenchmark?: typeof runOverheadBenchmark, writeOut?: (text: string) => void, writeErr?: (text: string) => void }} [dependencies]
+ */
+export async function runCli(
+  argv,
+  { runBenchmark = runOverheadBenchmark, writeOut = console.log, writeErr = console.error } = {},
+) {
   try {
-    const options = parseArgs(process.argv.slice(2));
+    const options = parseArgs(argv);
     if (options.help) {
-      console.log(USAGE);
-    } else {
-      const report = await runOverheadBenchmark(options);
-      if (options.json) console.log(JSON.stringify(report, null, 2));
-      else console.log(formatTextReport(report));
-      if (!report.summary.allVerified) process.exitCode = 1;
+      writeOut(USAGE);
+      return { exitCode: 0 };
     }
+    const report = await runBenchmark(options);
+    writeOut(options.json ? JSON.stringify(report, null, 2) : formatTextReport(report));
+    return { exitCode: report.summary.allVerified ? 0 : 1, report };
   } catch (error) {
-    console.error(error?.message || String(error));
-    process.exitCode = 1;
+    writeErr(error?.message || String(error));
+    return { exitCode: 1, error };
   }
+}
+
+if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url) {
+  const { exitCode } = await runCli(process.argv.slice(2));
+  process.exitCode = exitCode;
 }

@@ -1,10 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { performance } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
 import { defaultFixtures } from '../runtime/benchmark-fixtures.mjs';
 import * as overheadBench from '../scripts/overhead-bench.mjs';
@@ -14,17 +13,29 @@ const {
   DEFAULT_RUNS,
   OVERHEAD_METHODOLOGY,
   STAGE_KEYS,
+  buildEventTimeline,
+  createInstantServices,
+  createSandbox,
   formatTextReport,
   parseArgs,
   runOverheadBenchmark,
+  sanitizedGitEnv,
   summarizeValues,
 } = overheadBench;
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const script = path.join(root, 'scripts', 'overhead-bench.mjs');
+const nullDevice = process.platform === 'win32' ? 'NUL' : '/dev/null';
 
-function runGit(cwd, args, env = process.env) {
-  const result = spawnSync('git', args, { cwd, env, encoding: 'utf8', windowsHide: true });
+function runIsolatedGit(cwd, args, envOptions) {
+  const env = sanitizedGitEnv(envOptions.baseEnv ?? process.env, envOptions);
+  const hooksPath = envOptions.hooksDir ? envOptions.hooksDir.split(path.sep).join('/') : nullDevice;
+  const result = spawnSync('git', ['-c', `core.hooksPath=${hooksPath}`, ...args], {
+    cwd,
+    env,
+    encoding: 'utf8',
+    windowsHide: true,
+  });
   assert.equal(result.status, 0, `${args.join(' ')}\n${result.stderr}`);
   return result.stdout.trim();
 }
@@ -62,62 +73,119 @@ test('overhead-bench argument parser and summary statistics follow contract', ()
   assert.deepEqual(summarizeValues([]), { median: null, min: null, max: null, spread: null, mean: null });
 });
 
-test('sanitizedGitEnv strips credentials and all GIT_* redirects', () => {
-  assert.equal(typeof overheadBench.sanitizedGitEnv, 'function', 'sanitizedGitEnv must be exported');
-  const cleaned = overheadBench.sanitizedGitEnv({
-    PATH: process.env.PATH,
-    GEMINI_API_KEY: 'fake-gemini',
-    KODO_TYPESAFE_API_KEY: 'fake-jev',
-    GITHUB_TOKEN: 'fake-gh',
+test('sanitizedGitEnv uses an allowlist and blocks secrets, GIT_CONFIG_* and lowercase vars', () => {
+  const poisoned = {
+    Path: process.env.PATH || process.env.Path || '/usr/bin',
+    SystemRoot: process.env.SystemRoot || 'C:\\Windows',
+    SSH_PRIVATE_KEY: 'synthetic-ssh-key',
+    ssh_private_key: 'synthetic-ssh-key-lower',
+    GEMINI_API_KEY: 'synthetic-gemini',
+    gemini_api_key: 'synthetic-gemini-lower',
+    KODO_TYPESAFE_API_KEY: 'synthetic-jev',
+    GITHUB_TOKEN: 'synthetic-gh',
     GIT_DIR: '/foreign/.git',
+    git_dir: '/foreign/.git-lower',
     GIT_WORK_TREE: '/foreign',
+    GIT_INDEX_FILE: '/foreign/index',
+    git_index_file: '/foreign/index-lower',
+    GIT_CONFIG_COUNT: '1',
+    GIT_CONFIG_KEY_0: 'http.extraHeader',
+    GIT_CONFIG_VALUE_0: 'Authorization: Bearer synthetic-header',
+    git_config_value_0: 'Authorization: Bearer synthetic-header-lower',
     GIT_CONFIG_GLOBAL: '/foreign/gitconfig',
     GIT_TEMPLATE_DIR: '/foreign/template',
-    GIT_INDEX_FILE: '/foreign/index',
+    UNRELATED_CUSTOM_VAR: 'must-not-pass',
+  };
+
+  const cleaned = sanitizedGitEnv(poisoned, {
+    home: '/sandbox/home',
+    temp: '/sandbox/tmp',
+    gitConfigGlobal: '/sandbox/gitconfig',
+    platform: 'win32',
   });
-  assert.equal(cleaned.GEMINI_API_KEY, undefined);
-  assert.equal(cleaned.KODO_TYPESAFE_API_KEY, undefined);
-  assert.equal(cleaned.GITHUB_TOKEN, undefined);
-  assert.equal(cleaned.GIT_DIR, undefined);
-  assert.equal(cleaned.GIT_WORK_TREE, undefined);
-  assert.equal(cleaned.GIT_CONFIG_GLOBAL, undefined);
-  assert.equal(cleaned.GIT_TEMPLATE_DIR, undefined);
-  assert.equal(cleaned.GIT_INDEX_FILE, undefined);
+
+  const keysLower = new Set(Object.keys(cleaned).map(key => key.toLowerCase()));
+  for (const forbidden of [
+    'ssh_private_key',
+    'gemini_api_key',
+    'kodo_typesafe_api_key',
+    'github_token',
+    'git_dir',
+    'git_work_tree',
+    'git_index_file',
+    'git_config_count',
+    'git_config_key_0',
+    'git_config_value_0',
+    'git_template_dir',
+    'unrelated_custom_var',
+  ])
+    assert.ok(!keysLower.has(forbidden), `forbidden env var leaked: ${forbidden}`);
+
+  assert.ok(keysLower.has('path'), 'Windows Path/PATH must be preserved case-insensitively');
+  assert.equal(cleaned.HOME, '/sandbox/home');
+  assert.equal(cleaned.USERPROFILE, '/sandbox/home');
+  assert.equal(cleaned.TMP, '/sandbox/tmp');
+  assert.equal(cleaned.TEMP, '/sandbox/tmp');
+  assert.equal(cleaned.GIT_CONFIG_GLOBAL, '/sandbox/gitconfig');
   assert.equal(cleaned.GIT_CONFIG_NOSYSTEM, '1');
   assert.equal(cleaned.GIT_TERMINAL_PROMPT, '0');
-  assert.equal(cleaned.PATH, process.env.PATH);
+
+  // Verify real git does not see injected GIT_CONFIG_VALUE_0 when invoked with sanitizedGitEnv.
+  const gitCheck = spawnSync('git', ['-c', `core.hooksPath=${nullDevice}`, 'config', '--list'], {
+    cwd: root,
+    env: sanitizedGitEnv({ ...process.env, ...poisoned }),
+    encoding: 'utf8',
+    windowsHide: true,
+  });
+  assert.equal(gitCheck.status, 0, gitCheck.stderr);
+  assert.doesNotMatch(gitCheck.stdout, /synthetic-header|extraheader/i);
 });
 
-test('createInstantServices excludes synchronous request.onEvent work from providerCallback timing', async () => {
-  assert.equal(typeof overheadBench.createInstantServices, 'function', 'createInstantServices must be exported');
+test('repoCommit ignores broken user ~/.gitconfig', async () => {
+  assert.equal(typeof overheadBench.repoCommit, 'function', 'repoCommit must be exported');
+  const tmpParent = await realpath(os.tmpdir());
+  const brokenHome = await mkdtemp(path.join(tmpParent, 'kodo-overhead-broken-git-'));
+  try {
+    await writeFile(path.join(brokenHome, '.gitconfig'), '[broken\n');
+    const sha = overheadBench.repoCommit({
+      env: { ...process.env, HOME: brokenHome, USERPROFILE: brokenHome },
+    });
+    assert.match(String(sha), /^[0-9a-f]{40}$/, 'repoCommit must return HEAD SHA even with broken ~/.gitconfig');
+  } finally {
+    await rm(brokenHome, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  }
+});
+
+test('createInstantServices excludes synchronous request.onEvent work using deterministic clock', async () => {
   const fixture = defaultFixtures.find(item => item.id === 'button-color');
-  const services = overheadBench.createInstantServices({ fixture, client: 'codex', model: 'gpt-6.1-sol' });
+  let tick = 1000;
+  const services = createInstantServices({
+    fixture,
+    client: 'codex',
+    model: 'gpt-6.1-sol',
+    now: () => tick,
+  });
   await services.provider.runSession({
     schema: { properties: { tasks: {} } },
     onEvent: () => {
-      const until = performance.now() + 25;
-      while (performance.now() < until) {
-        /* simulate synchronous Engine SQLite/progress.md write inside onEvent */
-      }
+      // Advance deterministic clock only inside onEvent (no busy-wait).
+      tick += 500;
     },
   });
   assert.equal(services.sessionCallbacks.length, 1);
-  assert.ok(
-    services.sessionCallbacks[0].durationMs < 15,
-    `expected mock callback time < 15ms without onEvent, got ${services.sessionCallbacks[0].durationMs}ms`,
-  );
+  assert.equal(services.sessionCallbacks[0].durationMs, 0, 'onEvent time must not be counted in providerCallback');
 });
 
-test('createSandbox isolates KODO_TOOL_HOME and KODO_CODEX_CLIJS and restores them on cleanup', async () => {
-  assert.equal(typeof overheadBench.createSandbox, 'function', 'createSandbox must be exported');
+test('createSandbox uses canonical realpath tmpdir, isolates KODO_TOOL_HOME/KODO_CODEX_CLIJS and restores env', async () => {
   const prevToolHome = process.env.KODO_TOOL_HOME;
   const prevCodexCli = process.env.KODO_CODEX_CLIJS;
   const hostTools = path.join(os.tmpdir(), 'host-user-tools-sentinel');
   process.env.KODO_TOOL_HOME = hostTools;
   process.env.KODO_CODEX_CLIJS = path.join(os.tmpdir(), 'host-codex-cli.js');
   try {
-    const box = await overheadBench.createSandbox();
+    const box = await createSandbox();
     try {
+      assert.equal(box.directory, await realpath(box.directory), 'sandbox directory must be canonical realpath');
       assert.notEqual(process.env.KODO_TOOL_HOME, hostTools, 'sandbox must override host KODO_TOOL_HOME');
       assert.ok(
         path.resolve(process.env.KODO_TOOL_HOME).startsWith(path.resolve(box.directory) + path.sep),
@@ -137,6 +205,75 @@ test('createSandbox isolates KODO_TOOL_HOME and KODO_CODEX_CLIJS and restores th
   }
 });
 
+test('finalizeTrialResources runs cleanup even if store.close throws and preserves primary error', async () => {
+  assert.equal(typeof overheadBench.finalizeTrialResources, 'function', 'finalizeTrialResources must be exported');
+
+  // Case 1: store.close throws with no primary error -> cleanup still runs, close error propagates.
+  let cleanedA = false;
+  await assert.rejects(
+    overheadBench.finalizeTrialResources({
+      store: {
+        close() {
+          throw new Error('close boom');
+        },
+      },
+      cleanup: async () => {
+        cleanedA = true;
+      },
+    }),
+    /close boom/,
+  );
+  assert.equal(cleanedA, true, 'cleanup must still execute when store.close throws');
+
+  // Case 2: primary error present + both close and cleanup throw -> both run, primary error is preserved.
+  let closedB = false;
+  let cleanedB = false;
+  const primary = new Error('primary trial error');
+  await assert.rejects(
+    overheadBench.finalizeTrialResources({
+      store: {
+        close() {
+          closedB = true;
+          throw new Error('secondary close error');
+        },
+      },
+      cleanup: async () => {
+        cleanedB = true;
+        throw new Error('secondary cleanup error');
+      },
+      primaryError: primary,
+    }),
+    error => error === primary,
+  );
+  assert.equal(closedB, true);
+  assert.equal(cleanedB, true);
+});
+
+function stubTrial(runIndex, overrides = {}) {
+  return {
+    run: runIndex,
+    state: 'succeeded',
+    executionMode: { selected: 'quick', source: 'explicit', requested: 'quick' },
+    delivery: 'none',
+    totalMs: 10,
+    stagesMs: Object.fromEntries(STAGE_KEYS.map(key => [key, key === 'delivery' ? 0 : 1])),
+    detailsMs: {
+      createOnly: 1,
+      modeAndIntegrationWorktree: 1,
+      providerCallback: 0.5,
+      engineExcludingMock: 9.5,
+      fixtureSetup: 1,
+      cleanup: 1,
+    },
+    nativeSessions: { count: 3, stages: ['plan', 'developer', 'review'], attempts: [] },
+    verified: { correctnessPassed: true, scopePassed: true, scopeViolations: 0 },
+    mockedCalls: { assessment: 1, discovery: 1, sessions: 3, byStage: { plan: 1, developer: 1, review: 1 } },
+    unexpectedCalls: { analyzeGemini: 0, decideJev: 0, research: 0, delivery: 0 },
+    events: [],
+    ...overrides,
+  };
+}
+
 test('runOverheadBenchmark serializes overlapping calls so sandboxes never collide', async () => {
   let active = 0;
   let maxActive = 0;
@@ -147,32 +284,7 @@ test('runOverheadBenchmark serializes overlapping calls so sandboxes never colli
     calls++;
     await new Promise(resolve => setTimeout(resolve, 25));
     active--;
-    return {
-      run: runIndex,
-      state: 'succeeded',
-      executionMode: { selected: 'quick', source: 'explicit', requested: 'quick' },
-      delivery: 'none',
-      totalMs: 10,
-      stagesMs: Object.fromEntries(STAGE_KEYS.map(key => [key, key === 'delivery' ? 0 : 1])),
-      detailsMs: {
-        createOnly: 1,
-        modeAndIntegrationWorktree: 1,
-        providerCallback: 0.5,
-        engineExcludingMock: 9.5,
-        fixtureSetup: 1,
-        cleanup: 1,
-      },
-      nativeSessions: { count: 3, stages: ['plan', 'developer', 'review'], attempts: [] },
-      verified: { correctnessPassed: true, scopePassed: true, scopeViolations: 0 },
-      mockedCalls: {
-        assessment: 1,
-        discovery: 1,
-        sessions: 3,
-        byStage: { plan: 1, developer: 1, review: 1, other: 0 },
-      },
-      unexpectedCalls: { analyzeGemini: 0, decideJev: 0, research: 0, delivery: 0 },
-      events: [],
-    };
+    return stubTrial(runIndex);
   };
 
   const [first, second] = await Promise.all([
@@ -185,8 +297,33 @@ test('runOverheadBenchmark serializes overlapping calls so sandboxes never colli
   assert.equal(second.summary.succeeded, 1);
 });
 
+test('unexpected provider calls fail allVerified, appear in text report and yield CLI exitCode 1', async () => {
+  const report = await runOverheadBenchmark(
+    { runs: 1 },
+    {
+      runTrial: async ({ runIndex }) =>
+        stubTrial(runIndex, {
+          unexpectedCalls: { analyzeGemini: 0, decideJev: 1, research: 2, delivery: 0 },
+        }),
+    },
+  );
+  assert.equal(report.summary.allVerified, false, 'non-zero unexpected calls must invalidate allVerified');
+  const text = formatTextReport(report);
+  assert.match(text, /decideJev=1/, 'text report must surface non-zero unexpected decideJev calls');
+  assert.match(text, /research=2/, 'text report must surface non-zero unexpected research calls');
+
+  assert.equal(typeof overheadBench.runCli, 'function', 'runCli must be exported');
+  const stdoutLines = [];
+  const cliResult = await overheadBench.runCli(['--runs', '1', '--json'], {
+    runBenchmark: async () => report,
+    writeOut: line => stdoutLines.push(line),
+  });
+  assert.equal(cliResult.exitCode, 1, 'CLI must exit 1 when allVerified is false due to unexpected calls');
+  assert.equal(JSON.parse(stdoutLines.join('\n')).summary.allVerified, false);
+});
+
 test('buildEventTimeline returns observed offsets and null for unobserved events', () => {
-  const timeline = overheadBench.buildEventTimeline(
+  const timeline = buildEventTimeline(
     [
       { seq: 1, type: 'created' },
       { seq: 2, type: 'mode_selected' },
@@ -206,36 +343,60 @@ test('buildEventTimeline returns observed offsets and null for unobserved events
 });
 
 test(
-  'overhead-bench --runs 1 --json isolates env/temp/git-redirects, records real created offset, and cleans its temp root',
+  'overhead-bench --runs 1 --json isolates env/temp/git-redirects, protects external GIT_INDEX_FILE, records real created offset, and cleans its temp root',
   { timeout: 120000 },
   async () => {
-    const suiteRoot = await mkdtemp(path.join(os.tmpdir(), 'kodo-overhead-test-'));
+    const tmpParent = await realpath(os.tmpdir());
+    const suiteRoot = await mkdtemp(path.join(tmpParent, 'kodo-overhead-test-'));
     try {
       const childTemp = path.join(suiteRoot, 'child-temp');
       const foreignRepo = path.join(suiteRoot, 'foreign-repo');
       const hostTools = path.join(suiteRoot, 'host-tools');
+      const gitHome = path.join(suiteRoot, 'git-home');
+      const emptyHooks = path.join(gitHome, 'hooks');
+      const emptyTemplate = path.join(gitHome, 'template');
+      const emptyGitConfig = path.join(gitHome, 'gitconfig');
+      const externalIndexSentinel = path.join(suiteRoot, 'external-index-sentinel');
+
       await mkdir(childTemp, { recursive: true });
       await mkdir(foreignRepo, { recursive: true });
       await mkdir(hostTools, { recursive: true });
+      await mkdir(emptyHooks, { recursive: true });
+      await mkdir(emptyTemplate, { recursive: true });
+      await writeFile(emptyGitConfig, '');
       await writeFile(path.join(hostTools, 'sentinel.txt'), 'not-a-kodo-tool-home\n');
 
-      // Separate Git repository whose GIT_DIR/GIT_WORK_TREE are injected into the child process
-      // to verify environment.commit still reports Kodo's own HEAD and never inherits GIT_DIR.
+      // Separate Git repository prepared with isolated env (even with external GIT_INDEX_FILE present
+      // in baseEnv) so `git add .` can never touch externalIndexSentinel.
       await writeFile(path.join(foreignRepo, 'README.md'), 'foreign repo\n');
-      const cleanGitEnv = {
+      const poisonedBaseEnv = {
         ...process.env,
-        GIT_CONFIG_NOSYSTEM: '1',
-        GIT_TERMINAL_PROMPT: '0',
+        GIT_INDEX_FILE: externalIndexSentinel,
+        GIT_DIR: path.join(suiteRoot, 'nonexistent-git-dir'),
+        GIT_WORK_TREE: suiteRoot,
+        SSH_PRIVATE_KEY: 'synthetic-ssh-key',
       };
-      delete cleanGitEnv.GIT_DIR;
-      delete cleanGitEnv.GIT_WORK_TREE;
-      runGit(foreignRepo, ['init', '-b', 'main'], cleanGitEnv);
-      runGit(foreignRepo, ['config', 'user.name', 'Foreign'], cleanGitEnv);
-      runGit(foreignRepo, ['config', 'user.email', 'foreign@example.invalid'], cleanGitEnv);
-      runGit(foreignRepo, ['add', '.'], cleanGitEnv);
-      runGit(foreignRepo, ['-c', 'commit.gpgsign=false', 'commit', '-m', 'Foreign commit'], cleanGitEnv);
-      const foreignHead = runGit(foreignRepo, ['rev-parse', 'HEAD'], cleanGitEnv);
-      const expectedRepoHead = runGit(root, ['rev-parse', 'HEAD'], cleanGitEnv);
+      const gitEnvOptions = {
+        baseEnv: poisonedBaseEnv,
+        home: gitHome,
+        temp: childTemp,
+        gitConfigGlobal: emptyGitConfig,
+        gitTemplateDir: emptyTemplate,
+        hooksDir: emptyHooks,
+      };
+      runIsolatedGit(foreignRepo, ['init', '-b', 'main'], gitEnvOptions);
+      runIsolatedGit(foreignRepo, ['config', 'user.name', 'Foreign'], gitEnvOptions);
+      runIsolatedGit(foreignRepo, ['config', 'user.email', 'foreign@example.invalid'], gitEnvOptions);
+      runIsolatedGit(foreignRepo, ['add', '.'], gitEnvOptions);
+      runIsolatedGit(foreignRepo, ['-c', 'commit.gpgsign=false', 'commit', '-m', 'Foreign commit'], gitEnvOptions);
+      await assert.rejects(
+        access(externalIndexSentinel),
+        { code: 'ENOENT' },
+        'fixture git setup must never create or modify external GIT_INDEX_FILE',
+      );
+
+      const foreignHead = runIsolatedGit(foreignRepo, ['rev-parse', 'HEAD'], gitEnvOptions);
+      const expectedRepoHead = runIsolatedGit(root, ['rev-parse', 'HEAD'], gitEnvOptions);
       assert.notEqual(foreignHead, expectedRepoHead);
 
       const childEnv = {
@@ -246,6 +407,11 @@ test(
         KODO_TOOL_HOME: hostTools,
         GIT_DIR: path.join(foreignRepo, '.git'),
         GIT_WORK_TREE: foreignRepo,
+        GIT_INDEX_FILE: externalIndexSentinel,
+        GIT_CONFIG_COUNT: '1',
+        GIT_CONFIG_KEY_0: 'http.extraHeader',
+        GIT_CONFIG_VALUE_0: 'Authorization: Bearer synthetic-header',
+        SSH_PRIVATE_KEY: 'synthetic-ssh-key',
         GEMINI_API_KEY: 'dummy-test-sentinel-value',
       };
 
@@ -259,6 +425,11 @@ test(
 
       assert.equal(result.error, undefined, result.error?.message);
       assert.equal(result.status, 0, `stderr: ${result.stderr}\nstdout: ${result.stdout}`);
+      await assert.rejects(
+        access(externalIndexSentinel),
+        { code: 'ENOENT' },
+        'benchmark run must never create or modify external GIT_INDEX_FILE',
+      );
 
       const report = JSON.parse(result.stdout);
       assert.equal(report.schemaVersion, 1);
@@ -289,6 +460,7 @@ test(
       assert.ok(typeof report.summary.totalMs.median === 'number' && report.summary.totalMs.median > 0);
       assert.equal(report.summary.totalMs.spread, 0);
       assert.ok(report.summary.nativeSessions.median >= 2, 'at least worker and review sessions ran');
+      assert.deepEqual(Object.keys(report.summary.nativeSessions.byStage), ['plan', 'developer', 'review']);
 
       for (const key of STAGE_KEYS) {
         const stat = report.summary.stagesMs[key];

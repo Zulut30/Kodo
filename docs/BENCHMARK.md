@@ -97,9 +97,9 @@ node scripts/overhead-bench.mjs --runs 3 --fixture button-color
 
 **Что измеряет скрипт:**
 
-- Полное время `Engine.create` + `Engine.run` на маленькой задаче из фикстуры в режиме `quick` с выключенной доставкой (`delivery: 'none'`).
-- Реальную работу локальных подсистем Kodo: создание временного Git-репозитория, Git worktree (интеграционного и узла), SQLite Store, ACL приватных каталогов evidence, настроенную проверку (`node verify.cjs`), behaviour gate, слияние `git merge --no-ff` и запись отчётных артефактов.
-- Разбивку по этапам из событий и переходов состояния запуска (`createAndMode`, `analysis`, `plan`, `worktree`, `sessions`, `integration`, `checks`, `review`, `delivery: 0`, `finalize`), число нативных сессий (`summary.nativeSessions`), а также медиану, минимум, максимум и разброс (`max - min`) по `N` прогонам.
+- Полное время **только** `Engine.create` + `Engine.run` (`summary.totalMs` и `summary.stagesMs`) на маленькой задаче из фикстуры в режиме `quick` с выключенной доставкой (`delivery: 'none'`). Подготовка временного Git-репозитория из фикстуры и удаление песочницы в `totalMs` не входят и учитываются отдельно в `detailsMs.fixtureSetup` и `detailsMs.cleanup`.
+- Реальную работу локальных подсистем Kodo внутри `Engine`: создание Git worktree (интеграционного и узла), SQLite Store, ACL приватных каталогов evidence, настроенную проверку (`node verify.cjs`), behaviour gate, слияние `git merge --no-ff` и запись отчётных артефактов.
+- Разбивку по этапам из событий и переходов состояния запуска (`createAndMode`, `analysis`, `plan`, `worktree`, `sessions`, `integration`, `checks`, `review`, `delivery: 0`, `finalize`), число нативных сессий (`summary.nativeSessions`), а также медиану, минимум, максимум и разброс (`max - min`) по `N` прогонам. При этом `stagesMs.sessions` отражает только этап сессии реализации (`developer`: evidence batch, worker, проверка scope, коммит), а сессии планирования и ревью входят в этапы `plan` и `review`.
 - Все нативные сессии и координаторские провайдеры заменены мгновенным детерминированным провайдером без сетевых вызовов и чтения ключей (`realProviderCalls: 0`). Временные каталоги каждого прогона удаляются автоматически.
 
 **Чего скрипт НЕ измеряет:**
