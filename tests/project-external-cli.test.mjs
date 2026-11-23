@@ -4,9 +4,12 @@ import { spawnSync } from 'node:child_process';
 import { mkdtemp, mkdir, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { projectCli } from '../runtime/project-cli.mjs';
 import { projectExternalCli } from '../runtime/project-cli-external.mjs';
+import { workerEnvironment } from '../runtime/security.mjs';
 
+const cli = fileURLToPath(new URL('../cli/index.mjs', import.meta.url));
 const id = '11111111-1111-4111-8111-111111111111';
 const head = 'a'.repeat(40);
 
@@ -203,6 +206,9 @@ test('Project CLI delegates next-wave and complete-task to the pull protocol', a
   assert.equal(brief.role, 'architect');
   assert.equal(brief.chatTitle, 'Kodo · [e] Task a');
   assert.deepEqual(JSON.parse(next.output), next.report);
+  // Without a CLI context (a library caller) the commands keep the `kodo` prefix.
+  assert.equal(next.report.result.cli, 'kodo');
+  assert.ok(brief.completeCommand.startsWith('kodo project complete-task '));
 
   const human = await projectCli(['next-wave', waveId, '--host', 'orca'], { ...base, wave });
   assert.equal(human.exitCode, 0);
@@ -245,3 +251,65 @@ test('Project CLI delegates next-wave and complete-task to the pull protocol', a
     ['blocked', 'project_attempt_not_running'],
   );
 });
+
+test(
+  'The real CLI issues next-wave briefs whose commands call its own absolute entry',
+  { timeout: 180000 },
+  async t => {
+    const temp = await realpath(await mkdtemp(path.join(os.tmpdir(), 'kodo-external-cli-')));
+    t.after(() => rm(temp, { recursive: true, force: true }));
+    const isolated = path.join(temp, 'empty-home');
+    await mkdir(isolated);
+    await writeFile(path.join(isolated, 'gitconfig'), '');
+    const env = {
+      ...workerEnvironment(),
+      HOME: isolated,
+      USERPROFILE: isolated,
+      LOCALAPPDATA: isolated,
+      XDG_CONFIG_HOME: isolated,
+      KODO_HOME: path.join(temp, 'state'),
+      KODO_CREDENTIAL_HOME: path.join(temp, 'credentials'),
+      KODO_WORKTREE_HOME: path.join(temp, 'worktrees'),
+      GIT_CONFIG_NOSYSTEM: '1',
+      GIT_CONFIG_GLOBAL: path.join(isolated, 'gitconfig'),
+      GIT_TERMINAL_PROMPT: '0',
+    };
+    // `node` without a path, as the main chat's shell finds it.
+    const pathKey = Object.keys(env).find(key => key.toUpperCase() === 'PATH') ?? 'PATH';
+    env[pathKey] = [path.dirname(process.execPath), env[pathKey]].filter(Boolean).join(path.delimiter);
+    const kodo = (...args) => {
+      const result = spawnSync(process.execPath, [cli, 'project', ...args, '--json'], {
+        env,
+        encoding: 'utf8',
+        timeout: 60000,
+        windowsHide: true,
+      });
+      assert.equal(result.error, undefined);
+      return { exitCode: result.status, report: JSON.parse(result.stdout) };
+    };
+    const created = kodo('create', '--file', await project(t, temp, 'wave', true));
+    assert.equal(created.exitCode, 0, JSON.stringify(created.report));
+    const projectId = created.report.projectId;
+    const next = kodo('next-wave', projectId, '--host', 't3');
+    assert.equal(next.exitCode, 0, JSON.stringify(next.report));
+    const prefix = `node "${cli}"`;
+    assert.equal(next.report.result.cli, prefix);
+    const [brief] = next.report.result.briefs;
+    assert.equal(brief.selfCheck, `${prefix} ci feedback --base ${brief.baseSha} --project "${brief.worktree}" --json`);
+    assert.equal(brief.completeCommand, `${prefix} project complete-task ${projectId} task-a --head <SHA>`);
+    assert.equal(
+      brief.abandonCommand,
+      `${prefix} project complete-task ${projectId} task-a --head <SHA> --abandon --attempt ${brief.attemptId}`,
+    );
+    // The brief's command runs as written in the platform shell (cmd.exe on Windows, sh elsewhere).
+    const abandon = spawnSync(`${brief.abandonCommand.replace('<SHA>', brief.baseSha)} --json`, {
+      shell: true,
+      env,
+      encoding: 'utf8',
+      timeout: 60000,
+      windowsHide: true,
+    });
+    assert.equal(abandon.status, 0, abandon.stdout + abandon.stderr);
+    assert.equal(JSON.parse(abandon.stdout).result.status, 'abandoned');
+  },
+);

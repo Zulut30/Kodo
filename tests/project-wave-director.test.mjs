@@ -446,6 +446,44 @@ test('A quota stop returns waiting_limits and the next drain resumes the same Ru
   assert.equal(f.runs().filter(row => row.directorBinding?.kind !== 'gate').length, 1);
 });
 
+test(
+  'A write outside writePaths blocks the wave task with scope_conflict without a repair round',
+  { timeout: 300000 },
+  async t => {
+    const f = await fixture(t, {
+      tasks: [task('alpha'), task('beta')],
+      config: { executionMode: 'deep', repairRounds: 5 },
+      hooks: {
+        onWorker: async (request, id) => {
+          if (id === 'alpha') await writeFile(path.join(request.cwd, 'stray.txt'), 'outside the task\n');
+        },
+      },
+    });
+    const result = await f.director.drain(f.id, { concurrency: 2 });
+    assert.equal(result.status, 'blocked', JSON.stringify(result));
+    assert.deepEqual(
+      result.blockers.map(row => [row.kind, row.id, row.code]),
+      [['task', 'alpha', 'scope_conflict']],
+    );
+    assert.deepEqual(
+      f.calls.worker.filter(id => id === 'alpha'),
+      ['alpha'],
+      'the scope violation spends no repair session',
+    );
+    const run = f.runs().find(row => row.directorBinding?.taskId === 'alpha');
+    assert.equal(run.state, 'blocked');
+    assert.equal(run.blocker.current.code, 'scope_conflict');
+    assert.equal(run.nodes.implementation.attempt, 1);
+    const snapshot = f.repo.snapshot(f.id);
+    assert.equal(snapshot.tasks.find(row => row.id === 'beta').status, 'integrated');
+    assert.equal(
+      spawnSync('git', ['cat-file', '-e', `${f.branchHead()}:stray.txt`], { cwd: f.root }).status !== 0,
+      true,
+      'the stray file never reaches the integration branch',
+    );
+  },
+);
+
 test('A missing risk approval blocks the drain before any reservation', async t => {
   const f = await fixture(t, {
     tasks: [task('alpha', { riskApprovalRequired: true }), task('beta', { dependsOn: ['alpha'] })],

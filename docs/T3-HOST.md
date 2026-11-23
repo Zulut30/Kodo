@@ -51,11 +51,13 @@ kodo project complete-task --head ►  проверка commit, task-fast,
 | `worktree`, `branch`, `baseSha` | Рабочая копия, её ветка и база |
 | `interfaces` | Пути `interfaceRefs` самой задачи (неизменяемые evidence-файлы) |
 | `prompt` | Точный `buildDirectorTaskInput` задачи и контракт воркера |
-| `selfCheck` | `kodo ci feedback --base <baseSha> --project "<worktree>" --json` |
-| `completeCommand` | `kodo project complete-task <projectId> <taskId> --head <SHA>` |
-| `abandonCommand` | `kodo project complete-task <projectId> <taskId> --head <SHA> --abandon --attempt <attemptId>` — отказ привязан к этой попытке |
+| `selfCheck` | `<cli> ci feedback --base <baseSha> --project "<worktree>" --json` |
+| `completeCommand` | `<cli> project complete-task <projectId> <taskId> --head <SHA>` |
+| `abandonCommand` | `<cli> project complete-task <projectId> <taskId> --head <SHA> --abandon --attempt <attemptId>` — отказ привязан к этой попытке |
 
-Контракт воркера в `prompt`: работать только в worktree и только в `writePaths`; не удалять, не пропускать и не ослаблять тесты; закоммитить в свою ветку без push, PR, merge и rebase; запустить `selfCheck`; закончить с чистым worktree и вернуть полный SHA. Бриф проходит `assertDirectorSafe` (известные секреты, PEM, redaction). Из абсолютных путей он содержит только worktree, пути `interfaces` и `projectContext.root` внутри замороженного входа задачи; state home, артефакты Run и интеграционный worktree в бриф не попадают.
+`<cli>` — префикс CLI, выдавшего бриф (поле `cli` ответа `next-wave`, `runtime/cli-command.mjs`). Из `kodo` и `node cli/index.mjs` это `node "<абсолютный путь к cli/index.mjs этого пакета>"`: путь берётся из `import.meta.url` точки входа, `node` без пути находят PowerShell, cmd и bash. Поэтому воркер и главный чат вызывают тот же пакет Kodo, даже если на PATH другая версия `kodo` (например, 0.2.6 без `project`). Библиотечный вызов `nextWave` без CLI-контекста сохраняет `kodo`; недопустимый префикс (пустой, с пробелами по краям или управляющими символами) — `project_cli_invalid` до lease и резерва.
+
+Контракт воркера в `prompt`: работать только в worktree и только в `writePaths`; не удалять, не пропускать и не ослаблять тесты; закоммитить в свою ветку без push, PR, merge и rebase; запустить `selfCheck`; закончить с чистым worktree и вернуть полный SHA. Бриф проходит `assertDirectorSafe` (известные секреты, PEM, redaction). Из абсолютных путей он содержит только worktree, пути `interfaces`, `projectContext.root` внутри замороженного входа задачи и путь `cli/index.mjs` пакета Kodo в префиксе команд; state home, артефакты Run и интеграционный worktree в бриф не попадают.
 
 ## Роли
 
@@ -70,11 +72,11 @@ kodo project complete-task PROJECT_ID TASK_ID --head SHA --abandon --attempt UUI
 kodo project gates PROJECT_ID [--retry-failed] [--json]
 ```
 
-Аргументы разбираются строго до чтения учётных данных, состояния и Git; любая ошибка — exit 1, `project_arguments`. `--abandon` без `--attempt` — тоже `project_arguments`. `--limit` по умолчанию 3.
+Аргументы разбираются строго до чтения учётных данных, состояния и Git; любая ошибка — exit 1, `project_arguments`. `kodo project --help` и `kodo project <действие> --help` (или `-h`) печатают справку проектных команд (с `--json` — `result.status: "help"`, `result.usage`) с exit 0 ещё до разбора, без ключей и состояния. `--abandon` без `--attempt` — тоже `project_arguments`. `--limit` по умолчанию 3.
 
 | Команда | Результат | Exit |
 | --- | --- | --- |
-| `next-wave` | `{projectId, revision, briefs, blocked:[{taskId, code}]}` | 0 — есть брифы, 2 — пусто |
+| `next-wave` | `{projectId, revision, cli, briefs, blocked:[{taskId, code}]}` | 0 — есть брифы, 2 — пусто |
 | `complete-task` | `integrated` (`integration`, `gates`), `abandoned` | 0 |
 | `complete-task` | `checks_failed` (`code`, `message`), `blocked` (`code`) | 2 |
 | `gates` | `passed` (`gates`) | 0 |
@@ -117,7 +119,7 @@ kodo project gates PROJECT_ID [--retry-failed] [--json]
 - `--command-id` используется только для перехода `--abandon`; команды интеграции директор строит сам.
 - Gate Run эпика и принятие задач (`accepted`) выполняет директор (`runPendingGates`) внутри `complete-task`, `gates` или `drain`.
 - Заблокированный gate Run сам не повторяется: `complete-task` запускает только ожидающие гейты. После устранения причины (например, задача исправлена новой попыткой или починено окружение) хост вызывает `kodo project gates PROJECT_ID --retry-failed`: директор резервирует новый гейт на текущей голове интеграционной ветки и проходит его под lease `project:<id>`. Без `--retry-failed` команда лишь выполняет ожидающие гейты. Проект на паузе, отменённый, проваленный или заблокированный — `blocked`, `project_control_blocked` (те же состояния отклоняет `complete-task`); отменённый проход — `blocked`, `project_cancelled`, даже если гейты не успели заблокироваться; не-wave проект — `project_wave_required`.
-- Kodo не создаёт, не читает и не архивирует чаты хоста; это делает главный чат своими инструментами.
+- Kodo не создаёт, не читает и не архивирует чаты хоста; это делает главный чат своими инструментами: в T3 — `delegate_task`, правки в тот же чат — `t3_thread_send`, архив — `t3_thread_organize` с `action: "archive"` и `childThreadId` из ответа `delegate_task` сразу после итога задачи (`integrated` или `abandoned`), а не в конце проекта (навык `kodo-project-director`).
 - Orca использует тот же протокол (`--host orca`), но с Orca он не проверялся.
 - Функции директора (`selectWave`, `createWaveContext`, `integrateAndAdvance`, `runPendingGates`) берутся из `runtime/project-director-waves.mjs`; модульные тесты протокола подменяют их fake-портами, сквозной `tests/project-wave-e2e.test.mjs` идёт без подмен.
 

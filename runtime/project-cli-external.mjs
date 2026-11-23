@@ -24,6 +24,7 @@ const reported = new Set([
   'project_attempt_not_external',
   'project_wave_ports_invalid',
   'project_snapshot_incomplete',
+  'project_cli_invalid',
 ]);
 const dataErrors = new Set([
   'project_schema',
@@ -131,6 +132,8 @@ async function operate(options, ports, safety) {
         limit: flags['--limit'] === undefined ? 3 : Number(flags['--limit']),
         retryFailed: flags['--retry-failed'] === true,
         ports: ports.wave,
+        // The CLI entry passes its own command: the briefs call the same Kodo package.
+        ...(ports.cli === undefined ? {} : { cli: ports.cli }),
       });
       success = result.briefs.length > 0;
     } else if (options.action === 'gates') {
@@ -166,7 +169,8 @@ async function operate(options, ports, safety) {
 /**
  * Ports belong to the coordinator/test harness, never to decoded CLI data:
  * `secrets`/`loadSecrets`, `store`/`openStore`/`home`, `createEngine`,
- * `createAuthorizer`, `wave` (the director's wave functions) and `signal`.
+ * `createAuthorizer`, `wave` (the director's wave functions), `cli` (command prefix of
+ * the brief commands, runtime/cli-command.mjs) and `signal`.
  */
 export async function projectExternalCli(argv, ports = {}) {
   let options,

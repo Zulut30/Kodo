@@ -37,6 +37,7 @@ import * as waves from './project-director-waves.mjs';
 import { verifyTaskFastOnce } from './wave-verifier.mjs';
 import { workerRole } from './worker-roles.mjs';
 import { applyWavePolicy } from './wave-policy.mjs';
+import { DEFAULT_CLI, validCliPrefix } from './cli-command.mjs';
 
 /** The largest batch one `nextWave` call returns. */
 export const MAX_WAVE_LIMIT = 5;
@@ -145,12 +146,13 @@ function workerContract(run, writePaths, selfCheck) {
 }
 
 function briefFor(state, attempt, task, run) {
-  const { C, options } = state,
+  const { C, options, cli } = state,
     project = state.snapshot.project;
   const input = C.buildDirectorTaskInput({ project, task }, options);
   need(run.task === input, 'binding_invalid');
   const { role, instructions } = workerRole(task.owner);
-  const selfCheck = `kodo ci feedback --base ${run.baseSha} --project ${quote(run.cwd)} --json`;
+  // The caller's CLI (`cli`): a chat runs the same Kodo package that issued the brief.
+  const selfCheck = `${cli} ci feedback --base ${run.baseSha} --project ${quote(run.cwd)} --json`;
   const brief = {
     projectId: project.projectId,
     taskId: task.id,
@@ -166,8 +168,8 @@ function briefFor(state, attempt, task, run) {
     interfaces: task.interfaceRefs.map(ref => ref.path),
     prompt: `${input}\n\n${workerContract(run, task.writePaths, selfCheck)}`,
     selfCheck,
-    completeCommand: `kodo project complete-task ${project.projectId} ${task.id} --head <SHA>`,
-    abandonCommand: `kodo project complete-task ${project.projectId} ${task.id} --head <SHA> --abandon --attempt ${attempt.id}`,
+    completeCommand: `${cli} project complete-task ${project.projectId} ${task.id} --head <SHA>`,
+    abandonCommand: `${cli} project complete-task ${project.projectId} ${task.id} --head <SHA> --abandon --attempt ${attempt.id}`,
   };
   C.assertDirectorSafe(brief, options);
   return brief;
@@ -381,14 +383,16 @@ async function reserveSelected(state, limit, ports) {
 
 /**
  * Reserve the next wave for an external host: the briefs of this host's running
- * attempts, then new non-overlapping tasks up to `limit` (1..5).
+ * attempts, then new non-overlapping tasks up to `limit` (1..5). `cli` is the command
+ * prefix of the brief commands and is returned with them (default `kodo`).
  * @param {{ repo: any, engine: any, store?: any, contracts?: any, clock?: () => string }} ctx
- * @param {{ projectId: string, host: string, limit?: number, retryFailed?: boolean, ports?: any }} input
+ * @param {{ projectId: string, host: string, limit?: number, retryFailed?: boolean, ports?: any, cli?: string }} input
  */
 export async function nextWave(ctx, input) {
-  const { projectId, host, limit = 3, retryFailed = false, ports } = input;
+  const { projectId, host, limit = 3, retryFailed = false, ports, cli = DEFAULT_CLI } = input;
   need(isPullHost(host), 'host_unsupported');
   need(Number.isSafeInteger(limit) && limit >= 1 && limit <= MAX_WAVE_LIMIT, 'limit_invalid');
+  need(validCliPrefix(cli), 'cli_invalid');
   const C = await contractsOf(ctx),
     store = storeOf(ctx);
   const snapshot = await snapshotOf(ctx, projectId);
@@ -406,6 +410,7 @@ export async function nextWave(ctx, input) {
       ctx,
       C,
       host,
+      cli,
       token,
       integration,
       options: { knownValues: known(ctx.engine) },
@@ -418,7 +423,7 @@ export async function nextWave(ctx, input) {
     if (retryFailed) await reserveRetries(state, limit);
     await reserveSelected(state, limit, ports);
     const revision = (await snapshotOf(ctx, projectId)).revision;
-    return { projectId, revision, briefs: state.briefs, blocked: state.blocked };
+    return { projectId, revision, cli, briefs: state.briefs, blocked: state.blocked };
   } finally {
     store.releaseLease(token);
   }

@@ -136,6 +136,8 @@ kodo project extend <projectId> "Теги заметок" --prepare --json
 kodo project append-milestone <projectId> --file <bundle>\milestone.json --json
 ```
 
+`kodo project --help` показывает справку проектных команд. Команды в брифах `next-wave` и подсказках `next` вызывают тот же пакет: `node "<абсолютный путь к cli/index.mjs>" …`, поэтому другая версия `kodo` на PATH им не мешает. Воркер-чат главный чат архивирует сразу после итога его задачи.
+
 Формат чертежа и проверки — [BLUEPRINT.md](docs/BLUEPRINT.md), протокол воркер-чатов — [T3-HOST.md](docs/T3-HOST.md), решения — [ADR-0014](docs/decisions/0014-wave-factory.md) и [ADR-0015](docs/decisions/0015-t3-pull-host.md).
 
 ## Каталог компонентов

@@ -97,6 +97,9 @@ async function waveCommand(argv) {
  * Ports belong to the coordinator/test harness, never to decoded CLI data.
  */
 export async function projectCli(argv, ports = {}) {
+  // Help precedes strict parsing, credentials and state of every project action.
+  const help = (await import('./project-help.mjs')).projectHelp(argv);
+  if (help) return help;
   const wave = await waveCommand(argv);
   if (wave) return wave(argv, ports);
   let options,

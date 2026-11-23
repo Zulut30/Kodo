@@ -4,6 +4,7 @@
 // no API fallback. The report envelope matches runtime/project-cli.mjs.
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
+import { DEFAULT_CLI, validCliPrefix } from './cli-command.mjs';
 
 export const BLUEPRINT_ACTIONS = Object.freeze(['bootstrap', 'apply-spec', 'extend', 'append-milestone']);
 
@@ -211,7 +212,7 @@ async function bootstrap(ctx) {
         `Прочитай context.md, rules.md и templates/ в ${bundle.dir}.`,
         `Напиши чертёж только в ${target}: PROJECT.md, interfaces/<module>.md, spec.json (root = ${bundle.summary.root}).`,
         'Перед регистрацией root — корень Git-репозитория с коммитом; всё вне .kodo/blueprint закоммичено или в .gitignore.',
-        `Проверь и зарегистрируй проект: kodo project apply-spec --root "${bundle.summary.root}" --json`,
+        `Проверь и зарегистрируй проект: ${ctx.cli} project apply-spec --root "${bundle.summary.root}" --json`,
       ],
     });
   }
@@ -235,7 +236,9 @@ async function bootstrap(ctx) {
     ...extra,
     blueprint: path.join(generated.spec.root, '.kodo', 'blueprint'),
     modules: moduleMap(generated.spec),
-    next: [`Проверь чертёж и зарегистрируй проект: kodo project apply-spec --root "${generated.spec.root}" --json`],
+    next: [
+      `Проверь чертёж и зарегистрируй проект: ${ctx.cli} project apply-spec --root "${generated.spec.root}" --json`,
+    ],
   });
 }
 
@@ -319,6 +322,12 @@ async function applySpec(ctx) {
     execution: snapshot.project.execution ?? null,
     interfaces: bound.interfaces.map(item => ({ module: item.module, sha256: item.sha256 })),
     modules: moduleMap(snapshot),
+    next: [
+      // Workers' self-check (ci feedback) lints JS/TS with the managed oxlint; without it the
+      // feedback is blocked, never passed. Installing is the coordinator's step, not a worker's.
+      `Перед первой волной установи управляемый линтер самопроверки воркеров (один раз на машину, нужна сеть): ${ctx.cli} tools install oxlint --project "${snapshot.project.root}" --json — для JS/TS, для TypeScript ещё typescript. Без него ci feedback воркера отвечает blocked, а не passed.`,
+      `Запусти волну: ${ctx.cli} project next-wave ${created.projectId} --host t3 --limit 3 --json`,
+    ],
   });
 }
 
@@ -389,7 +398,7 @@ async function extend(ctx) {
       next: [
         `Прочитай context.md и rules.md в ${bundle.dir}; форма майлстоуна — ${template}.`,
         `Запиши майлстоун в ${file} (вне репозитория).`,
-        `Проверь и добавь: kodo project append-milestone ${options.projectId} --file "${file}" --json`,
+        `Проверь и добавь: ${ctx.cli} project append-milestone ${options.projectId} --file "${file}" --json`,
       ],
     });
   }
@@ -433,7 +442,8 @@ function failureReport(error, phase) {
 
 /** Explicit, lazy composition of the project factory actions. Ports belong to
  * the coordinator/test harness: secrets, loadSecrets, home, store, openStore,
- * createEngine, provider, architecture, knowledge, now, signal. */
+ * createEngine, provider, architecture, knowledge, now, signal and cli (command
+ * prefix of the `next` hints, runtime/cli-command.mjs). */
 export async function projectBlueprintCli(argv, ports = {}) {
   let options,
     outcome,
@@ -456,8 +466,10 @@ export async function projectBlueprintCli(argv, ports = {}) {
       knownValues,
       safety,
       home: ports.home || ports.store?.home || security.stateHome(),
+      cli: ports.cli ?? DEFAULT_CLI,
     });
     phase = 'operation';
+    if (!validCliPrefix(ctx.cli)) throw Object.assign(new Error('Invalid CLI prefix'), { code: 'project_cli_invalid' });
     outcome = await HANDLERS[options.action](ctx);
     safety(outcome.report); // Guard every output value before either format.
   } catch (error) {

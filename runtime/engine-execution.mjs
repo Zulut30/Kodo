@@ -8,6 +8,7 @@ import { execute } from './command.mjs';
 import { git, makeWorktree, changedFiles, commitChanges } from './workspace.mjs';
 import { taskContract } from './task-context.mjs';
 import { runReadyQueue } from './task-scheduler.mjs';
+import { TASK_FAST_PROFILE } from './task-fast-checks.mjs';
 import { executeDurableTasks } from './engine-jobs.mjs';
 import { normalizeWatchdogConfig, unchanged } from './watchdog.mjs';
 import { EnginePlanning } from './engine-planning.mjs';
@@ -287,8 +288,15 @@ export class EngineExecution extends EnginePlanning {
         const repeated = node.lastFailure === signature;
         node.lastFailure = signature;
         this.save(run);
-        if (repeated || node.attempt >= run.config.repairRounds) {
-          node.stopped = node.attempt >= run.config.repairRounds ? 'repair_budget_exhausted' : 'no_progress';
+        // A wave task (task-fast) owns only its writePaths: a write outside them is the task's
+        // blocker with its own code, not a defect for another repair session.
+        const scopeStop = error.code === 'scope_conflict' && run.verificationProfile === TASK_FAST_PROFILE;
+        if (scopeStop || repeated || node.attempt >= run.config.repairRounds) {
+          node.stopped = scopeStop
+            ? 'scope_conflict'
+            : node.attempt >= run.config.repairRounds
+              ? 'repair_budget_exhausted'
+              : 'no_progress';
           node.status = 'blocked';
           this.assess(run, { scope: task.id, attempts: node.attempt, reason: node.stopped, problem: node.error });
           throw Object.assign(new Error(`Нет прогресса в ${task.id}: ${node.error}`), {

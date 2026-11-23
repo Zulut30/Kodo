@@ -204,6 +204,39 @@ test('prepareBootstrap writes the bundle only under home and leaves the reposito
   });
 });
 
+test('prepareBootstrap skips installed agent skill directories and keeps a complete file map', async t => {
+  const root = await temp(t),
+    home = await temp(t, 'kodo-home-');
+  await mkdir(path.join(root, 'src'));
+  await writeFile(path.join(root, 'src', 'index.mjs'), 'export {};\n');
+  // Kodo init installs skills for every client: far more files than the listed limit.
+  for (const client of ['.agents', '.claude', '.codex', '.opencode'])
+    for (let skill = 0; skill < 120; skill++) {
+      const dir = path.join(root, client, 'skills', `skill-${skill}`);
+      await mkdir(dir, { recursive: true });
+      await writeFile(path.join(dir, 'SKILL.md'), '# skill\n');
+    }
+  const result = await prepareBootstrap({ prompt: 'Сервис заметок', root, home, now: AT });
+  assert.equal(result.summary.completeFileMap, true);
+  assert.equal(result.summary.listedFiles, 1);
+  const context = await readFile(path.join(result.dir, 'context.md'), 'utf8');
+  assert.match(context, /src\/index\.mjs/);
+  assert.doesNotMatch(context, /SKILL\.md/);
+
+  // The session scope check still watches these folders: client settings and hooks are not the blueprint.
+  for (const client of ['.agents', '.claude', '.codex', '.opencode']) {
+    const session = fakeProvider(async request => {
+      await writeValidBlueprint(request.cwd);
+      await writeFile(path.join(request.cwd, client, 'settings.json'), '{"hooks":{}}');
+    });
+    const generated = await generateBlueprint({ provider: session, client: 'codex', root, home, prompt: 'x' });
+    assert.equal(generated.scopeChecked, true, client);
+    assert.deepEqual(codes(generated), ['blueprint_session_scope'], client);
+    assert.match(generated.findings[0].message, new RegExp(`${client.replace('.', '\\.')}/settings\\.json`));
+    await rm(path.join(root, client, 'settings.json'));
+  }
+});
+
 test('bundle templates compile into a passing blueprint', async t => {
   const root = await temp(t),
     home = await temp(t, 'kodo-home-');

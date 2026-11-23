@@ -330,7 +330,13 @@ test('bootstrap --prepare writes the context bundle only to KODO_HOME', async t 
   assert.match(await readFile(path.join(bundle.dir, 'context.md'), 'utf8'), /Сервис заметок с поиском/);
   assert.equal(report.result.summary.root, root);
   assert.equal(report.result.blueprint, path.join(root, '.kodo', 'blueprint'));
-  assert.ok(report.result.next.some(line => line.includes('kodo project apply-spec')));
+  // The hints call the CLI that issued them, by its absolute entry.
+  assert.ok(
+    report.result.next.includes(
+      `Проверь и зарегистрируй проект: node "${cli}" project apply-spec --root "${root}" --json`,
+    ),
+  );
+  assert.ok(report.result.next.every(line => !/kodo project/.test(line)));
   assert.deepEqual(await tree(root), before, 'the repository is unchanged');
 });
 
@@ -384,9 +390,22 @@ test('apply-spec creates a wave project with verifiable interfaces and replays b
   const root = await f.root();
   const dir = await writeBlueprint(root);
   const commandId = randomUUID();
-  const { exitCode, report } = await f.run(['apply-spec', '--root', root, '--command-id', commandId]);
+  const prefix = `node "${cli}"`;
+  const { exitCode, report } = await f.run(['apply-spec', '--root', root, '--command-id', commandId], { cli: prefix });
   assert.equal(exitCode, 0, JSON.stringify(report));
   assert.equal(report.result.status, 'created');
+  // Next steps with the caller's CLI: the managed linter for workers' self-check, then the first wave.
+  const hint = text =>
+    assert.ok(
+      report.result.next.some(line => line.includes(text)),
+      text,
+    );
+  hint(`${prefix} tools install oxlint --project "${root}" --json`);
+  hint(`${prefix} project next-wave ${report.projectId} --host t3 --limit 3 --json`);
+  assert.ok(
+    report.result.next.some(line => line.includes('blocked')),
+    'a missing tool is named a blocker',
+  );
   assert.equal(report.result.replayed, false);
   assert.deepEqual(report.result.execution, wave);
   assert.deepEqual(report.result.modules.waveZero, ['scaffold', 'test-bench']);
@@ -521,8 +540,15 @@ test('extend prepares a feature bundle from the snapshot or appends a session mi
   const f = await fixture(t);
   const prepared = await acceptedProject(f);
   const before = await tree(prepared.root);
-  const bundle = await f.run(['extend', prepared.projectId, 'Добавить теги', '--prepare']);
+  const bundle = await f.run(['extend', prepared.projectId, 'Добавить теги', '--prepare'], {
+    cli: `node "${cli}"`,
+  });
   assert.equal(bundle.exitCode, 0, JSON.stringify(bundle.report));
+  assert.ok(
+    bundle.report.result.next.some(line =>
+      line.includes(`node "${cli}" project append-milestone ${prepared.projectId} --file "`),
+    ),
+  );
   assert.equal(bundle.report.projectId, prepared.projectId);
   assert.equal(bundle.report.revision, prepared.snapshot.revision);
   assert.equal(bundle.report.result.status, 'prepared');

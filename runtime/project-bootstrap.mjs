@@ -38,11 +38,15 @@ const CLOSED = ['accepted', 'released'];
 const REDACTED = '[REDACTED]';
 // A whole PEM private key block; an unterminated header redacts to the end.
 const PEM_BLOCK = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/gi;
+// Agent client folders: installed skills, roles and settings, not project source. The file
+// map skips them; a native session that changes them is still out of scope (generateBlueprint).
+const AGENT_DIRS = ['.agents', '.claude', '.codex', '.opencode'];
 const SKIP_DIRS = new Set([
   '.git',
   '.hg',
   '.svn',
   '.kodo',
+  ...AGENT_DIRS,
   'node_modules',
   'dist',
   'build',
@@ -149,8 +153,9 @@ async function existingRoot(root) {
 const isoTime = now => new Date(typeof now === 'function' ? now() : (now ?? Date.now())).toISOString();
 
 /** Bounded, link-free walk without content reads; skips VCS, dependency and
- * build directories and Kodo state (.kodo). Files are in byte-sorted DFS order. */
-async function scanProject(root) {
+ * build directories, Kodo state (.kodo) and agent client folders unless named in
+ * `watch`. Files are in byte-sorted DFS order. */
+async function scanProject(root, { watch = [] } = {}) {
   const files = [],
     state = { links: 0, skippedDirs: 0, complete: true };
   async function visit(directory, prefix, depth) {
@@ -171,7 +176,7 @@ async function scanProject(root) {
       const relative = prefix + entry.name;
       if (entry.isSymbolicLink()) state.links++;
       else if (entry.isDirectory()) {
-        if (SKIP_DIRS.has(entry.name)) state.skippedDirs++;
+        if (SKIP_DIRS.has(entry.name) && !watch.includes(entry.name)) state.skippedDirs++;
         else if (depth >= SCAN_DEPTH) {
           state.skippedDirs++;
           state.complete = false;
@@ -625,7 +630,7 @@ export async function generateBlueprint(options = {}) {
   const bundle = await prepareBootstrap({ prompt, root, home, now, architecture, knowledge, ...safety });
   const real = bundle.summary.root;
   const files = await bundleFiles(bundle);
-  const before = await scanProject(real);
+  const before = await scanProject(real, { watch: AGENT_DIRS });
   const result = await provider.runSession({
     client,
     model: model ?? undefined,
@@ -635,7 +640,7 @@ export async function generateBlueprint(options = {}) {
     readOnly: false,
     signal,
   });
-  const after = await scanProject(real);
+  const after = await scanProject(real, { watch: AGENT_DIRS });
   const output = result?.output;
   const status = isPlain(output) && ['written', 'blocked'].includes(output.status) ? output.status : null;
   const sessionFindings = !status

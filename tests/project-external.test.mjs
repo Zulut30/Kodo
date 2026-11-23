@@ -5,6 +5,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { Store } from '../runtime/store.mjs';
 import { Engine } from '../runtime/engine.mjs';
 import * as contracts from '../runtime/project-contracts.mjs';
@@ -333,6 +334,32 @@ test('next-wave reserves non-overlapping tasks on the integration head; a repeat
     attempts.map(row => row.number),
     [1, 1],
   );
+});
+
+test('next-wave briefs call the CLI of their caller; a library call keeps the kodo default', async t => {
+  const f = await fixture(t);
+  const cli = `node "${fileURLToPath(new URL('../cli/index.mjs', import.meta.url))}"`;
+  const result = await f.wave({ limit: 1, cli });
+  assert.equal(result.cli, cli);
+  const [row] = result.briefs;
+  assert.equal(row.selfCheck, `${cli} ci feedback --base ${row.baseSha} --project "${row.worktree}" --json`);
+  assert.equal(row.completeCommand, `${cli} project complete-task ${f.projectId} ${row.taskId} --head <SHA>`);
+  assert.equal(
+    row.abandonCommand,
+    `${cli} project complete-task ${f.projectId} ${row.taskId} --head <SHA> --abandon --attempt ${row.attemptId}`,
+  );
+  assert.ok(row.prompt.includes(row.selfCheck));
+  contracts.assertDirectorSafe(row, { knownValues: [] });
+  // The same attempt without a CLI context: the library default prefix.
+  const plain = await f.wave({ limit: 1 });
+  assert.equal(plain.cli, 'kodo');
+  assert.equal(plain.briefs[0].attemptId, row.attemptId);
+  assert.equal(plain.briefs[0].selfCheck, row.selfCheck.replace(cli, 'kodo'));
+  // An unusable prefix is refused before the lease or any reservation.
+  const before = (await f.snapshot()).revision;
+  for (const bad of ['', ' ', 'node "x"\nkodo', 42])
+    await assert.rejects(f.wave({ cli: bad }), { code: 'project_cli_invalid' });
+  assert.equal((await f.snapshot()).revision, before);
 });
 
 test('complete-task rejects a commit outside its write paths, a foreign branch, a dirty or unrelated worktree and a deleted test', async t => {
