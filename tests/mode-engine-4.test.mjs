@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { readConfig } from '../runtime/config.mjs';
+import { ProviderError } from '../runtime/providers.mjs';
 import { git, task, metrics, fixture } from './helpers/mode-engine-fixture.mjs';
 
 test('Automatic assessment precedes expensive analysis and project mode is overridden by explicit mode', async t => {
@@ -300,4 +301,23 @@ test('An automatic restart of a silent client takes its own session budget and n
   assert.equal(capped.sessions.length, 1, 'the refused restart started nothing');
   const node = Object.values(blocked.nodes)[0];
   assert.deepEqual([node.attempt, node.stopped], [0, undefined], 'no repair round was spent');
+});
+
+test('An unconfirmed stop of a client stops the run with that reason and spends no repair round', async t => {
+  const fx = await fixture(t);
+  const original = fx.provider.runSession;
+  fx.provider.runSession = async request => {
+    if (!request.schema.properties.tasks && !request.schema.properties.passed) {
+      fx.sessions.push(request);
+      throw new ProviderError('Остановка процессов клиента не подтверждена', 'process_teardown');
+    }
+    return original(request);
+  };
+  const result = await fx.engine.run(
+    (await fx.engine.create('Set value to one', { project: fx.project, mode: 'quick' })).id,
+  );
+  assert.deepEqual([result.state, result.error.code], ['blocked', 'process_teardown']);
+  const node = Object.values(result.nodes)[0];
+  assert.deepEqual([node.attempt, node.stopped], [0, undefined], 'no repair round was spent');
+  assert.equal(fx.sessions.filter(request => !request.schema.properties.tasks).length, 1, 'no second worker start');
 });

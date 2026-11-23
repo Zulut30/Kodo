@@ -621,7 +621,11 @@ export async function runSession(
     const failure =
       error instanceof ProviderError || signal?.aborted
         ? error
-        : new ProviderError(redact(error.message), 'unavailable');
+        : // An unconfirmed stop of the client's processes keeps its reason: no restart, no repair.
+          new ProviderError(
+            redact(error.message),
+            error?.code === 'process_teardown' ? 'process_teardown' : 'unavailable',
+          );
     if (failure instanceof Error && Object.isExtensible(failure))
       failure.metrics = sessionMetrics(client, events, {
         durationMs: nowImpl() - started,

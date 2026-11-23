@@ -1126,6 +1126,17 @@ async function gone(pid, ms = 5000) {
   return false;
 }
 
+/** Stops a run as soon as `ready` sees its line: no fixed wait for the descendant to start. */
+function stopWhenReady(ready) {
+  const controller = new AbortController();
+  return {
+    signal: controller.signal,
+    onLine: line => {
+      if (ready(line)) controller.abort(Object.assign(new Error('descendant ready'), { code: 'TEST_STOP' }));
+    },
+  };
+}
+
 test('A stopped client takes the descendant that inherited its stdout with it', { timeout: 60000 }, async t => {
   let descendant;
   t.after(() => {
@@ -1143,13 +1154,9 @@ setInterval(()=>{},1000);`;
       command: process.execPath,
       args: ['-e', launcher],
       timeoutMs: 120000,
-      startupTimeoutMs: 1500,
-      startedBy: jsonObjectLine,
-      onLine: line => {
-        descendant ??= Number(/^descendant (\d+)$/.exec(line)?.[1]) || undefined;
-      },
+      ...stopWhenReady(line => (descendant ??= Number(/^descendant (\d+)$/.exec(line)?.[1]) || undefined)),
     }),
-    error => error.code === 'KODO_STARTUP_TIMEOUT',
+    error => error.code === 'TEST_STOP',
   );
   assert.ok(performance.now() - started < 30000, 'the runner did not wait for the inherited pipe');
   assert.ok(descendant, 'the descendant reported itself');
@@ -1176,16 +1183,83 @@ setInterval(()=>{},1000);`;
       command: process.execPath,
       args: ['-e', launcher],
       timeoutMs: 120000,
-      startupTimeoutMs: 1500,
-      startedBy: jsonObjectLine,
-      onLine: line => {
-        escaped ??= Number(/^escaped (\d+)$/.exec(line)?.[1]) || undefined;
-      },
+      ...stopWhenReady(line => (escaped ??= Number(/^escaped (\d+)$/.exec(line)?.[1]) || undefined)),
     }),
-    error => error.code === 'KODO_STARTUP_TIMEOUT',
+    error => error.code === 'TEST_STOP',
   );
   assert.ok(performance.now() - started < 30000, 'a bounded wait, not the pipe, ended the session');
   assert.ok(escaped, 'the escaped descendant reported itself');
+});
+
+test('A stopped attempt ends only after its processes are confirmed stopped', { timeout: 60000 }, async () => {
+  let confirmed = false;
+  await assert.rejects(
+    runProcess({
+      command: process.execPath,
+      args: ['-e', "process.stdout.write('up\\n');setInterval(()=>{},1000)"],
+      timeoutMs: 120000,
+      ...stopWhenReady(line => line === 'up'),
+      stopImpl: async child => {
+        await new Promise(resolve => setTimeout(resolve, 300));
+        child.kill('SIGKILL');
+        confirmed = true;
+      },
+    }),
+    error => {
+      assert.equal(error.code, 'TEST_STOP');
+      assert.equal(confirmed, true, 'the attempt did not end before the stop was confirmed');
+      return true;
+    },
+  );
+});
+
+test('An unconfirmed stop is reported as such and never followed by a restart', { timeout: 60000 }, async t => {
+  let client;
+  t.after(() => {
+    try {
+      if (client?.pid) process.kill(client.pid, 'SIGKILL');
+    } catch {}
+  });
+  await assert.rejects(
+    runProcess({
+      command: process.execPath,
+      args: ['-e', 'setInterval(()=>{},1000)'],
+      timeoutMs: 120000,
+      startupTimeoutMs: 300,
+      startedBy: jsonObjectLine,
+      stopImpl: async child => {
+        client = child;
+        throw new Error('access denied');
+      },
+    }),
+    error => error.code === 'process_teardown' && /не подтверждена/.test(error.message),
+  );
+  let starts = 0,
+    restarts = 0;
+  await assert.rejects(
+    runSession(
+      {
+        client: 'claude-code',
+        cwd: process.cwd(),
+        prompt: 'fixture task',
+        schema,
+        startupTimeoutMs: 50,
+        onStartupRetry: () => {
+          restarts++;
+        },
+      },
+      {
+        resolveClientImpl: async () => ({ command: 'fixture', args: [] }),
+        processImpl: async invocation => {
+          if (invocation.args.includes('status')) return { exitCode: 0, stdout: claudeLoggedIn, stderr: '' };
+          starts++;
+          throw Object.assign(new Error('Остановка процессов клиента не подтверждена'), { code: 'process_teardown' });
+        },
+      },
+    ),
+    error => error.code === 'process_teardown',
+  );
+  assert.deepEqual([starts, restarts], [1, 0], 'no restart after an unconfirmed stop');
 });
 
 test('A session without any event is started again exactly once with a fresh native session', async () => {

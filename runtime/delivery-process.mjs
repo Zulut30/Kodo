@@ -92,6 +92,10 @@ async function processHelper(command, args, input) {
   });
 }
 
+/**
+ * Stops the process tree (Windows) or process group (POSIX) of an owned child and resolves only
+ * once every captured owned process has exited; otherwise it throws `process_teardown`.
+ */
 async function stopOwnedTree(child) {
   if (!child.pid) return;
   if (process.platform === 'win32') {
@@ -434,4 +438,14 @@ export async function execute(
   });
 }
 
-export { sha256, fail, parse, wait, commandRedactions, redactCommandOutput, redactCommandError, commandFailure };
+export {
+  sha256,
+  fail,
+  parse,
+  wait,
+  commandRedactions,
+  redactCommandOutput,
+  redactCommandError,
+  commandFailure,
+  stopOwnedTree,
+};

@@ -4,6 +4,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { parse as parseToml } from 'smol-toml';
 import { workerEnvironment } from './security.mjs';
+import { stopOwnedTree } from './delivery-process.mjs';
 
 export function redact(value, secrets = {}) {
   let result = typeof value === 'string' ? value : JSON.stringify(value);
@@ -70,19 +71,20 @@ export async function resolveClient(client, environment = process.env) {
   throw new Error(`Не найден исполняемый файл клиента ${client}`);
 }
 
-/** After SIGTERM to the group, the group gets SIGKILL; after a stop, the pipes are closed by force. */
-const STOP_GRACE_MS = 2000,
-  CLOSE_WAIT_MS = 3000;
+/** After a confirmed stop, pipes still held by a process outside the tree are closed by force. */
+const CLOSE_WAIT_MS = 3000;
 
 /**
  * `startupTimeoutMs` bounds the wait for the first stdout line accepted by `startedBy` (any line by
  * default); it is armed only when shorter than `timeoutMs`. Past it the process tree is stopped
  * with `KODO_STARTUP_TIMEOUT`.
  *
- * A stop reaches the client's descendants: on POSIX the client leads its own process group, which
- * gets SIGTERM and, after a grace period, SIGKILL; on Windows `taskkill /T /F` stops the tree, and
- * a failed taskkill falls back to killing the client. A descendant outside the tree or group may
- * still hold the pipes, so after a stop the runner waits for them only for a bounded time.
+ * Every stop (timeouts, cancellation, output limit) goes through `stopImpl`, the owned-tree
+ * teardown of delivery: the POSIX client leads its own process group, which gets SIGTERM, then
+ * SIGKILL, until no member runs; on Windows every captured descendant is killed and awaited. The
+ * attempt ends only after that is confirmed. An unconfirmed stop ends it with `process_teardown`,
+ * never with the stop reason, so no caller starts the client again next to survivors. A process
+ * outside the tree may still hold the pipes: after the confirmed stop they are awaited only briefly.
  */
 export async function runProcess({
   command,
@@ -96,6 +98,7 @@ export async function runProcess({
   startedBy = /** @type {(line: string) => boolean} */ (() => true),
   onLine,
   maxOutputBytes = 16 * 1024 * 1024,
+  stopImpl = stopOwnedTree,
 }) {
   signal?.throwIfAborted();
   return new Promise((resolve, reject) => {
@@ -114,44 +117,35 @@ export async function runProcess({
       pending = '',
       finished = false,
       terminalError,
+      teardownError,
+      stopping,
       forced;
-    const signalGroup = name => {
-      try {
-        process.kill(-child.pid, name);
-      } catch {
-        try {
-          child.kill(name);
-        } catch {
-          /* Already gone. */
-        }
-      }
-    };
+    const outcome = () => teardownError ?? terminalError;
     const terminate = error => {
       if (finished) return;
       terminalError = error;
-      if (child.pid) {
-        if (posix) signalGroup('SIGTERM');
-        else {
-          // Windows process groups require taskkill to stop the CLI's native child too.
-          const stopped = spawnSync('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], {
-            windowsHide: true,
-            stdio: 'ignore',
-          });
-          if (stopped.status !== 0) child.kill('SIGKILL');
-        }
-      }
-      if (forced) return;
-      if (posix && child.pid) setTimeout(() => signalGroup('SIGKILL'), STOP_GRACE_MS).unref();
-      // Never wait forever for 'close': a descendant outside the tree may keep the pipes open.
-      forced = setTimeout(
-        () => {
-          child.stdout.destroy();
-          child.stderr.destroy();
-          finish(() => reject(terminalError));
-        },
-        (posix ? STOP_GRACE_MS : 0) + CLOSE_WAIT_MS,
-      );
-      forced.unref();
+      if (stopping) return;
+      stopping = Promise.resolve()
+        .then(() => stopImpl(child))
+        .catch(cause => {
+          teardownError = Object.assign(
+            new Error(`Остановка процессов клиента не подтверждена: ${redact(cause?.message ?? String(cause))}`),
+            { code: 'process_teardown' },
+          );
+          try {
+            child.kill('SIGKILL');
+          } catch {
+            /* Already gone. */
+          }
+        })
+        .then(() => {
+          // Never wait forever for 'close': a process outside the tree may keep the pipes open.
+          forced = setTimeout(() => {
+            child.stdout.destroy();
+            child.stderr.destroy();
+            finish(() => reject(outcome()));
+          }, CLOSE_WAIT_MS);
+        });
     };
     const timer = setTimeout(
       () => terminate(Object.assign(new Error('Истекло время выполнения клиента'), { code: 'KODO_TIMEOUT' })),
@@ -215,19 +209,23 @@ export async function runProcess({
       if (Buffer.byteLength(stdout) + Buffer.byteLength(stderr) > maxOutputBytes)
         terminate(Object.assign(new Error('Превышен предел вывода клиента'), { code: 'KODO_OUTPUT_LIMIT' }));
     });
-    child.on('close', (exitCode, exitSignal) =>
-      finish(() => {
-        if (pending) {
-          try {
-            onLine?.(pending.replace(/\r$/, ''));
-          } catch (error) {
-            terminalError ??= error;
+    child.on('close', (exitCode, exitSignal) => {
+      const settle = () =>
+        finish(() => {
+          if (pending) {
+            try {
+              onLine?.(pending.replace(/\r$/, ''));
+            } catch (error) {
+              terminalError ??= error;
+            }
           }
-        }
-        if (terminalError) reject(terminalError);
-        else resolve({ stdout, stderr, exitCode, signal: exitSignal, pid: child.pid });
-      }),
-    );
+          if (outcome()) reject(outcome());
+          else resolve({ stdout, stderr, exitCode, signal: exitSignal, pid: child.pid });
+        });
+      // A stopped attempt ends only once its processes are confirmed stopped.
+      if (stopping) stopping.then(settle);
+      else settle();
+    });
     child.stdin.on('error', error => {
       if (error.code !== 'EPIPE') terminate(error);
     });

@@ -302,6 +302,8 @@ export class EngineExecution extends EnginePlanning {
             'budget',
             'context_budget',
             'context_manifest_invalid',
+            // Processes of the client may still run: never start it again next to them.
+            'process_teardown',
           ].includes(error.code)
         ) {
           node.attempt--;
