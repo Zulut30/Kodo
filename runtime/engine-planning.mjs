@@ -5,7 +5,13 @@ import { validate, validatePlan, planSchema, routingSchema, scopesOverlap } from
 import { git, makeWorktree, collectFiles } from './workspace.mjs';
 import { maxTaskContractBytes, validateTaskContract } from './task-context.mjs';
 import { assessTask, resolveMode } from './modes.mjs';
-import { FAST_PATH_VERSION, classifyLocalTask, fastPathAllowsPlan } from './fast-path.mjs';
+import {
+  FAST_PATH_TEST_SCOPES,
+  FAST_PATH_VERSION,
+  classifyLocalTask,
+  fastPathAllowsPlan,
+  fastPathPlan,
+} from './fast-path.mjs';
 import { EngineCore, contentHash, defaultModel, evidencePrompt, lstatSafe } from './engine-core.mjs';
 
 /** Assessment, research, planning and routing stages. */
@@ -122,7 +128,11 @@ export class EnginePlanning extends EngineCore {
    * ordinary route. Returns true when the mode was re-resolved.
    */
   async fastPathGuard(run, candidate, signal) {
-    if (run.executionMode?.source !== 'fast-path' || fastPathAllowsPlan(candidate, run.fastPath.files)) return false;
+    if (
+      run.executionMode?.source !== 'fast-path' ||
+      fastPathAllowsPlan(candidate, run.fastPath.files, run.fastPath.reason)
+    )
+      return false;
     for (const key of budgetKeys) {
       if (run.fastPath.budgets[key] === null) delete run.config[key];
       else run.config[key] = run.fastPath.budgets[key];
@@ -190,7 +200,10 @@ export class EnginePlanning extends EngineCore {
             requests: 0,
             requested: run.requestedMode ?? null,
             source: 'fast-path',
-            reason: 'Deterministic local proof: the task names only existing tracked style files',
+            reason:
+              local.reason === 'style_only'
+                ? 'Deterministic local proof: the task names only existing tracked style files'
+                : 'Deterministic local proof: the task names one to three small tracked source files',
           };
         } else run.executionMode = await this.assessedMode(run, context, signal);
         for (const key of budgetKeys) run.config[key] = run.executionMode.profile[key];
@@ -259,6 +272,18 @@ export class EnginePlanning extends EngineCore {
       this.validateModePlan(run, run.plan, { legacy: true });
       return;
     }
+    if (run.executionMode.source === 'fast-path') {
+      // The proof already names the whole write scope: one developer node, built locally and
+      // deterministically. No planner session; the plan still passes the ordinary validator.
+      const local = fastPathPlan(run.task, run.fastPath);
+      if (!fastPathAllowsPlan(local, run.fastPath.files, run.fastPath.reason))
+        throw new Error('Локальный план быстрого пути вышел за доказательство');
+      run.plan = this.validateModePlan(run, local);
+      run.planSource = 'fast-path';
+      this.save(run);
+      this.log(run, 'fast_path_planned', { reason: run.fastPath.reason, files: run.fastPath.files });
+      return;
+    }
     run.state = 'planning';
     this.save(run);
     const selected = this.primary(run);
@@ -292,9 +317,11 @@ export class EnginePlanning extends EngineCore {
   planInstructions(run) {
     // The fast path was proven for named files only: a plan that writes anything else revokes it.
     const proven =
-      run.executionMode.source === 'fast-path'
-        ? ` This run was admitted for a style-only change: writePaths must be exactly these files and nothing else: ${JSON.stringify(run.fastPath.files)}. Do not add test or documentation files; state their checks as acceptance of the same task.`
-        : '';
+      run.executionMode.source !== 'fast-path'
+        ? ''
+        : run.fastPath.reason === 'small_local'
+          ? ` This run was admitted for a small local code change: writePaths must be these files: ${JSON.stringify(run.fastPath.files)}, plus at most these test locations or literal test files inside them: ${JSON.stringify(FAST_PATH_TEST_SCOPES)}. A behaviour change needs an added or updated regression test there. Do not add documentation or other files.`
+          : ` This run was admitted for a style-only change: writePaths must be exactly these files and nothing else: ${JSON.stringify(run.fastPath.files)}. Do not add test or documentation files; state their checks as acceptance of the same task.`;
     return (
       `Execution mode ${run.executionMode.selected}; at most ${run.executionMode.profile.maxTasks} tasks. Keep each mandatory node contract below ${maxTaskContractBytes} UTF-8 bytes; decompose oversized contracts without losing criteria. Prefer small cohesive deliverables and early scoped tests; a tiny change needs no artificial split. ` +
       (run.executionMode.selected === 'quick'

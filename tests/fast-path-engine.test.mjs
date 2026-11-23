@@ -4,6 +4,8 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { readConfig } from '../runtime/config.mjs';
 import { manifestFreshness } from '../runtime/context-manifest.mjs';
+import { FAST_PATH_TEST_SCOPES } from '../runtime/fast-path.mjs';
+import { buildAuditReport } from '../runtime/audit.mjs';
 import { fixture, git, task } from './helpers/mode-engine-fixture.mjs';
 
 const css = 'styles/button.css';
@@ -46,8 +48,8 @@ test('A proven style-only task skips Jev, Gemini and research and still gets an 
   assert.equal(result.state, 'succeeded', result.error?.message);
   assert.deepEqual(
     fx.calls.filter(call => call !== 'discovery'),
-    ['plan', 'worker', 'review'],
-    'no assessment, analysis, research or routing call',
+    ['worker', 'review'],
+    'no assessment, analysis, research, routing or planner call',
   );
   assert.deepEqual(
     [result.executionMode.selected, result.executionMode.source, result.executionMode.requested],
@@ -64,16 +66,45 @@ test('A proven style-only task skips Jev, Gemini and research and still gets an 
   assert.equal(result.analysis.kind, 'local');
   assert.equal(await readFile(path.join(result.cwd, css), 'utf8'), '.button { color: blue; }\n');
   assert.equal(result.review.passed, true, 'the review gate is not skipped');
-  // The planner is told the boundary of the proof, so an honest plan does not revoke it.
-  assert.match(
-    fx.sessions[0].prompt,
-    /writePaths must be exactly these files and nothing else: \["styles\/button\.css"\]/,
+  // The plan is built locally: one developer node that owns exactly the proven file.
+  assert.equal(result.planSource, 'fast-path');
+  assert.equal(result.plannerSession, undefined);
+  assert.deepEqual(
+    result.plan.tasks.map(node => [node.role, node.writePaths]),
+    [['developer', [css]]],
   );
+  assert.deepEqual(
+    result.sessionAttempts.map(attempt => attempt.stage),
+    ['developer', 'review'],
+  );
+  assert.match(fx.sessions[0].prompt, /Make the button in styles\/button\.css blue/, 'the task reached the worker');
+  assert.equal(buildAuditReport(result).skills.complete, true, 'kodo audit stays complete');
+});
+
+test('A small local code task plans locally, allows a regression test and runs two sessions', async t => {
+  const fx = await fixture(t);
+  const run = await fx.engine.create('Set the exported value to one in value.mjs', { project: fx.project });
+  const result = await fx.engine.run(run.id);
+  assert.equal(result.state, 'succeeded', result.error?.message);
+  assert.deepEqual(
+    fx.calls.filter(call => call !== 'discovery'),
+    ['worker', 'review'],
+  );
+  assert.deepEqual(
+    [result.executionMode.selected, result.executionMode.source, result.fastPath.reason],
+    ['quick', 'fast-path', 'small_local'],
+  );
+  assert.deepEqual(result.fastPath.files, ['value.mjs']);
+  assert.equal(result.planSource, 'fast-path');
+  assert.deepEqual(result.plan.tasks[0].writePaths, ['value.mjs', ...FAST_PATH_TEST_SCOPES]);
+  assert.match(fx.sessions[0].prompt, /regression test/, 'the worker is asked for a regression test');
+  assert.equal(result.review.passed, true);
+  assert.equal(buildAuditReport(result).skills.complete, true);
 });
 
 test('Doubt takes the ordinary route: a non-style path, a risk word or an explicit wider mode', async t => {
   for (const [name, text, options] of [
-    ['non-style path', `Make ${css} blue and update value.mjs`, {}],
+    ['non-source path', `Make ${css} blue as described in docs/design.md`, {}],
     ['risk word', `Hide the login button in ${css}`, {}],
     ['explicit standard', cssTask, { mode: 'standard' }],
   ])
@@ -89,18 +120,26 @@ test('Doubt takes the ordinary route: a non-style path, a risk word or an explic
 });
 
 test('A plan that leaves the proven files revokes the fast path and restores the ordinary budgets', async t => {
-  const fx = await styled(t, {
-    config: { repairRounds: 3, researchBudget: 7 },
-    plan: () => ({ summary: 'Also touch code', tasks: [{ ...task('code'), writePaths: ['value.mjs'] }] }),
-  });
+  const outside = () => ({ summary: 'Also touch code', tasks: [{ ...task('code'), writePaths: ['value.mjs'] }] });
+  // The native planner is never asked on a proven fast path, so it cannot leave the proof.
+  const local = await styled(t, { plan: outside });
+  const planned = await local.engine.run((await local.engine.create(cssTask, { project: local.project })).id);
+  assert.equal(planned.state, 'succeeded', planned.error?.message);
+  assert.deepEqual([planned.planSource, planned.fastPath.revoked], ['fast-path', undefined]);
+  assert.ok(!local.calls.includes('plan'));
+
+  const fx = await styled(t, { config: { repairRounds: 3, researchBudget: 7 } });
   const run = await fx.engine.create(cssTask, { project: fx.project });
-  const result = await fx.engine.run(run.id);
+  const planFile = path.join(fx.root, 'outside.json');
+  await writeFile(planFile, JSON.stringify(outside()));
+  const result = await fx.engine.run(run.id, { planFile });
   assert.equal(result.state, 'succeeded', result.error?.message);
   assert.deepEqual(
     fx.calls.filter(call => ['plan', 'assessment'].includes(call)),
-    ['plan', 'assessment', 'plan'],
-    'the ordinary route assesses and plans again',
+    ['assessment'],
+    'the ordinary route assesses, then takes the host plan under its own mode',
   );
+  assert.equal(result.planSource, 'host');
   assert.equal(result.fastPath.revoked, 'plan_outside_proof');
   // The fixture assessment is confidently low and local, so the ordinary route also selects quick,
   // but from Jev and from the project's own budgets, not from the fast-path clamp.
@@ -110,22 +149,22 @@ test('A plan that leaves the proven files revokes the fast path and restores the
 });
 
 test('A session cap is persisted: resume and a retry cycle cannot start another session', async t => {
-  const fx = await styled(t, { config: { budgets: { sessions: 2 } } });
+  const fx = await styled(t, { config: { budgets: { sessions: 1 } } });
   const run = await fx.engine.create(cssTask, { project: fx.project });
   const blocked = await fx.engine.run(run.id);
   assert.deepEqual([blocked.state, blocked.error.code], ['blocked', 'budget']);
   assert.deepEqual(
     blocked.sessionAttempts.map(attempt => attempt.stage),
-    ['plan', 'developer'],
+    ['developer'],
     'the review session was refused before it started',
   );
-  assert.equal(fx.sessions.length, 2);
-  assert.equal(blocked.config.budgets.sessions, 2);
+  assert.equal(fx.sessions.length, 1);
+  assert.equal(blocked.config.budgets.sessions, 1);
   for (const options of [{}, { retryFailed: true }]) {
     const again = await fx.engine.run(run.id, options);
     assert.deepEqual([again.state, again.error.code], ['blocked', 'budget']);
-    assert.equal(again.sessionAttempts.length, 2);
-    assert.equal(fx.sessions.length, 2, 'no provider session after the cap');
+    assert.equal(again.sessionAttempts.length, 1);
+    assert.equal(fx.sessions.length, 1, 'no provider session after the cap');
   }
 });
 
@@ -147,7 +186,7 @@ test('Every session leaves a manifest bound to its contract and head; a context 
   const run = await fx.engine.create(cssTask, { project: fx.project });
   const result = await fx.engine.run(run.id);
   assert.equal(result.state, 'succeeded', result.error?.message);
-  assert.equal(result.sessionAttempts.length, 3);
+  assert.equal(result.sessionAttempts.length, 2);
   for (const attempt of result.sessionAttempts) {
     const { manifest } = attempt;
     assert.equal(manifest.kind, 'context-manifest');
@@ -162,7 +201,11 @@ test('Every session leaves a manifest bound to its contract and head; a context 
   assert.equal(manifest.mandatory.contract.sha256, contract.sha256);
   const context = manifest.sections.find(section => section.name === 'task-context');
   assert.equal(context.mandatory, true);
-  assert.match(fx.sessions[1].prompt, /Make the button blue/, 'the full task description reached the worker');
+  assert.match(
+    fx.sessions[0].prompt,
+    /Make the button in styles\/button\.css blue/,
+    'the full task reached the worker',
+  );
   const hashes = Object.fromEntries(manifest.references.map(item => [item.file, item.sha256]));
   assert.equal(manifestFreshness(manifest, { headSha: manifest.headSha, hashes }).status, 'fresh');
   assert.equal(manifestFreshness(manifest, { headSha: result.headSha, hashes }).status, 'stale');

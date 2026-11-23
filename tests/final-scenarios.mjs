@@ -517,9 +517,11 @@ test(
     assert.deepEqual(result.fastPath.files, [css]);
     assert.deepEqual(
       calls.filter(call => call !== 'discovery'),
-      ['plan', 'worker', 'review'],
-      'no assessment, routing, Gemini analysis or research',
+      ['worker', 'review'],
+      'no assessment, routing, planner session, Gemini analysis or research',
     );
+    assert.equal(result.planSource, 'fast-path', 'the plan is built locally from the proof');
+    assert.deepEqual(result.plan.tasks[0].writePaths, [css]);
     assert.equal(result.research.requests, 0);
     assert.equal(result.analysis.kind, 'local');
     assert.equal(result.review.passed, true, 'the independent review is not skipped');
