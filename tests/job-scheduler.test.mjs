@@ -108,7 +108,7 @@ test('Parallel independent jobs finish in two worker intervals instead of eight'
             for (const done of batch) done();
           });
       });
-    const result = await run({ execute }, { limits: { workers, pools: {} } });
+    const result = await run({ execute }, { limits: { workers, pools: {} }, heartbeatMs: 3_600_000 });
     assert.deepEqual(result, { status: 'integrated', counts: { integrated: 8 } });
     assert.equal(intervals, 8 / workers);
   }

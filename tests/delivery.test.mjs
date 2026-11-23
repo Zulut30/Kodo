@@ -835,6 +835,43 @@ for (const scenario of [
   });
 }
 
+function gateTreeDeadline(t, ready, timeoutMs) {
+  let armed = false;
+  const arm = () => {
+    armed = true;
+  };
+  ready.then(arm, arm);
+  const schedule = globalThis.setTimeout;
+  t.mock.method(
+    globalThis,
+    'setTimeout',
+    (callback, ms) => {
+      assert.equal(ms, timeoutMs);
+      const timer = schedule(() => {
+        if (armed) callback();
+        else timer.refresh(); // The original handle stays cancellable until readiness.
+      }, ms);
+      return timer;
+    },
+    { times: 1 },
+  );
+}
+
+test('Clearing the delivery deadline before readiness suppresses its callback', async t => {
+  const ready = Promise.withResolvers(),
+    schedule = globalThis.setTimeout;
+  gateTreeDeadline(t, ready.promise, 1);
+  let fired = false;
+  const timer = setTimeout(() => {
+    fired = true;
+  }, 1);
+  await new Promise(resolve => schedule(resolve, 1));
+  clearTimeout(timer);
+  ready.resolve();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(fired, false);
+});
+
 for (const mode of ['timeout', 'abort', 'output-limit']) {
   test(`Delivery lifecycle awaits owned parent and grandchild shutdown on ${mode}`, { timeout: 40000 }, async t => {
     const tree = await ownedTree(t, { inheritedPipes: mode !== 'abort' });
@@ -856,17 +893,7 @@ for (const mode of ['timeout', 'abort', 'output-limit']) {
     if (mode === 'timeout') {
       // Deliver the command's deadline only after all three PIDs are observable.
       // Only this timer is gated. Teardown helpers keep their real watchdogs.
-      const schedule = globalThis.setTimeout;
-      t.mock.method(
-        globalThis,
-        'setTimeout',
-        (callback, ms) => {
-          assert.equal(ms, timeoutMs);
-          const fire = () => callback();
-          return schedule(() => tree.ready.then(fire, fire), ms);
-        },
-        { times: 1 },
-      );
+      gateTreeDeadline(t, tree.ready, timeoutMs);
     }
     const outcome = execute(process.execPath, [tree.filename, '0', tree.directory], {
       cwd: tree.directory,
@@ -929,14 +956,23 @@ for (const mode of ['timeout', 'abort']) {
       {
         command: process.execPath,
         args: [tree.filename, '0', tree.directory],
-        timeoutMs: mode === 'timeout' ? 4000 : 15000,
+        timeoutMs: mode === 'timeout' ? 20 : 15000,
       },
     ];
     let source,
       pids,
       cleanupObserved = false;
     ctx.exec = async (command, args, options) => {
-      if (command === process.execPath && args[0] === tree.filename) source = options.cwd;
+      if (command === process.execPath && args[0] === tree.filename) {
+        source = options.cwd;
+        if (mode === 'timeout') gateTreeDeadline(t, tree.ready, options.timeoutMs);
+      }
+      if (command === 'git' && args[0] === 'worktree') {
+        assert.equal(
+          await readFile(path.join(ctx.run.project, '.git', 'kodo-worktree.lock'), 'utf8'),
+          String(process.pid),
+        );
+      }
       if (command === 'git' && args[0] === 'worktree' && args[1] === 'remove') {
         await assertStopped(pids);
         cleanupObserved = true;

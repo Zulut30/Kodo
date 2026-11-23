@@ -1,5 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
 import { createInterface } from 'node:readline';
 import { spawn } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -16,6 +18,10 @@ function child(home, owner, signal) {
   const env = { ...process.env };
   delete env.NODE_TEST_CONTEXT;
   const proc = spawn(process.execPath, [worker, home, Q, owner], { env, signal, windowsHide: true });
+  return workerProtocol(proc, owner);
+}
+
+function workerProtocol(proc, owner) {
   const closed = new Promise(resolve => proc.once('close', resolve));
   const lines = createInterface({ input: proc.stdout })[Symbol.asyncIterator]();
   let stderr = '';
@@ -25,7 +31,11 @@ function child(home, owner, signal) {
   proc.stderr.on('data', data => (stderr += data));
   async function read() {
     const { done, value } = await lines.next();
-    if (done) throw new Error(`${owner} exited before its response: ${stderr}`);
+    if (done) {
+      proc.stdin.end();
+      await closed;
+      throw new Error(`${owner} exited before its response: ${stderr}`);
+    }
     return value;
   }
   return {
@@ -42,7 +52,22 @@ function child(home, owner, signal) {
   };
 }
 
-test('Four processes contending for one queue claim every job exactly once', { timeout: 120000 }, async t => {
+test('A worker EOF reports diagnostics written after stdout closed', async () => {
+  const proc = Object.assign(new EventEmitter(), {
+    stdin: new PassThrough(),
+    stdout: new PassThrough(),
+    stderr: new PassThrough(),
+  });
+  const worker = workerProtocol(proc, 'fixture');
+  const outcome = worker.read().catch(error => error);
+  proc.stdout.end();
+  await new Promise(resolve => setImmediate(resolve));
+  proc.stderr.end('late diagnostic');
+  proc.emit('close', 1);
+  assert.match((await outcome).message, /fixture exited before its response: late diagnostic/);
+});
+
+test('Four processes claim jobs in rounds and complete each claim once', { timeout: 120000 }, async t => {
   const home = mkdtempSync(path.join(os.tmpdir(), 'kodo-job-contention-'));
   const store = new Store(home);
   t.after(() => {

@@ -1,6 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { writeFile } from 'node:fs/promises';
+import { writeFile, unlink, utimes } from 'node:fs/promises';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { promisify } from 'node:util';
+import childProcess from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
+import { makeWorktree } from '../runtime/workspace.mjs';
 import path from 'node:path';
 import { Engine } from '../runtime/engine.mjs';
 import {
@@ -295,6 +300,164 @@ test('Engine integrates developer tester and documenter work with independent re
   assert.equal(await read(path.join(fx.project, 'src/value.mjs')), 'export const value = 0;\n');
 });
 
+function observeSpawn(t, observe) {
+  const original = childProcess.spawn;
+  t.mock.method(childProcess, 'spawn', (command, args, options) => {
+    const proc = original(command, args, options);
+    if (command === 'git') observe(args, proc);
+    return proc;
+  });
+  syncBuiltinESMExports();
+  t.after(() => {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+  });
+}
+
+test('Worktree registration waits for the live owner shared by linked checkouts', async t => {
+  const fx = await fixture(t);
+  const peer = path.join(fx.directory, 'peer');
+  git(fx.project, 'worktree', 'add', '--detach', peer, fx.base);
+  const lock = path.join(fx.project, '.git', 'kodo-worktree.lock');
+  await writeFile(lock, String(process.pid), { flag: 'wx' });
+  const old = new Date(0);
+  await utimes(lock, old, old);
+  const waiting = Promise.withResolvers(),
+    caller = new AsyncLocalStorage(),
+    contenders = new Set();
+  const kill = process.kill.bind(process);
+  t.mock.method(process, 'kill', (pid, signal) => {
+    if (pid === process.pid && signal === 0) {
+      contenders.add(caller.getStore());
+      if (contenders.size === 2) waiting.resolve();
+    }
+    return kill(pid, signal);
+  });
+  let adds = 0,
+    active = 0,
+    maxActive = 0;
+  observeSpawn(t, (args, proc) => {
+    if (args.includes('worktree') && args.includes('add')) {
+      adds++;
+      maxActive = Math.max(maxActive, ++active);
+      proc.once('close', () => active--);
+    }
+  });
+  const a = path.join(fx.directory, 'a'),
+    b = path.join(fx.directory, 'b');
+  const both = Promise.allSettled([
+    caller.run(a, () => makeWorktree(peer.replaceAll(path.sep, '/'), a, 'worker-a', fx.base)),
+    caller.run(b, () => makeWorktree(fx.project, b, 'worker-b', fx.base)),
+  ]);
+  try {
+    await Promise.race([waiting.promise, both.then(() => assert.fail('registrations bypassed held lock'))]);
+    assert.equal(adds, 0);
+  } finally {
+    await unlink(lock);
+    await both;
+  }
+  assert.deepEqual(
+    await both,
+    [a, b].map(value => ({ status: 'fulfilled', value })),
+  );
+  assert.equal(adds, 2);
+  assert.equal(maxActive, 1);
+  assert.equal(git(a, 'rev-parse', 'HEAD'), fx.base);
+  assert.equal(git(b, 'rev-parse', 'HEAD'), fx.base);
+  assert.equal(await exists(lock), false);
+});
+
+test('Worktree registration recovers a dead owner and releases after Git failure', async t => {
+  const fx = await fixture(t),
+    target = path.join(fx.directory, 'worker');
+  const lock = path.join(fx.project, '.git', 'kodo-worktree.lock');
+  const dead = childProcess.spawnSync(process.execPath, ['-e', ''], { windowsHide: true });
+  assert.equal(dead.status, 0);
+  await writeFile(lock, String(dead.pid), { flag: 'wx' });
+  await assert.rejects(makeWorktree(fx.project, target, 'worker', 'absent-revision'), { code: 'command_failed' });
+  assert.equal(await exists(lock), false);
+  await writeFile(lock, '', { flag: 'wx' });
+  await utimes(lock, new Date(0), new Date(0)); // Crash before the owner PID was written.
+  await makeWorktree(fx.project, target, 'worker', fx.base);
+  assert.equal(await exists(lock), false);
+});
+
+test('Worktree registration honours cancellation while waiting and after acquisition', async t => {
+  const fx = await fixture(t),
+    target = path.join(fx.directory, 'worker');
+  const lock = path.join(fx.project, '.git', 'kodo-worktree.lock');
+  const waiting = new AbortController(),
+    active = new AbortController();
+  await writeFile(lock, String(process.pid), { flag: 'wx' });
+  const kill = process.kill.bind(process);
+  t.mock.method(process, 'kill', (pid, signal) => {
+    if (pid === process.pid && signal === 0) waiting.abort();
+    return kill(pid, signal);
+  });
+  await assert.rejects(makeWorktree(fx.project, target, 'worker', fx.base, { signal: waiting.signal }), {
+    code: 'cancelled',
+  });
+  assert.equal(await read(lock), String(process.pid));
+  assert.equal(await exists(target), false);
+  await unlink(lock);
+  observeSpawn(t, args => {
+    if (args.includes('show-ref')) active.abort();
+  });
+  await assert.rejects(makeWorktree(fx.project, target, 'worker', fx.base, { signal: active.signal }), {
+    code: 'cancelled',
+  });
+  assert.equal(await exists(lock), false);
+  assert.equal(await exists(target), false);
+});
+
+test('Worktree registration bounds the wait without stealing a live lock', async t => {
+  const fx = await fixture(t),
+    target = path.join(fx.directory, 'worker');
+  const lock = path.join(fx.project, '.git', 'kodo-worktree.lock');
+  await writeFile(lock, String(process.pid), { flag: 'wx' });
+  const kill = process.kill.bind(process),
+    now = performance.now.bind(performance);
+  let elapsed = 0;
+  t.mock.method(process, 'kill', (pid, signal) => {
+    if (pid === process.pid && signal === 0) elapsed = 60000;
+    return kill(pid, signal);
+  });
+  t.mock.method(performance, 'now', () => now() + elapsed);
+  await assert.rejects(makeWorktree(fx.project, target, 'worker', fx.base), { code: 'timeout' });
+  assert.equal(await exists(target), false);
+  assert.equal(await read(lock), String(process.pid));
+});
+
+test('Independent Node processes register worktrees after the lock owner exits', async t => {
+  const fx = await fixture(t),
+    peer = path.join(fx.directory, 'peer');
+  git(fx.project, 'worktree', 'add', '--detach', peer, fx.base);
+  const workspace = new URL('../runtime/workspace.mjs', import.meta.url).href;
+  const invoke = (source, ...args) =>
+    promisify(childProcess.execFile)(process.execPath, ['--input-type=module', '-e', source, '--', ...args], {
+      windowsHide: true,
+      signal: t.signal,
+    });
+  await invoke(
+    `import {withWorktreeLock} from ${JSON.stringify(workspace)};
+    await withWorktreeLock(process.argv[1], async () => process.exit(0));`,
+    peer,
+  );
+  const lock = path.join(fx.project, '.git', 'kodo-worktree.lock');
+  assert.ok(await exists(lock), 'the crashed owner left a PID file');
+  const source = `import {makeWorktree} from ${JSON.stringify(workspace)};
+    await makeWorktree(...process.argv.slice(1));`;
+  const results = await Promise.allSettled(
+    [peer, fx.project].map((repo, index) =>
+      invoke(source, repo, path.join(fx.directory, 'cross-' + index), 'cross-' + index, fx.base),
+    ),
+  );
+  for (const result of results) if (result.status === 'rejected') throw result.reason;
+  for (const index of [0, 1])
+    assert.equal(git(path.join(fx.directory, 'cross-' + index), 'rev-parse', 'HEAD'), fx.base);
+  assert.equal(await exists(lock), false);
+});
+
 test('Engine prepares once and resumes a host plan after reopening state without repeating completed work', async t => {
   const fx = await fixture(t),
     services = fakeServices();
@@ -311,28 +474,8 @@ test('Engine prepares once and resumes a host plan after reopening state without
   const planFile = path.join(prepared.artifacts, 'host-plan.json');
   await writeFile(planFile, JSON.stringify(featurePlan()));
   fx.closeStore(firstStore);
-  const store = fx.openStore();
-  // Another coordinator is registering a worktree in this repository.
-  const leaseName = 'worktree:add:' + (process.platform === 'win32' ? run.project.toLowerCase() : run.project);
-  const otherStore = fx.openStore();
-  const held = otherStore.acquireLease(leaseName, 'other-coordinator');
-  const registrations = git(fx.project, 'worktree', 'list', '--porcelain');
-  assert.ok(held);
-  const acquire = store.acquireLease.bind(store);
-  let contended = false;
-  t.mock.method(store, 'acquireLease', (name, ...args) => {
-    const token = acquire(name, ...args);
-    if (name === leaseName && !token && !contended) {
-      contended = true;
-      assert.equal(services.calls.worker.length, 0);
-      assert.equal(git(fx.project, 'worktree', 'list', '--porcelain'), registrations);
-      otherStore.releaseLease(held);
-    }
-    return token;
-  });
-  const engine = new Engine({ store, ...services });
+  const engine = new Engine({ store: fx.openStore(), ...services });
   const result = await engine.run(run.id, { planFile });
-  assert.ok(contended, 'node worktree creation must wait for repository registration');
   assert.equal(result.state, 'succeeded', result.error?.message);
   assert.equal(result.planSource, 'host');
   assert.equal(services.calls.planner, 0);
