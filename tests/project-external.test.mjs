@@ -940,6 +940,106 @@ test('The gate classification names a gate Run blocked by its acceptance with it
   ]);
 });
 
+test('The gate classification follows the chain past an accepted epic and honours a replacing gate', () => {
+  // Review finding (major): a gate over epic → milestone → project accepted its epic, then the
+  // milestone lacked proof; the Run stayed blocked with that code, but the accepted epic hid it.
+  const chain = [
+    { kind: 'epic', id: 'e' },
+    { kind: 'milestone', id: 'm' },
+    { kind: 'project', id: 'p' },
+  ];
+  const base = {
+    project: { projectId: 'p', status: 'integrated' },
+    milestones: [{ id: 'm', status: 'integrated' }],
+    epics: [{ id: 'e', milestoneId: 'm', status: 'accepted' }],
+    tasks: [{ id: 't', epicId: 'e', status: 'accepted', dependsOn: [] }],
+    currentAttempts: [],
+  };
+  const runs = {
+    r1: { id: 'r1', state: 'blocked', error: { code: 'wave_gate_proof_missing', message: 'no milestone proof' } },
+    r2: { id: 'r2', state: 'executing' },
+    r3: { id: 'r3', state: 'blocked', error: { code: 'wave_gate_proof_missing', message: 'still none' } },
+  };
+  const store = {
+    getRun: id => {
+      if (runs[id]) return runs[id];
+      throw new Error(`Запуск не найден: ${id}`);
+    },
+  };
+  const gate = (id, number, runId) => ({ id, number, runId, containers: chain });
+  const holds = gates => gateHolds({ store }, { ...base, gates });
+  assert.deepEqual(holds([gate('g1', 1, 'r1')]), [
+    { code: 'wave_gate_proof_missing', kind: 'milestone', id: 'm', gateId: 'g1', runId: 'r1', state: 'blocked' },
+  ]);
+  // A retry of the chain replaces the stopped gate: while it runs nothing is held, and a stop of
+  // the retry is named by its own gate and Run.
+  assert.deepEqual(holds([gate('g1', 1, 'r1'), gate('g2', 2, 'r2')]), []);
+  assert.deepEqual(holds([gate('g1', 1, 'r1'), gate('g3', 2, 'r3')]), [
+    { code: 'wave_gate_proof_missing', kind: 'milestone', id: 'm', gateId: 'g3', runId: 'r3', state: 'blocked' },
+  ]);
+});
+
+test('next-wave names a blocked epic whose tasks are all integrated and a cancelled predecessor', async t => {
+  // Review finding (major): the epic's rows came only from its open tasks, so a blocked epic with
+  // every task integrated vanished; a cancelled required predecessor looked like ordinary waiting.
+  const f = await fixture(t, {
+    edit(spec) {
+      spec.epics.push({ id: 'e2', milestoneId: 'm', title: 'Second epic', acceptance: [criterion] });
+      spec.tasks.find(row => row.id === 'task-b').epicId = 'e2';
+    },
+  });
+  const transition = async (kind, id, to) =>
+    f.repo.apply({
+      schemaVersion: 1,
+      commandId: randomUUID(),
+      projectId: f.projectId,
+      expectedRevision: (await f.snapshot()).revision,
+      actor: 'owner',
+      reason: 'Stop a record for the test',
+      action: { op: 'transition', kind, id, to, evidence: [], mappings: [] },
+    });
+  const first = await f.wave({ limit: 2, ports: undefined });
+  const b = brief(first, 'task-b');
+  const head = await commit(b.worktree, { 'src/b.mjs': 'export const b = 2;\n' });
+  assert.equal((await f.complete('task-b', head, { deferGate: true })).status, 'integrated');
+  await transition('epic', 'e2', 'blocked');
+  // task-a is cancelled before it ran; task-d needs it and can never start.
+  const a = brief(first, 'task-a');
+  assert.equal((await f.complete('task-a', a.baseSha, { abandon: true, attemptId: a.attemptId })).status, 'abandoned');
+  await transition('task', 'task-a', 'cancelled');
+  const wave = await f.wave({ limit: 3, ports: undefined });
+  assert.deepEqual(
+    wave.briefs.map(row => row.taskId),
+    ['task-c'],
+  );
+  assert.deepEqual(wave.blocked, [
+    { taskId: 'task-d', code: 'project_dependency_cancelled', dependencyId: 'task-a' },
+    { code: 'project_epic_blocked', kind: 'epic', id: 'e2' },
+  ]);
+});
+
+test('next-wave checks a refused interface proof again before it names it', async t => {
+  // Review finding (minor): a reused negative proof check can be stale without a new revision
+  // (the evidence file was restored); only a fresh refusal is reported.
+  const f = await fixture(t, {
+    edit(spec) {
+      spec.tasks = spec.tasks.filter(row => row.id === 'task-b');
+    },
+  });
+  const reads = [];
+  const assertEvidence = f.engine.assertEvidence.bind(f.engine);
+  f.engine.assertEvidence = async ref => {
+    reads.push(ref.path);
+    if (reads.length === 1)
+      throw Object.assign(new Error('Fixture: evidence briefly unreadable'), { code: 'evidence' });
+    return assertEvidence(ref);
+  };
+  const wave = await f.wave({ limit: 1, ports: undefined });
+  assert.deepEqual(wave.briefs, [], 'the selection saw the refusal');
+  assert.deepEqual(wave.blocked, [], 'the proof verifies again before it would be named');
+  assert.deepEqual(reads, [f.iface.path, f.iface.path]);
+});
+
 test('gates runs the pending epic gates outside a completion and retries a blocked gate only on request', async t => {
   const f = await fixture(t);
   const gates = input => runProjectGates(f.ctx, { projectId: f.projectId, ports: f.ports, ...input });

@@ -355,6 +355,9 @@ function fieldOf(kind, record, accepts, execution) {
     return { detail: `лишнее поле ${nameOf(unknown) ?? '(имя вне формата)'}`, field: nameOf(unknown) };
   const missing = Object.keys(sample).find(key => !Object.hasOwn(record, key));
   if (missing) return { detail: `нет поля ${missing}`, field: missing };
+  // A task that names itself is visible only on its own record: a probe sample has another id.
+  if (kind === 'task' && Array.isArray(record.dependsOn) && record.dependsOn.includes(record.id))
+    return { detail: 'поле dependsOn (ссылка на саму задачу)', field: 'dependsOn' };
   const field = Object.keys(sample).find(
     key => !accepts(probeSpec(kind, { ...sample, [key]: record[key] }, execution)),
   );

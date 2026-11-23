@@ -392,6 +392,13 @@ test('blueprint_spec_invalid names the record and the field the strict parser re
       ['api-module'],
       'tasks[3].dependsOn',
     ],
+    // Review finding (minor): a task that names itself was located at the record, not its field.
+    [
+      spec => (task(spec, 'scaffold').dependsOn = ['scaffold']),
+      /задача scaffold, поле dependsOn \(ссылка на саму задачу\)/,
+      ['scaffold'],
+      'tasks[0].dependsOn',
+    ],
     // Review finding (minor): a repeated existing id in dependsOn was not located.
     [
       spec => (task(spec, 'api-module').dependsOn = ['test-bench', 'test-bench']),

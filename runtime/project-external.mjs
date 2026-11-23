@@ -396,38 +396,83 @@ const actionable = [
   ['task_failed', 'project_task_failed'],
   ['task_blocked', 'project_task_blocked'],
 ];
-// A stopped epic or milestone holds every open task inside it: one row names it.
-const stoppedContainer = /^(epic|milestone)_(blocked|failed|cancelled)$/;
+const stoppedStates = ['blocked', 'failed', 'cancelled'];
 const openTask = task => !['integrated', 'cancelled', ...settled].includes(task.status);
 
-// Why open tasks are not handed out and which gates hold the project, so that a short or empty
-// wave always names its cause. Read-only: nothing is reserved or run here.
+// Stopped epics and milestones, one row each, straight from the snapshot (even when every task of
+// the epic is integrated): blocked or failed, or cancelled while it still holds a live task.
+function stoppedContainers(snapshot) {
+  const live = epicId => snapshot.tasks.some(task => task.epicId === epicId && task.status !== 'cancelled');
+  const holds = {
+    epic: epic => live(epic.id),
+    milestone: milestone => snapshot.epics.some(epic => epic.milestoneId === milestone.id && live(epic.id)),
+  };
+  return [
+    ['epic', snapshot.epics],
+    ['milestone', snapshot.milestones],
+  ].flatMap(([kind, rows]) =>
+    rows
+      .filter(row => stoppedStates.includes(row.status) && (row.status !== 'cancelled' || holds[kind](row)))
+      .map(row => ({ code: `project_${kind}_${row.status}`, kind, id: row.id })),
+  );
+}
+
+// The nearest cancelled task among the unmet transitive dependencies of `task`: a requirement that
+// is never met. A dependency still on its way is ordinary waiting (null).
+function cancelledPredecessor(C, snapshot, task) {
+  const seen = new Set(),
+    queue = [...task.dependsOn];
+  while (queue.length) {
+    const id = queue.shift();
+    const dependency = snapshot.tasks.find(row => row.id === id);
+    if (seen.has(id) || !dependency) continue;
+    seen.add(id);
+    if (dependency.status === 'cancelled') return dependency.id;
+    if (!C.dependencySatisfied(snapshot.project, dependency.status)) queue.push(...dependency.dependsOn);
+  }
+  return null;
+}
+
+// The selection's proof checks at the same revision are reused; a refused proof may have been
+// restored since, so it is checked again before it is named.
+async function explanationAvailability(state, snapshot) {
+  if (state.availability?.revision !== snapshot.revision) return waves.waveAvailability(state.ctx, snapshot);
+  const rows = [];
+  for (const row of state.availability.rows) {
+    const task = !row.interfacesVerified && snapshot.tasks.find(item => item.id === row.taskId);
+    const verified = row.interfacesVerified || (Boolean(task) && (await interfacesVerified(state, task)));
+    rows.push(verified === row.interfacesVerified ? row : { ...row, interfacesVerified: true, reason: null });
+  }
+  return rows;
+}
+
+// Why open tasks are not handed out and which containers and gates hold the project, so that a
+// short or empty wave always names its cause. Read-only: nothing is reserved or run here.
 async function explainWave(state, snapshot) {
   const { ctx, C } = state;
-  const availability =
-    state.availability?.revision === snapshot.revision
-      ? state.availability.rows
-      : await waves.waveAvailability(ctx, snapshot);
   const horizon = planProjectHorizon(
-    { snapshot, limit: 24, availability, now: (ctx.clock ?? (() => new Date().toISOString()))() },
+    {
+      snapshot,
+      limit: 24,
+      availability: await explanationAvailability(state, snapshot),
+      now: (ctx.clock ?? (() => new Date().toISOString()))(),
+    },
     { contracts: C, knownValues: state.options.knownValues },
   );
   const named = new Set([...state.blocked.map(row => row.taskId), ...state.briefs.map(row => row.taskId)]);
-  const containers = [];
   for (const row of horizon.blocked) {
     const task = snapshot.tasks.find(item => item.id === row.taskId);
-    if (!task || !openTask(task)) continue;
-    for (const reason of row.reasons) {
-      const [, kind, status] = stoppedContainer.exec(reason) ?? [];
-      const id = kind === 'epic' ? task.epicId : snapshot.epics.find(epic => epic.id === task.epicId)?.milestoneId;
-      if (kind && !containers.some(item => item.kind === kind && item.id === id))
-        containers.push({ code: `project_${kind}_${status}`, kind, id });
+    if (!task || !openTask(task) || named.has(task.id)) continue;
+    if (inFlightStates.has(currentOf(snapshot, task.id)?.status)) continue;
+    const cancelled = cancelledPredecessor(C, snapshot, task);
+    if (cancelled) {
+      state.blocked.push({ taskId: task.id, code: 'project_dependency_cancelled', dependencyId: cancelled });
+      continue;
     }
-    if (named.has(task.id) || inFlightStates.has(currentOf(snapshot, task.id)?.status)) continue;
     const found = actionable.find(([reason]) => row.reasons.includes(reason));
     if (found) state.blocked.push({ taskId: task.id, code: found[1] });
   }
-  state.blocked.push(...containers, ...waves.gateHolds({ store: storeOf(ctx) }, snapshot));
+  state.blocked.push(...stoppedContainers(snapshot), ...waves.gateHolds({ store: storeOf(ctx) }, snapshot));
 }
 
 /**

@@ -747,8 +747,9 @@ test(
   'A gate whose install is refused names its reserved Run, the install stage and the diagnosis',
   { timeout: 300000 },
   async t => {
-    // Review finding (minor): gate_invalid carried no runId, stage or diagnosis, although the
-    // reservation already names its Run.
+    // Review findings (minor): gate_invalid carried no runId, stage or diagnosis, although the
+    // reservation already names its Run; and the first install (right after the reservation)
+    // threw past the handler of a later install, so the CLI showed only project_blocked.
     const refusal = 'Некорректный гейт эпика: owned install refusal';
     const f = await fixture(t, {
       tasks: [task('alpha')],
@@ -759,26 +760,28 @@ test(
         },
       }),
     });
-    await assert.rejects(f.director.drain(f.id), { code: 'gate_invalid' });
+    const first = await f.director.drain(f.id);
+    assert.equal(first.status, 'blocked', JSON.stringify(first));
     const [gate] = f.repo.snapshot(f.id).gates;
     assert.equal(gate.installed, false);
     assert.equal(typeof gate.runId, 'string');
+    const named = row => row.kind === 'epic';
+    // The first install (with the reservation) and a later one (the next pass) are reported alike.
     const result = await f.director.drain(f.id);
     assert.equal(result.status, 'blocked', JSON.stringify(result));
-    assert.deepEqual(
-      result.blockers.filter(row => row.kind === 'epic'),
-      [
-        {
-          code: 'gate_invalid',
-          kind: 'epic',
-          id: 'e1',
-          gateId: gate.id,
-          runId: gate.runId,
-          stage: 'install',
-          message: refusal,
-        },
-      ],
-    );
+    assert.deepEqual(first.blockers.filter(named), result.blockers.filter(named));
+    assert.equal(f.repo.snapshot(f.id).gates.length, 1, 'the refused reservation is not replaced');
+    assert.deepEqual(result.blockers.filter(named), [
+      {
+        code: 'gate_invalid',
+        kind: 'epic',
+        id: 'e1',
+        gateId: gate.id,
+        runId: gate.runId,
+        stage: 'install',
+        message: refusal,
+      },
+    ]);
   },
 );
 
