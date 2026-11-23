@@ -203,7 +203,7 @@ const milestone = (extra = {}) => ({
 });
 
 /** An accepted wave project, staged through real forward transitions. */
-async function acceptedProject(f) {
+async function acceptedProject(f, task = {}) {
   const root = await f.root();
   const { repo } = await f.direct();
   const command = (projectId, action) => ({
@@ -227,7 +227,7 @@ async function acceptedProject(f) {
     execution: { ...wave },
     milestones: [{ id: 'm', title: 'First milestone', acceptance: [proof], releaseRequired: false }],
     epics: [{ id: 'e', milestoneId: 'm', title: 'First epic', acceptance: [proof] }],
-    tasks: [taskSpec('a')],
+    tasks: [taskSpec('a', task)],
   };
   const { projectId } = await repo.apply(command(null, { op: 'create', spec }));
   const drive = async (kind, id, states) => {
@@ -925,4 +925,72 @@ test('extend uses the reopen rule of append-milestone: a paused or unsettled acc
   assert.equal(result.exitCode, 2, JSON.stringify(result.report));
   assert.equal(result.report.result.reason, 'project_append_blocked');
   assert.equal(existsSync(path.join(f.home, 'bootstrap')), false, 'no context bundle was written');
+});
+
+test('append-milestone keeps a bound interface Ref copied from the snapshot and refuses one whose evidence fails', async t => {
+  const f = await fixture(t);
+  const { store } = await f.direct();
+  const engine = new Engine({ store, secrets: {} });
+  const text = '# core\n';
+  const value = {
+    schemaVersion: 1,
+    module: 'core',
+    source: 'interfaces/core.md',
+    sha256: 'e'.repeat(64),
+    bytes: 7,
+    text,
+  };
+  const stored = await engine.withEvidenceBatch({ artifacts: path.join(f.home, 'project-interfaces') }, write =>
+    write('interface', value, { headSha: null }),
+  );
+  const bound = { kind: 'interface', runId: null, headSha: null, path: stored.path, sha256: stored.sha256 };
+  await engine.assertEvidence(bound);
+  const file = path.join(f.dir, 'milestone.json');
+
+  // The Ref of an accepted task, copied unchanged: appended, and the new task keeps it for its brief.
+  const valid = await acceptedProject(f, { interfaceRefs: [bound] });
+  const [copied] = valid.snapshot.tasks.find(task => task.id === 'a').interfaceRefs;
+  await writeFile(
+    file,
+    JSON.stringify(milestone({ tasks: [taskSpec('c', { epicId: 'e2', dependsOn: ['a'], interfaceRefs: [copied] })] })),
+  );
+  const appended = await f.run(['append-milestone', valid.projectId, '--file', file]);
+  assert.equal(appended.exitCode, 0, JSON.stringify(appended.report));
+  assert.equal(appended.report.result.status, 'appended');
+  assert.deepEqual(valid.repo.snapshot(valid.projectId).tasks.find(task => task.id === 'c').interfaceRefs, [bound]);
+
+  // A Ref of the snapshot whose evidence does not verify is not carried into new work.
+  const lost = {
+    ...bound,
+    path: path.join(path.dirname(bound.path), `interface-${'f'.repeat(64)}.json`),
+    sha256: 'f'.repeat(64),
+  };
+  const broken = await acceptedProject(f, { interfaceRefs: [lost] });
+  await writeFile(
+    file,
+    JSON.stringify(milestone({ tasks: [taskSpec('c', { epicId: 'e2', dependsOn: ['a'], interfaceRefs: [lost] })] })),
+  );
+  const refused = await f.run(['append-milestone', broken.projectId, '--file', file]);
+  assert.equal(refused.exitCode, 1, JSON.stringify(refused.report));
+  assert.deepEqual(codes(refused.report), ['milestone_interface_unbound']);
+  assert.deepEqual(refused.report.result.findings[0].taskIds, ['c']);
+  assert.equal(broken.repo.snapshot(broken.projectId).revision, broken.snapshot.revision);
+});
+
+test('apply-spec requires kodo.config.json to be a regular file of HEAD, not a directory', async t => {
+  const f = await fixture(t);
+  const root = path.join(f.dir, 'config-directory');
+  await mkdir(path.join(root, 'kodo.config.json'), { recursive: true });
+  await writeFile(path.join(root, 'kodo.config.json', 'settings.json'), '{}');
+  const git = (...args) => execFileSync('git', args, { cwd: root, env: f.env, windowsHide: true });
+  git('init', '-b', 'main');
+  git('config', 'user.name', 'Owned blueprint CLI');
+  git('config', 'user.email', 'blueprint-cli@example.invalid');
+  git('config', 'commit.gpgSign', 'false');
+  git('add', '.');
+  git('commit', '-m', 'A directory named like the config');
+  await writeBlueprint(root);
+  const result = await f.run(['apply-spec', '--root', root]);
+  assert.equal(result.exitCode, 1, JSON.stringify(result.report));
+  assert.deepEqual(codes(result.report), ['blueprint_config_missing']);
 });

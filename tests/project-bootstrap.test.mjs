@@ -705,6 +705,9 @@ test('prepareBootstrap writes a kodo.config.json template whose test command fol
     [{ 'Cargo.toml': '[package]\n' }, [{ command: 'cargo', args: ['test'] }]],
     [{ 'Cargo.toml': '[workspace]\n', 'crates/app/Cargo.toml': '[package]\n' }, [{ command: 'cargo', args: ['test'] }]],
     [{ 'go.mod': 'module x\n' }, [{ command: 'go', args: ['test', './...'] }]],
+    [{ 'App.slnx': '<Solution />\n' }, [{ command: 'dotnet', args: ['test'] }]],
+    // An incomplete walk is not an empty folder: the only manifest lies deeper than the scan limit.
+    [{ 'a/b/c/d/e/f/g/h/i/go.mod': 'module x\n' }, []],
     // A nested manifest, several stacks or an unknown stack: the coordinator sets commands.test.
     [{ 'README.md': '# x\n', 'backend/go.mod': 'module x\n' }, []],
     [{ 'crates/app/Cargo.toml': '[package]\n' }, []],
@@ -836,18 +839,30 @@ test('prepareExtend names interface evidence by its module only inside Kodo home
   );
 });
 
-test('lintMilestone explains that a new milestone takes interfaceRefs: []', async t => {
+test('lintMilestone admits only interface Refs the project already bound, copied unchanged', async t => {
   const { snapshot } = await project(t, { 'storage-module': 'accepted' });
   const short = milestoneFile({ index: { interfaceRefs: [{ kind: 'interface', path: 'interfaces/storage.md' }] } });
   const result = lintMilestone(short, snapshot);
   assert.deepEqual(codes(result), ['milestone_interface_unbound']);
   assert.deepEqual(result.findings[0].taskIds, ['search-index']);
-  assert.match(result.findings[0].message, /interfaceRefs: \[\]/);
-  // A full Ref is refused as well: a new milestone references no interface.
-  const [full] = snapshot.tasks.find(task => task.id === 'api-module').interfaceRefs;
-  const bound = lintMilestone(milestoneFile({ review: { interfaceRefs: [full] } }), snapshot);
-  assert.deepEqual(codes(bound), ['milestone_interface_unbound']);
-  assert.deepEqual(bound.findings[0].taskIds, ['search-review']);
+  assert.match(result.findings[0].message, /interfaceRefs/);
+  // A full Ref copied from a task of the snapshot keeps the worker's interface (brief.interfaces).
+  const [full] = snapshot.tasks.find(task => task.id === 'storage-module').interfaceRefs;
+  assert.deepEqual(lintMilestone(milestoneFile({ index: { interfaceRefs: [full] } }), snapshot), {
+    ok: true,
+    findings: [],
+  });
+  // Any change makes it an unknown Ref: another digest, another path or another field.
+  for (const changed of [
+    { ...full, sha256: 'f'.repeat(64) },
+    { ...full, path: path.join(path.dirname(full.path), 'other.md') },
+    { ...full, runId: '11111111-1111-4111-8111-111111111111' },
+    { ...full, extra: true },
+  ]) {
+    const refused = lintMilestone(milestoneFile({ review: { interfaceRefs: [changed] } }), snapshot);
+    assert.deepEqual(codes(refused), ['milestone_interface_unbound'], JSON.stringify(changed));
+    assert.deepEqual(refused.findings[0].taskIds, ['search-review']);
+  }
   const { dir } = await prepareExtend({
     snapshot,
     prompt: 'Поиск',
@@ -857,4 +872,9 @@ test('lintMilestone explains that a new milestone takes interfaceRefs: []', asyn
   const rules = await readFile(path.join(dir, 'rules.md'), 'utf8');
   assert.match(rules, /interfaceRefs: \[\]/);
   assert.ok(rules.includes('milestone_interface_unbound'));
+  // The context lists the bound Refs to copy, with their module.
+  const context = await readFile(path.join(dir, 'context.md'), 'utf8');
+  assert.match(context, /## Привязанные интерфейсы/);
+  assert.ok(context.includes(JSON.stringify(full.path)), 'the full path of the bound Ref');
+  assert.ok(context.includes(full.sha256));
 });

@@ -306,9 +306,11 @@ async function gitFindings(root, finding) {
   if ((await run(['rev-parse', '--verify', '--quiet', 'HEAD^{commit}'])).code !== 0)
     return required('В репозитории нет коммита: закоммитьте исходное состояние проекта до apply-spec');
   // The wave verification policy comes from the committed kodo.config.json (runtime/wave-policy.mjs):
-  // without it every wave would run the defaults (codex, npm test) whatever the stack.
+  // without it every wave would run the defaults (codex, npm test) whatever the stack. Only a regular
+  // file of HEAD counts (mode 100644/100755): a directory, a link or a submodule of that name does not.
+  const tree = await run(['ls-tree', '-z', 'HEAD', '--', 'kodo.config.json']);
   const config =
-    (await run(['cat-file', '-e', 'HEAD:kodo.config.json'])).code === 0
+    tree.code === 0 && /^100(?:644|755) blob [0-9a-f]+\tkodo\.config\.json\0?$/.test(tree.stdout)
       ? []
       : [
           finding(
@@ -396,7 +398,7 @@ async function applySpec(ctx) {
 async function appendFromFile(ctx, projectId, file, extra = {}) {
   const { options, contracts, knownValues, safety } = ctx;
   const { readMilestoneFile, lintMilestone } = await import('./project-bootstrap.mjs');
-  const { repo } = await openState(ctx);
+  const { repo, engine } = await openState(ctx);
   const snapshot = await repo.snapshot(projectId);
   safety(snapshot);
   const at = { projectId, revision: snapshot.revision };
@@ -410,6 +412,36 @@ async function appendFromFile(ctx, projectId, file, extra = {}) {
   safety(input);
   const lint = lintMilestone(input, snapshot, { contracts, knownValues });
   if (!lint.ok) return findingsReport(lint.findings, extra, at);
+  // lintMilestone admits only Refs the project already bound; their evidence must still verify, as
+  // next-wave requires of every interface proof (verifyRef), or the new task would never run.
+  const { verifyRef } = await import('./project-director.mjs');
+  const verified = async ref => {
+    try {
+      await verifyRef(engine, ref);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const unverified = [];
+  for (const task of input.tasks)
+    for (const ref of task.interfaceRefs)
+      if (!(await verified(ref))) {
+        unverified.push(String(task.id));
+        break;
+      }
+  if (unverified.length)
+    return findingsReport(
+      [
+        {
+          code: 'milestone_interface_unbound',
+          taskIds: unverified,
+          message: 'Evidence ссылки interfaceRefs не прошло проверку: уберите эту ссылку (interfaceRefs: [])',
+        },
+      ],
+      extra,
+      at,
+    );
   const applied = await repo.apply({
     schemaVersion: 1,
     commandId: options.flags['--command-id'] || randomUUID(),
