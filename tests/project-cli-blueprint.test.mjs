@@ -595,10 +595,14 @@ test('extend prepares a feature bundle from the snapshot or appends a session mi
       line.includes(`node "${cli}" project append-milestone ${prepared.projectId} --file "`),
     ),
   );
+  const id = / --command-id ([a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}) --json$/.exec(
+    bundle.report.result.commands[0].command,
+  )?.[1];
+  assert.ok(id);
   assert.deepEqual(
     bundle.report.result.commands.map(item => item.command),
     [
-      `node "${cli}" project append-milestone ${prepared.projectId} --file "${path.join(bundle.report.result.bundle.dir, 'milestone.json')}" --json`,
+      `node "${cli}" project append-milestone ${prepared.projectId} --file "${path.join(bundle.report.result.bundle.dir, 'milestone.json')}" --command-id ${id} --json`,
     ],
   );
   assert.equal(bundle.report.projectId, prepared.projectId);

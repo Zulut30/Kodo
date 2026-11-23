@@ -40,7 +40,7 @@ import {
 import { withGateController } from './project-controller-lease.mjs';
 import { withIntegrationLease as withLease } from './project-integration-lease.mjs';
 import { GATE_WATCHDOG, createGateRunDraft, runEpicGate } from './wave-verifier.mjs';
-import { normalizeWatchdogConfig } from './watchdog.mjs';
+import { normalizeWatchdogConfig, recordBlocker } from './watchdog.mjs';
 import { applyWavePolicy, assertWavePolicy } from './wave-policy.mjs';
 import {
   bindingFor,
@@ -668,7 +668,7 @@ async function gateHistoryDefect(ctx, snapshot, gate, run, worktree) {
 // integration lease held until each acceptance commits: the authorizer's Git proof (merges,
 // range, verified head on the branch) cannot go stale in between. The project is accepted only
 // while the branch head is the gate's verified head; otherwise a project gate follows.
-async function acceptGate(ctx, projectId, gate, run, out) {
+async function acceptGate(ctx, projectId, gate, run, out, signal) {
   await withIntegrationLease(ctx, projectId, undefined, async () => {
     const before = await snapshotOf(ctx, projectId);
     const { worktree } = await integrationOf(ctx, before);
@@ -680,6 +680,7 @@ async function acceptGate(ctx, projectId, gate, run, out) {
     }
     // Fast-forward while the branch still stands on the gate head; otherwise the
     // in-scope repairs are merged `--no-ff`.
+    if (signal?.aborted || controlState(await snapshotOf(ctx, projectId))) return;
     await mergeBackGate({ worktree, expectedHead: gate.headSha, gateHead: run.headSha });
     const refs = await persistRefs(ctx, run, gateKinds);
     for (const merge of gate.merges)
@@ -730,10 +731,26 @@ async function runAndAccept(ctx, projectId, { gate, run }, signal, out, entity) 
     return;
   }
   try {
-    await acceptGate(ctx, projectId, gate, run, out);
+    await acceptGate(ctx, projectId, gate, run, out, signal);
   } catch (error) {
     if (!['project_integration_conflict', 'project_integration_invalid'].includes(error?.code)) throw error;
-    out.blocked.push({ code: error.code, ...entity });
+    const { code } = error;
+    const message =
+      code === 'project_integration_conflict'
+        ? 'Verified gate repairs conflict with the current integration head'
+        : 'The gate head cannot be integrated on the current branch history';
+    ctx.store.updateRun(run.id, {
+      state: 'blocked',
+      error: { code, message },
+      blocker: recordBlocker(run.blocker, {
+        code,
+        message,
+        scope: 'integration',
+        headSha: run.headSha,
+        at: ctx.clock(),
+      }),
+    });
+    out.blocked.push({ code, ...entity });
   } finally {
     // Acceptance may still block the Run (for example a repair history defect): report the saved state.
     const saved = storedRun(ctx.store, run.id) ?? run;

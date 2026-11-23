@@ -347,6 +347,9 @@ test('next-wave refuses an unusable CLI prefix port before the Store opens', asy
 test('Pull CLI reports known operation errors without leaking exception details', async t => {
   for (const code of [
     'project_integration_branch_busy',
+    'project_integration_worktree_invalid',
+    'project_integration_busy',
+    'project_integration_invalid',
     'project_frontier_integration_missing',
     'project_wave_policy_invalid',
     'project_wave_policy_unsafe',

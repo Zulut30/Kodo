@@ -7,6 +7,7 @@ import { randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
 import { Engine } from '../runtime/engine.mjs';
+import { buildProjectReport } from '../runtime/telemetry.mjs';
 import { Store } from '../runtime/store.mjs';
 import * as A from '../runtime/project-contracts.mjs';
 import { openProjectStore } from '../runtime/project-store.mjs';
@@ -1238,10 +1239,14 @@ test(
     const observed = [];
     let betaHead;
     const hooks = { onReview: undefined };
-    const f = await fixture(t, { epics: ['e1', 'e2'], tasks: [task('alpha'), task('beta', { epicId: 'e2' })], hooks });
+    const f = await fixture(t, {
+      epics: ['e1', 'e2'],
+      tasks: [task('alpha'), task('beta', { epicId: 'e2' }), task('gamma', { epicId: 'e2' })],
+      hooks,
+    });
     const submit = (brief, head) =>
       f.cli(['complete-task', f.id, brief.taskId, '--head', head, '--attempt', brief.attemptId, '--defer-gate']);
-    const [alpha, beta] = (await f.cli(['next-wave', f.id, '--host', 't3'])).report.result.briefs;
+    const [alpha, beta] = (await f.cli(['next-wave', f.id, '--host', 't3', '--limit', '2'])).report.result.briefs;
     for (const brief of [alpha, beta]) {
       await writeFile(path.join(brief.worktree, brief.taskId + '.txt'), brief.taskId);
       git(brief.worktree, 'add', '-A');
@@ -1251,22 +1256,111 @@ test(
       else betaHead = head;
     }
     assert.equal(f.repo.snapshot(f.id).gates.length, 0);
+    assert.ok(!f.repo.snapshot(f.id).currentAttempts.some(row => row.taskId === 'gamma'));
     hooks.onReview = async () => {
       if (!observed.length) {
         observed.push((await f.cli(['next-wave', f.id, '--host', 't3'])).report.result);
         observed.push((await submit(beta, betaHead)).report.result);
         observed.push((await f.cli(['gates', f.id])).report.result);
+        observed.push((await f.cli(['drain', f.id])).report.result);
+        observed.push((await f.cli(['complete-task', f.id, 'beta', '--head', betaHead])).report.result);
+        const gamma = observed[0].briefs.find(row => row.taskId === 'gamma');
+        observed.push((await submit(gamma, await editWorker(gamma, 'gamma.txt', 'gamma'))).report.result);
       }
     };
     const gated = await f.cli(['gates', f.id]);
     assert.deepEqual(
       observed[0]?.briefs?.map(brief => brief.taskId),
-      ['beta'],
+      ['beta', 'gamma'],
       JSON.stringify(observed),
     );
     assert.equal(observed[1].status, 'integrated');
-    assert.equal(observed[2].code, 'project_busy');
+    assert.deepEqual(
+      observed.slice(2, 5).map(row => row.code),
+      Array(3).fill('project_busy'),
+    );
+    assert.equal(observed[5].status, 'integrated');
     assert.equal(gated.report.result.status, 'passed', gated.output);
     assert.equal(f.repo.snapshot(f.id).project.status, 'accepted');
   },
 );
+
+async function editWorker(brief, file, content) {
+  await writeFile(path.join(brief.worktree, file), content);
+  git(brief.worktree, 'add', '-A');
+  git(brief.worktree, 'commit', '-m', 'Implement ' + brief.taskId);
+  return git(brief.worktree, 'rev-parse', 'HEAD');
+}
+
+for (const scenario of ['conflict', 'pause']) {
+  test('Gate repair merge-back handles ' + scenario + ' during review', { timeout: 600000 }, async t => {
+    let reviews = 0;
+    const hooks = {
+      onRepair: request => writeFile(path.join(request.cwd, 'shared.txt'), 'repair\n'),
+      onReview: async request => {
+        if (++reviews === 1)
+          return {
+            passed: true,
+            findings: [],
+            ...confirmedCriteria(request.schema, { unmet: ['task:alpha:alpha-proof'] }),
+          };
+        if (reviews !== 2) return;
+        if (scenario === 'pause') {
+          await f.repo.apply(f.command(f.repo.snapshot(f.id), { op: 'setPaused', paused: true }));
+          return;
+        }
+        const [beta] = (await f.cli(['next-wave', f.id, '--host', 't3'])).report.result.briefs;
+        assert.equal(beta.taskId, 'beta');
+        assert.equal((await submit(beta, 'sibling\n')).report.result.status, 'integrated');
+      },
+    };
+    const f = await fixture(t, {
+      epics: ['e1', 'e2'],
+      tasks: [
+        task('alpha', { writePaths: ['shared.txt'] }),
+        task('beta', { epicId: 'e2', dependsOn: ['alpha'], writePaths: ['shared.txt'] }),
+      ],
+      hooks,
+    });
+    const submit = async (brief, text) =>
+      f.cli([
+        'complete-task',
+        f.id,
+        brief.taskId,
+        '--head',
+        await editWorker(brief, 'shared.txt', text),
+        '--attempt',
+        brief.attemptId,
+        '--defer-gate',
+      ]);
+    const [alpha] = (await f.cli(['next-wave', f.id, '--host', 't3'])).report.result.briefs;
+    assert.equal((await submit(alpha, 'initial\n')).report.result.status, 'integrated');
+    const firstHead = f.branchHead();
+    const stopped = await f.cli(['gates', f.id]);
+    assert.equal(stopped.report.result.status, 'blocked', stopped.output);
+    const snapshot = f.repo.snapshot(f.id);
+    const gate = f.store.getRun(snapshot.gates[0].runId);
+    assert.notEqual(gate.headSha, firstHead, 'the verified repair changed the head');
+    if (scenario === 'pause') {
+      assert.equal(stopped.report.result.code, 'project_control_blocked');
+      assert.equal(f.branchHead(), firstHead, 'no repair enters the paused project');
+      assert.equal(gate.state, 'succeeded', 'the verified run can be accepted on resume');
+      return;
+    }
+    const siblingHead = f.branchHead();
+    assert.equal(git(f.root, 'show', siblingHead + ':shared.txt'), 'sibling');
+    assert.deepEqual([gate.state, gate.error?.code], ['blocked', 'project_integration_conflict']);
+    assert.ok(gate.error.message);
+    const report = buildProjectReport(snapshot, { [gate.id]: gate }, {});
+    assert.ok(report.blockers.some(row => row.runId === gate.id && row.code === 'project_integration_conflict'));
+    assert.equal((await f.cli(['gates', f.id])).report.result.status, 'blocked');
+    assert.equal(f.repo.snapshot(f.id).gates.length, 1);
+    const retry = await f.cli(['gates', f.id, '--retry-failed']);
+    assert.equal(retry.report.result.status, 'passed', retry.output);
+    const after = f.repo.snapshot(f.id);
+    const replacement = after.gates.find(row => row.containers[0].id === 'e1' && row.runId !== gate.id);
+    assert.ok(replacement);
+    assert.equal(replacement.headSha, siblingHead);
+    assert.equal(after.project.status, 'accepted');
+  });
+}

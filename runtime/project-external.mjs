@@ -606,9 +606,15 @@ export async function runProjectGates(ctx, input) {
     const W = wavePorts(input.ports, ['createWaveContext', 'runPendingGates']);
     const waveCtx = {
       ...waveContextOf(ctx, C, W),
-      runGate: input => outsideLease(() => runEpicGate(input)),
+      runGate: input => outsideLease(() => runEpicGate(input), signal),
     };
-    const gates = await runGates(W, waveCtx, projectId, signal, retryFailed === true);
+    let gates;
+    try {
+      gates = await runGates(W, waveCtx, projectId, signal, retryFailed === true);
+    } catch (error) {
+      if (error?.code !== 'project_cancelled') throw error;
+      return { status: 'blocked', code: error.code, revision: (await snapshotOf(ctx, projectId)).revision };
+    }
     // A pause, cancel or block during the pass (`project pause` takes no gate lease) or an
     // interrupted pass may stop the gates before any ran: never `passed`.
     const after = await snapshotOf(ctx, projectId);

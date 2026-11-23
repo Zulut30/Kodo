@@ -28,16 +28,24 @@ async function withControllerLease(store, name, work) {
   timer.unref();
   // Only the standalone gate uses this callback, around the private Run. Rejoin
   // the serialized protocol before inspecting state, merging or accepting anything.
-  const outsideLease = async operation => {
+  const outsideLease = async (operation, signal) => {
     store.releaseLease(token);
     token = null;
     const result = await operation();
     const deadline = Date.now() + 120000;
-    while (!(token = acquire())) {
+    const cancelled = () => Object.assign(new Error('Project cancelled'), { code: 'project_cancelled' });
+    while (!signal?.aborted) {
+      token = acquire();
+      if (token) return result;
       if (Date.now() >= deadline) throw busy();
-      await delay(50);
+      try {
+        await delay(50, undefined, { signal });
+      } catch (error) {
+        if (signal?.aborted) throw cancelled();
+        throw error;
+      }
     }
-    return result;
+    throw cancelled();
   };
   try {
     return await work(outsideLease);

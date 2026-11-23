@@ -6,6 +6,7 @@ import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promi
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { withPullLease } from '../runtime/project-controller-lease.mjs';
 import { Store } from '../runtime/store.mjs';
 import { Engine } from '../runtime/engine.mjs';
 import * as contracts from '../runtime/project-contracts.mjs';
@@ -888,4 +889,33 @@ test('Worker roles are short profiles; an unknown owner gets the developer profi
   }
   assert.deepEqual(workerRole('mystery'), workerRole('developer'));
   assert.deepEqual(workerRole(undefined), workerRole('developer'));
+});
+
+test('Cancellation interrupts project lease reacquisition after a private gate run', async () => {
+  for (const abortDuringWait of [false, true]) {
+    const controller = new AbortController();
+    let attempts = 0;
+    const released = [];
+    const store = {
+      acquireLease(name) {
+        if (name === 'project:p' && ++attempts > 1 && attempts < 4) {
+          setTimeout(() => controller.abort(), 5);
+          return null;
+        }
+        return name;
+      },
+      renewLease: () => true,
+      releaseLease: token => released.push(token),
+    };
+    await assert.rejects(
+      withPullLease(store, 'p', true, outsideLease =>
+        outsideLease(async () => {
+          if (!abortDuringWait) controller.abort();
+        }, controller.signal),
+      ),
+      { code: 'project_cancelled' },
+    );
+    assert.equal(attempts, abortDuringWait ? 2 : 1);
+    assert.deepEqual(released, ['project:p', 'project-gates:p']);
+  }
 });

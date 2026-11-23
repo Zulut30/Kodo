@@ -418,7 +418,7 @@ async function extend(ctx) {
     });
     const template = path.join(bundle.dir, 'templates', 'milestone.json');
     const file = path.join(bundle.dir, 'milestone.json');
-    const append = `${ctx.cli} project append-milestone ${options.projectId} --file ${quotePath(file)} --json`;
+    const append = `${ctx.cli} project append-milestone ${options.projectId} --file ${quotePath(file)} --command-id ${randomUUID()} --json`;
     return envelope(options.projectId, snapshot.revision, {
       status: 'prepared',
       bundle: { id: bundle.id, dir: bundle.dir, files: bundle.files },
