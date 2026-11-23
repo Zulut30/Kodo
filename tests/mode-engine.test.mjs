@@ -4,7 +4,8 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { runUIVerification } from '../runtime/ui-verification.mjs';
 import { runSecurityChecks } from '../runtime/security-gates.mjs';
-import { git, task, metrics, fixture } from './helpers/mode-engine-fixture.mjs';
+import { ProviderError } from '../runtime/providers.mjs';
+import { git, task, metrics, fixture, low, choice } from './helpers/mode-engine-fixture.mjs';
 
 test('Independent task routing separates parallel confidence from model uncertainty and sends the prepared graph', async t => {
   const fx = await fixture(t);
@@ -96,6 +97,43 @@ test('Malformed or unavailable assessment records honest standard fallback and a
   const result = await fx.engine.run(run.id);
   assert.equal(result.state, 'cancelled');
   assert.deepEqual(fx.calls, ['assessment']);
+});
+
+test('A missing Gemini key falls back to local analysis only for an automatically selected mode', async t => {
+  const noKey = async () => {
+    throw new ProviderError('Не настроен GEMINI_API_KEY', 'auth');
+  };
+  const medium = () => ({ ...low(), complexity: choice(['low', 'medium', 'high'], 'medium') });
+  const offline = () => {
+    throw new Error('offline');
+  };
+  for (const [source, assessment] of [
+    ['fallback', offline],
+    ['jev', medium],
+  ]) {
+    const fx = await fixture(t, { assessment });
+    fx.provider.analyzeGemini = noKey;
+    const run = await fx.engine.create('Set value to one', { project: fx.project });
+    const result = await fx.engine.run(run.id);
+    assert.equal(result.state, 'succeeded', `${source}: ${result.error?.message}`);
+    assert.deepEqual([result.executionMode.source, result.executionMode.selected], [source, 'standard']);
+    assert.equal(result.analysis.kind, 'local');
+    assert.equal(result.analysisFallback, 'auth', 'the limitation is recorded in the run');
+    assert.match(result.analysis.limitations.join(' '), /Gemini.*auth/);
+    assert.equal(
+      fx.store.events(run.id).filter(event => event.type === 'analysis_fallback').length,
+      1,
+      'the fallback is logged once',
+    );
+  }
+  // An explicitly requested wider mode keeps its contract: no key, no run.
+  const fx = await fixture(t);
+  fx.provider.analyzeGemini = noKey;
+  const run = await fx.engine.create('Set value to one', { project: fx.project, mode: 'standard' });
+  const blocked = await fx.engine.run(run.id, { prepare: true });
+  assert.deepEqual([blocked.state, blocked.error.code], ['blocked', 'auth']);
+  assert.equal(blocked.analysisFallback, undefined);
+  assert.equal(blocked.completed.analysis, undefined);
 });
 
 test('Automatic quick by assessment for a named local change ignores unrelated project size without hiding focused truncation', async t => {

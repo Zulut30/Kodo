@@ -217,21 +217,34 @@ export class EnginePlanning extends EngineCore {
       bundle ||= await collectFiles(run.cwd, run.task, this.secrets);
       const standards = await this.policy(run, 'analyze');
       const context = await this.toolContext(run, 'analyze');
-      const analysis = run.executionMode.profile.gemini
-        ? await this.logical(run, 'analysis', () =>
+      const local = limitation => ({
+        kind: 'local',
+        summary: 'Quick local project map; implementation and independent review must verify the requested behavior',
+        model: null,
+        files: bundle.files.map(file => file.path),
+        limitations: [limitation],
+      });
+      let analysis;
+      if (!run.executionMode.profile.gemini) analysis = local('No external analysis or research in quick mode');
+      else
+        try {
+          analysis = await this.logical(run, 'analysis', () =>
             this.provider.analyzeGemini(
               { task: `${run.task}\n${standards}\n${context}`, files: bundle.files, signal },
               { secrets: this.secrets },
             ),
-          )
-        : {
-            kind: 'local',
-            summary:
-              'Quick local project map; implementation and independent review must verify the requested behavior',
-            model: null,
-            files: bundle.files.map(file => file.path),
-            limitations: ['No external analysis or research in quick mode'],
-          };
+          );
+        } catch (error) {
+          // Without a Gemini key an automatically selected mode continues on the local map; an
+          // explicitly requested standard/deep mode keeps its contract and stops as before.
+          if (error?.code !== 'auth' || !['fallback', 'jev', 'fast-path'].includes(run.executionMode.source))
+            throw error;
+          run.analysisFallback = 'auth';
+          this.log(run, 'analysis_fallback', { code: 'auth', source: run.executionMode.source });
+          analysis = local(
+            'Gemini analysis unavailable (auth: GEMINI_API_KEY missing or rejected); local project map only',
+          );
+        }
       const evidence = { items: [], requests: 0, errors: [], cache: [] };
       run.research = evidence;
       if (run.config.researchBudget > 0) await this.moreResearch(run, analysis.researchQuery || run.task, signal);
