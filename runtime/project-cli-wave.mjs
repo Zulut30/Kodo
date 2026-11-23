@@ -5,6 +5,13 @@ const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 const invalid = () => {
   throw Object.assign(new Error('Invalid project arguments'), { code: 'project_arguments' });
 };
+// Constant refusals of the drain itself: reported as they are, never data, paths or provider output.
+const reported = new Set([
+  'project_wave_not_enabled',
+  'project_wave_delivery_unsupported',
+  'project_control_blocked',
+  'project_busy',
+]);
 const bounded = (value, min, max) =>
   value === undefined || (/^(0|[1-9][0-9]*)$/.test(value) && Number(value) >= min && Number(value) <= max);
 
@@ -112,7 +119,13 @@ export async function projectWaveCli(argv, ports = {}) {
       revision: null,
       result: {
         status: exitCode === 1 ? 'invalid' : 'blocked',
-        code: argumentError ? 'project_arguments' : exitCode === 1 ? 'project_invalid' : 'project_blocked',
+        code: argumentError
+          ? 'project_arguments'
+          : exitCode === 1
+            ? 'project_invalid'
+            : reported.has(error?.code)
+              ? error.code
+              : 'project_blocked',
       },
     };
   } finally {

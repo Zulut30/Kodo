@@ -363,6 +363,45 @@ test('bindInterfaceEvidence turns blueprint interfaces into immutable evidence r
   });
 });
 
+test('blueprint_spec_invalid names the record and the field the strict parser rejects', async t => {
+  // Audit finding 8d: the finding quoted only the parser code, so the model could not find its mistake.
+  const cases = [
+    [spec => (task(spec, 'api-module').extra = true), /задача api-module, лишнее поле extra/, ['api-module']],
+    [spec => (task(spec, 'web-module').priority = 'high'), /задача web-module, поле priority/, ['web-module']],
+    [spec => delete task(spec, 'scaffold').risk, /задача scaffold, нет поля risk/, ['scaffold']],
+    [
+      spec => (task(spec, 'storage-module').writePaths = ['../x']),
+      /задача storage-module, поле writePaths/,
+      ['storage-module'],
+    ],
+    [
+      spec => (task(spec, 'api-module').dependsOn = ['ghost']),
+      /задача api-module, поле dependsOn \(нет задачи ghost\)/,
+      ['api-module'],
+    ],
+    [
+      spec => (task(spec, 'api-module').epicId = 'ghost'),
+      /задача api-module, поле epicId \(нет эпика ghost\)/,
+      ['api-module'],
+    ],
+    [spec => (spec.epics[1].title = ''), /эпик storage, поле title/],
+    [spec => (spec.milestones[0].releaseRequired = 'no'), /майлстоун foundation, поле releaseRequired/],
+    [spec => (spec.title = 42), /spec\.json, поле title/],
+    [
+      spec => (spec.execution = { cadence: 'wave', integration: 'branch', watchdog: { stalledRounds: 9 } }),
+      /spec\.json, поле execution/,
+    ],
+  ];
+  for (const [mutate, pattern, taskIds] of cases) {
+    const { root } = await blueprint(t, { mutate });
+    const result = await compileBlueprint(root);
+    assert.deepEqual(codes(result), ['blueprint_spec_invalid'], pattern.source);
+    assert.match(result.findings[0].message, pattern);
+    assert.match(result.findings[0].message, /\(project_[a-z_]+\)/, 'the parser code stays named');
+    assert.deepEqual(result.findings[0].taskIds, taskIds, pattern.source);
+  }
+});
+
 test('roles, strict schema and root binding are enforced', async t => {
   const owner = await blueprint(t, {
     mutate(spec) {

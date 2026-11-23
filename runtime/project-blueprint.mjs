@@ -282,6 +282,133 @@ function errorCode(error) {
   throw error;
 }
 
+// ---- Locating a strict ProjectSpec refusal ------------------------------------
+// The strict parser reports only a code. Each record of the blueprint is checked alone inside a
+// minimal valid spec, then field by field against a valid sample, to name what it rejects.
+
+const PROBE_CRITERION = { id: 'probe', text: 'Probe criterion', evidenceKinds: ['acceptance'] };
+const PROBE = {
+  spec: {
+    schemaVersion: 1,
+    id: 'probe',
+    root: '/probe',
+    title: 'Probe',
+    definitionOfDone: [PROBE_CRITERION],
+    constraints: [],
+    businessContext: '',
+    architectureRefs: [],
+  },
+  milestone: { id: 'probe-milestone', title: 'Probe', acceptance: [PROBE_CRITERION], releaseRequired: false },
+  epic: { id: 'probe-epic', milestoneId: 'probe-milestone', title: 'Probe', acceptance: [PROBE_CRITERION] },
+  task: {
+    id: 'probe-task',
+    epicId: 'probe-epic',
+    title: 'Probe',
+    description: 'Probe',
+    owner: 'developer',
+    dependsOn: [],
+    writePaths: ['probe'],
+    acceptance: [PROBE_CRITERION],
+    interfaceRefs: [],
+    priority: 50,
+    userValue: 1,
+    risk: 1,
+    estimatedEffort: 1,
+    riskApprovalRequired: false,
+  },
+};
+const LABELS = { milestone: 'майлстоун', epic: 'эпик', task: 'задача' };
+const nameOf = value => (typeof value === 'string' && /^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(value) ? value : null);
+const children = ['milestones', 'epics', 'tasks'];
+
+// A minimal valid spec around one record of `kind`; its parent and child are probe records.
+// Known dependencies are checked across records, so a task is probed without them.
+function probeSpec(kind, record, execution) {
+  const milestone =
+    kind === 'milestone' ? record : { ...PROBE.milestone, ...(kind === 'epic' ? { id: record.milestoneId } : {}) };
+  const epic =
+    kind === 'epic'
+      ? record
+      : { ...PROBE.epic, milestoneId: milestone.id, ...(kind === 'task' ? { id: record.epicId } : {}) };
+  const strings = Array.isArray(record.dependsOn) && record.dependsOn.every(item => typeof item === 'string');
+  const task =
+    kind === 'task' ? { ...record, dependsOn: strings ? [] : record.dependsOn } : { ...PROBE.task, epicId: epic.id };
+  return {
+    ...(kind === 'spec' ? record : PROBE.spec),
+    execution,
+    milestones: [milestone],
+    epics: [epic],
+    tasks: [task],
+  };
+}
+
+function fieldOf(kind, record, accepts, execution) {
+  const sample = PROBE[kind];
+  if (!isPlain(record)) return 'не объект';
+  const unknown = Object.keys(record).find(key => !Object.hasOwn(sample, key));
+  if (unknown !== undefined) return `лишнее поле ${nameOf(unknown) ?? '(имя вне формата)'}`;
+  const missing = Object.keys(sample).find(key => !Object.hasOwn(record, key));
+  if (missing) return `нет поля ${missing}`;
+  const field = Object.keys(sample).find(
+    key => !accepts(probeSpec(kind, { ...sample, [key]: record[key] }, execution)),
+  );
+  return field ? `поле ${field}` : null;
+}
+
+// Links between records (parents, dependencies, unique ids) that each record alone cannot show.
+function referenceOf(spec) {
+  for (const key of children) {
+    const seen = new Set();
+    for (const record of spec[key]) {
+      if (seen.has(record.id))
+        return {
+          where: `${LABELS[key.slice(0, -1)]} ${nameOf(record.id) ?? ''}`.trim(),
+          detail: 'повторяющийся id',
+          ...(key === 'tasks' && nameOf(record.id) ? { taskId: record.id } : {}),
+        };
+      seen.add(record.id);
+    }
+  }
+  const ids = key => new Set(spec[key].map(record => record.id));
+  const milestones = ids('milestones'),
+    epics = ids('epics'),
+    tasks = ids('tasks');
+  const named = (kind, record, field, label, value) => ({
+    where: `${LABELS[kind]} ${nameOf(record.id) ?? ''}`.trim(),
+    detail: `поле ${field} (нет ${label}${nameOf(value) ? ` ${value}` : ''})`,
+    ...(kind === 'task' && nameOf(record.id) ? { taskId: record.id } : {}),
+  });
+  for (const epic of spec.epics)
+    if (!milestones.has(epic.milestoneId)) return named('epic', epic, 'milestoneId', 'майлстоуна', epic.milestoneId);
+  for (const task of spec.tasks) {
+    if (!epics.has(task.epicId)) return named('task', task, 'epicId', 'эпика', task.epicId);
+    const ghost = task.dependsOn.find(id => !tasks.has(id));
+    if (ghost !== undefined) return named('task', task, 'dependsOn', 'задачи', ghost);
+  }
+  return null;
+}
+
+// Where the strict parser refused `spec`: `{where, detail, taskId?}` or null when not found.
+function locateSpecError(spec, execution, accepts) {
+  if (!accepts(probeSpec('spec', PROBE.spec, execution))) return { where: 'spec.json', detail: 'поле execution' };
+  const missing = children.find(key => !Array.isArray(spec[key]));
+  if (missing) return { where: 'spec.json', detail: `поле ${missing}` };
+  const header = Object.fromEntries(
+    Object.entries(spec).filter(([key]) => !children.includes(key) && key !== 'execution'),
+  );
+  const records = [['spec', header], ...children.flatMap(key => spec[key].map(record => [key.slice(0, -1), record]))];
+  for (const [kind, record] of records) {
+    if (isPlain(record) && accepts(probeSpec(kind, record, execution))) continue;
+    const id = kind === 'spec' ? null : nameOf(record?.id);
+    return {
+      where: kind === 'spec' ? 'spec.json' : `${LABELS[kind]} ${id ?? '(id вне формата)'}`,
+      detail: fieldOf(kind === 'spec' ? 'spec' : kind, record, accepts, execution),
+      ...(kind === 'task' && id ? { taskId: id } : {}),
+    };
+  }
+  return referenceOf(spec);
+}
+
 // The spec is normalized as is, `execution` included; an invalid execution is
 // reported and replaced by the default so the remaining rules still run.
 function normalizeFactory(spec, { contracts, knownValues }) {
@@ -295,8 +422,27 @@ function normalizeFactory(spec, { contracts, knownValues }) {
     return { spec: contracts.normalizeProjectSpec({ ...spec, execution }, { knownValues }), findings };
   } catch (error) {
     const code = errorCode(error);
+    // A refusal for a secret is not probed: only data that passed the safety check is named.
+    const accepts = candidate => {
+      try {
+        contracts.normalizeProjectSpec(candidate, { knownValues });
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const place =
+      code === 'project_unsafe'
+        ? null
+        : (locateSpecError(spec, execution, accepts) ??
+          (code === 'project_dag' ? { where: 'граф задач', detail: 'цикл в dependsOn' } : null));
+    const where = place ? `: ${place.where}${place.detail ? `, ${place.detail}` : ''}` : '';
     findings.push(
-      finding('blueprint_spec_invalid', `ProjectSpec отклонён строгой проверкой (${code}); см. docs/PROJECTS.md`),
+      finding(
+        'blueprint_spec_invalid',
+        `ProjectSpec отклонён строгой проверкой (${code})${where}; см. docs/PROJECTS.md`,
+        place?.taskId ? [place.taskId] : undefined,
+      ),
     );
     return { spec: null, findings };
   }
