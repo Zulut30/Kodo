@@ -92,6 +92,10 @@ async function processHelper(command, args, input) {
   });
 }
 
+/**
+ * Stops the process tree (Windows) or process group (POSIX) of an owned child and resolves only
+ * once every captured owned process has exited; otherwise it throws `process_teardown`.
+ */
 async function stopOwnedTree(child) {
   if (!child.pid) return;
   if (process.platform === 'win32') {
@@ -125,14 +129,24 @@ async function stopOwnedTree(child) {
         # Only invoke the bulk kill for the captured root identity. Retain its
         # handle until teardown finishes, including if it exits during taskkill.
         $rootProcess = $owned | Where-Object { $_.Id -eq $root } | Select-Object -First 1
+        $taskkill = 0
         if ($null -ne $rootProcess -and !$rootProcess.HasExited) {
           try { & "$env:SystemRoot\\System32\\taskkill.exe" /PID $root /T /F 2>$null | Out-Null } catch { }
+          if ($null -ne $LASTEXITCODE) { $taskkill = $LASTEXITCODE }
         }
         foreach ($p in $owned) {
           try { if (!$p.HasExited) { $p.Kill() } }
           catch [InvalidOperationException] { if (!$p.HasExited) { throw } }
         }
         foreach ($p in $owned) { if (!$p.WaitForExit(5000)) { throw 'Owned process did not exit' } }
+        # A failed taskkill (128: already gone) or a descendant born after the first walk means the
+        # stop cannot be confirmed complete: report it instead of allowing a restart.
+        if ($taskkill -ne 0 -and $taskkill -ne 128) { throw "taskkill failed ($taskkill)" }
+        foreach ($p in $owned) {
+          foreach ($entry in @(Get-CimInstance Win32_Process -Filter "ParentProcessId = $($p.Id)")) {
+            if (!$seen.Contains([int]$entry.ProcessId)) { throw 'Owned process tree changed during teardown' }
+          }
+        }
       } finally { foreach ($p in $owned) { $p.Dispose() } }
     `;
     const powershell = path.join(
@@ -434,4 +448,14 @@ export async function execute(
   });
 }
 
-export { sha256, fail, parse, wait, commandRedactions, redactCommandOutput, redactCommandError, commandFailure };
+export {
+  sha256,
+  fail,
+  parse,
+  wait,
+  commandRedactions,
+  redactCommandOutput,
+  redactCommandError,
+  commandFailure,
+  stopOwnedTree,
+};

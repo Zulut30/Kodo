@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
 import { Store } from './store.mjs';
 import { loadSecrets, redact } from './security.mjs';
-import { validateCommandTimeouts } from './config.mjs';
+import { validateCommandTimeouts, validateStartupTimeout } from './config.mjs';
 import { planSchema } from './contracts.mjs';
 import { commitChanges } from './workspace.mjs';
 import { writeProgress } from './progress.mjs';
@@ -66,7 +66,7 @@ export class Engine extends EngineVerification {
             providers: run.fixedModel ? 'current' : run.providers,
             primaryModel: run.config.primaryModel,
           },
-          { secrets: this.secrets, config: run.config },
+          { secrets: this.secrets, config: run.config, subscriptionChecks: this.runSubscriptionChecks(run) },
         ),
       )
     ).filter(
@@ -156,6 +156,7 @@ export class Engine extends EngineVerification {
       // Saved runs bypass readConfig; reject invalid timer values before any
       // preparation, check reuse or coordinator delivery command can start.
       validateCommandTimeouts(run.config.commands);
+      validateStartupTimeout(run.config.startupTimeoutMs);
       normalizeArchitectureConfig(run.config.architecture);
       this.checkCancelled(run, signal);
       const hadNextRetryAt = Object.hasOwn(run, 'nextRetryAt');

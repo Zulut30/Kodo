@@ -143,6 +143,38 @@ export {
   lstatSafe,
 };
 
+/**
+ * Final metrics of a native start. A client measures its whole call, so the time of earlier
+ * silent starts in the same call (`offset`) is taken off; without a client measurement the times
+ * Engine observed are used.
+ */
+function settledMetrics(reported, { localBytes, offset, started, firstEvent }) {
+  return {
+    ...reported,
+    ...localBytes,
+    durationMs:
+      typeof reported.durationMs === 'number' ? Math.max(0, reported.durationMs - offset) : performance.now() - started,
+    firstEventMs:
+      typeof reported.firstEventMs === 'number' ? Math.max(0, reported.firstEventMs - offset) : (firstEvent ?? null),
+    startupRetries: reported.startupRetries ?? null,
+    nativeRequestCount: null,
+  };
+}
+
+/** A start that sent no event before the startup limit: a failed attempt of its own. */
+function settleSilentStart(attempt, reason, elapsed) {
+  attempt.status = 'failed';
+  attempt.errorCode = reason;
+  attempt.metrics = {
+    ...attempt.metrics,
+    durationMs: elapsed,
+    firstEventMs: null,
+    startupRetries: 0,
+    toolSteps: 0,
+    nativeRequestCount: null,
+  };
+}
+
 /** State, evidence, leases and native sessions shared by every engine stage. */
 export class EngineCore {
   constructor({
@@ -173,6 +205,49 @@ export class EngineCore {
       ...gates,
     };
     this.tools = { resolveTool, formatToolContext, ...tools };
+    // Login checks of native clients, one cache per loaded run object: a new `run()` loads a new
+    // object and checks again, so nothing is shared between runs.
+    this.subscriptionChecks = new WeakMap();
+  }
+  /**
+   * Persisted admission of one native start: the cap counts every start of this run, including an
+   * automatic restart, across resume, retry cycles and parallel workers. It is checked and
+   * recorded in one synchronous step.
+   */
+  admitSessionStart(run, { stage, node, request, references, manifest, localBytes, restart }) {
+    const sessionCap = run.config.budgets?.sessions ?? null;
+    if (sessionCap !== null && (run.sessionAttempts?.length ?? 0) >= sessionCap)
+      throw Object.assign(new Error(`Исчерпан лимит сессий запуска: ${sessionCap}`), { code: 'budget' });
+    const attempt = {
+      stage,
+      node: node?.id ?? null,
+      client: request.client,
+      model: request.model,
+      status: 'started',
+      ...(restart ? { restart } : {}),
+      evidence: references,
+      // Kept with the attempt, not as another evidence file: preparing the protected
+      // evidence directory once per session would cost more than the session setup itself.
+      manifest,
+      manifestSha256: contentHash(manifest),
+      metrics: {
+        ...localBytes,
+        durationMs: null,
+        firstEventMs: null,
+        startupRetries: null,
+        toolSteps: null,
+        nativeRequestCount: null,
+        usage: normalizeUsage(request.client),
+      },
+    };
+    (run.sessionAttempts ||= []).push(attempt);
+    this.save(run);
+    return attempt;
+  }
+  /** The login cache of this loaded run, shared by model discovery and every native session. */
+  runSubscriptionChecks(run) {
+    if (!this.subscriptionChecks.has(run)) this.subscriptionChecks.set(run, new Map());
+    return this.subscriptionChecks.get(run);
   }
   log(run, type, data = {}) {
     const clean = redact(data, this.secrets);
@@ -768,7 +843,13 @@ try {
           if (this.store.getRun(run.id).cancelRequested) controller.abort();
         }, 500);
         timer.unref();
-        let attempt, started, localBytes;
+        let attempt,
+          started,
+          localBytes,
+          firstEvent,
+          // Time of earlier silent starts inside the same provider call: the client's whole-call
+          // measurements are reduced by it, so each start is counted once.
+          offset = 0;
         try {
           const tools = await this.resolveWorkerTools(request.cwd);
           const guidance = redact(
@@ -804,39 +885,40 @@ try {
           const env = await this.executionEnvironment(run, request.cwd, tools);
           for (const reference of references) await this.assertEvidence(reference);
           this.checkCancelled(run, controller.signal);
-          // Persisted admission: the cap counts every started session of this run,
-          // across resume, retry cycles and parallel workers. It is checked and
-          // recorded in one synchronous step.
-          const sessionCap = run.config.budgets?.sessions ?? null;
-          if (sessionCap !== null && (run.sessionAttempts?.length ?? 0) >= sessionCap)
-            throw Object.assign(new Error(`Исчерпан лимит сессий запуска: ${sessionCap}`), { code: 'budget' });
-          attempt = {
-            stage,
-            node: node?.id ?? null,
-            client: request.client,
-            model: request.model,
-            status: 'started',
-            evidence: references,
-            // Kept with the attempt, not as another evidence file: preparing the protected
-            // evidence directory once per session would cost more than the session setup itself.
-            manifest,
-            manifestSha256: contentHash(manifest),
-            metrics: {
-              ...localBytes,
-              durationMs: null,
-              toolSteps: null,
-              nativeRequestCount: null,
-              usage: normalizeUsage(request.client),
-            },
-          };
-          (run.sessionAttempts ||= []).push(attempt);
-          this.save(run);
+          const admit = restart =>
+            (attempt = this.admitSessionStart(run, {
+              stage,
+              node,
+              request,
+              references,
+              manifest,
+              localBytes,
+              restart,
+            }));
+          admit();
           started = performance.now();
           const result = await this.provider.runSession({
             ...request,
             signal: controller.signal,
             env,
+            subscriptionChecks: this.runSubscriptionChecks(run),
+            ...(run.config.startupTimeoutMs !== undefined ? { startupTimeoutMs: run.config.startupTimeoutMs } : {}),
+            // The client sent nothing before the startup limit: that start is a failed attempt of its
+            // own, and the restart needs its own admission. Neither is a repair attempt of the node.
+            onStartupRetry: details => {
+              const reason = details?.reason ?? 'startup_timeout',
+                elapsed = performance.now() - started;
+              settleSilentStart(attempt, reason, elapsed);
+              attempt = undefined;
+              this.save(run);
+              offset += elapsed;
+              started = performance.now();
+              firstEvent = undefined;
+              this.checkCancelled(run, controller.signal);
+              admit(reason);
+            },
             onEvent: event => {
+              firstEvent ??= performance.now() - started;
               if (identity && event.sessionId) {
                 identity.sessionId = event.sessionId;
                 this.save(run);
@@ -860,12 +942,7 @@ try {
           throw error;
         } finally {
           if (attempt) {
-            attempt.metrics = {
-              ...attempt.metrics,
-              ...localBytes,
-              durationMs: attempt.metrics.durationMs ?? performance.now() - started,
-              nativeRequestCount: null,
-            };
+            attempt.metrics = settledMetrics(attempt.metrics, { localBytes, offset, started, firstEvent });
             this.save(run);
           }
           clearInterval(timer);

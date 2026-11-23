@@ -54,6 +54,9 @@ const defaults = {
  * @property {(event: any) => void} [onEvent]
  * @property {NodeJS.ProcessEnv} [env]
  * @property {number} [timeoutMs]
+ * @property {number} [startupTimeoutMs] Limit from process start to the first JSON event; one restart without events.
+ * @property {Map<string, Promise<any>>} [subscriptionChecks] Login checks of one Engine run, by client.
+ * @property {(details: { reason: string }) => unknown} [onStartupRetry] Admits an automatic restart; a throw refuses it.
  */
 
 /**
@@ -201,7 +204,7 @@ export async function subscriptionStatus(
 
 /**
  * @param {{ client?: string, providers?: string, primaryModel?: string }} [request]
- * @param {{ config?: Record<string, any>, live?: boolean, secrets?: import('./security.mjs').Secrets, statusImpl?: typeof subscriptionStatus, cacheImpl?: typeof readCodexModelCache, sessionImpl?: typeof runSession }} [deps]
+ * @param {{ config?: Record<string, any>, live?: boolean, secrets?: import('./security.mjs').Secrets, statusImpl?: typeof subscriptionStatus, cacheImpl?: typeof readCodexModelCache, sessionImpl?: typeof runSession, subscriptionChecks?: Map<string, Promise<any>> }} [deps]
  */
 export async function discoverProviders(
   { client = 'codex', providers = 'current', primaryModel } = {},
@@ -212,6 +215,7 @@ export async function discoverProviders(
     statusImpl = subscriptionStatus,
     cacheImpl = readCodexModelCache,
     sessionImpl = runSession,
+    subscriptionChecks,
   } = {},
 ) {
   const selectedClient = client === 'opencode' ? config.backend || 'codex' : client;
@@ -229,7 +233,8 @@ export async function discoverProviders(
   for (const current of clients) {
     let availability;
     try {
-      availability = await statusImpl(current);
+      // The login check of a run is shared with its sessions (`subscriptionChecks`).
+      availability = await checkedSubscription(subscriptionChecks, current, () => statusImpl(current));
     } catch (error) {
       availability = { available: false, error: error.message, code: error.code };
     }
@@ -379,9 +384,13 @@ export function sessionInvocation({ client, model, cwd, schemaPath, schema, sess
 /**
  * @param {string} client
  * @param {any[]} events
- * @param {{ schema?: Record<string, any>, sessionId?: string, model?: string, durationMs?: number }} [details]
+ * @param {{ schema?: Record<string, any>, sessionId?: string, model?: string, durationMs?: number, firstEventMs?: number | null, startupRetries?: number }} [details]
  */
-export function parseSessionEvents(client, events, { schema, sessionId, model, durationMs } = {}) {
+export function parseSessionEvents(
+  client,
+  events,
+  { schema, sessionId, model, durationMs, firstEventMs, startupRetries } = {},
+) {
   let output,
     usage,
     failure,
@@ -431,7 +440,83 @@ export function parseSessionEvents(client, events, { schema, sessionId, model, d
         'invalid_output',
       );
   }
-  return { sessionId, output, usage, model, metrics: sessionMetrics(client, events, { durationMs, usage }) };
+  return {
+    sessionId,
+    output,
+    usage,
+    model,
+    metrics: sessionMetrics(client, events, { durationMs, usage, firstEventMs, startupRetries }),
+  };
+}
+
+/**
+ * One login check per client and cache; only a passed check (`available: true`) is remembered.
+ * @param {Map<string, Promise<any>> | undefined} cache
+ * @param {string} client
+ * @param {() => any} check
+ */
+function checkedSubscription(cache, client, check) {
+  if (!(cache instanceof Map)) return check();
+  if (!cache.has(client)) {
+    // Always a promise, even for a synchronous check, so a failure can be forgotten below.
+    const pending = Promise.resolve().then(check);
+    cache.set(client, pending);
+    const forget = () => {
+      if (cache.get(client) === pending) cache.delete(client);
+    };
+    pending.then(status => {
+      if (status?.available !== true) forget();
+    }, forget);
+  }
+  return cache.get(client);
+}
+
+/** A client event is a JSON object; other JSON values and text are not. */
+const eventOf = line => {
+  try {
+    const value = JSON.parse(line);
+    return value !== null && typeof value === 'object' && !Array.isArray(value) ? value : undefined;
+  } catch {
+    return undefined;
+  }
+};
+const jsonLine = line => eventOf(line) !== undefined;
+
+/**
+ * The executable of a passed login check, shared by the run when `cache` is given.
+ * @param {Map<string, Promise<any>> | undefined} cache
+ * @param {string} client
+ * @param {() => Promise<any>} check
+ */
+async function subscribedExecutable(cache, client, check) {
+  const { executable } = (await checkedSubscription(cache, client, check)) ?? {};
+  // A shared check that passed without an executable cannot start the client: check here.
+  return executable ?? (await check()).executable;
+}
+
+/**
+ * Settles a failed start: only a first silence (no event, no earlier restart) may start again, and
+ * only once the caller admits it (its session budget). Otherwise the failure is thrown.
+ * @param {any} error
+ * @param {{ answered: boolean, aborted?: boolean, client: string, startupTimeoutMs: number, onStartupRetry?: (details: { reason: string }) => unknown }} state
+ */
+async function restartAfterSilence(error, { answered, aborted, client, startupTimeoutMs, onStartupRetry }) {
+  if (error?.code !== 'KODO_STARTUP_TIMEOUT' || aborted) throw error;
+  // A client that never answered did no work. A second silence, or a silence after events, fails
+  // the session as unavailable, which spends no repair round.
+  if (answered)
+    throw Object.assign(
+      new ProviderError(`Клиент ${client} не прислал первое событие за ${startupTimeoutMs} мс`, 'unavailable'),
+      { startupTimeout: true },
+    );
+  // Every native start is admitted by the caller; a refusal keeps its reason.
+  try {
+    await onStartupRetry?.({ reason: 'startup_timeout' });
+  } catch (refusal) {
+    throw refusal instanceof ProviderError
+      ? refusal
+      : new ProviderError(redact(refusal?.message ?? String(refusal)), refusal?.code || 'unavailable');
+  }
 }
 
 /**
@@ -439,48 +524,83 @@ export function parseSessionEvents(client, events, { schema, sessionId, model, d
  * @param {ProcessDeps & { nowImpl?: () => number }} [deps]
  */
 export async function runSession(
-  { client, model, cwd, prompt, schema, sessionId, readOnly = false, signal, onEvent, env, timeoutMs = 1800000 },
+  {
+    client,
+    model,
+    cwd,
+    prompt,
+    schema,
+    sessionId,
+    readOnly = false,
+    signal,
+    onEvent,
+    env,
+    timeoutMs = 1800000,
+    startupTimeoutMs = 120000,
+    subscriptionChecks,
+    onStartupRetry,
+  },
   { processImpl = runProcess, resolveClientImpl = resolveClient, nowImpl = () => performance.now() } = {},
 ) {
   signal?.throwIfAborted();
   const started = nowImpl(),
     events = [];
-  let directory;
+  let directory,
+    firstEventMs = null,
+    startupRetries = 0;
   const environment = subscriptionEnvironment(env);
   try {
-    const { executable } = await subscriptionStatus(client, { env: environment, processImpl, resolveClientImpl });
+    const executable = await subscribedExecutable(subscriptionChecks, client, () =>
+      subscriptionStatus(client, { env: environment, processImpl, resolveClientImpl }),
+    );
     directory = await mkdtemp(path.join(os.tmpdir(), 'kodo-provider-'));
     const schemaPath = schema ? path.join(directory, 'output.schema.json') : undefined;
     if (schema) await writeFile(schemaPath, JSON.stringify(providerSchema(schema)), { mode: 0o600 });
-    const invocation = sessionInvocation({ client, model, cwd, schemaPath, schema, sessionId, readOnly });
-    if (client === 'codex')
-      invocation.args.splice(invocation.args.indexOf('exec'), 0, ...(await codexIsolationOverrides(cwd, environment)));
-    const result = await processImpl({
-      ...executable,
-      args: [...executable.args, ...invocation.args],
-      cwd,
-      input: prompt,
-      env: environment,
-      signal,
-      timeoutMs,
-      onLine: line => {
-        if (!line.trim()) return;
-        let event;
-        try {
-          event = JSON.parse(line);
-        } catch {
-          return;
-        }
-        events.push(event);
-        // Stream lifecycle only. Command/output payloads may contain repository secrets.
-        onEvent?.({
-          type: event.type,
-          subtype: event.subtype,
-          sessionId: event.thread_id ?? event.session_id ?? invocation.sessionId,
-          model,
+    const isolation = client === 'codex' ? await codexIsolationOverrides(cwd, environment) : [];
+    let invocation, result;
+    for (;;) {
+      // A restart is a fresh invocation: a new Claude session id, the same resumed Codex thread.
+      invocation = sessionInvocation({ client, model, cwd, schemaPath, schema, sessionId, readOnly });
+      if (client === 'codex') invocation.args.splice(invocation.args.indexOf('exec'), 0, ...isolation);
+      const current = invocation;
+      try {
+        result = await processImpl({
+          ...executable,
+          args: [...executable.args, ...current.args],
+          cwd,
+          input: prompt,
+          env: environment,
+          signal,
+          timeoutMs,
+          startupTimeoutMs,
+          startedBy: jsonLine,
+          onLine: line => {
+            if (!line.trim()) return;
+            const event = eventOf(line);
+            if (!event) return;
+            firstEventMs ??= nowImpl() - started;
+            events.push(event);
+            // Stream lifecycle only. Command/output payloads may contain repository secrets.
+            onEvent?.({
+              type: event.type,
+              subtype: event.subtype,
+              sessionId: event.thread_id ?? event.session_id ?? current.sessionId,
+              model,
+            });
+          },
         });
-      },
-    });
+        break;
+      } catch (error) {
+        await restartAfterSilence(error, {
+          answered: events.length > 0 || startupRetries > 0,
+          aborted: signal?.aborted,
+          client,
+          startupTimeoutMs,
+          onStartupRetry,
+        });
+        startupRetries++;
+      }
+    }
     if (result.exitCode !== 0) {
       try {
         parseSessionEvents(client, events, { schema, sessionId: invocation.sessionId, model });
@@ -494,14 +614,24 @@ export async function runSession(
       sessionId: invocation.sessionId,
       model,
       durationMs: nowImpl() - started,
+      firstEventMs,
+      startupRetries,
     });
   } catch (error) {
     const failure =
       error instanceof ProviderError || signal?.aborted
         ? error
-        : new ProviderError(redact(error.message), 'unavailable');
+        : // An unconfirmed stop of the client's processes keeps its reason: no restart, no repair.
+          new ProviderError(
+            redact(error.message),
+            error?.code === 'process_teardown' ? 'process_teardown' : 'unavailable',
+          );
     if (failure instanceof Error && Object.isExtensible(failure))
-      failure.metrics = sessionMetrics(client, events, { durationMs: nowImpl() - started });
+      failure.metrics = sessionMetrics(client, events, {
+        durationMs: nowImpl() - started,
+        firstEventMs,
+        startupRetries,
+      });
     throw failure;
   } finally {
     if (

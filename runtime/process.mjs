@@ -4,6 +4,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { parse as parseToml } from 'smol-toml';
 import { workerEnvironment } from './security.mjs';
+import { stopOwnedTree } from './delivery-process.mjs';
 
 export function redact(value, secrets = {}) {
   let result = typeof value === 'string' ? value : JSON.stringify(value);
@@ -70,6 +71,21 @@ export async function resolveClient(client, environment = process.env) {
   throw new Error(`Не найден исполняемый файл клиента ${client}`);
 }
 
+/** After a confirmed stop, pipes still held by a process outside the tree are closed by force. */
+const CLOSE_WAIT_MS = 3000;
+
+/**
+ * `startupTimeoutMs` bounds the wait for the first stdout line accepted by `startedBy` (any line by
+ * default); it is armed only when shorter than `timeoutMs`. Past it the process tree is stopped
+ * with `KODO_STARTUP_TIMEOUT`.
+ *
+ * Every stop (timeouts, cancellation, output limit) goes through `stopImpl`, the owned-tree
+ * teardown of delivery: the POSIX client leads its own process group, which gets SIGTERM, then
+ * SIGKILL, until no member runs; on Windows every captured descendant is killed and awaited. The
+ * attempt ends only after that is confirmed. An unconfirmed stop ends it with `process_teardown`,
+ * never with the stop reason, so no caller starts the client again next to survivors. A process
+ * outside the tree may still hold the pipes: after the confirmed stop they are awaited only briefly.
+ */
 export async function runProcess({
   command,
   args = [],
@@ -78,30 +94,80 @@ export async function runProcess({
   env = process.env,
   signal,
   timeoutMs = 1800000,
+  startupTimeoutMs,
+  startedBy = /** @type {(line: string) => boolean} */ (() => true),
   onLine,
   maxOutputBytes = 16 * 1024 * 1024,
+  stopImpl = stopOwnedTree,
 }) {
   signal?.throwIfAborted();
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { cwd, env, windowsHide: true, shell: false, stdio: ['pipe', 'pipe', 'pipe'] });
+    const posix = process.platform !== 'win32';
+    const child = spawn(command, args, {
+      cwd,
+      env,
+      windowsHide: true,
+      shell: false,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      // A POSIX client leads its own process group, so a stop can reach every descendant.
+      detached: posix,
+    });
     let stdout = '',
       stderr = '',
       pending = '',
       finished = false,
-      terminalError;
+      terminalError,
+      teardownError,
+      stopping,
+      forced;
+    const outcome = () => teardownError ?? terminalError;
     const terminate = error => {
-      if (finished) return;
+      // The first reason of a stop stays (a later timer cannot turn it into a restartable one);
+      // an unconfirmed teardown still takes precedence over it.
+      if (finished || stopping) return;
       terminalError = error;
-      // Windows process groups require taskkill to stop the CLI's native child too.
-      if (process.platform === 'win32' && child.pid)
-        spawnSync('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
-      else child.kill('SIGTERM');
+      clearTimeout(startup);
+      startup = undefined;
+      stopping = Promise.resolve()
+        .then(() => stopImpl(child))
+        .catch(cause => {
+          teardownError = Object.assign(
+            new Error(`Остановка процессов клиента не подтверждена: ${redact(cause?.message ?? String(cause))}`),
+            { code: 'process_teardown' },
+          );
+          try {
+            child.kill('SIGKILL');
+          } catch {
+            /* Already gone. */
+          }
+        })
+        .then(() => {
+          // Never wait forever for 'close': a process outside the tree may keep the pipes open.
+          forced = setTimeout(() => {
+            child.stdout.destroy();
+            child.stderr.destroy();
+            finish(() => reject(outcome()));
+          }, CLOSE_WAIT_MS);
+        });
     };
     const timer = setTimeout(
       () => terminate(Object.assign(new Error('Истекло время выполнения клиента'), { code: 'KODO_TIMEOUT' })),
       timeoutMs,
     );
     timer.unref();
+    let startup =
+      Number.isFinite(startupTimeoutMs) && startupTimeoutMs > 0 && startupTimeoutMs < timeoutMs
+        ? setTimeout(
+            () =>
+              terminate(
+                Object.assign(new Error(`Клиент не прислал первое событие за ${startupTimeoutMs} мс`), {
+                  code: 'KODO_STARTUP_TIMEOUT',
+                }),
+              ),
+            startupTimeoutMs,
+          )
+        : undefined;
+    startup?.unref();
     const aborted = () =>
       terminate(
         signal.reason instanceof Error
@@ -113,6 +179,8 @@ export async function runProcess({
       if (finished) return;
       finished = true;
       clearTimeout(timer);
+      clearTimeout(startup);
+      clearTimeout(forced);
       signal?.removeEventListener('abort', aborted);
       callback();
     };
@@ -129,6 +197,10 @@ export async function runProcess({
         const line = pending.slice(0, newline).replace(/\r$/, '');
         pending = pending.slice(newline + 1);
         try {
+          if (startup && startedBy(line)) {
+            clearTimeout(startup);
+            startup = undefined;
+          }
           onLine?.(line);
         } catch (error) {
           terminate(error);
@@ -140,19 +212,23 @@ export async function runProcess({
       if (Buffer.byteLength(stdout) + Buffer.byteLength(stderr) > maxOutputBytes)
         terminate(Object.assign(new Error('Превышен предел вывода клиента'), { code: 'KODO_OUTPUT_LIMIT' }));
     });
-    child.on('close', (exitCode, exitSignal) =>
-      finish(() => {
-        if (pending) {
-          try {
-            onLine?.(pending.replace(/\r$/, ''));
-          } catch (error) {
-            terminalError ??= error;
+    child.on('close', (exitCode, exitSignal) => {
+      const settle = () =>
+        finish(() => {
+          if (pending) {
+            try {
+              onLine?.(pending.replace(/\r$/, ''));
+            } catch (error) {
+              terminalError ??= error;
+            }
           }
-        }
-        if (terminalError) reject(terminalError);
-        else resolve({ stdout, stderr, exitCode, signal: exitSignal, pid: child.pid });
-      }),
-    );
+          if (outcome()) reject(outcome());
+          else resolve({ stdout, stderr, exitCode, signal: exitSignal, pid: child.pid });
+        });
+      // A stopped attempt ends only once its processes are confirmed stopped.
+      if (stopping) stopping.then(settle);
+      else settle();
+    });
     child.stdin.on('error', error => {
       if (error.code !== 'EPIPE') terminate(error);
     });

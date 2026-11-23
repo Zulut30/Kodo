@@ -573,7 +573,7 @@ export class EngineVerification extends EngineExecution {
       // the scope stops the cycle (scope_conflict), so a resume never repeats the session.
       if (run.verificationProfile === TASK_FAST_PROFILE)
         try {
-          await this.checkTaskScope(run, run.cwd, pending.headSha, scopes);
+          await this.checkRunScope(run, run.cwd, pending.headSha, scopes);
         } catch (error) {
           if (error.code !== 'scope_conflict') throw error;
           cycle.stopped = 'scope_conflict';
@@ -595,7 +595,7 @@ export class EngineVerification extends EngineExecution {
       this.save(run);
     }
     this.checkCancelled(run, signal);
-    await this.checkTaskScope(run, run.cwd, pending.headSha, scopes);
+    await this.checkRunScope(run, run.cwd, pending.headSha, scopes);
     await commitChanges(run.cwd, `Kodo repair checks ${cycle.attempt}`);
     delete cycle.pendingRepair;
     run.checks = null;

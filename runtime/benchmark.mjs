@@ -342,6 +342,9 @@ function safeMetrics(client, result, elapsed) {
   usage.source = value?.usage || result?.usage ? `${client}.usage` : null;
   return {
     durationMs: finite(value?.durationMs) ?? elapsed,
+    // Optional receipts of the native client; older manifests simply lack them.
+    firstEventMs: finite(value?.firstEventMs),
+    startupRetries: count(value?.startupRetries),
     toolSteps: count(value?.toolSteps),
     nativeRequestCount: null,
     usage,

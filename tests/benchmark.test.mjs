@@ -520,7 +520,14 @@ test('Production benchmark executes actual Engine worktrees review and checks us
   assert.equal(stages.filter(item => item === 'review').length, 2);
   assert.equal(stages.filter(item => item === 'developer').length, 2);
   assert.equal(homes.size, 2);
-  assert.ok(report.trials.filter(item => item.condition === 'kodo').every(item => item.metrics.sessions === 3));
+  // The CSS fixture edits only its stylesheet (`node verify.cjs` is a command to run): a proven style
+  // fast path plans locally (developer and review). The other fixture is not proven and runs the planner.
+  assert.deepEqual(
+    Object.fromEntries(
+      report.trials.filter(item => item.condition === 'kodo').map(item => [item.fixture, item.metrics.sessions]),
+    ),
+    { 'button-color': 2, 'filename-extension': 3 },
+  );
   await assert.rejects(access(process.env.KODO_WORKTREE_HOME), { code: 'ENOENT' });
 });
 
@@ -605,15 +612,21 @@ test('Unavailable plain and real Engine developer sessions remain pending and re
           store.close();
         }
       };
+      // One node either way: the planner's `fix` or the local fast-path node.
+      const only = run => {
+        const nodes = Object.values(run.nodes);
+        assert.equal(nodes.length, 1);
+        return nodes[0];
+      };
       let pendingRun;
       if (condition === 'kodo') {
         pendingRun = readRun();
         assert.equal(pendingRun.error.code, 'unavailable');
         assert.equal(pendingRun.config.repairRounds, 1);
-        assert.equal(pendingRun.nodes.fix.attempt, 0);
-        assert.equal(pendingRun.nodes.fix.status, 'pending');
-        assert.equal(pendingRun.nodes.fix.stopped, undefined);
-        assert.equal(pendingRun.nodes.fix.resumeRequired, true);
+        assert.equal(only(pendingRun).attempt, 0);
+        assert.equal(only(pendingRun).status, 'pending');
+        assert.equal(only(pendingRun).stopped, undefined);
+        assert.equal(only(pendingRun).resumeRequired, true);
         assert.equal(pendingRun.controllerAssessment, undefined);
         assert.equal(pendingRun.sessionAttempts.at(-1).errorCode, 'unavailable');
       }
@@ -636,11 +649,11 @@ test('Unavailable plain and real Engine developer sessions remain pending and re
       if (condition === 'kodo') {
         const finalRun = readRun();
         assert.equal(finalRun.id, pendingRun.id);
-        assert.equal(finalRun.nodes.fix.cwd, pendingRun.nodes.fix.cwd);
-        assert.equal(finalRun.nodes.fix.attempt, 1);
-        assert.equal(finalRun.nodes.fix.stopped, undefined);
+        assert.equal(only(finalRun).cwd, only(pendingRun).cwd);
+        assert.equal(only(finalRun).attempt, 1);
+        assert.equal(only(finalRun).stopped, undefined);
         assert.deepEqual(sessions.slice(beforeResume, beforeResume + 2), [
-          { stage: 'developer', cwd: pendingRun.nodes.fix.cwd, sessionId: 'interrupted-developer' },
+          { stage: 'developer', cwd: only(pendingRun).cwd, sessionId: 'interrupted-developer' },
           { stage: 'review', cwd: pendingRun.cwd, sessionId: undefined },
         ]);
       }
@@ -1055,4 +1068,23 @@ test('Paired reports separate native duration from wall time and keep failed and
       },
     ],
   );
+});
+
+test('Native session receipts keep the first event and startup restarts the client reported', async t => {
+  const root = await temp(t),
+    deps = services(root);
+  deps.provider.runSession = async request => {
+    if (!request.readOnly) await fix(request.cwd);
+    return { model: request.model, metrics: { ...metric, firstEventMs: 7, startupRetries: 1 } };
+  };
+  const output = path.join(root, 'out');
+  assert.equal((await runBenchmark(options(output), deps)).complete, true);
+  const manifest = JSON.parse(await readFile(path.join(output, 'benchmark.json'), 'utf8'));
+  const plain = manifest.trials.filter(cell => cell.condition === 'plain');
+  assert.ok(plain.length > 0);
+  for (const cell of plain)
+    assert.deepEqual(
+      cell.sessions.map(row => [row.firstEventMs, row.startupRetries]),
+      [[7, 1]],
+    );
 });
