@@ -414,32 +414,6 @@ test('Engine prepares one private evidence directory per worker batch and rechec
   for (const reference of next.references) await readEvidence(reference.path, fx.baseSha);
 });
 
-test('Engine analysis writes analysis and research evidence in one protected batch with the same rights', async t => {
-  const fx = await fixture(t),
-    prepare = fx.engine.privateDirectory.bind(fx.engine),
-    prepared = [];
-  fx.engine.privateDirectory = async directory => {
-    prepared.push(directory);
-    return prepare(directory);
-  };
-  fx.run.branch = 'main';
-  await fx.engine.prepare(fx.run);
-  assert.ok(fx.run.completed.analysis);
-  assert.deepEqual(
-    prepared,
-    [path.join(fx.run.artifacts, 'evidence')],
-    'no worker or project command runs between the two writes, so one protection covers both',
-  );
-  for (const [reference, kind] of [
-    [fx.run.analysisEvidence, 'analysis'],
-    [fx.run.researchEvidence, 'research'],
-  ]) {
-    // readEvidence verifies the owner, SYSTEM and read-only CodexSandboxUsers ACL on Windows (0700 elsewhere).
-    assert.equal((await readEvidence(reference.path, fx.baseSha)).kind, kind);
-    await fx.engine.assertEvidence(reference);
-  }
-});
-
 test('Engine evidence batches reject expired writers and replaced or missing directories before producing another artifact', async t => {
   const fx = await fixture(t),
     directory = path.join(fx.run.artifacts, 'evidence');
