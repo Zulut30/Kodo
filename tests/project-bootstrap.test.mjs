@@ -692,38 +692,75 @@ test('lintMilestone reports epic cycles of the new milestone before append', asy
 
 test('prepareBootstrap writes a kodo.config.json template whose test command follows the stack', async t => {
   const home = await temp(t, 'kodo-home-');
+  const npmTest = [{ command: 'npm', args: ['test'] }];
+  const manifest = scripts => JSON.stringify({ name: 'x', private: true, scripts });
   const cases = [
-    [{}, [{ command: 'npm', args: ['test'] }]],
-    [{ 'package.json': '{}' }, [{ command: 'npm', args: ['test'] }]],
+    // An empty folder is a new Node project: the spec template's scaffold writes package.json.
+    [{}, npmTest],
+    [{ 'package.json': manifest({ test: 'node --test' }) }, npmTest],
+    // A root manifest of a known stack gives its command; npm only with a real test script.
+    [{ 'package.json': '{}' }, []],
+    [{ 'package.json': manifest({ test: 'echo "Error: no test specified" && exit 1' }) }, []],
     [{ 'pyproject.toml': '[project]\n' }, [{ command: 'python', args: ['-m', 'pytest'] }]],
     [{ 'Cargo.toml': '[package]\n' }, [{ command: 'cargo', args: ['test'] }]],
+    [{ 'Cargo.toml': '[workspace]\n', 'crates/app/Cargo.toml': '[package]\n' }, [{ command: 'cargo', args: ['test'] }]],
     [{ 'go.mod': 'module x\n' }, [{ command: 'go', args: ['test', './...'] }]],
-    // A stack without a known test command gets none: the coordinator must set it explicitly.
+    // A nested manifest, several stacks or an unknown stack: the coordinator sets commands.test.
+    [{ 'README.md': '# x\n', 'backend/go.mod': 'module x\n' }, []],
+    [{ 'crates/app/Cargo.toml': '[package]\n' }, []],
+    [{ 'package.json': manifest({ test: 'node --test' }), 'backend/go.mod': 'module x\n' }, []],
     [{ 'composer.json': '{}' }, []],
+    [{ 'README.md': '# x\n' }, []],
   ];
   for (const [files, test] of cases) {
     const root = await temp(t);
-    for (const [name, content] of Object.entries(files)) await writeFile(path.join(root, name), content);
+    for (const [name, content] of Object.entries(files)) {
+      await mkdir(path.dirname(path.join(root, name)), { recursive: true });
+      await writeFile(path.join(root, name), content);
+    }
     const result = await prepareBootstrap({ prompt: 'Сервис заметок', root, home });
     assert.ok(result.files.includes('templates/kodo.config.json'), JSON.stringify(files));
     const config = JSON.parse(await readFile(path.join(result.dir, 'templates', 'kodo.config.json'), 'utf8'));
     assert.equal(config.client, 'codex');
     assert.deepEqual(config.commands.test, test, JSON.stringify(files));
+    assert.deepEqual(result.config, config, 'the caller sees the template it wrote');
     assert.deepEqual(normalizeConfig(config).commands.test, test, 'the template is a valid kodo.config.json');
   }
-  const rules = await readFile(
-    path.join((await prepareBootstrap({ prompt: 'x', root: await temp(t), home })).dir, 'rules.md'),
-    'utf8',
-  );
+  // The client chosen for the native session is the client of the template.
+  const chosen = await prepareBootstrap({ prompt: 'x', root: await temp(t), home, client: 'claude-code' });
+  assert.equal(chosen.config.client, 'claude-code');
+  await assert.rejects(prepareBootstrap({ prompt: 'x', root: await temp(t), home, client: 'api' }), {
+    code: 'bootstrap_client_invalid',
+  });
+  const rules = await readFile(path.join(chosen.dir, 'rules.md'), 'utf8');
   for (const text of [
     'kodo.config.json',
     'commands.test',
+    'scripts.test',
     'client',
     'claude-code',
     'apply-spec',
+    'blueprint_config_missing',
     'fast_check_no_tests',
   ])
     assert.ok(rules.includes(text), text);
+  assert.match(rules, /создаёт координатор/);
+});
+
+test('the native blueprint session never receives the kodo.config.json template', async t => {
+  const root = await temp(t),
+    home = await temp(t, 'kodo-home-');
+  const provider = fakeProvider(request => writeValidBlueprint(request.cwd));
+  const generated = await generateBlueprint({ provider, client: 'claude-code', root, home, prompt: 'Заметки' });
+  assert.equal(generated.ok, true, JSON.stringify(generated.findings));
+  const [request] = provider.calls;
+  assert.doesNotMatch(request.prompt, /=== templates\/kodo\.config\.json ===/);
+  assert.match(request.prompt, /=== templates\/spec\.json ===/);
+  // The coordinator writes the config after the blueprint: the session may not create it.
+  assert.match(request.prompt, /kodo\.config\.json[^\n]*создаёт координатор/);
+  assert.equal(generated.config.client, 'claude-code');
+  const template = JSON.parse(await readFile(path.join(generated.dir, 'templates', 'kodo.config.json'), 'utf8'));
+  assert.equal(template.client, 'claude-code');
 });
 
 test('bundle templates add no trailing reviewer task and give Wave 0 a minimal test', async t => {
@@ -742,6 +779,10 @@ test('bundle templates add no trailing reviewer task and give Wave 0 a minimal t
     first.writePaths.some(item => /^tests?\//.test(item)),
     'the first task writes a minimal test: a check that passes no test fails',
   );
+  assert.ok(
+    first.acceptance.some(item => /commands\.test/.test(item.text) && /хотя бы один проходящий тест/.test(item.text)),
+    JSON.stringify(first.acceptance),
+  );
   const { snapshot } = await project(t, { scaffold: 'accepted' });
   const extended = await prepareExtend({ snapshot, prompt: 'Теги', root: snapshot.project.root, home });
   const milestone = JSON.parse(await readFile(path.join(extended.dir, 'templates', 'milestone.json'), 'utf8'));
@@ -752,48 +793,61 @@ test('bundle templates add no trailing reviewer task and give Wave 0 a minimal t
   assert.deepEqual(lintMilestone(milestone, snapshot), { ok: true, findings: [] });
 });
 
-test('prepareExtend names interface evidence by its module, not by its content-addressed file', async t => {
+test('prepareExtend names interface evidence by its module only inside Kodo home evidence', async t => {
   const { root, snapshot } = await project(t, { scaffold: 'accepted' });
   const home = await temp(t, 'kodo-home-');
-  const evidence = path.join(home, 'project-interfaces', 'evidence');
-  await mkdir(evidence, { recursive: true });
-  const bound = new Map();
-  for (const module of ['api', 'storage']) {
+  const envelope = async (directory, module) => {
+    await mkdir(directory, { recursive: true });
     const source = `interfaces/${module}.md`;
     const text = await readFile(path.join(root, '.kodo', 'blueprint', ...source.split('/')), 'utf8');
     const value = { schemaVersion: 1, module, source, sha256: 'b'.repeat(64), bytes: Buffer.byteLength(text), text };
     const body = JSON.stringify({ schemaVersion: 1, kind: 'interface', baseSha: null, headSha: null, value });
     const sha256 = createHash('sha256').update(body).digest('hex');
-    const file = path.join(evidence, `interface-${sha256}.json`);
+    const file = path.join(directory, `interface-${sha256}.json`);
     await writeFile(file, body);
-    bound.set(module, { kind: 'interface', runId: null, headSha: null, path: file, sha256 });
-  }
+    return { kind: 'interface', runId: null, headSha: null, path: file, sha256 };
+  };
+  const evidence = path.join(home, 'project-interfaces', 'evidence');
+  const bound = new Map();
+  for (const module of ['api', 'storage']) bound.set(module, await envelope(evidence, module));
   // A ref whose envelope is missing keeps its file name: nothing is guessed.
   const lost = {
-    kind: 'interface',
-    runId: null,
-    headSha: null,
+    ...bound.get('api'),
     path: path.join(evidence, `interface-${'c'.repeat(64)}.json`),
     sha256: 'c'.repeat(64),
   };
+  // A valid envelope outside <home>/project-interfaces/evidence is never trusted (nor opened).
+  const outside = await envelope(path.join(home, 'elsewhere'), 'web');
+  // The same path with another digest is another ref: no label is reused across digests.
+  const changed = { ...bound.get('storage'), sha256: 'd'.repeat(64) };
   const current = structuredClone(snapshot);
   for (const task of current.tasks)
     task.interfaceRefs = task.interfaceRefs.map(ref => bound.get(path.basename(ref.path, '.md')) ?? ref);
   current.tasks.find(task => task.id === 'web-module').interfaceRefs = [lost];
+  current.tasks.find(task => task.id === 'web-ui-qa').interfaceRefs = [outside, changed];
   const result = await prepareExtend({ snapshot: current, prompt: 'Теги', root, home, now: AT });
   const context = await readFile(path.join(result.dir, 'context.md'), 'utf8');
   assert.match(context, /- api-module \[ready\] [^\n]*; interfaces: api\.md, storage\.md\n/);
-  assert.doesNotMatch(context, /interface-[a-f0-9]{64}\.json, /);
   assert.match(context, /- web-module \[ready\] [^\n]*; interfaces: interface-c{64}\.json\n/);
+  const name = ref => path.basename(ref.path).replaceAll('.', '\\.');
+  assert.match(
+    context,
+    new RegExp(`- web-ui-qa \\[ready\\] [^\\n]*; interfaces: ${name(outside)}, ${name(changed)}\\n`),
+  );
 });
 
-test('lintMilestone explains that a new milestone takes interfaceRefs: [] instead of the blueprint short form', async t => {
+test('lintMilestone explains that a new milestone takes interfaceRefs: []', async t => {
   const { snapshot } = await project(t, { 'storage-module': 'accepted' });
   const short = milestoneFile({ index: { interfaceRefs: [{ kind: 'interface', path: 'interfaces/storage.md' }] } });
   const result = lintMilestone(short, snapshot);
   assert.deepEqual(codes(result), ['milestone_interface_unbound']);
   assert.deepEqual(result.findings[0].taskIds, ['search-index']);
   assert.match(result.findings[0].message, /interfaceRefs: \[\]/);
+  // A full Ref is refused as well: a new milestone references no interface.
+  const [full] = snapshot.tasks.find(task => task.id === 'api-module').interfaceRefs;
+  const bound = lintMilestone(milestoneFile({ review: { interfaceRefs: [full] } }), snapshot);
+  assert.deepEqual(codes(bound), ['milestone_interface_unbound']);
+  assert.deepEqual(bound.findings[0].taskIds, ['search-review']);
   const { dir } = await prepareExtend({
     snapshot,
     prompt: 'Поиск',

@@ -346,7 +346,14 @@ test('bootstrap --prepare writes the context bundle only to KODO_HOME', async t 
   const config = report.result.next.findIndex(line => line.includes('kodo.config.json'));
   const register = report.result.next.findIndex(line => line.includes('project apply-spec --root'));
   assert.ok(config >= 0 && config < register, report.result.next.join('\n'));
-  for (const text of ['templates', 'client', 'commands.test', 'закоммить'])
+  for (const text of [
+    'templates',
+    'проверь существующий',
+    'client',
+    'commands.test',
+    'закоммить',
+    'blueprint_config_missing',
+  ])
     assert.ok(report.result.next[config].includes(text), text);
   assert.equal(report.result.summary.root, root);
   assert.equal(report.result.blueprint, path.join(root, '.kodo', 'blueprint'));
@@ -400,6 +407,16 @@ test('bootstrap runs one native session through the Engine provider and compiles
   );
   assert.ok(report.result.next.some(line => line.includes('apply-spec')));
   assert.equal((await compileBlueprint(root)).ok, true);
+  // The template of the coordinator's config names the client the session ran with.
+  const template = path.join(
+    await realpath(f.home),
+    'bootstrap',
+    report.result.bundle.id,
+    'templates',
+    'kodo.config.json',
+  );
+  assert.equal(JSON.parse(await readFile(template, 'utf8')).client, 'claude-code');
+  assert.ok(report.result.next.some(line => line.includes('kodo.config.json') && line.includes(template)));
 
   const empty = await f.root();
   const silent = { runSession: async () => ({ output: { status: 'blocked', summary: 'Неясно' } }) };
@@ -810,10 +827,102 @@ test('the director skill follows the factory contract for a new project and a ne
   // kodo.config.json (client, commands.test) is created and committed before apply-spec.
   const config = blueprint.indexOf('kodo.config.json');
   assert.ok(config >= 0 && config < blueprint.indexOf('apply-spec --root'), 'config before registration');
-  for (const text of ['commands.test', 'claude-code', 'templates/kodo.config.json'])
+  for (const text of ['commands.test', 'claude-code', 'templates/kodo.config.json', 'blueprint_config_missing'])
     assert.ok(blueprint.includes(text), text);
   assert.match(blueprint, /reviewer[^\n]*гейт/);
   const feature = section('## Новая фича в готовый проект', '## Правила');
   assert.match(feature, /interfaceRefs: \[\]/);
   assert.match(feature, /project_append_blocked/);
+});
+
+test('a coordinator that runs only result.commands cannot register a project without a committed kodo.config.json', async t => {
+  const f = await fixture(t);
+  const bare = path.join(f.dir, 'bare');
+  await mkdir(bare);
+  const git = (...args) => execFileSync('git', args, { cwd: bare, env: f.env, windowsHide: true });
+  git('init', '-b', 'main');
+  git('config', 'user.name', 'Owned blueprint CLI');
+  git('config', 'user.email', 'blueprint-cli@example.invalid');
+  git('config', 'commit.gpgSign', 'false');
+  await writeFile(path.join(bare, 'README.md'), '# Заметки\n');
+  git('add', '.');
+  git('commit', '-m', 'Owned fixture');
+  const prepared = await f.run(['bootstrap', 'Сервис заметок', '--root', bare, '--prepare'], {
+    cli: `node "${cli}"`,
+  });
+  assert.equal(prepared.exitCode, 0, JSON.stringify(prepared.report));
+  await writeBlueprint(bare);
+  const env = { ...f.env };
+  const pathKey = Object.keys(env).find(key => key.toUpperCase() === 'PATH') ?? 'PATH';
+  env[pathKey] = [path.dirname(process.execPath), env[pathKey]].filter(Boolean).join(path.delimiter);
+  // The consumer executes the machine commands as is, in order, and reads only their JSON.
+  const consume = () =>
+    prepared.report.result.commands.map(item => {
+      const ran = spawnSync(item.command, {
+        shell: true,
+        cwd: bare,
+        env,
+        encoding: 'utf8',
+        timeout: 60000,
+        windowsHide: true,
+      });
+      return { status: ran.status, report: JSON.parse(ran.stdout) };
+    });
+  const [refused] = consume();
+  assert.equal(refused.status, 1, JSON.stringify(refused.report));
+  assert.equal(refused.report.result.code, 'blueprint_findings');
+  assert.deepEqual(
+    refused.report.result.findings.map(item => item.code),
+    ['blueprint_config_missing'],
+  );
+  assert.match(refused.report.result.findings[0].message, /templates\/kodo\.config\.json/);
+  assert.equal(existsSync(path.join(f.home, 'project-interfaces')), false, 'no evidence and no project');
+
+  // The committed config registers the project; the coordinator's file is kept as written.
+  const template = path.join(prepared.report.result.bundle.dir, 'templates', 'kodo.config.json');
+  const config = JSON.parse(await readFile(template, 'utf8'));
+  assert.deepEqual(config.commands.test, [], 'no manifest: the coordinator sets the command');
+  config.client = 'claude-code';
+  config.commands.test = [{ command: 'node', args: ['--test'] }];
+  const text = `${JSON.stringify(config, null, 2)}\n`;
+  await writeFile(path.join(bare, 'kodo.config.json'), text);
+  git('add', 'kodo.config.json');
+  git('commit', '-m', 'Kodo config');
+  const [created] = consume();
+  assert.equal(created.status, 0, JSON.stringify(created.report));
+  assert.equal(created.report.result.status, 'created');
+  assert.equal(await readFile(path.join(bare, 'kodo.config.json'), 'utf8'), text);
+});
+
+test('extend uses the reopen rule of append-milestone: a paused or unsettled accepted project is refused early', async t => {
+  const f = await fixture(t);
+  const accepted = await acceptedProject(f);
+  assert.equal(contracts.projectReopenable(accepted.snapshot), true);
+  const variants = {
+    legacy: s => delete s.project.execution,
+    running: s => (s.project.status = 'running'),
+    paused: s => (s.project.paused = true),
+    incomplete: s => (s.completeness.tasks = { ...s.completeness.tasks, complete: false }),
+    unsettled: s => (s.currentAttempts = s.currentAttempts.map(row => ({ ...row, status: 'running' }))),
+    reopened: s => (s.project.reopened = Array.from({ length: 100 }, () => ({}))),
+  };
+  assert.ok(accepted.snapshot.currentAttempts.length > 0);
+  for (const [name, change] of Object.entries(variants)) {
+    const snapshot = structuredClone(accepted.snapshot);
+    change(snapshot);
+    assert.equal(contracts.projectReopenable(snapshot), false, name);
+  }
+  await accepted.repo.apply({
+    schemaVersion: 1,
+    commandId: randomUUID(),
+    projectId: accepted.projectId,
+    expectedRevision: accepted.repo.snapshot(accepted.projectId).revision,
+    actor: 'owner',
+    reason: 'Pause the accepted project',
+    action: { op: 'setPaused', paused: true },
+  });
+  const result = await f.run(['extend', accepted.projectId, 'Теги', '--prepare']);
+  assert.equal(result.exitCode, 2, JSON.stringify(result.report));
+  assert.equal(result.report.result.reason, 'project_append_blocked');
+  assert.equal(existsSync(path.join(f.home, 'bootstrap')), false, 'no context bundle was written');
 });

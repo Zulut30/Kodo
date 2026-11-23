@@ -84,20 +84,29 @@ const MARKERS = [
   [/^Package\.swift$/, 'Swift'],
   [/^kodo\.config\.json$/, 'Kodo config'],
 ];
-// commands.test of the kodo.config.json template, by a manifest in the root (first match). Another
-// recognised stack gets none: the coordinator sets it (an empty commands.test is never a pass).
-/** @type {Array<[RegExp, { command: string, args: string[] }]>} */
-const TEST_COMMANDS = [
-  [/^deno\.jsonc?$/, { command: 'deno', args: ['test'] }],
-  [/^package\.json$/, { command: 'npm', args: ['test'] }],
-  [/^(?:pyproject\.toml|requirements[^/]*\.txt|setup\.py|Pipfile)$/, { command: 'python', args: ['-m', 'pytest'] }],
-  [/^Cargo\.toml$/, { command: 'cargo', args: ['test'] }],
-  [/^go\.mod$/, { command: 'go', args: ['test', './...'] }],
-  [/\.(?:csproj|fsproj|sln)$/, { command: 'dotnet', args: ['test'] }],
-  [/^pom\.xml$/, { command: 'mvn', args: ['test'] }],
-  [/^build\.gradle(?:\.kts)?$/, { command: 'gradle', args: ['test'] }],
+// Stack manifests for commands.test of the kodo.config.json template (configTemplate); `test: null`
+// is a stack Kodo knows no test command for.
+/** @type {Array<{ stack: string, pattern: RegExp, test: { command: string, args: string[] } | null }>} */
+const STACK_MANIFESTS = [
+  { stack: 'deno', pattern: /^deno\.jsonc?$/, test: { command: 'deno', args: ['test'] } },
+  { stack: 'node', pattern: /^package\.json$/, test: { command: 'npm', args: ['test'] } },
+  {
+    stack: 'python',
+    pattern: /^(?:pyproject\.toml|requirements[^/]*\.txt|setup\.py|Pipfile)$/,
+    test: { command: 'python', args: ['-m', 'pytest'] },
+  },
+  { stack: 'rust', pattern: /^Cargo\.toml$/, test: { command: 'cargo', args: ['test'] } },
+  { stack: 'go', pattern: /^go\.mod$/, test: { command: 'go', args: ['test', './...'] } },
+  { stack: 'dotnet', pattern: /\.(?:csproj|fsproj|sln)$/, test: { command: 'dotnet', args: ['test'] } },
+  { stack: 'maven', pattern: /^pom\.xml$/, test: { command: 'mvn', args: ['test'] } },
+  { stack: 'gradle', pattern: /^(?:build|settings)\.gradle(?:\.kts)?$/, test: { command: 'gradle', args: ['test'] } },
+  { stack: 'php', pattern: /^composer\.json$/, test: null },
+  { stack: 'ruby', pattern: /^Gemfile$/, test: null },
+  { stack: 'cmake', pattern: /^CMakeLists\.txt$/, test: null },
+  { stack: 'dart', pattern: /^pubspec\.yaml$/, test: null },
+  { stack: 'swift', pattern: /^Package\.swift$/, test: null },
 ];
-const NOT_A_STACK = ['Docker', 'Kodo config'];
+const CONFIG_TEMPLATE = 'templates/kodo.config.json';
 const FRAMEWORKS = [
   'react',
   'next',
@@ -232,16 +241,34 @@ async function detectStack(root, files) {
   return { labels: [...found.keys()], lines };
 }
 
+// A real test script of the root package.json: not absent and not npm init's failing placeholder.
+async function npmTestScript(root) {
+  try {
+    const pkg = JSON.parse((await readBoundedFile(path.join(root, 'package.json'), 256 * 1024)).text);
+    const script = pkg?.scripts?.test;
+    return typeof script === 'string' && script.trim() !== '' && !/no test specified/i.test(script);
+  } catch {
+    return false;
+  }
+}
+
 /** kodo.config.json for the coordinator to commit before apply-spec: the client of the gate Runs and
- * the test command of the stack. An empty root gets the Node command of the spec template. */
-function configTemplate(files) {
-  const names = files.filter(file => !file.path.includes('/')).map(file => file.path);
-  const known = TEST_COMMANDS.find(([pattern]) => names.some(name => pattern.test(name)));
-  const stack = MARKERS.some(
-    ([pattern, label]) => !NOT_A_STACK.includes(label) && names.some(name => pattern.test(name)),
-  );
-  const test = known ? [known[1]] : stack ? [] : [{ command: 'npm', args: ['test'] }];
-  return { schemaVersion: 1, client: 'codex', commands: { test, build: [], deploy: [], smoke: [] } };
+ * the test command of the stack. An empty folder is a new Node project (the spec template's scaffold
+ * writes package.json): `npm test`. One stack whose manifest is in the root: its command (npm only
+ * with a test script). A nested manifest alone, several stacks, a stack without a known command or
+ * no manifest: `[]`, which the coordinator must replace (an empty commands.test is never a pass). */
+async function configTemplate(root, files, client) {
+  const config = test => ({ schemaVersion: 1, client, commands: { test, build: [], deploy: [], smoke: [] } });
+  if (!files.length) return config([{ command: 'npm', args: ['test'] }]);
+  const found = files.flatMap(file => {
+    const item = STACK_MANIFESTS.find(entry => entry.pattern.test(file.path.split('/').at(-1)));
+    return item ? [{ ...item, root: !file.path.includes('/') }] : [];
+  });
+  const stacks = new Set(found.map(item => item.stack));
+  const manifest = found.find(item => item.root);
+  if (stacks.size !== 1 || !manifest?.test) return config([]);
+  if (manifest.stack === 'node' && !(await npmTestScript(root))) return config([]);
+  return config([structuredClone(manifest.test)]);
 }
 
 function fenced(text, info = '') {
@@ -392,11 +419,13 @@ const RULES = `# Правила чертежа Kodo
 
 ## kodo.config.json — до apply-spec
 
-Политику проверки волн (\`commands\` и гейты) Kodo берёт из \`kodo.config.json\` в коммите, от которого стартует проект; правка файла в рабочей копии после регистрации проверку волн не меняет. Поэтому до \`apply-spec\` создайте \`<root>/kodo.config.json\` по \`templates/kodo.config.json\` и закоммитьте его вместе с исходным состоянием.
+\`kodo.config.json\` создаёт координатор (главный чат) после чертежа; сессия, которая пишет чертёж, этот файл не создаёт и не меняет.
+
+Политику проверки волн (\`commands\` и гейты) Kodo берёт из \`kodo.config.json\` в коммите, от которого стартует проект; правка файла в рабочей копии после регистрации проверку волн не меняет. Поэтому до \`apply-spec\` координатор создаёт \`<root>/kodo.config.json\` по шаблону \`templates/kodo.config.json\` пакета (или проверяет существующий) и коммитит его вместе с исходным состоянием. Без файла в коммите HEAD \`apply-spec\` отвечает \`blueprint_config_missing\`.
 
 - \`client\` — подписочный клиент, который исполняет гейты: \`codex\` или \`claude-code\` (есть только подписка Claude Code — \`claude-code\`).
-- \`commands.test\` — команда тестов стека из «Стек»: \`{ "command": "<программа>", "args": [...] }\`. Шаблон заполнен по найденному стеку (Node — \`npm test\`, Python — \`python -m pytest\`, Rust — \`cargo test\`, Go — \`go test ./...\`, .NET — \`dotnet test\`; пустой каталог — \`npm test\`). Выбран другой стек или в шаблоне команды нет — задайте её сами: пустой \`commands.test\` гейт не принимает.
-- \`kodo.config.json\` уже есть — проверьте в нём \`client\` и \`commands.test\`.
+- \`commands.test\` — команда тестов стека из «Стек»: \`{ "command": "<программа>", "args": [...] }\`. Шаблон: пустой каталог — \`npm test\` (новый Node-проект); один стек с манифестом в корне — его команда (Node — \`npm test\`, только если в package.json есть \`scripts.test\`; Python — \`python -m pytest\`, Rust — \`cargo test\`, Go — \`go test ./...\`, .NET — \`dotnet test\`, Maven — \`mvn test\`, Gradle — \`gradle test\`, Deno — \`deno test\`). Манифест только во вложенном каталоге, несколько стеков, package.json без \`scripts.test\`, стек без известной команды или нераспознанный стек — в шаблоне \`commands.test: []\`: задайте команду сами. Пустой \`commands.test\` гейт не принимает.
+- \`kodo.config.json\` уже есть — проверьте в нём \`client\` и \`commands.test\` и не перезаписывайте остальное.
 
 ## Коды проверки
 
@@ -414,6 +443,7 @@ const RULES = `# Правила чертежа Kodo
 | \`blueprint_parallel_overlap\` | Пересечение writePaths параллельных задач |
 | \`split_required\` | Разделить задачу |
 | \`blueprint_interface_missing\`, \`blueprint_interface_stale\` | Ссылки на interfaces/*.md |
+| \`blueprint_config_missing\` | (apply-spec) В коммите HEAD нет kodo.config.json: создать по шаблону и закоммитить |
 `;
 
 const PROJECT_TEMPLATE = `# <Название проекта>
@@ -509,14 +539,23 @@ function specTemplate(root) {
       { id: 'core', milestoneId: 'mvp', title: '<Модуль core>', acceptance: [criterion('core-done', '<Критерий>')] },
     ],
     tasks: [
-      templateTask(
-        'scaffold',
-        'foundation-setup',
-        'architect',
-        [],
-        ['package.json', 'src/shared', 'tests/smoke'],
-        ['core'],
-      ),
+      {
+        ...templateTask(
+          'scaffold',
+          'foundation-setup',
+          'architect',
+          [],
+          ['package.json', 'src/shared', 'tests/smoke'],
+          ['core'],
+        ),
+        acceptance: [
+          criterion('scaffold-done', '<Проверяемый критерий>'),
+          criterion(
+            'scaffold-tests',
+            'commands.test из kodo.config.json выполняет хотя бы один проходящий тест (минимальный тест из writePaths)',
+          ),
+        ],
+      },
       templateTask('quality-bench', 'foundation-setup', 'developer', ['scaffold'], ['tests/support', 'tooling'], []),
       templateTask('core-module', 'core', 'developer', ['quality-bench'], ['src/core'], ['core']),
     ],
@@ -561,12 +600,15 @@ function bootstrapContext({ prompt, root, at, scan, stack, architecture, knowled
  * context.md, rules.md and templates/. Returns { id, dir, files, summary }.
  * @param {Record<string, any>} [options] */
 export async function prepareBootstrap(options = {}) {
-  const { prompt, root, home, now, architecture, knowledge, contracts, knownValues } = options;
+  const { prompt, root, home, now, architecture, knowledge, contracts, knownValues, client = 'codex' } = options;
   checkPrompt(prompt);
+  if (!BOOTSTRAP_CLIENTS.includes(client))
+    throw failure('bootstrap_client_invalid', `client — один из ${BOOTSTRAP_CLIENTS.join(', ')}`);
   const real = await existingRoot(root);
   const at = isoTime(now);
   const scan = await scanProject(real);
   const stack = await detectStack(real, scan.files);
+  const config = await configTemplate(real, scan.files, client);
   const graph = await architectureSection(architecture);
   const facts = knowledgeSection(knowledge, prompt);
   const { redacted, ...bundle } = await writeBundle({
@@ -581,11 +623,12 @@ export async function prepareBootstrap(options = {}) {
       ['templates/PROJECT.md', PROJECT_TEMPLATE],
       ['templates/interfaces/module.md', INTERFACE_TEMPLATE],
       ['templates/spec.json', `${JSON.stringify(specTemplate(real), null, 2)}\n`],
-      ['templates/kodo.config.json', `${JSON.stringify(configTemplate(scan.files), null, 2)}\n`],
+      [CONFIG_TEMPLATE, `${JSON.stringify(config, null, 2)}\n`],
     ],
   });
   return {
     ...bundle,
+    config,
     summary: {
       kind: 'bootstrap',
       root: real,
@@ -672,9 +715,10 @@ export async function generateBlueprint(options = {}) {
     options;
   checkSession({ provider, client, model, signal });
   const safety = { contracts, knownValues };
-  const bundle = await prepareBootstrap({ prompt, root, home, now, architecture, knowledge, ...safety });
+  const bundle = await prepareBootstrap({ prompt, root, home, now, architecture, knowledge, client, ...safety });
   const real = bundle.summary.root;
-  const files = await bundleFiles(bundle);
+  // The coordinator writes kodo.config.json after the blueprint; the session writes the blueprint only.
+  const files = (await bundleFiles(bundle)).filter(([name]) => name !== CONFIG_TEMPLATE);
   const before = await scanProject(real, { watch: AGENT_DIRS });
   const result = await provider.runSession({
     client,
@@ -698,6 +742,7 @@ export async function generateBlueprint(options = {}) {
   return {
     id: bundle.id,
     dir: bundle.dir,
+    config: bundle.config,
     session: sessionInfo(result, model, status),
     scopeChecked: before.complete && after.complete,
     ok: findings.length === 0,
@@ -718,25 +763,39 @@ function snapshotOf(snapshot, contracts, knownValues) {
   }
 }
 
+// A ref is its path and its digest: one path with another digest is another envelope.
+const labelKey = ref => `${ref.path}\0${ref.sha256}`;
+
 function refLabel(ref, labels) {
-  const name = labels.get(ref.path) ?? ref.path.replaceAll('\\', '/').split('/').at(-1);
+  const name = labels.get(labelKey(ref)) ?? ref.path.replaceAll('\\', '/').split('/').at(-1);
   return ref.kind === 'interface' ? name : `${ref.kind}:${name}`;
 }
 
 const MAX_EVIDENCE = 1024 * 1024;
 const MODULE = /^[a-z][a-z0-9-]{0,47}$/;
 
-/** `<module>.md` of interface refs that apply-spec bound to evidence envelopes, by path. An envelope
- * that is missing, unreadable, changed (sha256) or not an interface keeps its file name. */
-async function interfaceLabels(snapshot) {
+/** `<module>.md` of interface refs that apply-spec bound to evidence envelopes, by (path, sha256).
+ * Only a file whose realpath lies in `<home>/project-interfaces/evidence` (where apply-spec writes
+ * them) is opened; a missing, outside, unreadable, changed (sha256) or non-interface envelope keeps
+ * its file name (null). */
+async function interfaceLabels(snapshot, home) {
   const labels = new Map();
+  const evidence =
+    typeof home === 'string'
+      ? await realpath(path.join(path.resolve(home), 'project-interfaces', 'evidence')).catch(() => null)
+      : null;
   for (const ref of snapshot.tasks.flatMap(task => task.interfaceRefs)) {
-    if (ref.kind !== 'interface' || !ref.path.endsWith('.json') || labels.has(ref.path)) continue;
+    const key = labelKey(ref);
+    if (ref.kind !== 'interface' || !ref.path.endsWith('.json') || labels.has(key)) continue;
+    labels.set(key, null);
+    if (!evidence) continue;
     try {
-      const file = await readBoundedFile(ref.path, MAX_EVIDENCE);
+      const real = await realpath(ref.path);
+      if (real === evidence || !inside(evidence, real)) continue;
+      const file = await readBoundedFile(real, MAX_EVIDENCE);
       const envelope = file.sha256 === ref.sha256 ? JSON.parse(file.text) : null;
       const module = envelope?.kind === 'interface' ? envelope.value?.module : undefined;
-      if (typeof module === 'string' && MODULE.test(module)) labels.set(ref.path, `${module}.md`);
+      if (typeof module === 'string' && MODULE.test(module)) labels.set(key, `${module}.md`);
     } catch {
       // Only a label: the file name stays.
     }
@@ -811,7 +870,7 @@ const MILESTONE_RULES = `# Правила нового майлстоуна
 6. owner — одна из ролей: ${FACTORY_ROLES.join(', ')}. Хвостовую задачу reviewer не добавляйте: ревью делает gate Run эпика.
 7. Новые эпики не образуют цикл: если задача эпика X зависит от задачи эпика Y, никакая задача Y не зависит (через задачи любых эпиков) от задач X.
 8. В майлстоуне есть хотя бы один эпик, в каждом новом эпике — хотя бы одна задача.
-9. \`interfaceRefs: []\`. Короткую форму \`interfaces/<module>.md\` привязывает к замороженным интерфейсам только apply-spec, здесь она отклоняется (\`milestone_interface_unbound\`): нужный контракт модуля опишите в description.
+9. \`interfaceRefs: []\`. Ссылки на интерфейсы (и короткую форму \`interfaces/<module>.md\`, и полный Ref) привязывает к замороженным интерфейсам только apply-spec; непустой interfaceRefs здесь отклоняется (\`milestone_interface_unbound\`): нужный контракт модуля опишите в description.
 
 Коды: \`milestone_shape\`, \`milestone_task_count\`, \`milestone_id_conflict\`, \`milestone_foreign_parent\`, \`milestone_dependency_unknown\`, \`milestone_dependency_not_accepted\`, \`milestone_interface_unbound\`, \`milestone_snapshot_invalid\`, \`milestone_snapshot_incomplete\`, \`milestone_spec_invalid\`, \`blueprint_owner_unknown\`, \`blueprint_container_empty\`, \`blueprint_epic_cycle\`, \`blueprint_parallel_overlap\`, \`split_required\`.
 `;
@@ -856,7 +915,7 @@ export async function prepareExtend(options = {}) {
   const at = isoTime(now);
   const graph = await architectureSection(architecture);
   const facts = knowledgeSection(knowledge, prompt);
-  const labels = await interfaceLabels(current);
+  const labels = await interfaceLabels(current, home);
   const { redacted, ...bundle } = await writeBundle({
     home,
     root: real,
@@ -1024,27 +1083,24 @@ function structuralFindings(input, current) {
         [...open],
       ),
     );
+  // Interface refs are bound to frozen interface evidence by apply-spec only (bindInterfaceEvidence):
+  // a new milestone references none, in the short or the full form.
   const unbound = tasks
-    .filter(task => Array.isArray(task.interfaceRefs) && task.interfaceRefs.some(shortRef))
+    .filter(task => Array.isArray(task.interfaceRefs) && task.interfaceRefs.length > 0)
     .map(task => String(task.id));
   if (unbound.length)
     findings.push(
       finding(
         'milestone_interface_unbound',
-        'В майлстоуне interfaceRefs: [] — короткую форму interfaces/<module>.md привязывает только apply-spec; контракт опишите в description',
+        'В майлстоуне interfaceRefs: [] — ссылки на интерфейсы привязывает только apply-spec; контракт опишите в description',
         unbound,
       ),
     );
   return findings;
 }
 
-// The blueprint short form `{ path: 'interfaces/<module>.md' }`: bound to frozen interface evidence
-// by apply-spec only (bindInterfaceEvidence), never by a new milestone.
-const shortRef = ref =>
-  isPlain(ref) && typeof ref.path === 'string' && !path.isAbsolute(ref.path) && !path.win32.isAbsolute(ref.path);
-
 // Schema check of the new records alone: foreign parents, external dependencies
-// and short interface refs are reported above and neutralized here.
+// and interface refs are reported above and neutralized here.
 function normalizeMilestone(input, current, contracts, knownValues) {
   const project = current.project,
     epicIds = new Set(input.epics.filter(isPlain).map(epic => epic.id)),
@@ -1069,7 +1125,7 @@ function normalizeMilestone(input, current, contracts, knownValues) {
       if (Object.hasOwn(copy, 'epicId') && !epicIds.has(copy.epicId) && firstEpic !== undefined)
         copy.epicId = firstEpic;
       if (Array.isArray(copy.dependsOn)) copy.dependsOn = copy.dependsOn.filter(id => fresh.has(id));
-      if (Array.isArray(copy.interfaceRefs)) copy.interfaceRefs = copy.interfaceRefs.filter(ref => !shortRef(ref));
+      if (Array.isArray(copy.interfaceRefs)) copy.interfaceRefs = [];
       return copy;
     }),
   };
