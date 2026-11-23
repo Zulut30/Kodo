@@ -909,7 +909,7 @@ async function installTaskRun(ctx, projectId, attempt, options, control) {
   }
   requireValue(run.task === input && isDeepStrictEqual(run.directorBinding, bindingFor(attempt)), 'binding_invalid');
   // Worktrees are created one by one; Engine reuses an existing one.
-  await makeWorktree(run.project, run.cwd, run.branch, run.baseSha);
+  await makeWorktree(run.project, run.cwd, run.branch, run.baseSha, { signal: control.signal });
   return run;
 }
 

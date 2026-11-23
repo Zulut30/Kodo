@@ -1,6 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { writeFile } from 'node:fs/promises';
+import { DatabaseSync } from 'node:sqlite';
+import { once } from 'node:events';
+import { assertWorktreeLockHeld } from './helpers/worktree-lock.mjs';
+import childProcess from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
+import { makeWorktree, withWorktreeLock } from '../runtime/workspace.mjs';
 import path from 'node:path';
 import { Engine } from '../runtime/engine.mjs';
 import {
@@ -293,6 +299,218 @@ test('Engine integrates developer tester and documenter work with independent re
   assert.equal(await read(path.join(fx.project, 'untouched.txt')), 'user local edit\n');
   assert.equal(await read(path.join(fx.project, 'notes.txt')), 'user untracked note\n');
   assert.equal(await read(path.join(fx.project, 'src/value.mjs')), 'export const value = 0;\n');
+});
+
+function observeSpawn(t, observe) {
+  const original = childProcess.spawn;
+  t.mock.method(childProcess, 'spawn', (command, args, options) => {
+    const proc = original(command, args, options);
+    if (command === 'git') observe(args, proc);
+    return proc;
+  });
+  syncBuiltinESMExports();
+  t.after(() => {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+  });
+}
+
+for (const finish of ['release', 'kill']) {
+  test(`Worktree registration waits across processes until owner ${finish}`, { timeout: 30000 }, async t => {
+    const fx = await fixture(t);
+    const peer = path.join(fx.directory, 'peer');
+    git(fx.project, 'worktree', 'add', '--detach', peer, fx.base);
+    const ownerTarget = path.join(fx.directory, 'owner');
+    const owner = childProcess.fork(
+      new URL('./fixtures/worktree-lock-owner.mjs', import.meta.url),
+      [peer, ownerTarget, 'owner', fx.base],
+      { silent: true },
+    );
+    let stderr = '';
+    owner.stderr.on('data', chunk => {
+      stderr += chunk;
+    });
+    const closed = once(owner, 'close');
+    const controller = new AbortController();
+    let contender;
+    try {
+      const [message] = await Promise.race([
+        once(owner, 'message', { signal: t.signal }),
+        closed.then(() => assert.fail(stderr || 'owner exited early')),
+      ]);
+      assert.equal(message, 'add pending');
+      assertWorktreeLockHeld(path.join(fx.project, '.git'));
+      const waiting = Promise.withResolvers();
+      const exec = DatabaseSync.prototype.exec;
+      t.mock.method(DatabaseSync.prototype, 'exec', function (sql) {
+        try {
+          return exec.call(this, sql);
+        } catch (error) {
+          if (sql === 'BEGIN IMMEDIATE' && (error.errcode & 0xff) === 5) waiting.resolve();
+          throw error;
+        }
+      });
+      let adds = 0;
+      observeSpawn(t, args => {
+        if (args.includes('worktree') && args.includes('add')) adds++;
+      });
+      const target = path.join(fx.directory, 'contender');
+      contender = makeWorktree(fx.project, target, 'contender', fx.base, {
+        signal: AbortSignal.any([controller.signal, t.signal]),
+      });
+      await Promise.race([waiting.promise, contender.then(() => assert.fail('contender bypassed owner'))]);
+      assert.equal(adds, 0);
+      if (finish === 'kill') assert.ok(owner.kill('SIGKILL'));
+      else owner.send('release');
+      const [code, signal] = await closed;
+      if (finish === 'release') assert.equal(code, 0, stderr);
+      else assert.equal(signal, 'SIGKILL');
+      assert.equal(await contender, target);
+      assert.equal(adds, 1);
+      for (const cwd of [ownerTarget, target]) assert.equal(git(cwd, 'rev-parse', 'HEAD'), fx.base);
+    } finally {
+      controller.abort();
+      owner.kill('SIGKILL');
+      await Promise.allSettled([closed, contender]);
+    }
+  });
+}
+
+test('Worktree registration serializes local callers and bounds a cancelled or expired queue entry', async t => {
+  const fx = await fixture(t);
+  const peer = path.join(fx.directory, 'peer');
+  git(fx.project, 'worktree', 'add', '--detach', peer, fx.base);
+  const entered = Promise.withResolvers(),
+    release = Promise.withResolvers();
+  const owner = withWorktreeLock(peer, async () => {
+    entered.resolve();
+    await release.promise;
+  });
+  await entered.promise;
+  let attempts = 0;
+  const exec = DatabaseSync.prototype.exec;
+  t.mock.method(DatabaseSync.prototype, 'exec', function (sql) {
+    if (sql === 'BEGIN IMMEDIATE') attempts++;
+    return exec.call(this, sql);
+  });
+  const targets = ['local-a', 'local-b'].map(branch => path.join(fx.directory, branch));
+  let registrations;
+  try {
+    assertWorktreeLockHeld(path.join(fx.project, '.git'));
+    attempts = 0;
+    const controller = new AbortController();
+    const waitMs = 120000;
+    const schedule = globalThis.setTimeout;
+    // Git receives the full budget. Drive the local queue timers explicitly
+    // after metadata discovery so a slow Git startup cannot expire the test.
+    const timers = [];
+    t.mock.method(globalThis, 'setTimeout', (callback, ms, ...args) => {
+      if (ms < waitMs && ms > 35) timers.shift()?.(callback);
+      return schedule(callback, ms, ...args);
+    });
+    const forbidden = async () => assert.fail('queued action ran while owner held the lock');
+    timers.push(() => queueMicrotask(() => controller.abort()));
+    await assert.rejects(withWorktreeLock(fx.project, forbidden, controller.signal, waitMs), { code: 'cancelled' });
+    timers.push(callback => queueMicrotask(callback));
+    await assert.rejects(
+      withWorktreeLock(fx.project, forbidden, undefined, waitMs),
+      error =>
+        error.code === 'timeout' &&
+        error.message.includes(path.join(fx.project, '.git')) &&
+        error.message.includes(waitMs + ' ms'),
+    );
+    const queued = Promise.withResolvers();
+    timers.push(
+      () => {},
+      () => queued.resolve(),
+    );
+    registrations = Promise.all(
+      targets.map((target, index) =>
+        makeWorktree(index === 0 ? peer : fx.project, target, path.basename(target), fx.base, { waitMs }),
+      ),
+    );
+    await Promise.race([queued.promise, registrations.then(() => assert.fail('registration bypassed local queue'))]);
+    assert.equal(attempts, 0, 'local waiters should not compete for SQLite');
+    for (const target of targets) assert.equal(await exists(target), false);
+  } finally {
+    release.resolve();
+    await Promise.all([owner, registrations]);
+  }
+  assert.deepEqual(await registrations, targets);
+  for (const target of targets) assert.equal(git(target, 'rev-parse', 'HEAD'), fx.base);
+});
+
+test('Worktree registration can abort or time out while another connection owns SQLite', async t => {
+  const fx = await fixture(t);
+  const common = path.join(fx.project, '.git');
+  const holder = new DatabaseSync(path.join(common, 'kodo-worktree-guard.sqlite'));
+  const controller = new AbortController();
+  const exec = DatabaseSync.prototype.exec,
+    now = performance.now.bind(performance);
+  let elapsed = 0,
+    attempts = 0;
+  holder.exec('BEGIN IMMEDIATE');
+  try {
+    t.mock.method(performance, 'now', () => now() + elapsed);
+    t.mock.method(DatabaseSync.prototype, 'exec', function (sql) {
+      try {
+        return exec.call(this, sql);
+      } catch (error) {
+        if (sql === 'BEGIN IMMEDIATE' && (error.errcode & 0xff) === 5) {
+          if (++attempts === 1) queueMicrotask(() => controller.abort());
+          else elapsed = 121000;
+        }
+        throw error;
+      }
+    });
+    const forbidden = async () => assert.fail('action bypassed SQLite');
+    await assert.rejects(withWorktreeLock(fx.project, forbidden, controller.signal), { code: 'cancelled' });
+    await assert.rejects(
+      withWorktreeLock(fx.project, forbidden),
+      error => error.code === 'timeout' && error.message.includes(common) && error.message.includes('120000 ms'),
+    );
+    assert.equal(attempts, 2);
+  } finally {
+    holder.close();
+  }
+});
+
+test('Worktree registration releases after Git failure and cancellation of an active add', async t => {
+  const fx = await fixture(t),
+    target = path.join(fx.directory, 'worker');
+  await assert.rejects(makeWorktree(fx.project, target, 'worker', 'absent-revision'), { code: 'command_failed' });
+  const active = new AbortController();
+  observeSpawn(t, args => {
+    if (args.includes('show-ref')) active.abort();
+  });
+  await assert.rejects(makeWorktree(fx.project, target, 'worker', fx.base, { signal: active.signal }), {
+    code: 'cancelled',
+  });
+  assert.equal(await exists(target), false);
+  await makeWorktree(fx.project, target, 'worker', fx.base);
+  assert.equal(git(target, 'rev-parse', 'HEAD'), fx.base);
+});
+
+test('Worktree registration retries extended SQLITE_BUSY once more after the final wait', async t => {
+  const fx = await fixture(t);
+  const exec = DatabaseSync.prototype.exec,
+    now = performance.now.bind(performance);
+  const started = now();
+  let attempts = 0,
+    atDeadline = false;
+  t.mock.method(performance, 'now', () => {
+    if (!attempts) return started;
+    if (atDeadline) return started + 6000;
+    atDeadline = true;
+    return started + 4999;
+  });
+  t.mock.method(DatabaseSync.prototype, 'exec', function (sql) {
+    if (sql === 'BEGIN IMMEDIATE' && ++attempts === 1)
+      throw Object.assign(new Error('SQLITE_BUSY_RECOVERY'), { errcode: 261 });
+    return exec.call(this, sql);
+  });
+  assert.equal(await withWorktreeLock(fx.project, async () => 'acquired', undefined, 5000), 'acquired');
+  assert.equal(attempts, 2);
 });
 
 test('Engine prepares once and resumes a host plan after reopening state without repeating completed work', async t => {

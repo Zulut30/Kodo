@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
-import { readFile, lstat, mkdir } from 'node:fs/promises';
+import { readFile, lstat, mkdir, realpath } from 'node:fs/promises';
+import { setTimeout as delay } from 'node:timers/promises';
 import path from 'node:path';
 import { execute } from './command.mjs';
 import { secretFile, redact, stateHome, worktreeHome } from './security.mjs';
@@ -36,26 +37,135 @@ export async function inspectProject(project) {
   const branches = await git(root, ['worktree', 'list', '--porcelain']);
   return { root, head, dirty, worktrees: branches };
 }
-export async function makeWorktree(project, directory, branch, base) {
-  await mkdir(path.dirname(directory), { recursive: true });
-  const exists = await lstat(directory).catch(() => null);
-  if (exists) {
-    if ((await git(directory, ['branch', '--show-current'])) !== branch)
-      throw new Error('Несоответствие ветки существующего worktree');
-    return directory;
+// Hand the next local caller its turn directly; only the head polls SQLite.
+const worktreeQueues = new Map();
+
+async function withLocalWorktreeTurn(key, action, remaining, timeoutError, signal) {
+  const queue = worktreeQueues.get(key) ?? new Set();
+  const turn = Promise.withResolvers();
+  queue.add(turn);
+  worktreeQueues.set(key, queue);
+  try {
+    if (queue.size > 1) {
+      const timeout = setTimeout(() => turn.reject(timeoutError()), Math.max(0, remaining()));
+      const abort = () => turn.reject(signal.reason);
+      signal?.addEventListener('abort', abort, { once: true });
+      try {
+        await turn.promise;
+      } finally {
+        clearTimeout(timeout);
+        signal?.removeEventListener('abort', abort);
+      }
+    }
+    signal?.throwIfAborted();
+    return await action();
+  } finally {
+    const wasHead = queue.values().next().value === turn;
+    queue.delete(turn);
+    if (!queue.size) worktreeQueues.delete(key);
+    else if (wasHead) queue.values().next().value.resolve();
   }
-  const branchExists =
-    (
-      await execute('git', ['show-ref', '--verify', '--quiet', `refs/heads/${branch}`], {
-        cwd: project,
-        allowFailure: true,
-      })
-    ).code === 0;
-  await git(
+}
+
+/**
+ * Serialize repository-wide worktree changes across checkouts and processes.
+ * @template T
+ * @param {string} project
+ * @param {() => Promise<T>} action
+ * @param {AbortSignal} [signal]
+ * @param {number} [waitMs] Maximum time to acquire the lock, independent of action duration.
+ */
+export async function withWorktreeLock(project, action, signal = undefined, waitMs = 120000) {
+  const started = performance.now();
+  const remaining = () => waitMs - (performance.now() - started);
+  try {
+    signal?.throwIfAborted();
+    const { stdout } = await execute('git', ['rev-parse', '--path-format=absolute', '--git-common-dir'], {
+      cwd: project,
+      signal,
+      rawOutput: true,
+      timeoutMs: waitMs,
+    });
+    const directory = stdout.replace(/\r?\n$/, '');
+    if (!path.isAbsolute(directory)) throw new Error('Git returned a relative common directory');
+    const common = await realpath(directory);
+    const key = process.platform === 'win32' ? common.toLowerCase() : common;
+    const timeoutError = () => {
+      const elapsed = Math.round(performance.now() - started);
+      return Object.assign(
+        new Error(`Timed out waiting for worktree lock in ${common} after ${elapsed} ms (limit ${waitMs} ms)`),
+        {
+          code: 'timeout',
+        },
+      );
+    };
+    signal?.throwIfAborted();
+    return await withLocalWorktreeTurn(
+      key,
+      async () => {
+        const { DatabaseSync } = await import('node:sqlite');
+        const guard = new DatabaseSync(path.join(common, 'kodo-worktree-guard.sqlite'), { timeout: 0 });
+        try {
+          for (;;) {
+            signal?.throwIfAborted();
+            try {
+              guard.exec('BEGIN IMMEDIATE');
+              break;
+            } catch (error) {
+              if ((error.errcode & 0xff) !== 5) throw error;
+            }
+            const left = remaining();
+            if (left <= 0) throw timeoutError();
+            await delay(Math.min(35, left), undefined, { signal });
+          }
+          return await action();
+        } finally {
+          // Closing rolls back the transaction. Process death releases the same OS lock.
+          guard.close();
+        }
+      },
+      remaining,
+      timeoutError,
+      signal,
+    );
+  } catch (error) {
+    if (signal?.aborted && (error === signal.reason || error?.code === 'ABORT_ERR'))
+      throw Object.assign(new Error('Worktree registration cancelled', { cause: error }), { code: 'cancelled' });
+    throw error;
+  }
+}
+
+/** @param {{signal?: AbortSignal, waitMs?: number}} [options] */
+export async function makeWorktree(project, directory, branch, base, options = {}) {
+  const { signal } = options;
+  return withWorktreeLock(
     project,
-    branchExists ? ['worktree', 'add', directory, branch] : ['worktree', 'add', '-b', branch, directory, base],
+    async () => {
+      await mkdir(path.dirname(directory), { recursive: true });
+      const exists = await lstat(directory).catch(() => null);
+      if (exists) {
+        if ((await git(directory, ['branch', '--show-current'], { signal })) !== branch)
+          throw new Error('Несоответствие ветки существующего worktree');
+        return directory;
+      }
+      const branchExists =
+        (
+          await execute('git', ['show-ref', '--verify', '--quiet', `refs/heads/${branch}`], {
+            cwd: project,
+            allowFailure: true,
+            signal,
+          })
+        ).code === 0;
+      await git(
+        project,
+        branchExists ? ['worktree', 'add', directory, branch] : ['worktree', 'add', '-b', branch, directory, base],
+        { signal },
+      );
+      return directory;
+    },
+    signal,
+    options.waitMs,
   );
-  return directory;
 }
 export async function collectFiles(cwd, task, secrets = {}) {
   const names = (await git(cwd, ['ls-files', '-z'])).split('\0').filter(Boolean);

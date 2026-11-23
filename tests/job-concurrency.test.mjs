@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
+import { createInterface } from 'node:readline';
 import { spawn } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
@@ -11,21 +14,60 @@ import { openJobStore } from '../runtime/job-store.mjs';
 const worker = fileURLToPath(new URL('./fixtures/job-claim-worker.mjs', import.meta.url));
 const Q = 'project:contention';
 
-function child(home, owner, startAt) {
-  return new Promise((resolve, reject) => {
-    const env = { ...process.env };
-    delete env.NODE_TEST_CONTEXT;
-    const proc = spawn(process.execPath, [worker, home, Q, owner, String(startAt)], { env, windowsHide: true });
-    let stdout = '',
-      stderr = '';
-    proc.stdout.on('data', data => (stdout += data));
-    proc.stderr.on('data', data => (stderr += data));
-    proc.on('error', reject);
-    proc.on('close', code => (code === 0 ? resolve(JSON.parse(stdout)) : reject(new Error(`${owner}: ${stderr}`))));
-  });
+function child(home, owner, signal) {
+  const env = { ...process.env };
+  delete env.NODE_TEST_CONTEXT;
+  const proc = spawn(process.execPath, [worker, home, Q, owner], { env, signal, windowsHide: true });
+  return workerProtocol(proc, owner);
 }
 
-test('Four processes contending for one queue claim every job exactly once', { timeout: 120000 }, async t => {
+function workerProtocol(proc, owner) {
+  const closed = new Promise(resolve => proc.once('close', resolve));
+  const lines = createInterface({ input: proc.stdout })[Symbol.asyncIterator]();
+  let stderr = '';
+  const recordError = error => (stderr += error.message + '\n');
+  proc.on('error', recordError);
+  proc.stdin.on('error', recordError);
+  proc.stderr.on('data', data => (stderr += data));
+  async function read() {
+    const { done, value } = await lines.next();
+    if (done) {
+      proc.stdin.end();
+      await closed;
+      throw new Error(`${owner} exited before its response: ${stderr}`);
+    }
+    return value;
+  }
+  return {
+    read,
+    async request(command) {
+      proc.stdin.write(command + '\n');
+      return JSON.parse(await read());
+    },
+    async close() {
+      proc.stdin.end();
+      const code = await closed;
+      assert.equal(code, 0, stderr);
+    },
+  };
+}
+
+test('A worker EOF reports diagnostics written after stdout closed', async () => {
+  const proc = Object.assign(new EventEmitter(), {
+    stdin: new PassThrough(),
+    stdout: new PassThrough(),
+    stderr: new PassThrough(),
+  });
+  const worker = workerProtocol(proc, 'fixture');
+  const outcome = worker.read().catch(error => error);
+  proc.stdout.end();
+  await new Promise(resolve => setImmediate(resolve));
+  proc.stderr.end('late diagnostic');
+  proc.emit('close', 1);
+  assert.match((await outcome).message, /fixture exited before its response: late diagnostic/);
+});
+
+test('Four processes claim jobs in rounds and complete each claim once', { timeout: 120000 }, async t => {
   const home = mkdtempSync(path.join(os.tmpdir(), 'kodo-job-contention-'));
   const store = new Store(home);
   t.after(() => {
@@ -38,12 +80,32 @@ test('Four processes contending for one queue claim every job exactly once', { t
     Q,
     Array.from({ length: total }, (_, i) => ({ key: `j${i}`, role: 'developer', writePaths: [`src/j${i}.mjs`] })),
   );
-  const startAt = Date.now() + 3000; // After every child has loaded its modules.
-  const claims = await Promise.all(['w1', 'w2', 'w3', 'w4'].map(owner => child(home, owner, startAt)));
+  const workers = ['w1', 'w2', 'w3', 'w4'].map(owner => child(home, owner, t.signal));
+  const claims = workers.map(() => []);
+  let exits;
+  try {
+    for (const message of await Promise.all(workers.map(worker => worker.read()))) assert.equal(message, 'ready');
+    for (;;) {
+      const round = await Promise.all(workers.map(worker => worker.request('claim')));
+      if (round.every(id => id === null)) break;
+      // A fast writer cannot reacquire the SQLite lock for completion while a peer still waits to claim.
+      const completed = await Promise.all(workers.map(worker => worker.request('complete')));
+      assert.deepEqual(completed, round);
+      round.forEach((id, index) => {
+        if (id !== null) claims[index].push(id);
+      });
+    }
+  } finally {
+    exits = await Promise.allSettled(workers.map(worker => worker.close()));
+  }
+  for (const exit of exits) if (exit.status === 'rejected') throw exit.reason;
   const all = claims.flat();
   assert.equal(all.length, total, 'no claim was handed out twice');
   assert.equal(new Set(all).size, total, 'every job was claimed');
-  assert.ok(claims.filter(list => list.length > 0).length >= 2, 'the processes really competed');
+  assert.ok(
+    claims.every(list => list.length > 0),
+    'all four processes claimed work',
+  );
   const rows = jobs.list(Q);
   assert.ok(rows.every(job => job.state === 'verifying' && job.attempt === 1));
   for (const job of rows)
