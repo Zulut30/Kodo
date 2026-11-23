@@ -13,6 +13,7 @@ import { performance } from 'node:perf_hooks';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { defaultFixtures, evaluateFixture, materializeFixture } from '../runtime/benchmark-fixtures.mjs';
 import { Engine } from '../runtime/engine.mjs';
+import { workerEnvironment } from '../runtime/security.mjs';
 import { Store } from '../runtime/store.mjs';
 
 export const OVERHEAD_METHODOLOGY = 'local-engine-instant-provider-v1';
@@ -42,6 +43,8 @@ const SANDBOX_ENV_KEYS = [
   'KODO_HOME',
   'KODO_CREDENTIAL_HOME',
   'KODO_WORKTREE_HOME',
+  'KODO_TOOL_HOME',
+  'KODO_CODEX_CLIJS',
   'GIT_CONFIG_NOSYSTEM',
   'GIT_CONFIG_GLOBAL',
   'GIT_TERMINAL_PROMPT',
@@ -150,12 +153,27 @@ export function parseArgs(argv) {
   return { runs, fixture, json, help };
 }
 
+/**
+ * Clean environment for helper `git` invocations: no credentials/keys and no
+ * inherited GIT_* redirections or global/system config overrides.
+ * @param {NodeJS.ProcessEnv} [base]
+ */
+export function sanitizedGitEnv(base = process.env) {
+  const env = workerEnvironment(base);
+  for (const key of [...GIT_REDIRECT_KEYS, 'GIT_CONFIG_GLOBAL']) delete env[key];
+  env.GIT_CONFIG_NOSYSTEM = '1';
+  env.GIT_TERMINAL_PROMPT = '0';
+  return env;
+}
+
 function writeIsolatedGitConfig(file, { template, hooks }) {
+  const env = sanitizedGitEnv();
   for (const [key, value] of [
     ['init.templateDir', template],
     ['core.hooksPath', hooks],
   ]) {
     const result = spawnSync('git', ['config', '--file', file, key, value.split(path.sep).join('/')], {
+      env,
       encoding: 'utf8',
       windowsHide: true,
     });
@@ -163,12 +181,13 @@ function writeIsolatedGitConfig(file, { template, hooks }) {
   }
 }
 
-async function createSandbox() {
+export async function createSandbox() {
   const parent = os.tmpdir();
   const directory = await mkdtemp(path.join(parent, SANDBOX_PREFIX));
   const previous = Object.fromEntries([...SANDBOX_ENV_KEYS, ...GIT_REDIRECT_KEYS].map(key => [key, process.env[key]]));
   const root = path.join(directory, 'repo');
   const stateDir = path.join(directory, 'state');
+  const toolsDir = path.join(directory, 'tools');
   const isolated = path.join(directory, 'empty-home');
   const temp = path.join(directory, 'tmp');
   const template = path.join(isolated, 'git-template');
@@ -184,6 +203,7 @@ async function createSandbox() {
 
   try {
     await mkdir(root);
+    await mkdir(toolsDir);
     await mkdir(isolated);
     await mkdir(temp);
     await mkdir(template);
@@ -191,6 +211,7 @@ async function createSandbox() {
     await writeFile(gitconfig, '');
     writeIsolatedGitConfig(gitconfig, { template, hooks });
     for (const key of GIT_REDIRECT_KEYS) delete process.env[key];
+    delete process.env.KODO_CODEX_CLIJS;
     Object.assign(process.env, {
       TMP: temp,
       TEMP: temp,
@@ -201,6 +222,7 @@ async function createSandbox() {
       KODO_HOME: stateDir,
       KODO_CREDENTIAL_HOME: path.join(isolated, 'empty-credentials'),
       KODO_WORKTREE_HOME: path.join(directory, 'worktrees'),
+      KODO_TOOL_HOME: toolsDir,
       GIT_CONFIG_NOSYSTEM: '1',
       GIT_CONFIG_GLOBAL: gitconfig,
       GIT_TERMINAL_PROMPT: '0',
@@ -215,6 +237,7 @@ async function createSandbox() {
     directory,
     root,
     stateDir,
+    toolsDir,
     async cleanup() {
       restoreEnv();
       if (
@@ -252,7 +275,7 @@ async function applyFixtureSolution(fixtureId, cwd) {
   throw new Error(`No deterministic solution configured for fixture: ${fixtureId}`);
 }
 
-function createInstantServices({ fixture, client, model }) {
+export function createInstantServices({ fixture, client, model }) {
   const mockedCalls = {
     assessment: 0,
     discovery: 0,
@@ -282,15 +305,17 @@ function createInstantServices({ fixture, client, model }) {
       throw new Error('Unexpected decideJev call in quick overhead benchmark');
     },
     runSession: async request => {
-      const started = performance.now();
       const sessionId = `mock-session-${++sequence}`;
       const isPlan = Boolean(request.schema?.properties?.tasks);
       const isReview = Boolean(request.schema?.properties?.passed);
       const stage = isPlan ? 'plan' : isReview ? 'review' : 'developer';
       mockedCalls.sessions++;
       mockedCalls.byStage[stage]++;
+      // Keep Engine's synchronous onEvent (SQLite + progress.md persistence) outside
+      // the mock-work timer so engineExcludingMock never subtracts Kodo's own work.
       request.onEvent?.({ sessionId, stage });
 
+      const started = performance.now();
       let output;
       if (isPlan) {
         output = {
@@ -342,6 +367,7 @@ function attachRunObserver(store) {
   /** @type {Record<string, number | null>} */
   const marks = {
     start: null,
+    createdEvent: null,
     created: null,
     modeSelected: null,
     analyzed: null,
@@ -373,18 +399,51 @@ function attachRunObserver(store) {
     return updated;
   };
 
-  const onEvent = event => {
+  const originalEvent = store.event.bind(store);
+  store.event = (runId, type, data) => {
     const now = performance.now();
-    observedEvents.push({ type: event.type, at: now });
-    if (event.type === 'mode_selected' && marks.modeSelected === null) marks.modeSelected = now;
-    if (event.type === 'analyzed' && marks.analyzed === null) marks.analyzed = now;
-    if (event.type === 'routed' && marks.routed === null) marks.routed = now;
-    if (event.type === 'integrated' && marks.integrated === null) marks.integrated = now;
-    if (event.type === 'check_started' && marks.checkStarted === null) marks.checkStarted = now;
-    if (event.type === 'succeeded' && marks.succeeded === null) marks.succeeded = now;
+    const written = originalEvent(runId, type, data);
+    observedEvents.push({ type, at: now });
+    if (type === 'created' && marks.createdEvent === null) marks.createdEvent = now;
+    if (type === 'mode_selected' && marks.modeSelected === null) marks.modeSelected = now;
+    if (type === 'analyzed' && marks.analyzed === null) marks.analyzed = now;
+    if (type === 'routed' && marks.routed === null) marks.routed = now;
+    if (type === 'integrated' && marks.integrated === null) marks.integrated = now;
+    if (type === 'check_started' && marks.checkStarted === null) marks.checkStarted = now;
+    if (type === 'succeeded' && marks.succeeded === null) marks.succeeded = now;
+    return written;
   };
 
-  return { marks, observedEvents, onEvent };
+  return { marks, observedEvents };
+}
+
+/**
+ * Map persisted SQLite events to their observed high-resolution offsets.
+ * Unobserved events stay `null` rather than substituting another timestamp.
+ * @param {Array<{ seq: number, type: string }>} storedEvents
+ * @param {Array<{ type: string, at: number }>} observedEvents
+ * @param {number | null} startMs
+ */
+export function buildEventTimeline(storedEvents, observedEvents, startMs) {
+  const eventOffsetMap = new Map();
+  if (typeof startMs === 'number') {
+    for (const item of observedEvents) {
+      const list = eventOffsetMap.get(item.type) || [];
+      list.push(roundMs(Math.max(0, item.at - startMs)));
+      eventOffsetMap.set(item.type, list);
+    }
+  }
+  const consumed = new Map();
+  return storedEvents.map(row => {
+    const index = consumed.get(row.type) || 0;
+    consumed.set(row.type, index + 1);
+    const offsets = eventOffsetMap.get(row.type) || [];
+    return {
+      seq: row.seq,
+      type: row.type,
+      offsetMs: offsets[index] ?? null,
+    };
+  });
 }
 
 const spanMs = (from, to) =>
@@ -424,7 +483,7 @@ async function executeTrial({ runIndex, fixture, client, model }) {
     const fixtureSetupMs = roundMs(performance.now() - setupStart);
 
     store = new Store(box.stateDir, {});
-    const { marks, observedEvents, onEvent } = attachRunObserver(store);
+    const { marks, observedEvents } = attachRunObserver(store);
     const services = createInstantServices({ fixture, client, model });
     const engine = new Engine(
       /** @type {any} */ ({
@@ -433,7 +492,6 @@ async function executeTrial({ runIndex, fixture, client, model }) {
         provider: services.provider,
         researcher: services.researcher,
         delivery: services.delivery,
-        onEvent,
       }),
     );
 
@@ -464,24 +522,7 @@ async function executeTrial({ runIndex, fixture, client, model }) {
     const totalMs = spanMs(marks.start, marks.finished);
     const stagesMs = buildStagesMs(marks);
     const providerCallbackMs = roundMs(services.sessionCallbacks.reduce((sum, item) => sum + item.durationMs, 0));
-    const eventOffsetMap = new Map();
-    for (const item of observedEvents) {
-      const list = eventOffsetMap.get(item.type) || [];
-      list.push(roundMs(Math.max(0, item.at - marks.start)));
-      eventOffsetMap.set(item.type, list);
-    }
-    const consumed = new Map();
-    const events = storedEvents.map(row => {
-      const index = consumed.get(row.type) || 0;
-      consumed.set(row.type, index + 1);
-      const offsets = eventOffsetMap.get(row.type) || [];
-      const fallbackOffset = row.type === 'created' ? spanMs(marks.start, marks.created) : null;
-      return {
-        seq: row.seq,
-        type: row.type,
-        offsetMs: offsets[index] ?? fallbackOffset,
-      };
-    });
+    const events = buildEventTimeline(storedEvents, observedEvents, marks.start);
 
     const attempts = (result.sessionAttempts || []).map(item => ({
       stage: item.stage,
@@ -536,28 +577,21 @@ async function executeTrial({ runIndex, fixture, client, model }) {
 
 function repoCommit() {
   const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-  const result = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8', windowsHide: true });
+  const result = spawnSync('git', ['rev-parse', 'HEAD'], {
+    cwd: root,
+    env: sanitizedGitEnv(),
+    encoding: 'utf8',
+    windowsHide: true,
+  });
   return result.status === 0 ? result.stdout.trim() : null;
 }
 
-/**
- * Run the local Kodo overhead benchmark N times and return the structured report.
- * @param {{ runs?: number, fixture?: string, client?: string, model?: string }} [options]
- */
-export async function runOverheadBenchmark({
-  runs = DEFAULT_RUNS,
-  fixture: fixtureId = DEFAULT_FIXTURE,
-  client = DEFAULT_CLIENT,
-  model = DEFAULT_MODEL,
-} = {}) {
-  if (!Number.isSafeInteger(runs) || runs < 1 || runs > MAX_RUNS)
-    throw new TypeError(`runs must be an integer from 1 to ${MAX_RUNS}`);
-  const fixture = defaultFixtures.find(item => item.id === fixtureId);
-  if (!fixture) throw new TypeError(`Unknown fixture: ${fixtureId}`);
+let benchmarkQueue = Promise.resolve();
 
+async function runOverheadBenchmarkSerial({ runs, fixture, client, model, runTrial }) {
   const results = [];
   for (let index = 1; index <= runs; index++) {
-    results.push(await executeTrial({ runIndex: index, fixture, client, model }));
+    results.push(await runTrial({ runIndex: index, fixture, client, model }));
   }
 
   const stagesSummary = Object.fromEntries(
@@ -639,6 +673,30 @@ export async function runOverheadBenchmark({
     limitations: [...LIMITATIONS],
     runs: results,
   };
+}
+
+/**
+ * Run the local Kodo overhead benchmark N times and return the structured report.
+ * Calls are serialized because each trial temporarily isolates `process.env`.
+ * @param {{ runs?: number, fixture?: string, client?: string, model?: string }} [options]
+ * @param {{ runTrial?: typeof executeTrial }} [dependencies]
+ */
+export function runOverheadBenchmark(
+  { runs = DEFAULT_RUNS, fixture: fixtureId = DEFAULT_FIXTURE, client = DEFAULT_CLIENT, model = DEFAULT_MODEL } = {},
+  { runTrial = executeTrial } = {},
+) {
+  if (!Number.isSafeInteger(runs) || runs < 1 || runs > MAX_RUNS)
+    return Promise.reject(new TypeError(`runs must be an integer from 1 to ${MAX_RUNS}`));
+  const fixture = defaultFixtures.find(item => item.id === fixtureId);
+  if (!fixture) return Promise.reject(new TypeError(`Unknown fixture: ${fixtureId}`));
+
+  const start = () => runOverheadBenchmarkSerial({ runs, fixture, client, model, runTrial });
+  const pending = benchmarkQueue.then(start, start);
+  benchmarkQueue = pending.then(
+    () => {},
+    () => {},
+  );
+  return pending;
 }
 
 /** @param {Awaited<ReturnType<typeof runOverheadBenchmark>>} report */
