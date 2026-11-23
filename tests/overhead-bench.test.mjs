@@ -16,8 +16,11 @@ const {
   buildEventTimeline,
   createInstantServices,
   createSandbox,
+  finalizeTrialResources,
   formatTextReport,
   parseArgs,
+  repoCommit,
+  runCli,
   runOverheadBenchmark,
   sanitizedGitEnv,
   summarizeValues,
@@ -65,6 +68,7 @@ test('overhead-bench argument parser and summary statistics follow contract', ()
     ['--fixture', 'unknown-fixture'],
     ['--json', '--json'],
     ['--unknown'],
+    ['--internal-trial'],
   ])
     assert.throws(() => parseArgs(invalid), TypeError, JSON.stringify(invalid));
 
@@ -73,7 +77,7 @@ test('overhead-bench argument parser and summary statistics follow contract', ()
   assert.deepEqual(summarizeValues([]), { median: null, min: null, max: null, spread: null, mean: null });
 });
 
-test('sanitizedGitEnv uses an allowlist and blocks secrets, GIT_CONFIG_* and lowercase vars', () => {
+test('sanitizedGitEnv uses an allowlist and blocks secrets, GIT_CONFIG_* and lowercase vars', async () => {
   const poisoned = {
     Path: process.env.PATH || process.env.Path || '/usr/bin',
     SystemRoot: process.env.SystemRoot || 'C:\\Windows',
@@ -83,6 +87,7 @@ test('sanitizedGitEnv uses an allowlist and blocks secrets, GIT_CONFIG_* and low
     gemini_api_key: 'synthetic-gemini-lower',
     KODO_TYPESAFE_API_KEY: 'synthetic-jev',
     GITHUB_TOKEN: 'synthetic-gh',
+    XDG_CONFIG_HOME: '/foreign/xdg-config',
     GIT_DIR: '/foreign/.git',
     git_dir: '/foreign/.git-lower',
     GIT_WORK_TREE: '/foreign',
@@ -110,6 +115,7 @@ test('sanitizedGitEnv uses an allowlist and blocks secrets, GIT_CONFIG_* and low
     'gemini_api_key',
     'kodo_typesafe_api_key',
     'github_token',
+    'xdg_config_home',
     'git_dir',
     'git_work_tree',
     'git_index_file',
@@ -130,24 +136,92 @@ test('sanitizedGitEnv uses an allowlist and blocks secrets, GIT_CONFIG_* and low
   assert.equal(cleaned.GIT_CONFIG_NOSYSTEM, '1');
   assert.equal(cleaned.GIT_TERMINAL_PROMPT, '0');
 
-  // Verify real git does not see injected GIT_CONFIG_VALUE_0 when invoked with sanitizedGitEnv.
-  const gitCheck = spawnSync('git', ['-c', `core.hooksPath=${nullDevice}`, 'config', '--list'], {
-    cwd: root,
-    env: sanitizedGitEnv({ ...process.env, ...poisoned }),
-    encoding: 'utf8',
-    windowsHide: true,
-  });
-  assert.equal(gitCheck.status, 0, gitCheck.stderr);
-  assert.doesNotMatch(gitCheck.stdout, /synthetic-header|extraheader/i);
+  // Verify in an empty temporary repository using `git config --get` (never `--list` on Kodo checkout,
+  // and never printing git config stdout on failure).
+  const tmpParent = await realpath(os.tmpdir());
+  const emptyRepo = await mkdtemp(path.join(tmpParent, 'kodo-overhead-gitconfig-'));
+  try {
+    const emptyConfig = path.join(emptyRepo, 'empty-gitconfig');
+    const repoDir = path.join(emptyRepo, 'repo');
+    await mkdir(repoDir);
+    await writeFile(emptyConfig, '');
+    const isolatedEnv = sanitizedGitEnv(
+      { ...process.env, ...poisoned },
+      { home: emptyRepo, temp: emptyRepo, gitConfigGlobal: emptyConfig },
+    );
+    const init = spawnSync('git', ['-c', `core.hooksPath=${nullDevice}`, 'init', '-b', 'main'], {
+      cwd: repoDir,
+      env: isolatedEnv,
+      encoding: 'utf8',
+      windowsHide: true,
+    });
+    assert.equal(init.status, 0);
+
+    const probe = spawnSync('git', ['-c', `core.hooksPath=${nullDevice}`, 'config', '--get', 'http.extraHeader'], {
+      cwd: repoDir,
+      env: isolatedEnv,
+      encoding: 'utf8',
+      windowsHide: true,
+    });
+    assert.equal(probe.status, 1, 'injected http.extraHeader must not be visible to git');
+    assert.equal(probe.stdout.length, 0, 'git config --get must return empty output for absent key');
+  } finally {
+    await rm(emptyRepo, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  }
+});
+
+test('buildTrialEnv isolates child git processes from host SSH_PRIVATE_KEY and XDG_CONFIG_HOME', async () => {
+  assert.equal(typeof overheadBench.buildTrialEnv, 'function', 'buildTrialEnv must be exported');
+  const box = await createSandbox();
+  try {
+    const poisonedParent = {
+      ...process.env,
+      SSH_PRIVATE_KEY: 'synthetic-ssh-key',
+      XDG_CONFIG_HOME: path.join(box.directory, 'host-xdg-sentinel'),
+      GEMINI_API_KEY: 'synthetic-gemini',
+    };
+    const trialEnv = overheadBench.buildTrialEnv(poisonedParent, box);
+    assert.equal(trialEnv.SSH_PRIVATE_KEY, undefined);
+    assert.equal(trialEnv.GEMINI_API_KEY, undefined);
+    assert.equal(trialEnv.XDG_CONFIG_HOME, box.xdgConfigHome);
+    assert.equal(trialEnv.XDG_DATA_HOME, box.xdgDataHome);
+    assert.equal(trialEnv.XDG_CACHE_HOME, box.xdgCacheHome);
+    assert.equal(trialEnv.KODO_HOME, box.stateDir);
+    assert.equal(trialEnv.KODO_TOOL_HOME, box.toolsDir);
+
+    // Probe an actual `git` subprocess spawned with trialEnv via a tiny node alias.
+    const probeScript = path.join(box.directory, 'probe-env.mjs');
+    await writeFile(
+      probeScript,
+      'console.log(JSON.stringify({ ssh: process.env.SSH_PRIVATE_KEY ?? null, xdg: process.env.XDG_CONFIG_HOME ?? null }));\n',
+    );
+    const aliasCmd = `!"${process.execPath.replaceAll('\\', '/')}" "${probeScript.replaceAll('\\', '/')}"`;
+    const gitProbe = spawnSync(
+      'git',
+      ['-c', `core.hooksPath=${nullDevice}`, '-c', `alias.envprobe=${aliasCmd}`, 'envprobe'],
+      {
+        cwd: box.directory,
+        env: trialEnv,
+        encoding: 'utf8',
+        windowsHide: true,
+      },
+    );
+    assert.equal(gitProbe.status, 0, gitProbe.stderr);
+    assert.deepEqual(JSON.parse(gitProbe.stdout.trim()), {
+      ssh: null,
+      xdg: box.xdgConfigHome,
+    });
+  } finally {
+    await box.cleanup();
+  }
 });
 
 test('repoCommit ignores broken user ~/.gitconfig', async () => {
-  assert.equal(typeof overheadBench.repoCommit, 'function', 'repoCommit must be exported');
   const tmpParent = await realpath(os.tmpdir());
   const brokenHome = await mkdtemp(path.join(tmpParent, 'kodo-overhead-broken-git-'));
   try {
     await writeFile(path.join(brokenHome, '.gitconfig'), '[broken\n');
-    const sha = overheadBench.repoCommit({
+    const sha = repoCommit({
       env: { ...process.env, HOME: brokenHome, USERPROFILE: brokenHome },
     });
     assert.match(String(sha), /^[0-9a-f]{40}$/, 'repoCommit must return HEAD SHA even with broken ~/.gitconfig');
@@ -156,7 +230,7 @@ test('repoCommit ignores broken user ~/.gitconfig', async () => {
   }
 });
 
-test('createInstantServices excludes synchronous request.onEvent work using deterministic clock', async () => {
+test('createInstantServices excludes onEvent work with deterministic clock and rejects unknown session requests', async () => {
   const fixture = defaultFixtures.find(item => item.id === 'button-color');
   let tick = 1000;
   const services = createInstantServices({
@@ -168,50 +242,104 @@ test('createInstantServices excludes synchronous request.onEvent work using dete
   await services.provider.runSession({
     schema: { properties: { tasks: {} } },
     onEvent: () => {
-      // Advance deterministic clock only inside onEvent (no busy-wait).
       tick += 500;
     },
   });
   assert.equal(services.sessionCallbacks.length, 1);
   assert.equal(services.sessionCallbacks[0].durationMs, 0, 'onEvent time must not be counted in providerCallback');
+
+  // Unknown schema and repair prompts must be flagged as unexpected, never classified as developer.
+  await assert.rejects(
+    services.provider.runSession({
+      schema: { properties: { unknownField: {} } },
+      prompt: 'Unknown request',
+    }),
+    /Unexpected or unknown session request/i,
+  );
+  await assert.rejects(
+    services.provider.runSession({
+      schema: { properties: { complete: {}, summary: {}, checks: {} } },
+      prompt: 'Repair confirmed failures in task',
+    }),
+    /Unexpected or unknown session request/i,
+  );
+  assert.equal(services.unexpectedCalls.unknownSession, 2);
+  assert.equal(services.mockedCalls.byStage.developer, 0);
 });
 
-test('createSandbox uses canonical realpath tmpdir, isolates KODO_TOOL_HOME/KODO_CODEX_CLIJS and restores env', async () => {
-  const prevToolHome = process.env.KODO_TOOL_HOME;
-  const prevCodexCli = process.env.KODO_CODEX_CLIJS;
-  const hostTools = path.join(os.tmpdir(), 'host-user-tools-sentinel');
-  process.env.KODO_TOOL_HOME = hostTools;
-  process.env.KODO_CODEX_CLIJS = path.join(os.tmpdir(), 'host-codex-cli.js');
+test('validateSessionSequence verifies both 3-session cli route and 2-session fast-path route and catches mismatches', () => {
+  assert.equal(typeof overheadBench.validateSessionSequence, 'function', 'validateSessionSequence must be exported');
+
+  // Current 3-session route (plan -> developer -> review)
+  assert.deepEqual(
+    overheadBench.validateSessionSequence({
+      planSource: 'cli',
+      plannerSession: 'mock-session-1',
+      planTasks: [{ role: 'developer' }],
+      sessionAttempts: [{ stage: 'plan' }, { stage: 'developer' }, { stage: 'review' }],
+      mockedSequence: ['plan', 'developer', 'review'],
+    }),
+    { ok: true, expected: ['plan', 'developer', 'review'], mismatchCount: 0 },
+  );
+
+  // Future 2-session fast-path route (local plan: developer -> review)
+  assert.deepEqual(
+    overheadBench.validateSessionSequence({
+      planSource: 'fast-path',
+      plannerSession: undefined,
+      planTasks: [{ role: 'developer' }],
+      sessionAttempts: [{ stage: 'developer' }, { stage: 'review' }],
+      mockedSequence: ['developer', 'review'],
+    }),
+    { ok: true, expected: ['developer', 'review'], mismatchCount: 0 },
+  );
+
+  // Extra mocked call (4 mocked vs 3 attempts) must fail.
+  const extraMocked = overheadBench.validateSessionSequence({
+    planSource: 'cli',
+    plannerSession: 'mock-session-1',
+    planTasks: [{ role: 'developer' }],
+    sessionAttempts: [{ stage: 'plan' }, { stage: 'developer' }, { stage: 'review' }],
+    mockedSequence: ['plan', 'developer', 'developer', 'review'],
+  });
+  assert.equal(extraMocked.ok, false);
+  assert.ok(extraMocked.mismatchCount >= 1);
+
+  // Unknown stage must fail.
+  const unknownStage = overheadBench.validateSessionSequence({
+    planSource: 'fast-path',
+    plannerSession: undefined,
+    planTasks: [{ role: 'developer' }],
+    sessionAttempts: [{ stage: 'developer' }, { stage: 'review' }],
+    mockedSequence: ['unknown', 'review'],
+  });
+  assert.equal(unknownStage.ok, false);
+  assert.ok(unknownStage.mismatchCount >= 1);
+});
+
+test('createSandbox uses canonical realpath tmpdir and does not mutate parent process.env', async () => {
+  const beforeHome = process.env.HOME;
+  const beforeKodoHome = process.env.KODO_HOME;
+  const beforeToolHome = process.env.KODO_TOOL_HOME;
+  const box = await createSandbox();
   try {
-    const box = await createSandbox();
-    try {
-      assert.equal(box.directory, await realpath(box.directory), 'sandbox directory must be canonical realpath');
-      assert.notEqual(process.env.KODO_TOOL_HOME, hostTools, 'sandbox must override host KODO_TOOL_HOME');
-      assert.ok(
-        path.resolve(process.env.KODO_TOOL_HOME).startsWith(path.resolve(box.directory) + path.sep),
-        'KODO_TOOL_HOME must point inside the run sandbox directory',
-      );
-      assert.equal(process.env.KODO_CODEX_CLIJS, undefined, 'sandbox must unset KODO_CODEX_CLIJS');
-    } finally {
-      await box.cleanup();
-    }
-    assert.equal(process.env.KODO_TOOL_HOME, hostTools);
-    assert.equal(process.env.KODO_CODEX_CLIJS, path.join(os.tmpdir(), 'host-codex-cli.js'));
+    assert.equal(box.directory, await realpath(box.directory), 'sandbox directory must be canonical realpath');
+    assert.equal(process.env.HOME, beforeHome, 'createSandbox must not mutate parent HOME');
+    assert.equal(process.env.KODO_HOME, beforeKodoHome, 'createSandbox must not mutate parent KODO_HOME');
+    assert.equal(process.env.KODO_TOOL_HOME, beforeToolHome, 'createSandbox must not mutate parent KODO_TOOL_HOME');
+    assert.ok(
+      path.resolve(box.toolsDir).startsWith(path.resolve(box.directory) + path.sep),
+      'toolsDir must live inside sandbox directory',
+    );
   } finally {
-    if (prevToolHome === undefined) delete process.env.KODO_TOOL_HOME;
-    else process.env.KODO_TOOL_HOME = prevToolHome;
-    if (prevCodexCli === undefined) delete process.env.KODO_CODEX_CLIJS;
-    else process.env.KODO_CODEX_CLIJS = prevCodexCli;
+    await box.cleanup();
   }
 });
 
 test('finalizeTrialResources runs cleanup even if store.close throws and preserves primary error', async () => {
-  assert.equal(typeof overheadBench.finalizeTrialResources, 'function', 'finalizeTrialResources must be exported');
-
-  // Case 1: store.close throws with no primary error -> cleanup still runs, close error propagates.
   let cleanedA = false;
   await assert.rejects(
-    overheadBench.finalizeTrialResources({
+    finalizeTrialResources({
       store: {
         close() {
           throw new Error('close boom');
@@ -225,12 +353,11 @@ test('finalizeTrialResources runs cleanup even if store.close throws and preserv
   );
   assert.equal(cleanedA, true, 'cleanup must still execute when store.close throws');
 
-  // Case 2: primary error present + both close and cleanup throw -> both run, primary error is preserved.
   let closedB = false;
   let cleanedB = false;
   const primary = new Error('primary trial error');
   await assert.rejects(
-    overheadBench.finalizeTrialResources({
+    finalizeTrialResources({
       store: {
         close() {
           closedB = true;
@@ -268,58 +395,69 @@ function stubTrial(runIndex, overrides = {}) {
     nativeSessions: { count: 3, stages: ['plan', 'developer', 'review'], attempts: [] },
     verified: { correctnessPassed: true, scopePassed: true, scopeViolations: 0 },
     mockedCalls: { assessment: 1, discovery: 1, sessions: 3, byStage: { plan: 1, developer: 1, review: 1 } },
-    unexpectedCalls: { analyzeGemini: 0, decideJev: 0, research: 0, delivery: 0 },
+    unexpectedCalls: {
+      analyzeGemini: 0,
+      decideJev: 0,
+      research: 0,
+      delivery: 0,
+      unknownSession: 0,
+      sessionMismatch: 0,
+    },
     events: [],
     ...overrides,
   };
 }
 
-test('runOverheadBenchmark serializes overlapping calls so sandboxes never collide', async () => {
-  let active = 0;
-  let maxActive = 0;
-  let calls = 0;
-  const fakeTrial = async ({ runIndex }) => {
-    active++;
-    maxActive = Math.max(maxActive, active);
-    calls++;
-    await new Promise(resolve => setTimeout(resolve, 25));
-    active--;
-    return stubTrial(runIndex);
-  };
-
-  const [first, second] = await Promise.all([
-    runOverheadBenchmark({ runs: 1 }, { runTrial: fakeTrial }),
-    runOverheadBenchmark({ runs: 1 }, { runTrial: fakeTrial }),
-  ]);
-  assert.equal(calls, 2, 'both serialized runs must use the injected trial runner');
-  assert.equal(maxActive, 1, 'overlapping runOverheadBenchmark calls must never interleave');
-  assert.equal(first.summary.succeeded, 1);
-  assert.equal(second.summary.succeeded, 1);
-});
-
-test('unexpected provider calls fail allVerified, appear in text report and yield CLI exitCode 1', async () => {
+test('unexpected provider calls and extra mocked sessions fail allVerified, appear in text report and yield CLI exitCode 1', async () => {
+  // Case 1: unexpected decideJev / research calls
   const report = await runOverheadBenchmark(
     { runs: 1 },
     {
       runTrial: async ({ runIndex }) =>
         stubTrial(runIndex, {
-          unexpectedCalls: { analyzeGemini: 0, decideJev: 1, research: 2, delivery: 0 },
+          unexpectedCalls: {
+            analyzeGemini: 0,
+            decideJev: 1,
+            research: 2,
+            delivery: 0,
+            unknownSession: 0,
+            sessionMismatch: 0,
+          },
         }),
     },
   );
   assert.equal(report.summary.allVerified, false, 'non-zero unexpected calls must invalidate allVerified');
   const text = formatTextReport(report);
-  assert.match(text, /decideJev=1/, 'text report must surface non-zero unexpected decideJev calls');
-  assert.match(text, /research=2/, 'text report must surface non-zero unexpected research calls');
+  assert.match(text, /decideJev=1/);
+  assert.match(text, /research=2/);
 
-  assert.equal(typeof overheadBench.runCli, 'function', 'runCli must be exported');
   const stdoutLines = [];
-  const cliResult = await overheadBench.runCli(['--runs', '1', '--json'], {
+  const cliResult = await runCli(['--runs', '1', '--json'], {
     runBenchmark: async () => report,
     writeOut: line => stdoutLines.push(line),
   });
   assert.equal(cliResult.exitCode, 1, 'CLI must exit 1 when allVerified is false due to unexpected calls');
   assert.equal(JSON.parse(stdoutLines.join('\n')).summary.allVerified, false);
+
+  // Case 2: 4 mocked session calls vs 3 Engine attempts -> must be detected as sessionMismatch -> exitCode 1
+  const mismatchReport = await runOverheadBenchmark(
+    { runs: 1 },
+    {
+      runTrial: async ({ runIndex }) =>
+        stubTrial(runIndex, {
+          mockedCalls: { assessment: 1, discovery: 1, sessions: 4, byStage: { plan: 1, developer: 2, review: 1 } },
+          nativeSessions: { count: 3, stages: ['plan', 'developer', 'review'], attempts: [] },
+        }),
+    },
+  );
+  assert.equal(mismatchReport.summary.allVerified, false, '4 mocked calls vs 3 attempts must fail allVerified');
+  assert.ok(mismatchReport.providerCalls.unexpected.sessionMismatch >= 1);
+  assert.match(formatTextReport(mismatchReport), /sessionMismatch=/);
+  const mismatchCli = await runCli(['--runs', '1'], {
+    runBenchmark: async () => mismatchReport,
+    writeOut: () => {},
+  });
+  assert.equal(mismatchCli.exitCode, 1);
 });
 
 test('buildEventTimeline returns observed offsets and null for unobserved events', () => {
@@ -343,7 +481,7 @@ test('buildEventTimeline returns observed offsets and null for unobserved events
 });
 
 test(
-  'overhead-bench --runs 1 --json isolates env/temp/git-redirects, protects external GIT_INDEX_FILE, records real created offset, and cleans its temp root',
+  'overhead-bench --runs 1 --json isolates child process from host SSH_PRIVATE_KEY, XDG git/ignore, GIT_INDEX_FILE and cleans temp root',
   { timeout: 120000 },
   async () => {
     const tmpParent = await realpath(os.tmpdir());
@@ -352,6 +490,7 @@ test(
       const childTemp = path.join(suiteRoot, 'child-temp');
       const foreignRepo = path.join(suiteRoot, 'foreign-repo');
       const hostTools = path.join(suiteRoot, 'host-tools');
+      const hostXdgConfig = path.join(suiteRoot, 'host-xdg-config');
       const gitHome = path.join(suiteRoot, 'git-home');
       const emptyHooks = path.join(gitHome, 'hooks');
       const emptyTemplate = path.join(gitHome, 'template');
@@ -361,13 +500,14 @@ test(
       await mkdir(childTemp, { recursive: true });
       await mkdir(foreignRepo, { recursive: true });
       await mkdir(hostTools, { recursive: true });
+      await mkdir(path.join(hostXdgConfig, 'git'), { recursive: true });
       await mkdir(emptyHooks, { recursive: true });
       await mkdir(emptyTemplate, { recursive: true });
       await writeFile(emptyGitConfig, '');
       await writeFile(path.join(hostTools, 'sentinel.txt'), 'not-a-kodo-tool-home\n');
+      // Poisoned XDG global git ignore that ignores the fixture implementation file!
+      await writeFile(path.join(hostXdgConfig, 'git', 'ignore'), 'src/button.css\n');
 
-      // Separate Git repository prepared with isolated env (even with external GIT_INDEX_FILE present
-      // in baseEnv) so `git add .` can never touch externalIndexSentinel.
       await writeFile(path.join(foreignRepo, 'README.md'), 'foreign repo\n');
       const poisonedBaseEnv = {
         ...process.env,
@@ -375,6 +515,7 @@ test(
         GIT_DIR: path.join(suiteRoot, 'nonexistent-git-dir'),
         GIT_WORK_TREE: suiteRoot,
         SSH_PRIVATE_KEY: 'synthetic-ssh-key',
+        XDG_CONFIG_HOME: hostXdgConfig,
       };
       const gitEnvOptions = {
         baseEnv: poisonedBaseEnv,
@@ -405,6 +546,7 @@ test(
         TEMP: childTemp,
         TMPDIR: childTemp,
         KODO_TOOL_HOME: hostTools,
+        XDG_CONFIG_HOME: hostXdgConfig,
         GIT_DIR: path.join(foreignRepo, '.git'),
         GIT_WORK_TREE: foreignRepo,
         GIT_INDEX_FILE: externalIndexSentinel,
@@ -452,6 +594,8 @@ test(
         decideJev: 0,
         research: 0,
         delivery: 0,
+        unknownSession: 0,
+        sessionMismatch: 0,
       });
 
       assert.equal(report.summary.runs, 1);
@@ -501,7 +645,6 @@ test(
       assert.match(text, /реальных вызовов провайдеров: 0/);
       assert.match(text, /Доставка \(none\)/);
 
-      // Dedicated child temp root must be completely empty after the benchmark finishes.
       const remaining = await readdir(childTemp);
       assert.deepEqual(remaining, [], 'all temporary benchmark directories must be removed');
     } finally {
