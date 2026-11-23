@@ -3,6 +3,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadCatalog, resolveComponents } from './catalog.mjs';
 import { planInstallation, applyInstallation } from './installer.mjs';
+import { PROJECT_USAGE } from '../runtime/project-help.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const help = `Kodo — Codex / Claude Code / OpenCode
@@ -21,22 +22,7 @@ kodo run "TASK" --client codex|claude-code [--model MODEL] [--mode quick|standar
 kodo benchmark run --models MODEL,... [--client codex|claude-code] [--mode quick|standard|deep] [--repeats N] [--seed N] [--output ABSOLUTE_DIR] [--json]
 kodo benchmark resume|report PATH [--json]
 kodo status|logs|resume|cancel RUN_ID [--json]
-kodo project create --file SPEC [--command-id UUID] [--json]
-kodo project status PROJECT_ID [--json]
-kodo project plan PROJECT_ID [--limit 1..24] [--dry-run] [--json]
-kodo project resume PROJECT_ID [--retry-failed] [--command-id UUID] [--json]
-kodo project drain PROJECT_ID [--max-waves 1..100] [--concurrency 1..5] [--retry-failed] [--command-id UUID] [--json]
-kodo project cancel|pause PROJECT_ID [--command-id UUID] [--json]
-kodo project reprioritize PROJECT_ID TASK_ID --priority 0..100 [--command-id UUID] [--json]
-kodo project approve-risk PROJECT_ID TASK_ID --reason TEXT [--command-id UUID] [--json]
-kodo project next-wave PROJECT_ID --host t3|orca [--limit 1..5] [--retry-failed] [--json]
-kodo project complete-task PROJECT_ID TASK_ID --head SHA [--defer-gate|--abandon] [--command-id UUID] [--json]
-kodo project gates PROJECT_ID [--retry-failed] [--json]
-kodo project bootstrap "IDEA" --root PATH [--prepare] [--client codex|claude-code] [--model MODEL] [--json]
-kodo project apply-spec --root PATH [--file SPEC_JSON] [--command-id UUID] [--json]
-kodo project extend PROJECT_ID "FEATURE" [--prepare] [--client codex|claude-code] [--model MODEL] [--command-id UUID] [--json]
-kodo project append-milestone PROJECT_ID --file MILESTONE_JSON [--command-id UUID] [--json]
-kodo project report PROJECT_ID [--json]
+${PROJECT_USAGE.join('\n')}
 kodo report RUN_ID [--json]
 kodo report --project PROJECT_ID [--json]
 kodo jobs list [--queue QUEUE] [--json]
@@ -104,12 +90,17 @@ async function main() {
   // SQLite store or credential/provider startup path.
   if (command === 'project') {
     const { projectCli } = await import('../runtime/project-cli.mjs');
+    // Briefs and next hints call this same entry (`node "<absolute cli/index.mjs>"`).
+    const { cliCommand } = await import('../runtime/cli-command.mjs');
     const controller = new AbortController(),
       abort = () => controller.abort();
     process.once('SIGINT', abort);
     process.once('SIGTERM', abort);
     try {
-      const result = await projectCli(argv, { signal: controller.signal });
+      const result = await projectCli(argv, {
+        signal: controller.signal,
+        cli: cliCommand(fileURLToPath(import.meta.url)),
+      });
       console.log(result.output);
       process.exitCode = result.exitCode;
     } finally {

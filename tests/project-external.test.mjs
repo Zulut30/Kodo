@@ -5,6 +5,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { Store } from '../runtime/store.mjs';
 import { Engine } from '../runtime/engine.mjs';
 import * as contracts from '../runtime/project-contracts.mjs';
@@ -120,7 +121,7 @@ async function integrateLeased(f, { projectId, taskId, run }) {
   };
 }
 
-async function fixture(t, { wave = true } = {}) {
+async function fixture(t, { wave = true, stateInGit = false } = {}) {
   const temp = await realpath(await mkdtemp(path.join(os.tmpdir(), 'kodo-external-')));
   const stores = [];
   t.after(async () => {
@@ -246,6 +247,9 @@ async function fixture(t, { wave = true } = {}) {
   f.complete = (taskId, head, input = {}) =>
     completeTask(f.ctx, { projectId: f.projectId, taskId, head, ports: f.ports, ...input });
   f.snapshot = () => repo.snapshot(f.projectId);
+  // A state home that became a Git work tree after its project store was created: the Engine
+  // then keeps Run artifacts and worktrees beside a temporary home unless KODO_WORKTREE_HOME is set.
+  if (stateInGit) git(home, 'init', '-b', 'main');
   f.integrationHead = () => git(root, 'rev-parse', `refs/heads/kodo/project/${f.projectId}`);
   return f;
 }
@@ -333,6 +337,139 @@ test('next-wave reserves non-overlapping tasks on the integration head; a repeat
     attempts.map(row => row.number),
     [1, 1],
   );
+});
+
+test('next-wave briefs call the CLI of their caller; a library call keeps the kodo default', async t => {
+  const f = await fixture(t);
+  const cli = `node "${fileURLToPath(new URL('../cli/index.mjs', import.meta.url))}"`;
+  const result = await f.wave({ limit: 1, cli });
+  assert.equal(result.cli, cli);
+  const [row] = result.briefs;
+  assert.equal(row.selfCheck, `${cli} ci feedback --base ${row.baseSha} --project "${row.worktree}" --json`);
+  assert.equal(row.completeCommand, `${cli} project complete-task ${f.projectId} ${row.taskId} --head <SHA>`);
+  assert.equal(
+    row.abandonCommand,
+    `${cli} project complete-task ${f.projectId} ${row.taskId} --head <SHA> --abandon --attempt ${row.attemptId}`,
+  );
+  assert.ok(row.prompt.includes(row.selfCheck));
+  contracts.assertDirectorSafe(row, { knownValues: [] });
+  // The same attempt without a CLI context: the library default prefix.
+  const plain = await f.wave({ limit: 1 });
+  assert.equal(plain.cli, 'kodo');
+  assert.equal(plain.briefs[0].attemptId, row.attemptId);
+  assert.equal(plain.briefs[0].selfCheck, row.selfCheck.replace(cli, 'kodo'));
+  // An unusable prefix is refused before the lease or any reservation.
+  const before = (await f.snapshot()).revision;
+  for (const bad of ['', ' ', 'node "x"\nkodo', 42, null, 'npx kodo', 'kodo --x', `node ${cli.slice(6, -1)}`])
+    await assert.rejects(f.wave({ cli: bad }), { code: 'project_cli_invalid' }, String(bad));
+  assert.equal((await f.snapshot()).revision, before);
+});
+
+// Shells expand these even inside double quotes: $ and backtick (PowerShell, bash), % and ! (cmd);
+// a quote ends the argument. A path a brief command would carry is refused before any state change.
+const unsafeNames = ['wt $(calc)', 'wt $x', 'wt %PATH%', 'wt `id`', 'wt !x!'];
+
+test('next-wave refuses a worktree home or CLI path a shell would expand, before any state change', async t => {
+  const f = await fixture(t);
+  const before = await f.snapshot();
+  const saved = process.env.KODO_WORKTREE_HOME;
+  t.after(() => {
+    if (saved === undefined) delete process.env.KODO_WORKTREE_HOME;
+    else process.env.KODO_WORKTREE_HOME = saved;
+  });
+  for (const name of unsafeNames) {
+    process.env.KODO_WORKTREE_HOME = path.join(f.temp, name);
+    await assert.rejects(f.wave(), { code: 'project_path_unsafe' }, name);
+  }
+  if (saved === undefined) delete process.env.KODO_WORKTREE_HOME;
+  else process.env.KODO_WORKTREE_HOME = saved;
+  for (const name of [...unsafeNames, 'relative'])
+    await assert.rejects(
+      f.wave({ cli: `node "${name === 'relative' ? 'cli/index.mjs' : path.join(f.temp, name, 'index.mjs')}"` }),
+      { code: 'project_path_unsafe' },
+      name,
+    );
+  await assert.rejects(f.wave({ cli: `node "${path.join(f.temp, 'wt "q', 'index.mjs')}"` }), {
+    code: 'project_cli_invalid',
+  });
+  // Windows: only a fully qualified local path (drive letter, colon, separator); a network share, a drive root or a path
+  // without a drive letter is refused with the advice to move the project below a local drive.
+  if (process.platform === 'win32')
+    for (const location of [
+      '/tools/cli/index.mjs',
+      path.win32.join('//server/share', 'cli', 'index.mjs'),
+      path.win32.resolve('C:/'),
+    ])
+      await assert.rejects(
+        f.wave({ cli: `node "${location}"` }),
+        error => error.code === 'project_path_unsafe' && /подкаталог локального диска/.test(error.message),
+        location,
+      );
+  const after = await f.snapshot();
+  assert.equal(after.revision, before.revision);
+  assert.deepEqual(after.currentAttempts, []);
+  // A path with spaces and Cyrillic is an ordinary quoted argument.
+  process.env.KODO_WORKTREE_HOME = path.join(f.temp, 'рабочие копии');
+  const wave = await f.wave({ limit: 1 });
+  assert.ok(wave.briefs[0].selfCheck.includes(`--project "${wave.briefs[0].worktree}" --json`));
+  assert.ok(wave.briefs[0].worktree.startsWith(path.join(f.temp, 'рабочие копии')));
+});
+
+test('next-wave checks an explicit KODO_WORKTREE_HOME of a state home inside Git before any reservation', async t => {
+  const f = await fixture(t, { stateInGit: true });
+  const saved = process.env.KODO_WORKTREE_HOME;
+  t.after(() => {
+    if (saved === undefined) delete process.env.KODO_WORKTREE_HOME;
+    else process.env.KODO_WORKTREE_HOME = saved;
+  });
+  const before = await f.snapshot();
+  // The Engine puts worktrees in an explicit KODO_WORKTREE_HOME first, even for a state home in Git.
+  process.env.KODO_WORKTREE_HOME = path.join(f.temp, 'wt %PATH%');
+  await assert.rejects(f.wave(), { code: 'project_path_unsafe' });
+  const after = await f.snapshot();
+  assert.equal(after.revision, before.revision);
+  assert.deepEqual(after.currentAttempts, []);
+  process.env.KODO_WORKTREE_HOME = path.join(f.temp, 'рабочие копии');
+  const wave = await f.wave({ limit: 1 });
+  assert.ok(wave.briefs[0].worktree.startsWith(path.join(f.temp, 'рабочие копии')));
+});
+
+test('next-wave checks the CLI against known values before the lease and guards its whole result', async t => {
+  const f = await fixture(t);
+  const cli = `node "${fileURLToPath(new URL('../cli/index.mjs', import.meta.url))}"`;
+  const calls = [];
+  const C = {
+    ...contracts,
+    assertDirectorSafe: (value, options) => {
+      calls.push(typeof value === 'string' ? value : Object.keys(value).sort().join());
+      return contracts.assertDirectorSafe(value, options);
+    },
+  };
+  const acquire = f.store.acquireLease;
+  f.store.acquireLease = (...args) => {
+    calls.push('lease');
+    return acquire.apply(f.store, args);
+  };
+  t.after(() => {
+    f.store.acquireLease = acquire;
+  });
+  const input = { projectId: f.projectId, host: 't3', ports: f.ports, limit: 1 };
+  await nextWave({ ...f.ctx, contracts: C }, { ...input, cli });
+  assert.equal(calls[0], cli, 'the prefix is checked first');
+  assert.ok(calls.indexOf('lease') > 0);
+  assert.equal(calls.at(-1), 'blocked,briefs,cli,projectId,revision', 'the whole result is guarded');
+  // A prefix carrying a known secret value is refused before the lease.
+  calls.length = 0;
+  const secrets = f.engine.secrets;
+  f.engine.secrets = { FIXTURE_TOKEN: 'knownfixturevalue42' };
+  t.after(() => {
+    f.engine.secrets = secrets;
+  });
+  await assert.rejects(
+    nextWave({ ...f.ctx, contracts: C }, { ...input, cli: `node "${path.join(f.temp, 'knownfixturevalue42.mjs')}"` }),
+    { code: 'project_unsafe' },
+  );
+  assert.ok(!calls.includes('lease'));
 });
 
 test('complete-task rejects a commit outside its write paths, a foreign branch, a dirty or unrelated worktree and a deleted test', async t => {

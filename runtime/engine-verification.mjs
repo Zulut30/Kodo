@@ -569,13 +569,33 @@ export class EngineVerification extends EngineExecution {
         undefined,
         pending,
       );
+      // A wave task checks the repair's actual diff before its completion report: a write outside
+      // the scope stops the cycle (scope_conflict), so a resume never repeats the session.
+      if (run.verificationProfile === TASK_FAST_PROFILE)
+        try {
+          await this.checkTaskScope(run, run.cwd, pending.headSha, scopes);
+        } catch (error) {
+          if (error.code !== 'scope_conflict') throw error;
+          cycle.stopped = 'scope_conflict';
+          this.assess(run, {
+            scope: 'verification',
+            attempts: cycle.attempt,
+            reason: cycle.stopped,
+            problem: error.message,
+          });
+          throw Object.assign(new Error(`Ремонт проверки вне области задачи: ${error.message}`), {
+            code: 'blocked',
+            scope: 'verification',
+            reason: cycle.stopped,
+          });
+        }
       if (!response.output.complete) throw new Error('Исправление проверки не завершено');
       pending.sessionId = response.sessionId || pending.sessionId;
       pending.complete = true;
       this.save(run);
     }
     this.checkCancelled(run, signal);
-    await this.checkScope(run.cwd, pending.headSha, scopes);
+    await this.checkTaskScope(run, run.cwd, pending.headSha, scopes);
     await commitChanges(run.cwd, `Kodo repair checks ${cycle.attempt}`);
     delete cycle.pendingRepair;
     run.checks = null;

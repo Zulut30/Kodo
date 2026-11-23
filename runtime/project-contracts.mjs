@@ -915,6 +915,12 @@ export function buildDirectorTaskInput(input, options) {
     directorBytes('taskRunInput', { schemaVersion: 1, projectContext, task: contract(task) }, options).toString('utf8')
   );
 }
+/** The frozen ProjectTask writePaths of a task Run input (`buildDirectorTaskInput`). */
+export function directorTaskWritePaths(text, options) {
+  if (typeof text !== 'string' || !text.startsWith(PREFIX)) fail('project_binding_invalid');
+  const input = normalizeDirectorRecord('taskRunInput', JSON.parse(text.slice(PREFIX.length)), options);
+  return [...input.task.writePaths];
+}
 // Immutable project context shared by task and gate inputs; never `execution`.
 function contextOf(project) {
   return {

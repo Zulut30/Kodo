@@ -571,8 +571,9 @@ try {
         if (scope === parent) return true;
         // Conservative containment for directory scopes. Complex globs require an
         // exact match; comparing glob strings as filenames can widen permissions.
+        // `dir/**` owns paths below dir, never dir itself (a file named dir).
         const directory = parent.replace(/\/\*\*$/, '');
-        return !/[?*\[\]{}]/.test(directory) && (scope === directory || scope.startsWith(directory + '/'));
+        return !/[?*\[\]{}]/.test(directory) && scope.startsWith(directory + '/');
       });
     if (run.plan.tasks.some(task => task.writePaths.some(scope => !contains(scope)))) deny();
   }

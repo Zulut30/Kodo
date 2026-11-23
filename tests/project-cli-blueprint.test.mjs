@@ -3,7 +3,19 @@ import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { cp, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
+import {
+  access,
+  cp,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  realpath,
+  rename,
+  rm,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -330,7 +342,28 @@ test('bootstrap --prepare writes the context bundle only to KODO_HOME', async t 
   assert.match(await readFile(path.join(bundle.dir, 'context.md'), 'utf8'), /Сервис заметок с поиском/);
   assert.equal(report.result.summary.root, root);
   assert.equal(report.result.blueprint, path.join(root, '.kodo', 'blueprint'));
-  assert.ok(report.result.next.some(line => line.includes('kodo project apply-spec')));
+  // The hints call the CLI that issued them, by its absolute entry.
+  assert.ok(
+    report.result.next.includes(
+      `Проверь и зарегистрируй проект: node "${cli}" project apply-spec --root "${root}" --json`,
+    ),
+  );
+  const bare = /\bkodo project\b/;
+  assert.ok(bare.test('Проверь: kodo project apply-spec --json'), 'the check sees a bare kodo command');
+  assert.ok(report.result.next.every(line => !bare.test(line)));
+  // The machine field holds only the command: it runs as is in the platform shell.
+  const apply = `node "${cli}" project apply-spec --root "${root}" --json`;
+  assert.deepEqual(
+    report.result.commands.map(item => item.command),
+    [apply],
+  );
+  assert.ok(report.result.commands.every(item => typeof item.why === 'string' && item.why.length > 0));
+  const env = { ...f.env };
+  const pathKey = Object.keys(env).find(key => key.toUpperCase() === 'PATH') ?? 'PATH';
+  env[pathKey] = [path.dirname(process.execPath), env[pathKey]].filter(Boolean).join(path.delimiter);
+  const ran = spawnSync(apply, { shell: true, cwd: root, env, encoding: 'utf8', timeout: 60000, windowsHide: true });
+  assert.equal(ran.status, 1, ran.stdout + ran.stderr);
+  assert.equal(JSON.parse(ran.stdout).result.code, 'blueprint_findings', 'apply-spec ran and found no blueprint yet');
   assert.deepEqual(await tree(root), before, 'the repository is unchanged');
 });
 
@@ -384,9 +417,32 @@ test('apply-spec creates a wave project with verifiable interfaces and replays b
   const root = await f.root();
   const dir = await writeBlueprint(root);
   const commandId = randomUUID();
-  const { exitCode, report } = await f.run(['apply-spec', '--root', root, '--command-id', commandId]);
+  const prefix = `node "${cli}"`;
+  const { exitCode, report } = await f.run(['apply-spec', '--root', root, '--command-id', commandId], { cli: prefix });
   assert.equal(exitCode, 0, JSON.stringify(report));
   assert.equal(report.result.status, 'created');
+  // Next steps with the caller's CLI: the managed linter for workers' self-check, then the first wave.
+  const hint = text =>
+    assert.ok(
+      report.result.next.some(line => line.includes(text)),
+      text,
+    );
+  hint(`${prefix} tools install oxlint --project "${root}" --json`);
+  hint(`${prefix} project next-wave ${report.projectId} --host t3 --limit 3 --json`);
+  assert.deepEqual(
+    report.result.commands.map(item => item.command),
+    [
+      `${prefix} tools install oxlint --project "${root}" --json`,
+      `${prefix} tools install typescript --project "${root}" --json`,
+      `${prefix} project next-wave ${report.projectId} --host t3 --limit 3 --json`,
+    ],
+  );
+  // ci feedback succeeds with feedback_ready; a missing tool is a blocker, never a success.
+  assert.ok(
+    report.result.next.some(line => line.includes('blocked') && line.includes('feedback_ready')),
+    'a missing tool is named a blocker',
+  );
+  assert.ok(report.result.next.every(line => !line.includes('passed')));
   assert.equal(report.result.replayed, false);
   assert.deepEqual(report.result.execution, wave);
   assert.deepEqual(report.result.modules.waveZero, ['scaffold', 'test-bench']);
@@ -521,8 +577,21 @@ test('extend prepares a feature bundle from the snapshot or appends a session mi
   const f = await fixture(t);
   const prepared = await acceptedProject(f);
   const before = await tree(prepared.root);
-  const bundle = await f.run(['extend', prepared.projectId, 'Добавить теги', '--prepare']);
+  const bundle = await f.run(['extend', prepared.projectId, 'Добавить теги', '--prepare'], {
+    cli: `node "${cli}"`,
+  });
   assert.equal(bundle.exitCode, 0, JSON.stringify(bundle.report));
+  assert.ok(
+    bundle.report.result.next.some(line =>
+      line.includes(`node "${cli}" project append-milestone ${prepared.projectId} --file "`),
+    ),
+  );
+  assert.deepEqual(
+    bundle.report.result.commands.map(item => item.command),
+    [
+      `node "${cli}" project append-milestone ${prepared.projectId} --file "${path.join(bundle.report.result.bundle.dir, 'milestone.json')}" --json`,
+    ],
+  );
   assert.equal(bundle.report.projectId, prepared.projectId);
   assert.equal(bundle.report.revision, prepared.snapshot.revision);
   assert.equal(bundle.report.result.status, 'prepared');
@@ -646,4 +715,45 @@ test('apply-spec requires a committed Git root with no changes outside the bluep
   const created = await f.run(['apply-spec', '--root', dirty]);
   assert.equal(created.exitCode, 0, JSON.stringify(created.report));
   assert.equal(created.report.result.status, 'created');
+});
+
+test('bootstrap and apply-spec refuse a root a shell would expand and an unusable CLI port before any state', async t => {
+  const f = await fixture(t);
+  const unsafe = message => assert.match(message, /переименуйте или переместите/);
+  for (const name of ['repo $(calc)', 'repo $x', 'repo %PATH%', 'repo `id`', 'repo !x!']) {
+    const root = path.join(f.dir, name);
+    await mkdir(root);
+    const result = await f.run(['bootstrap', 'Заметки', '--root', root, '--prepare']);
+    assert.equal(result.exitCode, 1, name);
+    assert.equal(result.report.result.reason, 'project_path_unsafe', name);
+    unsafe(result.report.result.message);
+  }
+  // A committed repository moved under such a name: no evidence and no project are written.
+  const moved = path.join(f.dir, 'moved $x');
+  await rename(await f.root(), moved);
+  await writeBlueprint(moved);
+  const applied = await f.run(['apply-spec', '--root', moved]);
+  assert.equal(applied.exitCode, 1, JSON.stringify(applied.report));
+  assert.equal(applied.report.result.reason, 'project_path_unsafe');
+  // A null CLI port is refused, not replaced with kodo.
+  const plain = await f.root();
+  const refused = await f.run(['bootstrap', 'Заметки', '--root', plain, '--prepare'], { cli: null });
+  assert.equal(refused.exitCode, 2);
+  assert.equal(refused.report.result.reason, 'project_cli_invalid');
+  await assert.rejects(access(f.home), 'no bundle, evidence or Store was written');
+});
+
+test('extend --prepare checks the milestone file of its bundle before creating the bundle directory', async t => {
+  const f = await fixture(t);
+  const prepared = await acceptedProject(f);
+  // Kodo home itself is safe, but its bundle folder resolves into a directory cmd would expand.
+  const target = path.join(f.dir, 'bundles %PATH%');
+  await mkdir(target);
+  await symlink(target, path.join(f.home, 'bootstrap'), 'junction');
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const result = await f.run(['extend', prepared.projectId, 'Теги', '--prepare']);
+    assert.equal(result.exitCode, 1, JSON.stringify(result.report));
+    assert.equal(result.report.result.reason, 'project_path_unsafe');
+    assert.deepEqual(await readdir(target), [], 'no bundle is written, a repeat adds none');
+  }
 });

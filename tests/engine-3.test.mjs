@@ -494,3 +494,81 @@ test('Engine resumes an interrupted conflicted node refresh against its recorded
   assert.equal(await read(path.join(fx.cwd, 'upstream-fix.txt')), 'incoming outside task scope\n');
   assert.match(await read(path.join(fx.cwd, 'src/value.mjs')), /upstream = true/);
 });
+
+// A wave task Run (task-fast) checks the actual diff right after a repair or refresh session,
+// before its completion report: a write outside the scope stops it with scope_conflict, and a
+// resume never calls the session again on the same tree.
+test('A task-fast verification repair writing outside its scope stops with scope_conflict even when incomplete', async t => {
+  const fx = await fixture(t, { testScript: 'process.exit(0);\n' });
+  const task = node('feature', 'developer', ['src/value.mjs']);
+  const services = fakeServices({ plan: { summary: 'value', tasks: [task] } });
+  const original = services.provider.runSession;
+  let repairs = 0;
+  services.provider.runSession = async request => {
+    if (!/Repair confirmed failures/.test(request.prompt)) return original(request);
+    repairs++;
+    await writeFile(path.join(request.cwd, 'stray.txt'), 'outside the scope\n');
+    return { sessionId: 'repair-outside', output: { summary: 'not finished', checks: [], complete: false } };
+  };
+  const store = fx.openStore(),
+    engine = new Engine({ store, ...services });
+  const run = await engine.create('Repair inside the task scope', { project: fx.project });
+  await engine.prepare(run);
+  run.plan = { summary: 'value', tasks: [task] };
+  run.models = await services.provider.discoverProviders();
+  run.completed.implementation = true;
+  run.verificationProfile = 'task-fast';
+  run.verification = {
+    attempt: 1,
+    cycle: 1,
+    pendingRepair: { headSha: git(run.cwd, 'rev-parse', 'HEAD'), problem: 'checks failed' },
+  };
+  engine.save(run);
+  for (let resume = 0; resume < 2; resume++) {
+    const result = await engine.run(run.id);
+    assert.equal(result.state, 'blocked');
+    assert.equal(result.blocker.current.code, 'scope_conflict', result.error?.message);
+    assert.equal(result.verification.stopped, 'scope_conflict');
+  }
+  assert.equal(repairs, 1, 'a resume never repeats the session on the same tree');
+});
+
+test('A task-fast refresh resolver writing outside its scope stops with scope_conflict even when incomplete', async t => {
+  let resolvers = 0;
+  const fx = await refreshFixture(
+    t,
+    async request => {
+      if (!request.role) {
+        resolvers++;
+        await writeFile(path.join(request.cwd, 'stray.txt'), 'outside the scope\n');
+        return { sessionId: 'refresh-outside', output: { summary: 'not resolved', checks: [], complete: false } };
+      }
+      return { sessionId: 'worker', output: { summary: 'done', checks: [], complete: true } };
+    },
+    true,
+  );
+  fx.run.verificationProfile = 'task-fast';
+  fx.engine.save(fx.run);
+  await assert.rejects(fx.engine.performNode(fx.run, fx.task), { code: 'scope_conflict' });
+  assert.equal(resolvers, 1);
+});
+
+test('A successful task-fast node scans its diff once after the worker and reuses the result', async t => {
+  let worked = false;
+  const fx = await refreshFixture(t, async request => {
+    if (request.role) worked = true;
+    return { sessionId: 'worker', output: { summary: 'done', checks: [], complete: true } };
+  });
+  fx.run.verificationProfile = 'task-fast';
+  fx.engine.save(fx.run);
+  const scans = [],
+    scan = fx.engine.checkScope.bind(fx.engine);
+  fx.engine.checkScope = async (...args) => {
+    if (worked) scans.push(args[0]);
+    return scan(...args);
+  };
+  await fx.engine.performNode(fx.run, fx.task);
+  assert.equal(fx.run.nodes.feature.status, 'completed');
+  assert.deepEqual(fx.run.nodes.feature.changedFiles, ['src/value.mjs']);
+  assert.deepEqual(scans, [fx.cwd], 'one scan after the worker session');
+});

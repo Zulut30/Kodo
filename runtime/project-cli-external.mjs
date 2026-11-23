@@ -1,4 +1,5 @@
 import { isPullHost } from './job-contracts.mjs';
+import { PATH_UNSAFE_MESSAGE, assertCliPrefix } from './cli-command.mjs';
 
 // `kodo project next-wave|complete-task|gates`: the pull protocol of external worker
 // chats (docs/T3-HOST.md). Strict parsing precedes credentials, state and Git.
@@ -24,6 +25,8 @@ const reported = new Set([
   'project_attempt_not_external',
   'project_wave_ports_invalid',
   'project_snapshot_incomplete',
+  'project_cli_invalid',
+  'project_path_unsafe',
 ]);
 const dataErrors = new Set([
   'project_schema',
@@ -35,6 +38,8 @@ const dataErrors = new Set([
   'project_wave_required',
   'project_attempt_missing',
   'project_attempt_not_external',
+  'project_cli_invalid',
+  'project_path_unsafe',
 ]);
 const invalid = () => {
   throw Object.assign(new Error('Invalid project arguments'), { code: 'project_arguments' });
@@ -131,6 +136,8 @@ async function operate(options, ports, safety) {
         limit: flags['--limit'] === undefined ? 3 : Number(flags['--limit']),
         retryFailed: flags['--retry-failed'] === true,
         ports: ports.wave,
+        // The CLI entry passes its own command: the briefs call the same Kodo package.
+        ...(ports.cli === undefined ? {} : { cli: ports.cli }),
       });
       success = result.briefs.length > 0;
     } else if (options.action === 'gates') {
@@ -166,7 +173,8 @@ async function operate(options, ports, safety) {
 /**
  * Ports belong to the coordinator/test harness, never to decoded CLI data:
  * `secrets`/`loadSecrets`, `store`/`openStore`/`home`, `createEngine`,
- * `createAuthorizer`, `wave` (the director's wave functions) and `signal`.
+ * `createAuthorizer`, `wave` (the director's wave functions), `cli` (command prefix of
+ * the brief commands, runtime/cli-command.mjs) and `signal`.
  */
 export async function projectExternalCli(argv, ports = {}) {
   let options,
@@ -182,6 +190,8 @@ export async function projectExternalCli(argv, ports = {}) {
     const safety = value => contracts.assertDirectorSafe(value, { knownValues });
     phase = 'input';
     safety(argv);
+    // The prefix of next-wave's brief commands: checked before the Store opens or anything is written.
+    if (options.action === 'next-wave' && ports.cli !== undefined) safety(assertCliPrefix(ports.cli));
     phase = 'operation';
     outcome = await operate(options, { ...ports, secrets }, safety);
   } catch (error) {
@@ -204,6 +214,7 @@ export async function projectExternalCli(argv, ports = {}) {
                 : exitCode === 1
                   ? 'project_invalid'
                   : 'project_blocked',
+          ...(code === 'project_path_unsafe' ? { message: PATH_UNSAFE_MESSAGE } : {}),
         },
       },
     };

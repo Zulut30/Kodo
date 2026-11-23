@@ -38,11 +38,15 @@ const CLOSED = ['accepted', 'released'];
 const REDACTED = '[REDACTED]';
 // A whole PEM private key block; an unterminated header redacts to the end.
 const PEM_BLOCK = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/gi;
+// Agent client folders: installed skills, roles and settings, not project source. The file
+// map skips them; a native session that changes them is still out of scope (generateBlueprint).
+const AGENT_DIRS = ['.agents', '.claude', '.codex', '.opencode'];
 const SKIP_DIRS = new Set([
   '.git',
   '.hg',
   '.svn',
   '.kodo',
+  ...AGENT_DIRS,
   'node_modules',
   'dist',
   'build',
@@ -149,8 +153,9 @@ async function existingRoot(root) {
 const isoTime = now => new Date(typeof now === 'function' ? now() : (now ?? Date.now())).toISOString();
 
 /** Bounded, link-free walk without content reads; skips VCS, dependency and
- * build directories and Kodo state (.kodo). Files are in byte-sorted DFS order. */
-async function scanProject(root) {
+ * build directories, Kodo state (.kodo) and agent client folders unless named in
+ * `watch`. Files are in byte-sorted DFS order. */
+async function scanProject(root, { watch = [] } = {}) {
   const files = [],
     state = { links: 0, skippedDirs: 0, complete: true };
   async function visit(directory, prefix, depth) {
@@ -171,7 +176,7 @@ async function scanProject(root) {
       const relative = prefix + entry.name;
       if (entry.isSymbolicLink()) state.links++;
       else if (entry.isDirectory()) {
-        if (SKIP_DIRS.has(entry.name)) state.skippedDirs++;
+        if (SKIP_DIRS.has(entry.name) && !watch.includes(entry.name)) state.skippedDirs++;
         else if (depth >= SCAN_DEPTH) {
           state.skippedDirs++;
           state.complete = false;
@@ -311,7 +316,9 @@ function redactContext(text, { contracts = projectContracts, knownValues = [] } 
  * inside the project root: the repository is not changed by preparation. Every
  * file is redacted (redactContext) before the first write.
  * @returns {Promise<{ id: string, dir: string, files: string[], redacted: boolean }>} */
-async function writeBundle({ home, root, kind, now, files: raw, safety }) {
+// `checkDir(dir)` sees the final bundle directory (Kodo home and its bootstrap folder resolved)
+// before it is created: a caller that quotes a bundle path refuses an unusable one first.
+async function writeBundle({ home, root, kind, now, files: raw, safety, checkDir = undefined }) {
   const checked = raw.map(([name, content]) => [name, redactContext(content, safety)]);
   const files = checked.map(([name, item]) => [name, item.text]);
   if (typeof home !== 'string' || !path.isAbsolute(home))
@@ -326,6 +333,7 @@ async function writeBundle({ home, root, kind, now, files: raw, safety }) {
     throw failure('bootstrap_home_inside_root', 'Контекст-пакет не создаётся внутри каталога проекта');
   const id = `${kind}-${isoTime(now).replace(/[-:.]/g, '')}-${randomBytes(4).toString('hex')}`;
   const dir = path.join(realBase, id);
+  checkDir?.(dir);
   await mkdir(dir, { mode: 0o700 });
   for (const [name, content] of files) {
     const target = path.join(dir, ...name.split('/'));
@@ -493,7 +501,7 @@ function bootstrapContext({ prompt, root, at, scan, stack, architecture, knowled
     '## Карта файлов',
     '',
     scan.files.length
-      ? `Показано файлов: ${listed.length}${more ? ' (список неполный)' : ''}. Пропущены каталоги VCS, зависимостей, сборки и .kodo (${scan.skippedDirs}), ссылки (${scan.links}).`
+      ? `Показано файлов: ${listed.length}${more ? ' (список неполный)' : ''}. Пропущены каталоги VCS, зависимостей, сборки, .kodo и клиентов агентов (${AGENT_DIRS.join(', ')}) (${scan.skippedDirs}), ссылки (${scan.links}).`
       : 'Каталог пуст.',
     ...(listed.length ? ['', fenced(listed.join('\n'), 'text')] : []),
     '',
@@ -625,7 +633,7 @@ export async function generateBlueprint(options = {}) {
   const bundle = await prepareBootstrap({ prompt, root, home, now, architecture, knowledge, ...safety });
   const real = bundle.summary.root;
   const files = await bundleFiles(bundle);
-  const before = await scanProject(real);
+  const before = await scanProject(real, { watch: AGENT_DIRS });
   const result = await provider.runSession({
     client,
     model: model ?? undefined,
@@ -635,7 +643,7 @@ export async function generateBlueprint(options = {}) {
     readOnly: false,
     signal,
   });
-  const after = await scanProject(real);
+  const after = await scanProject(real, { watch: AGENT_DIRS });
   const output = result?.output;
   const status = isPlain(output) && ['written', 'blocked'].includes(output.status) ? output.status : null;
   const sessionFindings = !status
@@ -790,6 +798,7 @@ export async function prepareExtend(options = {}) {
   const { redacted, ...bundle } = await writeBundle({
     home,
     root: real,
+    checkDir: options.checkDir,
     kind: 'extend',
     now: at,
     safety: { contracts, knownValues },

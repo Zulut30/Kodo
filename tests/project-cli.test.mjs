@@ -603,6 +603,58 @@ test('Actual invalid project flags bypass even a corrupt isolated credential hom
   await assert.rejects(access(f.home));
 });
 
+test('project --help prints the project command reference before credentials, state or providers', async t => {
+  const f = await fixture(t);
+  await mkdir(f.credentials);
+  await writeFile(
+    path.join(f.credentials, process.platform === 'win32' ? 'credentials.dpapi.json' : 'credentials.json'),
+    'corrupt fake data',
+  );
+  const full = f.invoke(['project', '--help'], false);
+  assert.equal(full.exitCode, 0, full.stderr);
+  for (const name of ['create', 'status', 'cancel', 'drain', 'next-wave', 'complete-task', 'gates', 'bootstrap'])
+    assert.match(full.output, new RegExp(`^kodo project ${name}[ |]`, 'm'), name);
+  for (const name of ['apply-spec', 'extend', 'append-milestone', 'report'])
+    assert.match(full.output, new RegExp(`^kodo project ${name} `, 'm'), name);
+  assert.doesNotMatch(full.output, /^kodo run /m);
+  const sub = f.invoke(['project', 'next-wave', '--help'], false);
+  assert.equal(sub.exitCode, 0, sub.stderr);
+  assert.match(sub.output, /^kodo project next-wave PROJECT_ID --host t3\|orca /m);
+  assert.doesNotMatch(sub.output, /kodo project bootstrap/);
+  const pause = f.invoke(['project', 'pause', '-h'], false);
+  assert.match(pause.output, /^kodo project cancel\|pause PROJECT_ID/m);
+  const json = f.invoke(['project', 'bootstrap', '--help']);
+  assert.equal(json.exitCode, 0);
+  assert.equal(json.report.result.status, 'help');
+  assert.equal(json.report.result.usage.length, 1);
+  assert.match(json.report.result.usage[0], /^kodo project bootstrap "IDEA" --root PATH /);
+  await assert.rejects(access(f.home), 'help creates no state');
+  // In process: no port is touched either.
+  const { projectCli } = await load();
+  const ports = {
+    loadSecrets: () => assert.fail('help never loads credentials'),
+    openStore: () => assert.fail('help never opens state'),
+  };
+  for (const args of [['--help'], ['help'], ['drain', '--help'], ['apply-spec', '-h', '--json']]) {
+    const result = await projectCli(args, ports);
+    assert.equal(result.exitCode, 0, args.join(' '));
+    assert.equal(result.report.result.status, 'help');
+  }
+  // `help <action>` names the action; an abandon names its attempt.
+  const named = await projectCli(['help', 'next-wave'], ports);
+  assert.deepEqual(named.report.result.usage, [
+    'kodo project next-wave PROJECT_ID --host t3|orca [--limit 1..5] [--retry-failed] [--json]',
+  ]);
+  const complete = await projectCli(['complete-task', '--help'], ports);
+  assert.ok(
+    complete.report.result.usage.includes(
+      'kodo project complete-task PROJECT_ID TASK_ID --head SHA --abandon --attempt UUID [--command-id UUID] [--json]',
+    ),
+    complete.output,
+  );
+  assert.ok(complete.report.result.usage.every(line => !line.includes('[--defer-gate|--abandon]')));
+});
+
 test('Legacy catalog commands and help retain their CLI routes', async t => {
   const f = await fixture(t);
   const help = f.invoke(['--help'], false);

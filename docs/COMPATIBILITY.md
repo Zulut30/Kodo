@@ -24,7 +24,7 @@ Claude Code запускается через обычный `claude -p` с ав
 
 OpenCode пока служит точкой запуска навыка с настроенным backend Codex или Claude. Отдельное исполнение дешёвыми моделями OpenCode не входит в этот этап.
 
-Видимость чатов зависит от host-клиента. Координатор в Codex desktop использует доступные `create_thread`, `wait_threads`, `set_thread_archived` для реальной порученной работы и обратимого архивирования собственных чатов. Основной диспетчер остаётся активным. Обычный Codex/Claude CLI session ID подтверждает native-сессию и возможность resume, но не появление чата в приложении. CLI не содержит универсального desktop chat backend; интеграция видимых чатов Claude Code не заявляется без соответствующей возможности host. [Порядок работы](../skills/kodo-build-feature/SKILL.md).
+Видимость чатов зависит от host-клиента. Координатор в Codex desktop использует доступные `create_thread`, `wait_threads`, `set_thread_archived` для реальной порученной работы и обратимого архивирования собственных чатов; в T3 Code — `delegate_task`, `t3_thread_send` и `t3_thread_organize` с `action: "archive"` ([T3-HOST.md](T3-HOST.md)). Основной диспетчер остаётся активным. Обычный Codex/Claude CLI session ID подтверждает native-сессию и возможность resume, но не появление чата в приложении. CLI не содержит универсального desktop chat backend; интеграция видимых чатов Claude Code не заявляется без соответствующей возможности host. [Порядок работы](../skills/kodo-build-feature/SKILL.md).
 
 ## Внешние API
 

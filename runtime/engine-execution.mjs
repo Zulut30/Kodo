@@ -8,6 +8,7 @@ import { execute } from './command.mjs';
 import { git, makeWorktree, changedFiles, commitChanges } from './workspace.mjs';
 import { taskContract } from './task-context.mjs';
 import { runReadyQueue } from './task-scheduler.mjs';
+import { TASK_FAST_PROFILE } from './task-fast-checks.mjs';
 import { executeDurableTasks } from './engine-jobs.mjs';
 import { normalizeWatchdogConfig, unchanged } from './watchdog.mjs';
 import { EnginePlanning } from './engine-planning.mjs';
@@ -15,7 +16,18 @@ import { contentHash, evidencePrompt, lstatSafe } from './engine-core.mjs';
 
 /** Node execution, integration and base synchronization stages. */
 export class EngineExecution extends EnginePlanning {
-  async checkScope(cwd, baseSha, scopes) {
+  /** The node (or repair) scope check; a wave task Run (task-fast) also keeps its actual
+   * changes inside the frozen ProjectTask writePaths, not only inside the plan's node scopes. */
+  async checkTaskScope(run, cwd, baseSha, scopes) {
+    if (run.verificationProfile !== TASK_FAST_PROFILE || !run.directorBinding)
+      return this.checkScope(cwd, baseSha, scopes);
+    const { directorTaskWritePaths } = await import('./project-contracts.mjs');
+    const knownValues = Object.values(this.secrets || {}).filter(value => typeof value === 'string');
+    return this.checkScope(cwd, baseSha, scopes, directorTaskWritePaths(run.task, { knownValues }));
+  }
+  /** One scan of the changes since baseSha; every file must be inside `scopes` and, when
+   * given, inside the frozen task scope too. */
+  async checkScope(cwd, baseSha, scopes, frozen = null) {
     const tracked = await changedFiles(cwd, baseSha);
     // Never trimmed: a NUL-separated name may begin with whitespace or U+FEFF.
     const untracked = (
@@ -24,7 +36,9 @@ export class EngineExecution extends EnginePlanning {
       .split('\0')
       .filter(Boolean);
     const files = [...new Set([...tracked, ...untracked])];
-    const outside = files.filter(name => !ownsPath(scopes, name) || secretFile(name));
+    const outside = files.filter(
+      name => !ownsPath(scopes, name) || (frozen && !ownsPath(frozen, name)) || secretFile(name),
+    );
     if (outside.length)
       throw Object.assign(new Error(`Изменены файлы вне области задачи: ${outside.join(', ')}`), {
         code: 'scope_conflict',
@@ -93,7 +107,7 @@ export class EngineExecution extends EnginePlanning {
         allowFailure: true,
       });
       if (pending.code !== 0 && included.code === 0) {
-        await this.checkScope(node.cwd, target, task.writePaths);
+        await this.checkTaskScope(run, node.cwd, target, task.writePaths);
         node.baseSha = target;
         delete node.pendingRefresh;
         this.save(run);
@@ -101,7 +115,7 @@ export class EngineExecution extends EnginePlanning {
       }
       let merged = { code: 1 };
       if (pending.code !== 0) {
-        await this.checkScope(node.cwd, node.baseSha, task.writePaths);
+        await this.checkTaskScope(run, node.cwd, node.baseSha, task.writePaths);
         await commitChanges(node.cwd, `Kodo preserve ${task.id} before base refresh`);
         node.pendingRefresh = { headSha: target, model: selected.id };
         this.save(run);
@@ -142,11 +156,14 @@ export class EngineExecution extends EnginePlanning {
             undefined,
             state,
           );
+          // A wave task checks the resolver's actual diff before its completion report.
+          if (run.verificationProfile === TASK_FAST_PROFILE)
+            await this.checkTaskScope(run, node.cwd, target, task.writePaths);
           if (!result.output.complete) throw new Error('Конфликт обновления задачи не разрешён');
           state.sessionId = result.sessionId;
           this.save(run);
         }
-        await this.checkScope(node.cwd, target, task.writePaths);
+        await this.checkTaskScope(run, node.cwd, target, task.writePaths);
         await git(node.cwd, ['add', '-A']);
         await execute(
           'git',
@@ -161,7 +178,7 @@ export class EngineExecution extends EnginePlanning {
         );
         await commitChanges(node.cwd, `Kodo refresh ${task.id}`);
       }
-      await this.checkScope(node.cwd, target, task.writePaths);
+      await this.checkTaskScope(run, node.cwd, target, task.writePaths);
       node.baseSha = target;
       delete node.pendingRefresh;
       this.save(run);
@@ -245,8 +262,14 @@ export class EngineExecution extends EnginePlanning {
         node.model = selected.id;
         node.sessionId = result.sessionId;
         node.result = validate(resultSchema, result.output);
+        // A wave task checks its worktree first: a write outside writePaths is its blocker
+        // even when the worker reports an incomplete result. The one scan is reused below.
+        const scanned =
+          run.verificationProfile === TASK_FAST_PROFILE
+            ? await this.checkTaskScope(run, node.cwd, node.baseSha, task.writePaths)
+            : null;
         if (!node.result.complete) throw new Error(`Исполнитель не завершил задачу: ${node.result.summary}`);
-        node.changedFiles = await this.checkScope(node.cwd, node.baseSha, task.writePaths);
+        node.changedFiles = scanned ?? (await this.checkTaskScope(run, node.cwd, node.baseSha, task.writePaths));
         if (normalizeWatchdogConfig(run.config.watchdog).rejectUnchanged && (await unchanged(node.cwd, node.baseSha)))
           throw new Error('Узел ничего не изменил: его рабочее дерево совпадает с базой');
         node.headSha = await commitChanges(node.cwd, `Kodo ${task.id}: ${run.task.slice(0, 100)}`);
@@ -287,8 +310,15 @@ export class EngineExecution extends EnginePlanning {
         const repeated = node.lastFailure === signature;
         node.lastFailure = signature;
         this.save(run);
-        if (repeated || node.attempt >= run.config.repairRounds) {
-          node.stopped = node.attempt >= run.config.repairRounds ? 'repair_budget_exhausted' : 'no_progress';
+        // A wave task (task-fast) owns only its writePaths: a write outside them is the task's
+        // blocker with its own code, not a defect for another repair session.
+        const scopeStop = error.code === 'scope_conflict' && run.verificationProfile === TASK_FAST_PROFILE;
+        if (scopeStop || repeated || node.attempt >= run.config.repairRounds) {
+          node.stopped = scopeStop
+            ? 'scope_conflict'
+            : node.attempt >= run.config.repairRounds
+              ? 'repair_budget_exhausted'
+              : 'no_progress';
           node.status = 'blocked';
           this.assess(run, { scope: task.id, attempts: node.attempt, reason: node.stopped, problem: node.error });
           throw Object.assign(new Error(`Нет прогресса в ${task.id}: ${node.error}`), {
