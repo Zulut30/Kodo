@@ -1,17 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { validatePlan } from '../runtime/contracts.mjs';
 import { defaultFixtures } from '../runtime/benchmark-fixtures.mjs';
 import {
   FAST_PATH_LIMITS,
+  FAST_PATH_VERSION,
   classifyLocalTask,
   fastPathAllowsPlan,
+  fastPathOutdated,
   fastPathPlan,
-  regressionTestPaths,
 } from '../runtime/fast-path.mjs';
 
 /** A committed repository with `files`; returns a git runner for extra setup. */
@@ -45,6 +46,7 @@ function fixture(t) {
     'src/app.mjs': 'export const app = 1;\n',
     'src/view.tsx': 'export const View = () => null;\n',
     'src/big.js': `// ${'x'.repeat(FAST_PATH_LIMITS.fileBytes)}\n`,
+    'tests/app.test.mjs': "import '../src/app.mjs';\n",
     'index.html': '<h1>Title</h1>\n',
     'verify.cjs': "require('node:assert');\n",
     'dist/app.js': 'export {};\n',
@@ -65,15 +67,9 @@ function fixture(t) {
   return cwd;
 }
 
-/** The decision of a style proof: its write list is exactly its files. */
+/** A proof writes exactly the files it names, whatever its kind. */
 const style = (...files) => ({ fastPath: true, reason: 'style_only', files, writePaths: files });
-/** The decision of a code proof: the files plus the regression tests of its sources. */
-const code = (...files) => ({
-  fastPath: true,
-  reason: 'small_local',
-  files,
-  writePaths: [...files, ...files.flatMap(regressionTestPaths)],
-});
+const code = (...files) => ({ fastPath: true, reason: 'small_local', files, writePaths: files });
 
 test('A short task naming only existing tracked style files is a fast path', async t => {
   const cwd = fixture(t);
@@ -113,7 +109,7 @@ test('A class selector next to proven style files is not a path', async t => {
     assert.deepEqual(await classifyLocalTask({ cwd, task }), style(button), task);
 });
 
-test('Names in a command are arguments to run, not targets to write', async t => {
+test('Names after a known interpreter or package manager are arguments, not targets', async t => {
   // The benchmark prompt: `verify.cjs` is the check to run, not a file to edit.
   const [buttonColor] = defaultFixtures;
   const benchmark = repository(t, buttonColor.files);
@@ -121,11 +117,10 @@ test('Names in a command are arguments to run, not targets to write', async t =>
   const cwd = fixture(t);
   for (const task of [
     'Fix the off-by-one error in src/app.mjs. Run node verify.cjs.',
-    'Fix the off-by-one error in src/app.mjs and run `node --test tests/app.test.mjs`',
-    'Fix the off-by-one error in src/app.mjs, then execute verify.cjs',
     'Исправь ошибку в src/app.mjs и запусти node verify.cjs',
-    'Исправь ошибку в src/app.mjs, выполни `npm run check -- verify.cjs`',
     'Fix the off-by-one error in src/app.mjs and run npm test',
+    'Fix the off-by-one error in src/app.mjs, then npm run check',
+    'Fix the off-by-one error in src/app.mjs. Edit only src/app.mjs.',
   ])
     assert.deepEqual(await classifyLocalTask({ cwd, task }), code('src/app.mjs'), task);
   // A name that is also a target outside the command is a target.
@@ -145,18 +140,19 @@ test('Names in a command are arguments to run, not targets to write', async t =>
   });
 });
 
-test('A task that restricts the edit gets no test paths', async t => {
+test('A code proof writes only the named files; a test is writable only when it is named', async t => {
   const cwd = fixture(t);
-  for (const task of [
-    'Fix the off-by-one error in src/app.mjs. Edit only src/app.mjs.',
-    'Исправь ошибку только в src/app.mjs',
-    'Fix the off-by-one error in src/app.mjs; do not touch other files',
-  ])
-    assert.deepEqual(
-      await classifyLocalTask({ cwd, task }),
-      { fastPath: true, reason: 'small_local', files: ['src/app.mjs'], writePaths: ['src/app.mjs'] },
-      task,
-    );
+  assert.deepEqual(
+    await classifyLocalTask({ cwd, task: 'Fix the off-by-one error in src/app.mjs' }),
+    code('src/app.mjs'),
+  );
+  assert.deepEqual(
+    await classifyLocalTask({
+      cwd,
+      task: 'Fix the off-by-one error in src/app.mjs and cover it in tests/app.test.mjs',
+    }),
+    code('src/app.mjs', 'tests/app.test.mjs'),
+  );
 });
 
 test('Updating or deleting the content of named files is not a risk marker', async t => {
@@ -181,10 +177,6 @@ test('Updating or deleting the content of named files is not a risk marker', asy
 test('One to three small tracked source files are a small local code change', async t => {
   const cwd = fixture(t);
   assert.deepEqual(
-    await classifyLocalTask({ cwd, task: 'Fix the off-by-one error in src/app.mjs' }),
-    code('src/app.mjs'),
-  );
-  assert.deepEqual(
     await classifyLocalTask({ cwd, task: 'Make src/styles/button.css blue and update src/app.mjs' }),
     code('src/app.mjs', 'src/styles/button.css'),
     'a style file next to a source file makes the code kind',
@@ -195,34 +187,62 @@ test('One to three small tracked source files are a small local code change', as
   );
 });
 
-test('Regression test paths are a fixed list derived from the named sources', () => {
-  const paths = regressionTestPaths('src/app.mjs');
-  for (const expected of [
-    'tests/app.test.mjs',
-    'test/app.test.mjs',
-    'src/app.test.mjs',
-    'src/__tests__/app.test.mjs',
-    'tests/app.spec.mjs',
-    'src/__tests__/app.spec.js',
-  ])
-    assert.ok(paths.includes(expected), expected);
-  for (const forbidden of [
-    'tsconfig.test.json',
-    'tests/package.json',
-    'tests/helpers/app.mjs',
-    'tests/fixtures/app.test.mjs',
-    'tests/app.test.ts',
-    'src/app.mjs',
-  ])
-    assert.ok(!paths.includes(forbidden), forbidden);
-  assert.ok(
-    paths.every(name => !/[*?[\]{}]/.test(name)),
-    'literal paths, no masks',
+test('With core.ignorecase the canonical index name is used; an ambiguous name is doubt', async t => {
+  const repo = repository(t, { 'src/app.mjs': 'export const app = 1;\n' });
+  repo.git('config', 'core.ignorecase', 'true');
+  assert.deepEqual(
+    await classifyLocalTask({ cwd: repo.cwd, task: 'Fix the off-by-one error in SRC/App.mjs' }),
+    code('src/app.mjs'),
   );
-  assert.ok(regressionTestPaths('src/view.tsx').includes('src/__tests__/view.test.tsx'));
-  assert.ok(regressionTestPaths('app.ts').includes('__tests__/app.spec.ts'));
-  assert.deepEqual(regressionTestPaths('src/styles/button.css'), [], 'styles get no tests');
-  assert.deepEqual(regressionTestPaths('index.html'), []);
+  const blob = spawnSync('git', ['hash-object', '-w', '--stdin'], { cwd: repo.cwd, input: 'x', encoding: 'utf8' });
+  repo.git('update-index', '--add', '--cacheinfo', `100644,${blob.stdout.trim()},src/APP.mjs`);
+  assert.deepEqual(await classifyLocalTask({ cwd: repo.cwd, task: 'Fix the off-by-one error in src/app.mjs' }), {
+    fastPath: false,
+    reason: 'path_ambiguous',
+  });
+});
+
+test('A named file reached through a linked directory is outside the worktree', async t => {
+  const repo = repository(t, { 'inside/app.mjs': 'export const app = 1;\n' });
+  const outside = mkdtempSync(path.join(os.tmpdir(), 'kodo-fast-path-outside-'));
+  t.after(() => rmSync(outside, { recursive: true, force: true }));
+  writeFileSync(path.join(outside, 'app.mjs'), 'export const app = 2;\n');
+  rmSync(path.join(repo.cwd, 'inside'), { recursive: true, force: true });
+  try {
+    symlinkSync(outside, path.join(repo.cwd, 'inside'), process.platform === 'win32' ? 'junction' : 'dir');
+  } catch (error) {
+    t.skip(`cannot create a directory link here: ${error.code}`);
+    return;
+  }
+  // The index still records `inside/app.mjs` as a regular file.
+  assert.deepEqual(await classifyLocalTask({ cwd: repo.cwd, task: 'Fix inside/app.mjs' }), {
+    fastPath: false,
+    reason: 'path_outside',
+  });
+});
+
+test('Every ambiguity is doubt, not a guess', async t => {
+  const cwd = fixture(t);
+  const cases = [
+    // An exclusion or negation next to a path.
+    'Fix src/app.mjs except src/view.tsx',
+    'Fix src/app.mjs without touching src/view.tsx',
+    'Fix src/app.mjs; do not change src/view.tsx',
+    "Fix src/app.mjs but don't modify src/view.tsx",
+    'Исправь src/app.mjs, не меняй src/view.tsx',
+    'Исправь src/app.mjs, но не трогай src/view.tsx',
+    'Исправь всё в src/app.mjs кроме экспорта',
+    // A run verb with an unknown way to run a name, or an unknown tool with options.
+    'Fix src/app.mjs, then execute verify.cjs',
+    'Fix src/app.mjs and run eslint on src/view.tsx',
+    'Исправь src/app.mjs и запусти verify.cjs',
+    'Fix src/app.mjs; eslint --fix src/view.tsx',
+    // Several words in backticks: a command whose meaning is not read.
+    'Fix src/app.mjs and run `node --test tests/app.test.mjs`',
+    'Исправь src/app.mjs, выполни `npm run check`',
+  ];
+  for (const task of cases)
+    assert.deepEqual(await classifyLocalTask({ cwd, task }), { fastPath: false, reason: 'ambiguous' }, task);
 });
 
 test('Every doubt returns the ordinary route with its reason', async t => {
@@ -241,11 +261,17 @@ test('Every doubt returns the ordinary route with its reason', async t => {
     [{ task: `Удали файл ${button}` }, 'risk_marker'],
     [{ task: `Delete the file ${button}` }, 'risk_marker'],
     [{ task: 'Delete src/app.mjs' }, 'risk_marker'],
+    [{ task: 'Delete "src/app.mjs"' }, 'risk_marker'],
     [{ task: 'Удали src/app.mjs' }, 'risk_marker'],
+    [{ task: 'Удали «src/app.mjs»' }, 'risk_marker'],
+    [{ task: 'Run git rm -f src/app.mjs' }, 'risk_marker'],
     [{ task: `Remove ${button}` }, 'risk_marker'],
     [{ task: 'Create a new file next to src/app.mjs' }, 'risk_marker'],
     [{ task: 'Добавь файл рядом с src/app.mjs' }, 'risk_marker'],
     [{ task: 'Создай новый файл для src/app.mjs' }, 'risk_marker'],
+    [{ task: 'Create src/helper.mjs for src/app.mjs' }, 'risk_marker'],
+    [{ task: `Add .palette to ${button}` }, 'risk_marker'],
+    [{ task: `Добавь .palette в ${button}` }, 'risk_marker'],
     [{ task: `Обнови зависимости и цвет в ${button}` }, 'risk_marker'],
     [{ task: `Установи пакет для анимации в ${button}` }, 'risk_marker'],
     [{ task: 'Move the API key into src/app.mjs' }, 'risk_marker'],
@@ -259,7 +285,7 @@ test('Every doubt returns the ordinary route with its reason', async t => {
     [{ task: 'Make .button blue' }, 'no_paths'],
     [{ task: 'Make .button blue in src/app.mjs' }, 'non_style_path'],
     // A configuration or data name is never a selector or an argument-free mention.
-    [{ task: 'Add .pre-commit-config.yaml and edit src/app.mjs' }, 'non_style_path'],
+    [{ task: 'Read .pre-commit-config.yaml and edit src/app.mjs' }, 'non_style_path'],
     [{ task: `Make ${button} blue per .stylelintrc.json` }, 'non_style_path'],
     [{ task: 'Read settings.yaml in src/app.mjs' }, 'non_style_path'],
     [{ task: `Make ${button} blue as described in docs/design.md` }, 'non_style_path'],
@@ -312,6 +338,7 @@ test('A fast-path plan may write only the listed paths, literally', () => {
     plan(['src/styles/*.css']),
     plan(['src/styles']),
     plan(['src/styles/button.css'], ['tests/button.test.mjs']),
+    plan(['src/styles/button.css', '**/*.test.*']),
     plan([]),
     plan(),
     {},
@@ -320,67 +347,56 @@ test('A fast-path plan may write only the listed paths, literally', () => {
     assert.equal(fastPathAllowsPlan(outside, files), false, JSON.stringify(outside));
 });
 
-test('A small local code plan may also write the derived regression tests, and nothing else', () => {
-  const allowed = ['src/app.mjs', ...regressionTestPaths('src/app.mjs')];
-  const plan = (...scopes) => ({ tasks: scopes.map(writePaths => ({ writePaths })) });
-  for (const inside of [
-    plan(['src/app.mjs']),
-    plan(allowed),
-    plan(['src/app.mjs', 'tests/app.test.mjs']),
-    plan(['src/app.mjs'], ['src/__tests__/app.spec.mjs']),
-  ])
-    assert.equal(fastPathAllowsPlan(inside, allowed), true, JSON.stringify(inside));
-  for (const outside of [
-    plan(['src/app.mjs', 'src/other.mjs']),
-    plan(['src/app.mjs', 'tsconfig.test.json']),
-    plan(['src/app.mjs', 'tests/package.json']),
-    plan(['src/app.mjs', 'tests/helpers/app.mjs']),
-    plan(['src/app.mjs', '**/*.test.*']),
-    plan(['src/app.mjs', 'tests/**']),
-    plan(['src/app.mjs', 'tests/.env']),
-    plan(['src/**']),
-  ])
-    assert.equal(fastPathAllowsPlan(outside, allowed), false, JSON.stringify(outside));
-});
-
-test('The local fast-path plan is one deterministic, valid developer node inside the proof', () => {
+test('The local fast-path plan is one deterministic, valid developer node of the named files', () => {
   const task = 'Fix the off-by-one error in src/app.mjs';
-  const proof = code('src/app.mjs');
+  const proof = { ...code('src/app.mjs'), version: FAST_PATH_VERSION };
   const plan = fastPathPlan(task, proof);
   assert.deepEqual(plan, fastPathPlan(task, proof), 'deterministic');
   validatePlan(plan);
   assert.equal(plan.tasks.length, 1);
   const [node] = plan.tasks;
   assert.deepEqual([node.role, node.dependsOn, node.parallel], ['developer', [], false]);
-  assert.deepEqual(node.writePaths, proof.writePaths, 'the same list as the proof');
+  assert.deepEqual(node.writePaths, ['src/app.mjs'], 'only the named file');
   assert.ok(node.description.includes(task), 'the full task reaches the worker');
-  assert.ok(
-    node.acceptance.some(item => /regression test/i.test(item)),
-    'a behaviour change needs a regression test',
-  );
-  assert.ok(
-    !node.acceptance.some(item => /is made in src\/app\.mjs/.test(item)),
-    'no demand to change every named file',
-  );
+  assert.ok(!node.acceptance.some(item => /regression test|test file/i.test(item)), 'no test is demanded');
+  assert.ok(!node.acceptance.some(item => /is made in src\/app\.mjs/.test(item)), 'no demand to change every file');
   assert.equal(fastPathAllowsPlan(plan, proof.writePaths), true);
 
-  // A restricted edit asks for no test.
-  const restricted = fastPathPlan(`${task}. Edit only src/app.mjs.`, {
-    reason: 'small_local',
-    files: ['src/app.mjs'],
-    writePaths: ['src/app.mjs'],
+  // A named test is the one test the node may and should update.
+  const tested = fastPathPlan(`${task} and cover it in tests/app.test.mjs`, {
+    ...code('src/app.mjs', 'tests/app.test.mjs'),
+    version: FAST_PATH_VERSION,
   });
-  assert.deepEqual(restricted.tasks[0].writePaths, ['src/app.mjs']);
-  assert.ok(!restricted.tasks[0].acceptance.some(item => /regression test/i.test(item)));
+  assert.deepEqual(tested.tasks[0].writePaths, ['src/app.mjs', 'tests/app.test.mjs']);
+  assert.ok(tested.tasks[0].acceptance.some(item => item.includes('tests/app.test.mjs')));
 
   const styled = fastPathPlan('Make src/styles/button.css blue', style('src/styles/button.css'));
   validatePlan(styled);
   assert.deepEqual(styled.tasks[0].writePaths, ['src/styles/button.css']);
-  assert.ok(!styled.tasks[0].acceptance.some(item => /regression test/i.test(item)));
 
-  // A proof saved before the kind and the list were recorded is a style proof of its files.
+  // A style proof saved before the kind and the list were recorded is a style proof of its files.
   const legacy = fastPathPlan('Make a.css blue', { files: ['a.css'] });
   assert.doesNotMatch(legacy.summary, /undefined/);
   assert.match(legacy.summary, /style_only/);
   assert.deepEqual(legacy.tasks[0].writePaths, ['a.css']);
+});
+
+test('A saved code proof of an unreleased intermediate format is outdated; a style proof is not', () => {
+  assert.equal(fastPathOutdated({ version: 1, reason: 'style_only', files: ['a.css'] }), false);
+  assert.equal(fastPathOutdated({ files: ['a.css'] }), false);
+  assert.equal(fastPathOutdated({ version: 2, reason: 'small_local', files: ['a.mjs'] }), true, 'no write list');
+  assert.equal(
+    fastPathOutdated({
+      version: 2,
+      reason: 'small_local',
+      files: ['a.mjs'],
+      writePaths: ['a.mjs', 'tests/a.test.mjs'],
+    }),
+    true,
+    'derived test paths',
+  );
+  assert.equal(
+    fastPathOutdated({ version: FAST_PATH_VERSION, reason: 'small_local', files: ['a.mjs'], writePaths: ['a.mjs'] }),
+    false,
+  );
 });

@@ -17,20 +17,35 @@ import { fastPathScope } from './fast-path.mjs';
 /** Node execution, integration and base synchronization stages. */
 export class EngineExecution extends EnginePlanning {
   /**
-   * A fast-path diff may contain only the proof's listed paths, compared literally: a scope check
-   * by prefix would also accept a new directory named like a listed test file.
+   * A fast-path diff may contain only the proof's named files, compared literally (a scope check by
+   * prefix would also accept the contents of a directory named like a file), and a named file stays
+   * a regular file: deleting it, or replacing it with a directory, is refused. `extra` are the
+   * coordinator's own version-metadata files that a commit may also carry.
    * @param {any} run
+   * @param {string} cwd
    * @param {string[]} files
+   * @param {string[]} [extra]
    */
-  assertFastPathDiff(run, files) {
+  async assertFastPathDiff(run, cwd, files, extra = []) {
     if (run.executionMode?.source !== 'fast-path') return files;
     const listed = new Set(fastPathScope(run.fastPath));
-    const outside = files.filter(name => !listed.has(name));
+    const outside = files.filter(name => !listed.has(name) && !extra.includes(name));
     if (outside.length)
       throw Object.assign(new Error(`Изменены файлы вне списка быстрого пути: ${outside.join(', ')}`), {
         code: 'scope_conflict',
       });
+    for (const name of files.filter(item => listed.has(item)))
+      if (!(await lstatSafe(path.join(cwd, name)))?.isFile())
+        throw Object.assign(new Error(`Файл быстрого пути удалён или заменён: ${name}`), { code: 'scope_conflict' });
     return files;
+  }
+  /**
+   * The scope check before every commit of executor changes: the ordinary scope check and, for a
+   * fast path, the exact check of the same changes. `base` is the incoming base, so its own
+   * changes are not counted as the executor's.
+   */
+  async checkRunScope(run, cwd, base, scopes, extra = []) {
+    return this.assertFastPathDiff(run, cwd, await this.checkScope(cwd, base, scopes), extra);
   }
   async checkScope(cwd, baseSha, scopes) {
     const tracked = await changedFiles(cwd, baseSha);
@@ -110,7 +125,7 @@ export class EngineExecution extends EnginePlanning {
         allowFailure: true,
       });
       if (pending.code !== 0 && included.code === 0) {
-        await this.checkScope(node.cwd, target, task.writePaths);
+        await this.checkRunScope(run, node.cwd, target, task.writePaths);
         node.baseSha = target;
         delete node.pendingRefresh;
         this.save(run);
@@ -118,7 +133,7 @@ export class EngineExecution extends EnginePlanning {
       }
       let merged = { code: 1 };
       if (pending.code !== 0) {
-        await this.checkScope(node.cwd, node.baseSha, task.writePaths);
+        await this.checkRunScope(run, node.cwd, node.baseSha, task.writePaths);
         await commitChanges(node.cwd, `Kodo preserve ${task.id} before base refresh`);
         node.pendingRefresh = { headSha: target, model: selected.id };
         this.save(run);
@@ -163,7 +178,7 @@ export class EngineExecution extends EnginePlanning {
           state.sessionId = result.sessionId;
           this.save(run);
         }
-        await this.checkScope(node.cwd, target, task.writePaths);
+        await this.checkRunScope(run, node.cwd, target, task.writePaths);
         await git(node.cwd, ['add', '-A']);
         await execute(
           'git',
@@ -178,7 +193,7 @@ export class EngineExecution extends EnginePlanning {
         );
         await commitChanges(node.cwd, `Kodo refresh ${task.id}`);
       }
-      await this.checkScope(node.cwd, target, task.writePaths);
+      await this.checkRunScope(run, node.cwd, target, task.writePaths);
       node.baseSha = target;
       delete node.pendingRefresh;
       this.save(run);
@@ -263,10 +278,7 @@ export class EngineExecution extends EnginePlanning {
         node.sessionId = result.sessionId;
         node.result = validate(resultSchema, result.output);
         if (!node.result.complete) throw new Error(`Исполнитель не завершил задачу: ${node.result.summary}`);
-        node.changedFiles = this.assertFastPathDiff(
-          run,
-          await this.checkScope(node.cwd, node.baseSha, task.writePaths),
-        );
+        node.changedFiles = await this.checkRunScope(run, node.cwd, node.baseSha, task.writePaths);
         if (normalizeWatchdogConfig(run.config.watchdog).rejectUnchanged && (await unchanged(node.cwd, node.baseSha)))
           throw new Error('Узел ничего не изменил: его рабочее дерево совпадает с базой');
         node.headSha = await commitChanges(node.cwd, `Kodo ${task.id}: ${run.task.slice(0, 100)}`);
@@ -368,7 +380,8 @@ export class EngineExecution extends EnginePlanning {
           );
           if (!response.output.complete) throw new Error('Конфликт интеграции не разрешён');
         }
-        await this.checkScope(
+        await this.checkRunScope(
+          run,
           run.cwd,
           beforeMerge,
           run.plan.tasks.flatMap(item => item.writePaths),
@@ -501,7 +514,13 @@ export class EngineExecution extends EnginePlanning {
         );
         if (!result.output.complete) throw new Error('Конфликт целевой ветки не разрешён');
       }
-      await this.checkScope(run.cwd, base, [...run.plan.tasks.flatMap(task => task.writePaths), ...conflicts]);
+      await this.checkRunScope(
+        run,
+        run.cwd,
+        base,
+        [...run.plan.tasks.flatMap(task => task.writePaths), ...conflicts],
+        run.releaseAssignment?.version ? ['package.json', 'package-lock.json', 'registry.json'] : [],
+      );
       await git(run.cwd, ['add', '-A']);
       await execute(
         'git',
@@ -535,7 +554,8 @@ export class EngineExecution extends EnginePlanning {
       }
     }
     if (await git(run.cwd, ['status', '--porcelain'])) {
-      const scopes = run.plan.tasks.flatMap(task => task.writePaths);
+      const scopes = run.plan.tasks.flatMap(task => task.writePaths),
+        metadata = [];
       if (run.config.delivery.release && run.releaseAssignment?.version) {
         const changed = await changedFiles(run.cwd, 'HEAD');
         for (const name of ['package.json', 'package-lock.json', 'registry.json'].filter(
@@ -559,9 +579,10 @@ export class EngineExecution extends EnginePlanning {
               code: 'scope_conflict',
             });
           scopes.push(name);
+          metadata.push(name);
         }
       }
-      await this.checkScope(run.cwd, 'HEAD', scopes);
+      await this.checkRunScope(run, run.cwd, 'HEAD', scopes, metadata);
       run.headSha = await commitChanges(run.cwd, 'Kodo recover scoped interrupted repair');
       run.checks = null;
       run.review = null;

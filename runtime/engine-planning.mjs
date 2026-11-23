@@ -5,7 +5,14 @@ import { validate, validatePlan, planSchema, routingSchema, scopesOverlap } from
 import { git, makeWorktree, collectFiles } from './workspace.mjs';
 import { maxTaskContractBytes, validateTaskContract } from './task-context.mjs';
 import { assessTask, resolveMode } from './modes.mjs';
-import { FAST_PATH_VERSION, classifyLocalTask, fastPathAllowsPlan, fastPathPlan, fastPathScope } from './fast-path.mjs';
+import {
+  FAST_PATH_VERSION,
+  classifyLocalTask,
+  fastPathAllowsPlan,
+  fastPathOutdated,
+  fastPathPlan,
+  fastPathScope,
+} from './fast-path.mjs';
 import { EngineCore, contentHash, defaultModel, evidencePrompt, lstatSafe } from './engine-core.mjs';
 
 /** Assessment, research, planning and routing stages. */
@@ -124,17 +131,42 @@ export class EnginePlanning extends EngineCore {
   async fastPathGuard(run, candidate, signal) {
     if (run.executionMode?.source !== 'fast-path' || fastPathAllowsPlan(candidate, fastPathScope(run.fastPath)))
       return false;
+    await this.revokeFastPath(run, 'plan_outside_proof', signal);
+    return true;
+  }
+  /** Restore the saved budgets and take the ordinary route (assessment, analysis) from the start. */
+  async revokeFastPath(run, reason, signal) {
     for (const key of budgetKeys) {
       if (run.fastPath.budgets[key] === null) delete run.config[key];
       else run.config[key] = run.fastPath.budgets[key];
     }
-    run.fastPath = { ...run.fastPath, revoked: 'plan_outside_proof' };
+    run.fastPath = { ...run.fastPath, revoked: reason };
     delete run.executionMode;
     delete run.completed.analysis;
-    this.log(run, 'fast_path_revoked', { reason: run.fastPath.revoked });
+    this.log(run, 'fast_path_revoked', { reason });
     this.save(run);
     await this.prepare(run, signal);
-    return true;
+  }
+  /**
+   * A saved code proof of an unreleased intermediate format (no write list, or test paths beyond
+   * its files) is not migrated: before any worker starts, its plan is dropped and the ordinary
+   * route plans again. Once a node has worked under it, the run stops with that reason instead.
+   */
+  async revokeOutdatedFastPath(run, signal) {
+    if (run.executionMode?.source !== 'fast-path' || !fastPathOutdated(run.fastPath)) return;
+    if (
+      Object.values(run.nodes || {}).some(node => node.attempt > 0 || ['completed', 'integrated'].includes(node.status))
+    )
+      throw Object.assign(
+        new Error(
+          'Сохранённое доказательство быстрого пути устарело, а работа по его плану уже начата; нужен новый запуск',
+        ),
+        { code: 'fast_path_outdated' },
+      );
+    delete run.plan;
+    delete run.planSource;
+    run.nodes = {};
+    await this.revokeFastPath(run, 'proof_outdated', signal);
   }
   async prepare(run, signal) {
     await makeWorktree(run.project, run.cwd, run.branch, run.baseSha);
@@ -257,6 +289,7 @@ export class EnginePlanning extends EngineCore {
   }
   async plan(run, planFile, signal) {
     await this.policy(run, 'plan');
+    await this.revokeOutdatedFastPath(run, signal);
     if (planFile) {
       const candidate = JSON.parse(await readFile(planFile, 'utf8'));
       // A broken, oversized or forbidden plan is refused before it can change the mode of the run.

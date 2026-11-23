@@ -1,16 +1,17 @@
 /** Deterministic fast path: a local proof, made without any model, that a task
  * is a small change of a few named files — style files only (`style_only`) or
  * one to three small source files (`small_local`). Only a positive proof
- * selects it; every doubt returns the ordinary route (Jev assessment, then
- * quick/standard/deep). The proof is re-checked against the plan: a plan that
- * writes anything else revokes the fast path.
+ * selects it; every doubt or ambiguity returns the ordinary route (Jev
+ * assessment, then quick/standard/deep). The proof writes exactly the files it
+ * names; it is re-checked against the plan and the actual diff.
  */
-import { lstat } from 'node:fs/promises';
+import { lstat, realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { execute } from './command.mjs';
 import { secretFile } from './security.mjs';
 
-export const FAST_PATH_VERSION = 2;
+/** 3: the write list is exactly the named files, also for `small_local`. */
+export const FAST_PATH_VERSION = 3;
 export const STYLE_EXTENSIONS = Object.freeze(['.css', '.scss', '.sass', '.less', '.styl', '.pcss']);
 /**
  * Front-end and JavaScript/TypeScript sources whose effect stays inside code that the project's
@@ -60,126 +61,115 @@ const riskMarkers = [
   /\b(?:add|create)\s+(?:an?\s+|the\s+)?(?:new\s+)?files?\b|\bnew\s+files?\b/i,
   /(?:созда|добав)\S*\s+(?:нов\S*\s+)?файл|(?<![а-яё])нов\S*\s+файл/i,
 ];
-/** The task limits the edit: no test beyond the named files. */
-const restricted =
-  /\bonly\b|\bexclusively\b|\bnothing else\b|\bno other files?\b|\bdo(?:n't| not) (?:edit|change|modify|touch|add|create|write)\b|(?<![а-яё])(?:только|лишь|исключительно)(?![а-яё])|ничего (?:больше|другого|кроме)|не (?:трогай|меняй|изменяй|редактируй|добавляй|создавай|пиши)/i;
+/** An exclusion or negation: which files must stay is not read, so it is doubt. */
+const exclusion =
+  /\b(?:except|excluding|exclude|without\s+(?:touching|changing|modifying|editing)|do(?:n't|\s+not)\s+(?:change|modify|touch|edit|alter)|leave\s+\S+(?:\s+\S+)?\s+(?:untouched|unchanged|as\s+is))\b|(?<![а-яё])кроме(?![а-яё])|не\s+(?:меняй|трогай|изменяй|редактируй|правь|затрагивай)|без\s+изменени/i;
 
 const cssNumber = /^\d+(?:\.\d+)?(?:px|rem|em|ex|ch|vh|vw|vmin|vmax|pt|pc|cm|mm|in|s|ms|deg|rad|turn|fr|dpi|x|%)?$/i;
 
 /**
- * Words of the task that look like a file reference: anything with a slash,
- * or with a dot that is not sentence punctuation. `.env`, `обработчик.js`,
- * `a.7z`, `src/server` and `v1.2` all count; each must then be an allowed path
- * or, next to proven style files, a class selector.
+ * The words of the task, the single tokenization of every rule: quotes, brackets, backticks and
+ * commas separate words, sentence punctuation is not part of a word. A word that looks like a file
+ * reference has a slash or a dot that is not sentence punctuation: `.env`, `обработчик.js`, `a.7z`,
+ * `src/server` and `v1.2` all count; a plain number with an optional CSS unit does not.
  */
-function pathLike(task) {
-  return (
-    task
-      .split(/[\s"'`()[\]{}<>,«»‘’“”]+/)
-      .map(word => word.replace(/[.,;:!?]+$/, ''))
-      // A plain number with an optional CSS unit (`0.8`, `1.5rem`, `50%`) is a value, not a file.
-      // Any other suffix (`2.7z`, `1.0a`) still looks like a file.
-      .filter(word => (word.includes('/') || word.includes('.')) && !cssNumber.test(word))
-  );
+function wordsOf(task) {
+  return [...task.matchAll(/[^\s"'`()[\]{}<>,«»‘’“”]+/g)].map(match => ({
+    raw: match[0],
+    word: match[0].replace(/[.,;:!?]+$/, ''),
+    start: match.index,
+    end: match.index + match[0].length,
+  }));
 }
+const fileLike = word => (word.includes('/') || word.includes('.')) && !cssNumber.test(word);
 
 const runVerb = /^(?:run|execute|exec|запусти(?:те)?|запустить|выполни(?:те)?|выполнить)$/i;
 const interpreter = /^(?:node|deno|bun|tsx|ts-node|python3?)$/i;
-const packageManager = /^(?:npm|pnpm|yarn|npx)$/i;
+const packageManager = /^(?:npm|pnpm|yarn)$/i;
+const option = /^--?[A-Za-z][\w-]*(?:=\S*)?$/;
 const conjunction = /^(?:and|then|after|before|but|и|а|но|затем|потом|после|перед)$/i;
-const bare = token => token.replace(/^[("'«“‘]+|[)"'»”’.,;:!?]+$/g, '');
+const deleteVerb = /^(?:delete|remove|drop|erase|rm|удали(?:те)?|удалить|сотри(?:те)?|стереть|стери)$/i;
+const createVerb = /^(?:add|create|new|touch|создай(?:те)?|создать|добавь(?:те)?|добавить|нов(?:ый|ая|ое|ые))$/i;
+const filler = /^(?:the|this|that|a|an|file|files|module|файл|файлы|модуль|-\S*)$/i;
+
+/** The last word of a command that starts at `start`: before a conjunction, at sentence end, a comma or a line break. */
+function commandEnd(list, task, start) {
+  for (let index = start; index < list.length; index++) {
+    if (index > start && conjunction.test(list[index].word)) return index - 1;
+    const gap = list[index + 1] ? task.slice(list[index].end, list[index + 1].start) : '';
+    if (/[.;:!?]$/.test(list[index].raw) || /[,;\n]/.test(gap)) return index;
+  }
+  return list.length - 1;
+}
 
 /**
- * The task without its commands: a multi-word command in backticks, an interpreter or package
- * manager with its arguments (`node verify.cjs`, `npm run check`), and a run verb with its
- * command (`run X`, «запусти X»). A command ends at sentence punctuation, a line break or a
- * conjunction. Names inside a command are arguments to run, never targets to write.
+ * The words inside commands a known tool runs: an interpreter with its script (`node verify.cjs`)
+ * and a package manager with its script (`npm run check`, `npm test`), also after a run verb.
+ * `unknown` is set when a name is run some other way: a run verb before anything else, or an
+ * unknown tool with options (`eslint --fix X`). That is doubt, not a guess.
  */
-function withoutCommands(task) {
-  const text = task.replace(/`([^`]*)`/g, (whole, inner) =>
-    /\s/.test(inner.trim()) ? ' '.repeat(whole.length) : whole,
-  );
-  const tokens = [...text.matchAll(/\S+/g)];
-  const blank = new Set();
-  const pathy = word => /[./]/.test(word) && !cssNumber.test(word);
-  for (let index = 0; index < tokens.length; index++) {
-    const word = bare(tokens[index][0]),
-      next = tokens[index + 1] ? bare(tokens[index + 1][0]) : '';
+function commands(list, task) {
+  const inside = new Set();
+  for (let index = 0; index < list.length; index++) {
+    const word = list[index].word,
+      next = list[index + 1]?.word ?? '';
     let start = -1;
-    if (runVerb.test(word) && (interpreter.test(next) || packageManager.test(next) || pathy(next))) start = index + 1;
-    else if (interpreter.test(word) && (pathy(next) || next.startsWith('-'))) start = index;
-    else if (packageManager.test(word) && next) start = index;
-    if (start < 0) continue;
-    let end = start;
-    for (; end < tokens.length; end++) {
-      if (end > start && conjunction.test(bare(tokens[end][0]))) {
-        end--;
-        break;
-      }
-      blank.add(end);
-      const after = tokens[end + 1];
-      if (
-        /[.;,!?]$/.test(tokens[end][0]) ||
-        (after && text.slice(tokens[end].index + tokens[end][0].length, after.index).includes('\n'))
-      )
-        break;
+    if (runVerb.test(word) && !interpreter.test(next) && !packageManager.test(next)) {
+      const end = commandEnd(list, task, index + 1);
+      if (list.slice(index + 1, end + 1).some(item => fileLike(item.word))) return { inside, unknown: true };
+      continue;
     }
-    index = Math.max(index, end);
+    if (interpreter.test(word) && (fileLike(next) || option.test(next))) start = index;
+    else if (packageManager.test(word) && next) start = index;
+    else if (/^[a-z][\w-]*$/.test(word) && option.test(next)) {
+      const end = commandEnd(list, task, index);
+      if (list.slice(index, end + 1).some(item => fileLike(item.word))) return { inside, unknown: true };
+      continue;
+    }
+    if (start < 0) continue;
+    const end = commandEnd(list, task, start);
+    for (let item = start; item <= end; item++) inside.add(item);
+    index = end;
   }
-  let result = '',
-    position = 0;
-  for (const [index, token] of tokens.entries()) {
-    result += text.slice(position, token.index) + (blank.has(index) ? ' '.repeat(token[0].length) : token[0]);
-    position = token.index + token[0].length;
-  }
-  return result + text.slice(position);
+  return { inside, unknown: false };
 }
 
-/** Script sources by test family; markup and style files get no derived test. */
-const testFamilies = { js: ['.js', '.mjs', '.cjs', '.jsx'], ts: ['.ts', '.mts', '.cts', '.tsx'] };
-const familiesOf = {
-  '.js': ['js'],
-  '.mjs': ['js'],
-  '.cjs': ['js'],
-  '.jsx': ['js'],
-  '.ts': ['ts'],
-  '.mts': ['ts'],
-  '.cts': ['ts'],
-  '.tsx': ['ts'],
-  '.vue': ['js', 'ts'],
-  '.svelte': ['js', 'ts'],
-};
+/** The verb that governs the word at `index` over articles, `file` and options: `delete`, `create`… */
+function governing(list, index) {
+  for (let item = index - 1; item >= 0; item--) {
+    const word = list[item].word;
+    if (deleteVerb.test(word) || createVerb.test(word)) return word;
+    if (!filler.test(word)) return null;
+  }
+  return null;
+}
 
 /**
- * The literal paths of a regression test for one named source: `<base>.test<ext>` and
- * `<base>.spec<ext>` in `tests/`, `test/`, next to the source and in its `__tests__/`, for the
- * extensions of the source's family. No masks: configuration, manifests, helpers and fixtures are
- * never among them.
- * @param {string} file
+ * The index entries of `name`. With `core.ignorecase` a name is looked up regardless of case, so
+ * the caller can use the one canonical index name and compare literally from then on.
  */
-export function regressionTestPaths(file) {
-  const extension = path.posix.extname(file).toLowerCase();
-  const exts = (familiesOf[extension] ?? []).flatMap(family => testFamilies[family]);
-  const directory = path.posix.dirname(file) === '.' ? '' : `${path.posix.dirname(file)}/`;
-  const base = path.posix.basename(file, path.posix.extname(file));
-  const result = new Set();
-  for (const location of ['tests/', 'test/', directory, `${directory}__tests__/`])
-    for (const kind of ['test', 'spec'])
-      for (const ext of exts)
-        if (`${location}${base}.${kind}${ext}` !== file) result.add(`${location}${base}.${kind}${ext}`);
-  return [...result];
-}
-
-/** The single index entry of `name`, or none. */
 async function indexEntries(cwd, name) {
-  const tracked = await execute('git', ['ls-files', '-s', '--', name], { cwd, allowFailure: true });
-  return tracked.code === 0 ? tracked.stdout.split('\n').filter(Boolean) : [];
+  const ignoreCase = await execute('git', ['config', '--bool', 'core.ignorecase'], { cwd, allowFailure: true });
+  const icase = ignoreCase.code === 0 && ignoreCase.stdout.trim() === 'true';
+  const tracked = await execute('git', ['ls-files', '-s', '--', `:(${icase ? 'icase,literal' : 'literal'})${name}`], {
+    cwd,
+    allowFailure: true,
+  });
+  const entries = tracked.code === 0 ? tracked.stdout.split('\n').filter(Boolean) : [];
+  // A pathspec also matches the contents of a directory with that name: only the entry of the
+  // name itself counts; contents alone mean a directory.
+  const same = entry => {
+    const entryName = entry.slice(entry.indexOf('\t') + 1);
+    return icase ? entryName.toLowerCase() === name.toLowerCase() : entryName === name;
+  };
+  return { entries: entries.filter(same), directory: entries.some(entry => !same(entry)) };
 }
 
 /** A leading-dot word that is neither a known dot-file, a secret name, tracked nor present. */
 async function selector(cwd, word) {
   if (!classSelector.test(word) || dotFile.test(word) || secretFile(word)) return false;
-  if ((await indexEntries(cwd, word)).length) return false;
+  const tracked = await indexEntries(cwd, word);
+  if (tracked.entries.length || tracked.directory) return false;
   try {
     await lstat(path.join(cwd, word));
     return false;
@@ -188,24 +178,39 @@ async function selector(cwd, word) {
   }
 }
 
-const escape = value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-/** The task deletes the named file itself, not something inside it. */
-const deletes = (task, name) =>
-  new RegExp(
-    `(?:\\b(?:delet|remov|drop)\\S*|(?<![а-яё])(?:удал|сотр|стер)\\S*|\\b(?:git\\s+)?rm)\\s+(?:(?:-\\S+|the|this|file|файл)\\s+)*\`?${escape(name)}(?![\\w./-])`,
-    'i',
-  ).test(task);
-
 /** @typedef {{ fastPath: boolean, reason: string, files?: string[], writePaths?: string[] }} LocalTaskDecision `files` and `writePaths` are set when `fastPath` is true. */
 
 /** @returns {LocalTaskDecision} */
 const doubt = reason => ({ fastPath: false, reason });
 
 /**
+ * The canonical tracked name of one named file, or the reason of doubt: one regular index entry
+ * (not a link `120000` or a submodule `160000`), a regular file at the same place inside the
+ * worktree (no linked directory on the way), at most 64 KB.
+ */
+async function trackedFile(cwd, name) {
+  const { entries, directory } = await indexEntries(cwd, name);
+  if (!entries.length) return { reason: directory ? 'path_not_file' : 'path_untracked' };
+  if (entries.length !== 1) return { reason: 'path_ambiguous' };
+  if (!/^100(?:644|755) /.test(entries[0])) return { reason: 'path_not_file' };
+  const canonical = entries[0].slice(entries[0].indexOf('\t') + 1);
+  let info;
+  try {
+    info = await lstat(path.join(cwd, canonical));
+  } catch {
+    return { reason: 'path_missing' };
+  }
+  if (!info.isFile() || info.isSymbolicLink()) return { reason: 'path_not_file' };
+  const [root, file] = await Promise.all([realpath(cwd), realpath(path.join(cwd, canonical))]);
+  if (path.relative(root, file).split(path.sep).join('/') !== canonical) return { reason: 'path_outside' };
+  if (info.size > FAST_PATH_LIMITS.fileBytes) return { reason: 'file_too_large' };
+  return { name: canonical };
+}
+
+/**
  * Decide whether `task` is provably a small change of a few existing files: style files only
- * (`style_only`) or one to three small source files (`small_local`). `writePaths` is the one
- * list the plan and the diff may use: the files, plus the derived regression test paths of a code
- * change unless the task restricts the edit.
+ * (`style_only`) or one to three small source files (`small_local`). The proof writes exactly the
+ * named files (`writePaths`); a test is writable only when it is named as a target.
  * @param {{ cwd: string, task: string, requested?: string | null }} input `requested` is an explicit execution mode.
  * @returns {Promise<LocalTaskDecision>}
  */
@@ -217,9 +222,18 @@ export async function classifyLocalTask({ cwd, task, requested }) {
   if (/:\/\/|\bwww\./i.test(task)) return doubt('url');
   if (/[\\]|\.\.\/|(?:^|\s)[~/]/.test(task)) return doubt('path_not_relative');
   if (riskMarkers.some(marker => marker.test(task))) return doubt('risk_marker');
+  // Several words in backticks are a command whose meaning is not read; an exclusion is not read.
+  if ([...task.matchAll(/`([^`]*)`/g)].some(match => /\s/.test(match[1].trim())) || exclusion.test(task))
+    return doubt('ambiguous');
+  const list = wordsOf(task);
+  // Deleting or creating a named file is never a small local edit.
+  if (list.some((item, index) => fileLike(item.word) && governing(list, index))) return doubt('risk_marker');
+  const { inside, unknown } = commands(list, task);
+  if (unknown) return doubt('ambiguous');
   const named = [];
   let selectors = 0;
-  for (const word of new Set(pathLike(withoutCommands(task)))) {
+  const targets = list.filter((item, index) => !inside.has(index) && fileLike(item.word)).map(item => item.word);
+  for (const word of new Set(targets)) {
     if (configName.test(word)) return doubt('non_style_path');
     // A class selector is not a file; it never counts as one and proves nothing by itself.
     if (!word.includes('/') && (await selector(cwd, word))) {
@@ -234,34 +248,33 @@ export async function classifyLocalTask({ cwd, task, requested }) {
   // A selector is read as one only next to style files: elsewhere it may hide a requested file.
   if (selectors && !style) return doubt('non_style_path');
   if (named.length > FAST_PATH_LIMITS.files) return doubt('too_many_files');
-  if (named.some(name => deletes(task, name))) return doubt('risk_marker');
+  const canonical = [];
   for (const name of named) {
-    // The index entry must be a regular file: mode 120000 is a symbolic link even where the
-    // working tree shows it as a plain file, 160000 is a submodule.
-    const entries = await indexEntries(cwd, name);
-    if (entries.length !== 1) return doubt('path_untracked');
-    if (!/^100(?:644|755) /.test(entries[0])) return doubt('path_not_file');
-    let info;
-    try {
-      info = await lstat(path.join(cwd, name));
-    } catch {
-      return doubt('path_missing');
-    }
-    if (!info.isFile() || info.isSymbolicLink()) return doubt('path_not_file');
-    if (info.size > FAST_PATH_LIMITS.fileBytes) return doubt('file_too_large');
+    const tracked = await trackedFile(cwd, name);
+    if (tracked.reason) return doubt(tracked.reason);
+    canonical.push(tracked.name);
   }
-  const files = named.toSorted();
-  const tests = style || restricted.test(task) ? [] : files.flatMap(regressionTestPaths);
-  return {
-    fastPath: true,
-    reason: style ? 'style_only' : 'small_local',
-    files,
-    writePaths: [...new Set([...files, ...tests])],
-  };
+  const files = [...new Set(canonical)].toSorted();
+  return { fastPath: true, reason: style ? 'style_only' : 'small_local', files, writePaths: files };
 }
 
 /**
- * The write list of a proof: the recorded one, or the files of a proof saved before it was recorded.
+ * A saved proof that no longer holds: a code proof of an unreleased intermediate format, whose
+ * write list was missing or wider than its files. A style proof always wrote only its files.
+ * @param {{ version?: number, reason?: string, files: string[], writePaths?: string[] }} proof
+ */
+export function fastPathOutdated(proof) {
+  if ((proof.reason ?? 'style_only') === 'style_only') return false;
+  return (
+    proof.version !== FAST_PATH_VERSION ||
+    !Array.isArray(proof.writePaths) ||
+    proof.writePaths.length !== proof.files.length ||
+    proof.writePaths.some(name => !proof.files.includes(name))
+  );
+}
+
+/**
+ * The write list of a proof: exactly its files.
  * @param {{ files: string[], writePaths?: string[] }} proof
  */
 export const fastPathScope = proof => proof.writePaths ?? proof.files;
@@ -285,17 +298,19 @@ export function fastPathAllowsPlan(plan, allowed) {
   );
 }
 
+const testName = /(?:^|\/)(?:tests?|__tests__)\/|\.(?:test|spec)\.[^./]+$/i;
+
 /**
  * The plan of a proven fast path, built locally and deterministically: one developer node that
- * owns exactly the proof's write list. No planner session is needed.
+ * owns exactly the named files. No planner session is needed.
  * @param {string} task
  * @param {{ reason?: string, files: string[], writePaths?: string[] }} proof A saved proof without a kind is `style_only`.
  */
 export function fastPathPlan(task, proof) {
   const reason = proof.reason ?? 'style_only';
   const writePaths = [...fastPathScope(proof)];
-  const tests = writePaths.filter(name => !proof.files.includes(name));
-  const named = proof.files.join(', ');
+  const tests = writePaths.filter(name => testName.test(name));
+  const named = writePaths.join(', ');
   return {
     summary: `Fast path (${reason}): one developer change within ${named}`,
     tasks: [
@@ -303,20 +318,15 @@ export function fastPathPlan(task, proof) {
         id: 'change',
         role: 'developer',
         description:
-          `Make the requested change. Change only what the task needs among the named files (${named}); a named file that needs no change stays as it is. ` +
-          (tests.length
-            ? 'A regression test may go only to one of the test paths listed in writePaths.'
-            : reason === 'style_only'
-              ? 'This is a style change: do not add test or documentation files.'
-              : 'The task restricts the edit: do not add tests or other files.') +
+          `Make the requested change. Change only what the task needs among the named files (${named}); a named file that needs no change stays as it is. Do not add, delete or rename files.` +
           `\nTask: ${task}`,
         dependsOn: [],
         writePaths,
         acceptance: [
-          'The requested change is made, and only files from the allowed write paths change.',
+          'The requested change is made, and only the named files change.',
           ...(tests.length
             ? [
-                'If the change alters behaviour, a regression test at one of the listed test paths fails without the change and passes with it; otherwise the report states why no test is needed.',
+                `If the change alters behaviour, the named test ${tests.join(', ')} covers it: it fails without the change and passes with it.`,
               ]
             : []),
           'The configured project checks pass.',

@@ -1,10 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { readConfig } from '../runtime/config.mjs';
 import { manifestFreshness } from '../runtime/context-manifest.mjs';
-import { regressionTestPaths } from '../runtime/fast-path.mjs';
 import { buildAuditReport } from '../runtime/audit.mjs';
 import { fixture, git, task } from './helpers/mode-engine-fixture.mjs';
 
@@ -81,7 +80,7 @@ test('A proven style-only task skips Jev, Gemini and research and still gets an 
   assert.equal(buildAuditReport(result).skills.complete, true, 'kodo audit stays complete');
 });
 
-test('A small local code task plans locally, allows a regression test and runs two sessions', async t => {
+test('A small local code task plans locally, writes only its named file and runs two sessions', async t => {
   const fx = await fixture(t);
   const run = await fx.engine.create('Set the exported value to one in value.mjs', { project: fx.project });
   const result = await fx.engine.run(run.id);
@@ -95,47 +94,97 @@ test('A small local code task plans locally, allows a regression test and runs t
     ['quick', 'fast-path', 'small_local'],
   );
   assert.deepEqual(result.fastPath.files, ['value.mjs']);
-  const listed = ['value.mjs', ...regressionTestPaths('value.mjs')];
-  assert.deepEqual(result.fastPath.writePaths, listed, 'the proof records its one write list');
+  assert.deepEqual(result.fastPath.writePaths, ['value.mjs'], 'the proof writes only what it names');
   assert.equal(result.planSource, 'fast-path');
-  assert.deepEqual(result.plan.tasks[0].writePaths, listed, 'the plan uses the same list');
-  assert.match(fx.sessions[0].prompt, /regression test/, 'the worker is asked for a regression test');
+  assert.deepEqual(result.plan.tasks[0].writePaths, ['value.mjs'], 'the plan uses the same list');
+  assert.doesNotMatch(fx.sessions[0].prompt, /regression test/, 'no test is demanded when none is named');
   assert.equal(result.review.passed, true);
   assert.equal(buildAuditReport(result).skills.complete, true);
 });
 
-test('The actual diff of a code fast path may touch only the listed paths, exactly', async t => {
-  const code = 'Set the exported value to one in value.mjs';
-  for (const [name, extra, succeeds] of [
-    ['a derived regression test', 'tests/value.test.mjs', true],
-    ['a test helper', 'tests/helpers/fixture.mjs', false],
-    ['a test configuration', 'tsconfig.test.json', false],
-    ['a directory named like a listed test', 'tests/value.test.mjs/evil.json', false],
+test('The actual diff of a fast path may touch only the named files, exactly, and never delete one', async t => {
+  for (const [name, setup, task] of [
+    ['an unnamed test', 'tests/value.test.mjs', 'Set the exported value to one in value.mjs'],
+    ['a deleted named file', null, cssTask],
   ])
     await t.test(name, async subtest => {
-      const fx = await fixture(subtest);
+      const fx = setup ? await fixture(subtest) : await styled(subtest);
       const session = fx.provider.runSession;
       fx.provider.runSession = async request => {
         const result = await session(request);
         if (!request.schema.properties.tasks && !request.schema.properties.passed) {
-          await mkdir(path.dirname(path.join(request.cwd, extra)), { recursive: true });
-          await writeFile(path.join(request.cwd, extra), 'export {};\n');
+          if (setup) {
+            await mkdir(path.dirname(path.join(request.cwd, setup)), { recursive: true });
+            await writeFile(path.join(request.cwd, setup), 'export {};\n');
+          } else await rm(path.join(request.cwd, css));
         }
         return result;
       };
-      const result = await fx.engine.run((await fx.engine.create(code, { project: fx.project })).id);
-      assert.equal(result.fastPath.reason, 'small_local');
-      if (succeeds) {
-        assert.equal(result.state, 'succeeded', result.error?.message);
-        assert.deepEqual(
-          git(result.cwd, 'diff', '--name-only', result.baseSha, result.headSha).split('\n').toSorted(),
-          [extra, 'value.mjs'],
-        );
-      } else {
-        assert.notEqual(result.state, 'succeeded', `${extra} must not pass the scope check`);
-        assert.match(Object.values(result.nodes)[0].error ?? '', /вне области|быстрого пути/);
-      }
+      const result = await fx.engine.run((await fx.engine.create(task, { project: fx.project })).id);
+      assert.equal(result.executionMode.source, 'fast-path');
+      assert.notEqual(result.state, 'succeeded', `${name} must not pass the scope check`);
+      assert.match(Object.values(result.nodes)[0].error ?? '', /вне области|быстрого пути/);
     });
+});
+
+test('Edits found before execution pass the same exact check before any commit', async t => {
+  const fx = await styled(t);
+  const run = await fx.engine.create(cssTask, { project: fx.project });
+  const prepared = await fx.engine.run(run.id, { prepare: true });
+  assert.equal(prepared.state, 'awaiting_plan');
+  // An interrupted session replaced the named file with a directory of the same name.
+  await rm(path.join(prepared.cwd, css));
+  await mkdir(path.join(prepared.cwd, css));
+  await writeFile(path.join(prepared.cwd, css, 'evil.json'), '{}\n');
+  const result = await fx.engine.run(run.id);
+  assert.notEqual(result.state, 'succeeded');
+  assert.equal(result.error.code, 'scope_conflict');
+  assert.doesNotMatch(git(prepared.cwd, 'log', '--format=%s'), /Kodo recover/, 'nothing was committed');
+  assert.equal(fx.sessions.length, 0);
+});
+
+test('A saved code proof of the unreleased intermediate format is revoked before any worker', async t => {
+  const fx = await fixture(t);
+  const run = await fx.engine.create('Set the exported value to one in value.mjs', { project: fx.project });
+  const prepared = await fx.engine.run(run.id, { prepare: true });
+  assert.equal(prepared.fastPath.reason, 'small_local');
+  // The format of faed900: no write list, and a local plan with test masks.
+  const outdated = {
+    fastPath: { version: 2, files: ['value.mjs'], reason: 'small_local', budgets: prepared.fastPath.budgets },
+    plan: {
+      summary: 'Fast path (small_local)',
+      tasks: [{ ...task('change'), writePaths: ['value.mjs', '**/tests/**', '**/*.test.*'] }],
+    },
+    planSource: 'fast-path',
+  };
+  fx.store.updateRun(run.id, outdated);
+  const result = await fx.engine.run(run.id);
+  assert.equal(result.state, 'succeeded', result.error?.message);
+  assert.equal(result.fastPath.revoked, 'proof_outdated');
+  assert.deepEqual([result.executionMode.source, result.planSource], ['jev', 'cli'], 'the ordinary route replanned');
+  assert.deepEqual(result.plan.tasks[0].writePaths, ['value.mjs']);
+  assert.ok(fx.calls.includes('assessment') && fx.calls.includes('plan'));
+  assert.equal(
+    fx.store
+      .events(run.id)
+      .filter(event => event.type === 'fast_path_revoked' && event.data.reason === 'proof_outdated').length,
+    1,
+  );
+
+  // A proof whose node already worked cannot be replanned silently: the run stops with its reason.
+  const started = await fixture(t);
+  const second = await started.engine.create('Set the exported value to one in value.mjs', {
+    project: started.project,
+  });
+  const ready = await started.engine.run(second.id, { prepare: true });
+  started.store.updateRun(second.id, {
+    ...outdated,
+    fastPath: { ...outdated.fastPath, budgets: ready.fastPath.budgets },
+    nodes: { change: { id: 'change', attempt: 1, status: 'pending' } },
+  });
+  const blocked = await started.engine.run(second.id);
+  assert.deepEqual([blocked.state, blocked.error.code], ['blocked', 'fast_path_outdated']);
+  assert.equal(started.sessions.length, 0);
 });
 
 test('Doubt takes the ordinary route: a non-style path, a risk word or an explicit wider mode', async t => {
