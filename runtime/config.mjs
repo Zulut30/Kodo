@@ -59,10 +59,13 @@ export function validateCommandTimeouts(commands) {
       }
     }
 }
-/** Optional limit from a native client start to its first event; absent means the 120000 ms default. */
+/**
+ * Optional limit from a native client start to its first event; absent means the 120000 ms default.
+ * At most 600000 ms: strictly below the 1800000 ms session limit, so the startup limit can fire.
+ */
 export function validateStartupTimeout(value) {
-  if (value !== undefined && (!Number.isSafeInteger(value) || value < 10000 || value > 1800000))
-    throw Object.assign(new Error('Некорректный startupTimeoutMs: требуется целое число от 10000 до 1800000 мс'), {
+  if (value !== undefined && (!Number.isSafeInteger(value) || value < 10000 || value > 600000))
+    throw Object.assign(new Error('Некорректный startupTimeoutMs: требуется целое число от 10000 до 600000 мс'), {
       code: 'configuration',
     });
 }

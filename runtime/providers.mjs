@@ -56,6 +56,7 @@ const defaults = {
  * @property {number} [timeoutMs]
  * @property {number} [startupTimeoutMs] Limit from process start to the first JSON event; one restart without events.
  * @property {Map<string, Promise<any>>} [subscriptionChecks] Login checks of one Engine run, by client.
+ * @property {(details: { reason: string }) => unknown} [onStartupRetry] Admits an automatic restart; a throw refuses it.
  */
 
 /**
@@ -448,28 +449,33 @@ export function parseSessionEvents(
   };
 }
 
-/** One login check per client and cache; a failed check is not remembered. */
+/** One login check per client and cache; only a passed check (`available: true`) is remembered. */
 function checkedSubscription(cache, client, check) {
   if (!(cache instanceof Map)) return check();
   if (!cache.has(client)) {
     // Always a promise, even for a synchronous check, so a failure can be forgotten below.
     const pending = Promise.resolve().then(check);
     cache.set(client, pending);
-    pending.catch(() => {
+    const forget = () => {
       if (cache.get(client) === pending) cache.delete(client);
-    });
+    };
+    pending.then(status => {
+      if (status?.available !== true) forget();
+    }, forget);
   }
   return cache.get(client);
 }
 
-const jsonLine = line => {
+/** A client event is a JSON object; other JSON values and text are not. */
+const eventOf = line => {
   try {
-    JSON.parse(line);
-    return true;
+    const value = JSON.parse(line);
+    return value !== null && typeof value === 'object' && !Array.isArray(value) ? value : undefined;
   } catch {
-    return false;
+    return undefined;
   }
 };
+const jsonLine = line => eventOf(line) !== undefined;
 
 /**
  * @param {SessionRequest} request
@@ -490,6 +496,7 @@ export async function runSession(
     timeoutMs = 1800000,
     startupTimeoutMs = 120000,
     subscriptionChecks,
+    onStartupRetry,
   },
   { processImpl = runProcess, resolveClientImpl = resolveClient, nowImpl = () => performance.now() } = {},
 ) {
@@ -501,9 +508,10 @@ export async function runSession(
     startupRetries = 0;
   const environment = subscriptionEnvironment(env);
   try {
-    const { executable } = await checkedSubscription(subscriptionChecks, client, () =>
-      subscriptionStatus(client, { env: environment, processImpl, resolveClientImpl }),
-    );
+    const check = () => subscriptionStatus(client, { env: environment, processImpl, resolveClientImpl });
+    let { executable } = (await checkedSubscription(subscriptionChecks, client, check)) ?? {};
+    // A shared check that passed without an executable cannot start the client: check here.
+    executable ??= (await check()).executable;
     directory = await mkdtemp(path.join(os.tmpdir(), 'kodo-provider-'));
     const schemaPath = schema ? path.join(directory, 'output.schema.json') : undefined;
     if (schema) await writeFile(schemaPath, JSON.stringify(providerSchema(schema)), { mode: 0o600 });
@@ -527,12 +535,8 @@ export async function runSession(
           startedBy: jsonLine,
           onLine: line => {
             if (!line.trim()) return;
-            let event;
-            try {
-              event = JSON.parse(line);
-            } catch {
-              return;
-            }
+            const event = eventOf(line);
+            if (!event) return;
             firstEventMs ??= nowImpl() - started;
             events.push(event);
             // Stream lifecycle only. Command/output payloads may contain repository secrets.
@@ -554,6 +558,14 @@ export async function runSession(
             new ProviderError(`Клиент ${client} не прислал первое событие за ${startupTimeoutMs} мс`, 'unavailable'),
             { startupTimeout: true },
           );
+        // Every native start is admitted by the caller (its session budget); a refusal keeps its reason.
+        try {
+          await onStartupRetry?.({ reason: 'startup_timeout' });
+        } catch (refusal) {
+          throw refusal instanceof ProviderError
+            ? refusal
+            : new ProviderError(redact(refusal?.message ?? String(refusal)), refusal?.code || 'unavailable');
+        }
         startupRetries++;
       }
     }

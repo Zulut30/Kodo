@@ -1204,6 +1204,8 @@ test('A session without any event is started again exactly once with a fresh nat
       assert.equal(invocation.startupTimeoutMs, 50);
       assert.equal(invocation.startedBy('{"type":"system"}'), true);
       assert.equal(invocation.startedBy('Loading'), false);
+      // Only a JSON object is an event; other JSON values are not a start.
+      for (const value of ['null', '42', '"text"', '[1]']) assert.equal(invocation.startedBy(value), false, value);
       if (exec.length <= timeouts) {
         now += 50;
         throw Object.assign(new Error('no first event'), { code: 'KODO_STARTUP_TIMEOUT' });
@@ -1294,4 +1296,84 @@ test('A shared run cache checks the subscription login once per client and forge
   await runSession({ ...request, subscriptionChecks: shared }, deps);
   await runSession({ ...request, subscriptionChecks: shared }, deps);
   assert.deepEqual([discovered, status], [1, 4], 'one login check for discovery and every session');
+
+  // Only a passed check is remembered: an unavailable answer without an exception is not.
+  const unavailable = new Map();
+  await discoverProviders(
+    { client: 'claude-code' },
+    { statusImpl: async () => ({ available: false }), cacheImpl: async () => [], subscriptionChecks: unavailable },
+  );
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(unavailable.has('claude-code'), false);
+  await runSession({ ...request, subscriptionChecks: unavailable }, deps);
+  assert.equal(status, 5, 'the session checks the login itself');
+  // A passed check without an executable cannot start a client: the session checks itself.
+  const incomplete = new Map([['claude-code', Promise.resolve({ available: true })]]);
+  await runSession({ ...request, subscriptionChecks: incomplete }, deps);
+  assert.equal(status, 6);
+});
+
+test('Each restart is admitted by the caller, and a refused restart starts nothing', async () => {
+  const order = [];
+  const deps = {
+    resolveClientImpl: async () => ({ command: 'fixture', args: [] }),
+    processImpl: async invocation => {
+      if (invocation.args.includes('status')) return { exitCode: 0, stdout: claudeLoggedIn, stderr: '' };
+      order.push('start');
+      if (order.filter(item => item === 'start').length === 1)
+        throw Object.assign(new Error('no first event'), { code: 'KODO_STARTUP_TIMEOUT' });
+      invocation.onLine(claudeResult(invocation.args[invocation.args.indexOf('--session-id') + 1]));
+      return { exitCode: 0, stdout: '', stderr: '' };
+    },
+  };
+  const request = { client: 'claude-code', cwd: process.cwd(), prompt: 'fixture task', schema, startupTimeoutMs: 50 };
+  const result = await runSession(
+    {
+      ...request,
+      onStartupRetry: async details => {
+        order.push(details.reason);
+      },
+    },
+    deps,
+  );
+  assert.deepEqual(result.output, { ok: true });
+  assert.deepEqual(order, ['start', 'startup_timeout', 'start'], 'admission comes before the restart');
+
+  order.length = 0;
+  await assert.rejects(
+    runSession(
+      {
+        ...request,
+        onStartupRetry: async () => {
+          throw Object.assign(new Error('Исчерпан лимит сессий запуска: 2'), { code: 'budget' });
+        },
+      },
+      deps,
+    ),
+    error => error.code === 'budget' && error.startupTimeout === undefined,
+  );
+  assert.deepEqual(order, ['start'], 'no second start after a refusal');
+});
+
+test('JSON values that are not objects are not client events', async () => {
+  let now = 0;
+  const result = await runSession(
+    { client: 'claude-code', cwd: process.cwd(), prompt: 'fixture task', schema },
+    {
+      nowImpl: () => now,
+      resolveClientImpl: async () => ({ command: 'fixture', args: [] }),
+      processImpl: async invocation => {
+        if (invocation.args.includes('status')) return { exitCode: 0, stdout: claudeLoggedIn, stderr: '' };
+        for (const line of ['null', '42', '"text"', '[1]']) {
+          now += 10;
+          invocation.onLine(line);
+        }
+        now += 10;
+        invocation.onLine(claudeResult(invocation.args[invocation.args.indexOf('--session-id') + 1]));
+        return { exitCode: 0, stdout: '', stderr: '' };
+      },
+    },
+  );
+  assert.deepEqual(result.output, { ok: true });
+  assert.equal(result.metrics.firstEventMs, 50, 'the first object is the first event');
 });

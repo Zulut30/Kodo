@@ -775,7 +775,13 @@ try {
           if (this.store.getRun(run.id).cancelRequested) controller.abort();
         }, 500);
         timer.unref();
-        let attempt, started, localBytes, firstEvent;
+        let attempt,
+          started,
+          localBytes,
+          firstEvent,
+          // Time of earlier silent starts inside the same provider call: the client's whole-call
+          // measurements are reduced by it, so each start is counted once.
+          offset = 0;
         try {
           const tools = await this.resolveWorkerTools(request.cwd);
           const guidance = redact(
@@ -811,34 +817,39 @@ try {
           const env = await this.executionEnvironment(run, request.cwd, tools);
           for (const reference of references) await this.assertEvidence(reference);
           this.checkCancelled(run, controller.signal);
-          // Persisted admission: the cap counts every started session of this run,
-          // across resume, retry cycles and parallel workers. It is checked and
-          // recorded in one synchronous step.
+          // Persisted admission: the cap counts every native start of this run, including an
+          // automatic restart, across resume, retry cycles and parallel workers. It is checked
+          // and recorded in one synchronous step.
           const sessionCap = run.config.budgets?.sessions ?? null;
-          if (sessionCap !== null && (run.sessionAttempts?.length ?? 0) >= sessionCap)
-            throw Object.assign(new Error(`Исчерпан лимит сессий запуска: ${sessionCap}`), { code: 'budget' });
-          attempt = {
-            stage,
-            node: node?.id ?? null,
-            client: request.client,
-            model: request.model,
-            status: 'started',
-            evidence: references,
-            // Kept with the attempt, not as another evidence file: preparing the protected
-            // evidence directory once per session would cost more than the session setup itself.
-            manifest,
-            manifestSha256: contentHash(manifest),
-            metrics: {
-              ...localBytes,
-              durationMs: null,
-              firstEventMs: null,
-              toolSteps: null,
-              nativeRequestCount: null,
-              usage: normalizeUsage(request.client),
-            },
+          const admit = restart => {
+            if (sessionCap !== null && (run.sessionAttempts?.length ?? 0) >= sessionCap)
+              throw Object.assign(new Error(`Исчерпан лимит сессий запуска: ${sessionCap}`), { code: 'budget' });
+            attempt = {
+              stage,
+              node: node?.id ?? null,
+              client: request.client,
+              model: request.model,
+              status: 'started',
+              ...(restart ? { restart } : {}),
+              evidence: references,
+              // Kept with the attempt, not as another evidence file: preparing the protected
+              // evidence directory once per session would cost more than the session setup itself.
+              manifest,
+              manifestSha256: contentHash(manifest),
+              metrics: {
+                ...localBytes,
+                durationMs: null,
+                firstEventMs: null,
+                startupRetries: null,
+                toolSteps: null,
+                nativeRequestCount: null,
+                usage: normalizeUsage(request.client),
+              },
+            };
+            (run.sessionAttempts ||= []).push(attempt);
+            this.save(run);
           };
-          (run.sessionAttempts ||= []).push(attempt);
-          this.save(run);
+          admit();
           started = performance.now();
           const result = await this.provider.runSession({
             ...request,
@@ -846,6 +857,29 @@ try {
             env,
             subscriptionChecks: this.runSubscriptionChecks(run),
             ...(run.config.startupTimeoutMs !== undefined ? { startupTimeoutMs: run.config.startupTimeoutMs } : {}),
+            // The client sent nothing before the startup limit: that start is a failed attempt of its
+            // own, and the restart needs its own admission. Neither is a repair attempt of the node.
+            onStartupRetry: ({ reason = 'startup_timeout' } = {}) => {
+              const silent = attempt,
+                elapsed = performance.now() - started;
+              silent.status = 'failed';
+              silent.errorCode = reason;
+              silent.metrics = {
+                ...silent.metrics,
+                durationMs: elapsed,
+                firstEventMs: null,
+                startupRetries: 0,
+                toolSteps: 0,
+                nativeRequestCount: null,
+              };
+              attempt = undefined;
+              this.save(run);
+              offset += elapsed;
+              started = performance.now();
+              firstEvent = undefined;
+              this.checkCancelled(run, controller.signal);
+              admit(reason);
+            },
             onEvent: event => {
               firstEvent ??= performance.now() - started;
               if (identity && event.sessionId) {
@@ -871,12 +905,20 @@ try {
           throw error;
         } finally {
           if (attempt) {
+            const reported = attempt.metrics;
             attempt.metrics = {
-              ...attempt.metrics,
+              ...reported,
               ...localBytes,
-              durationMs: attempt.metrics.durationMs ?? performance.now() - started,
+              durationMs:
+                typeof reported.durationMs === 'number'
+                  ? Math.max(0, reported.durationMs - offset)
+                  : performance.now() - started,
               // The client's own measurement when it has one, else the first event Engine observed.
-              firstEventMs: attempt.metrics.firstEventMs ?? firstEvent ?? null,
+              firstEventMs:
+                typeof reported.firstEventMs === 'number'
+                  ? Math.max(0, reported.firstEventMs - offset)
+                  : (firstEvent ?? null),
+              startupRetries: reported.startupRetries ?? null,
               nativeRequestCount: null,
             };
             this.save(run);

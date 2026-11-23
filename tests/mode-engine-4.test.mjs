@@ -201,8 +201,15 @@ test('Native sessions of one run share one login check, get the startup limit an
   assert.ok([...caches][0] instanceof Map);
   assert.deepEqual(discovery, [...caches], 'model discovery fills the same cache');
   assert.ok(seen.every(request => request.startupTimeoutMs === 30000));
-  for (const attempt of first.sessionAttempts)
-    assert.ok(attempt.metrics.firstEventMs >= 0, `${attempt.stage}: the first client event is timed`);
+  for (const attempt of first.sessionAttempts) {
+    const { firstEventMs, startupRetries } = attempt.metrics;
+    assert.ok(
+      typeof firstEventMs === 'number' && Number.isFinite(firstEventMs) && firstEventMs >= 0,
+      `${attempt.stage}: the first client event is timed`,
+    );
+    assert.ok(Object.hasOwn(attempt.metrics, 'startupRetries'), `${attempt.stage}: restarts are recorded`);
+    assert.equal(startupRetries, null, 'the fixture provider reports no restart count');
+  }
 
   const before = seen.length;
   // Without client events the first event stays unknown.
@@ -215,19 +222,82 @@ test('Native sessions of one run share one login check, get the startup limit an
   const next = new Set(seen.slice(before).map(request => request.subscriptionChecks));
   assert.equal(next.size, 1);
   assert.ok(!caches.has([...next][0]), 'another run checks the login again: no state between runs');
-  assert.ok(second.sessionAttempts.every(attempt => attempt.metrics.firstEventMs === null));
+  assert.ok(
+    second.sessionAttempts.every(
+      attempt => attempt.metrics.firstEventMs === null && attempt.metrics.startupRetries === null,
+    ),
+  );
 });
 
 test('The startup limit of native sessions is bounded in the project and in a saved run', async t => {
   const fx = await fixture(t);
   assert.equal((await readConfig(fx.project)).startupTimeoutMs, undefined, 'absent means the default');
-  for (const value of [10000, 120000, 1800000])
+  // Strictly below the 1800000 ms session limit, or the startup limit could never fire.
+  for (const value of [10000, 120000, 600000])
     assert.equal((await readConfig(fx.project, { startupTimeoutMs: value })).startupTimeoutMs, value);
-  for (const value of [0, 9999, 1800001, 1.5, '120000', null])
+  for (const value of [0, 9999, 600001, 1800000, 1.5, '120000', null])
     await assert.rejects(readConfig(fx.project, { startupTimeoutMs: value }), /startupTimeoutMs/, String(value));
   const run = await fx.engine.create('Set value to one', { project: fx.project, mode: 'quick' });
   fx.store.updateRun(run.id, { config: { ...run.config, startupTimeoutMs: 5 } });
   const blocked = await fx.engine.run(run.id);
   assert.deepEqual([blocked.state, blocked.error.code], ['blocked', 'configuration']);
   assert.equal(fx.sessions.length, 0);
+});
+
+/** Make the first worker start of `fx` silent: what runSession does before its automatic restart. */
+function silentFirstWorkerStart(fx) {
+  const original = fx.provider.runSession;
+  let restarted = false;
+  fx.provider.runSession = async request => {
+    const worker = !request.schema.properties.tasks && !request.schema.properties.passed;
+    if (worker && !restarted) {
+      restarted = true;
+      await request.onStartupRetry({ reason: 'startup_timeout' });
+    }
+    return original(request);
+  };
+}
+
+test('An automatic restart of a silent client takes its own session budget and no repair round', async t => {
+  const fx = await fixture(t);
+  silentFirstWorkerStart(fx);
+  const result = await fx.engine.run(
+    (await fx.engine.create('Set value to one', { project: fx.project, mode: 'quick' })).id,
+  );
+  assert.equal(result.state, 'succeeded', result.error?.message);
+  assert.deepEqual(
+    result.sessionAttempts.map(attempt => [
+      attempt.stage,
+      attempt.status,
+      attempt.errorCode ?? null,
+      attempt.restart ?? null,
+    ]),
+    [
+      ['plan', 'completed', null, null],
+      ['developer', 'failed', 'startup_timeout', null],
+      ['developer', 'completed', null, 'startup_timeout'],
+      ['review', 'completed', null, null],
+    ],
+    'every native start has its own record',
+  );
+  assert.equal(result.metrics.sessions, 4);
+  assert.equal(Object.values(result.nodes)[0].attempt, 1, 'the restart is not a repair attempt');
+
+  // A cap of two admits the planner and the first worker start; the restart is refused.
+  const capped = await fixture(t, { config: { budgets: { sessions: 2 } } });
+  silentFirstWorkerStart(capped);
+  const blocked = await capped.engine.run(
+    (await capped.engine.create('Set value to one', { project: capped.project, mode: 'quick' })).id,
+  );
+  assert.deepEqual([blocked.state, blocked.error.code], ['blocked', 'budget']);
+  assert.deepEqual(
+    blocked.sessionAttempts.map(attempt => [attempt.stage, attempt.status, attempt.errorCode ?? null]),
+    [
+      ['plan', 'completed', null],
+      ['developer', 'failed', 'startup_timeout'],
+    ],
+  );
+  assert.equal(capped.sessions.length, 1, 'the refused restart started nothing');
+  const node = Object.values(blocked.nodes)[0];
+  assert.deepEqual([node.attempt, node.stopped], [0, undefined], 'no repair round was spent');
 });
