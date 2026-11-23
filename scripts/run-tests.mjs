@@ -16,6 +16,10 @@ const defaultPattern = `**/{test,test/**/*,test-*,*[._-]test}.{${extensions}}`;
 // Scheduling has only a case-work lower bound; retain lighter prior entries.
 // See docs/archive/WINDOWS-TEST-SPEED.md for provenance and the incomplete full check.
 const priority = [
+  // GitHub Actions Windows check, run 44577524507 (Node 24, concurrency 4): the TAP tail before the L2
+  // timeout holds 13 of its 14 cases, 1008474.9099 ms in sum, a lower bound for the file. The longest
+  // observed file starts first; at its old place after ~26 heavy files it ended the Windows check last.
+  'tests/project-wave-director.test.mjs', // >=1008474.9099 ms (13/14 cases, CI)
   'tests/delivery.test.mjs', // 434779.5897 ms
   'tests/project-director.test.mjs', // 375928.3714 ms
   'tests/architecture-gate-integration.test.mjs', // 314342.0235 ms
@@ -46,8 +50,6 @@ const priority = [
   'tests/task-fast-checks.test.mjs', // ~167000 ms
   'tests/wave-verifier.test.mjs', // ~72000 ms
   'tests/engine-fast-profile.test.mjs', // ~38000 ms
-  // Wave drain: sum of case durations from one local Windows run (Node 24), not a receipt.
-  'tests/project-wave-director.test.mjs', // ~320000 ms
   // External pull protocol: one local Windows run (Node 24), not a receipt and no speed claim.
   'tests/project-external.test.mjs', // ~69000 ms
   // Wave end to end (drain, T3 pull path, reservation ownership): one local Windows run (Node 24), not a receipt.

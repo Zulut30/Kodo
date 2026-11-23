@@ -160,6 +160,23 @@ test('Scheduler orders observed file durations longest first and retains every d
   assert.deepEqual(orderTests([...input].reverse(), temp), expected);
 });
 
+test('Scheduler starts the longest file observed on Windows CI before every other file', async () => {
+  const { orderTests } = await import(scheduleUrl);
+  const cwd = path.join(os.tmpdir(), 'kodo-test-order-unused');
+  // GitHub Actions Windows run 44577524507: 13 of the 14 project-wave-director cases took
+  // 1008474.9099 ms, more than any other observed file. Started late, it ends the whole check last.
+  const files = [
+    'tests/a-unobserved.test.mjs',
+    'tests/engine-fast-profile.test.mjs',
+    'tests/delivery.test.mjs',
+    'tests/project-director.test.mjs',
+    'tests/project-wave-director.test.mjs',
+  ];
+  const ordered = orderTests(files, cwd).map(file => path.relative(cwd, file).replaceAll('\\', '/'));
+  assert.equal(ordered[0], 'tests/project-wave-director.test.mjs');
+  assert.deepEqual([...ordered].sort(), [...files].sort());
+});
+
 test(
   'Scheduler starts heuristic heavy files before lexical files in real isolated children',
   { timeout: 15000 },
