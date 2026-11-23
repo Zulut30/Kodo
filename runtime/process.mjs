@@ -70,10 +70,19 @@ export async function resolveClient(client, environment = process.env) {
   throw new Error(`Не найден исполняемый файл клиента ${client}`);
 }
 
+/** After SIGTERM to the group, the group gets SIGKILL; after a stop, the pipes are closed by force. */
+const STOP_GRACE_MS = 2000,
+  CLOSE_WAIT_MS = 3000;
+
 /**
  * `startupTimeoutMs` bounds the wait for the first stdout line accepted by `startedBy` (any line by
  * default); it is armed only when shorter than `timeoutMs`. Past it the process tree is stopped
  * with `KODO_STARTUP_TIMEOUT`.
+ *
+ * A stop reaches the client's descendants: on POSIX the client leads its own process group, which
+ * gets SIGTERM and, after a grace period, SIGKILL; on Windows `taskkill /T /F` stops the tree, and
+ * a failed taskkill falls back to killing the client. A descendant outside the tree or group may
+ * still hold the pipes, so after a stop the runner waits for them only for a bounded time.
  */
 export async function runProcess({
   command,
@@ -90,19 +99,59 @@ export async function runProcess({
 }) {
   signal?.throwIfAborted();
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { cwd, env, windowsHide: true, shell: false, stdio: ['pipe', 'pipe', 'pipe'] });
+    const posix = process.platform !== 'win32';
+    const child = spawn(command, args, {
+      cwd,
+      env,
+      windowsHide: true,
+      shell: false,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      // A POSIX client leads its own process group, so a stop can reach every descendant.
+      detached: posix,
+    });
     let stdout = '',
       stderr = '',
       pending = '',
       finished = false,
-      terminalError;
+      terminalError,
+      forced;
+    const signalGroup = name => {
+      try {
+        process.kill(-child.pid, name);
+      } catch {
+        try {
+          child.kill(name);
+        } catch {
+          /* Already gone. */
+        }
+      }
+    };
     const terminate = error => {
       if (finished) return;
       terminalError = error;
-      // Windows process groups require taskkill to stop the CLI's native child too.
-      if (process.platform === 'win32' && child.pid)
-        spawnSync('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
-      else child.kill('SIGTERM');
+      if (child.pid) {
+        if (posix) signalGroup('SIGTERM');
+        else {
+          // Windows process groups require taskkill to stop the CLI's native child too.
+          const stopped = spawnSync('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], {
+            windowsHide: true,
+            stdio: 'ignore',
+          });
+          if (stopped.status !== 0) child.kill('SIGKILL');
+        }
+      }
+      if (forced) return;
+      if (posix && child.pid) setTimeout(() => signalGroup('SIGKILL'), STOP_GRACE_MS).unref();
+      // Never wait forever for 'close': a descendant outside the tree may keep the pipes open.
+      forced = setTimeout(
+        () => {
+          child.stdout.destroy();
+          child.stderr.destroy();
+          finish(() => reject(terminalError));
+        },
+        (posix ? STOP_GRACE_MS : 0) + CLOSE_WAIT_MS,
+      );
+      forced.unref();
     };
     const timer = setTimeout(
       () => terminate(Object.assign(new Error('Истекло время выполнения клиента'), { code: 'KODO_TIMEOUT' })),
@@ -134,6 +183,7 @@ export async function runProcess({
       finished = true;
       clearTimeout(timer);
       clearTimeout(startup);
+      clearTimeout(forced);
       signal?.removeEventListener('abort', aborted);
       callback();
     };

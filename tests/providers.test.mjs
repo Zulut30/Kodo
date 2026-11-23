@@ -1061,15 +1061,16 @@ const claudeLoggedIn = JSON.stringify({ loggedIn: true, authMethod: 'claude.ai' 
 const claudeResult = id =>
   JSON.stringify({ type: 'result', subtype: 'success', structured_output: { ok: true }, session_id: id });
 
+const jsonObjectLine = line => {
+  try {
+    const value = JSON.parse(line);
+    return value !== null && typeof value === 'object' && !Array.isArray(value);
+  } catch {
+    return false;
+  }
+};
+
 test('Process runner stops a client without a first JSON line at the startup limit', async () => {
-  const json = line => {
-    try {
-      JSON.parse(line);
-      return true;
-    } catch {
-      return false;
-    }
-  };
   const started = performance.now();
   await assert.rejects(
     runProcess({
@@ -1078,20 +1079,113 @@ test('Process runner stops a client without a first JSON line at the startup lim
       args: ['-e', "process.stdout.write('warming up\\n');setInterval(()=>{},1000)"],
       timeoutMs: 60000,
       startupTimeoutMs: 300,
-      startedBy: json,
+      startedBy: jsonObjectLine,
     }),
     error => error.code === 'KODO_STARTUP_TIMEOUT',
   );
   assert.ok(performance.now() - started < 30000, 'the startup limit, not the session limit, stopped it');
-  // The first JSON line clears the limit for the rest of the session.
-  const result = await runProcess({
-    command: process.execPath,
-    args: ['-e', 'process.stdout.write(\'{"type":"init"}\\n\');setTimeout(()=>{},2600)'],
-    timeoutMs: 60000,
-    startupTimeoutMs: 2000,
-    startedBy: json,
+});
+
+test('The first JSON line clears the startup limit, whatever the cold start costs', async () => {
+  // The client outlives the limit counted from its own first line, so the run proves the limit
+  // was cleared. A cold start slower than the limit prints nothing before it fires: that attempt
+  // is inconclusive and repeats with a doubled limit. A timeout after the first line is a failure.
+  for (let limit = 1500; ; limit *= 2) {
+    let firstLine = null;
+    const spawned = performance.now();
+    try {
+      const result = await runProcess({
+        command: process.execPath,
+        args: ['-e', `process.stdout.write('{"type":"init"}\\n');setTimeout(()=>{},${limit + 500})`],
+        timeoutMs: 120000,
+        startupTimeoutMs: limit,
+        startedBy: jsonObjectLine,
+        onLine: () => {
+          firstLine ??= performance.now();
+        },
+      });
+      assert.equal(result.exitCode, 0);
+      assert.ok(performance.now() - spawned > limit, 'the client outlived the startup limit');
+      return;
+    } catch (error) {
+      if (error.code !== 'KODO_STARTUP_TIMEOUT' || firstLine !== null || limit >= 12000) throw error;
+    }
+  }
+});
+
+/** Waits until `pid` is gone; false if it is still alive after `ms`. */
+async function gone(pid, ms = 5000) {
+  for (const until = performance.now() + ms; performance.now() < until;) {
+    try {
+      process.kill(pid, 0);
+    } catch {
+      return true;
+    }
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  return false;
+}
+
+test('A stopped client takes the descendant that inherited its stdout with it', { timeout: 60000 }, async t => {
+  let descendant;
+  t.after(() => {
+    try {
+      if (descendant) process.kill(descendant, 'SIGKILL');
+    } catch {}
   });
-  assert.equal(result.exitCode, 0);
+  const launcher = `const { spawn } = require('node:child_process');
+const child = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: ['ignore', 'inherit', 'inherit'], windowsHide: true });
+process.stdout.write('descendant ' + child.pid + '\\n');
+setInterval(()=>{},1000);`;
+  const started = performance.now();
+  await assert.rejects(
+    runProcess({
+      command: process.execPath,
+      args: ['-e', launcher],
+      timeoutMs: 120000,
+      startupTimeoutMs: 1500,
+      startedBy: jsonObjectLine,
+      onLine: line => {
+        descendant ??= Number(/^descendant (\d+)$/.exec(line)?.[1]) || undefined;
+      },
+    }),
+    error => error.code === 'KODO_STARTUP_TIMEOUT',
+  );
+  assert.ok(performance.now() - started < 30000, 'the runner did not wait for the inherited pipe');
+  assert.ok(descendant, 'the descendant reported itself');
+  assert.equal(await gone(descendant), true, 'the whole process tree or group was stopped');
+});
+
+test('A descendant that escaped the tree cannot hold a stopped session open', { timeout: 60000 }, async t => {
+  let escaped;
+  t.after(() => {
+    try {
+      if (escaped) process.kill(escaped, 'SIGKILL');
+    } catch {}
+  });
+  // The middle process starts a detached grandchild that inherits stdout and exits at once: the
+  // grandchild is outside the client's tree (Windows) and process group (POSIX).
+  const middle = `const g = require('node:child_process').spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: ['ignore', 'inherit', 'inherit'], detached: true, windowsHide: true });
+process.stdout.write('escaped ' + g.pid + '\\n');
+g.unref();`;
+  const launcher = `require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(middle)}], { stdio: ['ignore', 'inherit', 'inherit'], windowsHide: true });
+setInterval(()=>{},1000);`;
+  const started = performance.now();
+  await assert.rejects(
+    runProcess({
+      command: process.execPath,
+      args: ['-e', launcher],
+      timeoutMs: 120000,
+      startupTimeoutMs: 1500,
+      startedBy: jsonObjectLine,
+      onLine: line => {
+        escaped ??= Number(/^escaped (\d+)$/.exec(line)?.[1]) || undefined;
+      },
+    }),
+    error => error.code === 'KODO_STARTUP_TIMEOUT',
+  );
+  assert.ok(performance.now() - started < 30000, 'a bounded wait, not the pipe, ended the session');
+  assert.ok(escaped, 'the escaped descendant reported itself');
 });
 
 test('A session without any event is started again exactly once with a fresh native session', async () => {
