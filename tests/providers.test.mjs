@@ -11,6 +11,7 @@ import {
   discoverProviders,
   analyzeGemini,
   decideJev,
+  doctorProviders,
   classifyProviderFailure,
   providerSchema,
 } from '../runtime/providers.mjs';
@@ -1055,4 +1056,139 @@ test('Research bounds the outgoing query and filters off-source HTML links', asy
     result.items.map(item => item.source),
     ['github', 'hackernews', 'docs'],
   );
+});
+
+test('doctorProviders checks only the selected client and warns on missing optional keys', async () => {
+  const checkedClients = [];
+  const checks = await doctorProviders(
+    {
+      client: 'claude-code',
+      secrets: { GEMINI_API_KEY: secrets.GEMINI_API_KEY },
+      config: { client: 'claude-code' },
+    },
+    {
+      subscriptionStatusImpl: async selected => {
+        checkedClients.push(selected);
+        if (selected !== 'claude-code') throw new ProviderError('codex not logged in', 'auth');
+        return { client: selected, available: true, auth: 'subscription' };
+      },
+    },
+  );
+  assert.deepEqual(checkedClients, ['claude-code']);
+  assert.equal(
+    checks.some(item => item.provider === 'codex'),
+    false,
+  );
+  const byProvider = Object.fromEntries(checks.map(item => [item.provider, item]));
+  assert.equal(byProvider['claude-code'].ok, true);
+  assert.equal(byProvider['claude-code'].status, 'ok');
+  assert.equal(byProvider['claude-code'].required, true);
+  assert.equal(byProvider.gemini.ok, true);
+  assert.equal(byProvider.gemini.status, 'ok');
+  assert.equal(byProvider.gemini.required, true);
+  for (const optional of ['jev', 'scrape', 'reddit', 'x']) {
+    assert.equal(byProvider[optional].ok, true, optional);
+    assert.equal(byProvider[optional].status, 'warning', optional);
+    assert.equal(byProvider[optional].required, false, optional);
+    assert.equal(byProvider[optional].configured, false, optional);
+    assert.equal(typeof byProvider[optional].warning, 'string', optional);
+  }
+});
+
+test('doctorProviders treats missing required route keys as errors and relaxes Gemini in quick mode', async () => {
+  const subscriptionStatusImpl = async selected => ({ client: selected, available: true, auth: 'subscription' });
+  const standardMissing = await doctorProviders(
+    { client: 'codex', secrets: {}, config: { client: 'codex' } },
+    { subscriptionStatusImpl },
+  );
+  const stdGemini = standardMissing.find(item => item.provider === 'gemini');
+  assert.equal(stdGemini.ok, false);
+  assert.equal(stdGemini.status, 'error');
+  assert.equal(stdGemini.required, true);
+  assert.equal(stdGemini.code, 'auth');
+
+  const quickMissing = await doctorProviders(
+    { client: 'codex', secrets: {}, config: { client: 'codex', executionMode: 'quick' } },
+    { subscriptionStatusImpl },
+  );
+  for (const provider of ['gemini', 'jev', 'scrape', 'reddit', 'x']) {
+    const check = quickMissing.find(item => item.provider === provider);
+    assert.equal(check.ok, true, provider);
+    assert.equal(check.status, 'warning', provider);
+    assert.equal(check.required, false, provider);
+  }
+
+  const uiJev = await doctorProviders(
+    {
+      client: 'codex',
+      secrets: {},
+      config: {
+        client: 'codex',
+        executionMode: 'quick',
+        uiVerification: { enabled: true, cases: [{ id: 'ui', tool: 'jev-ultrafast' }] },
+      },
+    },
+    { subscriptionStatusImpl },
+  );
+  for (const provider of ['gemini', 'jev']) {
+    const check = uiJev.find(item => item.provider === provider);
+    assert.equal(check.ok, false, provider);
+    assert.equal(check.status, 'error', provider);
+    assert.equal(check.required, true, provider);
+  }
+  const uiBrowser = await doctorProviders(
+    {
+      client: 'codex',
+      secrets: {},
+      config: {
+        client: 'codex',
+        executionMode: 'quick',
+        uiVerification: { enabled: true, cases: [{ id: 'ui', tool: 'browser-use' }] },
+      },
+    },
+    { subscriptionStatusImpl },
+  );
+  assert.equal(uiBrowser.find(item => item.provider === 'gemini').required, true);
+  assert.equal(uiBrowser.find(item => item.provider === 'gemini').status, 'error');
+  assert.equal(uiBrowser.find(item => item.provider === 'jev').required, false);
+  assert.equal(uiBrowser.find(item => item.provider === 'jev').status, 'warning');
+});
+
+test('doctorProviders live mode skips unconfigured optional keys and unselected clients', async () => {
+  const called = [];
+  const checks = await doctorProviders(
+    {
+      client: 'claude-code',
+      live: true,
+      secrets: { GEMINI_API_KEY: secrets.GEMINI_API_KEY },
+      config: { client: 'claude-code' },
+    },
+    {
+      subscriptionStatusImpl: async selected => {
+        called.push(`status:${selected}`);
+        return { client: selected, available: true, auth: 'subscription' };
+      },
+      runSessionImpl: async request => {
+        called.push(`session:${request.client}`);
+        return { model: request.model, sessionId: 'live-session-1', output: { ok: true } };
+      },
+      analyzeGeminiImpl: async () => {
+        called.push('gemini');
+        return { model: 'gemini-fixture' };
+      },
+      decideJevImpl: async () => {
+        called.push('jev');
+        return { fallback: false, jevModel: 'jev-fixture' };
+      },
+      researchImpl: async () => {
+        called.push('research');
+        return { items: [], errors: [] };
+      },
+    },
+  );
+  assert.deepEqual(called, ['status:claude-code', 'session:claude-code', 'gemini']);
+  assert.equal(checks.find(item => item.provider === 'claude-code').live, true);
+  assert.equal(checks.find(item => item.provider === 'gemini').live, true);
+  assert.equal(checks.find(item => item.provider === 'jev').live, false);
+  assert.equal(checks.find(item => item.provider === 'jev').status, 'warning');
 });

@@ -62,7 +62,6 @@ Engine.prototype.run=async function(id,options){
           '--project',
           directory,
           ...(prepare ? ['--prepare'] : ['--plan', planFile]),
-          '--json',
         ],
         {
           cwd: directory,
@@ -82,4 +81,123 @@ Engine.prototype.run=async function(id,options){
       assert.equal(value.state, prepare ? 'awaiting_plan' : 'succeeded');
       assert.equal(value.retryConfirmed, true);
     });
+});
+
+async function makeRepo(t) {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'kodo-cli-nowait-'));
+  t.after(async () => {
+    assert.equal(path.dirname(path.resolve(directory)), path.resolve(os.tmpdir()));
+    assert.ok(path.basename(directory).startsWith('kodo-cli-nowait-'));
+    await rm(directory, { recursive: true, force: true });
+  });
+  const git = args => execFileSync('git', args, { cwd: directory, encoding: 'utf8', windowsHide: true, stdio: 'pipe' });
+  git(['init', '-b', 'main']);
+  git(['config', 'user.name', 'CLI Retry Test']);
+  git(['config', 'user.email', 'retry@example.invalid']);
+  await writeFile(path.join(directory, 'baseline.txt'), 'baseline\n');
+  git(['add', '.']);
+  git(['commit', '-m', 'baseline']);
+  return directory;
+}
+
+test('CLI run and resume with --json or --no-wait return waiting_limits and retryAt immediately without sleeping', async t => {
+  const futureIso = '2099-01-01T00:00:00.000Z';
+  const cases = [
+    { name: 'run --json with retryAt', command: 'run', flags: ['--json'], retryAt: futureIso },
+    { name: 'run --json without retryAt', command: 'run', flags: ['--json'], retryAt: null },
+    { name: 'resume --json with retryAt', command: 'resume', flags: ['--json'], retryAt: futureIso },
+    { name: 'run --no-wait without --json', command: 'run', flags: ['--no-wait'], retryAt: futureIso },
+    { name: 'resume --no-wait without --json', command: 'resume', flags: ['--no-wait'], retryAt: futureIso },
+  ];
+  for (const item of cases) {
+    await t.test(item.name, async subtest => {
+      const directory = await makeRepo(subtest);
+      const env = {
+        ...process.env,
+        KODO_HOME: path.join(directory, 'state'),
+        KODO_CREDENTIAL_HOME: path.join(directory, 'credentials'),
+      };
+      const hook = path.join(directory, 'waiting-hook.mjs');
+      await writeFile(
+        hook,
+        `import assert from 'node:assert/strict';
+import { Engine } from ${JSON.stringify(pathToFileURL(path.join(root, 'runtime/engine.mjs')).href)};
+let calls = 0;
+Engine.prototype.run = async function (id) {
+  calls++;
+  assert.equal(calls, 1, 'must not retry after immediate waiting_limits return');
+  globalThis.setTimeout = () => {
+    throw new Error('unexpected_sleep_on_waiting_limits');
+  };
+  const retryAt = ${JSON.stringify(item.retryAt)};
+  return this.store.updateRun(id, {
+    state: 'waiting_limits',
+    error: { code: 'quota', message: 'limit reached', ...(retryAt ? { retryAt } : {}) },
+  });
+};\n`,
+      );
+      let args;
+      if (item.command === 'run') {
+        args = ['run', 'fixture task', '--project', directory, ...item.flags];
+      } else {
+        const seedHook = path.join(directory, 'seed-hook.mjs');
+        await writeFile(
+          seedHook,
+          `import { Engine } from ${JSON.stringify(pathToFileURL(path.join(root, 'runtime/engine.mjs')).href)};
+Engine.prototype.run = async function (id) {
+  return this.store.updateRun(id, { state: 'awaiting_plan' });
+};\n`,
+        );
+        const seeded = spawnSync(
+          process.execPath,
+          [
+            '--import',
+            pathToFileURL(seedHook).href,
+            path.join(root, 'cli/index.mjs'),
+            'run',
+            'fixture task',
+            '--project',
+            directory,
+            '--prepare',
+            '--json',
+          ],
+          { cwd: directory, encoding: 'utf8', windowsHide: true, timeout: 30000, env },
+        );
+        assert.equal(seeded.status, 0, seeded.stderr);
+        const runId = JSON.parse(seeded.stdout).id;
+        args = ['resume', runId, ...item.flags];
+      }
+      const before = Date.now();
+      const result = spawnSync(
+        process.execPath,
+        ['--import', pathToFileURL(hook).href, path.join(root, 'cli/index.mjs'), ...args],
+        { cwd: directory, encoding: 'utf8', windowsHide: true, timeout: 30000, env },
+      );
+      assert.ifError(result.error);
+      assert.equal(result.status, 2, result.stderr);
+      const value = JSON.parse(result.stdout);
+      assert.equal(value.state, 'waiting_limits');
+      assert.equal(typeof value.retryAt, 'string');
+      assert.equal(value.nextRetryAt, value.retryAt);
+      if (item.retryAt) assert.equal(value.retryAt, item.retryAt);
+      else assert.ok(Date.parse(value.retryAt) > before + 14 * 60 * 1000);
+    });
+  }
+});
+
+test('CLI rejects --no-wait on non-waiting commands', async t => {
+  const directory = await makeRepo(t);
+  const result = spawnSync(process.execPath, [path.join(root, 'cli/index.mjs'), 'status', 'missing-run', '--no-wait'], {
+    cwd: directory,
+    encoding: 'utf8',
+    windowsHide: true,
+    timeout: 30000,
+    env: {
+      ...process.env,
+      KODO_HOME: path.join(directory, 'state'),
+      KODO_CREDENTIAL_HOME: path.join(directory, 'credentials'),
+    },
+  });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /неприменим/i);
 });

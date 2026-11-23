@@ -17,8 +17,8 @@ node cli/index.mjs validate [--json]
 kodo registry stats [--json]
 
 kodo init [--project PATH]
-kodo doctor [--live] [--json]
-kodo run "TASK" --client codex|claude-code [--model MODEL] [--mode quick|standard|deep] [--providers both] [--prepare] [--delivery none|pr|release]
+kodo doctor [--client codex|claude-code] [--mode quick|standard|deep] [--live] [--json]
+kodo run "TASK" --client codex|claude-code [--model MODEL] [--mode quick|standard|deep] [--providers both] [--prepare] [--no-wait] [--delivery none|pr|release]
 kodo benchmark run --models MODEL,... [--client codex|claude-code] [--mode quick|standard|deep] [--repeats N] [--seed N] [--output ABSOLUTE_DIR] [--json]
 kodo benchmark resume|report PATH [--json]
 kodo status|logs|resume|cancel RUN_ID [--json]
@@ -40,7 +40,7 @@ kodo architecture check --base FULL_SHA [--evidence-dir ABSOLUTE_PATH]
 kodo quality run [--mode quick|standard|deep] [--changed PATH] [--affected PATH] [--capability NAME] [--evidence-dir PATH]
 kodo ui verify [--project PATH] [--json]
 kodo security verify [--project PATH] [--json]
-kodo resume RUN_ID --plan FILE
+kodo resume RUN_ID --plan FILE [--no-wait] [--json]
 kodo migrate --target PROJECT
 
 Клиенты: codex, claude-code, opencode. В install и init --preset --client можно повторять или указать all; init без пресета принимает один --client (или all); run, doctor, benchmark run, project bootstrap и extend — один --client, обе подписки в run — --providers both.
