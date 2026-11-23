@@ -84,7 +84,7 @@ export async function runProcess({
   signal,
   timeoutMs = 1800000,
   startupTimeoutMs,
-  startedBy = () => true,
+  startedBy = /** @type {(line: string) => boolean} */ (() => true),
   onLine,
   maxOutputBytes = 16 * 1024 * 1024,
 }) {

@@ -97,6 +97,9 @@ function toolSteps(client, events) {
 /**
  * `firstEventMs` is the time from the start of the session to the first client event (null without
  * one); `startupRetries` counts restarts of a client that sent no event (null when unknown).
+ * @param {string} client
+ * @param {any[]} events
+ * @param {{ durationMs?: number, usage?: any, firstEventMs?: number | null, startupRetries?: number }} [details]
  */
 export function sessionMetrics(client, events, { durationMs, usage, firstEventMs, startupRetries } = {}) {
   if (usage === undefined && Array.isArray(events)) {

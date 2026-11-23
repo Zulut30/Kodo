@@ -14,7 +14,7 @@
   {
     "file": "runtime/benchmark.mjs",
     "code": "TS2739",
-    "message": "Type '{ command: string; args: string[]; env: { [k: string]: string; }; timeoutMs: number; }' is missing the following properties from type '{ args?: any[]; command: any; cwd: any; env?: ProcessEnv; input?: string; maxOutputBytes?: number; onLine: any; signal: any; timeoutMs?: number; }': cwd, onLine, signal",
+    "message": "Type '{ command: string; args: string[]; env: { [k: string]: string; }; timeoutMs: number; }' is missing the following properties from type '{ args?: any[]; command: any; cwd: any; env?: ProcessEnv; input?: string; maxOutputBytes?: number; onLine: any; signal: any; startedBy?: (line: string) => boolean; startupTimeoutMs: any; timeoutMs?: number; }': cwd, onLine, signal, startupTimeoutMs",
     "count": 1
   },
   {
@@ -327,18 +327,6 @@
     "file": "runtime/knowledge-refresh.mjs",
     "code": "TS2353",
     "message": "Object literal may only specify known properties, and 'store' does not exist in type '{ delivery?: { deliver: (options: any) => Promise<any>; releasePackage: (options: any) => Promise<any>; prepareReleaseVersion: (options: any) => Promise<{ version: any; changed: boolean; files: any[]; }>; reconcileDelivery: (options: any) => Promise<...>; }; ... 6 more ...; tools?: {}; }'.",
-    "count": 1
-  },
-  {
-    "file": "runtime/metrics.mjs",
-    "code": "TS2339",
-    "message": "Property 'durationMs' does not exist on type '{}'.",
-    "count": 1
-  },
-  {
-    "file": "runtime/metrics.mjs",
-    "code": "TS2339",
-    "message": "Property 'usage' does not exist on type '{}'.",
     "count": 1
   },
   {
