@@ -160,6 +160,15 @@ test('Scheduler orders observed file durations longest first and retains every d
   assert.deepEqual(orderTests([...input].reverse(), temp), expected);
 });
 
+test('Scheduler starts the two wave drain files first in the real discovered suite', async () => {
+  const { discoverTests } = await import(scheduleUrl);
+  // LPT heuristic from the data available before a full Windows CI measurement, not an observed
+  // completion order: 13 of the 14 project-wave-director cases took 1008474.9099 ms in Windows run
+  // 44577524507, and project-wave-e2e took as long as the director in one local Windows run.
+  const ordered = discoverTests(root).map(file => path.relative(root, file).replaceAll('\\', '/'));
+  assert.deepEqual(ordered.slice(0, 2), ['tests/project-wave-director.test.mjs', 'tests/project-wave-e2e.test.mjs']);
+});
+
 test(
   'Scheduler starts heuristic heavy files before lexical files in real isolated children',
   { timeout: 15000 },
