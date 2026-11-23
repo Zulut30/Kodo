@@ -212,7 +212,8 @@ export class EnginePlanning extends EngineCore {
       const context = await this.toolContext(run, 'analyze');
       const local = limitation => ({
         kind: 'local',
-        summary: 'Quick local project map; implementation and independent review must verify the requested behavior',
+        summary:
+          'Local project map without external analysis; implementation and independent review must verify the requested behavior',
         model: null,
         files: bundle.files.map(file => file.path),
         limitations: [limitation],

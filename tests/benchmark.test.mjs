@@ -1069,3 +1069,22 @@ test('Paired reports separate native duration from wall time and keep failed and
     ],
   );
 });
+
+test('Native session receipts keep the first event and startup restarts the client reported', async t => {
+  const root = await temp(t),
+    deps = services(root);
+  deps.provider.runSession = async request => {
+    if (!request.readOnly) await fix(request.cwd);
+    return { model: request.model, metrics: { ...metric, firstEventMs: 7, startupRetries: 1 } };
+  };
+  const output = path.join(root, 'out');
+  assert.equal((await runBenchmark(options(output), deps)).complete, true);
+  const manifest = JSON.parse(await readFile(path.join(output, 'benchmark.json'), 'utf8'));
+  const plain = manifest.trials.filter(cell => cell.condition === 'plain');
+  assert.ok(plain.length > 0);
+  for (const cell of plain)
+    assert.deepEqual(
+      cell.sessions.map(row => [row.firstEventMs, row.startupRetries]),
+      [[7, 1]],
+    );
+});

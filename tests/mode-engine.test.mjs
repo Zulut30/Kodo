@@ -118,6 +118,7 @@ test('A missing Gemini key falls back to local analysis only for an automaticall
     assert.equal(result.state, 'succeeded', `${source}: ${result.error?.message}`);
     assert.deepEqual([result.executionMode.source, result.executionMode.selected], [source, 'standard']);
     assert.equal(result.analysis.kind, 'local');
+    assert.doesNotMatch(result.analysis.summary, /quick/i, 'the summary does not claim quick mode in standard');
     assert.equal(result.analysisFallback, 'auth', 'the limitation is recorded in the run');
     assert.match(result.analysis.limitations.join(' '), /Gemini.*auth/);
     assert.equal(
