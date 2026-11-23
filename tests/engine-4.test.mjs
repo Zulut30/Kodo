@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { writeFile } from 'node:fs/promises';
+import { realpathSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { once } from 'node:events';
 import { assertWorktreeLockHeld } from './helpers/worktree-lock.mjs';
@@ -416,7 +417,7 @@ test('Worktree registration serializes local callers and bounds a cancelled or e
       withWorktreeLock(fx.project, forbidden, undefined, waitMs),
       error =>
         error.code === 'timeout' &&
-        error.message.includes(path.join(fx.project, '.git')) &&
+        error.message.includes(realpathSync.native(path.join(fx.project, '.git'))) &&
         error.message.includes(waitMs + ' ms'),
     );
     const queued = Promise.withResolvers();
@@ -442,7 +443,7 @@ test('Worktree registration serializes local callers and bounds a cancelled or e
 
 test('Worktree registration can abort or time out while another connection owns SQLite', async t => {
   const fx = await fixture(t);
-  const common = path.join(fx.project, '.git');
+  const common = realpathSync.native(path.join(fx.project, '.git'));
   const holder = new DatabaseSync(path.join(common, 'kodo-worktree-guard.sqlite'));
   const controller = new AbortController();
   const exec = DatabaseSync.prototype.exec,

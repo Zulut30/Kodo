@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
-import { readFile, lstat, mkdir, realpath } from 'node:fs/promises';
+import { readFile, lstat, mkdir } from 'node:fs/promises';
+import { realpathSync } from 'node:fs';
 import { setTimeout as delay } from 'node:timers/promises';
 import path from 'node:path';
 import { execute } from './command.mjs';
@@ -88,7 +89,9 @@ export async function withWorktreeLock(project, action, signal = undefined, wait
     });
     const directory = stdout.replace(/\r?\n$/, '');
     if (!path.isAbsolute(directory)) throw new Error('Git returned a relative common directory');
-    const common = await realpath(directory);
+    // The native call resolves Windows 8.3 aliases and SUBST drives like Store does, so one
+    // repository reached through different aliases shares the in-process queue.
+    const common = realpathSync.native(directory);
     const key = process.platform === 'win32' ? common.toLowerCase() : common;
     const timeoutError = () => {
       const elapsed = Math.round(performance.now() - started);
