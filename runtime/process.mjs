@@ -70,6 +70,11 @@ export async function resolveClient(client, environment = process.env) {
   throw new Error(`Не найден исполняемый файл клиента ${client}`);
 }
 
+/**
+ * `startupTimeoutMs` bounds the wait for the first stdout line accepted by `startedBy` (any line by
+ * default); it is armed only when shorter than `timeoutMs`. Past it the process tree is stopped
+ * with `KODO_STARTUP_TIMEOUT`.
+ */
 export async function runProcess({
   command,
   args = [],
@@ -78,6 +83,8 @@ export async function runProcess({
   env = process.env,
   signal,
   timeoutMs = 1800000,
+  startupTimeoutMs,
+  startedBy = () => true,
   onLine,
   maxOutputBytes = 16 * 1024 * 1024,
 }) {
@@ -102,6 +109,19 @@ export async function runProcess({
       timeoutMs,
     );
     timer.unref();
+    let startup =
+      Number.isFinite(startupTimeoutMs) && startupTimeoutMs > 0 && startupTimeoutMs < timeoutMs
+        ? setTimeout(
+            () =>
+              terminate(
+                Object.assign(new Error(`Клиент не прислал первое событие за ${startupTimeoutMs} мс`), {
+                  code: 'KODO_STARTUP_TIMEOUT',
+                }),
+              ),
+            startupTimeoutMs,
+          )
+        : undefined;
+    startup?.unref();
     const aborted = () =>
       terminate(
         signal.reason instanceof Error
@@ -113,6 +133,7 @@ export async function runProcess({
       if (finished) return;
       finished = true;
       clearTimeout(timer);
+      clearTimeout(startup);
       signal?.removeEventListener('abort', aborted);
       callback();
     };
@@ -129,6 +150,10 @@ export async function runProcess({
         const line = pending.slice(0, newline).replace(/\r$/, '');
         pending = pending.slice(newline + 1);
         try {
+          if (startup && startedBy(line)) {
+            clearTimeout(startup);
+            startup = undefined;
+          }
           onLine?.(line);
         } catch (error) {
           terminate(error);

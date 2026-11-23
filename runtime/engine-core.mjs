@@ -173,6 +173,14 @@ export class EngineCore {
       ...gates,
     };
     this.tools = { resolveTool, formatToolContext, ...tools };
+    // Login checks of native clients, one cache per loaded run object: a new `run()` loads a new
+    // object and checks again, so nothing is shared between runs.
+    this.subscriptionChecks = new WeakMap();
+  }
+  /** The login cache of this loaded run, shared by model discovery and every native session. */
+  runSubscriptionChecks(run) {
+    if (!this.subscriptionChecks.has(run)) this.subscriptionChecks.set(run, new Map());
+    return this.subscriptionChecks.get(run);
   }
   log(run, type, data = {}) {
     const clean = redact(data, this.secrets);
@@ -767,7 +775,7 @@ try {
           if (this.store.getRun(run.id).cancelRequested) controller.abort();
         }, 500);
         timer.unref();
-        let attempt, started, localBytes;
+        let attempt, started, localBytes, firstEvent;
         try {
           const tools = await this.resolveWorkerTools(request.cwd);
           const guidance = redact(
@@ -823,6 +831,7 @@ try {
             metrics: {
               ...localBytes,
               durationMs: null,
+              firstEventMs: null,
               toolSteps: null,
               nativeRequestCount: null,
               usage: normalizeUsage(request.client),
@@ -835,7 +844,10 @@ try {
             ...request,
             signal: controller.signal,
             env,
+            subscriptionChecks: this.runSubscriptionChecks(run),
+            ...(run.config.startupTimeoutMs !== undefined ? { startupTimeoutMs: run.config.startupTimeoutMs } : {}),
             onEvent: event => {
+              firstEvent ??= performance.now() - started;
               if (identity && event.sessionId) {
                 identity.sessionId = event.sessionId;
                 this.save(run);
@@ -863,6 +875,8 @@ try {
               ...attempt.metrics,
               ...localBytes,
               durationMs: attempt.metrics.durationMs ?? performance.now() - started,
+              // The client's own measurement when it has one, else the first event Engine observed.
+              firstEventMs: attempt.metrics.firstEventMs ?? firstEvent ?? null,
               nativeRequestCount: null,
             };
             this.save(run);

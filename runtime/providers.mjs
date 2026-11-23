@@ -54,6 +54,8 @@ const defaults = {
  * @property {(event: any) => void} [onEvent]
  * @property {NodeJS.ProcessEnv} [env]
  * @property {number} [timeoutMs]
+ * @property {number} [startupTimeoutMs] Limit from process start to the first JSON event; one restart without events.
+ * @property {Map<string, Promise<any>>} [subscriptionChecks] Login checks of one Engine run, by client.
  */
 
 /**
@@ -201,7 +203,7 @@ export async function subscriptionStatus(
 
 /**
  * @param {{ client?: string, providers?: string, primaryModel?: string }} [request]
- * @param {{ config?: Record<string, any>, live?: boolean, secrets?: import('./security.mjs').Secrets, statusImpl?: typeof subscriptionStatus, cacheImpl?: typeof readCodexModelCache, sessionImpl?: typeof runSession }} [deps]
+ * @param {{ config?: Record<string, any>, live?: boolean, secrets?: import('./security.mjs').Secrets, statusImpl?: typeof subscriptionStatus, cacheImpl?: typeof readCodexModelCache, sessionImpl?: typeof runSession, subscriptionChecks?: Map<string, Promise<any>> }} [deps]
  */
 export async function discoverProviders(
   { client = 'codex', providers = 'current', primaryModel } = {},
@@ -212,6 +214,7 @@ export async function discoverProviders(
     statusImpl = subscriptionStatus,
     cacheImpl = readCodexModelCache,
     sessionImpl = runSession,
+    subscriptionChecks,
   } = {},
 ) {
   const selectedClient = client === 'opencode' ? config.backend || 'codex' : client;
@@ -229,7 +232,8 @@ export async function discoverProviders(
   for (const current of clients) {
     let availability;
     try {
-      availability = await statusImpl(current);
+      // The login check of a run is shared with its sessions (`subscriptionChecks`).
+      availability = await checkedSubscription(subscriptionChecks, current, () => statusImpl(current));
     } catch (error) {
       availability = { available: false, error: error.message, code: error.code };
     }
@@ -379,9 +383,13 @@ export function sessionInvocation({ client, model, cwd, schemaPath, schema, sess
 /**
  * @param {string} client
  * @param {any[]} events
- * @param {{ schema?: Record<string, any>, sessionId?: string, model?: string, durationMs?: number }} [details]
+ * @param {{ schema?: Record<string, any>, sessionId?: string, model?: string, durationMs?: number, firstEventMs?: number | null, startupRetries?: number }} [details]
  */
-export function parseSessionEvents(client, events, { schema, sessionId, model, durationMs } = {}) {
+export function parseSessionEvents(
+  client,
+  events,
+  { schema, sessionId, model, durationMs, firstEventMs, startupRetries } = {},
+) {
   let output,
     usage,
     failure,
@@ -431,56 +439,123 @@ export function parseSessionEvents(client, events, { schema, sessionId, model, d
         'invalid_output',
       );
   }
-  return { sessionId, output, usage, model, metrics: sessionMetrics(client, events, { durationMs, usage }) };
+  return {
+    sessionId,
+    output,
+    usage,
+    model,
+    metrics: sessionMetrics(client, events, { durationMs, usage, firstEventMs, startupRetries }),
+  };
 }
+
+/** One login check per client and cache; a failed check is not remembered. */
+function checkedSubscription(cache, client, check) {
+  if (!(cache instanceof Map)) return check();
+  if (!cache.has(client)) {
+    const pending = check();
+    cache.set(client, pending);
+    pending.catch(() => {
+      if (cache.get(client) === pending) cache.delete(client);
+    });
+  }
+  return cache.get(client);
+}
+
+const jsonLine = line => {
+  try {
+    JSON.parse(line);
+    return true;
+  } catch {
+    return false;
+  }
+};
 
 /**
  * @param {SessionRequest} request
  * @param {ProcessDeps & { nowImpl?: () => number }} [deps]
  */
 export async function runSession(
-  { client, model, cwd, prompt, schema, sessionId, readOnly = false, signal, onEvent, env, timeoutMs = 1800000 },
+  {
+    client,
+    model,
+    cwd,
+    prompt,
+    schema,
+    sessionId,
+    readOnly = false,
+    signal,
+    onEvent,
+    env,
+    timeoutMs = 1800000,
+    startupTimeoutMs = 120000,
+    subscriptionChecks,
+  },
   { processImpl = runProcess, resolveClientImpl = resolveClient, nowImpl = () => performance.now() } = {},
 ) {
   signal?.throwIfAborted();
   const started = nowImpl(),
     events = [];
-  let directory;
+  let directory,
+    firstEventMs = null,
+    startupRetries = 0;
   const environment = subscriptionEnvironment(env);
   try {
-    const { executable } = await subscriptionStatus(client, { env: environment, processImpl, resolveClientImpl });
+    const { executable } = await checkedSubscription(subscriptionChecks, client, () =>
+      subscriptionStatus(client, { env: environment, processImpl, resolveClientImpl }),
+    );
     directory = await mkdtemp(path.join(os.tmpdir(), 'kodo-provider-'));
     const schemaPath = schema ? path.join(directory, 'output.schema.json') : undefined;
     if (schema) await writeFile(schemaPath, JSON.stringify(providerSchema(schema)), { mode: 0o600 });
-    const invocation = sessionInvocation({ client, model, cwd, schemaPath, schema, sessionId, readOnly });
-    if (client === 'codex')
-      invocation.args.splice(invocation.args.indexOf('exec'), 0, ...(await codexIsolationOverrides(cwd, environment)));
-    const result = await processImpl({
-      ...executable,
-      args: [...executable.args, ...invocation.args],
-      cwd,
-      input: prompt,
-      env: environment,
-      signal,
-      timeoutMs,
-      onLine: line => {
-        if (!line.trim()) return;
-        let event;
-        try {
-          event = JSON.parse(line);
-        } catch {
-          return;
-        }
-        events.push(event);
-        // Stream lifecycle only. Command/output payloads may contain repository secrets.
-        onEvent?.({
-          type: event.type,
-          subtype: event.subtype,
-          sessionId: event.thread_id ?? event.session_id ?? invocation.sessionId,
-          model,
+    const isolation = client === 'codex' ? await codexIsolationOverrides(cwd, environment) : [];
+    let invocation, result;
+    for (;;) {
+      // A restart is a fresh invocation: a new Claude session id, the same resumed Codex thread.
+      invocation = sessionInvocation({ client, model, cwd, schemaPath, schema, sessionId, readOnly });
+      if (client === 'codex') invocation.args.splice(invocation.args.indexOf('exec'), 0, ...isolation);
+      const current = invocation;
+      try {
+        result = await processImpl({
+          ...executable,
+          args: [...executable.args, ...current.args],
+          cwd,
+          input: prompt,
+          env: environment,
+          signal,
+          timeoutMs,
+          startupTimeoutMs,
+          startedBy: jsonLine,
+          onLine: line => {
+            if (!line.trim()) return;
+            let event;
+            try {
+              event = JSON.parse(line);
+            } catch {
+              return;
+            }
+            firstEventMs ??= nowImpl() - started;
+            events.push(event);
+            // Stream lifecycle only. Command/output payloads may contain repository secrets.
+            onEvent?.({
+              type: event.type,
+              subtype: event.subtype,
+              sessionId: event.thread_id ?? event.session_id ?? current.sessionId,
+              model,
+            });
+          },
         });
-      },
-    });
+        break;
+      } catch (error) {
+        if (error?.code !== 'KODO_STARTUP_TIMEOUT' || signal?.aborted) throw error;
+        // A client that never answered did no work: start it once more. A second silence, or a
+        // silence after events, fails the session as unavailable, which spends no repair round.
+        if (events.length || startupRetries)
+          throw Object.assign(
+            new ProviderError(`Клиент ${client} не прислал первое событие за ${startupTimeoutMs} мс`, 'unavailable'),
+            { startupTimeout: true },
+          );
+        startupRetries++;
+      }
+    }
     if (result.exitCode !== 0) {
       try {
         parseSessionEvents(client, events, { schema, sessionId: invocation.sessionId, model });
@@ -494,6 +569,8 @@ export async function runSession(
       sessionId: invocation.sessionId,
       model,
       durationMs: nowImpl() - started,
+      firstEventMs,
+      startupRetries,
     });
   } catch (error) {
     const failure =
@@ -501,7 +578,11 @@ export async function runSession(
         ? error
         : new ProviderError(redact(error.message), 'unavailable');
     if (failure instanceof Error && Object.isExtensible(failure))
-      failure.metrics = sessionMetrics(client, events, { durationMs: nowImpl() - started });
+      failure.metrics = sessionMetrics(client, events, {
+        durationMs: nowImpl() - started,
+        firstEventMs,
+        startupRetries,
+      });
     throw failure;
   } finally {
     if (

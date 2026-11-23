@@ -59,6 +59,13 @@ export function validateCommandTimeouts(commands) {
       }
     }
 }
+/** Optional limit from a native client start to its first event; absent means the 120000 ms default. */
+export function validateStartupTimeout(value) {
+  if (value !== undefined && (!Number.isSafeInteger(value) || value < 10000 || value > 1800000))
+    throw Object.assign(new Error('Некорректный startupTimeoutMs: требуется целое число от 10000 до 1800000 мс'), {
+      code: 'configuration',
+    });
+}
 export async function readConfig(project, overrides = {}) {
   let file = {};
   try {
@@ -134,6 +141,7 @@ export function normalizeConfig(file, overrides = {}) {
     )
       throw new Error(`Некорректные команды ${kind}`);
   validateCommandTimeouts(config.commands);
+  validateStartupTimeout(/** @type {any} */ (config).startupTimeoutMs);
   return config;
 }
 export async function initConfig(project, overrides = {}) {

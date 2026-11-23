@@ -1056,3 +1056,148 @@ test('Research bounds the outgoing query and filters off-source HTML links', asy
     ['github', 'hackernews', 'docs'],
   );
 });
+
+const claudeLoggedIn = JSON.stringify({ loggedIn: true, authMethod: 'claude.ai' });
+const claudeResult = id =>
+  JSON.stringify({ type: 'result', subtype: 'success', structured_output: { ok: true }, session_id: id });
+
+test('Process runner stops a client without a first JSON line at the startup limit', async () => {
+  const json = line => {
+    try {
+      JSON.parse(line);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const started = performance.now();
+  await assert.rejects(
+    runProcess({
+      command: process.execPath,
+      // A banner that is not an event does not count as a start.
+      args: ['-e', "process.stdout.write('warming up\\n');setInterval(()=>{},1000)"],
+      timeoutMs: 60000,
+      startupTimeoutMs: 300,
+      startedBy: json,
+    }),
+    error => error.code === 'KODO_STARTUP_TIMEOUT',
+  );
+  assert.ok(performance.now() - started < 30000, 'the startup limit, not the session limit, stopped it');
+  // The first JSON line clears the limit for the rest of the session.
+  const result = await runProcess({
+    command: process.execPath,
+    args: ['-e', 'process.stdout.write(\'{"type":"init"}\\n\');setTimeout(()=>{},2600)'],
+    timeoutMs: 60000,
+    startupTimeoutMs: 2000,
+    startedBy: json,
+  });
+  assert.equal(result.exitCode, 0);
+});
+
+test('A session without any event is started again exactly once with a fresh native session', async () => {
+  const exec = [];
+  let status = 0,
+    now = 0;
+  const deps = timeouts => ({
+    nowImpl: () => now,
+    resolveClientImpl: async () => ({ command: 'fixture', args: [] }),
+    processImpl: async invocation => {
+      if (invocation.args.includes('status')) {
+        status++;
+        return { exitCode: 0, stdout: claudeLoggedIn, stderr: '' };
+      }
+      exec.push(invocation.args);
+      assert.equal(invocation.startupTimeoutMs, 50);
+      assert.equal(invocation.startedBy('{"type":"system"}'), true);
+      assert.equal(invocation.startedBy('Loading'), false);
+      if (exec.length <= timeouts) {
+        now += 50;
+        throw Object.assign(new Error('no first event'), { code: 'KODO_STARTUP_TIMEOUT' });
+      }
+      now += 7;
+      invocation.onLine(claudeResult(invocation.args[invocation.args.indexOf('--session-id') + 1]));
+      return { exitCode: 0, stdout: '', stderr: '' };
+    },
+  });
+  const request = { client: 'claude-code', cwd: process.cwd(), prompt: 'fixture task', schema, startupTimeoutMs: 50 };
+  const result = await runSession(request, deps(1));
+  assert.deepEqual(result.output, { ok: true });
+  assert.equal(exec.length, 2, 'one automatic restart');
+  assert.equal(status, 1, 'the restart does not check the login again');
+  const ids = exec.map(args => args[args.indexOf('--session-id') + 1]);
+  assert.notEqual(ids[0], ids[1], 'the restart is a fresh native session');
+  assert.equal(result.sessionId, ids[1]);
+  assert.equal(result.metrics.startupRetries, 1);
+  assert.equal(result.metrics.firstEventMs, 57, 'measured from the start of the session');
+
+  exec.length = 0;
+  now = 0;
+  await assert.rejects(runSession(request, deps(5)), error => {
+    assert.equal(exec.length, 2, 'exactly one restart, never a second');
+    assert.deepEqual([error.code, error.startupTimeout], ['unavailable', true]);
+    assert.equal(error.metrics.firstEventMs, null, 'no event was observed');
+    assert.equal(error.metrics.startupRetries, 1);
+    return true;
+  });
+});
+
+test('A session that already produced events is never restarted', async () => {
+  let exec = 0;
+  const deps = {
+    resolveClientImpl: async () => ({ command: 'fixture', args: [] }),
+    processImpl: async invocation => {
+      if (invocation.args.includes('status')) return { exitCode: 0, stdout: 'Logged in using ChatGPT', stderr: '' };
+      exec++;
+      invocation.onLine(JSON.stringify(codexEvents[0]));
+      throw Object.assign(new Error('late'), { code: 'KODO_STARTUP_TIMEOUT' });
+    },
+  };
+  await assert.rejects(
+    runSession({ client: 'codex', cwd: process.cwd(), prompt: 'fixture task', schema, startupTimeoutMs: 50 }, deps),
+    error => error.code === 'unavailable' && error.startupTimeout === true && error.metrics.firstEventMs !== null,
+  );
+  assert.equal(exec, 1);
+});
+
+test('A shared run cache checks the subscription login once per client and forgets a failed check', async () => {
+  let status = 0,
+    loggedIn = false;
+  const deps = {
+    resolveClientImpl: async () => ({ command: 'fixture', args: [] }),
+    processImpl: async invocation => {
+      if (invocation.args.includes('status')) {
+        status++;
+        return loggedIn
+          ? { exitCode: 0, stdout: claudeLoggedIn, stderr: '' }
+          : { exitCode: 0, stdout: JSON.stringify({ loggedIn: false }), stderr: '' };
+      }
+      invocation.onLine(claudeResult(invocation.args[invocation.args.indexOf('--session-id') + 1]));
+      return { exitCode: 0, stdout: '', stderr: '' };
+    },
+  };
+  const subscriptionChecks = new Map();
+  const request = { client: 'claude-code', cwd: process.cwd(), prompt: 'fixture task', schema, subscriptionChecks };
+  await assert.rejects(runSession(request, deps), error => error.code === 'auth');
+  loggedIn = true;
+  await runSession(request, deps);
+  await runSession(request, deps);
+  assert.equal(status, 2, 'a failed check is not remembered; a passed one is reused');
+  await runSession({ ...request, subscriptionChecks: undefined }, deps);
+  assert.equal(status, 3, 'without a run cache every session checks');
+
+  // Model discovery of the same run fills the cache that its sessions use.
+  const shared = new Map();
+  let discovered = 0;
+  const statusImpl = async client => {
+    discovered++;
+    return subscriptionStatus(client, deps);
+  };
+  const pool = await discoverProviders(
+    { client: 'claude-code' },
+    { statusImpl, cacheImpl: async () => [], subscriptionChecks: shared },
+  );
+  assert.ok(pool.every(entry => entry.available));
+  await runSession({ ...request, subscriptionChecks: shared }, deps);
+  await runSession({ ...request, subscriptionChecks: shared }, deps);
+  assert.deepEqual([discovered, status], [1, 4], 'one login check for discovery and every session');
+});

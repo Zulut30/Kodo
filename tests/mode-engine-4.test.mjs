@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { readConfig } from '../runtime/config.mjs';
 import { git, task, metrics, fixture } from './helpers/mode-engine-fixture.mjs';
 
 test('Automatic assessment precedes expensive analysis and project mode is overridden by explicit mode', async t => {
@@ -177,4 +178,56 @@ test('Quick rejects contradictory passing review receipts with blocker or major 
       assert.equal(result.controllerAssessment.attempts, 1);
       assert.deepEqual(fx.calls, ['assessment', 'discovery', 'plan', 'worker', 'review']);
     });
+});
+
+test('Native sessions of one run share one login check, get the startup limit and record the first event', async t => {
+  const fx = await fixture(t, { config: { startupTimeoutMs: 30000 } });
+  const seen = [],
+    discovery = [];
+  const discover = fx.provider.discoverProviders;
+  fx.provider.discoverProviders = async (request, deps) => {
+    discovery.push(deps.subscriptionChecks);
+    return discover(request, deps);
+  };
+  const original = fx.provider.runSession;
+  fx.provider.runSession = async request => {
+    seen.push(request);
+    return original(request);
+  };
+  const first = await fx.engine.run((await fx.engine.create('Set value to one', { project: fx.project })).id);
+  assert.equal(first.state, 'succeeded', first.error?.message);
+  const caches = new Set(seen.map(request => request.subscriptionChecks));
+  assert.equal(caches.size, 1, 'every session of the run shares one login cache');
+  assert.ok([...caches][0] instanceof Map);
+  assert.deepEqual(discovery, [...caches], 'model discovery fills the same cache');
+  assert.ok(seen.every(request => request.startupTimeoutMs === 30000));
+  for (const attempt of first.sessionAttempts)
+    assert.ok(attempt.metrics.firstEventMs >= 0, `${attempt.stage}: the first client event is timed`);
+
+  const before = seen.length;
+  // Without client events the first event stays unknown.
+  fx.provider.runSession = async request => {
+    seen.push(request);
+    return original({ ...request, onEvent: undefined });
+  };
+  const second = await fx.engine.run((await fx.engine.create('Set value to one', { project: fx.project })).id);
+  assert.equal(second.state, 'succeeded', second.error?.message);
+  const next = new Set(seen.slice(before).map(request => request.subscriptionChecks));
+  assert.equal(next.size, 1);
+  assert.ok(!caches.has([...next][0]), 'another run checks the login again: no state between runs');
+  assert.ok(second.sessionAttempts.every(attempt => attempt.metrics.firstEventMs === null));
+});
+
+test('The startup limit of native sessions is bounded in the project and in a saved run', async t => {
+  const fx = await fixture(t);
+  assert.equal((await readConfig(fx.project)).startupTimeoutMs, undefined, 'absent means the default');
+  for (const value of [10000, 120000, 1800000])
+    assert.equal((await readConfig(fx.project, { startupTimeoutMs: value })).startupTimeoutMs, value);
+  for (const value of [0, 9999, 1800001, 1.5, '120000', null])
+    await assert.rejects(readConfig(fx.project, { startupTimeoutMs: value }), /startupTimeoutMs/, String(value));
+  const run = await fx.engine.create('Set value to one', { project: fx.project, mode: 'quick' });
+  fx.store.updateRun(run.id, { config: { ...run.config, startupTimeoutMs: 5 } });
+  const blocked = await fx.engine.run(run.id);
+  assert.deepEqual([blocked.state, blocked.error.code], ['blocked', 'configuration']);
+  assert.equal(fx.sessions.length, 0);
 });

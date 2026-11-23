@@ -94,7 +94,11 @@ function toolSteps(client, events) {
   return steps;
 }
 
-export function sessionMetrics(client, events, { durationMs, usage } = {}) {
+/**
+ * `firstEventMs` is the time from the start of the session to the first client event (null without
+ * one); `startupRetries` counts restarts of a client that sent no event (null when unknown).
+ */
+export function sessionMetrics(client, events, { durationMs, usage, firstEventMs, startupRetries } = {}) {
   if (usage === undefined && Array.isArray(events)) {
     for (const event of events) {
       if (
@@ -106,6 +110,8 @@ export function sessionMetrics(client, events, { durationMs, usage } = {}) {
   }
   return {
     durationMs: duration(durationMs),
+    firstEventMs: duration(firstEventMs),
+    startupRetries: count(startupRetries),
     toolSteps: toolSteps(client, events),
     promptBytes: null,
     contextOriginalBytes: null,
