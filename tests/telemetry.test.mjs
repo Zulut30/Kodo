@@ -652,6 +652,31 @@ test('project report: tasks in every status, retries and missing runs stay in th
   assert.ok(report.provenance.notes.includes('runs_missing'));
 });
 
+test('project report names an abandoned attempt of an open task as a blocker', () => {
+  // Audit finding 4d: an external chat's abandon leaves the attempt blocked and its Run cancelled
+  // without a blocker record, while the task stays running; the report showed no blocker at all.
+  const abandoned = finishedRun({
+    id: 'r-abandoned',
+    state: 'cancelled',
+    error: { code: 'external_abandoned', message: 'External worker abandoned the task' },
+  });
+  const tasks = [task('dropped', 'running'), task('working', 'running'), task('merged', 'integrated')];
+  const current = [
+    attempt('dropped', 1, 'r-abandoned', 'blocked'),
+    attempt('working', 1, 'r-working', 'running'),
+    attempt('merged', 1, 'r-merged', 'integrated'),
+  ];
+  const runs = {
+    'r-abandoned': abandoned,
+    'r-working': finishedRun({ id: 'r-working', state: 'executing' }),
+    'r-merged': finishedRun({ id: 'r-merged' }),
+  };
+  const report = buildProjectReport(deepFreeze(projectSnapshot(tasks, current)), runs, {}, { now: NOW });
+  assert.deepEqual(report.blockers, [
+    { taskId: 'dropped', runId: 'r-abandoned', code: 'attempt_blocked', scope: 'attempt', occurrences: null },
+  ]);
+});
+
 test('project usage is unknown when the attempt history is incomplete; the observed sum is named apart', () => {
   const sixty = finishedRun({
     id: 'r1',

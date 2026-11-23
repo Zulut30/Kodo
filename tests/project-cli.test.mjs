@@ -448,6 +448,13 @@ test('Project retry-failed is explicit and preserves prior failed Attempt histor
   const resume = flags => projectCli(['resume', id, ...flags, '--json'], ports);
   assert.equal((await resume([])).report.result.status, 'blocked');
   assert.equal((await resume([])).exitCode, 2);
+  // Audit finding 4c: status names what holds the project, not only the counts.
+  const status = await projectCli(['status', id, '--json'], ports);
+  assert.deepEqual(
+    status.report.result.blockers.map(row => [row.taskId, row.code, row.scope]),
+    [['task-0', 'attempt_blocked', 'attempt']],
+  );
+  assert.match((await projectCli(['status', id], ports)).output, /\nblockers: 1; attempt_blocked 1\n/);
   assert.equal(creations, 1);
   assert.equal(executions, 1);
   assert.equal((await resume(['--retry-failed'])).report.result.status, 'waiting_limits');
