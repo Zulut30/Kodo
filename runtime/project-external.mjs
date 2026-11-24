@@ -17,7 +17,7 @@
  * `integrateAndAdvance`, `runPendingGates`), by default from
  * `project-director-waves.mjs`. Kodo never starts or archives the host's chats.
  */
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { stat } from 'node:fs/promises';
 import { execute } from './command.mjs';
@@ -41,7 +41,7 @@ import { workerRole } from './worker-roles.mjs';
 import { applyWavePolicy } from './wave-policy.mjs';
 import { DEFAULT_CLI, assertCliPrefix, quotePath } from './cli-command.mjs';
 import { planProjectHorizon } from './project-planner.mjs';
-import { buildApiCards } from './api-cards.mjs';
+import { DEFAULT_API_CARD_MAX_BYTES, buildApiCards, createApiCardCache, unavailableApiCard } from './api-cards.mjs';
 import { buildContextManifest } from './context-manifest.mjs';
 import { measureContext, selectWaveVerifiedLessons } from './context-pack.mjs';
 import { formatDiagnosticPack } from './diagnostic-pack.mjs';
@@ -153,19 +153,67 @@ function retryDiagnosticsFor(state, attempt, task, run) {
   return previous[0]?.lastDiagnostics ?? null;
 }
 
+function apiCardScopeKey({ baseSha, maxBytes, project, task }) {
+  return createHash('sha256')
+    .update(
+      JSON.stringify({
+        baseSha,
+        maxBytes,
+        constraints: project.constraints ?? [],
+        dependsOn: task.dependsOn ?? [],
+        interfaceRefs: (task.interfaceRefs ?? []).map(ref => [ref.path, ref.sha256]),
+      }),
+    )
+    .digest('hex');
+}
+
+async function resolveWaveApiCards(state, project, task, run, maxBytes) {
+  const store = storeOf(state.ctx);
+  const secrets = state.ctx.engine.secrets || {};
+  const scopeKey = apiCardScopeKey({ baseSha: run.baseSha, maxBytes, project, task });
+  if (
+    run.waveApiCards &&
+    run.waveApiCards.scopeKey === scopeKey &&
+    run.waveApiCards.card &&
+    run.waveApiCards.card.unavailable !== true
+  ) {
+    return run.waveApiCards.card;
+  }
+  const builder = state.buildApiCards ?? buildApiCards;
+  let apiCards;
+  try {
+    apiCards = await builder({
+      cwd: run.project,
+      baseSha: run.baseSha,
+      task,
+      tasks: state.snapshot.tasks,
+      constraints: project.constraints,
+      maxBytes,
+      secrets,
+      cache: state.apiCardCache,
+      home: store.home,
+    });
+  } catch (error) {
+    apiCards = unavailableApiCard({
+      baseSha: run.baseSha,
+      code: error?.code || 'api_cards_failed',
+      maxBytes,
+    });
+  }
+  if (!apiCards || typeof apiCards !== 'object' || typeof apiCards.text !== 'string') {
+    apiCards = unavailableApiCard({ baseSha: run.baseSha, code: 'api_cards_invalid', maxBytes });
+  }
+  if (apiCards.unavailable !== true) {
+    store.updateRun(run.id, { waveApiCards: { scopeKey, card: apiCards } });
+  }
+  return apiCards;
+}
+
 async function waveBriefEnrichment(state, attempt, task, run, basePrompt) {
   const project = state.snapshot.project;
   if (project.execution?.cadence !== 'wave') return { prompt: basePrompt, extra: {} };
   const store = storeOf(state.ctx);
-  const secrets = state.ctx.engine.secrets || {};
-  const apiCards = await buildApiCards({
-    cwd: run.project,
-    baseSha: run.baseSha,
-    task,
-    tasks: state.snapshot.tasks,
-    constraints: project.constraints,
-    secrets,
-  });
+  const apiCards = await resolveWaveApiCards(state, project, task, run, DEFAULT_API_CARD_MAX_BYTES);
   const verifiedLessons = selectWaveVerifiedLessons(store.lessons(project.root, 20), {
     task,
     projectId: project.projectId,
@@ -538,7 +586,7 @@ async function explainWave(state, snapshot) {
  * prefix of the brief commands and is returned with them (default `kodo`). `blocked` names why
  * the rest waits: task rows `{taskId, code}` and gate rows `{code, kind, id, gateId?, runId?}`
  * (`gateHolds`). An accepted project returns `code: 'project_accepted'` and no briefs.
- * @param {{ repo: any, engine: any, store?: any, contracts?: any, clock?: () => string }} ctx
+ * @param {{ repo: any, engine: any, store?: any, contracts?: any, clock?: () => string, buildApiCards?: any }} ctx
  * @param {{ projectId: string, host: string, limit?: number, retryFailed?: boolean, ports?: any, cli?: string }} input
  */
 export async function nextWave(ctx, input) {
@@ -591,6 +639,8 @@ export async function nextWave(ctx, input) {
       inFlight: new Set(),
       briefs: [],
       blocked: [],
+      apiCardCache: createApiCardCache(),
+      buildApiCards: ctx.buildApiCards ?? buildApiCards,
     };
     await resumeInFlight(state);
     if (retryFailed) await reserveRetries(state, limit);
@@ -966,7 +1016,7 @@ async function externalAttempt(ctx, C, projectId, taskId) {
  * `project_attempt_stale`), and a late abandon of an earlier attempt replays its result without
  * touching the current one. The whole call holds lease
  * `project:<id>` (as `nextWave` and the drain do): `project_busy` while another holds it.
- * @param {{ repo: any, engine: any, store?: any, contracts?: any, clock?: () => string }} ctx
+ * @param {{ repo: any, engine: any, store?: any, contracts?: any, clock?: () => string, buildApiCards?: any }} ctx
  * @param {{ projectId: string, taskId: string, head: string, deferGate?: boolean, abandon?: boolean,
  *   commandId?: string, attemptId?: string, ports?: any, signal?: AbortSignal }} input
  */

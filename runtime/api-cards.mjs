@@ -3,13 +3,14 @@
  * Reads strictly from Git objects (`git ls-tree`, `git show <sha>:<path>`),
  * never from the working tree, with zero model or network calls.
  */
+import { spawn } from 'node:child_process';
 import { execute } from './command.mjs';
 import { ownsPath } from './contracts.mjs';
 import { redact, workerEnvironment } from './security.mjs';
 
 export const DEFAULT_API_CARD_MAX_BYTES = 12 * 1024;
-const MAX_SOURCE_BYTES = 512 * 1024;
-const READ_BATCH = 8;
+export const MAX_SOURCE_BYTES = 512 * 1024;
+const MAX_BATCH_STDOUT_BYTES = 64 * 1024 * 1024;
 const IGNORED_DIRS = /(?:^|\/)(?:node_modules|target|dist|build|coverage|\.git)(?:\/|$)/;
 const RUST_EXT = /\.rs$/;
 const JS_EXT = /\.[cm]?jsx?$/;
@@ -461,8 +462,53 @@ export function extractJsTsPublicApi(source) {
 
 // ---- Git tree & invariants --------------------------------------------------
 
-async function listTreeBlobs(cwd, baseSha) {
-  const result = await execute('git', ['ls-tree', '-r', '-z', '--full-tree', baseSha], {
+/**
+ * Create an in-memory cache shared across tasks in a single wave call:
+ * caches `git ls-tree` per `(cwd, baseSha)`, extracted signatures per `(language, oid)`,
+ * invariant lines per `(oid, sectionOnly)` and verified interface evidence modules.
+ */
+export function createApiCardCache() {
+  return {
+    trees: new Map(),
+    signatures: new Map(),
+    invariants: new Map(),
+    interfaceModules: new Map(),
+  };
+}
+
+/**
+ * Build a graceful degradation card when API card generation fails for any reason.
+ * @param {{ baseSha?: string, code?: string, maxBytes?: number }} [input]
+ */
+export function unavailableApiCard({
+  baseSha = '',
+  code = 'api_cards_unavailable',
+  maxBytes = DEFAULT_API_CARD_MAX_BYTES,
+} = {}) {
+  const safeCode = String(code || 'api_cards_unavailable').replace(/[^a-zA-Z0-9_.:-]/g, '_') || 'api_cards_unavailable';
+  const text = `API cards unavailable: ${safeCode}`;
+  const bytes = byteLength(text);
+  return {
+    schemaVersion: 1,
+    kind: 'api-cards',
+    baseSha: typeof baseSha === 'string' ? baseSha : '',
+    maxBytes: Number.isSafeInteger(maxBytes) && maxBytes >= 64 ? maxBytes : DEFAULT_API_CARD_MAX_BYTES,
+    unavailable: true,
+    code: safeCode,
+    text,
+    bytes,
+    originalBytes: bytes,
+    truncated: false,
+    omitted: { files: 0, signatures: 0, invariants: 0 },
+    invariants: [],
+    modules: [],
+  };
+}
+
+async function listTreeBlobs(cwd, baseSha, cache) {
+  const treeKey = `${cwd}\0${baseSha}`;
+  if (cache?.trees?.has(treeKey)) return cache.trees.get(treeKey);
+  const result = await execute('git', ['ls-tree', '-r', '-l', '-z', '--full-tree', baseSha], {
     cwd,
     env: workerEnvironment(),
     rawOutput: true,
@@ -471,25 +517,106 @@ async function listTreeBlobs(cwd, baseSha) {
   const blobs = [];
   for (const row of result.stdout.split('\0')) {
     if (!row) continue;
-    const match = /^(\d+) (\w+) ([a-f0-9]+)\t([\s\S]+)$/.exec(row);
+    const match = /^(\d+) (\w+) ([a-f0-9]+)\s+(\d+|-)\t([\s\S]+)$/.exec(row);
     if (!match) continue;
-    const [, mode, type, oid, filePath] = match;
-    if (type === 'blob' && /^100(?:644|755)$/.test(mode)) blobs.push({ path: filePath, oid });
+    const [, mode, type, oid, sizeRaw, filePath] = match;
+    if (type !== 'blob' || !/^100(?:644|755)$/.test(mode)) continue;
+    const size = sizeRaw === '-' ? null : Number(sizeRaw);
+    blobs.push({ path: filePath, oid, size: Number.isFinite(size) ? size : null });
   }
+  cache?.trees?.set(treeKey, blobs);
   return blobs;
 }
 
-async function readBlobAtCommit(cwd, baseSha, filePath) {
-  const result = await execute('git', ['show', `${baseSha}:${filePath}`], {
-    cwd,
-    env: workerEnvironment(),
-    rawOutput: true,
-    allowFailure: true,
-    timeoutMs: 15000,
+function parseCatFileBatchOutput(buffer) {
+  const contents = new Map();
+  let pos = 0;
+  while (pos < buffer.length) {
+    const lineEnd = buffer.indexOf(0x0a, pos);
+    if (lineEnd === -1) break;
+    const header = buffer.subarray(pos, lineEnd).toString('utf8').replace(/\r$/, '');
+    pos = lineEnd + 1;
+    if (!header) continue;
+    if (header.endsWith(' missing')) continue;
+    const parts = header.split(' ');
+    if (parts.length < 3) break;
+    const [oid, type, sizeStr] = parts;
+    const size = Number(sizeStr);
+    if (!Number.isSafeInteger(size) || size < 0 || pos + size > buffer.length) break;
+    if (type === 'blob' && size <= MAX_SOURCE_BYTES) {
+      contents.set(oid, buffer.subarray(pos, pos + size).toString('utf8'));
+    }
+    pos += size;
+    if (buffer[pos] === 0x0a) pos++;
+  }
+  return contents;
+}
+
+function readBlobsBatch(cwd, oids) {
+  const unique = [...new Set(oids.filter(Boolean))];
+  if (!unique.length) return Promise.resolve(new Map());
+  return new Promise((resolve, reject) => {
+    const child = spawn('git', ['cat-file', '--batch'], {
+      cwd,
+      env: workerEnvironment(),
+      windowsHide: true,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    const chunks = [];
+    let totalBytes = 0;
+    let stderr = '';
+    let settled = false;
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) reject(error);
+      else resolve(value);
+    };
+    const timer = setTimeout(() => {
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        // Ignore kill error on already exited child.
+      }
+      finish(Object.assign(new Error('git cat-file --batch timed out'), { code: 'api_cards_timeout' }));
+    }, 15000);
+    child.on('error', error => {
+      finish(Object.assign(new Error(error.message), { code: 'api_cards_git_error' }));
+    });
+    child.stdout.on('data', chunk => {
+      totalBytes += chunk.length;
+      if (totalBytes > MAX_BATCH_STDOUT_BYTES) {
+        try {
+          child.kill('SIGKILL');
+        } catch {
+          // Ignore kill error.
+        }
+        finish(Object.assign(new Error('git cat-file --batch output exceeded cap'), { code: 'api_cards_overflow' }));
+        return;
+      }
+      chunks.push(chunk);
+    });
+    child.stderr.on('data', chunk => {
+      if (stderr.length < 4096) stderr += chunk.toString('utf8');
+    });
+    child.on('close', code => {
+      if (settled) return;
+      if (code !== 0) {
+        finish(
+          Object.assign(new Error(`git cat-file --batch failed (${code}): ${stderr.trim()}`), {
+            code: 'api_cards_git_error',
+          }),
+        );
+        return;
+      }
+      finish(null, parseCatFileBatchOutput(Buffer.concat(chunks, totalBytes)));
+    });
+    child.stdin.on('error', () => {
+      // Child close/error handler reports failure.
+    });
+    child.stdin.end(`${unique.join('\n')}\n`);
   });
-  if (result.code !== 0) return null;
-  if (byteLength(result.stdout) > MAX_SOURCE_BYTES) return null;
-  return result.stdout;
 }
 
 function extractInvariantLines(markdown, sectionOnly) {
@@ -692,6 +819,60 @@ function packApiCard({ baseSha, invariants, modules, maxBytes }) {
   };
 }
 
+const isReadableBlob = blob => Boolean(blob && blob.size !== null && blob.size <= MAX_SOURCE_BYTES);
+
+function selectInvariantTargets(blobByPath) {
+  const targets = [];
+  for (const invPath of INVARIANT_FILES) {
+    const blob = blobByPath.get(invPath);
+    if (isReadableBlob(blob)) targets.push({ blob, sectionOnly: false });
+  }
+  const projectMdBlob = blobByPath.get(PROJECT_MD);
+  if (isReadableBlob(projectMdBlob)) targets.push({ blob: projectMdBlob, sectionOnly: true });
+  return targets;
+}
+
+function collectInvariants({ invTargets, fetched, cache, invariants, constraints, secrets }) {
+  const collected = [];
+  const seen = new Set();
+  const add = line => {
+    const clean = redact(String(line ?? '').trim(), secrets);
+    if (clean && !seen.has(clean)) {
+      seen.add(clean);
+      collected.push(clean);
+    }
+  };
+  for (const entry of invTargets) {
+    const key = `${entry.blob.oid}\0${entry.sectionOnly ? '1' : '0'}`;
+    let lines = cache?.invariants?.get(key);
+    if (!lines) {
+      const text = fetched.get(entry.blob.oid);
+      lines = text ? extractInvariantLines(text, entry.sectionOnly) : [];
+      cache?.invariants?.set(key, lines);
+    }
+    for (const line of lines) add(line);
+  }
+  for (const item of [...invariants, ...constraints]) add(item);
+  return collected;
+}
+
+function extractModuleCards({ sourceTargets, fetched, cache, secrets }) {
+  const modules = [];
+  for (const blob of sourceTargets) {
+    const language = detectLanguage(blob.path);
+    const key = `${language}\0${blob.oid}`;
+    let rawSigs = cache?.signatures?.get(key);
+    if (!rawSigs) {
+      const source = fetched.get(blob.oid);
+      rawSigs = source ? (language === 'rust' ? extractRustPublicApi(source) : extractJsTsPublicApi(source)) : [];
+      cache?.signatures?.set(key, rawSigs);
+    }
+    const signatures = rawSigs.map(sig => redact(sig, secrets)).filter(Boolean);
+    if (signatures.length) modules.push({ path: blob.path, language, signatures });
+  }
+  return modules;
+}
+
 /**
  * Build a deterministic public API card for a task's dependencies at `baseSha`.
  * Reads files strictly from Git (`baseSha`), never from the working directory.
@@ -706,6 +887,8 @@ function packApiCard({ baseSha, invariants, modules, maxBytes }) {
  *   invariants?: string[],
  *   maxBytes?: number,
  *   secrets?: Record<string, any>,
+ *   cache?: ReturnType<typeof createApiCardCache> | null,
+ *   home?: string | null,
  * }} input
  */
 export async function buildApiCards({
@@ -718,70 +901,43 @@ export async function buildApiCards({
   invariants = [],
   maxBytes = DEFAULT_API_CARD_MAX_BYTES,
   secrets = {},
+  cache = null,
 }) {
-  if (typeof cwd !== 'string' || !cwd)
-    throw Object.assign(new Error('API cards require cwd'), { code: 'api_cards_invalid' });
+  if (typeof cwd !== 'string' || !cwd) return unavailableApiCard({ baseSha, code: 'api_cards_invalid', maxBytes });
   if (typeof baseSha !== 'string' || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(baseSha))
-    throw Object.assign(new Error('API cards require a valid baseSha'), { code: 'api_cards_invalid' });
+    return unavailableApiCard({ baseSha, code: 'api_cards_invalid', maxBytes });
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 64)
-    throw Object.assign(new Error('API cards maxBytes must be a safe integer >= 64'), { code: 'api_cards_invalid' });
+    return unavailableApiCard({ baseSha, code: 'api_cards_invalid', maxBytes });
 
-  const blobs = await listTreeBlobs(cwd, baseSha);
-  const blobSet = new Set(blobs.map(b => b.path));
+  try {
+    const blobs = await listTreeBlobs(cwd, baseSha, cache);
+    const blobByPath = new Map(blobs.map(b => [b.path, b]));
+    const invTargets = selectInvariantTargets(blobByPath);
+    const scopes = resolveDependencyScopes({ task, tasks, paths });
+    const sourceTargets = scopes.length
+      ? blobs
+          .filter(
+            blob =>
+              isReadableBlob(blob) &&
+              !IGNORED_DIRS.test(blob.path) &&
+              detectLanguage(blob.path) !== null &&
+              ownsPath(scopes, blob.path),
+          )
+          .sort((a, b) => compare(a.path, b.path))
+      : [];
 
-  // Gather blueprint invariants from `baseSha` + caller constraints/invariants.
-  const collectedInvariants = [];
-  const seenInv = new Set();
-  const addInvariant = line => {
-    const clean = redact(String(line ?? '').trim(), secrets);
-    if (clean && !seenInv.has(clean)) {
-      seenInv.add(clean);
-      collectedInvariants.push(clean);
-    }
-  };
-  for (const invPath of INVARIANT_FILES) {
-    if (!blobSet.has(invPath)) continue;
-    const text = await readBlobAtCommit(cwd, baseSha, invPath);
-    if (text) for (const line of extractInvariantLines(text, false)) addInvariant(line);
+    const oidsToRead = [
+      ...invTargets
+        .filter(e => !cache?.invariants?.has(`${e.blob.oid}\0${e.sectionOnly ? '1' : '0'}`))
+        .map(e => e.blob.oid),
+      ...sourceTargets.filter(b => !cache?.signatures?.has(`${detectLanguage(b.path)}\0${b.oid}`)).map(b => b.oid),
+    ];
+    const fetched = await readBlobsBatch(cwd, oidsToRead);
+    const collectedInvariants = collectInvariants({ invTargets, fetched, cache, invariants, constraints, secrets });
+    const modules = extractModuleCards({ sourceTargets, fetched, cache, secrets });
+    const packed = packApiCard({ baseSha, invariants: collectedInvariants, modules, maxBytes });
+    return { schemaVersion: 1, kind: 'api-cards', baseSha, maxBytes, ...packed };
+  } catch (error) {
+    return unavailableApiCard({ baseSha, code: error?.code || 'api_cards_failed', maxBytes });
   }
-  if (blobSet.has(PROJECT_MD)) {
-    const text = await readBlobAtCommit(cwd, baseSha, PROJECT_MD);
-    if (text) for (const line of extractInvariantLines(text, true)) addInvariant(line);
-  }
-  for (const item of [...invariants, ...constraints]) addInvariant(item);
-
-  // Resolve dependency source files from `baseSha`.
-  const scopes = resolveDependencyScopes({ task, tasks, paths });
-  const targets = scopes.length
-    ? blobs
-        .map(b => b.path)
-        .filter(
-          filePath => !IGNORED_DIRS.test(filePath) && detectLanguage(filePath) !== null && ownsPath(scopes, filePath),
-        )
-        .sort(compare)
-    : [];
-
-  const modules = [];
-  for (let i = 0; i < targets.length; i += READ_BATCH) {
-    const batch = targets.slice(i, i + READ_BATCH);
-    const contents = await Promise.all(batch.map(filePath => readBlobAtCommit(cwd, baseSha, filePath)));
-    for (let j = 0; j < batch.length; j++) {
-      const filePath = batch[j];
-      const source = contents[j];
-      if (!source) continue;
-      const language = detectLanguage(filePath);
-      const rawSigs = language === 'rust' ? extractRustPublicApi(source) : extractJsTsPublicApi(source);
-      const signatures = rawSigs.map(sig => redact(sig, secrets)).filter(Boolean);
-      if (signatures.length) modules.push({ path: filePath, language, signatures });
-    }
-  }
-
-  const packed = packApiCard({ baseSha, invariants: collectedInvariants, modules, maxBytes });
-  return {
-    schemaVersion: 1,
-    kind: 'api-cards',
-    baseSha,
-    maxBytes,
-    ...packed,
-  };
 }

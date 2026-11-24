@@ -8,6 +8,7 @@ import { performance } from 'node:perf_hooks';
 import {
   DEFAULT_API_CARD_MAX_BYTES,
   buildApiCards,
+  createApiCardCache,
   extractJsTsPublicApi,
   extractRustPublicApi,
 } from '../runtime/api-cards.mjs';
@@ -281,4 +282,47 @@ test('buildApiCards truncates deterministically within maxBytes and marks trunca
   assert.ok(first.originalBytes > maxBytes);
   assert.ok(first.omitted.files > 0 || first.omitted.signatures > 0);
   assert.match(first.text, /\[truncated:/);
+});
+
+test('buildApiCards skips >MAX_SOURCE_BYTES blobs via ls-tree -l before reading and degrades gracefully on errors', async t => {
+  const hugeContent = `// ${'x'.repeat(17 * 1024 * 1024)}\nexport const HUGE = 1;\n`;
+  const { dir, baseSha } = await createRepo(t, {
+    'src/huge.mjs': hugeContent,
+    'src/small.mjs': 'export function ping() { return "pong"; }\n',
+  });
+
+  const card = await buildApiCards({ cwd: dir, baseSha, paths: ['src'] });
+  assert.equal(card.unavailable, undefined);
+  assert.deepEqual(
+    card.modules.map(m => [m.path, m.signatures]),
+    [['src/small.mjs', ['export function ping()']]],
+  );
+
+  // Missing commit / git error degrades to unavailable card instead of throwing.
+  const missingSha = 'f'.repeat(40);
+  const degraded = await buildApiCards({ cwd: dir, baseSha: missingSha, paths: ['src'] });
+  assert.equal(degraded.unavailable, true);
+  assert.equal(typeof degraded.code, 'string');
+  assert.ok(degraded.code.length > 0);
+  assert.equal(degraded.text, `API cards unavailable: ${degraded.code}`);
+});
+
+test('buildApiCards batches blob reads and caches tree by baseSha and signatures by blob OID', async t => {
+  const files = {};
+  for (let i = 0; i < 20; i++) {
+    files[`src/mod/f${String(i).padStart(2, '0')}.mjs`] = `export function fn${i}(x) { return x + ${i}; }\n`;
+  }
+  const { dir, baseSha } = await createRepo(t, files);
+  const cache = createApiCardCache();
+
+  const first = await buildApiCards({ cwd: dir, baseSha, paths: ['src/mod'], cache });
+  assert.equal(first.modules.length, 20);
+  assert.equal(cache.trees.size, 1);
+  assert.equal(cache.signatures.size, 20);
+
+  const started = performance.now();
+  const second = await buildApiCards({ cwd: dir, baseSha, paths: ['src/mod'], cache });
+  const cachedMs = performance.now() - started;
+  assert.deepEqual(second, first);
+  assert.ok(cachedMs < 200, `cached rebuild should be fast, got ${cachedMs.toFixed(1)}ms`);
 });

@@ -539,3 +539,132 @@ test('repairVerification preserves legacy 6000-char prompt outside waves and use
   assert.match(prompts[2], /TAIL_MARKER_MUST_SURVIVE/);
   assert.doesNotMatch(prompts[2], /HEAD_MARKER_SHOULD_DROP/);
 });
+
+test('nextWave degrades gracefully when api-cards fail and reuses cached cards on repeated calls', async t => {
+  const dir = await realpath(await mkdtemp(path.join(os.tmpdir(), 'kodo-15d-cache-')));
+  const project = path.join(dir, 'repo');
+  const home = path.join(dir, 'home');
+  await mkdir(project, { recursive: true });
+  git(project, 'init', '-b', 'main');
+  git(project, 'config', 'user.name', 'Test');
+  git(project, 'config', 'user.email', 'test@example.invalid');
+  git(project, 'config', 'core.autocrlf', 'false');
+  await commit(
+    project,
+    {
+      'kodo.config.json': JSON.stringify({
+        schemaVersion: 1,
+        repository: 'fixture/Kodo',
+        client: 'codex',
+        baseBranch: 'main',
+        concurrency: 2,
+        repairRounds: 1,
+        researchBudget: 0,
+        commands: { test: [{ command: process.execPath, args: ['--test'] }], build: [], deploy: [], smoke: [] },
+        checks: [],
+        delivery: { enabled: false, release: false, firstVersion: '0.2.0' },
+      }),
+      'src/core/index.mjs': 'export function boot() { return true; }\n',
+    },
+    'init',
+  );
+
+  const store = new Store(home);
+  const engine = new Engine({
+    store,
+    provider: {
+      discoverProviders: async () => [
+        { id: 'codex:gpt-6.1-sol', client: 'codex', model: 'gpt-6.1-sol', available: true },
+      ],
+    },
+  });
+  const repo = await openProjectStore({
+    store,
+    contracts,
+    authorizeTransition: createProjectTransitionAuthorizer({ store, engine, contracts }),
+  });
+  t.after(async () => {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const criterion = { id: 'ok', text: 'Works', evidenceKinds: ['checks'] };
+  const created = await repo.apply({
+    schemaVersion: 1,
+    commandId: randomUUID(),
+    projectId: null,
+    expectedRevision: null,
+    actor: 'coordinator',
+    reason: 'Cache test',
+    action: {
+      op: 'create',
+      spec: {
+        schemaVersion: 1,
+        id: 'cache-test',
+        root: project,
+        title: 'Cache test',
+        definitionOfDone: [criterion],
+        constraints: ['No panics'],
+        businessContext: 'Test',
+        architectureRefs: [],
+        milestones: [{ id: 'm1', title: 'M1', acceptance: [criterion], releaseRequired: false }],
+        epics: [{ id: 'core', milestoneId: 'm1', title: 'Core', acceptance: [criterion] }],
+        tasks: [
+          {
+            id: 'core-1',
+            epicId: 'core',
+            title: 'Core 1',
+            description: 'Build core',
+            owner: 'developer',
+            dependsOn: [],
+            writePaths: ['src/core/**'],
+            acceptance: [criterion],
+            interfaceRefs: [],
+            priority: 50,
+            userValue: 3,
+            risk: 1,
+            estimatedEffort: 1,
+            riskApprovalRequired: false,
+          },
+        ],
+        execution: { cadence: 'wave', integration: 'branch' },
+      },
+    },
+  });
+  const ctx = { repo, engine, store, contracts };
+  const projectId = created.projectId;
+
+  // 1. Failing api-cards builder must NOT fail nextWave: degrades to unavailable card.
+  let calls = 0;
+  const degradedWave = await nextWave(
+    {
+      ...ctx,
+      buildApiCards: async () => {
+        calls++;
+        throw Object.assign(new Error('git failed'), { code: 'invalid_output' });
+      },
+    },
+    { projectId, host: 't3', limit: 2 },
+  );
+  assert.equal(degradedWave.briefs.length, 1, JSON.stringify(degradedWave.blocked));
+  assert.equal(degradedWave.briefs[0].apiCards.unavailable, true);
+  assert.equal(degradedWave.briefs[0].apiCards.code, 'invalid_output');
+  assert.equal(degradedWave.briefs[0].apiCards.text, 'API cards unavailable: invalid_output');
+  assert.match(degradedWave.briefs[0].prompt, /API cards unavailable: invalid_output/);
+  assert.equal(calls, 1);
+
+  // 2. Successful build caches card on the active attempt Run; subsequent nextWave does NOT rebuild it.
+  let buildCount = 0;
+  const { buildApiCards: realBuild } = await import('../runtime/api-cards.mjs');
+  const countingBuilder = async args => {
+    buildCount++;
+    return realBuild(args);
+  };
+  const firstValid = await nextWave({ ...ctx, buildApiCards: countingBuilder }, { projectId, host: 't3', limit: 2 });
+  assert.equal(firstValid.briefs[0].apiCards.unavailable, undefined);
+  assert.equal(buildCount, 1);
+
+  const repeated = await nextWave({ ...ctx, buildApiCards: countingBuilder }, { projectId, host: 't3', limit: 2 });
+  assert.equal(buildCount, 1, 'repeated nextWave must reuse cached apiCards for active attempt without rebuilding');
+  assert.deepEqual(repeated.briefs[0].apiCards, firstValid.briefs[0].apiCards);
+});
