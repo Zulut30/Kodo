@@ -160,3 +160,29 @@ test('Wave planning input still requires complete gate sets', () => {
   delete s.completeness.gates;
   assert.throws(() => plan(s), { code: 'project_schema' });
 });
+
+test('Wave admission ranks depth then direct successors before effort and stable ties', () => {
+  const tasks = [
+    task('expensive', 'ready', { estimatedEffort: 99 }),
+    task('fork'),
+    task('single'),
+    task('chain'),
+    task('f-one', 'proposed', { dependsOn: ['fork'] }),
+    task('f-two', 'proposed', { dependsOn: ['fork'] }),
+    task('s-one', 'proposed', { dependsOn: ['single'] }),
+    task('c-one', 'proposed', { dependsOn: ['chain'] }),
+    task('c-two', 'proposed', { dependsOn: ['c-one'] }),
+  ];
+  for (const order of [tasks, [...tasks].reverse()])
+    assert.deepEqual(plan(snapshot(order, { execution: wave })).taskIds, ['chain', 'fork', 'single', 'expensive']);
+});
+
+test('A profiled wave can see 64 ready tasks beyond the legacy horizon', async () => {
+  const { selectWave } = await import('../runtime/project-director-waves.mjs');
+  const s = snapshot(
+    Array.from({ length: 70 }, (_, i) => task('task-' + i)),
+    { execution: wave },
+  );
+  assert.equal(selectWave(s, { profiledWave: true, limit: 64, now: at }).length, 64);
+  assert.throws(() => selectWave(s, { limit: 64, now: at }), { code: 'project_limit_invalid' });
+});

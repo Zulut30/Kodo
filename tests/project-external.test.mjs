@@ -1250,3 +1250,41 @@ test('Cancellation interrupts project lease reacquisition after a private gate r
     assert.deepEqual(released, ['project:p', 'project-gates:p']);
   }
 });
+
+test('Profile fills eight slots across hosts and refills a completed slot before its siblings finish', async t => {
+  const f = await fixture(t, {
+    edit(spec) {
+      spec.tasks = Array.from({ length: 9 }, (_, n) => taskSpec('task-' + n, { writePaths: ['src/' + n + '.mjs'] }));
+      spec.tasks[8].dependsOn = ['task-0'];
+    },
+  });
+  const sub = (id, slots, tier) => ({ id, slots, tier, provider: 'codex', model: 'gpt' });
+  f.repo.setProfile(f.projectId, {
+    subscriptions: [
+      { ...sub('paused', 8, 'heavy'), cooldownUntil: '2099-01-01T00:00:00Z' },
+      sub('deep', 1, 'heavy'),
+      sub('quick', 7, 'fast'),
+    ],
+    machines: [{ id: 'remote', kind: 't3-env', environmentId: 'lab', maxWorkers: 8, maxHeavyBuilds: 1 }],
+  });
+  const pull = host => f.wave({ limit: 8, host, ports: undefined });
+  const initial = await f.wave({ host: 'orca', limit: 1, ports: undefined });
+  assert.equal(initial.briefs[0].taskId, 'task-0');
+  const partial = await f.wave({ limit: 1, ports: undefined });
+  assert.equal(partial.briefs.length, 1);
+  const first = await pull('t3');
+  assert.equal(first.briefs.length, 7, JSON.stringify(first.blocked));
+  const [root] = initial.briefs;
+  assert.equal(root.subscription.id, 'deep');
+  assert.equal(root.machine.environmentId, 'lab');
+  assert.ok(first.briefs.every(b => b.subscription.id === 'quick'));
+  assert.deepEqual((await pull('orca')).briefs, initial.briefs);
+  const head = await commit(root.worktree, { 'src/0.mjs': 'export const value = 1;\n' });
+  assert.equal((await f.complete(root.taskId, head, { deferGate: true })).status, 'integrated');
+  const next = await pull('orca');
+  assert.deepEqual(
+    next.briefs.map(b => b.taskId),
+    ['task-8'],
+  );
+  assert.equal(next.briefs[0].subscription.id, 'deep');
+});

@@ -40,10 +40,11 @@ import { runEpicGate, verifyTaskFastOnce } from './wave-verifier.mjs';
 import { workerRole } from './worker-roles.mjs';
 import { applyWavePolicy } from './wave-policy.mjs';
 import { DEFAULT_CLI, assertCliPrefix, quotePath } from './cli-command.mjs';
-import { planProjectHorizon } from './project-planner.mjs';
+import { assignWorker, waveCapacity, waveHorizon, MAX_WORKERS } from './execution-profile.mjs';
+import { planProjectHorizon, waveRanks } from './project-planner.mjs';
 
 /** The largest batch one `nextWave` call returns. */
-export const MAX_WAVE_LIMIT = 5;
+export const MAX_WAVE_LIMIT = MAX_WORKERS;
 const shaPattern = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 const uuidPattern = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 const settled = new Set(['accepted', 'released']);
@@ -135,6 +136,7 @@ function briefFor(state, attempt, task, run) {
   // The caller's CLI (`cli`): a chat runs the same Kodo package that issued the brief.
   const selfCheck = `${cli} ci feedback --base ${run.baseSha} --project ${quotePath(run.cwd)} --json`;
   const brief = {
+    ...run.workerPlacement,
     projectId: project.projectId,
     taskId: task.id,
     attemptId: attempt.id,
@@ -171,6 +173,11 @@ async function installExternalRun(state, attempt, task) {
       binding: bindingFor(attempt),
       installRun: async value => {
         // External chats implement; Kodo only verifies once (task-fast) and never delivers.
+        if (state.profile) {
+          const placement = placementFor(state, task);
+          need(placement, 'pool_unavailable');
+          value.runDraft.workerPlacement = placement;
+        }
         value.runDraft.executor = { kind: 'external', host };
         value.runDraft.verificationProfile = 'task-fast';
         // The policy of the base commit, not of the user's checkout (runtime/wave-policy.mjs).
@@ -207,6 +214,7 @@ async function prepareAttempt(state, attempt) {
     store = storeOf(ctx);
   const task = state.snapshot.tasks.find(row => row.id === attempt.taskId);
   let run = storedRun(store, attempt.runId) ?? (await installExternalRun(state, attempt, task));
+  if (state.profile && run.workerPlacement) state.placements.set(attempt.id, run.workerPlacement);
   need(run.executor?.kind === 'external' && run.executor.host === host, 'attempt_not_external');
   need(isDeepStrictEqual(run.directorBinding, bindingFor(attempt)), 'binding_invalid');
   await makeWorktree(run.project, run.cwd, run.branch, run.baseSha);
@@ -280,7 +288,42 @@ async function interfacesVerified(state, task) {
   }
 }
 
+function initializePlacements(state) {
+  if (!state.profile) return;
+  const { tasks, currentAttempts } = state.snapshot;
+  state.ranks = waveRanks(tasks);
+  state.maxDepth = Math.max(
+    0,
+    ...tasks.filter(t => ['ready', 'proposed'].includes(t.status)).map(t => state.ranks.get(t.id).depth),
+  );
+  state.placements = new Map();
+  for (const attempt of currentAttempts) {
+    if (inFlightStates.has(attempt.status))
+      state.placements.set(attempt.id, storedRun(storeOf(state.ctx), attempt.runId)?.workerPlacement);
+  }
+}
+
+function placementFor(state, task) {
+  const { snapshot, ranks } = state;
+  const depth = ranks.get(task.id).depth;
+  const foundation = snapshot.epics.some(
+    e => e.id === task.epicId && (e.id === 'foundation' || e.milestoneId === 'foundation'),
+  );
+  const heavy = foundation || (depth > 0 && depth === state.maxDepth);
+  const tiers = heavy
+    ? ['heavy', 'standard', 'fast']
+    : depth
+      ? ['standard', 'heavy', 'fast']
+      : ['fast', 'standard', 'heavy'];
+  return assignWorker(state.profile, state.now, [...state.placements.values()], tiers);
+}
+function freeSlots(state) {
+  const batchRemaining = state.limit - state.briefs.length;
+  return state.profile ? Math.min(batchRemaining, state.maximum - state.inFlight.size) : batchRemaining;
+}
 async function reserve(state, task, retryFailed) {
+  if (freeSlots(state) <= 0) return;
+  if (state.profile && !placementFor(state, task)) return;
   const reason =
     admissible(state, task) ?? ((await interfacesVerified(state, task)) ? null : 'project_interface_unverified');
   if (reason) {
@@ -301,6 +344,7 @@ async function reserve(state, task, retryFailed) {
         { actor: waves.externalReserver(state.host) },
       ),
     );
+    state.inFlight.add(task.id);
     state.snapshot = await snapshotOf(ctx, task.projectId);
     await prepareAttempt(state, attempt);
   });
@@ -310,14 +354,14 @@ const byPriority = (a, b) => b.priority - a.priority || (a.id < b.id ? -1 : a.id
 
 // A retry goes to the executor of the failed attempt: this host retries only its own attempts;
 // the drain's (native) and other hosts' failed attempts are left to them.
-async function reserveRetries(state, limit) {
+async function reserveRetries(state) {
   const store = storeOf(state.ctx);
   const candidates = state.snapshot.tasks
     .filter(task => !settled.has(task.status) && task.status !== 'integrated' && task.status !== 'cancelled')
     .filter(task => retryable.has(currentOf(state.snapshot, task.id)?.status))
     .sort(byPriority);
   for (const candidate of candidates) {
-    if (state.briefs.length >= limit) return;
+    if (freeSlots(state) <= 0) return;
     const executor = await waves.attemptExecutor(
       { repo: state.ctx.repo, store },
       state.snapshot,
@@ -335,8 +379,8 @@ async function reserveRetries(state, limit) {
   }
 }
 
-async function reserveSelected(state, limit, ports) {
-  const remaining = limit - state.briefs.length;
+async function reserveSelected(state, ports) {
+  const remaining = freeSlots(state);
   if (remaining <= 0) return;
   const W = wavePorts(ports, ['selectWave']);
   // Like drain: a task whose interface proofs do not verify is never selected. The rows are kept
@@ -344,6 +388,7 @@ async function reserveSelected(state, limit, ports) {
   const availability = await waves.waveAvailability(state.ctx, state.snapshot);
   state.availability = { revision: state.snapshot.revision, rows: availability };
   const selected = W.selectWave(state.snapshot, {
+    ...(state.profile && { profiledWave: true }),
     limit: remaining,
     inFlight: [...state.inFlight],
     availability,
@@ -351,7 +396,7 @@ async function reserveSelected(state, limit, ports) {
   });
   need(Array.isArray(selected), 'wave_ports_invalid');
   for (const taskId of selected) {
-    if (state.briefs.length >= limit) return;
+    if (freeSlots(state) <= 0) return;
     const task = state.snapshot.tasks.find(row => row.id === taskId);
     if (!task || state.inFlight.has(task.id) || !['proposed', 'ready'].includes(task.status)) continue;
     if (state.blocked.some(row => row.taskId === task.id)) continue;
@@ -434,7 +479,8 @@ async function explainWave(state, snapshot) {
   const horizon = planProjectHorizon(
     {
       snapshot,
-      limit: 24,
+      limit: state.profile ? waveHorizon(state.limit) : 24,
+      profiledWave: Boolean(state.profile),
       availability: await explanationAvailability(state, snapshot),
       now: (ctx.clock ?? (() => new Date().toISOString()))(),
     },
@@ -458,7 +504,7 @@ async function explainWave(state, snapshot) {
 
 /**
  * Reserve the next wave for an external host: the briefs of this host's running
- * attempts, then new non-overlapping tasks up to `limit` (1..5). `cli` is the command
+ * attempts, then new non-overlapping tasks up to the project's available capacity. `cli` is the command
  * prefix of the brief commands and is returned with them (default `kodo`). `blocked` names why
  * the rest waits: task rows `{taskId, code}` and gate rows `{code, kind, id, gateId?, runId?}`
  * (`gateHolds`). An accepted project returns `code: 'project_accepted'` and no briefs.
@@ -466,15 +512,26 @@ async function explainWave(state, snapshot) {
  * @param {{ projectId: string, host: string, limit?: number, retryFailed?: boolean, ports?: any, cli?: string }} input
  */
 export async function nextWave(ctx, input) {
-  const { projectId, host, limit = 3, retryFailed = false, ports, cli = DEFAULT_CLI } = input;
+  const { projectId, host, retryFailed = false, ports, cli = DEFAULT_CLI } = input;
   need(isPullHost(host), 'host_unsupported');
-  need(Number.isSafeInteger(limit) && limit >= 1 && limit <= MAX_WAVE_LIMIT, 'limit_invalid');
+  need(
+    input.limit === undefined ||
+      (Number.isSafeInteger(input.limit) && input.limit >= 1 && input.limit <= MAX_WAVE_LIMIT),
+    'limit_invalid',
+  );
   assertCliPrefix(cli);
   const C = await contractsOf(ctx),
     store = storeOf(ctx);
   const options = { knownValues: known(ctx.engine) };
   C.assertDirectorSafe(cli, options);
   const snapshot = await snapshotOf(ctx, projectId);
+  if (input.limit !== undefined) {
+    const maximum = waveCapacity(
+      ctx.repo.getProfile(projectId),
+      Date.parse((ctx.clock ?? (() => new Date().toISOString()))()),
+    );
+    need(input.limit <= maximum, 'limit_invalid');
+  }
   need(C.isWaveProject(snapshot.project), 'wave_required');
   // An accepted project has nothing left to hand out (and needs no worktree): its own code,
   // never a pause or a stop.
@@ -498,6 +555,11 @@ export async function nextWave(ctx, input) {
   const token = store.acquireLease(`project:${projectId}`, randomUUID(), { ttlMs: 60000, limit: 1 });
   need(token, 'busy');
   try {
+    const now = Date.parse((ctx.clock ?? (() => new Date().toISOString()))());
+    const profile = ctx.repo.getProfile(projectId);
+    const maximum = waveCapacity(profile, now);
+    const limit = input.limit ?? Math.min(3, maximum);
+    need(limit <= maximum, 'limit_invalid');
     const integration = await ensureIntegration({
       root: snapshot.project.root,
       projectId,
@@ -512,13 +574,19 @@ export async function nextWave(ctx, input) {
       integration,
       options,
       snapshot: await snapshotOf(ctx, projectId),
+      profile,
+      maximum,
+      now,
+      limit,
       inFlight: new Set(),
       briefs: [],
       blocked: [],
     };
+
+    initializePlacements(state);
     await resumeInFlight(state);
-    if (retryFailed) await reserveRetries(state, limit);
-    await reserveSelected(state, limit, ports);
+    if (retryFailed) await reserveRetries(state);
+    await reserveSelected(state, ports);
     const final = await snapshotOf(ctx, projectId);
     await explainWave(state, final);
     const revision = final.revision;

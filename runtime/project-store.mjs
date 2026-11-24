@@ -1,3 +1,4 @@
+import { validateExecutionProfile } from './execution-profile.mjs';
 import { backup } from 'node:sqlite';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync, mkdtempSync, lstatSync, realpathSync, chmodSync } from 'node:fs';
@@ -51,7 +52,20 @@ const migrationSql = `
   CREATE INDEX kodo_project_event_project ON kodo_project_events(project_id,seq);
   CREATE INDEX kodo_project_attempt_task ON kodo_project_attempts(project_id,task_id,number);
 `;
-const migrationHash = hash(migrationSql);
+const migrations = [
+  migrationSql,
+  'CREATE TABLE kodo_project_profiles(project_id TEXT PRIMARY KEY, body TEXT NOT NULL)',
+];
+function installedVersion(db) {
+  if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='kodo_project_migrations'").get()) return 0;
+  const rows = db.prepare('SELECT version,digest FROM kodo_project_migrations ORDER BY version').all();
+  for (const [index, row] of rows.entries())
+    requireValue(
+      row.version === index + 1 && index < migrations.length && row.digest === hash(migrations[index]),
+      'migration_unsupported',
+    );
+  return rows.length;
+}
 
 function transaction(db, mode, operation) {
   db.exec(mode);
@@ -74,23 +88,24 @@ async function migrate(store) {
   const db = store.db;
   requireValue(!db.isTransaction, 'transaction_active');
   requireValue(db.prepare('PRAGMA quick_check').get().quick_check === 'ok', 'database_corrupt');
-  const exists = () =>
-    db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='kodo_project_migrations'").get();
-  const version = () =>
-    exists()
-      ? db.prepare('SELECT version,digest FROM kodo_project_migrations ORDER BY version DESC LIMIT 1').get()
-      : null;
-  const current = version();
+  const current = installedVersion(db);
   if (current) {
-    requireValue(current.version === 1 && current.digest === migrationHash, 'migration_unsupported');
     // Missing or altered tables/indexes are corruption, not permission to recreate them.
-    for (const name of ['records', 'attempts', 'current', 'approvals', 'commands', 'events']) {
+    for (const name of [
+      'records',
+      'attempts',
+      'current',
+      'approvals',
+      'commands',
+      'events',
+      ...(current >= 2 ? ['profiles'] : []),
+    ]) {
       requireValue(
         db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get('kodo_project_' + name),
         'database_corrupt',
       );
     }
-    return;
+    if (current === migrations.length) return;
   }
   const location = db.location();
   requireValue(typeof location === 'string' && path.isAbsolute(location), 'database_invalid');
@@ -117,22 +132,25 @@ async function migrate(store) {
       { input: owned, env: workerEnvironment(), timeoutMs: 30000 },
     );
   }
-  const destination = path.join(owned, 'before-v1.sqlite');
+  const destination = path.join(owned, `before-v${current + 1}.sqlite`);
   await backup(db, destination);
   chmodSync(destination, 0o600);
   // Failed DDL rolls back on this connection. Keep the backup for offline recovery;
   // automatic replacement of an open DB would discard newer writes.
   transaction(db, 'BEGIN IMMEDIATE', () => {
-    const latest = version();
-    if (latest) {
-      requireValue(latest.version === 1 && latest.digest === migrationHash, 'migration_unsupported');
-      return;
-    }
+    const latest = installedVersion(db);
     db.exec(
       'CREATE TABLE IF NOT EXISTS kodo_project_migrations(version INTEGER PRIMARY KEY,digest TEXT NOT NULL,installed_at TEXT NOT NULL)',
     );
-    db.exec(migrationSql);
-    db.prepare('INSERT INTO kodo_project_migrations VALUES(?,?,?)').run(1, migrationHash, new Date().toISOString());
+    for (const [index, sql] of migrations.entries()) {
+      if (index < latest) continue;
+      db.exec(sql);
+      db.prepare('INSERT INTO kodo_project_migrations VALUES(?,?,?)').run(
+        index + 1,
+        hash(sql),
+        new Date().toISOString(),
+      );
+    }
   });
 }
 
@@ -198,6 +216,16 @@ export async function openProjectStore({
     validationSecrets,
   };
   return {
+    getProfile: id => readProfile(ctx, id),
+    setProfile: (id, profile) => transaction(db, 'BEGIN IMMEDIATE', () => writeProfile(ctx, id, profile)),
+    pausePool: (id, subscription, until) =>
+      transaction(db, 'BEGIN IMMEDIATE', () => {
+        const profile = readProfile(ctx, id);
+        const pool = profile?.subscriptions.find(row => row.id === subscription);
+        requireValue(pool && typeof until === 'string', 'profile_invalid');
+        pool.cooldownUntil = until;
+        return writeProfile(ctx, id, profile);
+      }),
     apply: (...args) => apply(ctx, ...args),
     snapshot: (...args) => snapshot(ctx, ...args),
     history: (...args) => history(ctx, ...args),
@@ -224,6 +252,22 @@ function refreshValidationContext(ctx) {
   ctx.options.knownValues = Object.values(ctx.validationSecrets).filter(
     value => typeof value === 'string' && value.length > 0,
   );
+}
+
+function readProfile(ctx, id) {
+  get(ctx, id, 'project', id);
+  const row = ctx.db.prepare('SELECT body FROM kodo_project_profiles WHERE project_id=?').get(id);
+  refreshValidationContext(ctx);
+  return row ? validateExecutionProfile(JSON.parse(row.body), ctx.options) : null;
+}
+function writeProfile(ctx, id, profile) {
+  requireValue(isWave(ctx, get(ctx, id, 'project', id)), 'wave_required');
+  refreshValidationContext(ctx);
+  const normalized = validateExecutionProfile(profile, ctx.options);
+  ctx.db
+    .prepare('INSERT INTO kodo_project_profiles VALUES(?,?) ON CONFLICT(project_id) DO UPDATE SET body=excluded.body')
+    .run(id, JSON.stringify(normalized));
+  return normalized;
 }
 
 function safe(ctx, value) {

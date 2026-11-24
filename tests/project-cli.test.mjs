@@ -650,7 +650,7 @@ test('project --help prints the project command reference before credentials, st
   // `help <action>` names the action; an abandon names its attempt.
   const named = await projectCli(['help', 'next-wave'], ports);
   assert.deepEqual(named.report.result.usage, [
-    'kodo project next-wave PROJECT_ID --host t3|orca [--limit 1..5] [--retry-failed] [--json]',
+    'kodo project next-wave PROJECT_ID --host t3|orca [--limit N] [--retry-failed] [--json] (default 3, max 5 or profile capacity up to 64)',
   ]);
   const complete = await projectCli(['complete-task', '--help'], ports);
   assert.ok(

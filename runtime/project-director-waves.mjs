@@ -27,6 +27,7 @@ import { makeWorktree, worktreeHomeFor } from './workspace.mjs';
 import { scopesOverlap } from './contracts.mjs';
 import { redact } from './security.mjs';
 import * as projectContracts from './project-contracts.mjs';
+import { waveCapacity, waveHorizon } from './execution-profile.mjs';
 import { planProjectHorizon } from './project-planner.mjs';
 import {
   ensureIntegration,
@@ -237,16 +238,25 @@ async function withProjectControl(ctx, projectId, signal, work) {
  * Optional `availability` (planner rows) and `now`; by default every task is available with
  * verified interfaces.
  * @param {any} snapshot
- * @param {{ limit: number, inFlight?: string[], availability?: any[], now?: string }} options
+ * @param {{ limit: number, profiledWave?: boolean, inFlight?: string[], availability?: any[], now?: string }} options
  */
-export function selectWave(snapshot, { limit, inFlight = [], availability, now } = /** @type {any} */ ({})) {
-  requireValue(Number.isSafeInteger(limit) && limit >= 1 && limit <= 24, 'limit_invalid');
+export function selectWave(
+  snapshot,
+  { limit, profiledWave = false, inFlight = [], availability, now } = /** @type {any} */ ({}),
+) {
+  requireValue(Number.isSafeInteger(limit) && limit >= 1 && limit <= (profiledWave ? 64 : 24), 'limit_invalid');
   requireValue(Array.isArray(inFlight), 'limit_invalid');
   const rows =
     availability ??
     snapshot.tasks.map(task => ({ taskId: task.id, available: true, interfacesVerified: true, reason: null }));
   const horizon = planProjectHorizon(
-    { snapshot, limit: 24, availability: rows, now: now ?? new Date().toISOString() },
+    {
+      snapshot,
+      profiledWave,
+      limit: profiledWave ? waveHorizon(limit) : 24,
+      availability: rows,
+      now: now ?? new Date().toISOString(),
+    },
     { contracts: projectContracts, knownValues: [] },
   );
   const scopes = id => taskOf(snapshot, id)?.writePaths ?? [];
@@ -288,9 +298,15 @@ export async function waveAvailability(ctx, snapshot) {
   return rows;
 }
 
-const horizonOf = async (ctx, snapshot) =>
+const horizonOf = async (ctx, snapshot, options) =>
   planProjectHorizon(
-    { snapshot, limit: 24, availability: await waveAvailability(ctx, snapshot), now: ctx.clock() },
+    {
+      snapshot,
+      profiledWave: options.profiledWave,
+      limit: options.profiledWave ? waveHorizon(options.concurrency) : 24,
+      availability: await waveAvailability(ctx, snapshot),
+      now: ctx.clock(),
+    },
     portsFor(ctx),
   );
 
@@ -1034,7 +1050,7 @@ async function installTaskRun(ctx, projectId, attempt, options, control) {
   if (!run) {
     const previous = await priorRetryRun(ctx, snapshot, attempt);
     const retry = await retrySettings(ctx, snapshot, previous);
-    const concurrency = Math.min(options.concurrency, previous?.config.concurrency ?? options.concurrency);
+    const concurrency = Math.min(5, options.concurrency, previous?.config.concurrency ?? options.concurrency);
     const baseSha = await frontierOf(ctx, snapshot);
     run = await ctx.engine.createReserved(
       input,
@@ -1216,7 +1232,7 @@ async function activeAttempts(ctx, projectId) {
 // attempts; a task an external chat abandoned is retried by `next-wave --retry-failed`.
 async function reserveRetries(ctx, projectId, options, control, state) {
   let snapshot = await snapshotOf(ctx, projectId);
-  const horizon = await horizonOf(ctx, snapshot);
+  const horizon = await horizonOf(ctx, snapshot, options);
   const active = await activeAttempts(ctx, projectId);
   const taken = [...active.native.map(row => row.taskId), ...active.external].map(
     id => taskOf(snapshot, id).writePaths,
@@ -1224,7 +1240,12 @@ async function reserveRetries(ctx, projectId, options, control, state) {
   let count = 0;
   for (const attempt of snapshot.currentAttempts.filter(row => retryStates.includes(row.status))) {
     const task = taskOf(snapshot, attempt.taskId);
-    if (count >= options.concurrency || reached(task.status, 'integrated') || task.status === 'cancelled') continue;
+    if (
+      count + (options.profiledWave ? active.native.length + active.external.length : 0) >= options.concurrency ||
+      reached(task.status, 'integrated') ||
+      task.status === 'cancelled'
+    )
+      continue;
     const executor = await attemptExecutor(ctx, snapshot, attempt);
     if (executor.kind !== 'native') {
       state.blockers.push({
@@ -1249,9 +1270,9 @@ async function reserveRetries(ctx, projectId, options, control, state) {
   }
 }
 
-async function noProgress(ctx, projectId, state) {
+async function noProgress(ctx, projectId, state, options) {
   const snapshot = await snapshotOf(ctx, projectId);
-  const horizon = await horizonOf(ctx, snapshot);
+  const horizon = await horizonOf(ctx, snapshot, options);
   const rows = horizon.blocked.filter(row => !reached(taskOf(snapshot, row.taskId).status, 'integrated'));
   for (const row of rows)
     state.blockers.push({ code: row.reasons[0], kind: 'task', id: row.taskId, reasons: row.reasons });
@@ -1324,13 +1345,16 @@ async function drainLoop(ctx, projectId, options, control, state) {
       );
     if (pending) return finish(ctx, projectId, state, pending);
     if (state.waves >= options.maxWaves) return finish(ctx, projectId, state, 'max_waves');
+    if (options.profiledWave && active.external.length >= options.concurrency)
+      return finish(ctx, projectId, state, await noProgress(ctx, projectId, state, options));
     const taskIds = selectWave(snapshot, {
-      limit: options.concurrency,
+      limit: options.concurrency - (options.profiledWave ? active.external.length : 0),
+      profiledWave: options.profiledWave,
       inFlight: active.external,
       availability: await waveAvailability(ctx, snapshot),
       now: ctx.clock(),
     });
-    if (!taskIds.length) return finish(ctx, projectId, state, await noProgress(ctx, projectId, state));
+    if (!taskIds.length) return finish(ctx, projectId, state, await noProgress(ctx, projectId, state, options));
     const attempts = [];
     for (const taskId of taskIds) attempts.push(await admitTask(ctx, projectId, taskId, options, control));
     pending = await executeWave(ctx, projectId, attempts, options, control, state);
@@ -1346,10 +1370,19 @@ async function drainLoop(ctx, projectId, options, control, state) {
  * @param {{ maxWaves?: number, concurrency?: number, retryFailed?: boolean, signal?: AbortSignal, commandId?: string }} [options]
  */
 export async function drain(ctx, projectId, options = {}) {
-  const { maxWaves = 10, concurrency = 3, retryFailed = false, signal, commandId } = options;
+  const { maxWaves = 10, retryFailed = false, signal, commandId } = options;
   requireValue(Number.isSafeInteger(maxWaves) && maxWaves >= 1 && maxWaves <= 100, 'drain_invalid');
-  requireValue(Number.isSafeInteger(concurrency) && concurrency >= 1 && concurrency <= 5, 'drain_invalid');
+  if (options.concurrency !== undefined)
+    requireValue(
+      Number.isSafeInteger(options.concurrency) && options.concurrency >= 1 && options.concurrency <= 64,
+      'drain_invalid',
+    );
   const snapshot = await snapshotOf(ctx, projectId);
+  if (options.concurrency !== undefined)
+    requireValue(
+      options.concurrency <= waveCapacity(ctx.repo.getProfile(projectId), Date.parse(ctx.clock())),
+      'drain_invalid',
+    );
   requireValue(waveProject(ctx, snapshot), 'wave_not_enabled');
   if (snapshot.project.status === 'released') fail('wave_delivery_unsupported');
   const state = { waves: 0, integrated: [], gates: [], blockers: [], code: undefined };
@@ -1359,14 +1392,19 @@ export async function drain(ctx, projectId, options = {}) {
     return finish(ctx, projectId, state, early);
   }
   return withGateController(ctx.store, projectId, () =>
-    withProjectControl(ctx, projectId, signal, control =>
-      drainLoop(
+    withProjectControl(ctx, projectId, signal, control => {
+      const profile = ctx.repo.getProfile(projectId);
+      const maximum = waveCapacity(profile, Date.parse(ctx.clock()));
+      const concurrency = options.concurrency ?? Math.min(3, maximum);
+      requireValue(concurrency <= maximum, 'drain_invalid');
+      if (!concurrency) return finish(ctx, projectId, state, 'waiting_limits');
+      return drainLoop(
         ctx,
         projectId,
-        { maxWaves, concurrency, retryFailed: retryFailed === true, commandId },
+        { maxWaves, concurrency, profiledWave: Boolean(profile), retryFailed: retryFailed === true, commandId },
         control,
         state,
-      ),
-    ),
+      );
+    }),
   );
 }

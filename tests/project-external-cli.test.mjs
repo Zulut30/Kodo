@@ -21,7 +21,7 @@ test('Invalid next-wave/complete-task arguments fail before credentials or state
     ['next-wave', id, '--host', 'codex'],
     ['next-wave', id, '--host', 'T3'],
     ['next-wave', id, '--host', 't3', '--limit', '0'],
-    ['next-wave', id, '--host', 't3', '--limit', '6'],
+    ['next-wave', id, '--host', 't3', '--limit', '65'],
     ['next-wave', id, '--host', 't3', '--limit', '1.5'],
     ['next-wave', id, '--host', 't3', '--limit', '03'],
     ['next-wave', id, '--host', 't3', '--host', 'orca'],
@@ -169,6 +169,27 @@ test('Project CLI delegates next-wave and complete-task to the pull protocol', a
   assert.deepEqual(noGates.report.result, { status: 'invalid', code: 'project_wave_required' });
 
   const waveId = await created('wave');
+  const pullLarge = () => projectCli(['next-wave', waveId, '--host', 'orca', '--limit', '8', '--json'], base);
+  assert.equal((await pullLarge()).report.result.code, 'project_limit_invalid');
+  const profile = {
+    schemaVersion: 1,
+    subscriptions: [{ id: 'pool', provider: 'codex', model: 'gpt', slots: 8, tier: 'fast' }],
+    machines: [{ id: 'local', kind: 'local', maxWorkers: 8, maxHeavyBuilds: 1 }],
+  };
+  const file = path.join(temp, 'profile.json');
+  await writeFile(file, JSON.stringify(profile));
+  const profileCli = (action, ...flags) => projectCli(['profile', action, waveId, ...flags, '--json'], base);
+  assert.deepEqual((await profileCli('set', '--file', file)).report.result.profile, profile);
+  assert.deepEqual((await profileCli('show')).report.result.profile, profile);
+  const until = '2099-01-01T00:00:00Z';
+  assert.equal(
+    (await profileCli('pause-pool', '--subscription', 'pool', '--until', until)).report.result.profile.subscriptions[0]
+      .cooldownUntil,
+    until,
+  );
+  assert.equal((await pullLarge()).report.result.code, 'project_limit_invalid');
+  assert.equal((await profileCli('set', '--file', file)).exitCode, 0);
+  assert.match((await projectCli(['--help'])).output, /profile pause-pool/);
   const selected = [];
   const wave = {
     selectWave: (snapshot, options) => {
@@ -176,7 +197,7 @@ test('Project CLI delegates next-wave and complete-task to the pull protocol', a
       return snapshot.tasks.filter(task => task.status === 'proposed').map(task => task.id);
     },
   };
-  const next = await projectCli(['next-wave', waveId, '--host', 'orca', '--limit', '2', '--json'], { ...base, wave });
+  const next = await projectCli(['next-wave', waveId, '--host', 'orca', '--limit', '8', '--json'], { ...base, wave });
   assert.equal(next.exitCode, 0, next.output);
   // Like drain, the selection sees which tasks have verified interface proofs.
   assert.deepEqual(
@@ -185,7 +206,7 @@ test('Project CLI delegates next-wave and complete-task to the pull protocol', a
       inFlight,
       availability: availability.map(row => [row.taskId, row.interfacesVerified]),
     })),
-    [{ limit: 2, inFlight: [], availability: [['task-a', true]] }],
+    [{ limit: 8, inFlight: [], availability: [['task-a', true]] }],
   );
   const gateCalls = [];
   const gatePorts = {

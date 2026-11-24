@@ -1,5 +1,21 @@
 import { dependencySatisfied } from './project-contracts.mjs';
 
+export function waveRanks(tasks) {
+  const children = new Map(tasks.map(t => [t.id, []]));
+  for (const task of tasks) for (const dep of task.dependsOn) children.get(dep).push(task.id);
+  const ranks = new Map();
+  function rank(id) {
+    if (!ranks.has(id)) {
+      const successors = children.get(id);
+      const depth = successors.reduce((n, child) => Math.max(n, 1 + rank(child).depth), 0);
+      ranks.set(id, { depth, children: successors.length });
+    }
+    return ranks.get(id);
+  }
+  for (const task of tasks) rank(task.id);
+  return ranks;
+}
+
 const sets = ['milestones', 'epics', 'tasks', 'currentAttempts', 'riskApprovals'];
 const compareId = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 const invalid = () =>
@@ -38,7 +54,13 @@ export function planProjectHorizon(input, ports) {
     throw invalid();
   const options = { knownValues: ports.knownValues };
   synchronous(contracts.assertDirectorSafe(input, options));
-  if (!input || !Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > 24 || !timestamp(input.now))
+  if (
+    !input ||
+    !Number.isSafeInteger(input.limit) ||
+    input.limit < 1 ||
+    input.limit > (input.snapshot?.project?.execution?.cadence === 'wave' && input.profiledWave === true ? 128 : 24) ||
+    !timestamp(input.now)
+  )
     throw invalid();
   let snapshot, snapshotFailure;
   try {
@@ -182,8 +204,12 @@ export function planProjectHorizon(input, ports) {
       (dependencySatisfied(project, byId.get(id).status) ? 0n : BigInt(byId.get(id).estimatedEffort)) + downstream,
     );
   }
+  const ranks = project.execution?.cadence === 'wave' ? waveRanks(tasks) : new Map();
+  for (const task of tasks) if (!['proposed', 'ready'].includes(task.status)) ranks.delete(task.id);
   const ranked = [...tasks].sort(
     (a, b) =>
+      (ranks.get(b.id)?.depth ?? 0) - (ranks.get(a.id)?.depth ?? 0) ||
+      (ranks.get(b.id)?.children ?? 0) - (ranks.get(a.id)?.children ?? 0) ||
       compareId(path.get(b.id), path.get(a.id)) ||
       b.priority - a.priority ||
       b.userValue - a.userValue ||
