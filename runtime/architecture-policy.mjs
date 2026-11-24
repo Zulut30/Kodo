@@ -1,5 +1,5 @@
-import path from 'node:path';
 import { createHash } from 'node:crypto';
+import { isExplicitContractScope } from './cargo-workspace.mjs';
 
 const limits = { files: 20000, modules: 256, edges: 100000, findings: 10000 };
 const digest = /^[a-f0-9]{64}$/;
@@ -446,20 +446,6 @@ function inspectRustGraph(graph) {
     edgeIds.add(edge.id);
   }
   return crates;
-}
-
-function ownsScope(scope, name) {
-  return path.posix.matchesGlob(name, scope) || name === scope || name.startsWith(scope.replace(/\/\*\*$/, '') + '/');
-}
-
-function isExplicitContractScope(scope, crateRoot, changedFile) {
-  const staticPrefix = scope.split(/[*?[{]/)[0].replace(/\/+$/, '');
-  if (!staticPrefix) return false;
-  const targetsCrate =
-    crateRoot === ''
-      ? staticPrefix === changedFile || changedFile.startsWith(staticPrefix + '/')
-      : staticPrefix === crateRoot || staticPrefix.startsWith(crateRoot + '/');
-  return targetsCrate && ownsScope(scope, changedFile);
 }
 
 function rustCycleFindings({ crates, adjacency, crossEdges, add }) {

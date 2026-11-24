@@ -6,6 +6,12 @@ import { createHash } from 'node:crypto';
 import { lstat, open, readdir, realpath, stat } from 'node:fs/promises';
 import path from 'node:path';
 import * as projectContracts from './project-contracts.mjs';
+import {
+  isBroadContractScope,
+  isExplicitContractScope,
+  normalizeScopePath,
+  scopeMatchesPath,
+} from './cargo-workspace.mjs';
 import { scopesOverlap } from './contracts.mjs';
 import { inside } from './toolchains.mjs';
 
@@ -833,50 +839,19 @@ function declaredWorkspaceRoots(spec, projectMarkdown, architecturePolicy, allCr
   return roots;
 }
 
-function scopeMatchesFile(scope, filePath) {
-  return (
-    path.posix.matchesGlob(filePath, scope) ||
-    filePath === scope ||
-    filePath.startsWith(`${scope.replace(/\/\*\*$/, '')}/`)
-  );
-}
-
-function scopeExplicitlyTargetsContract(rawScope, contractRoot) {
-  const scope = normalizeRelScope(rawScope);
-  if (!scope) return null;
-  const staticPrefix = scope.split(/[*?[{]/)[0].replace(/\/+$/, '');
-  if (staticPrefix !== contractRoot && !staticPrefix.startsWith(`${contractRoot}/`)) return null;
-  return scope;
-}
-
 function taskCreatesCompilableContractCrate(task, contractRoot) {
   let coversManifest = false;
   let coversSource = false;
+  const manifestPath = contractRoot ? `${contractRoot}/Cargo.toml` : 'Cargo.toml';
+  const libPath = contractRoot ? `${contractRoot}/src/lib.rs` : 'src/lib.rs';
+  const srcPrefix = contractRoot ? `${contractRoot}/src/` : 'src/';
   for (const rawScope of task.writePaths ?? []) {
-    const scope = scopeExplicitlyTargetsContract(rawScope, contractRoot);
-    if (!scope) continue;
-    if (scopeMatchesFile(scope, `${contractRoot}/Cargo.toml`)) coversManifest = true;
-    if (
-      scopeMatchesFile(scope, `${contractRoot}/src/lib.rs`) ||
-      (scope.startsWith(`${contractRoot}/src/`) && /\.rs$/i.test(scope))
-    )
-      coversSource = true;
+    if (!isExplicitContractScope(rawScope, contractRoot)) continue;
+    const scope = normalizeScopePath(rawScope);
+    if (scopeMatchesPath(scope, manifestPath)) coversManifest = true;
+    if (scopeMatchesPath(scope, libPath) || (scope.startsWith(srcPrefix) && /\.rs$/i.test(scope))) coversSource = true;
   }
   return coversManifest && coversSource;
-}
-
-function scopeCoversContractWithoutNamingIt(rawScope, contractRoot) {
-  const scope = normalizeRelScope(rawScope);
-  if (!scope) return false;
-  const staticPrefix = scope.split(/[*?[{]/)[0].replace(/\/+$/, '');
-  if (staticPrefix === contractRoot || staticPrefix.startsWith(`${contractRoot}/`)) return false;
-  const hasGlob = /[*?[{]/.test(scope);
-  if (!hasGlob) return scope === '.' || contractRoot === scope || contractRoot.startsWith(`${scope}/`);
-  return (
-    path.posix.matchesGlob(contractRoot, scope) ||
-    path.posix.matchesGlob(`${contractRoot}/Cargo.toml`, scope) ||
-    path.posix.matchesGlob(`${contractRoot}/src/lib.rs`, scope)
-  );
 }
 
 function broadContractScopeFindings(spec, contractRoots) {
@@ -885,7 +860,7 @@ function broadContractScopeFindings(spec, contractRoots) {
   for (const task of spec.tasks) {
     for (const scope of task.writePaths ?? []) {
       for (const contractRoot of contractRoots) {
-        if (scopeCoversContractWithoutNamingIt(scope, contractRoot)) offending.add(task.id);
+        if (isBroadContractScope(scope, contractRoot)) offending.add(task.id);
       }
     }
   }

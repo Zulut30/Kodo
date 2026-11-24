@@ -16,7 +16,7 @@ import {
   git as fixtureGit,
 } from './helpers/engine-fixture.mjs';
 import { applyArchitectureDebt } from '../runtime/architecture-debt.mjs';
-import { compileBlueprint, lintFactorySpec } from '../runtime/project-blueprint.mjs';
+import { compileBlueprint, lintFactorySpec, rustContractCrateFindings } from '../runtime/project-blueprint.mjs';
 import { projectBlueprintCli } from '../runtime/project-cli-blueprint.mjs';
 
 const rustModule = await import('../runtime/architecture-rust.mjs').catch(error => {
@@ -1504,4 +1504,129 @@ test('W1: end-to-end Wave 0 (contracts + all planned crates in layers, members=[
   assert.equal(migrationReceipt.passed, true);
   assert.equal(migrationReceipt.requiresReview, true);
   assert.equal(migrationReceipt.fullVerificationRequired, true);
+});
+
+test('W3: contract scope requires literal directory segments; crates/game-contracts*/** and crates/*/src/types.rs fail both gate and blueprint linter', async t => {
+  // 1) Gate: globbed contract name and sibling wildcard must NOT authorize contract edits.
+  const fx = await rustFixture(t);
+  await fx.put('crates/game-contracts/src/lib.rs', 'pub struct Event { pub id: u64 }\n');
+  const headSha = fx.commit('edit contract crate');
+
+  for (const badScope of [
+    'crates/game-contracts*/**',
+    'crates/game-contracts*',
+    'crates/*/src/lib.rs',
+    'crates/{world,game-contracts}/**',
+    '**/lib.rs',
+  ]) {
+    const res = await checkArchitecture({
+      project: fx.project,
+      baseSha: fx.baseSha,
+      headSha,
+      evidenceDir: fx.artifacts,
+      taskPaths: [badScope],
+    });
+    assert.equal(res.status, 'failed', `badScope ${badScope} must fail gate`);
+    assert.ok(
+      res.findings.some(f => f.ruleId === 'contract_change_not_allowed'),
+      `badScope ${badScope} must report contract_change_not_allowed, got ${JSON.stringify(res.findings)}`,
+    );
+  }
+
+  for (const goodScope of ['crates/game-contracts/**', 'crates/game-contracts', 'crates/game-contracts/src/lib.rs']) {
+    const res = await checkArchitecture({
+      project: fx.project,
+      baseSha: fx.baseSha,
+      headSha,
+      evidenceDir: fx.artifacts,
+      taskPaths: [goodScope],
+    });
+    assert.equal(res.status, 'passed', `goodScope ${goodScope} must pass gate: ${JSON.stringify(res.findings)}`);
+  }
+
+  // 2) Blueprint linter: any glob intersecting contract subtree without naming it literally -> contract_scope_too_broad.
+  const makeSpec = extraWritePath => ({
+    schemaVersion: 1,
+    id: 'w3-bp',
+    title: 'Rust W3',
+    root: '/tmp/w3',
+    businessContext: 'Cargo workspace',
+    execution: { cadence: 'wave', integration: 'branch' },
+    constraints: [],
+    milestones: [{ id: 'foundation', title: 'W0', acceptance: [] }],
+    epics: [
+      { id: 'foundation', milestoneId: 'foundation', title: 'W0', acceptance: [] },
+      { id: 'domain', milestoneId: 'foundation', title: 'Domain', acceptance: [] },
+    ],
+    tasks: [
+      {
+        id: 't0',
+        epicId: 'foundation',
+        title: 'Contracts',
+        owner: 'architect',
+        dependsOn: [],
+        writePaths: [
+          'Cargo.toml',
+          'crates/game-contracts/Cargo.toml',
+          'crates/game-contracts/src/**',
+          'architecture.policy.json',
+        ],
+      },
+      {
+        id: 't1',
+        epicId: 'domain',
+        title: 'World',
+        owner: 'developer',
+        dependsOn: ['t0'],
+        writePaths: [extraWritePath, 'crates/world/Cargo.toml', 'crates/world/src/**'],
+      },
+      {
+        id: 't2',
+        epicId: 'domain',
+        title: 'Combat',
+        owner: 'developer',
+        dependsOn: ['t0'],
+        writePaths: ['crates/combat/Cargo.toml', 'crates/combat/src/**'],
+      },
+    ],
+  });
+
+  for (const broad of [
+    'crates/game-contracts*/**',
+    'crates/game-contracts*',
+    'crates/*/src/types.rs',
+    'crates/{world,game-contracts}/**',
+    '**/types.rs',
+  ]) {
+    const findings = rustContractCrateFindings(makeSpec(broad), '## Стек\nRust Cargo workspace\n');
+    assert.ok(
+      findings.some(f => f.code === 'contract_scope_too_broad' && f.taskIds?.includes('t1')),
+      `expected contract_scope_too_broad for ${broad}, got ${JSON.stringify(findings)}`,
+    );
+  }
+
+  // Non-intersecting glob on another crate must NOT trigger contract_scope_too_broad.
+  const okFindings = rustContractCrateFindings(makeSpec('crates/world*/**'), '## Стек\nRust Cargo workspace\n');
+  assert.equal(
+    okFindings.some(f => f.code === 'contract_scope_too_broad'),
+    false,
+    `crates/world*/** must not trigger contract_scope_too_broad: ${JSON.stringify(okFindings)}`,
+  );
+
+  // Wave 0 using crates/game-contracts*/** must NOT satisfy contract_crate_required.
+  const badW0Spec = makeSpec('crates/world/src/lib.rs');
+  badW0Spec.tasks[0].writePaths = ['Cargo.toml', 'crates/game-contracts*/**', 'architecture.policy.json'];
+  badW0Spec.tasks.push({
+    id: 't3',
+    epicId: 'domain',
+    title: 'Render',
+    owner: 'developer',
+    dependsOn: ['t0'],
+    writePaths: ['crates/render/Cargo.toml', 'crates/render/src/**'],
+  });
+  const badW0Findings = rustContractCrateFindings(badW0Spec, '## Стек\nRust Cargo workspace\n');
+  assert.ok(
+    badW0Findings.some(f => f.code === 'contract_crate_required'),
+    `globbed Wave 0 path must not satisfy contract_crate_required: ${JSON.stringify(badW0Findings)}`,
+  );
 });

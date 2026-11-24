@@ -5,6 +5,92 @@ import { parse as parseToml } from 'smol-toml';
 
 const compare = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
+const SCOPE_GLOB_META = /[*?[{]/;
+
+export function normalizeScopePath(raw) {
+  if (typeof raw !== 'string') return '';
+  return raw
+    .trim()
+    .replaceAll('\\', '/')
+    .replace(/^(?:\.\/)+/, '')
+    .replace(/\/+$/, '');
+}
+
+function literalScopePrefix(scope) {
+  const literal = [];
+  for (const segment of scope.split('/')) {
+    if (SCOPE_GLOB_META.test(segment)) break;
+    literal.push(segment);
+  }
+  return literal.join('/');
+}
+
+export function scopeMatchesPath(rawScope, rawFile) {
+  const scope = normalizeScopePath(rawScope);
+  const file = normalizeScopePath(rawFile);
+  if (!scope || !file) return false;
+  if (scope === '.') return true;
+  if (!SCOPE_GLOB_META.test(scope)) return file === scope || file.startsWith(`${scope}/`);
+  return path.posix.matchesGlob(file, scope);
+}
+
+/**
+ * Shared contract scope authorization predicate used by both the architecture gate
+ * and the blueprint linter. A scope explicitly authorizes a contract crate only if
+ * its leading literal path segments (before any glob metacharacter) completely name
+ * the contract crate directory (or, for a root package, name the file/subtree literally).
+ * @param {string} rawScope
+ * @param {string} rawCrateRoot
+ * @param {string | null} [rawChangedFile]
+ */
+export function isExplicitContractScope(rawScope, rawCrateRoot, rawChangedFile = null) {
+  const scope = normalizeScopePath(rawScope);
+  const crateRoot = normalizeScopePath(rawCrateRoot);
+  if (!scope) return false;
+  const literal = literalScopePrefix(scope);
+  if (!literal || literal === '.') return false;
+  if (crateRoot === '') {
+    if (rawChangedFile === null) return true;
+    const file = normalizeScopePath(rawChangedFile);
+    return (literal === file || file.startsWith(`${literal}/`)) && scopeMatchesPath(scope, file);
+  }
+  const targetsCrate = literal === crateRoot || literal.startsWith(`${crateRoot}/`);
+  if (!targetsCrate) return false;
+  return rawChangedFile === null ? true : scopeMatchesPath(scope, rawChangedFile);
+}
+
+function segmentsIntersectSubtree(scopeSegs, rootSegs) {
+  const visited = new Set();
+  const walk = (si, ri) => {
+    if (ri === rootSegs.length) return true;
+    if (si === scopeSegs.length) return true;
+    const key = `${si}:${ri}`;
+    if (visited.has(key)) return false;
+    visited.add(key);
+    const seg = scopeSegs[si];
+    if (seg === '**') return walk(si + 1, ri) || walk(si, ri + 1);
+    if (path.posix.matchesGlob(rootSegs[ri], seg)) return walk(si + 1, ri + 1);
+    return false;
+  };
+  return walk(0, 0);
+}
+
+/**
+ * Returns true if `rawScope` can intersect any path inside `rawCrateRoot`'s subtree
+ * WITHOUT explicitly naming `rawCrateRoot` via literal segments.
+ * @param {string} rawScope
+ * @param {string} rawCrateRoot
+ */
+export function isBroadContractScope(rawScope, rawCrateRoot) {
+  if (isExplicitContractScope(rawScope, rawCrateRoot)) return false;
+  const scope = normalizeScopePath(rawScope);
+  const crateRoot = normalizeScopePath(rawCrateRoot);
+  if (!scope) return false;
+  if (scope === '.') return true;
+  if (crateRoot === '') return literalScopePrefix(scope) === '';
+  if (!SCOPE_GLOB_META.test(scope)) return crateRoot === scope || crateRoot.startsWith(`${scope}/`);
+  return segmentsIntersectSubtree(scope.split('/'), crateRoot.split('/'));
+}
 
 export const isPlainObject = value =>
   value !== null &&
