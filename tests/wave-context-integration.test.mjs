@@ -17,6 +17,7 @@ import { ensureIntegration, mergeTask } from '../runtime/project-integration.mjs
 import { integrationHome } from '../runtime/project-director-waves.mjs';
 import { confirmedCriteria } from './helpers/gate-review.mjs';
 import { MAX_TASK_MODULES, MAX_TASK_WRITE_PATHS, compileBlueprint } from '../runtime/project-blueprint.mjs';
+import { lintMilestone } from '../runtime/project-bootstrap.mjs';
 import { buildContextManifest } from '../runtime/context-manifest.mjs';
 import { buildDiagnosticPack } from '../runtime/diagnostic-pack.mjs';
 
@@ -134,6 +135,174 @@ test('blueprint linter rejects task without unambiguous owner, shared-file wave 
   assert.ok(
     modRes.findings.some(f => f.code === 'split_required' && f.taskIds?.includes('storage-module')),
     JSON.stringify(modRes.findings),
+  );
+
+  // (c3) 9 files inside ONE module (`src/search/*.js`) must NOT trigger split_required (MAX_TASK_WRITE_PATHS >= 24)
+  assert.ok(MAX_TASK_WRITE_PATHS >= 24);
+  const nineFilesOneMod = await blueprintCopy(t, spec => {
+    spec.tasks.find(item => item.id === 'storage-module').writePaths = Array.from(
+      { length: 9 },
+      (_, i) => `src/search/file-${i}.js`,
+    );
+  });
+  const nineRes = await compileBlueprint(nineFilesOneMod.root);
+  assert.equal(nineRes.ok, true, JSON.stringify(nineRes.findings));
+
+  // (d) Integrator role task is accepted and exempt from split_required on shared integration files
+  const integratorBp = await blueprintCopy(t, spec => {
+    const wiring = {
+      ...spec.tasks.find(item => item.id === 'web-module'),
+      id: 'wire-all',
+      epicId: 'api',
+      title: 'Wire workspace manifests',
+      owner: 'integrator',
+      dependsOn: ['storage-module', 'api-module', 'web-module'],
+      writePaths: [
+        'Cargo.toml',
+        'package.json',
+        'src/main.rs',
+        'crates/a/Cargo.toml',
+        'crates/b/Cargo.toml',
+        'crates/c/Cargo.toml',
+        'crates/d/Cargo.toml',
+      ],
+    };
+    spec.tasks.push(wiring);
+  });
+  const integratorRes = await compileBlueprint(integratorBp.root);
+  assert.equal(integratorRes.ok, true, JSON.stringify(integratorRes.findings));
+});
+
+test('lintMilestone applies moduleOwnerFindings, taskScopeSizeFindings, and integrator_required without re-linting accepted milestones', async t => {
+  const dir = await realpath(await mkdtemp(path.join(os.tmpdir(), 'kodo-15d-ms-lint-')));
+  const root = path.join(dir, 'repo');
+  const home = path.join(dir, 'home');
+  await mkdir(root, { recursive: true });
+  const store = new Store(home);
+  const repo = await openProjectStore({
+    store,
+    contracts,
+    authorizeTransition: async () => undefined,
+  });
+  t.after(async () => {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const crit = id => ({ id, text: `Criterion ${id}`, evidenceKinds: ['checks'] });
+  const makeTask = (id, epicId, extra = {}) => ({
+    id,
+    epicId,
+    title: `Task ${id}`,
+    description: `Implement ${id}`,
+    owner: 'developer',
+    dependsOn: [],
+    writePaths: [`src/${id}`],
+    acceptance: [crit(`${id}-ok`)],
+    interfaceRefs: [],
+    priority: 50,
+    userValue: 3,
+    risk: 1,
+    estimatedEffort: 1,
+    riskApprovalRequired: false,
+    ...extra,
+  });
+  // Existing accepted milestone has a legacy broad writePath (`src/**`) and a storage owner (`src/storage`).
+  const created = await repo.apply({
+    schemaVersion: 1,
+    commandId: randomUUID(),
+    projectId: null,
+    expectedRevision: null,
+    actor: 'coordinator',
+    reason: 'Setup accepted milestone',
+    action: {
+      op: 'create',
+      spec: {
+        schemaVersion: 1,
+        id: 'ms-lint',
+        root,
+        title: 'MS lint',
+        definitionOfDone: [crit('dod')],
+        constraints: ['Clean'],
+        businessContext: 'Test',
+        architectureRefs: [],
+        milestones: [{ id: 'm1', title: 'M1', acceptance: [crit('m1')], releaseRequired: false }],
+        epics: [
+          { id: 'foundation', milestoneId: 'm1', title: 'Foundation', acceptance: [crit('f')] },
+          { id: 'storage', milestoneId: 'm1', title: 'Storage', acceptance: [crit('s')] },
+          { id: 'legacy-wide', milestoneId: 'm1', title: 'Legacy', acceptance: [crit('l')] },
+        ],
+        tasks: [
+          makeTask('scaffold', 'foundation', { writePaths: ['package.json'] }),
+          makeTask('storage-1', 'storage', { dependsOn: ['scaffold'], writePaths: ['src/storage'] }),
+          makeTask('legacy-1', 'legacy-wide', {
+            dependsOn: ['scaffold'],
+            writePaths: ['src/**', ...Array.from({ length: 26 }, (_, i) => `src/legacy/f${i}.js`)],
+          }),
+        ],
+        execution: { cadence: 'wave', integration: 'branch' },
+      },
+    },
+  });
+  const projectId = created.projectId;
+  const snapshot = structuredClone(repo.snapshot(projectId));
+  for (const row of [...snapshot.tasks, ...snapshot.epics, ...snapshot.milestones]) row.status = 'accepted';
+  snapshot.project.status = 'accepted';
+
+  const ms = tasks => ({
+    milestone: { id: 'm2', title: 'M2', acceptance: [crit('m2')], releaseRequired: false },
+    epics: [{ id: 'search', milestoneId: 'm2', title: 'Search', acceptance: [crit('search')] }],
+    tasks,
+  });
+
+  // 1. Clean new milestone with 9 files in one module passes AND does NOT re-lint legacy accepted milestone!
+  const cleanRes = lintMilestone(
+    ms([
+      makeTask('search-1', 'search', {
+        dependsOn: ['storage-1'],
+        writePaths: Array.from({ length: 9 }, (_, i) => `src/search/f${i}.js`),
+      }),
+    ]),
+    snapshot,
+  );
+  assert.equal(cleanRes.ok, true, JSON.stringify(cleanRes.findings));
+
+  // 2. Two parallel tasks in new milestone colliding on Cargo.toml -> integrator_required
+  const integRes = lintMilestone(
+    ms([
+      makeTask('search-a', 'search', { dependsOn: ['storage-1'], writePaths: ['src/search/a.js', 'Cargo.toml'] }),
+      makeTask('search-b', 'search', { dependsOn: ['storage-1'], writePaths: ['src/search/b.js', 'Cargo.toml'] }),
+    ]),
+    snapshot,
+  );
+  assert.ok(
+    integRes.findings.some(f => f.code === 'integrator_required'),
+    JSON.stringify(integRes.findings),
+  );
+
+  // 3. New epic claiming existing module owner (`src/storage` owned by epic `storage`) -> blueprint_owner_ambiguous
+  const ownerConflict = lintMilestone(
+    ms([makeTask('search-steal', 'search', { dependsOn: ['storage-1'], writePaths: ['src/storage/hack.js'] })]),
+    snapshot,
+  );
+  assert.ok(
+    ownerConflict.findings.some(f => f.code === 'blueprint_owner_ambiguous' && f.taskIds?.includes('search-steal')),
+    JSON.stringify(ownerConflict.findings),
+  );
+
+  // 4. Oversized new task (>3 modules) -> split_required
+  const oversized = lintMilestone(
+    ms([
+      makeTask('search-huge', 'search', {
+        dependsOn: ['storage-1'],
+        writePaths: ['src/m1/a.js', 'src/m2/a.js', 'src/m3/a.js', 'src/m4/a.js'],
+      }),
+    ]),
+    snapshot,
+  );
+  assert.ok(
+    oversized.findings.some(f => f.code === 'split_required' && f.taskIds?.includes('search-huge')),
+    JSON.stringify(oversized.findings),
   );
 });
 

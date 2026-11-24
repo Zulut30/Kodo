@@ -11,10 +11,18 @@ import { inside } from './toolchains.mjs';
 
 export const BLUEPRINT_DIR = '.kodo/blueprint';
 export const MAX_TASK_INPUT_BYTES = 12000;
-export const MAX_TASK_WRITE_PATHS = 8;
+export const MAX_TASK_WRITE_PATHS = 24;
 export const MAX_TASK_MODULES = 3;
 export const FOUNDATION_ID = 'foundation';
-export const FACTORY_ROLES = Object.freeze(['architect', 'developer', 'ui-qa', 'performance', 'security', 'reviewer']);
+export const FACTORY_ROLES = Object.freeze([
+  'architect',
+  'developer',
+  'integrator',
+  'ui-qa',
+  'performance',
+  'security',
+  'reviewer',
+]);
 export const DEFAULT_EXECUTION = Object.freeze({ cadence: 'wave', integration: 'branch' });
 export const REQUIRED_SECTIONS = Object.freeze([
   { title: 'Цель', aliases: ['цель', 'цели', 'goal', 'goals'] },
@@ -526,6 +534,8 @@ const SHARED_INTEGRATION_FILES = new Set([
   'kodo.config.json',
 ]);
 const SHARED_ENTRYPOINT = /^(?:src\/|cli\/)?(?:main|index|lib|app)\.(?:rs|[cm]?[jt]sx?)$/;
+const WORKSPACE_SHARED_FILE =
+  /^(?:crates|packages|modules|libs|services|apps)\/[^/*?[{]+\/(?:Cargo\.toml|package\.json|src\/(?:lib|main|index)\.(?:rs|[cm]?[jt]sx?))$/;
 const UNBOUNDED_SCOPE =
   /^(?:\.|\.\.?\/\*+|\*+|\*\*\/\*+|(?:src|crates|packages|modules|libs)(?:\/\*+|\/\*\*|\/\*\*\/\*+)?)$/;
 const MODULE_SCOPE = /^((?:src|crates|packages|modules|libs|services|apps|runtime)\/[^/*?[{]+)/;
@@ -540,6 +550,11 @@ const cleanScope = scope =>
 export function isSharedIntegrationPath(scope) {
   const normalized = cleanScope(scope);
   return SHARED_INTEGRATION_FILES.has(normalized) || SHARED_ENTRYPOINT.test(normalized);
+}
+
+/** Whether a writePath is a shared manifest/entrypoint that an `integrator` task may touch without split_required. */
+function isIntegratorExemptPath(scope) {
+  return isSharedIntegrationPath(scope) || WORKSPACE_SHARED_FILE.test(cleanScope(scope));
 }
 
 /** Whether a writePath is an unbounded root/container wildcard without a concrete module owner. */
@@ -581,9 +596,32 @@ export function overlapFindings(pairs, tasks = []) {
   });
 }
 
+function ownedModulesOf(task) {
+  const paths =
+    task.owner === 'integrator'
+      ? (task.writePaths ?? []).filter(p => !isIntegratorExemptPath(p))
+      : (task.writePaths ?? []);
+  return new Set(paths.map(moduleOfWritePath).filter(Boolean));
+}
+
+function indexOwnersByModule(tasks, foundationEpics) {
+  const byModule = new Map();
+  for (const task of tasks) {
+    if (foundationEpics.has(task.epicId) || task.status === 'cancelled') continue;
+    for (const mod of ownedModulesOf(task)) {
+      const list = byModule.get(mod) ?? [];
+      list.push(task);
+      byModule.set(mod, list);
+    }
+  }
+  return byModule;
+}
+
 /** Reject tasks without an unambiguous module/write owner: unbounded catch-all scopes
- * or multiple non-foundation epics claiming write ownership of the same module. */
-export function moduleOwnerFindings(spec, { parallelPairs = [] } = {}) {
+ * or multiple non-foundation epics claiming write ownership of the same module.
+ * When `existingTasks`/`existingEpics` are supplied (`append-milestone`), only new
+ * tasks in `spec.tasks` are linted against existing owners; accepted milestones are never re-linted. */
+export function moduleOwnerFindings(spec, { parallelPairs = [], existingTasks = [], existingEpics = [] } = {}) {
   const findings = [];
   const unbounded = spec.tasks.filter(task => (task.writePaths ?? []).some(isUnboundedWritePath)).map(task => task.id);
   if (unbounded.length) {
@@ -596,49 +634,57 @@ export function moduleOwnerFindings(spec, { parallelPairs = [] } = {}) {
     );
   }
   const foundationEpics = new Set(
-    spec.epics.filter(epic => epic.id === FOUNDATION_ID || epic.milestoneId === FOUNDATION_ID).map(epic => epic.id),
+    [...(spec.epics ?? []), ...(existingEpics ?? [])]
+      .filter(epic => epic.id === FOUNDATION_ID || epic.milestoneId === FOUNDATION_ID)
+      .map(epic => epic.id),
   );
   const parallelSet = new Set(parallelPairs.map(([a, b]) => (a < b ? `${a}\0${b}` : `${b}\0${a}`)));
-  const ownersByModule = new Map();
-  for (const task of spec.tasks) {
-    if (foundationEpics.has(task.epicId)) continue;
-    const modules = new Set((task.writePaths ?? []).map(moduleOfWritePath).filter(Boolean));
-    for (const mod of modules) {
-      const list = ownersByModule.get(mod) ?? [];
-      list.push(task);
-      ownersByModule.set(mod, list);
-    }
-  }
-  for (const [mod, owners] of [...ownersByModule.entries()].sort(([a], [b]) => compare(a, b))) {
-    const epics = new Set(owners.map(task => task.epicId));
+  const freshByModule = indexOwnersByModule(spec.tasks, foundationEpics);
+  const existingByModule = indexOwnersByModule(existingTasks, foundationEpics);
+
+  for (const [mod, freshOwners] of [...freshByModule.entries()].sort(([a], [b]) => compare(a, b))) {
+    const existingOwners = existingByModule.get(mod) ?? [];
+    const allOwners = [...freshOwners, ...existingOwners];
+    const epics = new Set(allOwners.map(task => task.epicId));
     if (epics.size <= 1) continue;
-    const crossEpicPairs = [];
-    for (let i = 0; i < owners.length; i++)
-      for (let j = i + 1; j < owners.length; j++)
-        if (owners[i].epicId !== owners[j].epicId) {
-          const key =
-            owners[i].id < owners[j].id ? `${owners[i].id}\0${owners[j].id}` : `${owners[j].id}\0${owners[i].id}`;
-          if (!parallelSet.has(key)) crossEpicPairs.push([owners[i].id, owners[j].id]);
+    const crossEpicIds = new Set();
+    const pairKey = (a, b) => (a < b ? `${a}\0${b}` : `${b}\0${a}`);
+    for (let i = 0; i < freshOwners.length; i++) {
+      const left = freshOwners[i];
+      for (let j = i + 1; j < freshOwners.length; j++) {
+        const right = freshOwners[j];
+        if (left.epicId !== right.epicId && !parallelSet.has(pairKey(left.id, right.id))) {
+          crossEpicIds.add(left.id);
+          crossEpicIds.add(right.id);
         }
-    if (!crossEpicPairs.length) continue;
-    const taskIds = [...new Set(crossEpicPairs.flat())];
+      }
+      for (const existing of existingOwners) {
+        if (left.epicId !== existing.epicId && !parallelSet.has(pairKey(left.id, existing.id))) {
+          crossEpicIds.add(left.id);
+          crossEpicIds.add(existing.id);
+        }
+      }
+    }
+    if (!crossEpicIds.size) continue;
     findings.push(
       finding(
         'blueprint_owner_ambiguous',
         `Модуль ${mod} не имеет однозначного владельца: в него пишут задачи разных эпиков (${[...epics].sort(compare).join(', ')})`,
-        taskIds,
+        [...crossEpicIds],
       ),
     );
   }
   return findings;
 }
 
-/** Reject tasks whose write scope exceeds MAX_TASK_WRITE_PATHS or MAX_TASK_MODULES. */
+/** Reject tasks whose write scope exceeds MAX_TASK_WRITE_PATHS or MAX_TASK_MODULES.
+ * Integrator tasks (`owner === 'integrator'`) are exempt on shared integration files. */
 export function taskScopeSizeFindings(tasks, alreadyOversized = new Set()) {
   const oversized = tasks
     .filter(task => {
       if (alreadyOversized.has(task.id)) return false;
-      const paths = task.writePaths ?? [];
+      const rawPaths = task.writePaths ?? [];
+      const paths = task.owner === 'integrator' ? rawPaths.filter(p => !isIntegratorExemptPath(p)) : rawPaths;
       const modules = new Set(paths.map(moduleOfWritePath).filter(Boolean));
       return paths.length > MAX_TASK_WRITE_PATHS || modules.size > MAX_TASK_MODULES;
     })

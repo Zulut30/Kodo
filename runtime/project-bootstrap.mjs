@@ -19,12 +19,14 @@ import {
   containerFindings,
   epicCycleFindings,
   finding,
+  moduleOwnerFindings,
   overlapFindings,
   ownerFindings,
   parallelOverlaps,
   readBoundedFile,
   taskAncestors,
   taskInputFindings,
+  taskScopeSizeFindings,
 } from './project-blueprint.mjs';
 
 export const BOOTSTRAP_CLIENTS = Object.freeze(['codex', 'claude-code']);
@@ -895,7 +897,7 @@ const MILESTONE_RULES = `# Правила нового майлстоуна
 8. В майлстоуне есть хотя бы один эпик, в каждом новом эпике — хотя бы одна задача.
 9. \`interfaceRefs: []\` или полные Ref, скопированные без изменений из раздела «Привязанные интерфейсы» context.md (они уже есть у задач проекта): так воркер получит контракт в brief.interfaces. Новые ссылки к замороженным интерфейсам привязывает только apply-spec: короткая форма \`interfaces/<module>.md\`, изменённый или неизвестный Ref и Ref, чьё evidence не проходит проверку, отклоняются (\`milestone_interface_unbound\`).
 
-Коды: \`milestone_shape\`, \`milestone_task_count\`, \`milestone_id_conflict\`, \`milestone_foreign_parent\`, \`milestone_dependency_unknown\`, \`milestone_dependency_not_accepted\`, \`milestone_interface_unbound\`, \`milestone_snapshot_invalid\`, \`milestone_snapshot_incomplete\`, \`milestone_spec_invalid\`, \`blueprint_owner_unknown\`, \`blueprint_container_empty\`, \`blueprint_epic_cycle\`, \`blueprint_parallel_overlap\`, \`split_required\`.
+Коды: \`milestone_shape\`, \`milestone_task_count\`, \`milestone_id_conflict\`, \`milestone_foreign_parent\`, \`milestone_dependency_unknown\`, \`milestone_dependency_not_accepted\`, \`milestone_interface_unbound\`, \`milestone_snapshot_invalid\`, \`milestone_snapshot_incomplete\`, \`milestone_spec_invalid\`, \`blueprint_owner_unknown\`, \`blueprint_owner_ambiguous\`, \`blueprint_container_empty\`, \`blueprint_epic_cycle\`, \`blueprint_parallel_overlap\`, \`integrator_required\`, \`split_required\`.
 `;
 
 function milestoneTemplate(snapshot) {
@@ -1209,13 +1211,29 @@ export function lintMilestone(milestone, snapshot, options = {}) {
   const fresh = normalized.tasks.map(task => ({ ...task, dependsOn: raw.get(task.id) }));
   const ancestors = taskAncestors(fresh);
   const others = current.tasks.filter(task => ![...CLOSED, 'cancelled'].includes(task.status));
+  const pairs = parallelOverlaps(normalized.tasks, { ancestors, others });
+  const inputFindings = taskInputFindings({
+    project: current.project,
+    tasks: normalized.tasks,
+    contracts,
+    knownValues,
+  });
+  const alreadyOversized = new Set(
+    inputFindings.filter(item => item.code === 'split_required').flatMap(item => item.taskIds ?? []),
+  );
   findings.push(
     ...ownerFindings(normalized.tasks),
     // Raw task parents: normalization re-homes a foreign epicId (milestone_foreign_parent reports it).
     ...containerFindings({ ...normalized, tasks: milestone.tasks.filter(isPlain) }),
     ...epicCycleFindings([...current.tasks, ...fresh], { fresh: new Set(normalized.epics.map(epic => epic.id)) }),
-    ...overlapFindings(parallelOverlaps(normalized.tasks, { ancestors, others })),
-    ...taskInputFindings({ project: current.project, tasks: normalized.tasks, contracts, knownValues }),
+    ...overlapFindings(pairs, [...normalized.tasks, ...others]),
+    ...moduleOwnerFindings(normalized, {
+      parallelPairs: pairs,
+      existingTasks: current.tasks,
+      existingEpics: current.epics,
+    }),
+    ...inputFindings,
+    ...taskScopeSizeFindings(normalized.tasks, alreadyOversized),
   );
   return done(findings);
 }
