@@ -458,9 +458,9 @@ export async function runEpicGate({ engine, run: input, signal }) {
 /**
  * One pass of the task-fast checks and the behaviour gate on the Run's current head, without
  * repair: the verdict for a task an external chat implemented. A pass records `run.headSha`.
- * @param {{ engine: any, run: any, signal?: AbortSignal }} input
+ * @param {{ engine: any, run: any, signal?: AbortSignal, maxHeavyBuilds?: number }} input
  */
-export async function verifyTaskFastOnce({ engine, run: input, signal }) {
+export async function verifyTaskFastOnce({ engine, run: input, signal, maxHeavyBuilds = 1 }) {
   const id = typeof input === 'string' ? input : input?.id;
   engine.store.getRun(id);
   return withRunLease(engine, id, signal, async (leased, leaseError) => {
@@ -469,7 +469,7 @@ export async function verifyTaskFastOnce({ engine, run: input, signal }) {
     run.behavior = null;
     engine.save(run);
     try {
-      await runFastChecks({ engine, run, signal: leased });
+      await runFastChecks({ engine, run, signal: leased, maxHeavyBuilds });
       await engine.behaviorGate(run, leased);
       if (run.behavior.headSha !== run.checks.headSha)
         throw fail('HEAD изменился между быстрыми проверками и behaviour gate', 'stale_checks');

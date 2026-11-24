@@ -24,6 +24,7 @@ import { execute } from './command.mjs';
 import { git, makeWorktree, plannedWorktreeHome } from './workspace.mjs';
 import { scopesOverlap } from './contracts.mjs';
 import { redact } from './security.mjs';
+import { markTaskWorktree } from './project-worktree-gc.mjs';
 import { isPullHost } from './job-contracts.mjs';
 import {
   ensureIntegration,
@@ -209,7 +210,7 @@ async function prepareAttempt(state, attempt) {
   let run = storedRun(store, attempt.runId) ?? (await installExternalRun(state, attempt, task));
   need(run.executor?.kind === 'external' && run.executor.host === host, 'attempt_not_external');
   need(isDeepStrictEqual(run.directorBinding, bindingFor(attempt)), 'binding_invalid');
-  await makeWorktree(run.project, run.cwd, run.branch, run.baseSha);
+  await makeWorktree(run.project, run.cwd, run.branch, run.baseSha, { onCreated: () => markTaskWorktree(run) });
   if (run.state === 'created') {
     need((await git(run.cwd, ['rev-parse', 'HEAD'])) === run.baseSha, 'worktree_mismatch');
     run = store.updateRun(run.id, { state: 'executing', headSha: run.baseSha });

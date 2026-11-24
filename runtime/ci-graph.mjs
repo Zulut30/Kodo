@@ -75,7 +75,7 @@ async function revision(project, value) {
   if (resolved !== value) throw new Error('Affected graph commit mismatch');
   return value;
 }
-async function snapshot(project, sha) {
+export async function readSourceSnapshot(project, sha, include = file => javascript(file) || manifestFile(file)) {
   const entries = (await git(project, ['ls-tree', '-rz', '--full-tree', sha]))
     .split('\0')
     .filter(Boolean)
@@ -85,9 +85,7 @@ async function snapshot(project, sha) {
       return { mode: match[1], type: match[2], oid: match[3], file: relative(match[4]) };
     })
     .sort((a, b) => (a.file < b.file ? -1 : a.file > b.file ? 1 : 0));
-  const readable = entries.filter(
-    entry => entry.type === 'blob' && entry.mode !== '120000' && (javascript(entry.file) || manifestFile(entry.file)),
-  );
+  const readable = entries.filter(entry => entry.type === 'blob' && entry.mode !== '120000' && include(entry.file));
   // Git supplies object IDs; parser input is data, never imported or executed.
   const text = readable.length
     ? await git(project, ['cat-file', '--batch'], readable.map(entry => entry.oid).join('\n') + '\n')
@@ -336,8 +334,8 @@ export async function planAffected({ project, baseSha, headSha, changedPaths = [
   changedPaths.forEach(relative);
   headSha = await revision(project, headSha || (await git(project, ['rev-parse', 'HEAD'])).trim());
   baseSha = await revision(project, baseSha || headSha);
-  const head = await snapshot(project, headSha),
-    base = baseSha === headSha ? head : await snapshot(project, baseSha),
+  const head = await readSourceSnapshot(project, headSha),
+    base = baseSha === headSha ? head : await readSourceSnapshot(project, baseSha),
     reasons = new Set();
   const currentHead = (await git(project, ['rev-parse', 'HEAD'])).trim();
   if (currentHead !== headSha) reasons.add('head-mismatch');

@@ -6,7 +6,7 @@ import path from 'node:path';
 import { configureGitTestEnvironment } from '../scripts/git-test-environment.mjs';
 import { git } from '../runtime/workspace.mjs';
 import { normalizeConfig } from '../runtime/config.mjs';
-import { wavePolicyAt, wavePolicyHash } from '../runtime/wave-policy.mjs';
+import { assertWavePolicy, wavePolicyAt, wavePolicyHash } from '../runtime/wave-policy.mjs';
 
 configureGitTestEnvironment();
 const keys = ['HOME', 'USERPROFILE', 'GIT_CONFIG_NOSYSTEM', 'GIT_CONFIG_GLOBAL', 'GIT_TERMINAL_PROMPT'];
@@ -80,4 +80,19 @@ test('wavePolicyAt reads the committed policy raw and refuses one the Store woul
   const read = await wavePolicyAt(f.root, safe, { secrets });
   assert.deepEqual(read.config.commands.test, config.commands.test);
   assert.equal(read.hash, wavePolicyHash(normalizeConfig(config)));
+});
+
+test('a pre-Cargo wave policy receipt still checks newly covered settings against its commit', async t => {
+  const f = await fixture(t);
+  const original = policy({ command: 'cargo', args: ['test'] });
+  const file = { ...original, rust: { sccache: 'auto' }, fastChecks: { timeoutMs: 20000 } };
+  const commit = await f.commit(file);
+  const run = {
+    project: f.root,
+    config: normalizeConfig(file),
+    wavePolicy: { schemaVersion: 1, commit, hash: wavePolicyHash(normalizeConfig(original)) },
+  };
+  await assertWavePolicy({ run, policyCommit: commit });
+  run.config.fastChecks.timeoutMs = 30000;
+  await assert.rejects(assertWavePolicy({ run, policyCommit: commit }), { code: 'project_wave_policy_mismatch' });
 });

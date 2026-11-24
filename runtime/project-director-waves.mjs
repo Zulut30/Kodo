@@ -24,6 +24,7 @@ import { realpath } from 'node:fs/promises';
 import { isDeepStrictEqual } from 'node:util';
 import { execute } from './command.mjs';
 import { makeWorktree, worktreeHomeFor } from './workspace.mjs';
+import { markTaskWorktree } from './project-worktree-gc.mjs';
 import { scopesOverlap } from './contracts.mjs';
 import { redact } from './security.mjs';
 import * as projectContracts from './project-contracts.mjs';
@@ -1077,7 +1078,10 @@ async function installTaskRun(ctx, projectId, attempt, options, control) {
   }
   requireValue(run.task === input && isDeepStrictEqual(run.directorBinding, bindingFor(attempt)), 'binding_invalid');
   // Worktrees are created one by one; Engine reuses an existing one.
-  await makeWorktree(run.project, run.cwd, run.branch, run.baseSha, { signal: control.signal });
+  await makeWorktree(run.project, run.cwd, run.branch, run.baseSha, {
+    signal: control.signal,
+    onCreated: () => markTaskWorktree(run),
+  });
   return run;
 }
 

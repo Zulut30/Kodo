@@ -441,11 +441,11 @@ export class EngineVerification extends EngineExecution {
     this.save(run);
   }
   /** The task-fast profile: affected checks only (see runtime/task-fast-checks.mjs). */
-  async fastChecks(run, signal) {
+  async fastChecks(run, signal, maxHeavyBuilds = 1) {
     run.architectureChecks = null;
     run.state = 'testing';
     this.save(run);
-    await runFastChecks({ engine: this, run, signal });
+    await runFastChecks({ engine: this, run, signal, maxHeavyBuilds });
   }
   async verificationGates(run, signal) {
     const headSha = await git(run.cwd, ['rev-parse', 'HEAD']);

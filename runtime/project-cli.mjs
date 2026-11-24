@@ -17,7 +17,7 @@ function argumentsFor(argv) {
     invalid();
   const [action, ...args] = argv;
   const writes = ['create', 'resume', 'cancel', 'pause', 'reprioritize', 'approve-risk'];
-  if (![...writes, 'status', 'plan'].includes(action)) invalid();
+  if (![...writes, 'status', 'plan', 'gc-worktrees'].includes(action)) invalid();
   const allowed = new Set([
     '--json',
     ...(writes.includes(action) ? ['--command-id'] : []),
@@ -184,6 +184,10 @@ export async function projectCli(argv, ports = {}) {
         action: { op: 'create', spec },
       });
       projectId = result.projectId;
+    } else if (options.action === 'gc-worktrees') {
+      const snapshot = await repo.snapshot(projectId);
+      const { gcProjectWorktrees } = await import('./project-worktree-gc.mjs');
+      result = await gcProjectWorktrees(store, snapshot);
     } else if (options.action === 'status') {
       const snapshot = await repo.snapshot(projectId);
       safety(snapshot);
