@@ -1026,6 +1026,13 @@ test('The gate classification names a verified gate whose acceptance stopped mid
     tasks: [...snapshot.tasks, { id: 't2', epicId: 'e2', status: 'proposed', dependsOn: [] }],
   };
   assert.deepEqual(gateHolds({ store }, appended), []);
+  // Review finding (minor): an epic's finished chain never names the project's own gate. With the
+  // epic and milestone accepted and the project integrated, the project gate is pending on its own.
+  const projectGate = {
+    ...snapshot,
+    milestones: [{ id: 'm', status: 'accepted' }],
+  };
+  assert.deepEqual(gateHolds({ store }, projectGate), [{ code: 'project_gate_pending', kind: 'project', id: 'p' }]);
 });
 
 test('next-wave names a blocked epic whose tasks are all integrated and a cancelled predecessor', async t => {

@@ -207,7 +207,7 @@ export async function runTests({
   const files = paths.length
     ? explicitTests(cwd, paths)
     : coverage
-      ? orderTests([...discoverTests(cwd), ...separateSuites.map(file => path.join(cwd, file))], cwd)
+      ? orderTests([...discoverTests(cwd), ...explicitTests(cwd, separateSuites)], cwd)
       : discoverTests(cwd);
   const aborted = () => {
     process.exitCode = 1;

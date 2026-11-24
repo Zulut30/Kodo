@@ -174,7 +174,8 @@ test('The wave factory suites run in their own command and CI step, outside defa
   assert.equal(scripts['test:waves'], `node scripts/run-tests.mjs ${separateSuites.join(' ')}`);
   const workflow = readFileSync(path.join(root, '.github/workflows/ci.yml'), 'utf8');
   // The step belongs to the required check job of both platforms, not to the optional fast job.
-  const [fast, check] = workflow.split('\n  check:');
+  const [fast, rest] = workflow.split('\n  check:');
+  const check = rest.split(/\n {2}[A-Za-z0-9_-]+:\n/)[0];
   assert.doesNotMatch(fast, /npm run test:waves/);
   assert.match(check, /\n {6}- name: Wave factory suites\n {8}run: npm run test:waves\n/);
 });
