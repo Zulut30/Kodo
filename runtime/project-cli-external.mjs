@@ -14,6 +14,10 @@ const flagsFor = {
 };
 // Constant codes of the protocol itself; never data, paths or provider output.
 const reported = new Set([
+  'project_dependency_cycle',
+  'project_dependency_missing',
+  'project_dependency_duplicate',
+  'project_database_corrupt',
   'project_wave_required',
   'project_host_unsupported',
   'project_limit_invalid',
@@ -37,6 +41,7 @@ const reported = new Set([
   'project_path_unsafe',
 ]);
 const dataErrors = new Set([
+  'project_limit_invalid',
   'project_schema',
   'project_unsafe',
   'project_limit',
@@ -84,7 +89,11 @@ function argumentsFor(argv) {
     complete = action === 'complete-task';
   if (positional.length !== (complete ? 2 : 1) || !uuid.test(positional[0]) || (complete && !slug.test(positional[1])))
     invalid();
-  if (next && (!isPullHost(flags['--host']) || (flags['--limit'] !== undefined && !/^[1-5]$/.test(flags['--limit']))))
+  if (
+    next &&
+    (!isPullHost(flags['--host']) ||
+      (flags['--limit'] !== undefined && (!/^[1-9]\d?$/.test(flags['--limit']) || Number(flags['--limit']) > 64)))
+  )
     invalid();
   if (complete && (!sha.test(flags['--head'] ?? '') || (flags['--defer-gate'] && flags['--abandon']))) invalid();
   if (flags['--command-id'] !== undefined && !uuid.test(flags['--command-id'])) invalid();
@@ -142,7 +151,7 @@ async function operate(options, ports, safety) {
       result = await external.nextWave(ctx, {
         projectId: options.projectId,
         host: flags['--host'],
-        limit: flags['--limit'] === undefined ? 3 : Number(flags['--limit']),
+        ...(flags['--limit'] && { limit: Number(flags['--limit']) }),
         retryFailed: flags['--retry-failed'] === true,
         ports: ports.wave,
         // The CLI entry passes its own command: the briefs call the same Kodo package.

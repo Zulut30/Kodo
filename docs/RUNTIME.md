@@ -67,8 +67,8 @@ Accepted требует actual current-head checks/review и fresh enabled gates
 ```text
 kodo project bootstrap "IDEA" --root PATH [--prepare] [--client codex|claude-code] [--model MODEL] [--json]
 kodo project apply-spec --root PATH [--file SPEC_JSON] [--command-id UUID] [--json]
-kodo project drain PROJECT_ID [--max-waves 1..100] [--concurrency 1..5] [--retry-failed] [--command-id UUID] [--json]
-kodo project next-wave PROJECT_ID --host t3|orca [--limit 1..5] [--retry-failed] [--json]
+kodo project drain PROJECT_ID [--max-waves 1..100] [--concurrency N] [--retry-failed] [--command-id UUID] [--json]
+kodo project next-wave PROJECT_ID --host t3|orca [--limit N] [--retry-failed] [--json]
 kodo project complete-task PROJECT_ID TASK_ID --head SHA [--defer-gate] [--attempt UUID] [--command-id UUID] [--json]
 kodo project complete-task PROJECT_ID TASK_ID --head SHA --abandon --attempt UUID [--command-id UUID] [--json]
 kodo project gates PROJECT_ID [--retry-failed] [--json]
@@ -77,6 +77,38 @@ kodo project append-milestone PROJECT_ID --file MILESTONE_JSON [--command-id UUI
 ```
 
 `bootstrap`/`extend` с `--prepare` готовят контекст-пакет в Kodo home, не меняя репозиторий; `apply-spec` проверяет чертёж (findings — exit 1) и создаёт проект; `drain` исполняет волны нативными сессиями, `next-wave`/`complete-task` отдают их видимым воркер-чатам T3; `append-milestone` добавляет новую фичу в принятый проект. Задачи проходят профиль `task-fast` в режиме quick, полные проверки и ревью — у gate Run эпика. Подробно: [BLUEPRINT.md](BLUEPRINT.md), [PROJECTS.md](PROJECTS.md#волновой-режим-исполнение-drain), [T3-HOST.md](T3-HOST.md); алгоритм главного чата — навык `kodo-project-director`.
+
+### Профиль исполнения волн
+
+Профиль относится к одному волновому проекту. Kodo хранит его в своей SQLite вне Git. Команда `set` заменяет профиль целиком. Используй имена подписок, моделей и машин без учётных данных.
+
+```sh
+kodo project profile set PROJECT_ID --file profile.json
+kodo project profile show PROJECT_ID --json
+kodo project profile pause-pool PROJECT_ID --subscription primary --until 2026-12-05T09:00:00Z
+```
+
+```json
+{
+  "schemaVersion": 1,
+  "subscriptions": [{ "id": "primary", "provider": "codex", "model": "gpt-5", "slots": 8, "tier": "heavy" }],
+  "machines": [{ "id": "build", "kind": "t3-env", "environmentId": "build-host", "maxWorkers": 8, "maxHeavyBuilds": 1 }]
+}
+```
+
+Оба списка непустые, ID уникальны внутри списка. Числа ёмкости — положительные целые, `maxHeavyBuilds` ограничен значением `maxWorkers` этой машины. Сумма `slots` и сумма `maxWorkers` ограничены 64 каждая. `tier` принимает `heavy`, `standard` или `fast`, `kind` — `local`, `t3-env` или `ssh`. Поле `environmentId` необязательно. Для паузы укажи `cooldownUntil` в формате ISO 8601 с секундами и часовым поясом (`Z` или смещение). Отсутствие поля и `null` означают активную подписку. Неизвестные ключи отклоняются. `show` возвращает `result.profile`, до настройки — `null`.
+
+Без профиля действуют прежние пределы 3/5/24 — окно 3 по умолчанию, максимум 5, горизонт 24. Порядок готовых задач во всех волновых проектах определяется критическим путём. Предел обычного Run остаётся 5.
+
+С профилем `--limit` и `--concurrency` принимают числа от 1 до 64. Kodo уменьшает запрошенное окно до ёмкости активных подписок и машин. Свободные места считаются отдельно для каждой подписки вне паузы и каждой машины. Для подписок Kodo вычитает из суммы свободных слотов попытки с неизвестной подпиской. Для машин он так же учитывает попытки с неизвестной машиной. Меньшая из двух сумм определяет доступную ёмкость. Перегрузка одного пула после уменьшения числа слотов не закрывает места других пулов. Для горизонта Kodo берёт большую из двух величин — ёмкость профиля или число идущих задач плюс свободные места текущей выдачи. Удвоенное значение ограничивается диапазоном 24–128. Так один свободный слот позволяет искать задачу за первыми 24 кандидатами, даже если часть подписок уже поставлена на паузу.
+
+`drain --concurrency` ограничивает число нативных запусков. С профилем внешние попытки занимают места соответствующих ресурсов. После проверки гейтов `drain` перечитывает профиль и занятые места перед выдачей. Команда `next-wave` удерживает блокировки проекта и профиля на время выдачи. Если в этот момент `profile set` или `pause-pool` возвращает `project_busy`, повтори команду после завершения выдачи.
+
+`profile set` и `pause-pool` доступны во время `drain`. Текущая волна завершается, следующая итерация читает обновлённый профиль. При нулевой ёмкости `drain` и `project resume` возвращают статус `waiting_limits`. У `next-wave` это поле `result.code`: повтор по-прежнему возвращает брифы установленных попыток, а новую работу можно получить после восстановления ёмкости.
+
+Версия 2 схемы SQLite добавляет таблицу профилей. `kodo report --project` читает базы v1 и v2 без миграции. Kodo 1.0.1 откажется открывать проектную БД v2. Для отката базы, обновлённой с v1, останови клиентов Kodo и восстанови сохранённую перед миграцией копию `project-backups/migration-*/before-v2.sqlite`. Она содержит состояние на момент обновления. Изменения, сделанные после него, останутся только в базе v2.
+
+Готовые задачи волнового проекта упорядочены по глубине самой длинной цепочки потомков, затем по числу прямых потомков. При равенстве действует прежний порядок по трудоёмкости пути, приоритету, ценности, риску, трудоёмкости задачи и ID. Для Волны 0 и вершин самых глубоких незавершённых цепочек предпочтительна подписка `heavy`, для листьев — `fast`, затем `standard`. При заполнении предпочтительного пула Kodo выбирает доступный. Машины заполняются в порядке профиля. Зависимости, конфликты путей, проверки интерфейсов и гейты сохраняют свои правила допуска.
 
 ## Два способа планирования
 

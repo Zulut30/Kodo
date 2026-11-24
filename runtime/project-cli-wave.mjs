@@ -44,7 +44,7 @@ function argumentsFor(argv) {
   }
   if (positional.length !== 1 || !uuid.test(positional[0])) invalid();
   if (flags['--command-id'] !== undefined && !uuid.test(flags['--command-id'])) invalid();
-  if (!bounded(flags['--max-waves'], 1, 100) || !bounded(flags['--concurrency'], 1, 5)) invalid();
+  if (!bounded(flags['--max-waves'], 1, 100) || !bounded(flags['--concurrency'], 1, 64)) invalid();
   return { projectId: positional[0], flags, json: flags['--json'] === true };
 }
 

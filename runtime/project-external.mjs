@@ -35,15 +35,23 @@ import {
 import { withIntegrationLease } from './project-integration-lease.mjs';
 import { bindingFor, known, storedRun, verifyRef } from './project-director.mjs';
 import * as waves from './project-director-waves.mjs';
-import { withPullLease } from './project-controller-lease.mjs';
+import { withPullLease, withWaveAdmissionLeases } from './project-controller-lease.mjs';
 import { runEpicGate, verifyTaskFastOnce } from './wave-verifier.mjs';
 import { workerRole } from './worker-roles.mjs';
 import { applyWavePolicy } from './wave-policy.mjs';
 import { DEFAULT_CLI, assertCliPrefix, quotePath } from './cli-command.mjs';
-import { planProjectHorizon } from './project-planner.mjs';
+import {
+  chargedBriefs,
+  freeWorkerSlots,
+  assignWorker,
+  waveCapacity,
+  waveHorizon,
+  MAX_WORKERS,
+} from './execution-profile.mjs';
+import { planProjectHorizon, waveRanks } from './project-planner.mjs';
 
 /** The largest batch one `nextWave` call returns. */
-export const MAX_WAVE_LIMIT = 5;
+export const MAX_WAVE_LIMIT = MAX_WORKERS;
 const shaPattern = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 const uuidPattern = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 const settled = new Set(['accepted', 'released']);
@@ -135,6 +143,7 @@ function briefFor(state, attempt, task, run) {
   // The caller's CLI (`cli`): a chat runs the same Kodo package that issued the brief.
   const selfCheck = `${cli} ci feedback --base ${run.baseSha} --project ${quotePath(run.cwd)} --json`;
   const brief = {
+    ...run.workerPlacement,
     projectId: project.projectId,
     taskId: task.id,
     attemptId: attempt.id,
@@ -171,6 +180,11 @@ async function installExternalRun(state, attempt, task) {
       binding: bindingFor(attempt),
       installRun: async value => {
         // External chats implement; Kodo only verifies once (task-fast) and never delivers.
+        if (state.profile) {
+          const placement = placementFor(state, task, attempt.id);
+          need(placement, 'pool_unavailable');
+          value.runDraft.workerPlacement = placement;
+        }
         value.runDraft.executor = { kind: 'external', host };
         value.runDraft.verificationProfile = 'task-fast';
         // The policy of the base commit, not of the user's checkout (runtime/wave-policy.mjs).
@@ -179,6 +193,7 @@ async function installExternalRun(state, attempt, task) {
         // No independent review of its own (the epic gate reviews): an explicit null keeps the
         // persisted acceptance observation equal to the Run's (JSON drops undefined fields).
         value.runDraft.review = null;
+        state.checkLease();
         return ctx.repo.installRun(value);
       },
     },
@@ -198,6 +213,7 @@ async function advanceToRunning(state, taskId) {
     else if (['proposed', 'blocked', 'failed'].includes(task.status)) action = transition('task', task.id, 'ready');
     else if (task.status === 'ready') action = transition('task', task.id, 'running');
     if (!action) return;
+    state.checkLease();
     await ctx.repo.apply(command(snapshot, action));
   }
 }
@@ -207,11 +223,13 @@ async function prepareAttempt(state, attempt) {
     store = storeOf(ctx);
   const task = state.snapshot.tasks.find(row => row.id === attempt.taskId);
   let run = storedRun(store, attempt.runId) ?? (await installExternalRun(state, attempt, task));
+  if (state.profile && run.workerPlacement) state.placements.set(attempt.id, run.workerPlacement);
   need(run.executor?.kind === 'external' && run.executor.host === host, 'attempt_not_external');
   need(isDeepStrictEqual(run.directorBinding, bindingFor(attempt)), 'binding_invalid');
   await makeWorktree(run.project, run.cwd, run.branch, run.baseSha);
   if (run.state === 'created') {
     need((await git(run.cwd, ['rev-parse', 'HEAD'])) === run.baseSha, 'worktree_mismatch');
+    state.checkLease();
     run = store.updateRun(run.id, { state: 'executing', headSha: run.baseSha });
   }
   await advanceToRunning(state, attempt.taskId);
@@ -234,7 +252,7 @@ async function guarded(state, taskId, work) {
   } catch (error) {
     state.blocked.push({ taskId, code: typeof error?.code === 'string' ? error.code : 'project_blocked' });
   } finally {
-    storeOf(state.ctx).renewLease(state.token);
+    state.checkLease();
   }
 }
 
@@ -257,7 +275,7 @@ function admissible(state, task) {
 }
 
 // In-flight attempts of this host first: a repeated call returns the same briefs.
-async function resumeInFlight(state) {
+async function resumeInFlight(state, replayOnly) {
   const store = storeOf(state.ctx);
   for (const attempt of state.snapshot.currentAttempts)
     if (inFlightStates.has(attempt.status)) state.inFlight.add(attempt.taskId);
@@ -266,7 +284,8 @@ async function resumeInFlight(state) {
     // (by its reservation actor); the drain's and other hosts' attempts are left alone.
     const executor = await waves.attemptExecutor({ repo: state.ctx.repo, store }, state.snapshot, attempt);
     if (executor.kind !== 'external' || executor.host !== state.host) continue;
-    if (storedRun(store, attempt.runId)?.integration?.status === 'merged') continue;
+    const run = storedRun(store, attempt.runId);
+    if ((replayOnly && !run) || run?.integration?.status === 'merged') continue;
     await guarded(state, attempt.taskId, () => prepareAttempt(state, currentOf(state.snapshot, attempt.taskId)));
   }
 }
@@ -280,7 +299,50 @@ async function interfacesVerified(state, task) {
   }
 }
 
+function initializePlacements(state) {
+  if (!state.profile) return true;
+  const { tasks, currentAttempts } = state.snapshot;
+  state.placements = new Map();
+  for (const attempt of currentAttempts) {
+    if (inFlightStates.has(attempt.status))
+      state.placements.set(attempt.id, storedRun(storeOf(state.ctx), attempt.runId)?.workerPlacement);
+  }
+  try {
+    state.ranks = waveRanks(tasks);
+  } catch (error) {
+    if (
+      !['project_dependency_missing', 'project_dependency_duplicate', 'project_dependency_cycle'].includes(error.code)
+    )
+      throw error;
+    state.blocked.push({ kind: 'project', id: state.snapshot.project.projectId, code: error.code });
+    return false;
+  }
+  state.maxDepth = Math.max(0, ...tasks.filter(openTask).map(t => state.ranks.get(t.id).depth));
+  return true;
+}
+
+function placementFor(state, task, reservationId = null) {
+  const { snapshot, ranks } = state;
+  const depth = ranks.get(task.id).depth;
+  const foundation = snapshot.epics.some(
+    e => e.id === task.epicId && (e.id === 'foundation' || e.milestoneId === 'foundation'),
+  );
+  const heavy = foundation || (depth > 0 && depth >= state.maxDepth);
+  const tiers = heavy
+    ? ['heavy', 'standard', 'fast']
+    : depth
+      ? ['standard', 'heavy', 'fast']
+      : ['fast', 'standard', 'heavy'];
+  const occupied = [...state.placements].filter(([id]) => id !== reservationId).map(([, placement]) => placement);
+  return assignWorker(state.profile, state.now, occupied, tiers);
+}
+function freeSlots(state) {
+  if (!state.profile) return state.limit - state.briefs.length;
+  const batch = state.limit - chargedBriefs(state.profile, state.now, state.briefs);
+  return Math.min(batch, freeWorkerSlots(state.profile, state.now, [...state.placements.values()]));
+}
 async function reserve(state, task, retryFailed) {
+  if (freeSlots(state) <= 0) return;
   const reason =
     admissible(state, task) ?? ((await interfacesVerified(state, task)) ? null : 'project_interface_unverified');
   if (reason) {
@@ -290,9 +352,11 @@ async function reserve(state, task, retryFailed) {
   await guarded(state, task.id, async () => {
     const { ctx } = state;
     if (task.status === 'proposed') {
+      state.checkLease();
       await ctx.repo.apply(command(state.snapshot, transition('task', task.id, 'ready')));
       state.snapshot = await snapshotOf(ctx, task.projectId);
     }
+    state.checkLease();
     // The reservation names its executor: only this host may later resume it.
     const { attempt } = await ctx.repo.apply(
       command(
@@ -301,6 +365,8 @@ async function reserve(state, task, retryFailed) {
         { actor: waves.externalReserver(state.host) },
       ),
     );
+    state.inFlight.add(task.id);
+    state.placements?.set(attempt.id, undefined);
     state.snapshot = await snapshotOf(ctx, task.projectId);
     await prepareAttempt(state, attempt);
   });
@@ -310,14 +376,14 @@ const byPriority = (a, b) => b.priority - a.priority || (a.id < b.id ? -1 : a.id
 
 // A retry goes to the executor of the failed attempt: this host retries only its own attempts;
 // the drain's (native) and other hosts' failed attempts are left to them.
-async function reserveRetries(state, limit) {
+async function reserveRetries(state) {
   const store = storeOf(state.ctx);
   const candidates = state.snapshot.tasks
     .filter(task => !settled.has(task.status) && task.status !== 'integrated' && task.status !== 'cancelled')
     .filter(task => retryable.has(currentOf(state.snapshot, task.id)?.status))
     .sort(byPriority);
   for (const candidate of candidates) {
-    if (state.briefs.length >= limit) return;
+    if (freeSlots(state) <= 0) return;
     const executor = await waves.attemptExecutor(
       { repo: state.ctx.repo, store },
       state.snapshot,
@@ -335,8 +401,8 @@ async function reserveRetries(state, limit) {
   }
 }
 
-async function reserveSelected(state, limit, ports) {
-  const remaining = limit - state.briefs.length;
+async function reserveSelected(state, ports) {
+  const remaining = freeSlots(state);
   if (remaining <= 0) return;
   const W = wavePorts(ports, ['selectWave']);
   // Like drain: a task whose interface proofs do not verify is never selected. The rows are kept
@@ -344,6 +410,7 @@ async function reserveSelected(state, limit, ports) {
   const availability = await waves.waveAvailability(state.ctx, state.snapshot);
   state.availability = { revision: state.snapshot.revision, rows: availability };
   const selected = W.selectWave(state.snapshot, {
+    ...(state.profile && { profiledWave: true, windowSize: state.maximum }),
     limit: remaining,
     inFlight: [...state.inFlight],
     availability,
@@ -351,7 +418,7 @@ async function reserveSelected(state, limit, ports) {
   });
   need(Array.isArray(selected), 'wave_ports_invalid');
   for (const taskId of selected) {
-    if (state.briefs.length >= limit) return;
+    if (freeSlots(state) <= 0) return;
     const task = state.snapshot.tasks.find(row => row.id === taskId);
     if (!task || state.inFlight.has(task.id) || !['proposed', 'ready'].includes(task.status)) continue;
     if (state.blocked.some(row => row.taskId === task.id)) continue;
@@ -434,7 +501,8 @@ async function explainWave(state, snapshot) {
   const horizon = planProjectHorizon(
     {
       snapshot,
-      limit: 24,
+      limit: state.profile ? waveHorizon(Math.max(0, freeSlots(state)), state.inFlight.size, state.maximum) : 24,
+      profiledWave: Boolean(state.profile),
       availability: await explanationAvailability(state, snapshot),
       now: (ctx.clock ?? (() => new Date().toISOString()))(),
     },
@@ -458,7 +526,7 @@ async function explainWave(state, snapshot) {
 
 /**
  * Reserve the next wave for an external host: the briefs of this host's running
- * attempts, then new non-overlapping tasks up to `limit` (1..5). `cli` is the command
+ * attempts, then new non-overlapping tasks up to the project's available capacity. `cli` is the command
  * prefix of the brief commands and is returned with them (default `kodo`). `blocked` names why
  * the rest waits: task rows `{taskId, code}` and gate rows `{code, kind, id, gateId?, runId?}`
  * (`gateHolds`). An accepted project returns `code: 'project_accepted'` and no briefs.
@@ -466,9 +534,13 @@ async function explainWave(state, snapshot) {
  * @param {{ projectId: string, host: string, limit?: number, retryFailed?: boolean, ports?: any, cli?: string }} input
  */
 export async function nextWave(ctx, input) {
-  const { projectId, host, limit = 3, retryFailed = false, ports, cli = DEFAULT_CLI } = input;
+  const { projectId, host, retryFailed = false, ports, cli = DEFAULT_CLI } = input;
   need(isPullHost(host), 'host_unsupported');
-  need(Number.isSafeInteger(limit) && limit >= 1 && limit <= MAX_WAVE_LIMIT, 'limit_invalid');
+  need(
+    input.limit === undefined ||
+      (Number.isSafeInteger(input.limit) && input.limit >= 1 && input.limit <= MAX_WAVE_LIMIT),
+    'limit_invalid',
+  );
   assertCliPrefix(cli);
   const C = await contractsOf(ctx),
     store = storeOf(ctx);
@@ -495,9 +567,12 @@ export async function nextWave(ctx, input) {
   // priority, KODO_WORKTREE_HOME first) is refused before the lease or any reservation.
   const home = (ctx.engine.store ?? store)?.home;
   if (typeof home === 'string') quotePath(await plannedWorktreeHome(home));
-  const token = store.acquireLease(`project:${projectId}`, randomUUID(), { ttlMs: 60000, limit: 1 });
-  need(token, 'busy');
-  try {
+  return withWaveAdmissionLeases(store, projectId, async checkLease => {
+    const now = Date.parse((ctx.clock ?? (() => new Date().toISOString()))());
+    const profile = ctx.repo.getProfile(projectId);
+    const maximum = waveCapacity(profile, now);
+    need(profile || (input.limit ?? 3) <= maximum, 'limit_invalid');
+    const limit = Math.min(input.limit ?? 3, maximum);
     const integration = await ensureIntegration({
       root: snapshot.project.root,
       projectId,
@@ -508,26 +583,40 @@ export async function nextWave(ctx, input) {
       C,
       host,
       cli,
-      token,
+      checkLease,
       integration,
       options,
       snapshot: await snapshotOf(ctx, projectId),
+      profile,
+      maximum,
+      now,
+      limit,
       inFlight: new Set(),
       briefs: [],
       blocked: [],
     };
-    await resumeInFlight(state);
-    if (retryFailed) await reserveRetries(state, limit);
-    await reserveSelected(state, limit, ports);
+
+    const canPlan = initializePlacements(state);
+    await resumeInFlight(state, !canPlan);
+    if (canPlan) {
+      if (retryFailed) await reserveRetries(state);
+      await reserveSelected(state, ports);
+    }
     const final = await snapshotOf(ctx, projectId);
-    await explainWave(state, final);
+    if (canPlan) await explainWave(state, final);
+    checkLease();
     const revision = final.revision;
-    const result = { projectId, revision, cli, briefs: state.briefs, blocked: state.blocked };
+    const result = {
+      projectId,
+      revision,
+      cli,
+      briefs: state.briefs,
+      blocked: state.blocked,
+      ...(!maximum && { code: 'waiting_limits' }),
+    };
     C.assertDirectorSafe(result, options);
     return result;
-  } finally {
-    store.releaseLease(token);
-  }
+  });
 }
 
 // Symbolic links and submodules never enter the integration branch (raw output: never redacted).

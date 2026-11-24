@@ -6,6 +6,20 @@ const invalid = () => {
   throw Object.assign(new Error('Invalid project arguments'), { code: 'project_arguments' });
 };
 
+function validateFlags(action, flags, positional) {
+  const count = action === 'create' ? 0 : ['reprioritize', 'approve-risk'].includes(action) ? 2 : 1;
+  if (positional.length !== count || (count && !uuid.test(positional[0])) || (count === 2 && !slug.test(positional[1])))
+    invalid();
+  if (flags['--command-id'] !== undefined && !uuid.test(flags['--command-id'])) invalid();
+  if (
+    (['create', 'set'].includes(action) && !flags['--file']) ||
+    (action === 'pause-pool' && (!flags['--subscription'] || !flags['--until'])) ||
+    (action === 'approve-risk' && !flags['--reason'])
+  )
+    invalid();
+  if (flags['--reason'] && Buffer.byteLength(flags['--reason']) > 65536) invalid();
+}
+
 function argumentsFor(argv) {
   if (
     !Array.isArray(argv) ||
@@ -15,14 +29,19 @@ function argumentsFor(argv) {
     )
   )
     invalid();
-  const [action, ...args] = argv;
+  let [action, ...args] = argv;
+  const profile = action === 'profile';
+  if (profile) [action, ...args] = args;
+  if (profile && !['set', 'show', 'pause-pool'].includes(action)) invalid();
   const writes = ['create', 'resume', 'cancel', 'pause', 'reprioritize', 'approve-risk'];
-  if (![...writes, 'status', 'plan'].includes(action)) invalid();
+  if (!profile && ![...writes, 'status', 'plan'].includes(action)) invalid();
   const allowed = new Set([
     '--json',
     ...(writes.includes(action) ? ['--command-id'] : []),
     ...({
       create: ['--file'],
+      set: ['--file'],
+      'pause-pool': ['--subscription', '--until'],
       plan: ['--limit', '--dry-run'],
       resume: ['--retry-failed'],
       reprioritize: ['--priority'],
@@ -45,12 +64,7 @@ function argumentsFor(argv) {
       flags[arg] = value;
     }
   }
-  const count = action === 'create' ? 0 : ['reprioritize', 'approve-risk'].includes(action) ? 2 : 1;
-  if (positional.length !== count || (count && !uuid.test(positional[0])) || (count === 2 && !slug.test(positional[1])))
-    invalid();
-  if (flags['--command-id'] !== undefined && !uuid.test(flags['--command-id'])) invalid();
-  if ((action === 'create' && !flags['--file']) || (action === 'approve-risk' && !flags['--reason'])) invalid();
-  if (flags['--reason'] && Buffer.byteLength(flags['--reason']) > 65536) invalid();
+  validateFlags(action, flags, positional);
   for (const [flag, required, min, max] of [
     ['--limit', false, 1, 24],
     ['--priority', action === 'reprioritize', 0, 100],
@@ -108,6 +122,76 @@ async function waveCommand(argv) {
   return null;
 }
 
+async function readProjectInput(options, contracts, secrets, safety) {
+  if (!['create', 'set'].includes(options.action)) return null;
+  const { readFile, realpath } = await import('node:fs/promises');
+  const input = JSON.parse(await readFile(options.flags['--file'], 'utf8'));
+  safety(input);
+  const knownValues = Object.values(secrets).filter(v => typeof v === 'string');
+  if (options.action === 'set') {
+    const { validateExecutionProfile } = await import('./execution-profile.mjs');
+    return validateExecutionProfile(input, { knownValues });
+  }
+  const spec = contracts.normalizeProjectSpec(input, { knownValues });
+  spec.root = await realpath(spec.root);
+  safety(spec);
+  return spec;
+}
+
+function profileOperation(store, repo, { action, projectId, flags }, input) {
+  if (action === 'show') return repo.getProfile(projectId);
+  const lease = store.acquireLease('project-profile:' + projectId, randomUUID(), { ttlMs: 60000, limit: 1 });
+  if (!lease) throw Object.assign(new Error('Project busy'), { code: 'project_busy' });
+  try {
+    return action === 'set'
+      ? repo.setProfile(projectId, input)
+      : repo.pausePool(projectId, flags['--subscription'], flags['--until']);
+  } finally {
+    store.releaseLease(lease);
+  }
+}
+
+function projectFailure(error, phase, action) {
+  const profile = ['set', 'show', 'pause-pool'].includes(action);
+  const argumentError = phase === 'arguments';
+  const dataError = [
+    ...(profile ? ['project_profile_invalid', 'project_wave_required'] : []),
+    'project_schema',
+    'project_unsafe',
+    'project_limit',
+    'project_task_too_large',
+    'project_entity_not_found',
+    'project_task_missing',
+    'project_command_conflict',
+  ].includes(error?.code);
+  const exitCode = argumentError || phase === 'input' || dataError ? 1 : 2;
+  // Constant diagnostics only. Never echo paths, arguments, provider output or matching secrets.
+  const report = {
+    schemaVersion: 1,
+    projectId: null,
+    revision: null,
+    result: {
+      status: exitCode === 1 ? 'invalid' : 'blocked',
+      code:
+        profile &&
+        [
+          'project_busy',
+          'project_profile_invalid',
+          'project_wave_required',
+          'project_database_corrupt',
+          'project_unsafe',
+        ].includes(error?.code)
+          ? error.code
+          : argumentError
+            ? 'project_arguments'
+            : exitCode === 1
+              ? 'project_invalid'
+              : 'project_blocked',
+    },
+  };
+  return { report, exitCode };
+}
+
 /** Explicit, lazy Project composition. Only resume enters foreground Engine.run.
  * Ports belong to the coordinator/test harness, never to decoded CLI data.
  */
@@ -136,17 +220,7 @@ export async function projectCli(argv, ports = {}) {
       });
     phase = 'input';
     safety(argv);
-    let spec;
-    if (options.action === 'create') {
-      const { readFile, realpath } = await import('node:fs/promises');
-      const input = JSON.parse(await readFile(options.flags['--file'], 'utf8'));
-      safety(input); // Before canonical serialization, command hash, or Store construction.
-      spec = contracts.normalizeProjectSpec(input, {
-        knownValues: Object.values(secrets).filter(value => typeof value === 'string'),
-      });
-      spec.root = await realpath(spec.root);
-      safety(spec);
-    }
+    const input = await readProjectInput(options, contracts, secrets, safety);
     phase = 'operation';
     const { Store } = await import('./store.mjs');
     store =
@@ -181,9 +255,11 @@ export async function projectCli(argv, ports = {}) {
         expectedRevision: null,
         actor: 'project-cli',
         reason: 'Create Project from explicit specification',
-        action: { op: 'create', spec },
+        action: { op: 'create', spec: input },
       });
       projectId = result.projectId;
+    } else if (['set', 'show', 'pause-pool'].includes(options.action)) {
+      result = { profile: profileOperation(store, repo, options, input) };
     } else if (options.action === 'status') {
       const snapshot = await repo.snapshot(projectId);
       safety(snapshot);
@@ -220,27 +296,7 @@ export async function projectCli(argv, ports = {}) {
     report ||= { schemaVersion: 1, projectId, revision: (await repo.snapshot(projectId)).revision, result };
     safety(report); // Guard decoded keys/values again before either output format.
   } catch (error) {
-    const argumentError = phase === 'arguments';
-    const dataError = [
-      'project_schema',
-      'project_unsafe',
-      'project_limit',
-      'project_task_too_large',
-      'project_entity_not_found',
-      'project_task_missing',
-      'project_command_conflict',
-    ].includes(error?.code);
-    exitCode = argumentError || phase === 'input' || dataError ? 1 : 2;
-    // Constant diagnostics only. Never echo paths, arguments, provider output or matching secrets.
-    report = {
-      schemaVersion: 1,
-      projectId: null,
-      revision: null,
-      result: {
-        status: exitCode === 1 ? 'invalid' : 'blocked',
-        code: argumentError ? 'project_arguments' : exitCode === 1 ? 'project_invalid' : 'project_blocked',
-      },
-    };
+    ({ exitCode, report } = projectFailure(error, phase, options?.action));
   } finally {
     if (ownedStore) store?.close();
   }
