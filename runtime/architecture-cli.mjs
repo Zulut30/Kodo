@@ -226,7 +226,11 @@ function normalizedRegistry(value) {
   };
 }
 function validateLayout(files, policy) {
-  for (const root of [...policy.productRoots, ...policy.modules.flatMap(module => module.roots)]) {
+  const roots =
+    policy.schemaVersion === 2 && policy.language === 'rust'
+      ? policy.productRoots
+      : [...policy.productRoots, ...policy.modules.flatMap(module => module.roots)];
+  for (const root of roots) {
     if (
       !files.some(
         row => row.path.startsWith(root + '/') && row.type === 'blob' && ['100644', '100755'].includes(row.mode),
@@ -234,6 +238,24 @@ function validateLayout(files, policy) {
     )
       throw fail('configuration');
   }
+}
+
+function touchedRustContractCrate(changedPaths, pairs) {
+  if (!changedPaths.length) return false;
+  const roots = [];
+  for (const [policy, graph] of pairs) {
+    if (!policy || policy.schemaVersion !== 2 || policy.language !== 'rust' || !graph?.crates) continue;
+    const crates = new Map(graph.crates.map(crate => [crate.name, crate]));
+    for (const name of policy.contractCrates) {
+      const crate = crates.get(name);
+      if (crate) roots.push(crate);
+    }
+  }
+  return changedPaths.some(file =>
+    roots.some(crate =>
+      crate.root ? file === crate.root || file.startsWith(crate.root + '/') : crate.files.includes(file),
+    ),
+  );
 }
 
 async function evidenceLocation(target, project) {
@@ -510,8 +532,12 @@ async function compose(options, ports, plan) {
   }
   validateLayout(headFiles, headPolicy);
   if (basePolicy) validateLayout(baseFiles, basePolicy);
-  const baseRegistry = basePolicy ? await document(project, baseFiles, basePolicy.contracts, context) : null;
-  const headRegistry = await document(project, headFiles, headPolicy.contracts, context);
+  const isRust = headPolicy.schemaVersion === 2 && headPolicy.language === 'rust';
+  const baseRegistry =
+    !isRust && basePolicy && basePolicy.schemaVersion === 1
+      ? await document(project, baseFiles, basePolicy.contracts, context)
+      : null;
+  const headRegistry = isRust ? null : await document(project, headFiles, headPolicy.contracts, context);
   const baseGraph = await readArchitectureGraph({
     project,
     headSha: options.baseSha,
@@ -520,14 +546,31 @@ async function compose(options, ports, plan) {
   const headGraph = await readArchitectureGraph({ project, headSha, policy: headPolicy });
   context.checkpoint();
   const baseFindings = basePolicy ? evaluateArchitecture({ policy: basePolicy, graph: baseGraph }).findings : [];
-  const headFindings = evaluateArchitecture({ policy: headPolicy, graph: headGraph }).findings;
-  const contracts = new ContractRegistry().plan({
-    base: baseRegistry,
-    head: headRegistry,
-    baseGraph,
-    headGraph,
-    changedPaths,
-  });
+  const headFindings = isRust
+    ? evaluateArchitecture({
+        policy: headPolicy,
+        graph: headGraph,
+        changedPaths,
+        taskPaths: options.taskPaths ?? ports.taskPaths ?? [],
+        basePolicy,
+        baseGraph,
+      }).findings
+    : evaluateArchitecture({ policy: headPolicy, graph: headGraph }).findings;
+  const contracts = isRust
+    ? { requiredTests: [], findings: [] }
+    : new ContractRegistry().plan({
+        base: baseRegistry,
+        head: headRegistry,
+        baseGraph,
+        headGraph,
+        changedPaths,
+      });
+  const rustContractChanged =
+    isRust &&
+    touchedRustContractCrate(changedPaths, [
+      [basePolicy, baseGraph],
+      [headPolicy, headGraph],
+    ]);
   const now = ports.now ?? (() => new Date().toISOString());
   const debtAt = () =>
     applyArchitectureDebt({
@@ -556,11 +599,13 @@ async function compose(options, ports, plan) {
     hashes: {
       source: headGraph.sourceHash,
       policy: hash(headPolicy),
-      registry: hash(normalizedRegistry(headRegistry)),
+      registry: isRust ? hash(null) : hash(normalizedRegistry(headRegistry)),
     },
     baseRulesEvaluated: basePolicy !== null,
     unsupported: [...unsupported.values()].sort((a, b) => compare(a.id, b.id)),
     requiredTests: contracts.requiredTests,
+    requiresReview: report.requiresReview || rustContractChanged,
+    fullVerificationRequired: report.fullVerificationRequired || rustContractChanged,
   };
   const update = () => {
     report.debt = debtAt();
@@ -700,7 +745,12 @@ export async function architectureCli(argv, ports = {}) {
   try {
     const { action, options } = parse(argv);
     const report = await compose(
-      { ...options, signal: ports.signal, redactions: ports.redactions },
+      {
+        ...options,
+        signal: ports.signal,
+        redactions: ports.redactions,
+        ...(ports.taskPaths !== undefined ? { taskPaths: ports.taskPaths } : {}),
+      },
       ports,
       action === 'plan',
     );

@@ -53,6 +53,7 @@ async function pins() {
     'architecture-graph.mjs',
     'architecture-policy.mjs',
     'architecture-debt.mjs',
+    'architecture-rust.mjs',
     'contract-registry.mjs',
     'javascript-dependencies.mjs',
     'ci-graph.mjs',
@@ -101,6 +102,7 @@ async function pins() {
     new URL('../package.json', import.meta.url),
     lock,
     new URL(import.meta.resolve('acorn')),
+    new URL(import.meta.resolve('smol-toml')),
   ];
   return hash(
     await Promise.all(
@@ -195,12 +197,22 @@ const snapshot = receipt => Object.fromEntries(Object.entries(receipt).filter(([
 const staticReport = report =>
   Object.fromEntries(Object.entries(report).filter(([key]) => !['status', 'passed', 'receipts'].includes(key)));
 
+const normalizeTaskPaths = value =>
+  value === undefined
+    ? undefined
+    : Array.isArray(value) && value.every(item => typeof item === 'string' && item.trim().length > 0)
+      ? [...new Set(value)].sort()
+      : (() => {
+          throw failure('configuration');
+        })();
+
 /**
  * @typedef {object} ArchitectureGateOptions
  * @property {string} [cwd] Checked project checkout.
  * @property {string} [headSha] Exact head the receipt is bound to.
  * @property {string} [baseSha] Merge base of the affected-module plan.
  * @property {Record<string, any>} [config] Raw `architecture` configuration; normalized here.
+ * @property {string[]} [taskPaths] Explicit writePaths of the checked task(s) (used for Rust contract crate protection).
  * @property {AbortSignal} [signal]
  */
 
@@ -212,9 +224,12 @@ export async function runArchitectureChecks({
   config,
   artifacts,
   secrets = {},
+  taskPaths,
   signal,
 } = {}) {
   config = normalizeArchitectureConfig(config);
+  const boundTaskPaths = normalizeTaskPaths(taskPaths);
+  /** @type {Record<string, any>} */
   const receipt = {
     schemaVersion: 1,
     status: 'disabled',
@@ -222,6 +237,7 @@ export async function runArchitectureChecks({
     headSha,
     baseSha,
     configHash: architectureConfigHash(config),
+    ...(boundTaskPaths !== undefined ? { taskPaths: boundTaskPaths } : {}),
   };
   if (!config.enabled) return receipt;
   const directory = await privateDirectory(artifacts, cwd, signal);
@@ -244,6 +260,7 @@ export async function runArchitectureChecks({
       evidenceDir: directory,
       signal,
       redactions: secrets,
+      ...(boundTaskPaths !== undefined ? { taskPaths: boundTaskPaths } : {}),
     });
     receipt.status =
       receipt.report.passed === true ? 'passed' : receipt.report.status === 'failed' ? 'failed' : 'blocked';
@@ -289,11 +306,17 @@ export async function runArchitectureChecks({
 // oxlint-disable-next-line complexity -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
 export async function isCurrentArchitectureReceipt(
   receipt,
-  { cwd, project, headSha, baseSha, config, signal, now } = {},
+  { cwd, project, headSha, baseSha, config, taskPaths, signal, now } = {},
 ) {
   try {
     config = normalizeArchitectureConfig(config);
     if (!config.enabled) return true; // Neutral, never an enabled PASS.
+    const expectedTaskPaths = normalizeTaskPaths(taskPaths);
+    if (
+      expectedTaskPaths !== undefined &&
+      JSON.stringify(receipt?.taskPaths ?? []) !== JSON.stringify(expectedTaskPaths)
+    )
+      return false;
     if (
       receipt?.schemaVersion !== 1 ||
       receipt.status !== 'passed' ||
@@ -315,6 +338,7 @@ export async function isCurrentArchitectureReceipt(
     const planned = await architectureCli(['plan', '--project', receipt.cwd, '--base', baseSha, '--json'], {
       signal,
       ...(now ? { now } : {}),
+      ...(receipt.taskPaths !== undefined ? { taskPaths: receipt.taskPaths } : {}),
     });
     if (
       planned.report.status !== 'planned' ||

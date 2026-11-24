@@ -418,6 +418,7 @@ const RULES = `# Правила чертежа Kodo
 6. \`root\` — абсолютный путь каталога проекта; id — slug; остальные поля строго по ProjectSpec v1.
 7. **Эпики без циклов.** Если задача эпика X зависит от задачи эпика Y, никакая задача Y не должна зависеть (через задачи любых эпиков) от задач X: гейты эпиков закрываются по порядку.
 8. **Минимальный тест в Волне 0.** Первая задача Волны 0 создаёт минимальный проходящий тест, его путь — в её \`writePaths\`: без тестов проверка задачи ничего не доказывает, а прогон \`node --test\` без единого теста — отказ (\`fast_check_no_tests\`).
+9. **Контрактный крейт Волны 0 (Rust workspace с ≥ 3 крейтами).** Волна 0 (\`${FOUNDATION_ID}\`) должна содержать задачу, создающую компилируемый контрактный крейт (\`crates/<name>-contracts\`: \`pub trait\`, общие типы данных, ошибки, базовые conformance-тесты), а \`architecture.policy.json\` (\`schemaVersion: 2, language: "rust"\`) защищает его через \`contractCrates\` и нижний слой \`layers\`. Отсутствие такой задачи — finding \`contract_crate_required\`.
 
 ## kodo.config.json — до apply-spec
 
@@ -440,6 +441,7 @@ const RULES = `# Правила чертежа Kodo
 | \`blueprint_section_missing\`, \`blueprint_section_empty\` | Разделы PROJECT.md |
 | \`blueprint_owner_unknown\` | owner — одна из ролей |
 | \`blueprint_wave0_missing\`, \`blueprint_wave0_bypassed\`, \`blueprint_wave0_order\` | Волна 0 |
+| \`contract_crate_required\` | Rust workspace с ≥ 3 крейтами: добавить в Волну 0 задачу, создающую \`crates/<name>-contracts\`, и защитить крейт через \`contractCrates\` в \`architecture.policy.json\` |
 | \`blueprint_container_empty\` | Пустой майлстоун или эпик: добавить в него эпик/задачу или удалить его |
 | \`blueprint_epic_cycle\` | Цикл зависимостей между эпиками: перенести задачи или объединить эпики |
 | \`blueprint_parallel_overlap\` | Пересечение writePaths параллельных задач |

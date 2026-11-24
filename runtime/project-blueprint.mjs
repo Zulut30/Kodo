@@ -734,6 +734,68 @@ function interfaceFindings(spec, interfaces) {
   return findings;
 }
 
+const RUST_CONTRACT_CRATE_MIN = 3;
+const CONTRACT_CRATE_NAME = /(?:^|[-_])contracts$/i;
+
+function crateFromWritePath(raw) {
+  if (typeof raw !== 'string') return null;
+  const cleaned = raw.replaceAll('\\', '/').replace(/\/+$/, '');
+  const cratesMatch = /^crates\/([A-Za-z0-9][A-Za-z0-9_-]*)(?:\/|$)/.exec(cleaned);
+  if (cratesMatch) return { name: cratesMatch[1], root: `crates/${cratesMatch[1]}` };
+  const cargoMatch = /^([^/*?[{]+(?:\/[^/*?[{]+)*)\/Cargo\.toml$/.exec(cleaned);
+  if (cargoMatch) {
+    const root = cargoMatch[1];
+    return { name: root.split('/').at(-1), root };
+  }
+  return null;
+}
+
+function isRustBlueprint(spec, projectMarkdown) {
+  if (typeof projectMarkdown === 'string' && /\b(?:rust|cargo)\b/i.test(projectMarkdown)) return true;
+  if (
+    spec.tasks.some(task =>
+      (task.writePaths ?? []).some(scope => /(?:^|\/)Cargo\.toml$|\.rs$/i.test(String(scope).replaceAll('\\', '/'))),
+    )
+  )
+    return true;
+  const meta = [spec.title, spec.businessContext, ...(spec.constraints ?? [])].filter(Boolean).join('\n');
+  return /\b(?:rust|cargo)\b/i.test(meta);
+}
+
+/** Multi-crate Rust workspaces (>= 3 crates) must create a compilable contract crate
+ * (e.g. `crates/<name>-contracts`) in Wave 0 so parallel tasks compile against frozen traits/types. */
+export function rustContractCrateFindings(spec, projectMarkdown = '') {
+  if (!isRustBlueprint(spec, projectMarkdown)) return [];
+  const crates = new Map();
+  for (const task of spec.tasks) {
+    for (const scope of task.writePaths ?? []) {
+      const crate = crateFromWritePath(scope);
+      if (crate) crates.set(crate.root, crate.name);
+    }
+  }
+  if (crates.size < RUST_CONTRACT_CRATE_MIN) return [];
+  const waveZeroEpics = new Set(
+    spec.epics.filter(epic => epic.id === FOUNDATION_ID || epic.milestoneId === FOUNDATION_ID).map(epic => epic.id),
+  );
+  const waveZeroTasks = spec.tasks.filter(task => waveZeroEpics.has(task.epicId));
+  if (!waveZeroTasks.length) return [];
+  const hasWaveZeroContractCrate = waveZeroTasks.some(task =>
+    (task.writePaths ?? []).some(scope => {
+      const crate = crateFromWritePath(scope);
+      return crate !== null && CONTRACT_CRATE_NAME.test(crate.name);
+    }),
+  );
+  if (hasWaveZeroContractCrate) return [];
+  return [
+    finding(
+      'contract_crate_required',
+      'Для Rust workspace с ≥ 3 крейтами Волна 0 (foundation) должна содержать задачу, ' +
+        'создающую компилируемый контрактный крейт (crates/<name>-contracts: pub trait, типы данных, ошибки, ' +
+        'conformance-тесты), защищённый через contractCrates в architecture.policy.json',
+    ),
+  ];
+}
+
 function analyzeFactorySpec(spec, options = {}) {
   const { contracts = projectContracts, knownValues = [], interfaces = [], projectMarkdown = '' } = options;
   const base = normalizeFactory(spec, { contracts, knownValues });
@@ -743,6 +805,7 @@ function analyzeFactorySpec(spec, options = {}) {
   findings.push(
     ...ownerFindings(base.spec.tasks),
     ...waveZeroFindings(base.spec, ancestors),
+    ...rustContractCrateFindings(base.spec, projectMarkdown),
     ...containerFindings(base.spec),
     ...epicCycleFindings(base.spec.tasks),
     ...overlapFindings(parallelOverlaps(base.spec.tasks, { ancestors })),

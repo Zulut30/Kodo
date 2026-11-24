@@ -214,6 +214,30 @@ export async function readArchitectureGraph({ project, headSha, policy }) {
   }
   // B owns policy normalization; defensively guard all paths before using it.
   policy = canonical(policy);
+  if (policy.schemaVersion === 2 && policy.language === 'rust') {
+    if (!Array.isArray(policy.productRoots) || !policy.productRoots.length || !Array.isArray(policy.layers))
+      throw failure('configuration');
+    if (policy.layers.length > 256) throw failure('scope_limit');
+    for (const file of [...policy.productRoots, ...(policy.protectedPaths ?? [])]) safePath(file);
+    const entries = await snapshot(project, headSha),
+      files = entries.map(({ path, mode, oid }) => ({ path, mode, oid }));
+    const regular = entry => entry.type === 'blob' && ['100644', '100755'].includes(entry.mode);
+    const treeUnsupported = entries
+      .filter(entry => !regular(entry))
+      .map(entry => ({
+        id: hash(['tree', entry.path, 'unsupported-tree-entry', null]),
+        scope: 'tree',
+        file: entry.path,
+        reason: 'unsupported-tree-entry',
+        offset: null,
+      }));
+    const contents = await sources(
+      project,
+      entries.filter(entry => regular(entry) && (entry.path === 'Cargo.toml' || entry.path.endsWith('/Cargo.toml'))),
+    );
+    const { buildRustArchitectureGraph } = await import('./architecture-rust.mjs');
+    return buildRustArchitectureGraph({ headSha, policy, files, contents, treeUnsupported });
+  }
   if (
     policy.schemaVersion !== 1 ||
     !Array.isArray(policy.productRoots) ||

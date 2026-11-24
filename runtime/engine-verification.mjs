@@ -481,6 +481,10 @@ export class EngineVerification extends EngineExecution {
       const previous = run[field];
       run[field] = null;
       this.save(run);
+      const taskPaths =
+        field === 'architectureChecks' && Array.isArray(run.plan?.tasks)
+          ? run.plan.tasks.flatMap(task => (Array.isArray(task.writePaths) ? task.writePaths : []))
+          : undefined;
       try {
         run[field] = await executeGate({
           cwd: run.cwd,
@@ -490,6 +494,7 @@ export class EngineVerification extends EngineExecution {
           artifacts: run.artifacts,
           previous,
           secrets: this.secrets,
+          ...(taskPaths ? { taskPaths } : {}),
           signal,
         });
       } catch (error) {
@@ -498,7 +503,16 @@ export class EngineVerification extends EngineExecution {
       }
       this.save(run);
       await clean();
-      if (!(await current(run[field], { cwd: run.cwd, headSha, baseSha: run.baseSha, config, signal }))) {
+      if (
+        !(await current(run[field], {
+          cwd: run.cwd,
+          headSha,
+          baseSha: run.baseSha,
+          config,
+          ...(taskPaths ? { taskPaths } : {}),
+          signal,
+        }))
+      ) {
         const receipt = run[field];
         const findings = [
           ...(receipt?.tools || []).slice(0, 5).flatMap(row => (row.findings || []).slice(0, 10)),

@@ -6,7 +6,10 @@
 
 Нужны Node.js 24+, Git, исходный commit и чистое фактическое дерево на текущем HEAD. Анализатор читает immutable Git objects base/head; проверка текущих байтов не ограничивается porcelain и обнаруживает изменения под assume-unchanged/skip-worktree. Ссылки и небезопасные пути отвергаются до канонизации; физические Windows aliases сохраняются.
 
-В MVP анализируются product ESM `.mjs` и `.js` при `package.json type=module`. TypeScript/TSX/JSX, CJS, Rust, C#, Go, PHP и другие executable product languages дают явный unsupported/blocked. Неопределённые loaders, imports/exports и package resolution не превращаются в соответствие архитектуре. CSS/data остаются ресурсами. Builtin IO сам по себе допустим; неизвестные зависимости блокируют.
+Поддерживаются два анализатора, выбираемых версией политики `architecture.policy.json`:
+
+- **JS ESM (`schemaVersion: 1`)** — product ESM `.mjs` и `.js` при `package.json type=module`. TypeScript/TSX/JSX, CJS, Rust, C#, Go, PHP и другие executable product languages внутри v1 `productRoots` дают явный unsupported/blocked. Неопределённые loaders, imports/exports и package resolution не превращаются в соответствие архитектуре. CSS/data остаются ресурсами. Builtin IO сам по себе допустим; неизвестные зависимости блокируют.
+- **Rust Cargo workspace (`schemaVersion: 2`, `language: "rust"`)** — offline-анализ графа крейтов по корневому и крейтовым `Cargo.toml` из immutable Git-объектов (`runtime/architecture-rust.mjs`, разбор через `smol-toml`), без запуска `cargo` и без сети. Проверяются слои, циклы, список разрешённых внешних крейтов и защита контрактных крейтов.
 
 `productRoots` задаёт полную анализируемую область продукта. JS внутри неё без module owner — нарушение. Тесты, docs, scripts, vendored examples вне неё входят в source inventory/hash, но не получают архитектурный PASS. Импорт product-кода в локальный файл вне productRoots блокируется `out-of-product-import`. Нельзя выводить общую корректность проекта из проверки его небольшой JS-части. [Language quality](QUALITY.md) — отдельный механизм с собственными SDK/tool pins, offline dependencies и ограничениями; его девять профилей не являются девятью архитектурными анализаторами.
 
@@ -55,6 +58,46 @@ kodo architecture check --project $project --base $base --evidence-dir 'C:\Priva
 ```
 
 Roots — канонические относительные directory prefixes, без glob, dot, traversal и overlap; module roots лежат внутри productRoots. Public — точные пути entry-файлов. `allow` перечисляет module IDs, `layers` — разрешённые направления между слоями. Каждое cross-module ребро должно одновременно удовлетворять allow, layer, public-entry и forbidden правилам. Self-module private imports допустимы; cycles проверяются между модулями. Пустой public не требует контракта. Нормализатор возвращает сам policy, deep copy с отсортированными sets/modules; порядок baseline/exceptions сохраняется для индексов.
+
+## ArchitecturePolicy v2: Rust Cargo workspace
+
+Для многокрейтовых проектов на Rust политика использует `schemaVersion: 2` и `"language": "rust"` (совместимо с v1: JS-политики `schemaVersion: 1` не меняются). Файл `architecture.contracts.json` не требуется: контрактами выступают компилируемые контрактные крейты из `contractCrates`.
+
+```json
+{
+  "schemaVersion": 2,
+  "version": 1,
+  "language": "rust",
+  "productRoots": ["crates"],
+  "layers": [
+    { "id": "contracts", "crates": ["game-contracts"] },
+    { "id": "core", "crates": ["core"] },
+    { "id": "world", "crates": ["world"] },
+    { "id": "render", "crates": ["render"] },
+    { "id": "app", "crates": ["app"] }
+  ],
+  "cycles": "forbid",
+  "allowedExternalCrates": ["serde", "thiserror"],
+  "allowedDevExternalCrates": ["proptest"],
+  "contractCrates": ["game-contracts"],
+  "baseline": [],
+  "exceptions": [],
+  "protectedPaths": ["architecture.policy.json", "Cargo.toml", "Cargo.lock"]
+}
+```
+
+- **Разбор Cargo workspace (`runtime/architecture-rust.mjs`)**: читает корневой `Cargo.toml` (`[workspace] members` с поддержкой простых сегментных glob-масок вида `crates/*`, `exclude`, `[workspace.dependencies]`, а также корневой `[package]` при не-виртуальном workspace) и манифесты крейтов (`[dependencies]`, `[dev-dependencies]`, `[build-dependencies]`, `[target.<cfg>.*]`, `path = …`, `workspace = true`, переименование `package = …`). `cargo` не запускается, сеть не используется. Невалидный TOML, отсутствующий `[workspace]`, неразрешённый `workspace = true`, выход `path` за пределы репозитория или за пределы workspace попадают в `unsupported` и блокируют проверку.
+- **Слои (`layers`)**: упорядоченный массив слоёв **снизу вверх** (индекс 0 — самый нижний базовый слой). Идентификаторы слоёв и имена крейтов уникальны во всей политике; порядок слоёв при нормализации сохраняется. Крейт слоя `i` может зависеть от крейтов слоя `j ≤ i`. Зависимость нижнего слоя от верхнего (`i < j`) даёт нарушение `layer_violation`. Крейт workspace, не назначенный ни одному слою, даёт `ownership.unowned`.
+- **Циклы (`cycles: "forbid"`)**: любая сильно связная компонента из ≥ 2 крейтов по `[dependencies]` и `[build-dependencies]` даёт одно каноническое нарушение `dependency_cycle` со всеми участвующими `Cargo.toml`. `[dev-dependencies]` не образуют цикл сборки Cargo и не попадают в `dependency_cycle`, но проверяются на `layer_violation` и на список внешних крейтов.
+- **Внешние зависимости (`allowedExternalCrates`, `allowedDevExternalCrates`)**:
+  - `[dependencies]` и `[build-dependencies]` разрешают только пакеты из `allowedExternalCrates`.
+  - `[dev-dependencies]` разрешают пакеты из объединения `allowedExternalCrates ∪ allowedDevExternalCrates` (поле `allowedDevExternalCrates` необязательно и по умолчанию равно `[]`).
+  - При переименовании (`serde = { package = "evil", version = "1" }`) проверяется фактическое имя пакета (`package`), а не локальный псевдоним.
+  - Зависимость вне разрешённого списка даёт нарушение `external_dependency_not_allowed`.
+- **Защищённые контрактные крейты (`contractCrates`)**:
+  - Каждый крейт из `contractCrates` должен быть объявлен в `layers`. При проверке учитывается объединение `contractCrates` базовой и головной политик, поэтому удаление крейта из `contractCrates` в том же коммите не снимает защиту.
+  - Изменение любого файла внутри контрактного крейта разрешено только задаче, чья область путей (`taskPaths` — `writePaths` задачи/эпика из `run.plan.tasks`, передаваемые координатором в гейт) **явно** называет этот контрактный крейт или путь внутри него (`crates/game-contracts`, `crates/game-contracts/**`, `crates/game-contracts/src/lib.rs`). Отсутствующий `taskPaths`, пути других крейтов или слишком широкие маски уровня родителя (`crates`, `crates/**`) не дают допуска и приводят к `contract_change_not_allowed`.
+  - Нарушение `contract_change_not_allowed` не может быть списано через `baseline`/`exceptions`. Даже разрешённое изменение контрактного крейта выставляет `requiresReview: true` и `fullVerificationRequired: true`.
 
 ## Контракты, изменения и тесты
 
@@ -128,7 +171,7 @@ Baseline и exception имеют одинаковую форму и одинак
 | Иллюстративный проект | Применение MVP и предел |
 | --- | --- |
 | Hearthstone-сайт | headless-web для подготовленных ESM routes/services/domain; статистика колод, достоверность источников и браузерный UX требуют отдельных проверок. Next.js TSX/JSX этим AST MVP не сертифицируется |
-| VCS на Rust | library показывает направление API→internal концептуально; .rs внутри productRoots даёт unsupported/blocked. Cargo/Clippy относятся к quality, native Rust architecture пока отложен |
+| VCS / игра на Rust | `schemaVersion: 2, language: "rust"` проверяет граф крейтов Cargo workspace (`layers`, `dependency_cycle`, `allowedExternalCrates`, `contractCrates`) без запуска `cargo`. В политике JS v1 `.rs` внутри `productRoots` по-прежнему даёт unsupported/blocked |
 | Windows desktop app | desktop-app подходит ESM main/renderer/shared. WPF/Avalonia C# и .NET SDK этим preset не анализируются; native UI smoke остаётся отдельным наблюдением |
 | WordPress plugin | plugin-host иллюстрирует ESM plugin→host, либо отдельно заданную JS-часть. PHP hooks/permissions/plugin lifecycle не анализируются; PHP/WPCS/PHPStan и установленный WordPress smoke проверяются отдельно |
 
@@ -136,7 +179,11 @@ Baseline и exception имеют одинаковую форму и одинак
 
 Нормальный JSON schemaVersion=1 содержит status, passed, headSha, basePolicyState, baseRulesEvaluated, hashes:{source,policy,registry}, findings, unsupported, debt, requiredTests, receipts, requiresReview, fullVerificationRequired. passed=true только у passed; false у failed/blocked; null у planned/not_applicable. requiredTests rows: `{file,forContracts,forModules}`. Findings имеют id, ruleId, severity:error, nullable file/offset/fromModule/toModule, relatedFiles и sourceHashes; id привязан к остальным полям.
 
-Фиксированные rule IDs: ownership.unowned/overlap; dependency.forbidden/not-allowed/cycle; layer.direction; entry.private; contract.exports/version/migration/dependent/tests. Неподдержанные элементы возвращаются отдельно с scope/file/reason/offset/id и блокируют анализируемую область.
+Фиксированные rule IDs:
+- JS ESM (`schemaVersion: 1`): `ownership.unowned`, `ownership.overlap`, `dependency.forbidden`, `dependency.not-allowed`, `dependency.cycle`, `layer.direction`, `entry.private`, `contract.exports`, `contract.version`, `contract.migration`, `contract.dependent`, `contract.tests`.
+- Rust Cargo workspace (`schemaVersion: 2`): `ownership.unowned`, `layer_violation`, `dependency_cycle`, `external_dependency_not_allowed`, `contract_change_not_allowed`.
+
+Неподдержанные элементы возвращаются отдельно с scope/file/reason/offset/id и блокируют анализируемую область.
 
 Receipt содержит id/file/status/exitCode/durationMs/headSha/sourceHash/policyHash/registryHash, runtime:{node,abi,platform,arch}, counts:{tests,pass,fail,cancelled,skipped,todo}, evidence:[{path,bytes,sha256}]. Null exitCode/counts означает незавершённое наблюдение, а не PASS. Приватные captures вне Git не публикуют environment, prompts или provider output.
 

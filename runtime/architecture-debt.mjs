@@ -10,6 +10,9 @@ const eligibleRules = new Set([
   'dependency.cycle',
   'layer.direction',
   'entry.private',
+  'layer_violation',
+  'dependency_cycle',
+  'external_dependency_not_allowed',
 ]);
 const rules = new Set([
   ...eligibleRules,
@@ -18,6 +21,7 @@ const rules = new Set([
   'contract.migration',
   'contract.dependent',
   'contract.tests',
+  'contract_change_not_allowed',
 ]);
 const findingKeys = [
   'id',
@@ -224,10 +228,56 @@ export function applyArchitectureDebt(input) {
   });
 }
 
+const rustPolicyKeys = [
+  'schemaVersion',
+  'version',
+  'language',
+  'productRoots',
+  'layers',
+  'cycles',
+  'allowedExternalCrates',
+  'contractCrates',
+  'baseline',
+  'exceptions',
+  'protectedPaths',
+];
+const rustPolicyOptionalKeys = ['allowedDevExternalCrates'];
+
+function validateRustPolicy(policy) {
+  if (!object(policy)) fail();
+  const keys = Object.keys(policy);
+  const allowed = new Set([...rustPolicyKeys, ...rustPolicyOptionalKeys]);
+  if (
+    keys.some(key => !allowed.has(key)) ||
+    rustPolicyKeys.some(key => !Object.hasOwn(policy, key)) ||
+    policy.schemaVersion !== 2 ||
+    policy.language !== 'rust' ||
+    !Number.isSafeInteger(policy.version) ||
+    policy.version < 1 ||
+    policy.cycles !== 'forbid'
+  )
+    fail();
+  if (!paths(policy.productRoots).length) fail();
+  paths(policy.protectedPaths);
+  for (const layer of list(policy.layers, 256)) {
+    if (!exact(layer, ['id', 'crates']) || !text(layer.id) || !list(layer.crates, 256).every(text)) fail();
+  }
+  if (!list(policy.allowedExternalCrates, PATH_LIMIT).every(text)) fail();
+  if (policy.allowedDevExternalCrates !== undefined && !list(policy.allowedDevExternalCrates, PATH_LIMIT).every(text))
+    fail();
+  if (!list(policy.contractCrates, 256).every(text)) fail();
+  for (const key of ['baseline', 'exceptions']) list(policy[key], FINDING_LIMIT);
+  serialize(policy);
+}
+
 // Validation of rule semantics belongs to B. D checks the wire shape and paths
 // it consumes, compares the entire policy, and never imports its sibling stages.
 function validatePolicy(policy) {
   if (policy === null) return;
+  if (object(policy) && policy.schemaVersion === 2 && policy.language === 'rust') {
+    validateRustPolicy(policy);
+    return;
+  }
   if (
     !exact(policy, policyKeys) ||
     policy.schemaVersion !== 1 ||
@@ -296,7 +346,7 @@ export function evaluateArchitectureProtection(input) {
   if (serialize(basePolicy) !== serialize(headPolicy)) reviewPaths.add('architecture.policy.json');
   const protectedPaths = [basePolicy, headPolicy]
     .filter(policy => policy !== null)
-    .flatMap(policy => [policy.contracts, ...policy.protectedPaths]);
+    .flatMap(policy => [...(policy.contracts ? [policy.contracts] : []), ...policy.protectedPaths]);
   for (const file of changed) {
     if (builtinProtection(file) || protectedPaths.some(prefix => within(file, prefix))) reviewPaths.add(file);
   }
