@@ -777,54 +777,69 @@ function isRustBlueprint(spec, projectMarkdown, architecturePolicy) {
   return /\b(?:rust|cargo)\b/i.test(meta);
 }
 
-function declaredTokens(sources, pattern) {
+function linesOutsideCodeFences(text) {
+  if (typeof text !== 'string' || !text) return [];
+  const lines = text.replace(/\r\n?/g, '\n').split('\n');
+  const out = [];
+  let fence = null;
+  for (const line of lines) {
+    const opener = /^ {0,3}(`{3,}|~{3,})/.exec(line);
+    if (fence) {
+      if (
+        opener &&
+        opener[1][0] === fence[0] &&
+        opener[1].length >= fence.length &&
+        !/\S/.test(line.slice(opener[0].length))
+      )
+        fence = null;
+      continue;
+    }
+    if (opener) {
+      fence = opener[1];
+      continue;
+    }
+    out.push(line);
+  }
+  return out;
+}
+
+const CONTRACT_DECL_RE = /^\s*(?:[-*]\s*)?contractCrate\s*:\s*`?([A-Za-z0-9][A-Za-z0-9_./-]*)`?\s*$/;
+const WORKSPACE_DECL_RE = /^\s*(?:[-*]\s*)?workspaceRoot\s*:\s*`?(\.|[A-Za-z0-9][A-Za-z0-9_./-]*)`?\s*$/;
+
+function cleanDeclaredPath(raw) {
+  const cleaned = raw
+    .trim()
+    .replaceAll('\\', '/')
+    .replace(/^(?:\.\/)+/, '')
+    .replace(/\/+$/, '');
+  if (!cleaned || /^(?:none|no|false)$/i.test(cleaned)) return null;
+  if (cleaned !== '.' && cleaned.split('/').some(part => !part || part === '.' || part === '..')) return null;
+  return cleaned;
+}
+
+function collectStrictDeclarations(sources, pattern) {
   const tokens = new Set();
   for (const source of sources) {
-    if (typeof source !== 'string' || !source) continue;
-    for (const match of source.matchAll(pattern)) {
-      for (const raw of match[1].split(/[,;]/)) {
-        const cleaned = raw
-          .trim()
-          .replace(/^[`'"]+|[`'"]+$/g, '')
-          .replaceAll('\\', '/')
-          .replace(/^(?:\.\/)+/, '')
-          .replace(/\/+$/, '');
-        if (cleaned) tokens.add(cleaned);
-      }
+    for (const line of linesOutsideCodeFences(source)) {
+      const match = pattern.exec(line);
+      if (!match) continue;
+      const cleaned = cleanDeclaredPath(match[1]);
+      if (cleaned) tokens.add(cleaned);
     }
   }
   return tokens;
 }
 
-function declaredContractTokens(spec, projectMarkdown, architecturePolicy) {
-  const tokens = declaredTokens(
-    [projectMarkdown, ...(spec.constraints ?? [])],
-    /^\s*(?:[-*]\s*)?(?:contractCrates?|контрактн(?:ый|ые)\s+крейт(?:ы)?)\s*:\s*(.+)$/gim,
-  );
-  if (
-    architecturePolicy?.schemaVersion === 2 &&
-    architecturePolicy?.language === 'rust' &&
-    Array.isArray(architecturePolicy.contractCrates)
-  ) {
-    for (const name of architecturePolicy.contractCrates) {
-      if (typeof name === 'string' && name.trim()) tokens.add(name.trim());
-    }
-  }
-  return tokens;
+function declaredContractTokens(spec, projectMarkdown) {
+  return collectStrictDeclarations([projectMarkdown, ...(spec.constraints ?? [])], CONTRACT_DECL_RE);
 }
 
 function declaredWorkspaceRoots(spec, projectMarkdown, architecturePolicy, allCrates) {
   const roots = new Set();
   if (architecturePolicy?.schemaVersion === 2 && architecturePolicy?.language === 'rust') roots.add('');
-  for (const token of declaredTokens(
-    [projectMarkdown, ...(spec.constraints ?? [])],
-    /^\s*(?:[-*]\s*)?(?:workspaceRoot|cargoWorkspace|workspace)\s*:\s*(.+)$/gim,
-  )) {
-    if (/^(?:none|no|false)$/i.test(token)) continue;
+  for (const token of collectStrictDeclarations([projectMarkdown, ...(spec.constraints ?? [])], WORKSPACE_DECL_RE)) {
     roots.add(token === '.' || token === 'Cargo.toml' ? '' : token.replace(/\/Cargo\.toml$/, ''));
   }
-  const hasRootWorkspaceText = /\bcargo\s+workspace\b/i.test([projectMarkdown, ...(spec.constraints ?? [])].join('\n'));
-  if (hasRootWorkspaceText) roots.add('');
   for (const task of spec.tasks) {
     for (const raw of task.writePaths ?? []) {
       const cleaned = normalizeRelScope(raw);
@@ -875,13 +890,32 @@ function broadContractScopeFindings(spec, contractRoots) {
   ];
 }
 
-function selectContractRootsForCrates(cratesMap, explicitTokens) {
+function ownerWorkspaceOf(crateRoot, sortedWorkspaceRoots) {
+  return sortedWorkspaceRoots.find(wsRoot =>
+    wsRoot === '' ? true : crateRoot === wsRoot || crateRoot.startsWith(`${wsRoot}/`),
+  );
+}
+
+function selectContractRootsForWorkspace({ wsRoot, wsCrates, workspaceRoots, explicitTokens, architecturePolicy }) {
   const roots = new Set();
-  for (const [root, name] of cratesMap.entries()) {
+  const isRustV2Policy =
+    wsRoot === '' && architecturePolicy?.schemaVersion === 2 && architecturePolicy?.language === 'rust';
+  if (isRustV2Policy) {
+    const policyNames = new Set(
+      Array.isArray(architecturePolicy.contractCrates)
+        ? architecturePolicy.contractCrates.filter(n => typeof n === 'string' && n.trim()).map(n => n.trim())
+        : [],
+    );
+    for (const [root, name] of wsCrates.entries()) {
+      if (policyNames.has(name)) roots.add(root);
+    }
+    return roots;
+  }
+  for (const [root, name] of wsCrates.entries()) {
     if (explicitTokens.has(root) || explicitTokens.has(name) || CONTRACT_CRATE_NAME.test(name)) roots.add(root);
   }
   for (const token of explicitTokens) {
-    if (token.includes('/')) roots.add(token);
+    if (token.includes('/') && ownerWorkspaceOf(token, workspaceRoots) === wsRoot) roots.add(token);
   }
   return roots;
 }
@@ -943,18 +977,13 @@ export function rustContractCrateFindings(spec, projectMarkdown = '', architectu
       if (crate) allCrates.set(crate.root, crate.name);
     }
   }
-  const explicitTokens = declaredContractTokens(spec, projectMarkdown, architecturePolicy);
-  const allContractRoots = selectContractRootsForCrates(allCrates, explicitTokens);
-  const findings = [...broadContractScopeFindings(spec, allContractRoots)];
-
+  const explicitTokens = declaredContractTokens(spec, projectMarkdown);
   const workspaceRoots = [...declaredWorkspaceRoots(spec, projectMarkdown, architecturePolicy, allCrates)].sort(
     (a, b) => b.length - a.length || compare(a, b),
   );
-  if (!workspaceRoots.length) return findings;
-
   const byWorkspace = new Map(workspaceRoots.map(wsRoot => [wsRoot, new Map()]));
   for (const [crateRoot, crateName] of allCrates.entries()) {
-    const ownerWs = workspaceRoots.find(wsRoot => (wsRoot === '' ? true : crateRoot.startsWith(`${wsRoot}/`)));
+    const ownerWs = ownerWorkspaceOf(crateRoot, workspaceRoots);
     if (ownerWs !== undefined) byWorkspace.get(ownerWs).set(crateRoot, crateName);
   }
   for (const [wsRoot, wsCrates] of byWorkspace.entries()) {
@@ -962,6 +991,30 @@ export function rustContractCrateFindings(spec, projectMarkdown = '', architectu
       wsCrates.set(wsRoot, wsRoot ? wsRoot.split('/').at(-1) : spec.id || 'root');
     }
   }
+
+  const allContractRoots = new Set();
+  if (workspaceRoots.length) {
+    for (const [wsRoot, wsCrates] of byWorkspace.entries()) {
+      for (const root of selectContractRootsForWorkspace({
+        wsRoot,
+        wsCrates,
+        workspaceRoots,
+        explicitTokens,
+        architecturePolicy,
+      }))
+        allContractRoots.add(root);
+    }
+  } else {
+    for (const [root, name] of allCrates.entries()) {
+      if (explicitTokens.has(root) || explicitTokens.has(name) || CONTRACT_CRATE_NAME.test(name))
+        allContractRoots.add(root);
+    }
+    for (const token of explicitTokens) {
+      if (token.includes('/')) allContractRoots.add(token);
+    }
+  }
+  const findings = [...broadContractScopeFindings(spec, allContractRoots)];
+  if (!workspaceRoots.length) return findings;
 
   const waveZeroEpics = new Set(
     spec.epics.filter(epic => epic.id === FOUNDATION_ID || epic.milestoneId === FOUNDATION_ID).map(epic => epic.id),
@@ -971,10 +1024,16 @@ export function rustContractCrateFindings(spec, projectMarkdown = '', architectu
 
   let requiresPolicy = false;
   let missingContract = false;
-  for (const wsCrates of byWorkspace.values()) {
+  for (const [wsRoot, wsCrates] of byWorkspace.entries()) {
     if (wsCrates.size < RUST_CONTRACT_CRATE_MIN) continue;
     requiresPolicy = true;
-    const wsContracts = selectContractRootsForCrates(wsCrates, explicitTokens);
+    const wsContracts = selectContractRootsForWorkspace({
+      wsRoot,
+      wsCrates,
+      workspaceRoots,
+      explicitTokens,
+      architecturePolicy,
+    });
     const satisfied = waveZeroTasks.some(task =>
       [...wsContracts].some(contractRoot => taskCreatesCompilableContractCrate(task, contractRoot)),
     );

@@ -1167,7 +1167,7 @@ test('E5: contract_crate_required requires Cargo.toml + src/**, supports explici
   assert.equal(manifestAndSrc.ok, true);
 
   // 2) Explicitly declared contract crate without *-contracts suffix (crates/protocol) passes
-  const protocolMarkdown = wsMarkdown + '\nКонтрактный крейт: `crates/protocol`\n';
+  const protocolMarkdown = wsMarkdown + '\ncontractCrate: crates/protocol\n';
   const withProtocol = lintFactorySpec(
     baseSpec([
       mkTask('w0', 'foundation', [], ['Cargo.toml', 'architecture.policy.json', 'crates/protocol']),
@@ -2098,4 +2098,189 @@ test('W7: path dep to package under nested [workspace] becomes root member while
     resRoot.unsupported.some(u => u.reason === 'nested-workspace-root' && u.file === 'nested/Cargo.toml'),
     `expected nested-workspace-root on nested/Cargo.toml, got ${JSON.stringify(resRoot.unsupported)}`,
   );
+});
+
+test('W8: blueprint declarations ignore code fences and prose like "No Cargo workspace", scope contracts per workspace, and verify against existing policy v2 contractCrates', () => {
+  const mkSpec = (tasks, constraints = []) => ({
+    schemaVersion: 1,
+    id: 'w8-bp',
+    title: 'Rust W8',
+    root: '/tmp/w8',
+    businessContext: 'Rust project',
+    execution: { cadence: 'wave', integration: 'branch' },
+    constraints,
+    milestones: [
+      { id: 'foundation', title: 'W0', acceptance: [] },
+      { id: 'mvp', title: 'MVP', acceptance: [] },
+    ],
+    epics: [
+      { id: 'foundation', milestoneId: 'foundation', title: 'W0', acceptance: [] },
+      { id: 'domain', milestoneId: 'mvp', title: 'Domain', acceptance: [] },
+    ],
+    tasks,
+  });
+
+  // 1) contractCrate inside Markdown code fence is ignored -> contract_crate_required.
+  const protoSpec = mkSpec([
+    {
+      id: 'w0',
+      epicId: 'foundation',
+      title: 'Protocol',
+      owner: 'architect',
+      dependsOn: [],
+      writePaths: ['Cargo.toml', 'architecture.policy.json', 'crates/protocol/Cargo.toml', 'crates/protocol/src/**'],
+    },
+    {
+      id: 't1',
+      epicId: 'domain',
+      title: 'A',
+      owner: 'developer',
+      dependsOn: ['w0'],
+      writePaths: ['crates/a/Cargo.toml', 'crates/a/src/**'],
+    },
+    {
+      id: 't2',
+      epicId: 'domain',
+      title: 'B',
+      owner: 'developer',
+      dependsOn: ['w0'],
+      writePaths: ['crates/b/Cargo.toml', 'crates/b/src/**'],
+    },
+  ]);
+  const fencedMd = '## Стек\nRust\n```yaml\ncontractCrate: crates/protocol\n```\n';
+  const fencedFindings = rustContractCrateFindings(protoSpec, fencedMd);
+  assert.ok(
+    fencedFindings.some(f => f.code === 'contract_crate_required'),
+    `fenced contractCrate must be ignored, got ${JSON.stringify(fencedFindings)}`,
+  );
+  // Outside code fence with canonical `contractCrate: crates/protocol` -> PASS.
+  const outsideMd = '## Стек\nRust\ncontractCrate: crates/protocol\n';
+  assert.deepEqual(rustContractCrateFindings(protoSpec, outsideMd), []);
+
+  // 2) Prose "No Cargo workspace" must NOT fabricate a shared root workspace for independent CLIs.
+  const noWsSpec = mkSpec(
+    [
+      {
+        id: 'w0',
+        epicId: 'foundation',
+        title: 'Scripts',
+        owner: 'architect',
+        dependsOn: [],
+        writePaths: ['scripts/ci.mjs'],
+      },
+      {
+        id: 't1',
+        epicId: 'domain',
+        title: 'Lint',
+        owner: 'developer',
+        dependsOn: ['w0'],
+        writePaths: ['tools/lint/Cargo.toml', 'tools/lint/src/**'],
+      },
+      {
+        id: 't2',
+        epicId: 'domain',
+        title: 'Fmt',
+        owner: 'developer',
+        dependsOn: ['w0'],
+        writePaths: ['tools/fmt/Cargo.toml', 'tools/fmt/src/**'],
+      },
+      {
+        id: 't3',
+        epicId: 'domain',
+        title: 'Gen',
+        owner: 'developer',
+        dependsOn: ['w0'],
+        writePaths: ['tools/gen/Cargo.toml', 'tools/gen/src/**'],
+      },
+    ],
+    ['No Cargo workspace — standalone tools'],
+  );
+  const noWsFindings = rustContractCrateFindings(noWsSpec, '## Стек\nRust (No Cargo workspace)\n');
+  assert.deepEqual(
+    noWsFindings,
+    [],
+    `prose "No Cargo workspace" must not create a workspace: ${JSON.stringify(noWsFindings)}`,
+  );
+
+  // 3) Two workspaces: contract in ws-a does NOT satisfy ws-b.
+  const twoWsSpec = mkSpec([
+    {
+      id: 'w0',
+      epicId: 'foundation',
+      title: 'WS A contracts',
+      owner: 'architect',
+      dependsOn: [],
+      writePaths: [
+        'architecture.policy.json',
+        'ws-a/Cargo.toml',
+        'ws-a/crates/a-contracts/Cargo.toml',
+        'ws-a/crates/a-contracts/src/**',
+        'ws-b/Cargo.toml',
+      ],
+    },
+    {
+      id: 'a1',
+      epicId: 'domain',
+      title: 'A1',
+      owner: 'developer',
+      dependsOn: ['w0'],
+      writePaths: ['ws-a/crates/a1/Cargo.toml', 'ws-a/crates/a1/src/**'],
+    },
+    {
+      id: 'a2',
+      epicId: 'domain',
+      title: 'A2',
+      owner: 'developer',
+      dependsOn: ['w0'],
+      writePaths: ['ws-a/crates/a2/Cargo.toml', 'ws-a/crates/a2/src/**'],
+    },
+    {
+      id: 'b1',
+      epicId: 'domain',
+      title: 'B1',
+      owner: 'developer',
+      dependsOn: ['w0'],
+      writePaths: ['ws-b/crates/b1/Cargo.toml', 'ws-b/crates/b1/src/**'],
+    },
+    {
+      id: 'b2',
+      epicId: 'domain',
+      title: 'B2',
+      owner: 'developer',
+      dependsOn: ['w0'],
+      writePaths: ['ws-b/crates/b2/Cargo.toml', 'ws-b/crates/b2/src/**'],
+    },
+    {
+      id: 'b3',
+      epicId: 'domain',
+      title: 'B3',
+      owner: 'developer',
+      dependsOn: ['w0'],
+      writePaths: ['ws-b/crates/b3/Cargo.toml', 'ws-b/crates/b3/src/**'],
+    },
+  ]);
+  const twoWsFindings = rustContractCrateFindings(twoWsSpec, '## Стек\nRust\ncontractCrate: ws-a/crates/a-contracts\n');
+  assert.ok(
+    twoWsFindings.some(f => f.code === 'contract_crate_required'),
+    `ws-a contract must not satisfy ws-b, got ${JSON.stringify(twoWsFindings)}`,
+  );
+
+  // 4) Existing v2 architecture policy is authoritative: contractCrate not in policy.contractCrates must NOT pass.
+  const mismatchPolicy = {
+    schemaVersion: 2,
+    language: 'rust',
+    contractCrates: ['other-contracts'],
+  };
+  const mismatchFindings = rustContractCrateFindings(protoSpec, outsideMd, mismatchPolicy);
+  assert.ok(
+    mismatchFindings.some(f => f.code === 'contract_crate_required'),
+    `contractCrate not listed in existing policy.contractCrates must fail, got ${JSON.stringify(mismatchFindings)}`,
+  );
+
+  const matchingPolicy = {
+    schemaVersion: 2,
+    language: 'rust',
+    contractCrates: ['protocol'],
+  };
+  assert.deepEqual(rustContractCrateFindings(protoSpec, outsideMd, matchingPolicy), []);
 });
