@@ -46,7 +46,7 @@ Finding — `{ code, taskIds?, message }`; сообщения не содерж�
 | `blueprint_interface_name` | в `interfaces/` файл не вида `<slug>.md` |
 | `blueprint_root_mismatch` | `root` в `spec.json` — другой каталог |
 | `blueprint_execution_invalid` | `execution` не `{cadence:'wave', integration:'branch'}` |
-| `blueprint_spec_invalid` | строгий `normalizeProjectSpec` отклонил spec (код `project_*` в сообщении) или вход задачи не прошёл safety |
+| `blueprint_spec_invalid` | строгий `normalizeProjectSpec` отклонил spec (код `project_*` в сообщении; сообщение называет запись — `spec.json`, майлстоун, эпик или задачу — и поле: лишнее, отсутствующее, неверное или ссылку на неизвестный id; для задачи — `taskIds`) или вход задачи не прошёл safety |
 | `blueprint_section_missing`, `blueprint_section_empty` | раздел `PROJECT.md` отсутствует или пуст |
 | `blueprint_owner_unknown` | `owner` не из списка ролей |
 | `blueprint_wave0_missing` | нет `foundation` или в нём нет задач |

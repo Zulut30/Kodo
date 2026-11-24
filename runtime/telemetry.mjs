@@ -678,11 +678,17 @@ function taskRow(task, own, current, reportOf) {
   };
 }
 
-function projectBlockers(snapshot, rows) {
+// An attempt that stopped (an external chat's abandon, a failed or cancelled Run) while its task
+// is still open waits for a retry even without a blocker record of its own.
+const stoppedAttemptStates = ['blocked', 'failed', 'cancelled'];
+const closedTaskStates = ['integrated', 'accepted', 'released', 'cancelled'];
+
+function projectBlockers(snapshot, rows, current) {
   const blockers = [];
   if (snapshot.project.paused === true)
     blockers.push({ taskId: null, runId: null, code: 'project_paused', scope: 'project', occurrences: null });
   for (const { row, last } of rows) {
+    const attempt = current.get(row.id);
     if (last?.blocker)
       blockers.push({
         taskId: row.id,
@@ -693,6 +699,14 @@ function projectBlockers(snapshot, rows) {
       });
     else if (row.status === 'blocked')
       blockers.push({ taskId: row.id, runId: null, code: 'task_blocked', scope: 'task', occurrences: null });
+    else if (stoppedAttemptStates.includes(attempt?.status) && !closedTaskStates.includes(row.status))
+      blockers.push({
+        taskId: row.id,
+        runId: token(attempt.runId),
+        code: `attempt_${attempt.status}`,
+        scope: 'attempt',
+        occurrences: null,
+      });
   }
   return blockers;
 }
@@ -745,7 +759,9 @@ function gateBlockers(gates) {
     .map(gate => ({
       taskId: null,
       runId: gate.row.runId,
-      code: gate.report?.blocker?.code ?? `gate_${gate.row.status}`,
+      gateId: gate.row.id,
+      // A gate Run blocked after its acceptance failed has only an error code, no blocker record.
+      code: gate.report?.blocker?.code ?? code(gate.run?.error?.code, `gate_${gate.row.status}`),
       scope: 'gate',
       occurrences: gate.report?.blocker?.occurrences ?? null,
     }));
@@ -895,7 +911,7 @@ export function buildProjectReport(
     attempts: attemptRows.map(item => item.row),
     totals,
     ...(waveGates ? { gates: waveGates.map(gate => gate.row) } : {}),
-    blockers: [...projectBlockers(snapshot, rows), ...(waveGates ? gateBlockers(waveGates) : [])],
+    blockers: [...projectBlockers(snapshot, rows, current), ...(waveGates ? gateBlockers(waveGates) : [])],
     completeness,
     provenance: {
       source: 'kodo-state',

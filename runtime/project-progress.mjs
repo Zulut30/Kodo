@@ -15,7 +15,8 @@ const integer = value => (Number.isSafeInteger(value) && value >= 0 ? String(val
 
 // Counts and fixed vocabulary only: no title, ID, root, prompt, error message,
 // mapping reason, credential or evidence path can cross this output boundary.
-export function buildProjectProgress(snapshot) {
+// `blockers` (optional): rows of `kodo report --project`; only their codes are counted here.
+export function buildProjectProgress(snapshot, blockers) {
   const project = snapshot?.project;
   const status = statuses.includes(project?.status) ? project.status : 'unknown';
   const lines = [
@@ -50,10 +51,22 @@ export function buildProjectProgress(snapshot) {
   }
   // Wave projects only: legacy snapshots have no gates key and no gates line.
   if (snapshot && Object.hasOwn(snapshot, 'gates')) lines.push(...gateLines(snapshot));
+  if (Array.isArray(blockers)) lines.push(blockerLine(blockers));
   lines.push(
     'Evidence: unknown until trusted validation; disabled gates: neutral; blocked or incomplete sets cannot establish acceptance.',
   );
   return lines.join('\n') + '\n';
+}
+
+// Codes only (task, attempt, gate or project blockers), never their task or Run ids.
+function blockerLine(blockers) {
+  const counts = new Map();
+  for (const row of blockers) {
+    const code = typeof row?.code === 'string' && /^[a-z][a-z0-9_]{0,63}$/.test(row.code) ? row.code : 'unknown';
+    counts.set(code, (counts.get(code) ?? 0) + 1);
+  }
+  const listed = [...counts].map(([code, total]) => `${code} ${total}`).join('; ');
+  return `blockers: ${blockers.length}${listed ? `; ${listed}` : ''}`;
 }
 
 function gateLines(snapshot) {

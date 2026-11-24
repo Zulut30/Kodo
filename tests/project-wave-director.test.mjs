@@ -12,6 +12,7 @@ import * as A from '../runtime/project-contracts.mjs';
 import { openProjectStore } from '../runtime/project-store.mjs';
 import { createProjectDirector, createProjectTransitionAuthorizer } from '../runtime/project-director.mjs';
 import { createWaveContext, selectWave } from '../runtime/project-director-waves.mjs';
+import { nextWave } from '../runtime/project-external.mjs';
 import { withIntegrationLease } from '../runtime/project-integration-lease.mjs';
 import { evaluateWaveTransition } from '../runtime/project-wave-evidence.mjs';
 import { confirmedCriteria } from './helpers/gate-review.mjs';
@@ -401,9 +402,22 @@ test(
     assert.equal(snapshot.epics[0].status, 'integrated');
     assert.equal(snapshot.gates.length, 1);
     assert.equal(f.store.getRun(snapshot.gates[0].runId).state, 'blocked');
+    // Audit finding 8a: a gate blocker names its gate and gate Run, the place of its findings.
+    const named = { gateId: snapshot.gates[0].id, runId: snapshot.gates[0].runId };
+    const gateRows = result =>
+      result.blockers.filter(row => row.kind === 'epic').map(({ gateId, runId }) => ({ gateId, runId }));
+    assert.deepEqual(gateRows(blocked), [named]);
+    // Audit finding 4a: the pull protocol names the stopped gate instead of an empty wave.
+    const ctx = { repo: f.repo, engine: f.engine, store: f.store, contracts: A };
+    const waiting = await nextWave(ctx, { projectId: f.id, host: 't3' });
+    assert.deepEqual(waiting.briefs, []);
+    assert.deepEqual(waiting.blocked, [
+      { code: 'no_verified_progress', kind: 'epic', id: 'e1', ...named, state: 'blocked' },
+    ]);
     await rm(f.flag);
     const still = await f.director.drain(f.id);
     assert.equal(still.status, 'blocked', 'a failed gate is retried only explicitly');
+    assert.deepEqual(gateRows(still), [named]);
     assert.equal(f.repo.snapshot(f.id).gates.length, 1);
     const accepted = await f.director.drain(f.id, { retryFailed: true });
     assert.equal(accepted.status, 'accepted', JSON.stringify(accepted));
@@ -726,6 +740,48 @@ test(
     assert.equal(projectGate.baseSha, epicGate.baseSha, 'the project gate reviews the whole project range');
     assert.equal(projectGate.merges.length, 2);
     assert.equal(f.calls.review, 2, 'the epic gate and the project gate');
+  },
+);
+
+test(
+  'A gate whose install is refused names its reserved Run, the install stage and the diagnosis',
+  { timeout: 300000 },
+  async t => {
+    // Review findings (minor): gate_invalid carried no runId, stage or diagnosis, although the
+    // reservation already names its Run; and the first install (right after the reservation)
+    // threw past the handler of a later install, so the CLI showed only project_blocked.
+    const refusal = 'Некорректный гейт эпика: owned install refusal';
+    const f = await fixture(t, {
+      tasks: [task('alpha')],
+      wrapRepo: repo => ({
+        ...repo,
+        installGateRun: async () => {
+          throw Object.assign(new Error(refusal), { code: 'gate_invalid' });
+        },
+      }),
+    });
+    const first = await f.director.drain(f.id);
+    assert.equal(first.status, 'blocked', JSON.stringify(first));
+    const [gate] = f.repo.snapshot(f.id).gates;
+    assert.equal(gate.installed, false);
+    assert.equal(typeof gate.runId, 'string');
+    const named = row => row.kind === 'epic';
+    // The first install (with the reservation) and a later one (the next pass) are reported alike.
+    const result = await f.director.drain(f.id);
+    assert.equal(result.status, 'blocked', JSON.stringify(result));
+    assert.deepEqual(first.blockers.filter(named), result.blockers.filter(named));
+    assert.equal(f.repo.snapshot(f.id).gates.length, 1, 'the refused reservation is not replaced');
+    assert.deepEqual(result.blockers.filter(named), [
+      {
+        code: 'gate_invalid',
+        kind: 'epic',
+        id: 'e1',
+        gateId: gate.id,
+        runId: gate.runId,
+        stage: 'install',
+        message: refusal,
+      },
+    ]);
   },
 );
 

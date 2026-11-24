@@ -123,7 +123,8 @@ test('Project drain reports a blocked wave project and refuses a legacy one with
   const legacyId = await create('legacy');
   const legacy = await projectCli(['drain', legacyId, '--json'], ports);
   assert.equal(legacy.exitCode, 2);
-  assert.deepEqual(legacy.report.result, { status: 'blocked', code: 'project_blocked' });
+  // Audit finding 8e: the constant refusal is reported, not hidden as project_blocked.
+  assert.deepEqual(legacy.report.result, { status: 'blocked', code: 'project_wave_not_enabled' });
 });
 
 test('CLI help lists project drain', () => {
