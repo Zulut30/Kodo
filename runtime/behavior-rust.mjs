@@ -8,11 +8,11 @@
  *    on the base and on the head, compared as a multiset of
  *    (package, target kind, target, test name).
  */
-import { createHash, randomBytes } from 'node:crypto';
-import { mkdirSync, readdirSync, realpathSync, rmSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { execute } from './command.mjs';
-import { ownsPath } from './contracts.mjs';
 import { stateHome, workerEnvironment } from './security.mjs';
 import { withWorktreeLock } from './workspace.mjs';
 
@@ -232,6 +232,18 @@ export function rustCrateRootProbe(file) {
   return `${parts.slice(0, crateDir + 2).join('/')}/main.rs`;
 }
 
+/** The crate directory of a Rust file, read from its path: what stands before `src/`, `tests/`, `benches/` or `examples/`. */
+export function rustCrateDir(file) {
+  const parts = file.split('/');
+  parts.pop();
+  const source = parts.lastIndexOf('src');
+  const at =
+    source >= 0
+      ? source
+      : Math.max(parts.lastIndexOf('tests'), parts.lastIndexOf('benches'), parts.lastIndexOf('examples'));
+  return (at >= 0 ? parts.slice(0, at) : parts).join('/');
+}
+
 /** The path of an attribute (`tokio::test`) and the tokens after it. */
 function attributePath(attribute) {
   const parts = [];
@@ -241,59 +253,79 @@ function attributePath(attribute) {
     if (attribute[at] !== '::') break;
     at++;
   }
-  return { path: parts, rest: attribute.slice(at) };
+  return { path: parts.join('::'), rest: attribute.slice(at) };
 }
 
-/** Configuration names that may be set when tests run; any other bare name is unset in a test build. */
-const variableCfgs = new Set(['unix', 'windows', 'debug_assertions', 'target_thread_local']);
-
 /**
- * A `cfg` predicate in a test build, three-valued: `T`, `F` or `U` (depends on
- * the platform, features or flags). `test` is set; `any()` is false, `all()` is
- * true; `feature = "…"` and `target_os = "…"` are unknown; another bare name
- * (`FALSE`, `miri`, `loom`) is unset, as rustc reads it without `--cfg`.
+ * A `cfg` predicate in a test build, three-valued: `T`, `F` or `U`. Only what is
+ * provably decided is decided: `test` (set in every test build), the literals
+ * `true` and `false`, `any()` (false), `all()` (true) and their compositions
+ * with `not`, `any`, `all`. Every other name — features, platforms, flags a
+ * `build.rs` sets, `FALSE` — is unknown: the registry of a full gate judges it.
  * @param {string[]} tokens
  * @returns {'T'|'F'|'U'}
  */
 function evaluateCfg(tokens, depth = 0) {
   const [head] = tokens;
   if (depth > 32) return 'U';
-  if ((head === 'any' || head === 'all' || head === 'not') && tokens[1] === '(') {
-    const values = split(tokens.slice(2, groupEnd(tokens, 1))).map(part => evaluateCfg(part, depth + 1));
+  if (
+    (head === 'any' || head === 'all' || head === 'not') &&
+    tokens[1] === '(' &&
+    groupEnd(tokens, 1) === tokens.length - 1
+  ) {
+    const values = split(tokens.slice(2, -1)).map(part => evaluateCfg(part, depth + 1));
     if (head === 'not') return values.length !== 1 ? 'U' : values[0] === 'T' ? 'F' : values[0] === 'F' ? 'T' : 'U';
     if (head === 'any') return values.includes('T') ? 'T' : values.includes('U') ? 'U' : 'F';
     return values.includes('F') ? 'F' : values.includes('U') ? 'U' : 'T';
   }
-  if (tokens.length === 1 && isIdentifier(head)) return head === 'test' ? 'T' : variableCfgs.has(head) ? 'U' : 'F';
+  if (tokens.length === 1) return head === 'test' || head === 'true' ? 'T' : head === 'false' ? 'F' : 'U';
   return 'U';
 }
 
-/** `#[cfg(…)]` whose predicate is false in every test build. */
-function cfgOff(attribute) {
+/**
+ * The attributes an attribute stands for in a test build: `cfg_attr(<true>, a, b)` is `a` and
+ * `b` (also nested), `cfg_attr(<false or unknown>, …)` is nothing the reading may count on.
+ * @returns {string[][]}
+ */
+function expand(attribute, depth = 0) {
   const { path: name, rest } = attributePath(attribute);
-  return name.length === 1 && name[0] === 'cfg' && rest[0] === '(' && evaluateCfg(rest.slice(1, -1)) === 'F';
+  if (name !== 'cfg_attr') return [attribute];
+  if (depth > 8 || rest[0] !== '(' || groupEnd(rest, 0) !== rest.length - 1) return [];
+  const [predicate, ...applied] = split(rest.slice(1, -1));
+  if (!predicate || evaluateCfg(predicate) !== 'T') return [];
+  return applied.flatMap(part => expand(part, depth + 1));
 }
 
-/** `#[ignore]`, or `#[cfg_attr(<predicate that may hold>, ignore)]`. */
-function ignores(attribute) {
+/** `#[cfg(…)]` whose predicate is provably false in a test build. */
+function cfgOff(attribute) {
   const { path: name, rest } = attributePath(attribute);
-  if (name.length === 1 && name[0] === 'ignore') return true;
-  if (name.length !== 1 || name[0] !== 'cfg_attr' || rest[0] !== '(') return false;
-  const [predicate, ...applied] = split(rest.slice(1, -1));
-  return predicate !== undefined && evaluateCfg(predicate) !== 'F' && applied.some(part => part[0] === 'ignore');
+  return (
+    name === 'cfg' && rest[0] === '(' && groupEnd(rest, 0) === rest.length - 1 && evaluateCfg(rest.slice(1, -1)) === 'F'
+  );
 }
 
 /** `#[test]`, `#[tokio::test]`, `#[::tokio::test(…)]`: an attribute path that ends in `test`. */
 function isTestAttribute(attribute) {
   const { path: name, rest } = attributePath(attribute);
-  return name[name.length - 1] === 'test' && (!rest.length || rest[0] === '(');
+  return (name === 'test' || name.endsWith('::test')) && (!rest.length || rest[0] === '(');
 }
 
-/** `#[should_panic]` with its arguments as one string, or null. */
+/**
+ * `#[should_panic]` as `any`, `#[should_panic(expected = "…")]` and `#[should_panic = "…"]` as
+ * `expected:<fingerprint>`, or null.
+ */
 function panics(attributes) {
-  const found = attributes.find(attribute => attributePath(attribute).path.join('::') === 'should_panic');
-  return found ? found.join(' ') : null;
+  const found = attributes.find(attribute => attributePath(attribute).path === 'should_panic');
+  if (!found) return null;
+  const rest = attributePath(found).rest;
+  const expected =
+    rest[0] === '=' ? rest[1] : rest[0] === '(' && rest[1] === 'expected' && rest[2] === '=' ? rest[3] : null;
+  return expected ? `expected:${expected}` : 'any';
 }
+
+/** An existing test is weaker when it no longer has to panic, or no longer with its message. */
+export const panicWeakened = (before, after) =>
+  before !== null && after !== before && !(before === 'any' && after?.startsWith('expected:'));
 
 /**
  * Where the body of the function whose signature starts at `from` opens: the first
@@ -343,39 +375,47 @@ function statements(tokens) {
   return list;
 }
 
+const literalPattern = /^(?:"[0-9a-f]{8}"|'[0-9a-f]{8}'|\d[\p{XID_Continue}.]*)$/u;
+/** Tokens without the parentheses that only wrap them: `((true))` is `true`. */
+function unwrap(tokens) {
+  let inner = tokens;
+  while (inner[0] === '(' && inner.length > 1 && groupEnd(inner, 0) === inner.length - 1) inner = inner.slice(1, -1);
+  return inner;
+}
+/** A literal, `true`/`false`, a negative number or one plain name: an operand that cannot change between reads. */
+function constant(tokens) {
+  const inner = unwrap(tokens);
+  if (inner.length === 2 && inner[0] === '-') return literalPattern.test(inner[1]);
+  return inner.length === 1 && (literalPattern.test(inner[0]) || isIdentifier(inner[0]));
+}
+const sameConstant = (left, right) =>
+  left !== undefined && right !== undefined && constant(left) && unwrap(left).join(' ') === unwrap(right).join(' ');
+
 const trivialMacros = new Set(['assert', 'debug_assert', 'assert_eq', 'debug_assert_eq']);
 
-/** `assert!(true)`, `assert!(!false)`, `assert!(x == x)`, `assert_eq!(x, x)`, with any delimiter. */
+/**
+ * An assertion that cannot fail: `assert!(true)`, `assert!(!false)`, `assert!((true))`,
+ * `assert!(x == x)` and `assert_eq!(x, x)` with constant operands (a literal or one plain name;
+ * `assert_eq!(read(), read())` may fail), also through `std::`/`core::` and with any delimiter.
+ */
 function trivialAssertion(statement) {
-  if (!trivialMacros.has(statement[0]) || statement[1] !== '!' || !OPENING.has(statement[2])) return false;
-  const close = groupEnd(statement, 2);
+  let at = statement[0] === '::' ? 1 : 0;
+  if ((statement[at] === 'std' || statement[at] === 'core') && statement[at + 1] === '::') at += 2;
+  const name = statement[at];
+  if (!trivialMacros.has(name) || statement[at + 1] !== '!' || !OPENING.has(statement[at + 2])) return false;
+  const close = groupEnd(statement, at + 2);
   if (close !== statement.length - 1) return false;
-  const args = split(statement.slice(3, close)).map(part => part.join(' '));
-  if (statement[0].endsWith('_eq')) return args.length >= 2 && args[0] === args[1];
-  const first = split(statement.slice(3, close))[0] ?? [];
+  const args = split(statement.slice(at + 3, close));
+  if (name.endsWith('_eq')) return sameConstant(args[0], args[1]);
+  const first = unwrap(args[0] ?? []);
+  if (first.length === 1 && first[0] === 'true') return true;
+  if (first[0] === '!' && unwrap(first.slice(1)).join(' ') === 'false') return true;
   const sides = split(first, '==');
-  return (
-    args[0] === 'true' || args[0] === '! false' || (sides.length === 2 && sides[0].join(' ') === sides[1].join(' '))
-  );
+  return sides.length === 2 && sameConstant(sides[0], sides[1]);
 }
 
-/** The inner tokens of a block that always runs: `{ … }`, `if true { … }`, `unsafe { … }`, `loop { … }`. */
-function unconditionalBlock(statement) {
-  const open = statement[0] === '{' ? 0 : statement[0] === 'if' && statement[1] === 'true' ? 2 : 1;
-  if (open === 1 && statement[0] !== 'unsafe' && statement[0] !== 'loop') return null;
-  if (statement[open] !== '{' || groupEnd(statement, open) !== statement.length - 1) return null;
-  return statement.slice(open + 1, -1);
-}
-
-/** A statement that can never check anything: dead `if false { … }`, or a closure nobody calls. */
-function inert(statement, uses) {
-  if (
-    statement[0] === 'if' &&
-    statement[1] === 'false' &&
-    statement[2] === '{' &&
-    groupEnd(statement, 2) === statement.length - 1
-  )
-    return true;
+/** A closure nobody calls or passes on: `|| …;`, `let check = || …;` with `check` never named again. */
+function unusedClosure(statement, uses) {
   const closureAt = at =>
     statement[at] === '|' ||
     statement[at] === '||' ||
@@ -384,35 +424,57 @@ function inert(statement, uses) {
   if (statement[0] !== 'let') return false;
   const name = statement[1] === 'mut' ? statement[2] : statement[1],
     equals = statement[1] === 'mut' ? 3 : 2;
-  // Only the definition names it: the closure is never called or passed on.
   return (
     (name === '_' || (isIdentifier(name) && uses.get(name) === 1)) && statement[equals] === '=' && closureAt(equals + 1)
   );
 }
 
-/** `live` when the body may check something, `returns` or `nothing` when it cannot. */
+/** `return;`, `return ();`, `return Ok(());`: a return that hands back nothing a test could check. */
+const emptyReturn = statement =>
+  statement[0] === 'return' && ['', '( )', 'Ok ( ( ) )'].includes(statement.slice(1).join(' '));
+
+/** `live` when a statement may check something, `returns` when it returns first, `nothing` when it cannot check. */
+function statementVerdict(statement, uses, level) {
+  if (!statement.length || trivialAssertion(statement) || unusedClosure(statement, uses)) return 'nothing';
+  if (statement[0] === 'return') return emptyReturn(statement) ? 'returns' : 'live';
+  if (level >= 16) return 'live';
+  const whole = open => statement[open] === '{' && groupEnd(statement, open) === statement.length - 1;
+  if (whole(0)) return verdict(statement.slice(1, -1), uses, level + 1);
+  if (statement[0] === 'unsafe' && whole(1)) return verdict(statement.slice(2, -1), uses, level + 1);
+  // A loop that checks nothing never ends: the test hangs, it does not pass.
+  if (statement[0] === 'loop' && whole(1)) {
+    const inner = verdict(statement.slice(2, -1), uses, level + 1);
+    return inner === 'returns' ? 'returns' : 'live';
+  }
+  if (statement[0] === 'if' && (statement[1] === 'true' || statement[1] === 'false') && statement[2] === '{') {
+    // A constant condition: only the branch that runs counts, `else` and `else if` included.
+    const thenEnd = groupEnd(statement, 2),
+      rest = statement.slice(thenEnd + 1);
+    if (statement[1] === 'true')
+      return rest.length && rest[0] !== 'else' ? 'live' : verdict(statement.slice(3, thenEnd), uses, level + 1);
+    if (!rest.length) return 'nothing';
+    if (rest[0] !== 'else') return 'live';
+    if (rest[1] === '{' && groupEnd(rest, 1) === rest.length - 1) return verdict(rest.slice(2, -1), uses, level + 1);
+    return rest[1] === 'if' ? statementVerdict(rest.slice(1), uses, level + 1) : 'live';
+  }
+  return 'live';
+}
+
 function verdict(tokens, uses, level = 0) {
   for (const statement of statements(tokens)) {
-    if (!statement.length || trivialAssertion(statement) || inert(statement, uses)) continue;
-    if (statement[0] === 'return') return 'returns';
-    const block = level < 16 ? unconditionalBlock(statement) : null;
-    if (block) {
-      const inner = verdict(block, uses, level + 1);
-      if (inner === 'nothing') continue;
-      return inner;
-    }
-    return 'live';
+    const found = statementVerdict(statement, uses, level);
+    if (found !== 'nothing') return found;
   }
   return 'nothing';
 }
 
 /**
  * Why a Rust test cannot fail, or null. Precision before reach: only an empty
- * body (or comments only), a body of assertions that cannot fail (`assert!(true)`,
- * `assert_eq!(x, x)`, compared by tokens with literal values kept), dead
- * `if false { … }` blocks and closures never called, or a `return` before the
- * first statement (also in `{ … }`, `if true { … }`, `loop { … }`) is refused.
- * Any other statement, a call to an unknown helper included, may check.
+ * body (or comments only), a body of assertions that cannot fail, dead
+ * `if false { … }` branches and closures never called, or an empty `return`
+ * (`return;`, `return ();`, `return Ok(());`) before the first statement that
+ * may check is refused. Any other statement, a call to an unknown helper or a
+ * `return` with a value included, may check.
  * @param {string[]} body Tokens of the body.
  */
 export function rustWeakness(body) {
@@ -423,15 +485,44 @@ export function rustWeakness(body) {
   return found === 'live' ? null : found === 'returns' ? 'returns before any check' : 'only checks that cannot fail';
 }
 
+/** The tests a `macro_rules!` body would define: `#[test] fn name` or `#[test] fn $name`, with their bodies. */
+function templateTests(tokens) {
+  const tests = [];
+  let attributes = [];
+  for (let at = 0; at < tokens.length; at++) {
+    const token = tokens[at];
+    if (token === '#' && tokens[at + 1] === '[') {
+      const close = groupEnd(tokens, at + 1);
+      attributes.push(...expand(tokens.slice(at + 2, close)));
+      at = close;
+    } else if (token === 'fn') {
+      const name = tokens[at + 1] === '$' ? `$${tokens[at + 2]}` : tokens[at + 1];
+      const own = attributes;
+      attributes = [];
+      if (!own.some(isTestAttribute) || !name) continue;
+      const { open, stop } = bodyStart(tokens, at + (name.startsWith('$') ? 3 : 2));
+      if (open === undefined) {
+        at = /** @type {number} */ (stop);
+        continue;
+      }
+      const close = groupEnd(tokens, open),
+        body = tokens.slice(open + 1, close);
+      tests.push({ name, body: body.join(' '), weak: rustWeakness(body) });
+      at = close;
+    } else if (token === ';' || token === '{' || token === '}') attributes = [];
+  }
+  return tests;
+}
+
 /**
  * Rust tests of one file, read token by token: the attributes since the last
  * `;`, `{` or `}` belong to the next `fn`. With a test attribute it is a case
  * named as libtest prints it: the module path of the file, the inline `mod`
- * blocks around it, the function. `#[ignore]` (also through `cfg_attr` with a
- * predicate that may hold) and a `cfg` that is false in a test build, on the
- * function, a module around it or the file (`#![cfg(…)]`), switch it off. A
- * `macro_rules!` body is a template, not tests. Each case keeps its body as
- * tokens and its `should_panic`.
+ * blocks around it, the function. `cfg_attr(<true>, …)` is expanded, also
+ * nested. A test is switched off by `#[ignore]` (`off: 'ignore'`) or by a `cfg`
+ * provably false in a test build on the function, a module around it or the
+ * file (`off: 'cfg'`). A `macro_rules!` body is a template: its tests are kept
+ * apart (`templates`), with the macros the file calls (`calls`).
  * @param {string} file
  * @param {string} source
  * @param {{ nestedCrate?: boolean }} [options]
@@ -442,6 +533,8 @@ export function rustCases(file, source, { nestedCrate = false } = {}) {
     prefix = rustModulePath(file, nestedCrate),
     cases = [],
     bodies = [],
+    templates = [],
+    calls = new Set(),
     scopes = [{ name: '', depth: 0, off: false }];
   let depth = 0,
     attributes = [],
@@ -453,15 +546,18 @@ export function rustCases(file, source, { nestedCrate = false } = {}) {
       const inner = tokens[index + 1] === '!',
         open = inner ? index + 2 : index + 1,
         close = groupEnd(tokens, open),
-        attribute = tokens.slice(open + 1, close);
+        effective = expand(tokens.slice(open + 1, close));
       // An inner attribute (`#![cfg(…)]`) belongs to the module or file it stands in.
-      if (inner) scopes[scopes.length - 1].off ||= cfgOff(attribute);
-      else attributes.push(attribute);
+      if (inner) scopes[scopes.length - 1].off ||= effective.some(cfgOff);
+      else attributes.push(...effective);
       index = close + 1;
     } else if (token === 'macro_rules' && tokens[index + 1] === '!') {
       let open = index + 2;
-      if (isIdentifier(tokens[open])) open++;
-      index = OPENING.has(tokens[open]) ? groupEnd(tokens, open) + 1 : open;
+      const name = isIdentifier(tokens[open]) ? tokens[open++] : '';
+      const close = OPENING.has(tokens[open]) ? groupEnd(tokens, open) : open - 1;
+      const tests = close > open ? templateTests(tokens.slice(open + 1, close)) : [];
+      if (name && tests.length) templates.push({ name, tests });
+      index = close + 1;
       attributes = [];
     } else if (token === '{') {
       depth++;
@@ -498,18 +594,28 @@ export function rustCases(file, source, { nestedCrate = false } = {}) {
       const close = groupEnd(tokens, open),
         body = tokens.slice(open + 1, close);
       bodies.push(body.join(' '));
+      const off = own.some(cfgOff) || scopes.some(scope => scope.off) ? 'cfg' : own.some(ignores) ? 'ignore' : null;
       cases.push({
         name: [...prefix, ...scopes.slice(1).map(scope => scope.name), name].join('::'),
-        skipped: own.some(ignores) || own.some(cfgOff) || scopes.some(scope => scope.off),
+        skipped: off !== null,
+        off,
         body: body.join(' '),
         weak: rustWeakness(body),
         panics: panics(own),
       });
       index = close + 1;
-    } else index++;
+    } else {
+      if (isIdentifier(token) && tokens[index + 1] === '!' && OPENING.has(tokens[index + 2])) calls.add(token);
+      index++;
+    }
   }
   // Assertions are counted in the test bodies only: production code may assert too.
-  return { code: bodies.join('\n'), cases };
+  return { code: bodies.join('\n'), cases, templates, calls };
+}
+
+/** `#[ignore]` in a test build (after `cfg_attr` is expanded). */
+function ignores(attribute) {
+  return attributePath(attribute).path === 'ignore';
 }
 
 /**
@@ -532,6 +638,53 @@ export function packageName(id) {
   return decodeURIComponent(url.slice(url.lastIndexOf('/') + 1));
 }
 
+/** A path as the file system names it: symbolic links, `/private/var`, 8.3 names and `\\?\` resolved. */
+function canonical(value) {
+  let resolved;
+  try {
+    resolved = realpathSync.native(value);
+  } catch {
+    resolved = path.resolve(value);
+  }
+  resolved = resolved.replace(/^\\\\\?\\(?!UNC\\)/, '');
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
+/** The kind of a Cargo target as the registry compares it. */
+const kindOf = kinds => ['bin', 'test', 'bench', 'example'].find(kind => kinds.split(',').includes(kind)) ?? 'lib';
+
+/**
+ * Targets declared with `harness = false` in a manifest: libtest does not run them, so their
+ * `--list` says nothing. Read line by line from the `[lib]`, `[[bin]]`, `[[test]]`, `[[bench]]`
+ * and `[[example]]` tables. @returns {Set<string>} `kind:name`
+ */
+export function harnessFreeTargets(manifest, packageNameValue) {
+  const found = new Set();
+  let section = null;
+  const close = () => {
+    if (section?.harness === false)
+      found.add(
+        `${section.kind}:${section.name ?? (section.kind === 'lib' ? packageNameValue.replace(/-/g, '_') : '')}`,
+      );
+  };
+  for (const raw of manifest.split(/\r?\n/)) {
+    const line = raw.replace(/#.*$/, '').trim();
+    const header = /^\[\[?\s*([\w.-]+)\s*\]\]?$/.exec(line);
+    if (header) {
+      close();
+      const kind = { lib: 'lib', bin: 'bin', test: 'test', bench: 'bench', example: 'example' }[header[1]];
+      section = kind ? { kind } : null;
+      continue;
+    }
+    if (!section) continue;
+    const name = /^name\s*=\s*"([^"]*)"/.exec(line);
+    if (name) section.name = name[1];
+    if (/^harness\s*=\s*false\b/.test(line)) section.harness = false;
+  }
+  close();
+  return found;
+}
+
 /** The environment a test executable needs to find the libraries next to it, as Cargo gives it. */
 function libraryEnvironment(env, executable) {
   const key =
@@ -550,7 +703,9 @@ const LIST_TIMEOUT_MS = 120000;
 /**
  * The test registry of one checkout: `cargo test --workspace --no-run
  * --message-format=json` names the test executables, and each one lists its
- * tests (`--list --format terse`) and its ignored tests (`… --ignored`).
+ * tests (`--list --format terse`) and its ignored tests (`… --ignored`). A
+ * `harness = false` target is not run: it is one entry with an empty name, so
+ * the target itself is tracked.
  * @param {{ checkout: string, targetDir?: string, runner: any, signal?: AbortSignal, secrets?: any,
  *   env: Record<string, string> }} input `targetDir`: a target directory of its own (the base).
  * @returns {Promise<{ entries: { package: string, kind: string, target: string, dir: string, name: string, ignored: boolean }[] } | { reason: string }>}
@@ -558,13 +713,7 @@ const LIST_TIMEOUT_MS = 120000;
 async function listRegistry({ checkout, targetDir, runner, signal, secrets, env }) {
   const run = async (command, args, options) => {
     try {
-      const result = await runner(command, args, {
-        signal,
-        secrets,
-        allowFailure: true,
-        rawOutput: true,
-        ...options,
-      });
+      const result = await runner(command, args, { signal, secrets, allowFailure: true, rawOutput: true, ...options });
       return result.code === 0 ? { stdout: result.stdout } : { reason: `exit_${result.code}` };
     } catch (error) {
       if (signal?.aborted || error.code === 'cancelled') throw error;
@@ -575,7 +724,7 @@ async function listRegistry({ checkout, targetDir, runner, signal, secrets, env 
     cwd: checkout,
     env: targetDir ? { ...env, CARGO_TARGET_DIR: targetDir } : env,
   });
-  if (built.reason) return { reason: `build_${built.reason}` };
+  if ('reason' in built) return { reason: `build_${built.reason}` };
   const executables = new Map();
   for (const line of built.stdout.split(/\r?\n/)) {
     if (!line.startsWith('{')) continue;
@@ -588,14 +737,36 @@ async function listRegistry({ checkout, targetDir, runner, signal, secrets, env 
     if (message.reason !== 'compiler-artifact' || message.profile?.test !== true || !message.executable) continue;
     executables.set(message.executable, message);
   }
-  const entries = [];
+  const root = canonical(checkout),
+    manifests = new Map(),
+    entries = [];
   for (const [executable, message] of executables) {
-    const where = path.dirname(message.manifest_path ?? path.join(checkout, 'Cargo.toml'));
+    const manifest = message.manifest_path ?? path.join(checkout, 'Cargo.toml'),
+      where = path.dirname(manifest),
+      packageValue = packageName(String(message.package_id ?? '')),
+      kind = [].concat(message.target?.kind ?? []).join(','),
+      target = String(message.target?.name ?? '');
+    // Both sides canonical: a manifest path through `/private/var`, an 8.3 name or `\\?\` is the same directory.
+    const dir = path.relative(root, canonical(where)).split(path.sep).join('/');
+    if (!manifests.has(manifest)) {
+      let text = '';
+      try {
+        text = readFileSync(manifest, 'utf8');
+      } catch {
+        // A manifest that cannot be read declares no harness-free target.
+      }
+      manifests.set(manifest, harnessFreeTargets(text, packageValue));
+    }
+    const entry = { package: packageValue, kind, target, dir };
+    if (manifests.get(manifest).has(`${kindOf(kind)}:${target}`)) {
+      entries.push({ ...entry, name: '', ignored: false });
+      continue;
+    }
     const options = { cwd: where, env: libraryEnvironment(env, executable), timeoutMs: LIST_TIMEOUT_MS };
     const all = await run(executable, ['--list', '--format', 'terse'], options);
-    if (all.reason) return { reason: `list_${all.reason}` };
+    if ('reason' in all) return { reason: `list_${all.reason}` };
     const ignored = await run(executable, ['--list', '--format', 'terse', '--ignored'], options);
-    if (ignored.reason) return { reason: `list_${ignored.reason}` };
+    if ('reason' in ignored) return { reason: `list_${ignored.reason}` };
     const names = output =>
       output
         .split(/\r?\n/)
@@ -603,96 +774,165 @@ async function listRegistry({ checkout, targetDir, runner, signal, secrets, env 
         .filter(Boolean);
     const off = new Map();
     for (const name of names(ignored.stdout)) off.set(name, (off.get(name) ?? 0) + 1);
-    const dir = path.relative(checkout, where).split(path.sep).join('/');
     for (const name of names(all.stdout)) {
       const left = off.get(name) ?? 0;
       if (left > 0) off.set(name, left - 1);
-      entries.push({
-        package: packageName(String(message.package_id ?? '')),
-        kind: [].concat(message.target?.kind ?? []).join(','),
-        target: String(message.target?.name ?? ''),
-        dir,
-        name,
-        ignored: left > 0,
-      });
+      entries.push({ ...entry, name, ignored: left > 0 });
     }
   }
   return { entries };
 }
 
-const processAlive = pid => {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return error.code === 'EPERM';
-  }
-};
-const samePath = (left, right) => {
-  const normal = value => {
-    const resolved = path.resolve(value).split(path.sep).join('/');
-    return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
-  };
-  return normal(left) === normal(right);
-};
+const samePath = (left, right) => canonical(left) === canonical(right);
 
-/** Remove a base checkout: deregistered from Git and gone from disk, or the reason it is not. */
-async function removeCheckout(cwd, checkout, signal) {
+/** Remove a base checkout, also after a cancelled gate: no signal, a bounded wait. The reason it failed, or null. */
+async function removeCheckout(cwd, checkout) {
   try {
-    await withWorktreeLock(cwd, () => execute('git', ['worktree', 'remove', '--force', checkout], { cwd }), signal);
+    await withWorktreeLock(
+      cwd,
+      async () => {
+        await execute('git', ['worktree', 'remove', '--force', checkout], {
+          cwd,
+          allowFailure: true,
+          timeoutMs: 60000,
+        });
+        // A checkout deleted behind Git's back stays registered until it is pruned.
+        await execute('git', ['worktree', 'prune'], { cwd, allowFailure: true, timeoutMs: 60000 });
+      },
+      undefined,
+      60000,
+    );
+    const listed = (await execute('git', ['worktree', 'list', '--porcelain'], { cwd, timeoutMs: 60000 })).stdout;
+    if (
+      listed
+        .split(/\r?\n/)
+        .filter(line => line.startsWith('worktree '))
+        .some(line => samePath(line.slice(9), checkout))
+    )
+      return 'worktree is still registered';
+    rmSync(checkout, { recursive: true, force: true });
+    return null;
   } catch (error) {
-    return `worktree remove failed: ${String(error.message).slice(0, 300)}`;
+    return String(error.message).slice(0, 300);
   }
+}
+
+/**
+ * The base checkout at a stable path, at `baseSha`, clean. A stable path keeps Cargo's
+ * fingerprints of the workspace crates, so a repeated base builds incrementally. A checkout
+ * that is missing, unregistered or broken is removed and added again.
+ */
+async function prepareCheckout(cwd, checkout, baseSha, signal) {
   const listed = (await execute('git', ['worktree', 'list', '--porcelain'], { cwd })).stdout;
-  if (
-    listed
-      .split(/\r?\n/)
-      .filter(line => line.startsWith('worktree '))
-      .some(line => samePath(line.slice(9), checkout))
-  )
-    return 'worktree is still registered';
-  rmSync(checkout, { recursive: true, force: true });
-  return null;
-}
-
-/** Base checkouts a crashed gate left behind (`kodo-registry-<pid>-…` of a process that is gone). */
-async function removeStale(cwd, checkouts, signal) {
-  let names = [];
-  try {
-    names = readdirSync(checkouts);
-  } catch {
-    return;
+  const registered = listed
+    .split(/\r?\n/)
+    .filter(line => line.startsWith('worktree '))
+    .some(line => samePath(line.slice(9), checkout));
+  if (registered && existsSync(checkout)) {
+    try {
+      const moved = await execute('git', ['checkout', '--detach', '--force', '--quiet', baseSha], {
+        cwd: checkout,
+        allowFailure: true,
+        signal,
+      });
+      const cleaned =
+        moved.code === 0 && (await execute('git', ['clean', '-ffdxq'], { cwd: checkout, allowFailure: true, signal }));
+      if (cleaned && cleaned.code === 0) return;
+    } catch (error) {
+      if (signal?.aborted || error.code === 'cancelled') throw error;
+      // A broken checkout is added again below.
+    }
   }
-  const stale = names.filter(name => {
-    const pid = Number(/^kodo-registry-(\d+)-/.exec(name)?.[1]);
-    return Number.isInteger(pid) && pid > 0 && !processAlive(pid);
-  });
-  for (const name of stale) await removeCheckout(cwd, path.join(checkouts, name), signal);
-  if (stale.length)
-    await withWorktreeLock(cwd, () => execute('git', ['worktree', 'prune'], { cwd, allowFailure: true }), signal);
+  const failure = await removeCheckout(cwd, checkout);
+  if (failure && registered) throw new Error(`base checkout cleanup: ${failure}`);
+  rmSync(checkout, { recursive: true, force: true });
+  await withWorktreeLock(
+    cwd,
+    async () => {
+      await execute('git', ['worktree', 'prune'], { cwd, allowFailure: true });
+      await execute('git', ['worktree', 'add', '--detach', '--quiet', checkout, baseSha], { cwd });
+    },
+    signal,
+  );
 }
 
-/** Kodo's state directory for the registry of one repository: base checkouts and the base target directory. */
+/**
+ * A lock across processes on the base build directory, for the whole build and listing: two
+ * gates must not overwrite each other's base executables (the same path for different
+ * bases). An SQLite write transaction, as the worktree lock: process death releases it.
+ */
+async function withBaseLock(home, action, signal, waitMs = 4 * 60 * 60 * 1000) {
+  const { DatabaseSync } = await import('node:sqlite');
+  mkdirSync(home, { recursive: true });
+  const guard = new DatabaseSync(path.join(home, 'registry-base.lock.sqlite'), { timeout: 0 });
+  const started = performance.now();
+  try {
+    for (;;) {
+      signal?.throwIfAborted();
+      try {
+        guard.exec('BEGIN IMMEDIATE');
+        break;
+      } catch (error) {
+        if ((error.errcode & 0xff) !== 5) throw error;
+      }
+      if (performance.now() - started > waitMs)
+        throw Object.assign(new Error('Timed out waiting for the base build of the test registry'), {
+          code: 'timeout',
+        });
+      await delay(200, undefined, { signal });
+    }
+    return await action();
+  } finally {
+    guard.close();
+  }
+}
+
+/** Kodo's state directory for the registry of one repository: the base checkout, its target directory, the cache. */
 async function registryHomeFor(cwd) {
   const common = (
     await execute('git', ['rev-parse', '--path-format=absolute', '--git-common-dir'], { cwd, rawOutput: true })
   ).stdout.replace(/\r?\n$/, '');
-  const key = createHash('sha256')
-    .update(process.platform === 'win32' ? realpathSync.native(common).toLowerCase() : realpathSync.native(common))
-    .digest('hex')
-    .slice(0, 16);
+  const key = createHash('sha256').update(canonical(common)).digest('hex').slice(0, 16);
   return path.join(stateHome(), 'registry', key);
 }
 
+/** Where a file stands in a package: the target kind and name a test in it belongs to. */
+function targetOf(file, dir, nested) {
+  const parts = (dir ? file.slice(dir.length + 1) : file).split('/'),
+    stem = name => name.replace(/\.rs$/i, '');
+  if (parts[0] === 'src') {
+    if (parts[1] === 'bin') return { kind: 'bin', target: parts.length === 3 ? stem(parts[2]) : parts[2] };
+    if (parts.length === 2 && parts[1] === 'main.rs') return { kind: 'bin', target: null };
+    return { kind: 'lib-or-main', target: null };
+  }
+  const kind = { tests: 'test', benches: 'bench', examples: 'example' }[parts[0]];
+  if (!kind) return { kind: 'lib-or-main', target: null };
+  if (parts.length === 2) return { kind, target: stem(parts[1]) };
+  // `tests/<t>/main.rs` and its modules are target `<t>`; another directory is a module shared by any test target.
+  return { kind, target: nested || parts[parts.length - 1] === 'main.rs' ? parts[1] : null };
+}
+
+/** Whether a test of `file` can be the registry entry: same package directory, same target. */
+function sameTarget(item, entry, owner) {
+  if (owner(item.file) !== entry.dir) return false;
+  const { kind, target } = targetOf(item.file, entry.dir, item.nested),
+    entryKind = kindOf(entry.kind),
+    main = entryKind === 'bin' && entry.target.replace(/-/g, '_') === entry.package.replace(/-/g, '_');
+  if (kind === 'lib-or-main') return entryKind === 'lib' || main;
+  if (kind === 'bin') return entryKind === 'bin' && (target === null ? main : entry.target === target);
+  return entryKind === kind && (target === null || entry.target === target);
+}
+
 /**
- * Compare the registry of the base and the head. A name gone from the head, or
- * ignored there and not on the base, that the reading of the source has not
- * already reported is a finding. A base case in a file this run may reduce is
- * allowed; every explanation and every permission is used once.
- * @param {{ base: any[], head: any[], explained: { name: string, file: string }[],
- *   located: { name: string, file: string }[], allowed: string[] }} input
+ * Compare the registry of the base and the head. A test gone from the head, or ignored there
+ * and not on the base, that the reading of the source has not explained is a finding. Every
+ * explanation and every permission is matched to one base entry by (package, target kind,
+ * target, name) and used once: removals (also moves and a `cfg` provably false) explain gone
+ * tests, ignores explain ignored ones, and a permission covers only a test that is gone from
+ * its permitted file on the head. A `harness = false` target is one entry with an empty name.
+ * @param {{ base: any[], head: any[], removals: any[], skips: any[], permissions: any[] }} input
  */
-export function compareRegistry({ base, head, explained, located, allowed }) {
+export function compareRegistry({ base, head, removals, skips, permissions }) {
   const key = entry => `${entry.package}\u0000${entry.kind}\u0000${entry.target}\u0000${entry.name}`;
   const dirs = [...new Set([...base, ...head].map(entry => entry.dir))];
   const owner = file =>
@@ -702,20 +942,18 @@ export function compareRegistry({ base, head, explained, located, allowed }) {
         (best, dir) => (best === null || dir.length > best.length ? dir : best),
         /** @type {string|null} */ (null),
       );
-  const pool = list => {
+  const byName = list => {
     const map = new Map();
     for (const item of list) {
-      const slot = `${owner(item.file)}\u0000${item.name}`;
-      if (!map.has(slot)) map.set(slot, []);
-      map.get(slot).push(item);
+      if (!map.has(item.name)) map.set(item.name, []);
+      map.get(item.name).push(item);
     }
     return map;
   };
-  const reasons = pool(explained),
-    permissions = pool(located);
-  const take = (map, entry, accept = _item => true) => {
-    const list = map.get(`${entry.dir}\u0000${entry.name}`);
-    const at = list ? list.findIndex(accept) : -1;
+  const pools = { removals: byName(removals), skips: byName(skips), permissions: byName(permissions) };
+  const take = (pool, entry) => {
+    const list = pool.get(entry.name);
+    const at = list ? list.findIndex(item => sameTarget(item, entry, owner)) : -1;
     return at < 0 ? null : list.splice(at, 1)[0];
   };
   const tally = list => {
@@ -738,16 +976,17 @@ export function compareRegistry({ base, head, explained, located, allowed }) {
     const removed = Math.max(0, counts.total - now.total);
     const switched = Math.max(0, Math.max(0, counts.active - removed) - now.active);
     for (let left = removed; left > 0; left--) {
-      if (take(reasons, counts.entry)) continue;
-      const item = take(permissions, counts.entry, candidate => ownsPath(allowed, candidate.file));
-      if (item) {
-        if (!permitted.has(item.file)) permitted.set(item.file, []);
-        permitted.get(item.file).push(counts.entry);
-      } else gone.push(counts.entry);
+      if (take(pools.removals, counts.entry)) continue;
+      const item = take(pools.permissions, counts.entry);
+      if (!item) gone.push(counts.entry);
+      else {
+        if (!permitted.has(item.file)) permitted.set(item.file, new Set());
+        permitted.get(item.file).add(counts.entry);
+      }
     }
-    for (let left = switched; left > 0; left--) if (!take(reasons, counts.entry)) off.push(counts.entry);
+    for (let left = switched; left > 0; left--) if (!take(pools.skips, counts.entry)) off.push(counts.entry);
   }
-  const label = entry => `${entry.package} ${entry.kind} ${entry.target}: ${entry.name}`;
+  const label = entry => `${entry.package} ${entry.kind} ${entry.target}: ${entry.name || '(target, harness = false)'}`;
   const names = list =>
     `${list
       .slice(0, 5)
@@ -772,22 +1011,58 @@ export function compareRegistry({ base, head, explained, located, allowed }) {
     permitted: [...permitted].map(([file, list]) => ({
       rule: 'test_deleted',
       file,
-      detail: `test registry: tests are gone: ${names(list)}`,
+      detail: `test registry: tests are gone: ${names([...list])}`,
     })),
     base: count(before),
     head: count(after),
   };
 }
 
+/** What a cached base registry depends on: the commit, the lock file, the toolchain, the flags. */
+async function cacheKey(cwd, baseSha, toolchain) {
+  const lock = await execute('git', ['show', `${baseSha}:Cargo.lock`], { cwd, allowFailure: true, rawOutput: true });
+  return createHash('sha256')
+    .update(
+      JSON.stringify([
+        1,
+        baseSha,
+        lock.code === 0 ? createHash('sha256').update(lock.stdout).digest('hex') : null,
+        toolchain,
+        process.env.RUSTFLAGS ?? null,
+        process.env.CARGO_BUILD_TARGET ?? null,
+      ]),
+    )
+    .digest('hex');
+}
+
+function readCache(file) {
+  try {
+    const value = JSON.parse(readFileSync(file, 'utf8'));
+    return Array.isArray(value?.entries) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeCache(file, entries) {
+  try {
+    mkdirSync(path.dirname(file), { recursive: true });
+    const temporary = `${file}.${process.pid}.tmp`;
+    writeFileSync(temporary, JSON.stringify({ entries }));
+    renameSync(temporary, file);
+  } catch {
+    // A cache that cannot be written only costs the next gate a build.
+  }
+}
+
 /**
- * The registry check of a full gate on a Rust project. The head is listed in
- * the checked worktree; the base in a temporary `git worktree` under Kodo's
- * state directory, built into its own target directory (`registry-base`), never
- * the head's: an oracle after the gate must not find base binaries. Adding and
- * removing the checkout hold the repository's worktree lock; the build does
- * not. A base without `Cargo.toml` (a new crate) is an empty registry.
- * `incomplete` — Cargo missing, a build or a listing failed, the checkout not
- * removed — is never a pass.
+ * The registry check of a full gate on a Rust project: a root `Cargo.toml` on the base or the
+ * head. A side without it is an empty registry (a new crate; a manifest removed). The head is
+ * listed in the checked worktree. The base is listed in a checkout at a stable path under
+ * Kodo's state directory, built into its own target directory (`registry-base`), never the
+ * head's, under a lock across processes for the whole build and listing; a finished base
+ * registry is cached by commit, `Cargo.lock`, toolchain and flags. `incomplete` — Cargo
+ * missing, a build or a listing failed, the checkout broken — is never a pass.
  */
 export async function rustRegistryCheck({
   cwd,
@@ -796,71 +1071,119 @@ export async function rustRegistryCheck({
   secrets,
   runner,
   registryHome,
-  allowed,
-  explained,
-  located,
+  baseIsRust,
+  headIsRust,
+  removals,
+  skips,
+  permissions,
 }) {
   const env = workerEnvironment();
+  let toolchain;
   try {
-    await runner('cargo', ['--version'], { cwd, signal, env, secrets, allowFailure: false });
+    toolchain = String(
+      (await runner('cargo', ['--version'], { cwd, signal, env, secrets, allowFailure: false })).stdout,
+    ).trim();
   } catch (error) {
     if (signal?.aborted || error.code === 'cancelled') throw error;
     return { registry: { status: 'incomplete', reason: 'cargo_unavailable' } };
   }
-  const after = await listRegistry({ checkout: cwd, runner, signal, secrets, env });
-  if ('reason' in after) return { registry: { status: 'incomplete', reason: `head_${after.reason}` } };
-  const baseIsRust =
-    (await execute('git', ['cat-file', '-e', `${baseSha}:Cargo.toml`], { cwd, allowFailure: true })).code === 0;
-  let before = { entries: [] };
+  let after = /** @type {any} */ ({ entries: [] });
+  if (headIsRust) {
+    after = await listRegistry({ checkout: cwd, runner, signal, secrets, env });
+    if ('reason' in after) return { registry: { status: 'incomplete', reason: `head_${after.reason}` } };
+  }
+  let before = /** @type {any} */ ({ entries: [] }),
+    cached = false;
   if (baseIsRust) {
     const home = registryHome ?? (await registryHomeFor(cwd)),
-      checkouts = path.join(home, 'checkouts');
-    const checkout = path.join(checkouts, `kodo-registry-${process.pid}-${randomBytes(6).toString('hex')}`);
-    try {
-      mkdirSync(checkouts, { recursive: true });
-      await removeStale(cwd, checkouts, signal);
-      await withWorktreeLock(
-        cwd,
-        () => execute('git', ['worktree', 'add', '--detach', '--quiet', checkout, baseSha], { cwd }),
-        signal,
-      );
-    } catch (error) {
-      if (signal?.aborted || error.code === 'cancelled') throw error;
+      cache = path.join(home, 'cache', `${await cacheKey(cwd, baseSha, toolchain)}.json`);
+    const hit = readCache(cache);
+    if (hit) {
+      before = hit;
+      cached = true;
+    } else {
       try {
-        rmSync(checkout, { recursive: true, force: true });
-      } catch {
-        // The checkout was never created.
+        before = await withBaseLock(
+          home,
+          async () => {
+            // Another gate may have built this base while this one waited.
+            const ready = readCache(cache);
+            if (ready) {
+              cached = true;
+              return ready;
+            }
+            const checkout = path.join(home, 'base-checkout');
+            await prepareCheckout(cwd, checkout, baseSha, signal);
+            const listed = await listRegistry({
+              checkout,
+              targetDir: path.join(home, 'registry-base'),
+              runner,
+              signal,
+              secrets,
+              env,
+            });
+            if (!('reason' in listed)) writeCache(cache, listed.entries);
+            return listed;
+          },
+          signal,
+        );
+      } catch (error) {
+        if (signal?.aborted || error.code === 'cancelled') throw error;
+        return {
+          registry: { status: 'incomplete', reason: `base_checkout: ${String(error.message).slice(0, 300)}` },
+        };
       }
-      return {
-        registry: { status: 'incomplete', reason: `base_checkout: ${String(error.message).slice(0, 300)}` },
-      };
+      if ('reason' in before) return { registry: { status: 'incomplete', reason: `base_${before.reason}` } };
     }
-    let listed;
-    try {
-      listed = await listRegistry({
-        checkout,
-        targetDir: path.join(home, 'registry-base'),
-        runner,
-        signal,
-        secrets,
-        env,
-      });
-    } finally {
-      const failure = await removeCheckout(cwd, checkout, signal);
-      if (failure) listed = { reason: `checkout_cleanup: ${failure}` };
-    }
-    if ('reason' in listed) return { registry: { status: 'incomplete', reason: `base_${listed.reason}` } };
-    before = listed;
   }
-  const compared = compareRegistry({ base: before.entries, head: after.entries, explained, located, allowed });
+  const compared = compareRegistry({ base: before.entries, head: after.entries, removals, skips, permissions });
   return {
     registry: {
       status: 'compared',
       base: compared.base,
       head: compared.head,
       ...(baseIsRust ? {} : { baseRegistry: 'absent' }),
+      ...(headIsRust ? {} : { headRegistry: 'absent' }),
+      ...(cached ? { baseCached: true } : {}),
     },
     findings: compared.findings,
     permitted: compared.permitted,
   };
+}
+
+/** The packages a plain `cargo test` selects: `default-members`, else the root package, else every member. */
+function defaultSelection(manifest) {
+  const sections = new Map();
+  let current = '';
+  for (const raw of manifest.split(/\r?\n/)) {
+    const header = /^\s*\[\s*([\w.-]+)\s*\]\s*(?:#.*)?$/.exec(raw);
+    if (header) current = header[1];
+    else sections.set(current, `${sections.get(current) ?? ''}${raw}\n`);
+  }
+  const list = (text, key) => {
+    const match = new RegExp(`(?:^|\\n)\\s*${key}\\s*=\\s*\\[([^\\]]*)\\]`).exec(text ?? '');
+    return match ? [...match[1].matchAll(/"([^"]*)"/g)].map(item => item[1].replace(/\/+$/, '') || '.') : null;
+  };
+  const workspace = sections.get('workspace');
+  return (
+    list(workspace, 'default-members') ?? (sections.has('package') ? ['.'] : (list(workspace, 'members') ?? ['.']))
+  );
+}
+
+/**
+ * `test_selection_narrowed`: the project tests with a plain `cargo test` (no `--workspace`,
+ * no `--all`), and the root manifest now selects fewer packages by default.
+ * @param {{ base: string | null, head: string | null, commands: { command: string, args?: string[] }[] }} input
+ */
+export function selectionNarrowed({ base, head, commands }) {
+  const plain = commands.some(
+    item =>
+      /(?:^|[\\/])cargo(?:\.exe)?$/i.test(item.command) &&
+      (item.args ?? []).includes('test') &&
+      !(item.args ?? []).some(arg => arg === '--workspace' || arg === '--all'),
+  );
+  if (!plain || base === null || head === null) return null;
+  const after = new Set(defaultSelection(head));
+  const lost = defaultSelection(base).filter(member => !after.has(member));
+  return lost.length ? lost : null;
 }

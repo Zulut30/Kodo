@@ -19,7 +19,14 @@ import path from 'node:path';
 import { ownsPath } from './contracts.mjs';
 import { execute } from './command.mjs';
 import { workerEnvironment } from './security.mjs';
-import { rustCases, rustCrateRootProbe, rustRegistryCheck } from './behavior-rust.mjs';
+import {
+  panicWeakened,
+  rustCases,
+  rustCrateDir,
+  rustCrateRootProbe,
+  rustRegistryCheck,
+  selectionNarrowed,
+} from './behavior-rust.mjs';
 
 export { rustTestCases } from './behavior-rust.mjs';
 
@@ -252,6 +259,8 @@ export function qualityPolicy({ types, config, verification }) {
 
 /** Files larger than this are not inspected; the receipt says so. */
 const MAX_INSPECTED_BYTES = 262144;
+/** Rust files are read by a linear lexer: a larger limit, and on a full gate a larger file is `incomplete`. */
+const MAX_RUST_BYTES = 2 * 1024 * 1024;
 const MARK = '\u0001';
 const languages = {
   ...Object.fromEntries('js mjs cjs jsx ts mts cts tsx'.split(' ').map(ext => [ext, 'js'])),
@@ -806,6 +815,7 @@ function casesOf(file, source, options = {}) {
   const code = parsed.code ?? source;
   return {
     cases: parsed.cases,
+    ...(parsed.templates ? { templates: parsed.templates, calls: parsed.calls } : {}),
     dynamic: parsed.dynamic ?? 0,
     onlys: parsed.onlys ?? 0,
     assertions: count(code, /\bassert\w*|\bexpect\s*\(/g),
@@ -819,7 +829,10 @@ function casesOf(file, source, options = {}) {
   };
 }
 
-/** The cases of one revision of a file, or the reason it was not inspected. Never throws. */
+/**
+ * The cases of one revision of a file, or the reason it was not inspected. Never throws.
+ * @returns {Promise<any>}
+ */
 async function inspect(cwd, revision, file) {
   let result;
   try {
@@ -828,13 +841,25 @@ async function inspect(cwd, revision, file) {
     return { reason: 'unreadable' };
   }
   if (result.code !== 0) return { reason: 'unreadable' };
-  if (Buffer.byteLength(result.stdout) > MAX_INSPECTED_BYTES) return { reason: 'too_large' };
+  const rust = languageOf(file) === 'rs';
+  if (Buffer.byteLength(result.stdout) > (rust ? MAX_RUST_BYTES : MAX_INSPECTED_BYTES)) return { reason: 'too_large' };
   // A Rust file next to `tests/<dir>/main.rs` is a module of that crate, not of `<dir>`.
-  const probe = languageOf(file) === 'rs' ? rustCrateRootProbe(file) : null;
+  const probe = rust ? rustCrateRootProbe(file) : null;
   const nestedCrate =
     probe !== null &&
     (await execute('git', ['cat-file', '-e', `${revision}:${probe}`], { cwd, allowFailure: true })).code === 0;
-  return casesOf(file, result.stdout, { nestedCrate }) ?? { reason: 'unsupported_language' };
+  const parsed = casesOf(file, result.stdout, { nestedCrate });
+  if (!parsed) return { reason: 'unsupported_language' };
+  if (rust) {
+    // Compared with the crate: `tests::adds` of two crates are two tests. `test` keeps the libtest name.
+    const crate = rustCrateDir(file);
+    for (const item of parsed.cases) {
+      item.test = item.name;
+      item.nested = nestedCrate;
+      if (crate) item.name = `${crate}: ${item.name}`;
+    }
+  }
+  return parsed;
 }
 
 /** Changed files between base and head as `{ status, from, to }`, renames followed. */
@@ -868,7 +893,8 @@ function tally(entries, pick = _item => true) {
 
 /**
  * `test_skipped` findings: cases switched off, `.only` added, skip calls added inside existing tests.
- * @param {{ name: string, file: string }[]} [switchedOff] Receives every switched-off case.
+ * @param {{ name: string, file: string, nested?: boolean, off: string }[]} [switchedOff] Receives
+ *   every switched-off Rust case, with its libtest name and why (`cfg` or `ignore`).
  */
 function skipFindings(base, head, switchedOff = []) {
   const found = [];
@@ -882,7 +908,8 @@ function skipFindings(base, head, switchedOff = []) {
       name => (activeAfter.get(name) ?? 0) < (activeBefore.get(name) ?? 0),
     );
     for (const item of entry.cases)
-      if (item.skipped && names.includes(item.name)) switchedOff.push({ name: item.name, file: entry.file });
+      if (item.skipped && item.test !== undefined && names.includes(item.name))
+        switchedOff.push({ name: item.test, file: entry.file, nested: item.nested, off: item.off });
     if (names.length)
       found.push({ rule: 'test_skipped', file: entry.file, detail: `switched off: ${listNames(names)}` });
   }
@@ -921,7 +948,8 @@ function skipFindings(base, head, switchedOff = []) {
  * - `weak_or_empty_test`: a changed or new test that cannot fail. A body equal to the base, token
  *   for token, is old code and is left alone. No permission covers it: a test that is not needed is
  *   deleted instead.
- * - `test_weakened`: an existing test lost its `#[should_panic]` or its `expected` changed.
+ * - `test_weakened`: an existing test no longer has to panic, or no longer with its message.
+ *   Adding a message to a bare `#[should_panic]` tightens it.
  */
 function rustBodyFindings(base, head) {
   const weak = [],
@@ -941,8 +969,7 @@ function rustBodyFindings(base, head) {
       if (item.body === undefined) continue;
       const old = before.get(`${entry.file}\u0000${item.name}`) ?? [];
       if (item.weak && !old.some(previous => previous.body === item.body)) fake.push(item);
-      if (old.length && old.every(previous => previous.panics !== null && previous.panics !== item.panics))
-        lost.push(item.name);
+      if (old.length && old.every(previous => panicWeakened(previous.panics, item.panics))) lost.push(item.name);
     }
     if (fake.length)
       weak.push({
@@ -957,10 +984,87 @@ function rustBodyFindings(base, head) {
       weakened.push({
         rule: 'test_weakened',
         file: entry.file,
-        detail: `#[should_panic] removed or its expectation changed: ${listNames(lost)}`,
+        detail: `#[should_panic] removed or its expectation dropped or changed: ${listNames(lost)}`,
       });
   }
   return { weak, weakened };
+}
+
+/**
+ * `weak_or_empty_test` for a `macro_rules!` template: a test it defines that is new or changed
+ * and cannot fail, in a macro the package calls somewhere (`name!(`, `name! {`, `name! [`). An
+ * unused template defines no test.
+ */
+async function templateFindings(cwd, headSha, base, head) {
+  const before = new Map();
+  for (const entry of base)
+    for (const template of entry.templates ?? [])
+      for (const test of template.tests) {
+        const slot = `${entry.at}\u0000${template.name}\u0000${test.name}`;
+        if (!before.has(slot)) before.set(slot, new Set());
+        before.get(slot).add(test.body);
+      }
+  const called = async (name, file) => {
+    const crate = rustCrateDir(file);
+    if (head.some(entry => entry.calls?.has(name) && rustCrateDir(entry.file) === crate)) return true;
+    const pattern = `(^|[^A-Za-z0-9_])${name}[[:space:]]*![[:space:]]*[[({]`;
+    const pathspec = `${crate ? `${crate}/` : ''}*.rs`;
+    const grep = await execute('git', ['grep', '-q', '-E', pattern, headSha, '--', pathspec], {
+      cwd,
+      allowFailure: true,
+    });
+    return grep.code === 0;
+  };
+  const found = [];
+  for (const entry of head) {
+    const fake = [];
+    for (const template of entry.templates ?? []) {
+      const weak = template.tests.filter(
+        test => test.weak && !before.get(`${entry.file}\u0000${template.name}\u0000${test.name}`)?.has(test.body),
+      );
+      if (weak.length && (await called(template.name, entry.file)))
+        fake.push(...weak.map(test => `${template.name}!: fn ${test.name} (${test.weak})`));
+    }
+    if (fake.length)
+      found.push({
+        rule: 'weak_or_empty_test',
+        file: entry.file,
+        detail: `macro templates define tests that cannot fail: ${listNames(fake)}`,
+      });
+  }
+  return found;
+}
+
+/**
+ * What the registry comparison may count on from this reading, each item with its libtest name
+ * and file: `removals`, Rust cases gone from their own file (removed, or moved to another file)
+ * and cases a provably false `cfg` switched off; `skips`, cases newly `#[ignore]`d; and
+ * `permissions`, base cases of a file this run may reduce that are gone from that file on the
+ * head (plus the target of a permitted Rust file that is gone).
+ */
+function registryPools(base, head, missing, switchedOff, allowed) {
+  const removals = [],
+    permissions = [],
+    headCounts = new Map(head.map(entry => [entry.file, tally([entry])]));
+  for (const [index, entry] of base.entries()) {
+    const items = new Map(entry.cases.map(item => [item.name, item]));
+    for (const name of missing[index]) {
+      const item = items.get(name);
+      if (item?.test !== undefined) removals.push({ name: item.test, file: entry.file, nested: item.nested });
+    }
+    if (!ownsPath(allowed, entry.file)) continue;
+    const left = new Map(entry.gone ? [] : (headCounts.get(entry.at) ?? []));
+    for (const item of entry.cases) {
+      if (item.test === undefined) continue;
+      const still = left.get(item.name) ?? 0;
+      if (still > 0) left.set(item.name, still - 1);
+      else permissions.push({ name: item.test, file: entry.file, nested: item.nested });
+    }
+    if (entry.gone && languageOf(entry.file) === 'rs')
+      permissions.push({ name: '', file: entry.file, nested: entry.cases[0]?.nested ?? false });
+  }
+  for (const item of switchedOff) if (item.off === 'cfg') removals.push(item);
+  return { removals, skips: switchedOff.filter(item => item.off === 'ignore'), permissions };
 }
 
 /**
@@ -977,9 +1081,11 @@ function rustBodyFindings(base, head) {
  * `.only` added to a file with existing tests stops the others.
  *
  * Rust files are read wherever they are: tests live in `#[cfg(test)]` modules
- * of `src/**.rs` too. A changed or new Rust test that cannot fail (an empty
- * body, `assert!(true)`, a `return` before the first statement) is
- * `weak_or_empty_test`; a `#[should_panic]` removed or changed is `test_weakened`.
+ * of `src/**.rs` too, and a Rust case is compared with its crate. A changed or
+ * new Rust test that cannot fail (an empty body, `assert!(true)`, an empty
+ * `return` before the first statement), also in a `macro_rules!` template the
+ * package calls, is `weak_or_empty_test`; a `#[should_panic]` removed or
+ * loosened is `test_weakened`.
  *
  * What it cannot see is in the docs: a body emptied under the same name (except
  * Rust), an early `return`, a skip called inside the body, a renamed case
@@ -996,9 +1102,7 @@ export async function testWeakening(input) {
 const guarded = file => isTestFile(file) || languageOf(file) === 'rs';
 
 /**
- * `testWeakening` with what the registry comparison needs: `explained`, the cases this reading
- * already reported or allowed as removed or switched off, and `located`, every base case with
- * its base file.
+ * `testWeakening` with what the registry comparison needs: the pools of `registryPools`.
  * @param {{ cwd: string, baseSha: string, headSha: string, allowed?: string[] }} input
  */
 async function inspectTests({ cwd, baseSha, headSha, allowed = [] }) {
@@ -1008,7 +1112,7 @@ async function inspectTests({ cwd, baseSha, headSha, allowed = [] }) {
     findings = [],
     permitted = [],
     warnings = [],
-    explained = [];
+    switchedOff = [];
   const report = finding =>
     (finding.rule !== 'test_skipped' && ownsPath(allowed, finding.file) ? permitted : findings).push(finding);
   for (const { status, from, to } of await changes(cwd, baseSha, headSha)) {
@@ -1052,7 +1156,6 @@ async function inspectTests({ cwd, baseSha, headSha, allowed = [] }) {
   const moved = name => take(left, name);
   for (const [index, entry] of base.entries()) {
     const removed = missing[index].filter(name => !moved(name));
-    for (const name of removed) explained.push({ name, file: entry.file });
     if (removed.length)
       report(
         entry.gone
@@ -1078,7 +1181,7 @@ async function inspectTests({ cwd, baseSha, headSha, allowed = [] }) {
       detail: `cases named by an expression: ${dynamic(base)} -> ${dynamic(head)} across changed tests`,
     });
   }
-  skipFindings(base, head, explained).forEach(report);
+  skipFindings(base, head, switchedOff).forEach(report);
   const total = (entries, field) =>
     entries.reduce((sum, entry) => sum + (field ? entry[field] : entry.cases.length), 0);
   if (total(head, 'assertions') < total(base, 'assertions') && total(head) <= total(base))
@@ -1088,17 +1191,88 @@ async function inspectTests({ cwd, baseSha, headSha, allowed = [] }) {
       detail: `assertions ${total(base, 'assertions')} -> ${total(head, 'assertions')} across changed tests`,
     });
   const bodies = rustBodyFindings(base, head);
-  findings.push(...bodies.weak);
+  findings.push(...bodies.weak, ...(await templateFindings(cwd, headSha, base, head)));
   bodies.weakened.forEach(report);
-  const located = base.flatMap(entry => entry.cases.map(item => ({ name: item.name, file: entry.file })));
-  return { findings, allowed: permitted, warnings, unchecked, explained, located };
+  return {
+    findings,
+    allowed: permitted,
+    warnings,
+    unchecked,
+    pools: registryPools(base, head, missing, switchedOff, allowed),
+  };
 }
 
 /**
  * Findings a repair session cannot fix: only a person can change the configuration, and an
  * incomplete registry (no Cargo, a base that does not build) is not the implementation's to fix.
  */
-const unrepairable = new Set(['required_gate_disabled', 'test_registry_incomplete']);
+const unrepairable = new Set(['required_gate_disabled', 'test_registry_incomplete', 'test_inspection_incomplete']);
+
+/** Rules that mean a required observation is missing: the gate is `incomplete`, never passed. */
+const incompleteRules = new Set(['test_registry_incomplete', 'test_inspection_incomplete']);
+const REGISTRY_REMEDY =
+  'Install Cargo where the coordinator runs, or start a new run with "verification": { "testRegistry": false }';
+
+/** A file at a revision, or null. */
+async function fileAt(cwd, revision, file) {
+  const result = await execute('git', ['show', `${revision}:${file}`], { cwd, allowFailure: true, rawOutput: true });
+  return result.code === 0 ? result.stdout : null;
+}
+
+/** `test_selection_narrowed`: a plain `cargo test` of the project selects fewer packages now. */
+async function selectionFinding({ cwd, baseSha, headSha, config }) {
+  const lost = selectionNarrowed({
+    base: await fileAt(cwd, baseSha, 'Cargo.toml'),
+    head: await fileAt(cwd, headSha, 'Cargo.toml'),
+    commands: Array.isArray(config.commands?.test) ? config.commands.test : [],
+  });
+  return lost
+    ? {
+        rule: 'test_selection_narrowed',
+        file: 'Cargo.toml',
+        detail: `cargo test without --workspace no longer selects: ${listNames(lost)}`,
+      }
+    : null;
+}
+
+/**
+ * The Rust part of a full gate, when the base or the head has a root `Cargo.toml`: a changed Rust
+ * file too large to read and a registry that could not be compared make the gate incomplete.
+ */
+async function rustFullGate({ cwd, baseSha, headSha, signal, secrets, runner, registryHome, tests }) {
+  const exists = async revision =>
+    (await execute('git', ['cat-file', '-e', `${revision}:Cargo.toml`], { cwd, allowFailure: true })).code === 0;
+  const headIsRust = await exists(headSha),
+    baseIsRust = await exists(baseSha);
+  if (!headIsRust && !baseIsRust) return { findings: [], allowed: [] };
+  const findings = tests.unchecked
+    .filter(item => item.reason === 'too_large' && languageOf(item.file) === 'rs')
+    .map(item => ({
+      rule: 'test_inspection_incomplete',
+      file: item.file,
+      detail: `larger than ${MAX_RUST_BYTES} bytes, its tests were not read; split the file`,
+    }));
+  const compared = await rustRegistryCheck({
+    cwd,
+    baseSha,
+    signal,
+    secrets,
+    runner,
+    registryHome,
+    baseIsRust,
+    headIsRust,
+    ...tests.pools,
+  });
+  // Not compared is never a pass: the gate is incomplete.
+  if (compared.registry.status !== 'compared')
+    findings.push({
+      rule: 'test_registry_incomplete',
+      file: null,
+      detail: `test registry not compared: ${compared.registry.reason}. ${REGISTRY_REMEDY}`,
+    });
+  findings.push(...(compared.findings ?? []));
+  return { findings, allowed: compared.permitted ?? [], testRegistry: compared.registry };
+}
 
 /** Results of an oracle larger than this are not read. */
 const MAX_RESULT_BYTES = 65536;
@@ -1288,33 +1462,17 @@ export async function runBehaviorGate({
     allowed.push(...tests.allowed);
     warnings.push(...tests.warnings);
     unchecked.push(...tests.unchecked);
-    // A full gate of a Rust project compares the test registry, whatever files changed.
-    if (
-      registry &&
-      verification.testRegistry &&
-      (await execute('git', ['cat-file', '-e', `${headSha}:Cargo.toml`], { cwd, allowFailure: true })).code === 0
-    ) {
-      const compared = await rustRegistryCheck({
-        cwd,
-        baseSha,
-        signal,
-        secrets,
-        runner,
-        registryHome,
-        allowed: verification.testRemovalAllowed,
-        explained: tests.explained,
-        located: tests.located,
-      });
-      testRegistry = compared.registry;
-      // Not compared is never a pass: the gate is incomplete.
-      if (testRegistry.status !== 'compared')
-        findings.push({
-          rule: 'test_registry_incomplete',
-          file: null,
-          detail: `test registry not compared: ${testRegistry.reason}`,
-        });
-      findings.push(...(compared.findings ?? []));
-      allowed.push(...(compared.permitted ?? []));
+    // A plain `cargo test` that selects fewer packages runs fewer tests.
+    if (paths.includes('Cargo.toml')) {
+      const narrowed = await selectionFinding({ cwd, baseSha, headSha, config });
+      if (narrowed) (ownsPath(verification.testRemovalAllowed, 'Cargo.toml') ? allowed : findings).push(narrowed);
+    }
+    // A full gate of a Rust project (on the base or the head) compares the test registry, whatever changed.
+    if (registry && verification.testRegistry) {
+      const rust = await rustFullGate({ cwd, baseSha, headSha, signal, secrets, runner, registryHome, tests });
+      testRegistry = rust.testRegistry;
+      findings.push(...rust.findings);
+      allowed.push(...rust.allowed);
     }
   }
   const oracles = [];
@@ -1342,7 +1500,7 @@ export async function runBehaviorGate({
     baseSha,
     configHash: verificationConfigHash(config.verification),
     // `incomplete`: nothing was found wrong, but a required observation is missing. Never a pass.
-    status: findings.some(finding => finding.rule !== 'test_registry_incomplete')
+    status: findings.some(finding => !incompleteRules.has(finding.rule))
       ? 'failed'
       : findings.length
         ? 'incomplete'
