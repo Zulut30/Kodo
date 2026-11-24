@@ -1,7 +1,9 @@
 /** Offline Cargo workspace parser and Rust crate graph builder for Architecture Guardian. */
 import { createHash } from 'node:crypto';
+import { parse as parseToml } from 'smol-toml';
 import {
   collectManifestDependencies,
+  decodeUtf8,
   isPlainObject,
   resolveCargoWorkspace,
   resolveRelativeDir,
@@ -48,6 +50,10 @@ function resolveDependencySpec({ crate, dep, workspaceDeps, crateByDir, unknown 
     return null;
   }
   if (spec.workspace === true) {
+    if (spec.package !== undefined) {
+      unknown('dependency', crate.manifest, 'conflicting-workspace-package');
+      return null;
+    }
     const inherited = workspaceDeps.get(key);
     if (!inherited || !inherited.valid) {
       unknown('dependency', crate.manifest, 'unresolved-workspace-dependency');
@@ -75,12 +81,10 @@ function resolveDependencySpec({ crate, dep, workspaceDeps, crateByDir, unknown 
         workspaceInherited: true,
       };
     }
-    const extName =
-      typeof spec.package === 'string' && spec.package.trim() ? spec.package.trim() : inherited.packageName;
     return {
       from: crate.name,
       to: null,
-      externalCrate: extName,
+      externalCrate: inherited.packageName,
       kind,
       specifier: key,
       manifest: crate.manifest,
@@ -131,6 +135,35 @@ function resolveDependencySpec({ crate, dep, workspaceDeps, crateByDir, unknown 
   };
 }
 
+const isCargoConfigFile = file =>
+  file === '.cargo/config.toml' ||
+  file === '.cargo/config' ||
+  file.endsWith('/.cargo/config.toml') ||
+  file.endsWith('/.cargo/config');
+
+function checkUnsupportedOverrides({ files, contents, rootDoc, unknown }) {
+  if (rootDoc?.patch !== undefined) unknown('workspace', 'Cargo.toml', 'unsupported-cargo-patch');
+  if (rootDoc?.replace !== undefined) unknown('workspace', 'Cargo.toml', 'unsupported-cargo-replace');
+  for (const entry of files) {
+    if ((entry.mode !== '100644' && entry.mode !== '100755') || !isCargoConfigFile(entry.path)) continue;
+    const raw = contents.get(entry.path);
+    const decoded = raw === undefined ? null : decodeUtf8(raw);
+    if (!decoded) {
+      unknown('workspace', entry.path, 'parse-error', 0);
+      continue;
+    }
+    let doc;
+    try {
+      doc = parseToml(decoded.text);
+    } catch {
+      unknown('workspace', entry.path, 'parse-error', 0);
+      continue;
+    }
+    if (doc?.patch !== undefined) unknown('workspace', entry.path, 'unsupported-cargo-patch');
+    if (doc?.replace !== undefined) unknown('workspace', entry.path, 'unsupported-cargo-replace');
+  }
+}
+
 /**
  * Pure offline Cargo workspace parser over a tracked file inventory and Cargo.toml blobs.
  * Never spawns `cargo` or touches the network.
@@ -153,6 +186,7 @@ export function parseCargoWorkspace({ files, contents }) {
   }
   const resolved = resolveCargoWorkspace({ manifests, startDir: '' });
   for (const item of resolved.unsupported) unsupported.set(item.id, item);
+  checkUnsupportedOverrides({ files, contents, rootDoc: resolved.rootDoc, unknown });
   if (!resolved.hasWorkspace) {
     if (!unsupported.size) unknown('workspace', 'Cargo.toml', 'missing-cargo-workspace');
     return {

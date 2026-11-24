@@ -231,9 +231,16 @@ export async function readArchitectureGraph({ project, headSha, policy }) {
         reason: 'unsupported-tree-entry',
         offset: null,
       }));
+    const isCargoMeta = file =>
+      file === 'Cargo.toml' ||
+      file.endsWith('/Cargo.toml') ||
+      file === '.cargo/config.toml' ||
+      file === '.cargo/config' ||
+      file.endsWith('/.cargo/config.toml') ||
+      file.endsWith('/.cargo/config');
     const contents = await sources(
       project,
-      entries.filter(entry => regular(entry) && (entry.path === 'Cargo.toml' || entry.path.endsWith('/Cargo.toml'))),
+      entries.filter(entry => regular(entry) && isCargoMeta(entry.path)),
     );
     const { buildRustArchitectureGraph } = await import('./architecture-rust.mjs');
     return buildRustArchitectureGraph({ headSha, policy, files, contents, treeUnsupported });

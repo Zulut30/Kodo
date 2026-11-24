@@ -818,3 +818,88 @@ test('E2: cargo-workspace resolves workspace members matching real Cargo 1.96 me
   });
   assert.ok(nestedConflict.unsupported.some(row => row.reason === 'nested-workspace-root'));
 });
+
+test('E3: underscore dep tables, workspace=true package conflict, and [patch]/[replace]/.cargo/config blocking', async t => {
+  const mkFiles = map => ({
+    files: Object.keys(map)
+      .sort()
+      .map(file => ({ path: file, mode: '100644', oid: 'a'.repeat(40) })),
+    contents: new Map(Object.entries(map).map(([file, text]) => [file, Buffer.from(text, 'utf8')])),
+  });
+
+  // 1) [dev_dependencies], [build_dependencies], and target.* underscore variants
+  const underscore = parseWorkspace(
+    mkFiles({
+      'Cargo.toml': '[workspace]\nmembers = ["crates/*"]\n',
+      'crates/a/Cargo.toml': [
+        '[package]',
+        'name = "a"',
+        'version = "0.1.0"',
+        '[dev_dependencies]',
+        'proptest = "1.0"',
+        '[build_dependencies]',
+        'cc = "1.0"',
+        "[target.'cfg(unix)'.dev_dependencies]",
+        'nix = "0.29"',
+        "[target.'cfg(windows)'.build_dependencies]",
+        'winres = "0.1"',
+      ].join('\n'),
+    }),
+  );
+  assert.deepEqual(underscore.unsupported, []);
+  assert.ok(underscore.edges.some(e => e.externalCrate === 'proptest' && e.kind === 'dev-dependency'));
+  assert.ok(underscore.edges.some(e => e.externalCrate === 'cc' && e.kind === 'build-dependency'));
+  assert.ok(underscore.edges.some(e => e.externalCrate === 'nix' && e.kind === 'dev-dependency'));
+  assert.ok(underscore.edges.some(e => e.externalCrate === 'winres' && e.kind === 'build-dependency'));
+
+  // 2) workspace = true with package override in member -> unsupported
+  const wsConflict = parseWorkspace(
+    mkFiles({
+      'Cargo.toml':
+        '[workspace]\nmembers = ["crates/*"]\n[workspace.dependencies]\nser = { package = "serde", version = "1.0" }\n',
+      'crates/a/Cargo.toml':
+        '[package]\nname = "a"\nversion = "0.1.0"\n[dependencies]\nser = { workspace = true, package = "evil" }\n',
+    }),
+  );
+  assert.ok(
+    wsConflict.unsupported.some(row => row.reason === 'conflicting-workspace-package'),
+    `expected conflicting-workspace-package, got ${JSON.stringify(wsConflict.unsupported)}`,
+  );
+
+  // 3) Root [patch], [replace], and .cargo/config.toml [patch] -> unsupported + blocked in CLI
+  const withPatch = parseWorkspace(
+    mkFiles({
+      'Cargo.toml': '[workspace]\nmembers = ["crates/*"]\n[patch.crates-io]\nserde = { path = "crates/b" }\n',
+      'crates/a/Cargo.toml': '[package]\nname = "a"\nversion = "0.1.0"\n[dependencies]\nserde = "1.0"\n',
+      'crates/b/Cargo.toml': '[package]\nname = "b"\nversion = "0.1.0"\n',
+    }),
+  );
+  assert.ok(
+    withPatch.unsupported.some(row => row.reason === 'unsupported-cargo-patch' && row.file === 'Cargo.toml'),
+    `expected unsupported-cargo-patch, got ${JSON.stringify(withPatch.unsupported)}`,
+  );
+
+  const withReplace = parseWorkspace(
+    mkFiles({
+      'Cargo.toml': '[workspace]\nmembers = ["crates/*"]\n[replace]\n"serde:1.0.0" = { path = "crates/b" }\n',
+      'crates/a/Cargo.toml': '[package]\nname = "a"\nversion = "0.1.0"\n',
+      'crates/b/Cargo.toml': '[package]\nname = "b"\nversion = "0.1.0"\n',
+    }),
+  );
+  assert.ok(
+    withReplace.unsupported.some(row => row.reason === 'unsupported-cargo-replace' && row.file === 'Cargo.toml'),
+    `expected unsupported-cargo-replace, got ${JSON.stringify(withReplace.unsupported)}`,
+  );
+
+  // End-to-end check with .cargo/config.toml [patch] via checkArchitecture -> blocked
+  const fx = await rustFixture(t);
+  await fx.put('.cargo/config.toml', '[patch.crates-io]\nserde = { path = "crates/render" }\n');
+  fx.commit('add .cargo/config.toml patch');
+  const blocked = await checkArchitecture({ project: fx.project, baseSha: fx.baseSha });
+  assert.equal(blocked.status, 'blocked');
+  assert.equal(blocked.passed, false);
+  assert.ok(
+    blocked.unsupported.some(row => row.reason === 'unsupported-cargo-patch' && row.file === '.cargo/config.toml'),
+    `expected unsupported-cargo-patch for .cargo/config.toml, got ${JSON.stringify(blocked.unsupported)}`,
+  );
+});
