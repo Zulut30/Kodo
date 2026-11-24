@@ -10,14 +10,13 @@ import { readdirSync, lstatSync } from 'node:fs';
 const extensions = process.features.typescript ? 'js,mjs,cjs,ts,mts,cts' : 'js,mjs,cjs';
 const defaultPattern = `**/{test,test/**/*,test-*,*[._-]test}.{${extensions}}`;
 
+// The two wave factory suites (real Engine, Git and director work; project-wave-director alone took
+// >=1008474.9099 ms in Windows run 44577524507) run in their own step, `npm run test:waves`, like
+// `npm run test:final`: with them, one L2 command reached its fixed deadline on Windows CI
+// (runs 45410439061 and 45418257242, ~2400 s). Default discovery skips them; explicit paths run them.
+export const separateSuites = ['tests/project-wave-director.test.mjs', 'tests/project-wave-e2e.test.mjs'];
+
 const priority = [
-  // LPT heuristic from the data available before a full Windows CI measurement, not an observed
-  // completion order. project-wave-director: GitHub Actions Windows run 44577524507 (Node 24,
-  // concurrency 4), 13 of its 14 cases in the TAP tail before the L2 timeout, 1008474.9099 ms in sum,
-  // a lower bound for the file. project-wave-e2e: one local Windows run (Node 24.19.0), 486979.1258 ms
-  // against the director's 496030.1322 ms in the same conditions; no CI observation.
-  'tests/project-wave-director.test.mjs', // >=1008474.9099 ms (13/14 cases, CI)
-  'tests/project-wave-e2e.test.mjs', // 486979.1258 ms (local)
   // Source821 Windows/Node24.22.1 receipt c9b54c3c: all completed files >=90000 ms
   // in descending durationMs, not reporter delivery order. Static observations,
   // not runtime weights; environment/overlap differ and no speedup is implied.
@@ -144,7 +143,8 @@ export function discoverTests(cwd = process.cwd()) {
       const relative = path.relative(cwd, file).replaceAll('\\', '/');
       // Like Node's default glob, ** does not descend into hidden directories.
       if (entry.isDirectory() && !entry.name.startsWith('.')) visit(file);
-      else if (entry.isFile() && path.matchesGlob(relative, defaultPattern)) files.push(file);
+      else if (entry.isFile() && path.matchesGlob(relative, defaultPattern) && !separateSuites.includes(relative))
+        files.push(file);
     }
   }
   visit(cwd);

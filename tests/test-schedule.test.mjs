@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { mkdtemp, mkdir, writeFile, readFile, rm, symlink } from 'node:fs/promises';
+import { readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -160,15 +161,20 @@ test('Scheduler orders observed file durations longest first and retains every d
   assert.deepEqual(orderTests([...input].reverse(), temp), expected);
 });
 
-test('Scheduler starts the two wave drain files first in the real discovered suite', async () => {
-  const { discoverTests } = await import(scheduleUrl);
-  // LPT heuristic from the data available before a full Windows CI measurement, not an observed
-  // completion order: 13 of the 14 project-wave-director cases took 1008474.9099 ms in Windows run
-  // 44577524507, and project-wave-e2e took as long as the director in one local Windows run.
-  const ordered = discoverTests(root).map(file => path.relative(root, file).replaceAll('\\', '/'));
-  assert.deepEqual(ordered.slice(0, 2), ['tests/project-wave-director.test.mjs', 'tests/project-wave-e2e.test.mjs']);
+test('The wave factory suites run in their own command and CI step, outside default discovery', async () => {
+  const { discoverTests, separateSuites } = await import(scheduleUrl);
+  // With them, one L2 command reached its fixed Windows deadline (runs 45410439061, 45418257242).
+  assert.deepEqual(separateSuites, ['tests/project-wave-director.test.mjs', 'tests/project-wave-e2e.test.mjs']);
+  const discovered = discoverTests(root).map(file => path.relative(root, file).replaceAll('\\', '/'));
+  for (const suite of separateSuites) {
+    assert.ok(!discovered.includes(suite), `${suite} is not in the default suite`);
+    assert.ok(statSync(path.join(root, suite)).isFile(), `${suite} exists`);
+  }
+  const scripts = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8')).scripts;
+  assert.equal(scripts['test:waves'], `node scripts/run-tests.mjs ${separateSuites.join(' ')}`);
+  const workflow = readFileSync(path.join(root, '.github/workflows/ci.yml'), 'utf8');
+  assert.match(workflow, /run: npm run test:waves/);
 });
-
 test(
   'Scheduler starts heuristic heavy files before lexical files in real isolated children',
   { timeout: 15000 },

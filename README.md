@@ -179,7 +179,9 @@ MCP-шаблоны лежат в `.kodo/components/mcp/<name>/`. Они не п�
 
 ```powershell
 npm run test:fast   # быстрые модульные тесты, меньше минуты
-npm run check       # validate, формат, lint, типы и полная suite — как в CI
+npm run check       # validate, формат, lint, типы и suite — шаг L2 в CI
+npm run test:waves  # сквозные наборы фабрики волн — отдельный шаг CI
+npm run test:final  # финальные сценарии приёмки — отдельный шаг CI
 ```
 
 [Оглавление документации](docs/README.md) делит её на руководство, ADR и архив проверок; там же описаны команды разработки.
