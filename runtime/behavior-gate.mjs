@@ -13,6 +13,9 @@
  * The receipt is bound to the exact head, base and configuration.
  */
 import { createHash } from 'node:crypto';
+import { mkdtempSync, rmSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { ownsPath } from './contracts.mjs';
 import { execute } from './command.mjs';
 import { workerEnvironment } from './security.mjs';
@@ -41,8 +44,49 @@ const relativeScope = scope =>
  * @property {boolean} testProtection Refuse removed and switched-off tests.
  * @property {string[]} testRemovalAllowed Test paths (globs) this run may delete or reduce: an explicit, narrow exception.
  * @property {boolean} strictGates A gate the policy needs but the project disabled fails the gate.
- * @property {{ id: string, command: string, args: string[], timeoutMs?: number, protect: string[] }[]} oracles
+ * @property {boolean} testRegistry Compare `cargo test -- --list` on the base and the head of a Rust change.
+ * @property {{ id: string, command: string, args: string[], timeoutMs?: number, protect: string[],
+ *   budgets?: OracleBudget[] }[]} oracles
  */
+
+/**
+ * A number the oracle prints, with its bound: the oracle passes only when it exits 0
+ * and every budget is met.
+ * @typedef {{ metric: string, max?: number, min?: number }} OracleBudget
+ */
+
+/** Validates the budgets of one oracle and returns their normalized copy. */
+function normalizeBudgets(id, budgets) {
+  if (!Array.isArray(budgets) || !budgets.length || budgets.length > 8)
+    invalid(`oracle ${id} budgets must be a list of 1 to 8`);
+  return budgets.map(budget => {
+    if (!budget || typeof budget !== 'object' || Array.isArray(budget))
+      invalid(`oracle ${id} budget must be an object`);
+    for (const key of Object.keys(budget))
+      if (!['metric', 'max', 'min'].includes(key)) invalid(`unknown oracle ${id} budget key ${key}`);
+    if (typeof budget.metric !== 'string' || !budget.metric || budget.metric.length > 200)
+      invalid(`oracle ${id} budget metric must be a short regular expression`);
+    let groups;
+    try {
+      // The number of capture groups: an empty alternative always matches.
+      groups = new RegExp(`${budget.metric}|`).exec('').length - 1;
+    } catch {
+      invalid(`oracle ${id} budget metric is not a regular expression`);
+    }
+    if (groups < 1) invalid(`oracle ${id} budget metric must capture the number in a group`);
+    for (const key of ['max', 'min'])
+      if (budget[key] !== undefined && (typeof budget[key] !== 'number' || !Number.isFinite(budget[key])))
+        invalid(`oracle ${id} budget ${key} must be a number`);
+    if (budget.max === undefined && budget.min === undefined) invalid(`oracle ${id} budget needs max or min`);
+    if (budget.max !== undefined && budget.min !== undefined && budget.min > budget.max)
+      invalid(`oracle ${id} budget min is above max`);
+    return {
+      metric: budget.metric,
+      ...(budget.max === undefined ? {} : { max: budget.max }),
+      ...(budget.min === undefined ? {} : { min: budget.min }),
+    };
+  });
+}
 
 /**
  * @param {unknown} [value]
@@ -51,9 +95,9 @@ const relativeScope = scope =>
 export function normalizeVerificationConfig(value = undefined) {
   const input = /** @type {Record<string, any>} */ (value === undefined ? {} : value);
   if (!input || typeof input !== 'object' || Array.isArray(input)) invalid('an object is expected');
-  const known = ['baseline', 'testProtection', 'testRemovalAllowed', 'strictGates', 'oracles'];
+  const known = ['baseline', 'testProtection', 'testRemovalAllowed', 'strictGates', 'testRegistry', 'oracles'];
   for (const key of Object.keys(input)) if (!known.includes(key)) invalid(`unknown key ${key}`);
-  for (const key of ['baseline', 'testProtection', 'strictGates'])
+  for (const key of ['baseline', 'testProtection', 'strictGates', 'testRegistry'])
     if (input[key] !== undefined && typeof input[key] !== 'boolean') invalid(`${key} must be boolean`);
   const allowed = input.testRemovalAllowed ?? [];
   if (!Array.isArray(allowed) || allowed.length > 64 || allowed.some(scope => !relativeScope(scope)))
@@ -64,7 +108,8 @@ export function normalizeVerificationConfig(value = undefined) {
   const normalized = oracles.map(oracle => {
     if (!oracle || typeof oracle !== 'object' || Array.isArray(oracle)) invalid('an oracle must be an object');
     for (const key of Object.keys(oracle))
-      if (!['id', 'command', 'args', 'timeoutMs', 'protect'].includes(key)) invalid(`unknown oracle key ${key}`);
+      if (!['id', 'command', 'args', 'timeoutMs', 'protect', 'budgets'].includes(key))
+        invalid(`unknown oracle key ${key}`);
     if (typeof oracle.id !== 'string' || !/^[a-z][a-z0-9-]{0,47}$/.test(oracle.id) || ids.has(oracle.id))
       invalid('oracle id must be a unique slug');
     ids.add(oracle.id);
@@ -98,6 +143,7 @@ export function normalizeVerificationConfig(value = undefined) {
       args: [...args],
       ...(oracle.timeoutMs === undefined ? {} : { timeoutMs: oracle.timeoutMs }),
       protect: [...protect],
+      ...(oracle.budgets === undefined ? {} : { budgets: normalizeBudgets(oracle.id, oracle.budgets) }),
     };
   });
   return {
@@ -105,6 +151,7 @@ export function normalizeVerificationConfig(value = undefined) {
     testProtection: input.testProtection ?? true,
     testRemovalAllowed: [...allowed],
     strictGates: input.strictGates ?? false,
+    testRegistry: input.testRegistry ?? true,
     oracles: normalized,
   };
 }
@@ -576,31 +623,367 @@ function pythonCases(source) {
   return { code, cases: moduleSkip ? cases.map(item => ({ ...item, skipped: true })) : cases };
 }
 
-const rustAttribute = /\s*#\[[^\]\n]*\]/y;
-const rustFn = /\s*(?:pub(?:\([^)\n]*\))?\s+)?(?:(?:async|unsafe|const)\s+)*fn\s+(\w+)/y;
+const isRustStart = char => char !== undefined && /[A-Za-z_]/.test(char);
+const isRustWord = char => char !== undefined && /\w/.test(char);
 
-/** Rust tests by line: attributes, also over several lines and with comments between, then the function. */
-function rustCases(source) {
-  const cases = [];
-  let attributes = '';
-  for (const line of source.split('\n')) {
-    const text = line.trim();
-    if (!text || text.startsWith('//')) continue;
-    let at = 0;
-    rustAttribute.lastIndex = 0;
-    for (let found = rustAttribute.exec(line); found; found = rustAttribute.exec(line)) {
-      attributes += found[0];
-      at = rustAttribute.lastIndex;
-    }
-    // Attributes only: the function is on a later line.
-    if (at > 0 && !line.slice(at).trim()) continue;
-    rustFn.lastIndex = at;
-    const named = rustFn.exec(line);
-    if (named && /\btest\b/.test(attributes)) cases.push({ name: named[1], skipped: /\bignore\b/.test(attributes) });
-    attributes = '';
+/** Index after the `"` that closes the string whose text starts at `at`; escapes are stepped over. */
+function rustStringEnd(source, at) {
+  while (at < source.length) {
+    if (source[at] === '\\') at += 2;
+    else if (source[at] === '"') return at + 1;
+    else at++;
   }
-  return cases;
+  return source.length;
 }
+
+/**
+ * Index after the character literal that opens at `index` (`'a'`, `'\n'`, `'\''`,
+ * `'\u{1F600}'`), or -1 for a lifetime or a label (`'a`, `'outer:`). The look-ahead
+ * is bounded, so a file of apostrophes costs no more than its length.
+ */
+function rustCharEnd(source, index) {
+  const next = source[index + 1];
+  if (next === undefined || next === '\n' || next === "'") return -1;
+  if (next === '\\') {
+    let end = index + 3;
+    const stop = Math.min(source.length, index + 14);
+    while (end < stop && source[end] !== "'" && source[end] !== '\n') end++;
+    return source[end] === "'" ? end + 1 : -1;
+  }
+  const width = /** @type {number} */ (next.codePointAt(0)) > 0xffff ? 2 : 1;
+  return source[index + 1 + width] === "'" ? index + 2 + width : -1;
+}
+
+/**
+ * Rust source as code only, in one pass. Comments are removed: `//`, doc
+ * comments (`///`, `//!`, `/**`) and block comments, which nest. String
+ * literals become `""`: plain, byte (`b"…"`), C (`c"…"`) and raw ones with any
+ * number of `#` (`r#"…"#`, `br##"…"##`). Character and byte literals become
+ * `''`, while a lifetime or a label (`'a`) stays code. So a commented-out test
+ * is gone and a test quoted in a string (a fixture) is not a test.
+ * @param {string} source
+ */
+function scanRust(source) {
+  const length = source.length;
+  let code = '',
+    index = 0;
+  while (index < length) {
+    const char = source[index],
+      next = source[index + 1];
+    if (char === '/' && (next === '/' || next === '*')) {
+      index = next === '*' ? blockCommentEnd(source, index, true) : commentEnd(source, index);
+      code += ' ';
+    } else if (char === '"') {
+      index = rustStringEnd(source, index + 1);
+      code += '""';
+    } else if (char === "'") {
+      const end = rustCharEnd(source, index);
+      code += end < 0 ? char : "''";
+      index = end < 0 ? index + 1 : end;
+    } else if (isRustStart(char) && !isRustWord(source[index - 1])) {
+      let end = index + 1;
+      while (isRustWord(source[end])) end++;
+      const word = source.slice(index, end);
+      if (['r', 'br', 'cr'].includes(word) && (source[end] === '"' || source[end] === '#')) {
+        let open = end;
+        while (source[open] === '#') open++;
+        if (source[open] === '"') {
+          // A raw string ends at the first `"` followed by as many `#` as it opened with.
+          const close = `"${'#'.repeat(open - end)}`;
+          const found = source.indexOf(close, open + 1);
+          index = found < 0 ? length : found + close.length;
+          code += '""';
+          continue;
+        }
+      }
+      if ((word === 'b' || word === 'c') && source[end] === '"') {
+        index = rustStringEnd(source, end + 1);
+        code += '""';
+        continue;
+      }
+      if (word === 'b' && source[end] === "'") {
+        const close = rustCharEnd(source, end);
+        if (close > 0) {
+          index = close;
+          code += "''";
+          continue;
+        }
+      }
+      code += word;
+      index = end;
+    } else {
+      code += char;
+      index++;
+    }
+  }
+  return code;
+}
+
+/**
+ * The module path of a Rust file inside its crate, as `cargo test -- --list`
+ * prints it: `src/lib.rs`, `src/main.rs`, `src/bin/x.rs`, `src/bin/x/main.rs` and
+ * an integration test `tests/x.rs` are crate roots; `src/world/chunk.rs` and
+ * `src/world/chunk/mod.rs` are `world::chunk`; `tests/common/mod.rs` is
+ * `common`. The layout is read from the path only: `#[path]` and `include!`
+ * are not followed (the registry comparison sees them).
+ * @param {string} file
+ * @returns {string[]}
+ */
+function rustModulePath(file) {
+  const parts = file.split('/'),
+    name = /** @type {string} */ (parts.pop()).replace(/\.rs$/i, '');
+  const source = parts.lastIndexOf('src');
+  if (source >= 0) {
+    let inner = parts.slice(source + 1);
+    if (inner[0] === 'bin') {
+      // `src/bin/x.rs` or `src/bin/x/main.rs`: a binary crate of its own.
+      if (inner.length === 1) return [];
+      inner = inner.slice(2);
+      if (!inner.length && name === 'main') return [];
+    } else if (!inner.length && (name === 'lib' || name === 'main')) return [];
+    return name === 'mod' ? inner : [...inner, name];
+  }
+  const crateDir = Math.max(parts.lastIndexOf('tests'), parts.lastIndexOf('benches'), parts.lastIndexOf('examples'));
+  if (crateDir < 0) return [];
+  const inner = parts.slice(crateDir + 1);
+  // `tests/x.rs` and `tests/x/main.rs` are crates of their own; other files are their modules.
+  if (!inner.length || (inner.length === 1 && name === 'main')) return [];
+  return name === 'mod' ? inner : [...inner, name];
+}
+
+/** `#[test]`, `#[tokio::test]`, `#[async_std::test(…)]`: an attribute path that ends in `test`. */
+const rustTestAttribute = /^(?:[A-Za-z_]\w*\s*::\s*)*test\s*(?:\(|$)/;
+const rustToken = /[A-Za-z_]\w*|\?/g;
+const rustUnwraps = new Set(['unwrap', 'expect', 'unwrap_err', 'expect_err']);
+
+/** Whether a Rust test body holds a check; one pass over its words, nothing to backtrack over. */
+function hasRustCheck(body) {
+  const around = (at, step) => {
+    while (/\s/.test(body[at] ?? '')) at += step;
+    return body[at];
+  };
+  for (const match of body.matchAll(rustToken)) {
+    const word = match[0],
+      start = /** @type {number} */ (match.index);
+    if (word === '?') return true;
+    const next = around(start + word.length, 1);
+    if (word.includes('assert') && (next === '!' || next === '(')) return true;
+    if ((word === 'panic' || word === 'unreachable') && next === '!') return true;
+    if (rustUnwraps.has(word) && next === '(' && around(start - 1, -1) === '.') return true;
+  }
+  return false;
+}
+const rustTrivialCall = /\b(?:debug_)?assert(_eq)?\s*!\s*\(/g;
+
+/** Index of the bracket that closes the one opened at `open`, or the end of the code. */
+function closingBracket(code, open) {
+  const opening = code[open],
+    closing = opening === '[' ? ']' : '}';
+  let depth = 0;
+  for (let at = open; at < code.length; at++) {
+    if (code[at] === opening) depth++;
+    else if (code[at] === closing && --depth === 0) return at;
+  }
+  return code.length;
+}
+
+/** The arguments of a macro call split at the commas between them. */
+function topLevelArguments(text) {
+  const parts = [];
+  let depth = 0,
+    start = 0;
+  for (let at = 0; at < text.length; at++) {
+    const char = text[at];
+    if ('([{'.includes(char)) depth++;
+    else if (')]}'.includes(char)) depth--;
+    else if (char === ',' && depth === 0) {
+      parts.push(text.slice(start, at));
+      start = at + 1;
+    }
+  }
+  parts.push(text.slice(start));
+  return parts.map(part => part.replace(/\s+/g, '')).filter(Boolean);
+}
+
+/** The body without the assertions that cannot fail: `assert!(true)`, `assert_eq!(x, x)`, `assert!(x == x)`. */
+function withoutTrivialAssertions(body) {
+  let kept = '',
+    from = 0;
+  for (const match of body.matchAll(rustTrivialCall)) {
+    const open = /** @type {number} */ (match.index) + match[0].length;
+    if (open < from) continue;
+    // Bounded: an assertion is short, and nested calls are not rescanned without end.
+    const close = callEnd(body, open, 4000);
+    if (close < 0) continue;
+    const [first, second] = topLevelArguments(body.slice(open, close));
+    let trivial;
+    if (match[1]) trivial = first !== undefined && first === second;
+    else {
+      const equals = first?.indexOf('==') ?? -1;
+      trivial =
+        first === 'true' ||
+        first === '!false' ||
+        (equals > 0 && first.indexOf('==', equals + 2) < 0 && first.slice(0, equals) === first.slice(equals + 2));
+    }
+    if (trivial) {
+      kept += `${body.slice(from, match.index)} `;
+      from = close + 1;
+    }
+  }
+  return kept + body.slice(from);
+}
+
+/** The body up to the end of its first statement-level `return`, and whether there was one. */
+function untilReturn(body) {
+  let depth = 0;
+  for (let at = 0; at < body.length; at++) {
+    const char = body[at];
+    if ('([{'.includes(char)) depth++;
+    else if (')]}'.includes(char)) depth--;
+    else if (
+      depth === 0 &&
+      char === 'r' &&
+      body.startsWith('return', at) &&
+      !isRustWord(body[at - 1]) &&
+      !isRustWord(body[at + 6])
+    ) {
+      let end = at + 6;
+      for (let inner = 0; end < body.length; end++) {
+        if ('([{'.includes(body[end])) inner++;
+        else if (')]}'.includes(body[end])) inner--;
+        else if (body[end] === ';' && inner === 0) break;
+      }
+      return { live: body.slice(0, end + 1), returns: true };
+    }
+  }
+  return { live: body, returns: false };
+}
+
+/**
+ * Why a Rust test checks nothing, or null. A check is an assertion macro or an
+ * assertion helper (`assert…!(…)`, `assert…(…)`, also `prop_assert…`), `panic!`,
+ * `unreachable!`, `.unwrap()`/`.expect(…)` (and their `_err` forms), the `?`
+ * operator in a test that returns a `Result`, or `#[should_panic]` on a non-empty
+ * body. A statement-level `return` ends the body; assertions that cannot fail do
+ * not count.
+ * @param {string} body Code of the body, comments and string contents removed.
+ * @param {boolean} shouldPanic
+ */
+function rustWeakness(body, shouldPanic) {
+  if (!body.replace(/[\s;]/g, '')) return 'empty body';
+  const { live, returns } = untilReturn(body);
+  if (shouldPanic && live.replace(/[\s;]/g, '') !== 'return') return null;
+  const checked = withoutTrivialAssertions(live);
+  if (hasRustCheck(checked)) return null;
+  if (returns) return 'returns before any check';
+  return checked === live ? 'no assertion' : 'only assertions that cannot fail';
+}
+
+/**
+ * Rust tests of one file, read token by token over the scanned code: the
+ * attributes since the last `;`, `{` or `}` belong to the next `fn`. With a test
+ * attribute it is a case named as `cargo test -- --list` prints it: the module
+ * path of the file, the inline `mod` blocks around it, the function. `#[ignore]`
+ * (also inside `cfg_attr`) switches it off. Each case keeps its body, so a
+ * changed body can be told from an unchanged one.
+ * @param {string} file
+ * @param {string} source
+ */
+function rustCases(file, source) {
+  const code = scanRust(source),
+    length = code.length,
+    prefix = rustModulePath(file),
+    cases = [],
+    modules = [],
+    bodies = [];
+  let depth = 0,
+    attributes = [],
+    module = null,
+    index = 0;
+  const identifier = from => {
+    let at = from;
+    while (/\s/.test(code[at] ?? '')) at++;
+    if (code.startsWith('r#', at)) at += 2;
+    let end = at;
+    while (isRustWord(code[end])) end++;
+    return isRustStart(code[at]) ? [code.slice(at, end), end] : ['', at];
+  };
+  while (index < length) {
+    const char = code[index];
+    if (char === '#' && (code[index + 1] === '[' || (code[index + 1] === '!' && code[index + 2] === '['))) {
+      const open = code[index + 1] === '[' ? index + 1 : index + 2,
+        close = closingBracket(code, open);
+      // An inner attribute (`#![…]`) belongs to the enclosing item, not to the next one.
+      if (open === index + 1)
+        attributes.push(
+          code
+            .slice(open + 1, close)
+            .replace(/\s+/g, ' ')
+            .trim(),
+        );
+      index = close + 1;
+    } else if (char === '{') {
+      depth++;
+      if (module) modules.push({ name: module, depth });
+      module = null;
+      attributes = [];
+      index++;
+    } else if (char === '}') {
+      if (modules.length && modules[modules.length - 1].depth === depth) modules.pop();
+      depth = Math.max(0, depth - 1);
+      module = null;
+      attributes = [];
+      index++;
+    } else if (char === ';') {
+      module = null;
+      attributes = [];
+      index++;
+    } else if (isRustStart(char) && !isRustWord(code[index - 1])) {
+      let end = index + 1;
+      while (isRustWord(code[end])) end++;
+      const word = code.slice(index, end);
+      index = end;
+      if (word === 'mod') {
+        const [name, at] = identifier(end);
+        module = name || null;
+        index = at;
+        attributes = [];
+      } else if (word === 'fn') {
+        const [name, at] = identifier(end);
+        index = at;
+        if (name && attributes.some(attribute => rustTestAttribute.test(attribute))) {
+          // The body is the first `{` after the signature; none before a `;` or the end.
+          let open = at;
+          while (open < length && code[open] !== '{' && code[open] !== ';') open++;
+          const close = code[open] === '{' ? closingBracket(code, open) : -1;
+          const body = close < 0 ? null : code.slice(open + 1, close);
+          if (body !== null) {
+            const shouldPanic = attributes.some(attribute => /^should_panic\b/.test(attribute));
+            bodies.push(body);
+            cases.push({
+              name: [...prefix, ...modules.map(item => item.name), name].join('::'),
+              skipped: attributes.some(attribute => /\bignore\b/.test(attribute)),
+              body: body.replace(/\s+/g, ' ').trim(),
+              weak: rustWeakness(body, shouldPanic),
+            });
+          }
+          index = close < 0 ? open : close + 1;
+        }
+        attributes = [];
+      }
+    } else index++;
+  }
+  // Assertions are counted in the test bodies only: production code may assert too.
+  return { code: bodies.join('\n'), cases };
+}
+
+/**
+ * The Rust tests of a file as `{ name, skipped }`, named as `cargo test -- --list` prints them.
+ * @param {string} file Repository-relative path: it gives the module path.
+ * @param {string} source
+ */
+export const rustTestCases = (file, source) =>
+  rustCases(file, source).cases.map(({ name, skipped }) => ({ name, skipped }));
 
 /** Where the code continues after the block comment that opens at `index`. Kotlin comments nest. */
 function blockCommentEnd(source, index, nested) {
@@ -773,7 +1156,7 @@ function casesOf(file, source) {
   let parsed;
   if (language === 'js') parsed = jsCases(source);
   else if (language === 'py') parsed = pythonCases(source);
-  else if (language === 'rs') parsed = { cases: rustCases(source) };
+  else if (language === 'rs') parsed = rustCases(file, source);
   else if (language === 'go')
     parsed = {
       cases: [...source.matchAll(/^func\s+(Test\w+)\s*\(/gm)].map(match => ({ name: match[1], skipped: false })),
@@ -884,6 +1267,32 @@ function skipFindings(base, head) {
 }
 
 /**
+ * `weak_or_empty_test`: a changed or new Rust test that checks nothing. A test whose body is the
+ * same as on the base is old code and is left alone. No permission covers it: a test that is not
+ * needed is deleted instead.
+ */
+function weakFindings(base, head) {
+  const found = [],
+    baseBodies = new Map();
+  for (const entry of base)
+    for (const item of entry.cases)
+      if (item.body !== undefined) baseBodies.set(item.name, (baseBodies.get(item.name) ?? new Set()).add(item.body));
+  for (const entry of head) {
+    const weak = entry.cases.filter(item => item.weak && !baseBodies.get(item.name)?.has(item.body));
+    if (weak.length)
+      found.push({
+        rule: 'weak_or_empty_test',
+        file: entry.file,
+        detail: `tests that check nothing: ${weak
+          .slice(0, 5)
+          .map(item => `${JSON.stringify(item.name)} (${item.weak})`)
+          .join(', ')}${weak.length > 5 ? `, and ${weak.length - 5} more` : ''}`,
+      });
+  }
+  return found;
+}
+
+/**
  * Tests that existed on the base and were removed or switched off.
  *
  * Cases are compared by name across all changed test files: a case that moved
@@ -896,36 +1305,54 @@ function skipFindings(base, head) {
  * (`describe.skip`, `xdescribe`, a decorator on a class, `pytestmark`).
  * `.only` added to a file with existing tests stops the others.
  *
- * What it cannot see is in the docs: a body emptied under the same name, an
- * early `return`, a skip called inside the body, a renamed case (reported as
- * removed).
+ * Rust files are read wherever they are: tests live in `#[cfg(test)]` modules
+ * of `src/**.rs` too. A changed or new Rust test that checks nothing (an empty
+ * body, `assert!(true)`, a `return` before any assertion) is `weak_or_empty_test`.
+ *
+ * What it cannot see is in the docs: a body emptied under the same name (except
+ * Rust), an early `return`, a skip called inside the body, a renamed case
+ * (reported as removed).
  * @param {{ cwd: string, baseSha: string, headSha: string, allowed?: string[] }} input
  *   `allowed`: test paths this run may delete or reduce.
  */
-export async function testWeakening({ cwd, baseSha, headSha, allowed = [] }) {
+export async function testWeakening(input) {
+  const { findings, allowed, warnings, unchecked } = await inspectTests(input);
+  return { findings, allowed, warnings, unchecked };
+}
+
+/** A file whose cases are compared: a test file, or any Rust file (unit tests live in `src/`). */
+const guarded = file => isTestFile(file) || languageOf(file) === 'rs';
+
+/**
+ * `testWeakening` with what the registry comparison needs: the names this reading already
+ * reported or allowed as removed, and the base file of every base case.
+ * @param {{ cwd: string, baseSha: string, headSha: string, allowed?: string[] }} input
+ */
+async function inspectTests({ cwd, baseSha, headSha, allowed = [] }) {
   const base = [],
     head = [],
     unchecked = [],
     findings = [],
     permitted = [],
-    warnings = [];
+    warnings = [],
+    removedNames = new Set();
   const report = finding =>
     (finding.rule !== 'test_skipped' && ownsPath(allowed, finding.file) ? permitted : findings).push(finding);
   for (const { status, from, to } of await changes(cwd, baseSha, headSha)) {
     // A test renamed to a path no runner would pick up is gone.
-    const gone = status === 'D' || !isTestFile(to);
-    if (status !== 'A' && status !== 'C' && isTestFile(from)) {
+    const gone = status === 'D' || !guarded(to);
+    if (status !== 'A' && status !== 'C' && guarded(from)) {
       const before = await inspect(cwd, baseSha, from);
       if (!before.reason)
         base.push({ file: from, at: gone ? from : to, gone, renamedTo: status === 'D' ? null : to, ...before });
       else if (before.reason !== 'unsupported_language' || namedTest.test(from)) {
         unchecked.push({ file: from, reason: before.reason });
         // A removed test file is a removed test even when its cases could not be read.
-        if (gone && languageOf(from))
+        if (gone && languageOf(from) && isTestFile(from))
           report({ rule: 'test_deleted', file: from, detail: `removed and not inspected (${before.reason})` });
       }
     }
-    if (status !== 'D' && isTestFile(to)) {
+    if (status !== 'D' && guarded(to)) {
       const after = await inspect(cwd, headSha, to);
       if (!after.reason) head.push({ file: to, ...after });
       else if (after.reason !== 'unsupported_language' || namedTest.test(to))
@@ -952,6 +1379,7 @@ export async function testWeakening({ cwd, baseSha, headSha, allowed = [] }) {
   const moved = name => take(left, name);
   for (const [index, entry] of base.entries()) {
     const removed = missing[index].filter(name => !moved(name));
+    for (const name of removed) removedNames.add(name);
     if (removed.length)
       report(
         entry.gone
@@ -986,7 +1414,102 @@ export async function testWeakening({ cwd, baseSha, headSha, allowed = [] }) {
       file: null,
       detail: `assertions ${total(base, 'assertions')} -> ${total(head, 'assertions')} across changed tests`,
     });
-  return { findings, allowed: permitted, warnings, unchecked };
+  findings.push(...weakFindings(base, head));
+  const located = new Map();
+  for (const entry of base)
+    for (const item of entry.cases) if (!located.has(item.name)) located.set(item.name, entry.file);
+  return { findings, allowed: permitted, warnings, unchecked, removedNames, located };
+}
+
+/** Doc tests carry a line number that moves with any edit above them: `src/lib.rs - add (line 3)`. */
+const docTest = / - .* \(line \d+\)$/;
+
+/** Test names a `cargo test -- --list` output lists, as a multiset. */
+function registryNames(output) {
+  const names = new Map();
+  for (const line of output.split(/\r?\n/)) {
+    const match = /^(.+): test$/.exec(line.trim());
+    if (match && !docTest.test(match[1])) names.set(match[1], (names.get(match[1]) ?? 0) + 1);
+  }
+  return names;
+}
+
+const REGISTRY_ARGS = ['test', '--workspace', '--tests', '--', '--list'];
+
+/**
+ * Compare the test registry of `cargo test -- --list` on the base and the head:
+ * the names cargo sees include tests no reading of the source finds (generated
+ * by macros, behind `#[path]`, removed by a target or feature change in
+ * `Cargo.toml`). The base is listed in a temporary checkout that shares the
+ * head's target directory. A name gone from the head that the static reading
+ * has not already reported or allowed is `test_deleted`. Without cargo, or
+ * when a listing fails, the comparison is `unchecked`: never a pass, and the
+ * build failure itself is the checks' business.
+ */
+async function compareTestRegistry({ cwd, baseSha, signal, secrets, runner, allowed, removedNames, located }) {
+  const env = workerEnvironment();
+  const list = async (where, extra = {}) => {
+    try {
+      const result = await runner('cargo', REGISTRY_ARGS, {
+        cwd: where,
+        signal,
+        env: { ...env, ...extra },
+        secrets,
+        allowFailure: true,
+        rawOutput: true,
+      });
+      return result.code === 0 ? { names: registryNames(result.stdout) } : { reason: `exit_${result.code}` };
+    } catch (error) {
+      if (signal?.aborted || error.code === 'cancelled') throw error;
+      return { reason: error.code || 'execution_failed' };
+    }
+  };
+  try {
+    await runner('cargo', ['--version'], { cwd, signal, env, secrets, allowFailure: false });
+  } catch (error) {
+    if (signal?.aborted || error.code === 'cancelled') throw error;
+    return { registry: { status: 'unavailable', reason: 'cargo_unavailable' } };
+  }
+  const after = await list(cwd);
+  if (after.reason) return { registry: { status: 'failed', reason: `head_${after.reason}` } };
+  const checkout = mkdtempSync(path.join(os.tmpdir(), 'kodo-registry-'));
+  let before;
+  try {
+    await execute('git', ['worktree', 'add', '--detach', '--quiet', checkout, baseSha], { cwd });
+    // A target directory the project already chose is kept; otherwise the base build reuses the head's.
+    before = await list(checkout, env.CARGO_TARGET_DIR ? {} : { CARGO_TARGET_DIR: path.join(cwd, 'target') });
+  } finally {
+    await execute('git', ['worktree', 'remove', '--force', checkout], { cwd, allowFailure: true }).catch(() => {});
+    rmSync(checkout, { recursive: true, force: true });
+  }
+  if (before.reason) return { registry: { status: 'failed', reason: `base_${before.reason}` } };
+  const gone = [];
+  for (const [name, number] of before.names)
+    for (let left = number - (after.names.get(name) ?? 0); left > 0; left--) gone.push(name);
+  const findings = [],
+    permitted = [],
+    unexplained = [],
+    byFile = new Map();
+  for (const name of gone) {
+    if (removedNames.has(name)) continue;
+    const file = located.get(name);
+    if (file && ownsPath(allowed, file)) byFile.set(file, [...(byFile.get(file) ?? []), name]);
+    else unexplained.push(name);
+  }
+  for (const [file, names] of byFile)
+    permitted.push({ rule: 'test_deleted', file, detail: `cargo test -- --list: tests are gone: ${listNames(names)}` });
+  if (unexplained.length)
+    findings.push({
+      rule: 'test_deleted',
+      file: null,
+      detail: `cargo test -- --list: ${unexplained.length} tests are gone: ${listNames(unexplained)}`,
+    });
+  const count = names => [...names.values()].reduce((sum, number) => sum + number, 0);
+  return {
+    registry: { status: 'compared', base: count(before.names), head: count(after.names) },
+    findings,
+    permitted,
+  };
 }
 
 /** Findings a repair session cannot fix: only a person can change the configuration. */
@@ -1017,16 +1540,55 @@ async function runOracle(oracle, { cwd, signal, secrets, runner, persist }) {
   const evidence = persist
     ? await persist('oracle', { id: oracle.id, command: oracle.command, args: oracle.args, exitCode, output })
     : null;
+  // Budgets are read from the same output the evidence keeps, and only from an oracle that exited 0.
+  const budgets = exitCode === 0 && oracle.budgets ? oracle.budgets.map(budget => measure(budget, output)) : null;
+  const missed = budgets?.filter(budget => budget.status !== 'met') ?? [];
+  if (missed.length)
+    reason = missed.some(budget => budget.status === 'missing') ? 'budget_metric_missing' : 'budget_exceeded';
   return {
     receipt: {
       id: oracle.id,
-      status: exitCode === 0 ? 'passed' : 'failed',
+      status: exitCode === 0 && !missed.length ? 'passed' : 'failed',
       ...(reason ? { reason } : {}),
       exitCode,
+      ...(budgets ? { budgets } : {}),
       ...(evidence ? { outputPath: evidence.path, outputHash: evidence.sha256 } : {}),
     },
-    detail: reason ? `${oracle.id}: ${reason}` : `${oracle.id} exit ${exitCode}: ${output.slice(-2000)}`,
+    detail: missed.length
+      ? `${oracle.id}: ${missed
+          .map(budget =>
+            budget.status === 'missing'
+              ? `metric /${budget.metric}/ not found in the output`
+              : `${budget.metric} = ${budget.value}, ${budget.status === 'over' ? `above max ${budget.max}` : `below min ${budget.min}`}`,
+          )
+          .join('; ')}`
+      : reason
+        ? `${oracle.id}: ${reason}`
+        : `${oracle.id} exit ${exitCode}: ${output.slice(-2000)}`,
   };
+}
+
+/**
+ * One budget against an oracle's output: the last match of `metric` gives the
+ * number in its first capture group. No number is a failure, never a pass.
+ * @param {OracleBudget} budget
+ * @param {string} output
+ */
+function measure(budget, output) {
+  let value = null;
+  for (const match of output.matchAll(new RegExp(budget.metric, 'g'))) {
+    const number = Number(match[1]);
+    if (match[1] !== undefined && match[1].trim() !== '' && Number.isFinite(number)) value = number;
+  }
+  const status =
+    value === null
+      ? 'missing'
+      : budget.max !== undefined && value > budget.max
+        ? 'over'
+        : budget.min !== undefined && value < budget.min
+          ? 'under'
+          : 'met';
+  return { ...budget, value, status };
 }
 
 /**
@@ -1061,13 +1623,36 @@ export async function runBehaviorGate({
         file: null,
         detail: `${gap.gate} gate is required for this change`,
       });
+  let testRegistry;
   if (verification.testProtection) {
-    const tests = await testWeakening({ cwd, baseSha, headSha, allowed: verification.testRemovalAllowed });
+    const tests = await inspectTests({ cwd, baseSha, headSha, allowed: verification.testRemovalAllowed });
     findings.push(...tests.findings);
     // Removals this run was explicitly allowed; the receipt still shows them.
     allowed.push(...tests.allowed);
     warnings.push(...tests.warnings);
     unchecked.push(...tests.unchecked);
+    // A Rust change: the names cargo lists are compared too, when cargo is there.
+    if (
+      verification.testRegistry &&
+      paths.some(file => /\.rs$|(^|\/)Cargo\.toml$/i.test(file)) &&
+      (await execute('git', ['cat-file', '-e', `${headSha}:Cargo.toml`], { cwd, allowFailure: true })).code === 0
+    ) {
+      const compared = await compareTestRegistry({
+        cwd,
+        baseSha,
+        signal,
+        secrets,
+        runner,
+        allowed: verification.testRemovalAllowed,
+        removedNames: tests.removedNames,
+        located: tests.located,
+      });
+      testRegistry = compared.registry;
+      if (testRegistry.status !== 'compared')
+        unchecked.push({ file: null, reason: `test_registry: ${testRegistry.reason}` });
+      findings.push(...(compared.findings ?? []));
+      allowed.push(...(compared.permitted ?? []));
+    }
   }
   const oracles = [];
   for (const oracle of verification.oracles) {
@@ -1104,6 +1689,7 @@ export async function runBehaviorGate({
     warnings,
     unchecked,
     oracles,
+    ...(testRegistry ? { testRegistry } : {}),
   };
 }
 
