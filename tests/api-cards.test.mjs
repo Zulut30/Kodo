@@ -351,11 +351,25 @@ pub mod nested {
     pub mod deep {
         pub const FLAG: bool = true;
     }
+    #[macro_export]
+    macro_rules! nested_api {
+        () => {};
+    }
     fn hidden_in_mod() {}
 }
 
 mod private_mod {
     pub fn not_publicly_reachable() {}
+    #[macro_export]
+    macro_rules! api {
+        () => {};
+    }
+    mod inner {
+        #[macro_export]
+        macro_rules! deep_api {
+            () => {};
+        }
+    }
 }
 
 #[macro_export]
@@ -374,6 +388,10 @@ pub fn direct_test_helper() {}
 pub mod tests {
     pub struct TestFixture;
     pub fn test_only() {}
+    #[macro_export]
+    macro_rules! test_only_macro {
+        () => {};
+    }
 }
 `;
   const sigs = extractRustPublicApi(rust);
@@ -388,12 +406,15 @@ pub mod tests {
     'nested :: pub fn build() -> Item',
     'nested :: pub mod deep',
     'nested::deep :: pub const FLAG: bool = true',
-    '#[macro_export] macro_rules! my_macro',
+    'crate::nested_api!',
+    'crate::api!',
+    'crate::deep_api!',
+    'crate::my_macro!',
   ]);
   for (const sig of sigs) {
     assert.doesNotMatch(
       sig,
-      /hidden_in_mod|not_publicly_reachable|local_macro|direct_test_helper|TestFixture|test_only/,
+      /hidden_in_mod|not_publicly_reachable|local_macro|direct_test_helper|TestFixture|test_only|test_only_macro/,
     );
   }
 });

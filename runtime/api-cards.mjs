@@ -246,7 +246,8 @@ function isRustUseStatement(code, stmtStart) {
 function classifyRustBlock(frames, trimmedCode, rawHeader, attrs) {
   if (hasCfgTestAttr(attrs)) return { kind: 'skip' };
   const parent = frames.at(-1);
-  if (parent && parent.kind !== 'mod') {
+  const inPrivateMod = frames.some(f => f.kind === 'private_mod');
+  if (parent && parent.kind !== 'mod' && parent.kind !== 'private_mod') {
     if (parent.kind === 'trait' && RUST_TRAIT_ITEM.test(trimmedCode)) {
       const sig = cleanRustSignature(rawHeader, true);
       if (sig) return { kind: 'other', emit: `${parent.label} :: ${sig}` };
@@ -259,22 +260,23 @@ function classifyRustBlock(frames, trimmedCode, rawHeader, attrs) {
   }
   const macroMatch = RUST_MACRO_RULES.exec(trimmedCode);
   if (macroMatch) {
-    return hasMacroExportAttr(attrs)
-      ? { kind: 'skip', emit: qualifyMod(frames, `#[macro_export] macro_rules! ${macroMatch[1]}`) }
-      : { kind: 'skip' };
+    // #[macro_export] always exports to crate root regardless of enclosing module visibility.
+    return hasMacroExportAttr(attrs) ? { kind: 'skip', emit: `crate::${macroMatch[1]}!` } : { kind: 'skip' };
   }
+  if (/^(?:pub(?:\s*\([^)]*\))?\s+)?mod\b/.test(trimmedCode)) {
+    if (inPrivateMod || !/^pub\s+mod\b/.test(trimmedCode)) return { kind: 'private_mod' };
+    const modMatch = /^pub\s+mod\s+([A-Za-z_][A-Za-z0-9_]*)\b/.exec(trimmedCode);
+    const sig = cleanRustSignature(rawHeader, true);
+    return modMatch ? { kind: 'mod', name: modMatch[1], emit: qualifyMod(frames, sig) } : { kind: 'private_mod' };
+  }
+  if (inPrivateMod) return { kind: 'skip' };
   if (RUST_IMPL_HEAD.test(trimmedCode)) {
     const implHead = cleanRustSignature(rawHeader, true);
     return { kind: 'impl', label: qualifyMod(frames, implHead) };
   }
-  if (/^(?:pub\s*\([^)]*\)\s+)?mod\b/.test(trimmedCode) && !/^pub\s+mod\b/.test(trimmedCode)) {
-    return { kind: 'skip' };
-  }
   if (!/^pub\s*\(/.test(trimmedCode) && RUST_PUB_TOP.test(trimmedCode)) {
     const sig = cleanRustSignature(rawHeader, true);
     const qualified = qualifyMod(frames, sig);
-    const modMatch = /^pub\s+mod\s+([A-Za-z_][A-Za-z0-9_]*)\b/.exec(trimmedCode);
-    if (modMatch) return { kind: 'mod', name: modMatch[1], emit: qualified };
     if (/^pub\s+(?:unsafe\s+)?trait\b/.test(trimmedCode)) return { kind: 'trait', label: qualified, emit: qualified };
     return { kind: 'other', emit: qualified };
   }
@@ -284,7 +286,7 @@ function classifyRustBlock(frames, trimmedCode, rawHeader, attrs) {
 function inspectRustSemicolon(frames, trimmedCode, rawHeader, attrs) {
   if (hasCfgTestAttr(attrs)) return null;
   const parent = frames.at(-1);
-  if (parent && parent.kind !== 'mod') {
+  if (parent && parent.kind !== 'mod' && parent.kind !== 'private_mod') {
     if (parent.kind === 'trait' && RUST_TRAIT_ITEM.test(trimmedCode)) {
       const sig = cleanRustSignature(rawHeader, false);
       return sig ? `${parent.label} :: ${sig}` : null;
@@ -297,8 +299,9 @@ function inspectRustSemicolon(frames, trimmedCode, rawHeader, attrs) {
   }
   const macroMatch = RUST_MACRO_RULES.exec(trimmedCode);
   if (macroMatch) {
-    return hasMacroExportAttr(attrs) ? qualifyMod(frames, `#[macro_export] macro_rules! ${macroMatch[1]}`) : null;
+    return hasMacroExportAttr(attrs) ? `crate::${macroMatch[1]}!` : null;
   }
+  if (frames.some(f => f.kind === 'private_mod')) return null;
   if (!/^pub\s*\(/.test(trimmedCode) && RUST_PUB_TOP.test(trimmedCode)) {
     const sig = cleanRustSignature(rawHeader, false);
     return sig ? qualifyMod(frames, sig) : null;
