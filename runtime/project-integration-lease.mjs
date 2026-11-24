@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
+import { fencedBy } from './lease-fence.mjs';
 
 // Lease `project-integration:<projectId>` serializes every change of a wave project's
 // integration branch and every transition whose proof reads that branch. The holder's
@@ -46,7 +47,9 @@ export async function withIntegrationLease(store, projectId, work, options = {})
   }, heartbeatMs);
   timer.unref();
   try {
-    return await held.run(new Map([...(outer ?? []), [name, token]]), work);
+    // Writes inside are fenced by the token (runtime/lease-fence.mjs): a holder whose lease expired
+    // and passed to another holder cannot record a merge or a transition.
+    return await held.run(new Map([...(outer ?? []), [name, token]]), () => fencedBy([token], work));
   } finally {
     clearInterval(timer);
     store.releaseLease(token);

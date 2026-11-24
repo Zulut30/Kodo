@@ -7,6 +7,7 @@ import { redact, workerEnvironment } from './security.mjs';
 import { execute } from './command.mjs';
 import { assertPrivateArtifactPath } from './progress.mjs';
 import { gateRange } from './project-integration.mjs';
+import { assertFence } from './lease-fence.mjs';
 
 const fail = code => {
   throw Object.assign(new Error('Project ' + code), { code: 'project_' + code });
@@ -991,6 +992,8 @@ async function apply(ctx, input) {
     requireValue(decision === undefined, 'authorization_denied');
   }
   return transaction(ctx.db, 'BEGIN IMMEDIATE', () => {
+    // A lease holder's command is fenced: its leases must still be live (runtime/lease-fence.mjs).
+    assertFence(ctx.db);
     const repeated = replay(ctx, namespace, command.commandId, payloadHash);
     if (repeated) return repeated;
     const now = new Date().toISOString();

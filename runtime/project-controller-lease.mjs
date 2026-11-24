@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
+import { fencedBy } from './lease-fence.mjs';
 
 const busy = () => Object.assign(new Error('Project busy'), { code: 'project_busy' });
 const coded = code => Object.assign(new Error(`Project ${code}`), { code });
@@ -74,7 +75,7 @@ export async function withHeldLease(store, token, work, heartbeatMs = 10000) {
   }, heartbeatMs);
   timer.unref();
   try {
-    return await work(lost.signal);
+    return await fencedBy([token], () => work(lost.signal));
   } finally {
     clearInterval(timer);
     store.releaseLease(token);
@@ -130,26 +131,33 @@ export async function withProjectSection(store, projectId, work, options = {}) {
 
 // Gate-producing controllers exclude each other even while a standalone gate releases
 // the project lease for tests, independent review and repair in its private worktree.
-export const withGateController = (store, projectId, work) =>
-  withControllerLease(store, `project-gates:${projectId}`, work);
+// `work(outsideLease, lost)`: `lost` aborts when a renewal finds the lease gone (TTL expired);
+// writes inside the controller are fenced by its token (runtime/lease-fence.mjs).
+export const withGateController = (store, projectId, work, options = {}) =>
+  withControllerLease(store, `project-gates:${projectId}`, work, options);
 
 export function withPullLease(store, projectId, runsGates, work) {
   const run = () => withControllerLease(store, `project:${projectId}`, work);
   return runsGates ? withGateController(store, projectId, run) : run();
 }
 
-async function withControllerLease(store, name, work) {
+async function withControllerLease(store, name, work, options = {}) {
+  const heartbeatMs = options.heartbeatMs || 10000;
   const owner = randomUUID();
   const acquire = () => store.acquireLease(name, owner, { ttlMs: 60000, limit: 1 });
   let token = acquire();
   if (!token) throw busy();
+  const lost = new AbortController();
   const timer = setInterval(() => {
+    if (!token) return;
+    let renewed;
     try {
-      if (token) store.renewLease(token);
+      renewed = store.renewLease(token);
     } catch {
-      // A transient Store failure must not throw from the timer.
+      return; // A transient Store failure must not throw from the timer; the next beat retries.
     }
-  }, 10000);
+    if (renewed === false) lost.abort();
+  }, heartbeatMs);
   timer.unref();
   // Only the standalone gate uses this callback, around the private Run. Rejoin
   // the serialized protocol before inspecting state, merging or accepting anything.
@@ -173,7 +181,7 @@ async function withControllerLease(store, name, work) {
     throw cancelled();
   };
   try {
-    return await work(outsideLease);
+    return await fencedBy([() => token], () => work(outsideLease, lost.signal));
   } finally {
     clearInterval(timer);
     if (token) store.releaseLease(token);

@@ -11,6 +11,7 @@ import {
   openIntegrationQueue,
 } from '../runtime/project-integration-queue.mjs';
 import { acquireLeaseWaiting, projectSectionHeld, withProjectSection } from '../runtime/project-controller-lease.mjs';
+import { fencedBy } from '../runtime/lease-fence.mjs';
 import { machineBuildLeaseName, machineBuildSettings, withMachineBuild } from '../runtime/machine-build-lease.mjs';
 
 const projectId = randomUUID();
@@ -95,7 +96,15 @@ test('A drain keeps priority and FIFO order: a claim ends at the first overlappi
     scopeOf,
     integrate: async entry => {
       order.push(entry.taskId);
-      batches.push(entry.batchId);
+      // Which rows are claimed while this one integrates.
+      batches.push(
+        queue
+          .list(projectId)
+          .filter(row => row.status === 'merging')
+          .map(row => row.taskId)
+          .sort()
+          .join(''),
+      );
       if (entry.taskId === 'b') return { status: 'rejected', code: 'project_integration_conflict' };
       if (entry.taskId === 'd') throw Object.assign(new Error('boom'), { code: 'project_transition_blocked' });
       return { status: 'integrated' };
@@ -103,8 +112,7 @@ test('A drain keeps priority and FIFO order: a claim ends at the first overlappi
   });
   // c (priority 3) first; a overlaps c, so c's claim ends there and a heads the next one.
   assert.deepEqual(order, ['c', 'a', 'b', 'd']);
-  assert.notEqual(batches[0], batches[1]);
-  assert.equal(new Set(batches.slice(1)).size, 1, 'a, b and d are claimed together');
+  assert.deepEqual(batches, ['c', 'abd', 'bd', 'd'], 'c alone; then a, b and d are claimed together');
   assert.deepEqual(
     finished.map(entry => [entry.taskId, entry.status, entry.outcome.code ?? null]),
     [
@@ -124,7 +132,8 @@ test('A drain keeps priority and FIFO order: a claim ends at the first overlappi
 });
 
 test('One drain integrates at most four rows, stopped drains keep their merging rows', async t => {
-  const queue = openIntegrationQueue((await home(t)).open());
+  const store = (await home(t)).open();
+  const queue = openIntegrationQueue(store);
   for (let index = 0; index < 6; index++) queue.enqueue(row(`t${index}`, 0, index + 1));
   // A crash left t0 merging (claimed, never finished).
   const [orphan] = queue.claim(projectId, { maxBatch: 1 });
@@ -135,15 +144,49 @@ test('One drain integrates at most four rows, stopped drains keep their merging 
     [],
   );
   assert.equal(queue.get(orphan.seq).status, 'merging');
-  // Without the leases at the end of a row its outcome is not recorded.
-  const lost = await drainIntegrationQueue({
-    queue,
-    projectId,
-    owned: () => false,
-    integrate: async () => ({ status: 'integrated' }),
-  });
+  // A drain whose lease expired during the row (and passed on) records nothing: its fenced
+  // write fails and the row stays merging for the current holder.
+  const token = store.acquireLease(`project-integration:${projectId}`, 'stale', { ttlMs: 60000 });
+  const lost = await fencedBy([token], () =>
+    drainIntegrationQueue({
+      queue,
+      projectId,
+      integrate: async () => {
+        store.db.prepare('UPDATE leases SET expires=0 WHERE token=?').run(token);
+        return { status: 'integrated' };
+      },
+    }),
+  );
   assert.deepEqual(lost, []);
   assert.equal(queue.get(orphan.seq).status, 'merging');
+  store.releaseLease(token);
+  // A stale drain cannot finish or release a row another drain took over (claim).
+  let taken;
+  const stale = await drainIntegrationQueue({
+    queue,
+    projectId,
+    maxRows: 1,
+    integrate: async entry => {
+      const staleClaim = queue.get(entry.seq).claim;
+      // Meanwhile another drain adopts the same merging row and finishes it.
+      taken = await drainIntegrationQueue({
+        queue,
+        projectId,
+        maxRows: 1,
+        integrate: async () => ({ status: 'rejected', code: 'project_submission_stale' }),
+      });
+      queue.release(entry.seq, staleClaim);
+      return { status: 'integrated' };
+    },
+  });
+  assert.deepEqual(stale, [], 'the stale drain finished nothing');
+  assert.deepEqual(
+    taken.map(entry => [entry.taskId, entry.status]),
+    [['t0', 'rejected']],
+  );
+  assert.equal(queue.get(orphan.seq).outcome.code, 'project_submission_stale', 'the new outcome stays');
+  // The row is queued again for the rest of the test.
+  store.db.prepare("UPDATE kodo_integration_queue SET status='merging' WHERE seq=?").run(orphan.seq);
   const seen = [];
   const finished = await drainIntegrationQueue({
     queue,
@@ -295,6 +338,25 @@ test('A waiting submission drains when it can and stops with its own codes', asy
     { code: 'project_integration_queue_cancelled' },
   );
   assert.equal(queue.get(waiting.seq).status, 'queued', 'a stopped wait leaves the row queued');
+  // A finished row wins over the deadline: the drain that finished it ran past the deadline.
+  const late = queue.enqueue(row('late'));
+  clock = 0;
+  const finished = await awaitIntegration({
+    queue,
+    seq: late.seq,
+    waitMs: 1000,
+    pollMs: 1,
+    now: () => (clock += 600),
+    tryDrain: async () => {
+      await drainIntegrationQueue({
+        queue,
+        projectId,
+        integrate: async entry => ({ status: entry.taskId === 'late' ? 'integrated' : 'rejected', code: 'x' }),
+      });
+      return true;
+    },
+  });
+  assert.equal(finished.status, 'integrated');
 });
 
 test('The machine build semaphore admits its limit and waits for a free slot', async t => {
@@ -316,7 +378,11 @@ test('The machine build semaphore admits its limit and waits for a free slot', a
       { machine: { id: 'box', maxHeavyBuilds: 2 }, pollMs: 1 },
     );
   const until = async condition => {
-    while (!condition()) await new Promise(resolve => setImmediate(resolve));
+    const deadline = Date.now() + 30000;
+    while (!condition()) {
+      assert.ok(Date.now() < deadline, 'timed out waiting for the build slots');
+      await new Promise(resolve => setImmediate(resolve));
+    }
   };
   const builds = [build(), build(), build()];
   await until(() => release.length === 2);

@@ -303,6 +303,33 @@ async function existingMerge(worktree, taskHead) {
   return fail('integration_invalid');
 }
 
+// The integration branch moves only by compare-and-swap: `update-ref <branch> <next> <expected>`
+// fails when another holder moved it meanwhile (a holder whose lease expired and passed on), and
+// such a holder gets `project_lease_lost` without touching the branch. The worktree that has the
+// branch checked out then follows the branch's current head (never moves the branch itself).
+async function advanceBranch(worktree, branch, next, expected) {
+  const moved = await execute(
+    'git',
+    ['update-ref', '-m', 'Kodo: integration', `refs/heads/${branch}`, next, expected],
+    { cwd: worktree, allowFailure: true },
+  );
+  if (moved.code !== 0) fail('lease_lost');
+  await git(worktree, ['reset', '--quiet', '--hard', 'HEAD']);
+}
+
+// The merge commit of `head` into `before` (first parent `before`), built without touching any
+// worktree or branch (`merge-tree --write-tree`, the same ort merge as `git merge`).
+async function mergeCommitOf(worktree, before, head, message) {
+  const tree = await execute('git', ['merge-tree', '--write-tree', '--no-messages', before, head], {
+    cwd: worktree,
+    allowFailure: true,
+  });
+  if (tree.code === 1) fail('integration_conflict');
+  if (tree.code !== 0) fail('integration_invalid');
+  const treeSha = tree.stdout.trim().split(/\r?\n/)[0];
+  return git(worktree, ['commit-tree', treeSha, '-p', before, '-p', head, '-m', message]);
+}
+
 async function abortMerge(worktree, before) {
   await execute('git', ['merge', '--abort'], { cwd: worktree, allowFailure: true });
   if ((await headOf(worktree)) !== before || (await git(worktree, ['status', '--porcelain=v1'])))
@@ -505,28 +532,20 @@ export async function mergeTask({
         recovered.mergeCommit,
       );
       if (defect) {
-        if (recovered.mergeCommit === head) await git(worktree, ['reset', '--hard', recovered.before]);
+        if (recovered.mergeCommit === head) await advanceBranch(worktree, branch, recovered.before, head);
         fail(defect);
       }
       return { branch, ...recovered, mergedHead: taskHead, status: 'merged' };
     }
     const before = head;
     await savePending({ before });
-    const merged = await execute(
-      'git',
-      ['merge', '--no-ff', '--no-edit', '-m', `Kodo: integrate ${taskId}`, taskHead],
-      { cwd: worktree, allowFailure: true },
-    );
-    if (merged.code !== 0) {
-      await abortMerge(worktree, before);
-      fail('integration_conflict');
-    }
-    const defect = await mergeDefect(worktree, before, taskHead, writePaths, secrets);
-    if (defect) {
-      await git(worktree, ['reset', '--hard', before]);
-      fail(defect);
-    }
-    return { branch, before, mergeCommit: await headOf(worktree), mergedHead: taskHead, status: 'merged' };
+    // The merge commit is built and checked before the branch moves: a conflict or a defect leaves
+    // the branch and its worktree untouched, and only a compare-and-swap publishes the merge.
+    const mergeCommit = await mergeCommitOf(worktree, before, taskHead, `Kodo: integrate ${taskId}`);
+    const defect = await mergeDefect(worktree, before, taskHead, writePaths, secrets, mergeCommit);
+    if (defect) fail(defect);
+    await advanceBranch(worktree, branch, mergeCommit, before);
+    return { branch, before, mergeCommit, mergedHead: taskHead, status: 'merged' };
   };
   return withLease ? withLease(merge) : merge();
 }
@@ -565,7 +584,7 @@ export async function gateRepairInScope({ worktree, from, to, writePaths }) {
  */
 export async function mergeBackGate({ worktree, expectedHead, gateHead }) {
   if (!sha(gateHead) || !sha(expectedHead)) fail('integration_invalid');
-  await assertIntegrationWorktree(worktree);
+  const branch = await assertIntegrationWorktree(worktree);
   await assertCommit(worktree, gateHead);
   await assertCommit(worktree, expectedHead);
   if (!(await ancestor(worktree, expectedHead, gateHead))) fail('integration_invalid');
@@ -573,13 +592,11 @@ export async function mergeBackGate({ worktree, expectedHead, gateHead }) {
   if (await ancestor(worktree, gateHead, before)) return before;
   // The branch is never rewritten: it must still contain the gate head.
   if (!(await ancestor(worktree, expectedHead, before))) fail('integration_invalid');
-  const args =
+  // Fast-forward to the verified head, or merge the repairs; either way by compare-and-swap.
+  const next =
     before === expectedHead
-      ? ['merge', '--ff-only', gateHead]
-      : ['merge', '--no-ff', '--no-edit', '-m', 'Kodo: integrate gate repairs', gateHead];
-  if ((await execute('git', args, { cwd: worktree, allowFailure: true })).code !== 0) {
-    await abortMerge(worktree, before);
-    fail('integration_conflict');
-  }
-  return headOf(worktree);
+      ? gateHead
+      : await mergeCommitOf(worktree, before, gateHead, 'Kodo: integrate gate repairs');
+  await advanceBranch(worktree, branch, next, before);
+  return next;
 }

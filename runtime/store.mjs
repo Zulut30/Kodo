@@ -4,6 +4,7 @@ import { mkdirSync, realpathSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { stateHome, redact } from './security.mjs';
+import { assertFence } from './lease-fence.mjs';
 const projectKey = value => {
   const resolved = path.resolve(value);
   return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
@@ -350,9 +351,14 @@ export class Store {
     if (!row) throw new Error(`Запуск не найден: ${id}`);
     return JSON.parse(row.body);
   }
+  // Inside a lease holder's async context (runtime/lease-fence.mjs) the write is fenced: it checks
+  // in its own transaction that the holder's leases are still live (`project_lease_lost` otherwise).
+  // Nested in `withFence`, it joins that transaction.
   updateRun(id, patch, { preserveCancellation = false } = {}) {
-    this.db.exec('BEGIN IMMEDIATE');
+    const own = !this.db.isTransaction;
+    if (own) this.db.exec('BEGIN IMMEDIATE');
     try {
+      assertFence(this.db);
       const current = this.getRun(id);
       const run = { ...current, ...patch, updatedAt: new Date().toISOString() };
       if (preserveCancellation) {
@@ -365,8 +371,29 @@ export class Store {
       this.db
         .prepare('UPDATE runs SET body=?,updated=? WHERE id=?')
         .run(JSON.stringify(redact(run, this.secrets)), Date.now(), id);
-      this.db.exec('COMMIT');
+      if (own) this.db.exec('COMMIT');
       return run;
+    } catch (error) {
+      if (own) this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+  /**
+   * Run `operation` (synchronous; it may call updateRun) in one BEGIN IMMEDIATE transaction that
+   * first checks that every lease token in `tokens` and in the async context's fence still names a
+   * live row (`project_lease_lost` otherwise, nothing written).
+   * @template T
+   * @param {string[]} tokens
+   * @param {() => T} operation
+   * @returns {T}
+   */
+  withFence(tokens, operation) {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      assertFence(this.db, tokens);
+      const result = operation();
+      this.db.exec('COMMIT');
+      return result;
     } catch (error) {
       this.db.exec('ROLLBACK');
       throw error;

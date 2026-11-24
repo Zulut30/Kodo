@@ -20,6 +20,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { scopesOverlap } from './contracts.mjs';
+import { assertFence } from './lease-fence.mjs';
 
 const fail = code => {
   throw Object.assign(new Error(`Project ${code}`), { code: `project_${code}` });
@@ -32,7 +33,7 @@ const migrationSql = `
   CREATE TABLE kodo_integration_queue (
     seq INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL, task_id TEXT NOT NULL,
     attempt_id TEXT NOT NULL, run_id TEXT NOT NULL, base_sha TEXT NOT NULL, head_sha TEXT NOT NULL,
-    priority INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, batch_id TEXT,
+    priority INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, claim TEXT,
     enqueued_at TEXT NOT NULL, updated_at TEXT NOT NULL, outcome TEXT NOT NULL);
   CREATE UNIQUE INDEX kodo_integration_queue_active ON kodo_integration_queue(project_id,run_id,head_sha)
     WHERE status IN ('queued','merging');
@@ -48,9 +49,12 @@ const MAX_PRIORITY = 1000000;
 /** Rows one drain integrates under one hold of its leases. */
 export const DRAIN_ROWS = 4;
 
+// One BEGIN IMMEDIATE transaction, fenced by the leases of the caller's async context
+// (runtime/lease-fence.mjs): a drain whose lease passed to another holder writes nothing.
 function transaction(db, operation) {
   db.exec('BEGIN IMMEDIATE');
   try {
+    assertFence(db);
     const result = operation();
     db.exec('COMMIT');
     return result;
@@ -103,7 +107,7 @@ const entryOf = row =>
     headSha: row.head_sha,
     priority: Number(row.priority),
     status: row.status,
-    batchId: row.batch_id ?? null,
+    claim: row.claim ?? null,
     enqueuedAt: row.enqueued_at,
     updatedAt: row.updated_at,
     outcome: JSON.parse(row.outcome),
@@ -143,6 +147,24 @@ export function openIntegrationQueue(store) {
     /** Rows a stopped drain left `merging`. @param {string} projectId */
     orphans: projectId => select("project_id=? AND status='merging'", projectId),
     /**
+     * Take over at most `limit` rows a stopped drain left `merging` under the new `claim`: the old
+     * drain can no longer finish or release them.
+     * @param {string} projectId
+     * @param {string} claim
+     * @param {number} limit
+     */
+    adopt(projectId, claim, limit) {
+      return transaction(db, () => {
+        const rows = select("project_id=? AND status='merging'", projectId).slice(0, limit);
+        const take = db.prepare(
+          "UPDATE kodo_integration_queue SET claim=?,updated_at=? WHERE seq=? AND status='merging'",
+        );
+        const at = now();
+        for (const entry of rows) take.run(claim, at, entry.seq);
+        return rows.map(entry => queue.get(entry.seq));
+      });
+    },
+    /**
      * Queue a verified head. A repeat returns the live (`queued`, `merging`) or integrated row of
      * this Run and head; after a rejected or failed row a new row is queued with a new `seq`
      * (the finished row stays for its readers).
@@ -163,7 +185,7 @@ export function openIntegrationQueue(store) {
         const at = now();
         const { lastInsertRowid } = db
           .prepare(
-            "INSERT INTO kodo_integration_queue(project_id,task_id,attempt_id,run_id,base_sha,head_sha,priority,status,batch_id,enqueued_at,updated_at,outcome) VALUES(?,?,?,?,?,?,?,'queued',NULL,?,?,'{}')",
+            "INSERT INTO kodo_integration_queue(project_id,task_id,attempt_id,run_id,base_sha,head_sha,priority,status,claim,enqueued_at,updated_at,outcome) VALUES(?,?,?,?,?,?,?,'queued',NULL,?,?,'{}')",
           )
           .run(projectId, taskId, attemptId, runId, baseSha, headSha, priority, at, at);
         return queue.get(Number(lastInsertRowid));
@@ -174,12 +196,11 @@ export function openIntegrationQueue(store) {
      * write paths (`scopeOf(entry)`, null when unknown) overlap a claimed row; that row is left
      * queued and heads the next claim, so priority and FIFO order hold.
      * @param {string} projectId
-     * @param {{ scopeOf?: (entry: any) => string[] | null, maxBatch?: number }} [options]
+     * @param {{ scopeOf?: (entry: any) => string[] | null, maxBatch?: number, claim?: string }} [options]
      */
-    claim(projectId, { scopeOf = () => null, maxBatch = DRAIN_ROWS } = {}) {
+    claim(projectId, { scopeOf = () => null, maxBatch = DRAIN_ROWS, claim: claimId = randomUUID() } = {}) {
       return transaction(db, () => {
-        const batchId = randomUUID(),
-          batch = [],
+        const batch = [],
           scopes = [];
         for (const entry of select("project_id=? AND status='queued'", projectId)) {
           if (batch.length >= maxBatch) break;
@@ -190,23 +211,30 @@ export function openIntegrationQueue(store) {
         }
         const at = now();
         const claim = db.prepare(
-          "UPDATE kodo_integration_queue SET status='merging',batch_id=?,updated_at=? WHERE seq=? AND status='queued'",
+          "UPDATE kodo_integration_queue SET status='merging',claim=?,updated_at=? WHERE seq=? AND status='queued'",
         );
-        for (const entry of batch) claim.run(batchId, at, entry.seq);
+        for (const entry of batch) claim.run(claimId, at, entry.seq);
         return batch.map(entry => queue.get(entry.seq));
       });
     },
     /**
-     * Record the outcome of a `merging` row (`integrated`, `rejected` or `failed`); a repeat is a no-op.
+     * Record the outcome of a `merging` row (`integrated`, `rejected` or `failed`) that `claim`
+     * still holds; a repeat, or a drain whose row another drain took over, changes nothing.
+     * Returns the row and whether this call finished it.
      * @param {number} seq
+     * @param {string} claim
      * @param {{ status: string, [key: string]: any }} outcome
      */
-    finish(seq, outcome) {
+    finish(seq, claim, outcome) {
       need(terminal.has(outcome?.status), 'integration_queue_invalid');
-      db.prepare(
-        "UPDATE kodo_integration_queue SET status=?,outcome=?,updated_at=? WHERE seq=? AND status='merging'",
-      ).run(outcome.status, JSON.stringify(outcome), now(), seq);
-      return queue.get(seq);
+      const { changes } = transaction(db, () =>
+        db
+          .prepare(
+            "UPDATE kodo_integration_queue SET status=?,outcome=?,updated_at=? WHERE seq=? AND claim=? AND status='merging'",
+          )
+          .run(outcome.status, JSON.stringify(outcome), now(), seq, claim),
+      );
+      return { entry: queue.get(seq), finished: changes > 0 };
     },
     /**
      * Finish the live rows of one Run and head with `outcome` (a replay found the completion that
@@ -218,15 +246,23 @@ export function openIntegrationQueue(store) {
      */
     settle(projectId, runId, headSha, outcome) {
       need(terminal.has(outcome?.status), 'integration_queue_invalid');
-      db.prepare(
-        "UPDATE kodo_integration_queue SET status=?,outcome=?,updated_at=? WHERE project_id=? AND run_id=? AND head_sha=? AND status IN ('queued','merging')",
-      ).run(outcome.status, JSON.stringify(outcome), now(), projectId, runId, headSha);
+      transaction(db, () =>
+        db
+          .prepare(
+            "UPDATE kodo_integration_queue SET status=?,outcome=?,updated_at=? WHERE project_id=? AND run_id=? AND head_sha=? AND status IN ('queued','merging')",
+          )
+          .run(outcome.status, JSON.stringify(outcome), now(), projectId, runId, headSha),
+      );
     },
-    /** Put a claimed row that never started back in the queue. @param {number} seq */
-    release(seq) {
-      db.prepare(
-        "UPDATE kodo_integration_queue SET status='queued',batch_id=NULL,updated_at=? WHERE seq=? AND status='merging'",
-      ).run(now(), seq);
+    /** Put a row `claim` took and never started back in the queue. @param {number} seq @param {string} claim */
+    release(seq, claim) {
+      transaction(db, () =>
+        db
+          .prepare(
+            "UPDATE kodo_integration_queue SET status='queued',claim=NULL,updated_at=? WHERE seq=? AND claim=? AND status='merging'",
+          )
+          .run(now(), seq, claim),
+      );
     },
   };
   return queue;
@@ -244,27 +280,34 @@ const errorCode = error =>
  * at most `maxRows` rows in all, so one holder never keeps the leases for a stream of submissions.
  * The caller holds `project:<id>` and the integration lease. `stop()` is asked before every row
  * (a caller's cancel or deadline, a lost lease): it ends the drain between rows and returns the
- * claimed rows that never started to the queue; rows found `merging` stay `merging`. `owned()` is
- * asked before a row's outcome is recorded: without the leases the row stays `merging` for the
- * next holder.
+ * rows it claimed that never started to the queue; rows found `merging` stay `merging` (taken over
+ * with this drain's `claim`). A drain whose rows another drain took over can neither finish nor
+ * release them, and its fenced writes fail once its lease passed on (`project_lease_lost` ends
+ * the drain; the row stays `merging` for the current holder).
  * @param {{ queue: ReturnType<typeof openIntegrationQueue>, projectId: string,
  *   integrate: (entry: any) => Promise<{ status: string, [key: string]: any }>,
- *   scopeOf?: (entry: any) => string[] | null, maxRows?: number, stop?: () => boolean,
- *   owned?: () => boolean }} input
+ *   scopeOf?: (entry: any) => string[] | null, maxRows?: number, stop?: () => boolean }} input
  * @returns {Promise<any[]>} the finished rows in order
  */
 export async function drainIntegrationQueue(input) {
-  const { queue, projectId, integrate, scopeOf, maxRows = DRAIN_ROWS, stop = () => false, owned = () => true } = input;
-  const finished = [];
+  const { queue, projectId, integrate, scopeOf, maxRows = DRAIN_ROWS, stop = () => false } = input;
+  const claim = randomUUID(),
+    finished = [];
   let budget = maxRows;
   while (budget > 0 && !stop()) {
-    const orphans = queue.orphans(projectId).slice(0, budget);
-    const claimed = orphans.length ? [] : queue.claim(projectId, { scopeOf, maxBatch: budget });
-    const rows = orphans.length ? orphans : claimed;
+    let adopted, claimed;
+    try {
+      adopted = queue.adopt(projectId, claim, budget);
+      claimed = adopted.length ? [] : queue.claim(projectId, { scopeOf, maxBatch: budget, claim });
+    } catch (error) {
+      if (error?.code === 'project_lease_lost') return finished;
+      throw error;
+    }
+    const rows = adopted.length ? adopted : claimed;
     if (!rows.length) break;
     for (const [index, entry] of rows.entries()) {
       if (index > 0 && stop()) {
-        for (const rest of rows.slice(index)) if (claimed.includes(rest)) queue.release(rest.seq);
+        for (const rest of rows.slice(index)) if (claimed.includes(rest)) queue.release(rest.seq, claim);
         return finished;
       }
       let outcome;
@@ -272,10 +315,19 @@ export async function drainIntegrationQueue(input) {
         outcome = await integrate(entry);
         need(terminal.has(outcome?.status), 'integration_queue_invalid');
       } catch (error) {
+        // A lost lease ends the drain: the row stays merging for the holder that has the leases now.
+        if (error?.code === 'project_lease_lost') return finished;
         outcome = { status: 'failed', code: errorCode(error) };
       }
-      if (!owned()) return finished;
-      finished.push(queue.finish(entry.seq, outcome));
+      let done;
+      try {
+        done = queue.finish(entry.seq, claim, outcome);
+      } catch (error) {
+        if (error?.code === 'project_lease_lost') return finished;
+        throw error;
+      }
+      if (!done.finished) return finished;
+      finished.push(done.entry);
       budget--;
     }
   }

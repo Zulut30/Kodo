@@ -40,6 +40,7 @@ import {
 } from './project-integration.mjs';
 import { withGateController } from './project-controller-lease.mjs';
 import { withIntegrationLease as withLease } from './project-integration-lease.mjs';
+import { fencedBy } from './lease-fence.mjs';
 import { GATE_WATCHDOG, createGateRunDraft, runEpicGate } from './wave-verifier.mjs';
 import { normalizeWatchdogConfig, recordBlocker } from './watchdog.mjs';
 import { applyWavePolicy, assertWavePolicy } from './wave-policy.mjs';
@@ -131,6 +132,13 @@ function childrenOf(snapshot, kind, id) {
   if (kind === 'project') return snapshot.milestones;
   if (kind === 'milestone') return snapshot.epics.filter(row => row.milestoneId === id);
   return snapshot.tasks.filter(row => row.epicId === id);
+}
+// Why a gate pass stopped short (`out.stopped`): a pause, cancel or block of the project
+// (`project_control_blocked`) or a cancelled signal (`project_cancelled`); null to go on. The pass
+// reports it itself, so a caller never infers it from a later snapshot.
+function stopReason(snapshot, signal) {
+  if (controlState(snapshot)) return 'project_control_blocked';
+  return signal?.aborted ? 'project_cancelled' : null;
 }
 function controlState(snapshot) {
   if (snapshot.project.status === 'cancelled') return 'cancelled';
@@ -700,7 +708,11 @@ async function acceptGate(ctx, projectId, gate, run, out, signal) {
     if (unsafe) return { ...unsafe, ...gate.containers[0] };
     // Fast-forward while the branch still stands on the gate head; otherwise the
     // in-scope repairs are merged `--no-ff`.
-    if (signal?.aborted || controlState(await snapshotOf(ctx, projectId))) return;
+    const stopped = stopReason(await snapshotOf(ctx, projectId), signal);
+    if (stopped) {
+      out.stopped ??= stopped;
+      return;
+    }
     await mergeBackGate({ worktree, expectedHead: gate.headSha, gateHead: run.headSha });
     const refs = await persistRefs(ctx, run, gateKinds);
     for (const merge of gate.merges)
@@ -868,15 +880,16 @@ async function projectGateRun(ctx, snapshot, { retryFailed, stale }, out) {
  * moves again during that gate leaves `wave_project_head_mismatch`.
  * @param {any} ctx
  * @param {{ projectId: string, signal?: AbortSignal, retryFailed?: boolean }} input
- * @param {{ gates: any[], accepted: any[], blocked: any[] }} out
+ * @param {{ gates: any[], accepted: any[], blocked: any[], stopped?: string }} out
  */
 async function gateProject(ctx, { projectId, signal, retryFailed }, out) {
   for (const stale of [false, true]) {
     const snapshot = await snapshotOf(ctx, projectId);
+    const stopped = stopReason(snapshot, signal);
+    if (stopped && !settled(snapshot.project.status)) out.stopped ??= stopped;
     if (
       settled(snapshot.project.status) ||
-      controlState(snapshot) ||
-      signal?.aborted ||
+      stopped ||
       !reached(snapshot.project.status, 'integrated') ||
       !snapshot.milestones.every(row => settled(row.status))
     )
@@ -962,7 +975,8 @@ async function withGateLeases(ctx, names, work) {
   }, ctx.engine.leaseHeartbeatMs || 10000);
   timer.unref();
   try {
-    return { value: await work(lost.signal) };
+    // Writes of the gate are fenced by its leases (runtime/lease-fence.mjs).
+    return { value: await fencedBy(tokens, () => work(lost.signal)) };
   } finally {
     clearInterval(timer);
     for (const token of tokens) ctx.store.releaseLease(token);
@@ -981,7 +995,15 @@ async function gateEpicLeased(ctx, projectId, epicId, options, out) {
       const snapshot = await snapshotOf(ctx, projectId);
       const epic = recordOf(snapshot, 'epic', epicId);
       const signal = options.signal ? AbortSignal.any([options.signal, lost]) : lost;
-      if (controlState(snapshot) || signal.aborted) return 'done';
+      if (lost.aborted) {
+        out.blocked.push({ code: 'project_lease_lost', kind: 'epic', id: epicId });
+        return 'done';
+      }
+      const stopped = stopReason(snapshot, signal);
+      if (stopped) {
+        out.stopped ??= stopped;
+        return 'done';
+      }
       if (!gateCandidate(snapshot, epic) && !unfinishedEpicGate(ctx, snapshot, epic)) return 'done';
       // Another epic settled meanwhile and the chain now reaches its milestone: take those leases too.
       if (gateLeaseNames(snapshot, plannedContainers(snapshot, epic)).some(name => !names.includes(name)))
@@ -1023,13 +1045,18 @@ function concurrentEpics(snapshot, candidates) {
  * @param {{ projectId: string, signal?: AbortSignal, retryFailed?: boolean }} input
  */
 export async function runPendingGates(ctx, { projectId, signal, retryFailed = false }) {
+  /** @type {{ gates: any[], accepted: any[], blocked: any[], stopped?: string }} */
   const out = { gates: [], accepted: [], blocked: [] };
   const handled = new Set();
   for (;;) {
     await withIntegrationLease(ctx, projectId, signal, () => advanceContainers(ctx, projectId));
     const snapshot = await snapshotOf(ctx, projectId);
     requireValue(waveProject(ctx, snapshot), 'wave_not_enabled');
-    if (controlState(snapshot) || signal?.aborted) return out;
+    const stopped = stopReason(snapshot, signal);
+    if (stopped) {
+      out.stopped ??= stopped;
+      return out;
+    }
     const candidates = snapshot.epics.filter(
       row => !handled.has(row.id) && (gateCandidate(snapshot, row) || unfinishedEpicGate(ctx, snapshot, row)),
     );
@@ -1041,11 +1068,14 @@ export async function runPendingGates(ctx, { projectId, signal, retryFailed = fa
     const results = await Promise.allSettled(
       batch.map((epic, index) => gateEpicLeased(ctx, projectId, epic.id, { signal, retryFailed }, parts[index])),
     );
-    for (const part of parts) for (const key of Object.keys(out)) out[key].push(...part[key]);
+    for (const part of parts) {
+      for (const key of ['gates', 'accepted', 'blocked']) out[key].push(...part[key]);
+      if (part.stopped) out.stopped ??= part.stopped;
+    }
     const failure = results.find(result => result.status === 'rejected');
     if (failure) throw failure.reason;
   }
-  if (out.blocked.length) return out;
+  if (out.blocked.length || out.stopped) return out;
   // The project gate (when only the project is left) holds every gate lease of the project.
   const snapshot = await snapshotOf(ctx, projectId);
   if (
@@ -1054,9 +1084,11 @@ export async function runPendingGates(ctx, { projectId, signal, retryFailed = fa
     !snapshot.milestones.every(row => settled(row.status))
   )
     return out;
-  const held = await withGateLeases(ctx, gateLeaseNames(snapshot, [{ kind: 'project', id: projectId }]), lost =>
-    gateProject(ctx, { projectId, signal: signal ? AbortSignal.any([signal, lost]) : lost, retryFailed }, out),
-  );
+  const held = await withGateLeases(ctx, gateLeaseNames(snapshot, [{ kind: 'project', id: projectId }]), async lost => {
+    await gateProject(ctx, { projectId, signal: signal ? AbortSignal.any([signal, lost]) : lost, retryFailed }, out);
+    // A lost lease ended the project gate early: never a clean pass.
+    if (lost.aborted) out.blocked.push({ code: 'project_lease_lost', kind: 'project', id: projectId });
+  });
   if (!held) out.blocked.push(gateRunning('project', projectId));
   return out;
 }

@@ -12,7 +12,7 @@ import { Store } from '../runtime/store.mjs';
 import { Engine } from '../runtime/engine.mjs';
 import * as contracts from '../runtime/project-contracts.mjs';
 import { openProjectStore } from '../runtime/project-store.mjs';
-import { completeTask, nextWave } from '../runtime/project-external.mjs';
+import { completeTask, nextWave, runProjectGates } from '../runtime/project-external.mjs';
 import { createProjectTransitionAuthorizer } from '../runtime/project-director.mjs';
 import * as waves from '../runtime/project-director-waves.mjs';
 import { verifyTaskFastOnce } from '../runtime/wave-verifier.mjs';
@@ -387,8 +387,12 @@ test('A duplicate submission of one head waits for the first verification and in
     return token;
   });
   const verify = f.ports.verifyTaskFast;
+  // A failsafe for a broken build only; it is cancelled as soon as the race is decided.
+  const failsafe = new AbortController();
+  t.after(() => failsafe.abort());
   f.ports.verifyTaskFast = async input => {
-    await Promise.race([waiting, delay(3000)]);
+    await Promise.race([waiting, delay(3000, undefined, { signal: failsafe.signal }).catch(() => {})]);
+    failsafe.abort();
     return verify(input);
   };
   const results = await Promise.all([f.complete(brief, head), f.complete(brief, head)]);
@@ -509,9 +513,98 @@ test('Gates of a completion without --defer-gate run once, and never record a st
     });
     return { gates: [], accepted: [], blocked: [] };
   };
-  const second = await f.complete(briefs[1], await f.change(briefs[1]), { deferGate: false });
+  const secondHead = await f.change(briefs[1]);
+  const second = await f.complete(briefs[1], secondHead, { deferGate: false });
   assert.deepEqual([second.status, second.code], ['blocked', 'project_control_blocked']);
+  assert.ok(second.integration, 'the answer shows the merge is done');
   assert.equal(f.store.getRun(briefs[1].runId).externalCompletion.gates, null, 'a repeat may run them');
+  const unpause = async () =>
+    f.repo.apply({
+      schemaVersion: 1,
+      commandId: randomUUID(),
+      projectId: f.projectId,
+      expectedRevision: (await f.snapshot()).revision,
+      actor: 'owner',
+      reason: 'Resume after the pause',
+      action: { op: 'setPaused', paused: false },
+    });
+  await unpause();
+  // The pass stopped on a pause that was lifted before it returned: the pass itself says so.
+  f.ports.runPendingGates = async () => ({ gates: [], accepted: [], blocked: [], stopped: 'project_control_blocked' });
+  const lifted = await f.complete(briefs[1], secondHead, { deferGate: false });
+  assert.deepEqual([lifted.status, lifted.code], ['blocked', 'project_control_blocked']);
+  assert.equal(f.store.getRun(briefs[1].runId).externalCompletion.gates, null);
+  // After the pause the dispatcher repeats the submission: the gates run once and are recorded.
+  f.ports.runPendingGates = async (waveCtx, input) => {
+    passes.push(input.projectId);
+    return { gates: [], accepted: [], blocked: [] };
+  };
+  const resumed = await f.complete(briefs[1], secondHead, { deferGate: false });
+  assert.deepEqual([resumed.status, resumed.replayed], ['integrated', true]);
+  assert.deepEqual(f.store.getRun(briefs[1].runId).externalCompletion.gates, { gates: [], accepted: [], blocked: [] });
+  assert.equal(passes.length, 2);
+});
+
+test('A verdict is not written once the build slot of its check was lost', async t => {
+  const f = await fixture(t, { count: 1 });
+  lightPorts(f);
+  const [brief] = (await f.briefs()).values();
+  const head = await f.change(brief);
+  const verify = f.ports.verifyTaskFast;
+  f.ports.verifyTaskFast = async input => {
+    const verdict = await verify(input);
+    // The slot's TTL expired during task-fast and another build took it.
+    f.store.db.prepare("DELETE FROM leases WHERE name LIKE 'machine-build:%'").run();
+    return verdict;
+  };
+  const result = await f.complete(brief, head);
+  assert.deepEqual([result.status, result.code], ['blocked', 'project_lease_lost']);
+  const run = f.store.getRun(brief.runId);
+  assert.notEqual(run.state, 'succeeded', 'the fenced verdict was not written');
+  assert.deepEqual(f.calls.integrate, []);
+});
+
+test('A gate pass whose controller lease is lost is blocked, never passed', async t => {
+  const f = await fixture(t, { count: 1 });
+  f.engine.leaseHeartbeatMs = 5;
+  f.ports.runPendingGates = async (waveCtx, input) => {
+    f.store.db.prepare('DELETE FROM leases WHERE name=?').run(`project-gates:${f.projectId}`);
+    await new Promise(resolve => input.signal.addEventListener('abort', resolve, { once: true }));
+    return { gates: [], accepted: [], blocked: [] };
+  };
+  const result = await runProjectGates(f.ctx, { projectId: f.projectId, ports: f.ports });
+  assert.deepEqual([result.status, result.code], ['blocked', 'project_lease_lost']);
+});
+
+test('A pending merge that never reached the branch is checked again: a moved worker branch is refused', async t => {
+  const f = await fixture(t, { count: 1 });
+  lightPorts(f);
+  const [brief] = (await f.briefs()).values();
+  const head = await f.change(brief);
+  let died;
+  const dead = new Promise(resolve => (died = resolve));
+  const integrate = f.ports.integrateAndAdvance;
+  // The drain recorded `pending` (savePending) and its process died before the merge.
+  f.ports.integrateAndAdvance = async (waveCtx, input) => {
+    f.calls.integrate.push(input.taskId);
+    f.store.updateRun(input.run.id, {
+      integration: { branch: `kodo/project/${f.projectId}`, before: f.integrationHead(), status: 'pending' },
+    });
+    died();
+    await new Promise(() => {});
+  };
+  const background = new AbortController();
+  void f.complete(brief, head, { signal: background.signal }).catch(() => {});
+  await dead;
+  background.abort();
+  f.store.db.prepare("DELETE FROM leases WHERE name LIKE 'project%'").run();
+  f.ports.integrateAndAdvance = integrate;
+  // The worker commits again before the host repeats the old submission.
+  await f.change(brief, 9);
+  const result = await f.complete(brief, head);
+  assert.deepEqual([result.status, result.code], ['blocked', 'project_submission_stale']);
+  assert.deepEqual(f.calls.integrate, ['t0'], 'the old head is never merged');
+  assert.equal(f.merges().length, 0);
 });
 
 // The private worktree of the integration branch (where Kodo merges).

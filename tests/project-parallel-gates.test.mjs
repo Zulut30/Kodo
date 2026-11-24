@@ -71,7 +71,7 @@ function memoryProject({ milestones, epics, chains = {}, leaseHeartbeatMs = 1000
     contracts: { isWaveProject: () => true },
     clock: () => new Date().toISOString(),
   };
-  return { ctx, store, leases };
+  return { ctx, store, leases, snapshot };
 }
 
 const blockedGate = run => ({ ...run, state: 'blocked', error: { code: 'gate_red', message: 'red' } });
@@ -221,4 +221,61 @@ test('A gate whose epic lease is lost stops and never accepts', async () => {
     ['cancelled', 'project_lease_lost'],
   );
   assert.deepEqual(out.accepted, []);
+});
+
+test('A gate whose epic lease is lost before it starts is reported, never a clean pass', async () => {
+  const { ctx, store } = memoryProject({
+    milestones: ['m1', 'm2'],
+    epics: [
+      { id: 'e1', milestoneId: 'm1' },
+      { id: 'e2', milestoneId: 'm2', busy: true },
+    ],
+    leaseHeartbeatMs: 5,
+  });
+  // The epic lease expires right after it was taken: its first renewal finds no row.
+  const name = `project-gate:${projectId}:e1`;
+  let doomed = null,
+    noticed;
+  const seen = new Promise(resolve => (noticed = resolve));
+  const acquire = store.acquireLease,
+    renew = store.renewLease,
+    snapshot = ctx.repo.snapshot;
+  store.acquireLease = (lease, owner, options) => {
+    const token = acquire(lease, owner, options);
+    if (lease === name) doomed = token;
+    return token;
+  };
+  store.renewLease = token => {
+    if (token !== doomed) return renew(token);
+    noticed();
+    return false;
+  };
+  ctx.repo.snapshot = async id => {
+    if (doomed) await seen;
+    return snapshot(id);
+  };
+  ctx.runGate = async () => assert.fail('a gate without its lease never runs');
+  const out = await runPendingGates(ctx, { projectId });
+  assert.deepEqual(
+    out.blocked.map(row => [row.code, row.kind, row.id]),
+    [['project_lease_lost', 'epic', 'e1']],
+  );
+});
+
+test('A pass that a pause stopped reports why, even when the pause is lifted afterwards', async () => {
+  const project = memoryProject({
+    milestones: ['m1', 'm2', 'm3'],
+    epics: [
+      { id: 'e1', milestoneId: 'm1' },
+      { id: 'e2', milestoneId: 'm2' },
+      { id: 'e3', milestoneId: 'm3', busy: true },
+    ],
+  });
+  project.ctx.runGate = async ({ run }) => {
+    project.snapshot.project.paused = true;
+    return blockedGate(run);
+  };
+  const out = await runPendingGates(project.ctx, { projectId });
+  project.snapshot.project.paused = false;
+  assert.equal(out.stopped, 'project_control_blocked');
 });

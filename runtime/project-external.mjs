@@ -749,31 +749,43 @@ export async function runProjectGates(ctx, input) {
   const { projectId, retryFailed = false, signal } = input;
   const C = await contractsOf(ctx);
   need(C.isWaveProject((await snapshotOf(ctx, projectId)).project), 'wave_required');
-  return withGateController(storeOf(ctx), projectId, async () => {
-    // The same control states complete-task refuses: a gate pass never reports success for them.
-    const controlled = project => project.paused || ['cancelled', 'failed', 'blocked'].includes(project.status);
-    const snapshot = await snapshotOf(ctx, projectId);
-    if (controlled(snapshot.project))
-      return { status: 'blocked', code: 'project_control_blocked', revision: snapshot.revision };
-    if (signal?.aborted) return { status: 'blocked', code: 'project_cancelled', revision: snapshot.revision };
-    const W = wavePorts(input.ports, ['createWaveContext', 'runPendingGates']);
-    const waveCtx = sectionedContext(ctx, C, W, projectId, signal);
-    let gates;
-    try {
-      gates = await runGates(W, waveCtx, projectId, signal, retryFailed === true);
-    } catch (error) {
-      if (error?.code !== 'project_cancelled') throw error;
-      return { status: 'blocked', code: error.code, revision: (await snapshotOf(ctx, projectId)).revision };
-    }
-    // A pause, cancel or block during the pass (`project pause` takes no gate lease) or an
-    // interrupted pass may stop the gates before any ran: never `passed`.
-    const after = await snapshotOf(ctx, projectId);
-    if (controlled(after.project))
-      return { status: 'blocked', code: 'project_control_blocked', gates, revision: after.revision };
-    if (signal?.aborted) return { status: 'blocked', code: 'project_cancelled', gates, revision: after.revision };
-    const status = Array.isArray(gates.blocked) && gates.blocked.length ? 'blocked' : 'passed';
-    return { status, gates, revision: after.revision };
-  });
+  const heartbeat = { heartbeatMs: ctx.engine?.leaseHeartbeatMs };
+  return withGateController(
+    storeOf(ctx),
+    projectId,
+    async (_, lost) => {
+      // The same control states complete-task refuses: a gate pass never reports success for them.
+      const controlled = project => project.paused || ['cancelled', 'failed', 'blocked'].includes(project.status);
+      const snapshot = await snapshotOf(ctx, projectId);
+      if (controlled(snapshot.project))
+        return { status: 'blocked', code: 'project_control_blocked', revision: snapshot.revision };
+      if (signal?.aborted) return { status: 'blocked', code: 'project_cancelled', revision: snapshot.revision };
+      const W = wavePorts(input.ports, ['createWaveContext', 'runPendingGates']);
+      const passSignal = signal ? AbortSignal.any([signal, lost]) : lost;
+      const waveCtx = sectionedContext(ctx, C, W, projectId, passSignal);
+      let gates;
+      try {
+        gates = await runGates(W, waveCtx, projectId, passSignal, retryFailed === true);
+      } catch (error) {
+        if (error?.code !== 'project_cancelled' && error?.code !== 'project_lease_lost') throw error;
+        const code = lost.aborted ? 'project_lease_lost' : error.code;
+        return { status: 'blocked', code, revision: (await snapshotOf(ctx, projectId)).revision };
+      }
+      // The pass's own stop reason (or a lost controller lease) is never a success.
+      const stopped = passStop(gates, lost);
+      if (stopped)
+        return { status: 'blocked', code: stopped, gates, revision: (await snapshotOf(ctx, projectId)).revision };
+      // A pause, cancel or block during the pass (`project pause` takes no gate lease) or an
+      // interrupted pass may stop the gates before any ran: never `passed`.
+      const after = await snapshotOf(ctx, projectId);
+      if (controlled(after.project))
+        return { status: 'blocked', code: 'project_control_blocked', gates, revision: after.revision };
+      if (signal?.aborted) return { status: 'blocked', code: 'project_cancelled', gates, revision: after.revision };
+      const status = Array.isArray(gates.blocked) && gates.blocked.length ? 'blocked' : 'passed';
+      return { status, gates, revision: after.revision };
+    },
+    heartbeat,
+  );
 }
 
 function waveContextOf(ctx, C, W) {
@@ -842,6 +854,11 @@ async function replayedMerge(ctx, input, run) {
   };
 }
 
+// Whether `headSha` is on the project's integration branch (Git decides, not a record).
+async function headOnBranch(projectId, run, headSha) {
+  return ancestor(run.project, headSha, await integrationHeadOf({ cwd: run.project, projectId }));
+}
+
 const integrationStarted = run => ['merged', 'pending'].includes(run.integration?.status);
 const cancelled = run => Boolean(run.externalAbandon) || run.cancelRequested === true || run.state === 'cancelled';
 
@@ -891,6 +908,8 @@ async function verifySubmission(ctx, C, step, input) {
         } catch (error) {
           // Another call verifies the same Run right now (its lease `run:<id>`).
           if (error?.code === 'run_busy') return { blocked: 'project_task_busy' };
+          // A fenced write of the check found a lease of this submission gone.
+          if (error?.code === 'project_lease_lost') return { blocked: 'project_lease_lost' };
           if (dedupeLost.aborted || slotLost.aborted) return { blocked: 'project_lease_lost' };
           if (cancelled(store.getRun(run.id))) return stale;
           throw error;
@@ -903,17 +922,32 @@ async function verifySubmission(ctx, C, step, input) {
             : (await state()) === 'verified'
               ? null
               : stale;
-        return section(async () => {
-          const current = await verificationState(ctx, C, input, attempt.id, run.id);
-          const written = store.getRun(run.id);
-          if (current === 'stale' || integrationStarted(written) || written.externalCompletion) return stale;
-          if (!verdict.passed || verdict.headSha !== head) {
-            store.updateRun(run.id, { state: 'executing' }, { preserveCancellation: true });
-            return verdict.passed ? problem('external_head_changed') : { code: verdict.code, message: verdict.message };
-          }
-          store.updateRun(run.id, { state: 'succeeded', error: null }, { preserveCancellation: true });
-          return null;
-        });
+        // The verdict is written in a short project section, fenced by the leases of
+        // `project-verify`, the build slot and the section (one transaction, runtime/lease-fence.mjs).
+        try {
+          return await section(async () => {
+            const current = await verificationState(ctx, C, input, attempt.id, run.id);
+            if (current === 'stale') return stale;
+            return store.withFence([], () => {
+              const written = store.getRun(run.id);
+              if (cancelled(written) || integrationStarted(written) || written.externalCompletion) return stale;
+              if (!verdict.passed || verdict.headSha !== head) {
+                store.updateRun(run.id, { state: 'executing' }, { preserveCancellation: true });
+                return verdict.passed
+                  ? problem('external_head_changed')
+                  : { code: verdict.code, message: verdict.message };
+              }
+              // Only the head that was checked, with its complete proof, becomes `succeeded`.
+              if (written.headSha !== head || written.checks?.headSha !== head || written.checks.complete !== true)
+                return stale;
+              store.updateRun(run.id, { state: 'succeeded', error: null }, { preserveCancellation: true });
+              return null;
+            });
+          });
+        } catch (error) {
+          if (error?.code === 'project_lease_lost') return { blocked: 'project_lease_lost' };
+          throw error;
+        }
       },
       { machine: input.machine, signal },
     );
@@ -939,8 +973,12 @@ async function integrateQueued(ctx, C, W, waveCtx, entry, signal) {
       : { status: 'rejected', code: 'project_integration_missing' };
   if (run.state !== 'succeeded' || run.headSha !== headSha || run.checks?.headSha !== headSha) return stale;
   if (run.baseSha !== entry.baseSha) return stale;
-  // A merge that a stopped drain started continues (integrateAndAdvance recovers it).
-  if (!integrationStarted(run)) {
+  // Git first, then the Run's record: a recorded merge that left the branch is missing.
+  if (run.integration?.status === 'merged' && run.integration.mergedHead === headSha) {
+    if (!(await mergeRecorded(projectId, run))) return { status: 'rejected', code: 'project_integration_missing' };
+  } else if (!(await headOnBranch(projectId, run, headSha))) {
+    // A new merge — also after a `pending` record whose merge never reached the branch: the full
+    // check of the normal path (attempt, no abandon, the worker's branch and worktree on this head).
     if (cancelled(run) || !['running', 'verifying'].includes(attempt.status)) return stale;
     if (await workerStateDefect(run, headSha)) return stale;
   }
@@ -948,11 +986,24 @@ async function integrateQueued(ctx, C, W, waveCtx, entry, signal) {
   if (integration?.status !== 'integrated') {
     const code = integration?.code ?? 'project_integration_blocked';
     const after = store.getRun(run.id);
-    if (after.integration?.status === 'merged' && after.integration.mergedHead === headSha)
+    // A merge that is on the branch but whose transitions were refused is `failed`: a repeated
+    // submission continues it. Without a merge on the branch the head is refused.
+    if (
+      code !== 'project_integration_missing' &&
+      after.integration?.status === 'merged' &&
+      after.integration.mergedHead === headSha &&
+      (await mergeRecorded(projectId, after))
+    )
       return { status: 'failed', code, merged: true, integration: integration ?? null };
     return { status: 'rejected', code, integration: integration ?? null };
   }
-  store.updateRun(run.id, { externalCompletion: { schemaVersion: 1, headSha, integration, gates: null } });
+  // Fenced (runtime/lease-fence.mjs) in one transaction: a stale drain writes nothing, and a
+  // completion already recorded for this head keeps its gates.
+  store.withFence([], () => {
+    const recorded = store.getRun(run.id).externalCompletion;
+    const gates = recorded?.headSha === headSha ? (recorded.gates ?? null) : null;
+    store.updateRun(run.id, { externalCompletion: { schemaVersion: 1, headSha, integration, gates } });
+  });
   return { status: 'integrated', integration };
 }
 
@@ -985,7 +1036,6 @@ async function tryDrain(ctx, C, W, input, expired) {
               projectId,
               scopeOf,
               stop: () => signal?.aborted === true || expired() || !owned(),
-              owned,
               integrate: entry => integrateQueued(ctx, C, W, waveCtx, entry, lost),
             });
           },
@@ -999,6 +1049,16 @@ async function tryDrain(ctx, C, W, input, expired) {
     if (['project_busy', 'project_integration_busy'].includes(error?.code)) return false;
     throw error;
   }
+}
+
+const stopCodes = new Set(['project_control_blocked', 'project_cancelled', 'project_lease_lost']);
+
+// Why a gate pass stopped short: its own `stopped` reason, a lost lease, or a blocked row that
+// names a stop (never inferred from a later snapshot, which may show the pause already lifted).
+function passStop(gates, lost) {
+  if (lost?.aborted) return 'project_lease_lost';
+  if (typeof gates?.stopped === 'string') return gates.stopped;
+  return (gates?.blocked ?? []).find(row => stopCodes.has(row?.code))?.code ?? null;
 }
 
 const controlledProject = project => project.paused || ['cancelled', 'failed', 'blocked'].includes(project.status);
@@ -1017,22 +1077,46 @@ async function finishCompletion(ctx, C, input, run, replayed) {
     code = null;
   if (gates === null && !input.deferGate) {
     const W = wavePorts(input.ports, ['createWaveContext', 'runPendingGates']);
-    ({ gates, code } = await withGateController(store, projectId, async () => {
-      completion = receipt();
-      if (completion.gates !== null) return { gates: completion.gates, code: null };
-      let result;
-      try {
-        result = await runGates(W, sectionedContext(ctx, C, W, projectId, signal), projectId, signal);
-      } catch (error) {
-        if (error?.code !== 'project_cancelled') throw error;
-        return { gates: null, code: error.code };
-      }
-      if (signal?.aborted) return { gates: null, code: 'project_cancelled' };
-      if (controlledProject((await snapshotOf(ctx, projectId)).project))
-        return { gates: null, code: 'project_control_blocked' };
-      store.updateRun(run.id, { externalCompletion: { ...receipt(), gates: result } });
-      return { gates: result, code: null };
-    }));
+    ({ gates, code } = await withGateController(
+      store,
+      projectId,
+      async (_, lost) => {
+        completion = receipt();
+        if (completion.gates !== null) return { gates: completion.gates, code: null };
+        // The control states and a cancel stop the pass before it starts, as in `project gates`.
+        if (signal?.aborted) return { gates: null, code: 'project_cancelled' };
+        if (controlledProject((await snapshotOf(ctx, projectId)).project))
+          return { gates: null, code: 'project_control_blocked' };
+        const passSignal = signal ? AbortSignal.any([signal, lost]) : lost;
+        let result;
+        try {
+          result = await runGates(W, sectionedContext(ctx, C, W, projectId, passSignal), projectId, passSignal);
+        } catch (error) {
+          if (error?.code !== 'project_cancelled' && error?.code !== 'project_lease_lost') throw error;
+          return { gates: null, code: lost.aborted ? 'project_lease_lost' : error.code };
+        }
+        // The pass reports why it stopped short (a control state still in force is a stop as well);
+        // then nothing is recorded and a repeat runs the gates.
+        const stopped =
+          passStop(result, lost) ??
+          (signal?.aborted ? 'project_cancelled' : null) ??
+          (controlledProject((await snapshotOf(ctx, projectId)).project) ? 'project_control_blocked' : null);
+        if (stopped) return { gates: null, code: stopped };
+        // Fenced by the gate controller's lease, and only over a receipt without gates.
+        try {
+          return store.withFence([], () => {
+            const current = receipt();
+            if (current.gates !== null) return { gates: current.gates, code: null };
+            store.updateRun(run.id, { externalCompletion: { ...current, gates: result } });
+            return { gates: result, code: null };
+          });
+        } catch (error) {
+          if (error?.code !== 'project_lease_lost') throw error;
+          return { gates: null, code: error.code };
+        }
+      },
+      { heartbeatMs: ctx.engine?.leaseHeartbeatMs },
+    ));
   }
   const revision = (await snapshotOf(ctx, projectId)).revision;
   return {
