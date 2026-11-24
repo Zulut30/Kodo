@@ -886,9 +886,55 @@ function selectContractRootsForCrates(cratesMap, explicitTokens) {
   return roots;
 }
 
+function hasRootPackageMember(spec, wsRoot) {
+  const manifestPath = wsRoot ? `${wsRoot}/Cargo.toml` : 'Cargo.toml';
+  const srcDir = wsRoot ? `${wsRoot}/src` : 'src';
+  let hasManifest = false;
+  let hasSrc = false;
+  for (const task of spec.tasks) {
+    for (const rawScope of task.writePaths ?? []) {
+      const scope = normalizeScopePath(rawScope);
+      if (!scope) continue;
+      if (scope === manifestPath || isExplicitContractScope(scope, wsRoot, manifestPath)) hasManifest = true;
+      if (scope === srcDir || scope.startsWith(`${srcDir}/`)) hasSrc = true;
+    }
+  }
+  return hasManifest && hasSrc;
+}
+
+function waveZeroPolicyFindings({ waveZeroTasks, ancestors, architecturePolicy }) {
+  if (architecturePolicy?.schemaVersion === 2 && architecturePolicy?.language === 'rust') return [];
+  const policyTasks = waveZeroTasks.filter(task =>
+    (task.writePaths ?? []).some(scope => isExplicitContractScope(scope, '', 'architecture.policy.json')),
+  );
+  if (!policyTasks.length) {
+    return [
+      finding(
+        'architecture_policy_required',
+        'Для Rust workspace с ≥ 3 крейтами Волна 0 (foundation) должна содержать задачу, ' +
+          'создающую architecture.policy.json (в её writePaths), иначе гейты при architecture.enabled будут заблокированы',
+      ),
+    ];
+  }
+  const policyIds = new Set(policyTasks.map(task => task.id));
+  const unordered = waveZeroTasks
+    .filter(task => !policyIds.has(task.id) && !policyTasks.some(pt => ancestors.get(task.id)?.has(pt.id)))
+    .map(task => task.id)
+    .sort(compare);
+  if (!unordered.length) return [];
+  return [
+    finding(
+      'architecture_policy_order',
+      'Остальные задачи Волны 0 (foundation) должны зависеть от задачи, создающей architecture.policy.json, ' +
+        'или совпадать с ней, иначе гейт другого эпика Волны 0 при architecture.enabled получит blocked',
+      unordered,
+    ),
+  ];
+}
+
 /** Multi-crate Rust workspaces (>= 3 crates sharing a workspace root) must create a compilable
- * contract crate (`Cargo.toml` + `src/**`) in Wave 0 so parallel tasks compile against frozen traits/types. */
-export function rustContractCrateFindings(spec, projectMarkdown = '', architecturePolicy = null) {
+ * contract crate (`Cargo.toml` + `src/**`) and `architecture.policy.json` in Wave 0. */
+export function rustContractCrateFindings(spec, projectMarkdown = '', architecturePolicy = null, ancestors = null) {
   if (!isRustBlueprint(spec, projectMarkdown, architecturePolicy)) return [];
   const allCrates = new Map();
   for (const task of spec.tasks) {
@@ -911,6 +957,11 @@ export function rustContractCrateFindings(spec, projectMarkdown = '', architectu
     const ownerWs = workspaceRoots.find(wsRoot => (wsRoot === '' ? true : crateRoot.startsWith(`${wsRoot}/`)));
     if (ownerWs !== undefined) byWorkspace.get(ownerWs).set(crateRoot, crateName);
   }
+  for (const [wsRoot, wsCrates] of byWorkspace.entries()) {
+    if (!wsCrates.has(wsRoot) && hasRootPackageMember(spec, wsRoot)) {
+      wsCrates.set(wsRoot, wsRoot ? wsRoot.split('/').at(-1) : spec.id || 'root');
+    }
+  }
 
   const waveZeroEpics = new Set(
     spec.epics.filter(epic => epic.id === FOUNDATION_ID || epic.milestoneId === FOUNDATION_ID).map(epic => epic.id),
@@ -918,23 +969,30 @@ export function rustContractCrateFindings(spec, projectMarkdown = '', architectu
   const waveZeroTasks = spec.tasks.filter(task => waveZeroEpics.has(task.epicId));
   if (!waveZeroTasks.length) return findings;
 
+  let requiresPolicy = false;
+  let missingContract = false;
   for (const wsCrates of byWorkspace.values()) {
     if (wsCrates.size < RUST_CONTRACT_CRATE_MIN) continue;
+    requiresPolicy = true;
     const wsContracts = selectContractRootsForCrates(wsCrates, explicitTokens);
     const satisfied = waveZeroTasks.some(task =>
       [...wsContracts].some(contractRoot => taskCreatesCompilableContractCrate(task, contractRoot)),
     );
-    if (!satisfied) {
-      findings.push(
-        finding(
-          'contract_crate_required',
-          'Для Rust workspace с ≥ 3 крейтами Волна 0 (foundation) должна содержать задачу, ' +
-            'создающую компилируемый контрактный крейт (Cargo.toml и src/** в crates/<name>-contracts ' +
-            'или явно объявленном контрактном крейте), защищённый через contractCrates в architecture.policy.json',
-        ),
-      );
-      break;
-    }
+    if (!satisfied) missingContract = true;
+  }
+  if (missingContract) {
+    findings.push(
+      finding(
+        'contract_crate_required',
+        'Для Rust workspace с ≥ 3 крейтами Волна 0 (foundation) должна содержать задачу, ' +
+          'создающую компилируемый контрактный крейт (Cargo.toml и src/** в crates/<name>-contracts ' +
+          'или явно объявленном контрактном крейте), защищённый через contractCrates в architecture.policy.json',
+      ),
+    );
+  }
+  if (requiresPolicy) {
+    const resolvedAncestors = ancestors ?? taskAncestors(spec.tasks);
+    findings.push(...waveZeroPolicyFindings({ waveZeroTasks, ancestors: resolvedAncestors, architecturePolicy }));
   }
   return findings;
 }
@@ -954,7 +1012,7 @@ function analyzeFactorySpec(spec, options = {}) {
   findings.push(
     ...ownerFindings(base.spec.tasks),
     ...waveZeroFindings(base.spec, ancestors),
-    ...rustContractCrateFindings(base.spec, projectMarkdown, architecturePolicy),
+    ...rustContractCrateFindings(base.spec, projectMarkdown, architecturePolicy, ancestors),
     ...containerFindings(base.spec),
     ...epicCycleFindings(base.spec.tasks),
     ...overlapFindings(parallelOverlaps(base.spec.tasks, { ancestors })),

@@ -1630,3 +1630,172 @@ test('W3: contract scope requires literal directory segments; crates/game-contra
     `globbed Wave 0 path must not satisfy contract_crate_required: ${JSON.stringify(badW0Findings)}`,
   );
 });
+
+test('W2: Rust workspace >= 3 requires architecture.policy.json in Wave 0, orders other Wave 0 tasks after it, and counts root [package] separately from virtual root', () => {
+  const mkSpec = (epics, tasks) => ({
+    schemaVersion: 1,
+    id: 'w2-bp',
+    title: 'Rust W2',
+    root: '/tmp/w2',
+    businessContext: 'Cargo workspace',
+    execution: { cadence: 'wave', integration: 'branch' },
+    constraints: [],
+    milestones: [{ id: 'foundation', title: 'W0', acceptance: [] }],
+    epics,
+    tasks,
+  });
+  const md = '## Стек\nRust Cargo workspace\n';
+
+  // 1) Missing architecture.policy.json in Wave 0 -> architecture_policy_required.
+  const noPolicy = mkSpec(
+    [
+      { id: 'foundation', milestoneId: 'foundation', title: 'W0', acceptance: [] },
+      { id: 'domain', milestoneId: 'foundation', title: 'Domain', acceptance: [] },
+    ],
+    [
+      {
+        id: 'w0',
+        epicId: 'foundation',
+        title: 'Contracts',
+        owner: 'architect',
+        dependsOn: [],
+        writePaths: ['Cargo.toml', 'crates/game-contracts/Cargo.toml', 'crates/game-contracts/src/**'],
+      },
+      {
+        id: 't1',
+        epicId: 'domain',
+        title: 'World',
+        owner: 'developer',
+        dependsOn: ['w0'],
+        writePaths: ['crates/world/Cargo.toml', 'crates/world/src/**'],
+      },
+      {
+        id: 't2',
+        epicId: 'domain',
+        title: 'Combat',
+        owner: 'developer',
+        dependsOn: ['w0'],
+        writePaths: ['crates/combat/Cargo.toml', 'crates/combat/src/**'],
+      },
+    ],
+  );
+  const noPolicyFindings = rustContractCrateFindings(noPolicy, md);
+  assert.ok(
+    noPolicyFindings.some(f => f.code === 'architecture_policy_required'),
+    `expected architecture_policy_required, got ${JSON.stringify(noPolicyFindings)}`,
+  );
+
+  // 2) Second Wave 0 task/epic NOT depending on policy task -> architecture_policy_order.
+  const parallelW0 = mkSpec(
+    [
+      { id: 'foundation-core', milestoneId: 'foundation', title: 'W0 Core', acceptance: [] },
+      { id: 'foundation-tools', milestoneId: 'foundation', title: 'W0 Tools', acceptance: [] },
+      { id: 'domain', milestoneId: 'foundation', title: 'Domain', acceptance: [] },
+    ],
+    [
+      {
+        id: 'w0-policy',
+        epicId: 'foundation-core',
+        title: 'Contracts + Policy',
+        owner: 'architect',
+        dependsOn: [],
+        writePaths: [
+          'Cargo.toml',
+          'crates/game-contracts/Cargo.toml',
+          'crates/game-contracts/src/**',
+          'architecture.policy.json',
+        ],
+      },
+      {
+        id: 'w0-lint',
+        epicId: 'foundation-tools',
+        title: 'Lint setup',
+        owner: 'developer',
+        dependsOn: [],
+        writePaths: ['rustfmt.toml'],
+      },
+      {
+        id: 't1',
+        epicId: 'domain',
+        title: 'World',
+        owner: 'developer',
+        dependsOn: ['w0-policy', 'w0-lint'],
+        writePaths: ['crates/world/Cargo.toml', 'crates/world/src/**'],
+      },
+      {
+        id: 't2',
+        epicId: 'domain',
+        title: 'Combat',
+        owner: 'developer',
+        dependsOn: ['w0-policy'],
+        writePaths: ['crates/combat/Cargo.toml', 'crates/combat/src/**'],
+      },
+    ],
+  );
+  // Note: domain has milestoneId 'foundation' above — put domain in a separate milestone so only foundation-* are Wave 0.
+  parallelW0.milestones.push({ id: 'mvp', title: 'MVP', acceptance: [] });
+  parallelW0.epics[2].milestoneId = 'mvp';
+  const orderFindings = rustContractCrateFindings(parallelW0, md);
+  assert.ok(
+    orderFindings.some(f => f.code === 'architecture_policy_order' && f.taskIds?.includes('w0-lint')),
+    `expected architecture_policy_order for w0-lint, got ${JSON.stringify(orderFindings)}`,
+  );
+
+  // Once w0-lint depends on w0-policy, order is valid.
+  parallelW0.tasks[1].dependsOn = ['w0-policy'];
+  assert.deepEqual(rustContractCrateFindings(parallelW0, md), []);
+
+  // 3) Root [package] (Cargo.toml + src/main.rs) + 2 nested crates = 3 members -> triggers contract_crate_required & architecture_policy_required.
+  const rootPkgPlusTwo = mkSpec(
+    [
+      { id: 'foundation', milestoneId: 'foundation', title: 'W0', acceptance: [] },
+      { id: 'mvp', milestoneId: 'mvp', title: 'MVP', acceptance: [] },
+    ],
+    [
+      {
+        id: 'w0',
+        epicId: 'foundation',
+        title: 'Root app',
+        owner: 'developer',
+        dependsOn: [],
+        writePaths: ['Cargo.toml', 'src/main.rs'],
+      },
+      {
+        id: 't1',
+        epicId: 'mvp',
+        title: 'A',
+        owner: 'developer',
+        dependsOn: ['w0'],
+        writePaths: ['crates/a/Cargo.toml', 'crates/a/src/**'],
+      },
+      {
+        id: 't2',
+        epicId: 'mvp',
+        title: 'B',
+        owner: 'developer',
+        dependsOn: ['w0'],
+        writePaths: ['crates/b/Cargo.toml', 'crates/b/src/**'],
+      },
+    ],
+  );
+  rootPkgPlusTwo.milestones.push({ id: 'mvp', title: 'MVP', acceptance: [] });
+  const rootPkgFindings = rustContractCrateFindings(rootPkgPlusTwo, md);
+  assert.ok(
+    rootPkgFindings.some(f => f.code === 'contract_crate_required'),
+    `root [package] + 2 crates must trigger contract_crate_required, got ${JSON.stringify(rootPkgFindings)}`,
+  );
+  assert.ok(
+    rootPkgFindings.some(f => f.code === 'architecture_policy_required'),
+    `root [package] + 2 crates must trigger architecture_policy_required, got ${JSON.stringify(rootPkgFindings)}`,
+  );
+
+  // 4) Virtual root (Cargo.toml without src/**) + 2 nested crates = 2 members -> does NOT trigger.
+  const virtualRootPlusTwo = structuredClone(rootPkgPlusTwo);
+  virtualRootPlusTwo.tasks[0].writePaths = ['Cargo.toml'];
+  const virtualFindings = rustContractCrateFindings(virtualRootPlusTwo, md);
+  assert.deepEqual(
+    virtualFindings,
+    [],
+    `virtual root + 2 crates must not trigger contract/policy findings, got ${JSON.stringify(virtualFindings)}`,
+  );
+});

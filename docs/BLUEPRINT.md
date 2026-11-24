@@ -53,7 +53,9 @@ Finding — `{ code, taskIds?, message }`; сообщения не содерж�
 | `blueprint_wave0_missing` | нет `foundation` или в нём нет задач |
 | `blueprint_wave0_bypassed` | задача вне Волны 0 не зависит от неё транзитивно |
 | `blueprint_wave0_order` | задача Волны 0 зависит от задачи вне неё |
-| `contract_crate_required` | единый Rust workspace с ≥ 3 крейтами без задачи Волны 0, покрывающей `Cargo.toml` и `src/**` контрактного крейта (правило 9) |
+| `contract_crate_required` | единый Rust workspace с ≥ 3 крейтами (включая корневой `[package]`, если он не виртуальный) без задачи Волны 0, покрывающей `Cargo.toml` и `src/**` контрактного крейта (правило 9) |
+| `architecture_policy_required` | единый Rust workspace с ≥ 3 крейтами без задачи Волны 0, создающей `architecture.policy.json` (если политика v2 ещё не существует в репозитории) |
+| `architecture_policy_order` | задача Волны 0 не зависит от задачи Волны 0, создающей `architecture.policy.json` (иначе гейт её эпика при `architecture.enabled` будет `blocked`) |
 | `contract_scope_too_broad` | путь записи обычной задачи накрывает контрактный крейт широкой маской без явного указания его каталога (правило 9) |
 | `blueprint_container_empty` | майлстоун без эпиков или эпик без задач (правило 8) |
 | `blueprint_epic_cycle` | эпики зависят друг от друга по кругу через задачи (правило 7) |

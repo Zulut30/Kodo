@@ -442,7 +442,8 @@ const RULES = `# Правила чертежа Kodo
 | \`blueprint_section_missing\`, \`blueprint_section_empty\` | Разделы PROJECT.md |
 | \`blueprint_owner_unknown\` | owner — одна из ролей |
 | \`blueprint_wave0_missing\`, \`blueprint_wave0_bypassed\`, \`blueprint_wave0_order\` | Волна 0 |
-| \`contract_crate_required\` | Единый Rust workspace с ≥ 3 крейтами: добавить в Волну 0 задачу с \`Cargo.toml\` + \`src/**\` контрактного крейта (\`crates/<name>-contracts\` или \`Контрактный крейт: …\` в \`PROJECT.md\`) и \`architecture.policy.json\` в её \`writePaths\` |
+| \`contract_crate_required\` | Единый Rust workspace с ≥ 3 крейтами: добавить в Волну 0 задачу с \`Cargo.toml\` + \`src/**\` контрактного крейта (\`crates/<name>-contracts\` или \`contractCrate: …\` в \`PROJECT.md\`) и \`architecture.policy.json\` в её \`writePaths\` |
+| \`architecture_policy_required\`, \`architecture_policy_order\` | Добавить \`architecture.policy.json\` в \`writePaths\` задачи Волны 0 и поставить остальные задачи Волны 0 в зависимость от неё |
 | \`contract_scope_too_broad\` | Сузить \`writePaths\` обычной задачи, чтобы не накрывать контрактный крейт широкой маской |
 | \`blueprint_container_empty\` | Пустой майлстоун или эпик: добавить в него эпик/задачу или удалить его |
 | \`blueprint_epic_cycle\` | Цикл зависимостей между эпиками: перенести задачи или объединить эпики |
