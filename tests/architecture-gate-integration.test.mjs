@@ -488,7 +488,12 @@ test('Installed-layout gate works without package lock and rejects changed actua
   const receipt = await gate.runArchitectureChecks(fx.options());
   assert.equal(receipt.passed, true);
   assert.equal(await gate.isCurrentArchitectureReceipt(receipt, fx.options()), true);
-  for (const filename of [gatePath, path.join(installed, 'node_modules/acorn/dist/acorn.mjs')]) {
+  for (const filename of [
+    gatePath,
+    path.join(installed, 'runtime/project-controller-lease.mjs'),
+    path.join(installed, 'runtime/project-integration-lease.mjs'),
+    path.join(installed, 'node_modules/acorn/dist/acorn.mjs'),
+  ]) {
     const original = await readFile(filename);
     await writeFile(filename, Buffer.concat([original, Buffer.from('\n// changed pin\n')]));
     assert.equal(await gate.isCurrentArchitectureReceipt(receipt, fx.options()), false);

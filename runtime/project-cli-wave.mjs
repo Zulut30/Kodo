@@ -105,6 +105,7 @@ export async function projectWaveCli(argv, ports = {}) {
       'project_drain_invalid',
     ].includes(error?.code);
     exitCode = argumentError || phase === 'input' || dataError ? 1 : 2;
+    const blockedCode = phase === 'operation' && error?.code === 'project_busy' ? 'project_busy' : 'project_blocked';
     // Constant diagnostics only. Never echo paths, arguments, provider output or matching secrets.
     report = {
       schemaVersion: 1,
@@ -112,7 +113,7 @@ export async function projectWaveCli(argv, ports = {}) {
       revision: null,
       result: {
         status: exitCode === 1 ? 'invalid' : 'blocked',
-        code: argumentError ? 'project_arguments' : exitCode === 1 ? 'project_invalid' : 'project_blocked',
+        code: argumentError ? 'project_arguments' : exitCode === 1 ? 'project_invalid' : blockedCode,
       },
     };
   } finally {

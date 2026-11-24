@@ -80,6 +80,8 @@ async function pins() {
     'toolchains.mjs',
     'progress.mjs',
     'project-integration.mjs',
+    'project-integration-lease.mjs',
+    'project-controller-lease.mjs',
     'project-wave-evidence.mjs',
     'project-director-waves.mjs',
     'project-cli-wave.mjs',

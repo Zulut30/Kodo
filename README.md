@@ -127,13 +127,14 @@ OpenCode может загрузить тот же навык и передат�
 
 ```powershell
 kodo project bootstrap "Сервис заметок с поиском" --root "D:\Projects\notes" --prepare --json
-kodo project apply-spec --root "D:\Projects\notes" --json
+kodo project apply-spec --root "D:\Projects\notes" --command-id <UUID-из-команды-bootstrap> --json
 kodo project next-wave <projectId> --host t3 --limit 3 --json      # брифы для видимых воркер-чатов T3
-kodo project complete-task <projectId> <taskId> --head <SHA> --json
+kodo project complete-task <projectId> <taskId> --head <SHA> --attempt <attemptId> --defer-gate --json
+kodo project gates <projectId> --json                               # диспетчер запускает после сдачи
 kodo project gates <projectId> --retry-failed --json                # повтор заблокированного гейта после исправления
 kodo project drain <projectId> --concurrency 2 --json               # без T3: волны нативными сессиями
 kodo project extend <projectId> "Теги заметок" --prepare --json
-kodo project append-milestone <projectId> --file <bundle>\milestone.json --json
+kodo project append-milestone <projectId> --file <bundle>\milestone.json --command-id <UUID> --json
 ```
 
 `kodo project --help` показывает справку проектных команд. Команды в брифах `next-wave` и подсказках `next` вызывают тот же пакет: `node "<абсолютный путь к cli/index.mjs>" …`, поэтому другая версия `kodo` на PATH им не мешает. Воркер-чат главный чат архивирует сразу после итога его задачи.
