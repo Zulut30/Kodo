@@ -1,4 +1,4 @@
-// `kodo project drain PROJECT_ID [--max-waves 1..100] [--concurrency 1..5] [--retry-failed]
+// `kodo project drain PROJECT_ID [--max-waves 1..100] [--concurrency 1..64] [--retry-failed]
 // [--command-id UUID] [--json]`: strict parsing before credentials or state, the same
 // composition, report and exit codes as project-cli (0 done, 1 invalid input, 2 blocked).
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;

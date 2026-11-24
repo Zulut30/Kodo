@@ -1361,6 +1361,7 @@ test('B3b profile changes cannot interleave with a pull after its profile read',
     projectCli(['profile', 'pause-pool', f.projectId, '--subscription', 'p', '--until', '2099-01-01T00:00:00Z'], {
       home: f.home,
       secrets: {},
+      profileWaitMs: 0,
     });
   let read = false,
     raced;
@@ -1379,6 +1380,20 @@ test('B3b profile changes cannot interleave with a pull after its profile read',
   assert.equal(raced.report.result.code, 'project_busy');
   assert.equal(wave.briefs.length, 1);
   assert.equal((await pause()).exitCode, 0);
+  assert.equal((await f.wave()).code, 'waiting_limits');
+});
+test('A pause issued while a pull holds the profile lease waits and then applies', async t => {
+  const { projectCli } = await import('../runtime/project-cli.mjs');
+  const f = await fixture(t);
+  fourSlotProfile(f);
+  const held = f.store.acquireLease('project-profile:' + f.projectId, 'pull', { ttlMs: 60000, limit: 1 });
+  assert.ok(held);
+  setTimeout(() => f.store.releaseLease(held), 200);
+  const paused = await projectCli(
+    ['profile', 'pause-pool', f.projectId, '--subscription', 'p', '--until', '2099-01-01T00:00:00Z'],
+    { home: f.home, secrets: {} },
+  );
+  assert.equal(paused.exitCode, 0);
   assert.equal((await f.wave()).code, 'waiting_limits');
 });
 test('B7 graph errors preserve installed briefs and block new reservations', async t => {

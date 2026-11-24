@@ -138,10 +138,18 @@ async function readProjectInput(options, contracts, secrets, safety) {
   return spec;
 }
 
-function profileOperation(store, repo, { action, projectId, flags }, input) {
+// A pull holds project-profile:<id> while it admits a wave, so a pause issued at that moment
+// waits briefly instead of failing; the user pausing an exhausted pool should not have to retry.
+const PROFILE_WAIT_MS = 30000;
+
+async function profileOperation(store, repo, { action, projectId, flags }, input, waitMs = PROFILE_WAIT_MS) {
   if (action === 'show') return repo.getProfile(projectId);
-  const lease = store.acquireLease('project-profile:' + projectId, randomUUID(), { ttlMs: 60000, limit: 1 });
-  if (!lease) throw Object.assign(new Error('Project busy'), { code: 'project_busy' });
+  const deadline = Date.now() + waitMs;
+  let lease;
+  while (!(lease = store.acquireLease('project-profile:' + projectId, randomUUID(), { ttlMs: 60000, limit: 1 }))) {
+    if (Date.now() >= deadline) throw Object.assign(new Error('Project busy'), { code: 'project_busy' });
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
   try {
     return action === 'set'
       ? repo.setProfile(projectId, input)
@@ -259,7 +267,7 @@ export async function projectCli(argv, ports = {}) {
       });
       projectId = result.projectId;
     } else if (['set', 'show', 'pause-pool'].includes(options.action)) {
-      result = { profile: profileOperation(store, repo, options, input) };
+      result = { profile: await profileOperation(store, repo, options, input, ports.profileWaitMs) };
     } else if (options.action === 'status') {
       const snapshot = await repo.snapshot(projectId);
       safety(snapshot);
