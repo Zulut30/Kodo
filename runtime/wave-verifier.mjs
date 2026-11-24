@@ -275,8 +275,52 @@ async function gateDraft({ engine, project, gate, covered, containers, input }) 
   return draft;
 }
 
+function verifiedGateCheckReceipt(run) {
+  const checks = run.checks;
+  if (
+    checks?.complete !== true ||
+    typeof checks.headSha !== 'string' ||
+    checks.headSha !== run.headSha ||
+    checks.passed === false ||
+    (checks.status !== undefined && checks.status !== 'passed') ||
+    !Array.isArray(checks.results) ||
+    !checks.results.length
+  )
+    return null;
+  const results = checks.results.map(item => ({
+    command: item?.command,
+    exitCode: item?.exitCode,
+    ...(item?.status !== undefined ? { status: item.status } : {}),
+    ...(item?.passed !== undefined ? { passed: item.passed } : {}),
+  }));
+  const allPassed = results.every(
+    item => item.exitCode === 0 && item.passed !== false && (item.status === undefined || item.status === 'passed'),
+  );
+  if (!allPassed) return null;
+  return {
+    complete: true,
+    headSha: checks.headSha,
+    ...(checks.status !== undefined ? { status: checks.status } : {}),
+    results,
+  };
+}
+
+function verifiedGateCriterionIds(run) {
+  const criteria = run.review?.criteria;
+  if (!Array.isArray(criteria) || !criteria.length) return null;
+  if (!criteria.every(row => row && row.met === true && typeof row.id === 'string' && row.id.trim())) return null;
+  const ids = [...new Set(criteria.map(row => row.id.trim()))];
+  if (
+    Array.isArray(run.gateCriteria) &&
+    run.gateCriteria.length > 0 &&
+    !run.gateCriteria.every(row => ids.includes(row.id))
+  )
+    return null;
+  return ids;
+}
+
 /**
- * Record a head-verified gate lesson (<= 200 Unicode chars, bound to `run.headSha`,
+ * Record a head-verified, criterion-bound gate lesson (<= 200 Unicode chars, bound to `run.headSha`,
  * passing checks and passing review, redacted, without raw review findings) into
  * the project's knowledge store so subsequent tasks of the same module/epic receive it.
  * @param {any} engine
@@ -289,11 +333,11 @@ export function recordGateLesson(engine, run) {
   const trimmed = redact(rawLesson.trim(), engine.secrets || {});
   if (!trimmed) return null;
   if (!shaPattern.test(run.headSha) || run.review?.passed !== true || run.review.headSha !== run.headSha) return null;
+  const checks = verifiedGateCheckReceipt(run);
+  const criterionIds = verifiedGateCriterionIds(run);
+  if (!checks || !criterionIds) return null;
   const chars = Array.from(trimmed);
   const summary = chars.length <= 200 ? trimmed : chars.slice(0, 199).join('') + '…';
-  const checkResults = Array.isArray(run.checks?.results)
-    ? run.checks.results.map(item => ({ command: item.command, exitCode: item.exitCode }))
-    : [];
   const scope = run.gateScope ?? {
     epicIds: [],
     modules: modulesFromWritePaths((run.plan?.tasks || []).flatMap(task => task.writePaths || [])),
@@ -307,18 +351,14 @@ export function recordGateLesson(engine, run) {
     kind: 'gate-lesson',
     projectId: run.directorBinding.projectId,
     gateId: run.directorBinding.gateId,
+    criterionIds,
     epicIds: [...new Set(scope.epicIds || [])],
     modules: [...new Set(scope.modules || [])],
     writePaths: [...new Set(scope.writePaths || [])],
-    checks: {
-      complete: run.checks?.complete === true,
-      headSha: run.checks?.headSha ?? run.headSha,
-      results: checkResults,
-    },
+    checks,
     review: { passed: true, headSha: run.headSha },
   };
-  // Verify using the exact same head-bound checks/review rules as ContextPack.
-  if (!verifiedLessonSummaries([candidate], 1).length) return null;
+  if (!verifiedLessonSummaries([candidate], 1, { includeGateLessons: true, requireCriteria: true }).length) return null;
   if (typeof engine.store.rememberLesson === 'function')
     return engine.store.rememberLesson(run.project, run.id, candidate);
   return null;

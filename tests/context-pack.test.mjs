@@ -1,6 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { compactPlanEvidence, compactReviewEvidence, measureContext } from '../runtime/context-pack.mjs';
+import {
+  compactPlanEvidence,
+  compactReviewEvidence,
+  measureContext,
+  modulesFromWritePaths,
+  selectWaveVerifiedLessons,
+} from '../runtime/context-pack.mjs';
 
 const privatePaths = {
   plan: 'C:/private evidence/план-🧭.json',
@@ -312,4 +318,76 @@ test('Impossible or invalid byte budgets fail explicitly without truncating requ
     assert.throws(() => compactPlanEvidence({}, { maxBytes }), /budget/i);
   }
   assert.throws(() => measureContext({}), /string/i);
+});
+
+test('Wave gate lessons use full module paths, require criterion binding, deduplicate before max 3 and stay out of ordinary plan evidence', () => {
+  assert.deepEqual(modulesFromWritePaths(['crates/core/src/lib.rs']), ['crates/core']);
+  assert.deepEqual(modulesFromWritePaths(['packages/core/index.ts']), ['packages/core']);
+
+  const sha = 'a'.repeat(40);
+  const makeGateLesson = (id, summary, extra = {}) => ({
+    runId: id,
+    headSha: sha,
+    summary,
+    lesson: summary,
+    kind: 'gate-lesson',
+    projectId: 'p1',
+    epicIds: ['core-rs'],
+    modules: ['crates/core'],
+    writePaths: ['crates/core'],
+    criterionIds: ['epic:core-rs:ok'],
+    checks: { complete: true, headSha: sha, results: [{ command, exitCode: 0, status: 'passed' }] },
+    review: { passed: true, headSha: sha },
+    ...extra,
+  });
+
+  // Ordinary compactPlanEvidence MUST NOT read gate-lesson records at all!
+  const planDoc = parse(
+    compactPlanEvidence({ analysis: { summary: 'ok', priorLessons: [makeGateLesson('g1', 'Gate note')] } }),
+  );
+  assert.deepEqual(planDoc.analysis.verifiedLessons, []);
+
+  // packages/core MUST NOT receive crates/core's lesson!
+  const pkgTask = { epicId: 'core-js', writePaths: ['packages/core/index.ts'] };
+  assert.deepEqual(
+    selectWaveVerifiedLessons([makeGateLesson('g1', 'Rust core note')], { task: pkgTask, projectId: 'p1' }),
+    [],
+  );
+
+  // Unbound lesson (no criterionIds) is ignored.
+  const rsTask = { epicId: 'core-rs', writePaths: ['crates/core/src/mod.rs'] };
+  assert.deepEqual(
+    selectWaveVerifiedLessons([makeGateLesson('g-no-crit', 'No criterion', { criterionIds: [] })], {
+      task: rsTask,
+      projectId: 'p1',
+    }),
+    [],
+  );
+
+  // Deduplication of normalized text + filter by scope BEFORE maxLessons = 3.
+  const manyOther = Array.from({ length: 10 }, (_, i) =>
+    makeGateLesson(`other-${i}`, `Other note ${i}`, {
+      epicIds: ['other'],
+      modules: ['crates/other'],
+      writePaths: ['crates/other'],
+    }),
+  );
+  const matching = [
+    makeGateLesson('g1', 'Keep   errors   typed'),
+    makeGateLesson('g2', 'keep errors typed'),
+    makeGateLesson('g3', 'Use i32 coordinates'),
+    makeGateLesson('g4', 'Avoid unwrap in public API'),
+    makeGateLesson('g5', 'Fourth distinct note'),
+  ];
+  const selected = selectWaveVerifiedLessons([...manyOther, ...matching], {
+    task: rsTask,
+    projectId: 'p1',
+    maxLessons: 3,
+  });
+  assert.equal(selected.length, 3);
+  assert.deepEqual(
+    selected.map(row => row.summary),
+    ['Keep   errors   typed', 'Use i32 coordinates', 'Avoid unwrap in public API'],
+  );
+  assert.deepEqual(selected[0].criterionIds, ['epic:core-rs:ok']);
 });

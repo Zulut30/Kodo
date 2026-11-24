@@ -420,9 +420,18 @@ export class Store {
   }
   lessons(project, limit = 5) {
     return this.db
-      .prepare('SELECT body FROM knowledge WHERE project=? ORDER BY time DESC LIMIT ?')
-      .all(projectKey(project), limit)
-      .map(row => JSON.parse(row.body));
+      .prepare('SELECT body FROM knowledge WHERE project=? ORDER BY time DESC')
+      .all(projectKey(project))
+      .map(row => JSON.parse(row.body))
+      .filter(item => item?.kind !== 'gate-lesson')
+      .slice(0, limit);
+  }
+  gateLessons(project) {
+    return this.db
+      .prepare('SELECT body FROM knowledge WHERE project=? ORDER BY time DESC')
+      .all(projectKey(project))
+      .map(row => JSON.parse(String(row.body)))
+      .filter(item => item?.kind === 'gate-lesson');
   }
   findKnowledgeCapture(project, captureId) {
     return readKnowledgeCapture(this.db, knowledgeProjectKey(project), captureId);

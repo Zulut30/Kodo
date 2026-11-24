@@ -111,12 +111,18 @@ function addStrings(fields, owner, key, value, field) {
 
 // The caller supplies relevant project-scoped lessons in priority order. This
 // projects existing recorded evidence; it performs no new review or storage.
-export function verifiedLessonSummaries(lessons, maxLessons = 3) {
+export function verifiedLessonSummaries(
+  lessons,
+  maxLessons = 3,
+  { includeGateLessons = false, deduplicate = false, requireCriteria = false } = {},
+) {
   const selected = [];
+  const seenText = new Set();
   if (!Array.isArray(lessons)) return selected;
   for (const lesson of lessons) {
+    if (!record(lesson)) continue;
+    if (!includeGateLessons && lesson.kind === 'gate-lesson') continue;
     if (
-      !record(lesson) ||
       typeof lesson.runId !== 'string' ||
       !lesson.runId.trim() ||
       typeof lesson.headSha !== 'string' ||
@@ -127,6 +133,10 @@ export function verifiedLessonSummaries(lessons, maxLessons = 3) {
       lesson.review.headSha !== lesson.headSha
     )
       continue;
+    const criterionIds = Array.isArray(lesson.criterionIds)
+      ? [...new Set(lesson.criterionIds.filter(id => typeof id === 'string' && id.trim()).map(id => id.trim()))]
+      : [];
+    if (requireCriteria && !criterionIds.length) continue;
     const results = Array.isArray(lesson.checks) ? lesson.checks : lesson.checks?.results;
     if (!Array.isArray(results) || !results.length || !Array.from(results).every(record)) continue;
     // Stored knowledge uses command/exit arrays. Also accept complete receipts
@@ -134,36 +144,43 @@ export function verifiedLessonSummaries(lessons, maxLessons = 3) {
     // not establish verified knowledge, even alongside a passing review.
     const checks = Array.isArray(lesson.checks) ? { complete: true, headSha: lesson.headSha, results } : lesson.checks;
     if (checkEvidence(checks, lesson.headSha, []).status !== 'passed') continue;
-    const summary = Array.from(lesson.summary.trim());
+    const trimmed = lesson.summary.trim();
+    if (deduplicate) {
+      const norm = trimmed.replace(/\s+/g, ' ').toLowerCase();
+      if (seenText.has(norm)) continue;
+      seenText.add(norm);
+    }
+    const summary = Array.from(trimmed);
     selected.push({
       runId: lesson.runId,
       headSha: lesson.headSha,
       summary: summary.length <= 200 ? summary.join('') : summary.slice(0, 199).join('') + '…',
+      ...(requireCriteria ? { criterionIds } : {}),
     });
     if (selected.length === maxLessons) break;
   }
   return selected;
 }
 
-const MODULE_CONTAINER = /^(?:src|crates|packages|modules|libs|services|apps|runtime)\/([^/*?[{]+)/;
+const MODULE_CONTAINER = /^((?:src|crates|packages|modules|libs|services|apps|runtime)\/[^/*?[{]+)/;
 
-/** Extract normalized module names from a list of writePaths. */
+/** Extract normalized full module paths (e.g. `crates/core`, `packages/core`) from writePaths. */
 export function modulesFromWritePaths(writePaths) {
   const modules = new Set();
   for (const raw of strings(writePaths)) {
     const normalized = raw.replaceAll('\\', '/').replace(/^\.\//, '').replace(/\/+$/, '');
     const match = MODULE_CONTAINER.exec(normalized);
     if (!match) continue;
-    const name = match[1].replace(/\.[a-z0-9]+$/i, '').toLowerCase();
-    if (name) modules.add(name);
+    const mod = match[1].replace(/\.[a-z0-9]+$/i, '').toLowerCase();
+    if (mod) modules.add(mod);
   }
   return [...modules];
 }
 
 /**
- * Select up to `maxLessons` head-verified gate lessons matching a wave task's
- * epic or module/writePaths. Never returns secrets or raw review text: output
- * contains only `{ runId, headSha, summary }` (<= 200 Unicode chars).
+ * Select up to `maxLessons` head-verified, criterion-bound gate lessons matching a wave task's
+ * epic or full module path/writePaths. Filters by scope and deduplicates normalized text BEFORE
+ * applying `maxLessons`. Never returns secrets or raw review text.
  * @param {any[]} lessons
  * @param {{ task: { epicId?: string, writePaths?: string[] }, projectId?: string, maxLessons?: number }} options
  */
@@ -172,7 +189,7 @@ export function selectWaveVerifiedLessons(lessons, { task, projectId, maxLessons
   const taskModules = modulesFromWritePaths(task.writePaths);
   const taskPaths = strings(task.writePaths);
   const matched = lessons.filter(lesson => {
-    if (!record(lesson)) return false;
+    if (!record(lesson) || lesson.kind !== 'gate-lesson') return false;
     if (projectId && typeof lesson.projectId === 'string' && lesson.projectId !== projectId) return false;
     const epicIds = strings(lesson.epicIds);
     const modules = strings(lesson.modules).map(m => m.toLowerCase());
@@ -183,7 +200,11 @@ export function selectWaveVerifiedLessons(lessons, { task, projectId, maxLessons
     if (taskPaths.length && writePaths.length && scopesOverlap(writePaths, taskPaths)) return true;
     return false;
   });
-  return verifiedLessonSummaries(matched, maxLessons);
+  return verifiedLessonSummaries(matched, maxLessons, {
+    includeGateLessons: true,
+    deduplicate: true,
+    requireCriteria: true,
+  });
 }
 
 /** Bounded allowlisted analysis/discovery metadata; source bodies, cache,
