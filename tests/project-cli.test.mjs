@@ -720,3 +720,43 @@ test('Frozen independent Director oracle remains byte identical', async () => {
     'fa0a150b981f9b0ea609e2204bf562a5b04f546f86dc74450ec541bf8635c7c5',
   );
 });
+
+test('gc-worktrees CLI exposes separate incomplete retention and deletion lists', async t => {
+  const f = await fixture(t);
+  const created = f.invoke(['project', 'create', '--file', f.file]);
+  const projectId = created.report.projectId;
+  const { Store } = await import('../runtime/store.mjs');
+  const { makeWorktree, git } = await import('../runtime/workspace.mjs');
+  const { markTaskWorktree } = await import('../runtime/project-worktree-gc.mjs');
+  const store = new Store(f.home);
+  const id = randomUUID(),
+    worktreeRoot = path.join(f.env.KODO_WORKTREE_HOME, id);
+  const headSha = await git(f.root, ['rev-parse', 'HEAD']);
+  const run = {
+    id,
+    project: f.root,
+    worktreeRoot,
+    cwd: path.join(worktreeRoot, 'integration'),
+    branch: 'kodo/' + id,
+    directorBinding: { projectId, attemptId: 'attempt' },
+    executor: { kind: 'external' },
+    externalCompletion: { headSha, integration: { status: 'integrated' } },
+  };
+  const gc = () => {
+    const result = f.invoke(['project', 'gc-worktrees', projectId]);
+    assert.equal(result.exitCode, 0);
+    return result.report.result;
+  };
+  try {
+    store.createRun(run);
+    await makeWorktree(run.project, run.cwd, run.branch, headSha, { onCreated: () => markTaskWorktree(run) });
+    const token = store.acquireLease('run:' + id, 'active-worker');
+    assert.deepEqual(gc(), { removed: [], retained: [id], incomplete: [] });
+    store.releaseLease(token);
+    assert.deepEqual(gc(), { removed: [id], retained: [], incomplete: [] });
+    await assert.rejects(access(run.cwd), { code: 'ENOENT' });
+    assert.equal(await git(f.root, ['rev-parse', run.branch]), headSha);
+  } finally {
+    store.close();
+  }
+});

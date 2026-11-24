@@ -441,11 +441,11 @@ export class EngineVerification extends EngineExecution {
     this.save(run);
   }
   /** The task-fast profile: affected checks only (see runtime/task-fast-checks.mjs). */
-  async fastChecks(run, signal) {
+  async fastChecks(run, signal, maxHeavyBuilds = 1) {
     run.architectureChecks = null;
     run.state = 'testing';
     this.save(run);
-    await runFastChecks({ engine: this, run, signal });
+    await runFastChecks({ engine: this, run, signal, maxHeavyBuilds });
   }
   async verificationGates(run, signal) {
     const headSha = await git(run.cwd, ['rev-parse', 'HEAD']);
@@ -646,7 +646,17 @@ export class EngineVerification extends EngineExecution {
       } catch (error) {
         if (signal?.aborted || this.store.getRun(run.id).cancelRequested)
           throw Object.assign(new Error('Запуск отменён'), { code: 'cancelled' });
-        if (['cancelled', 'quota', 'auth', 'lease_lost', 'evidence_integrity', 'behavior_blocked'].includes(error.code))
+        if (
+          [
+            'cancelled',
+            'quota',
+            'auth',
+            'lease_lost',
+            'evidence_integrity',
+            'behavior_blocked',
+            'cargo_fetch_failed',
+          ].includes(error.code)
+        )
           throw error;
         checkError = error;
       }

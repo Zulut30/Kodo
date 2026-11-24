@@ -34,7 +34,7 @@ function argumentsFor(argv) {
   if (profile) [action, ...args] = args;
   if (profile && !['set', 'show', 'pause-pool'].includes(action)) invalid();
   const writes = ['create', 'resume', 'cancel', 'pause', 'reprioritize', 'approve-risk'];
-  if (!profile && ![...writes, 'status', 'plan'].includes(action)) invalid();
+  if (!profile && ![...writes, 'status', 'plan', 'gc-worktrees'].includes(action)) invalid();
   const allowed = new Set([
     '--json',
     ...(writes.includes(action) ? ['--command-id'] : []),
@@ -268,6 +268,10 @@ export async function projectCli(argv, ports = {}) {
       projectId = result.projectId;
     } else if (['set', 'show', 'pause-pool'].includes(options.action)) {
       result = { profile: await profileOperation(store, repo, options, input, ports.profileWaitMs) };
+    } else if (options.action === 'gc-worktrees') {
+      const snapshot = await repo.snapshot(projectId);
+      const { gcProjectWorktrees } = await import('./project-worktree-gc.mjs');
+      result = await gcProjectWorktrees(store, snapshot);
     } else if (options.action === 'status') {
       const snapshot = await repo.snapshot(projectId);
       safety(snapshot);

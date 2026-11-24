@@ -1437,3 +1437,17 @@ test('B4 replay of two legacy briefs fills a two-brief profiled pull', async t =
   assert.deepEqual(replay.briefs, first.briefs);
   assert.equal(f.repo.snapshot(f.projectId).currentAttempts.length, 2);
 });
+
+test('complete-task reports cargo_fetch_failed as an environment block for the same head', async t => {
+  const f = await fixture(t);
+  const wave = await f.wave({ limit: 1 });
+  const task = brief(wave, 'task-a');
+  const head = await commit(task.worktree, { 'src/a.mjs': 'export const a=3;\n' });
+  f.engine.setup = async () => {
+    throw Object.assign(new Error('fetch unavailable'), { code: 'cargo_fetch_failed' });
+  };
+  const result = await f.complete('task-a', head);
+  assert.equal(result.code, 'cargo_fetch_failed');
+  assert.equal(result.status, 'blocked');
+  assert.match(result.message, /fetch unavailable/);
+});

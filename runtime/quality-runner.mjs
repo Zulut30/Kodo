@@ -48,7 +48,7 @@ async function toolIdentity(tool) {
 }
 
 async function nativeTool(id) {
-  if (!['node', 'dotnet', 'cargo', 'rustc', 'rustfmt', 'go', 'gofmt', 'php'].includes(id))
+  if (!['node', 'dotnet', 'cargo', 'rustc', 'rustfmt', 'rustup', 'go', 'gofmt', 'php'].includes(id))
     throw qualityError('unsupported', 'unknown native quality runtime');
   if (id === 'node')
     return { command: process.execPath, args: [], env: {}, binaryHash: sha256(await readFile(process.execPath)) };
@@ -66,6 +66,12 @@ async function nativeTool(id) {
     }
   }
   throw qualityError('missing', 'native quality runtime is not installed');
+}
+/** @param {any} check @param {typeof nativeTool} nativeResolve */
+async function qualityNativeTool(check, nativeResolve) {
+  if (!check.toolchain) return nativeResolve(['phpcs', 'phpstan'].includes(check.tool) ? 'php' : check.tool);
+  const rustup = await nativeResolve('rustup');
+  return { ...rustup, args: [...(rustup.args ?? []), 'run', check.toolchain, check.tool] };
 }
 async function privateDirectory(target, project) {
   const requested = path.resolve(target);
@@ -587,7 +593,7 @@ async function resolveCheckTool(ctx, check, receipt) {
       tool.args.some(a => typeof a !== 'string')
     )
       throw qualityError('tool_integrity', 'invalid managed tool port');
-  } else tool = await nativeResolve(['phpcs', 'phpstan'].includes(check.tool) ? 'php' : check.tool);
+  } else tool = await qualityNativeTool(check, nativeResolve);
   receipt.binaryHash = tool.binaryHash ?? null;
   receipt.toolIdentity = await toolIdentity(tool);
   if (check.tool === 'go' && check.capability === 'typecheck')
@@ -617,24 +623,27 @@ async function resolveCheckTool(ctx, check, receipt) {
   return { tool, toolEnv, prefix };
 }
 
+async function verifyRustCompiler(check, receipt, call, { tool, toolEnv, prefix }, nativeResolve) {
+  const rustc = await nativeResolve('rustc');
+  const compiler = await call(rustc.command, [...(rustc.args ?? []), '--version'], { stage: 'version' });
+  if (compiler.code !== 0 || compiler.stderr.trim() || !validVersion('rustc', compiler.stdout, check.rustcVersion))
+    throw qualityError('version_mismatch', 'Rust compiler version mismatch');
+  receipt.compilerIdentity = await toolIdentity(rustc);
+  if (check.capability === 'lint') {
+    const clippy = await call(tool.command, [...prefix, 'clippy', '--version'], {
+      env: toolEnv,
+      stage: 'version',
+    });
+    const pin = check.clippyVersion ?? /^clippy (\d+\.\d+\.\d+)/.exec(clippy.stdout)?.[1];
+    if (!pin || clippy.code !== 0 || clippy.stderr.trim() || !validVersion('clippy', clippy.stdout, pin))
+      throw qualityError('version_mismatch', 'Clippy version mismatch');
+  }
+}
+
 /** Exact compiler, runtime and tool versions plus safe configured entrypoints and paths. */
 async function verifyCheckRuntime(ctx, check, receipt, call, { tool, toolEnv, prefix }) {
   const { plan, nativeResolve } = ctx;
-  if (check.tool === 'cargo') {
-    const rustc = await nativeResolve('rustc');
-    const compiler = await call(rustc.command, [...(rustc.args ?? []), '--version'], { stage: 'version' });
-    if (compiler.code !== 0 || compiler.stderr.trim() || !validVersion('rustc', compiler.stdout, check.rustcVersion))
-      throw qualityError('version_mismatch', 'Rust compiler version mismatch');
-    receipt.compilerIdentity = await toolIdentity(rustc);
-    if (check.capability === 'lint') {
-      const clippy = await call(tool.command, [...prefix, 'clippy', '--version'], {
-        env: toolEnv,
-        stage: 'version',
-      });
-      if (clippy.code !== 0 || clippy.stderr.trim() || !validVersion('clippy', clippy.stdout, check.clippyVersion))
-        throw qualityError('version_mismatch', 'Clippy version mismatch');
-    }
-  }
+  if (check.tool === 'cargo') await verifyRustCompiler(check, receipt, call, { tool, toolEnv, prefix }, nativeResolve);
   if (['phpcs', 'phpstan'].includes(check.tool)) {
     const php = await call(tool.command, [...prefix, '--version'], { env: toolEnv, stage: 'version' });
     if (php.code !== 0 || php.stderr.trim() || !validVersion('php', php.stdout, check.phpVersion))
@@ -655,6 +664,7 @@ async function verifyCheckRuntime(ctx, check, receipt, call, { tool, toolEnv, pr
       }
     }
   let version;
+  let actualVersion = check.version;
   if (check.tool === 'gofmt') {
     const go = await nativeResolve('go');
     version = await call(go.command, [...(go.args ?? []), 'version', tool.command], { stage: 'version' });
@@ -669,16 +679,21 @@ async function verifyCheckRuntime(ctx, check, receipt, call, { tool, toolEnv, pr
         ? ['version']
         : ['--version'];
     version = await call(tool.command, [...prefix, ...versionArgs], { env: toolEnv, stage: 'version' });
+    actualVersion =
+      check.toolchain && check.tool === 'rustfmt'
+        ? /^rustfmt (\d+\.\d+\.\d+)/.exec(version.stdout)?.[1]
+        : check.version;
     if (
+      !actualVersion ||
       version.code !== 0 ||
       version.stderr.trim() ||
       (check.configured
         ? version.stdout.trim() !== check.configured.versionOutput
-        : !validVersion(check.tool, version.stdout, check.version))
+        : !validVersion(check.tool, version.stdout, actualVersion))
     )
       throw qualityError('version_mismatch', 'exact quality tool version mismatch');
   }
-  receipt.actualVersion = check.version;
+  receipt.actualVersion = actualVersion;
 }
 
 /** Resolve and verify the exact tool, runtimes and entrypoints before a check runs. */
@@ -918,7 +933,7 @@ export async function isCurrentQualityReceipt(
           return false;
         const tool = managed.has(check.tool)
           ? await resolve(check.tool, { project: plan.project, home: toolHome })
-          : await nativeResolve(['phpcs', 'phpstan'].includes(check.tool) ? 'php' : check.tool);
+          : await qualityNativeTool(check, nativeResolve);
         if (
           (managed.has(check.tool) && (!tool.ready || tool.status !== 'ready')) ||
           (await toolIdentity(tool)) !== row.toolIdentity

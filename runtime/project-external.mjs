@@ -24,6 +24,7 @@ import { execute } from './command.mjs';
 import { git, makeWorktree, plannedWorktreeHome } from './workspace.mjs';
 import { scopesOverlap } from './contracts.mjs';
 import { redact } from './security.mjs';
+import { markTaskWorktree } from './project-worktree-gc.mjs';
 import { isPullHost } from './job-contracts.mjs';
 import {
   ensureIntegration,
@@ -226,7 +227,7 @@ async function prepareAttempt(state, attempt) {
   if (state.profile && run.workerPlacement) state.placements.set(attempt.id, run.workerPlacement);
   need(run.executor?.kind === 'external' && run.executor.host === host, 'attempt_not_external');
   need(isDeepStrictEqual(run.directorBinding, bindingFor(attempt)), 'binding_invalid');
-  await makeWorktree(run.project, run.cwd, run.branch, run.baseSha);
+  await makeWorktree(run.project, run.cwd, run.branch, run.baseSha, { onCreated: () => markTaskWorktree(run) });
   if (run.state === 'created') {
     need((await git(run.cwd, ['rev-parse', 'HEAD'])) === run.baseSha, 'worktree_mismatch');
     state.checkLease();
@@ -999,7 +1000,12 @@ export async function completeTask(ctx, input) {
       const defect =
         (await inspectSubmission(ctx.engine, run, task, head)) ??
         (await verifySubmission(ctx, run, task, head, signal));
-      if (defect) return { status: 'checks_failed', ...defect, revision: snapshot.revision };
+      if (defect)
+        return {
+          status: defect.code === 'cargo_fetch_failed' ? 'blocked' : 'checks_failed',
+          ...defect,
+          revision: snapshot.revision,
+        };
     }
     return integrateCompletion(ctx, C, { ...input, deferGate }, run);
   });

@@ -17,6 +17,7 @@ export const PROJECT_USAGE = Object.freeze([
   'kodo project next-wave PROJECT_ID --host t3|orca [--limit N] [--retry-failed] [--json] (default 3, max 5 or profile capacity up to 64)',
   'kodo project complete-task PROJECT_ID TASK_ID --head SHA [--defer-gate] [--attempt UUID] [--command-id UUID] [--json]',
   'kodo project complete-task PROJECT_ID TASK_ID --head SHA --abandon --attempt UUID [--command-id UUID] [--json]',
+  'kodo project gc-worktrees PROJECT_ID [--json]',
   'kodo project gates PROJECT_ID [--retry-failed] [--json]',
   'kodo project bootstrap "IDEA" --root PATH [--prepare] [--client codex|claude-code] [--model MODEL] [--json]',
   'kodo project apply-spec --root PATH [--file SPEC_JSON] [--command-id UUID] [--json]',

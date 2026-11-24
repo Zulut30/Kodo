@@ -16,6 +16,8 @@ import { redact } from './security.mjs';
 export const WAVE_POLICY_FIELDS = Object.freeze([
   'commands',
   'verification',
+  'rust',
+  'fastChecks',
   'security',
   'uiVerification',
   'architecture',
@@ -140,8 +142,12 @@ export async function applyWavePolicy(draft, commit, options = {}) {
  */
 export async function assertWavePolicy({ run, policyCommit, headSha, writePaths = [], secrets = {} }) {
   const own = wavePolicyHash(run.config);
-  if (run.wavePolicy?.schemaVersion !== 1 || run.wavePolicy.commit !== policyCommit || run.wavePolicy.hash !== own)
-    fail('wave_policy_mismatch');
+  if (run.wavePolicy?.schemaVersion !== 1 || run.wavePolicy.commit !== policyCommit) fail('wave_policy_mismatch');
+  if (run.wavePolicy.hash !== own) {
+    // Older receipts omitted Rust settings. Still check the complete current policy against Git below.
+    const { rust, fastChecks, ...legacy } = run.config;
+    if (run.wavePolicy.hash !== wavePolicyHash(legacy)) fail('wave_policy_mismatch');
+  }
   if ((await wavePolicyAt(run.project, policyCommit, { secrets })).hash !== own) fail('wave_policy_mismatch');
   if (!headSha || headSha === policyCommit) return;
   if ((await wavePolicyAt(run.project, headSha, { secrets })).hash !== own && !ownsPath(writePaths, CONFIG_FILE))

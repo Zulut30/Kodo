@@ -2,6 +2,7 @@
 import path from 'node:path';
 import { lstat, readFile, readdir, realpath } from 'node:fs/promises';
 import { parse as parseToml } from 'smol-toml';
+import { cargoMembers } from './cargo-graph.mjs';
 import { toolCatalog } from './tools.mjs';
 import { inside, noLinks, sha256 } from './toolchains.mjs';
 import { secretFile } from './security.mjs';
@@ -434,6 +435,18 @@ async function validateManifestScope(root, files, documents) {
       if (config.compilerOptions?.baseUrl !== undefined) await checkedPath(name, config.compilerOptions.baseUrl);
     }
     if (base === 'Cargo.toml') {
+      const doc = documents.get(name);
+      for (const patterns of [doc.workspace?.members, doc.workspace?.exclude]) {
+        if (patterns === undefined) continue;
+        if (!Array.isArray(patterns))
+          throw qualityError('configuration', 'invalid Cargo workspace members or excludes');
+        for (const pattern of patterns) {
+          if (typeof pattern !== 'string' || /[*?[{].*\/\.\.(?:\/|$)/.test(pattern))
+            throw qualityError('unsafe_path', 'unsafe Cargo workspace pattern');
+          await checkedPath(name, pattern, true);
+        }
+      }
+      if (doc.package?.workspace !== undefined) await checkedPath(name, doc.package.workspace);
       const visit = async value => {
         if (!object(value)) return;
         for (const [key, item] of Object.entries(value)) {
@@ -567,18 +580,30 @@ function metadataScope(report, scope, affected) {
     return { widened, blocked: unknown };
   return { widened, blocked: [] };
 }
+function rustWorkspaceRoots(documents) {
+  const roots = new Map();
+  for (const [name, doc] of documents) {
+    if (path.posix.basename(name) !== 'Cargo.toml' || !doc.workspace) continue;
+    const root = dir(name);
+    for (const member of cargoMembers(documents, root).keys()) {
+      if (!roots.has(member) || roots.get(member).length < root.length) roots.set(member, root);
+    }
+  }
+  return roots;
+}
+
+function inheritedDocument(root, filename, documents) {
+  for (;;) {
+    const value = documents.get(at(root, filename));
+    if (value || !root) return value;
+    root = dir(root);
+  }
+}
+
 function nativePin(profile, id, config, documents) {
   const configured = config.tools[id === 'gofmt' ? 'go' : id]?.version;
   let manifest;
-  const inherited = filename => {
-    let current = profile.root;
-    for (;;) {
-      const value = documents.get(at(current, filename));
-      if (value) return value;
-      if (!current) return undefined;
-      current = dir(current);
-    }
-  };
+  const inherited = filename => inheritedDocument(profile.root, filename, documents);
   if (id === 'dotnet') manifest = inherited('global.json')?.sdk?.version;
   if (id === 'cargo' || id === 'rustc') manifest = inherited('rust-toolchain.toml')?.toolchain?.channel;
   if (id === 'go' || id === 'gofmt') {
@@ -799,6 +824,7 @@ export class QualityProfileRegistry {
     const metadata =
       mode === 'quick' && scope ? metadataScope(report, scope, affected) : { widened: new Map(), blocked: [] };
     const checks = [];
+    const workspaceRoots = rustWorkspaceRoots(documents);
     for (const profile of report.profiles)
       for (const capability of selected) {
         const triggers = metadata.widened.get(profile.id);
@@ -865,17 +891,35 @@ export class QualityProfileRegistry {
             }
             if (profile.language === 'rust') {
               check.manifest = at(profile.root, 'Cargo.toml');
-              check.edition = String(documents.get(check.manifest)?.package?.edition ?? '2015');
-              if (!names.has(check.manifest) || !['2015', '2018', '2021', '2024'].includes(check.edition))
+              const pkg = documents.get(check.manifest)?.package;
+              const workspace = workspaceRoots.get(profile.root);
+              const edition =
+                pkg?.edition?.workspace === true
+                  ? workspace === undefined
+                    ? undefined
+                    : documents.get(at(workspace, 'Cargo.toml'))?.workspace?.package?.edition
+                  : (pkg?.edition ?? '2015');
+              check.edition = typeof edition === 'string' ? edition : null;
+              if (!pkg || !['2015', '2018', '2021', '2024'].includes(check.edition))
                 check = { ...check, status: 'blocked', reason: 'rust_manifest_and_edition_required' };
-              if (check.tool === 'cargo' && !names.has(at(profile.root, 'Cargo.lock')))
+              if (check.tool === 'cargo' && !names.has(at(workspace ?? profile.root, 'Cargo.lock')))
                 check = { ...check, status: 'missing', reason: 'cargo_lock_required' };
+              const channel = inheritedDocument(profile.root, 'rust-toolchain.toml', documents)?.toolchain?.channel;
+              if (check.tool === 'rustfmt' && !check.version && exact(channel)) {
+                check.toolchain = channel;
+                check.version = channel;
+                if (check.reason === 'exact_project_tool_pin_required') {
+                  check.status = 'applicable';
+                  delete check.reason;
+                }
+              }
               if (check.tool === 'cargo') {
                 check.rustcVersion = nativePin(profile, 'rustc', config, documents) ?? null;
                 if (!check.rustcVersion) check = { ...check, status: 'missing', reason: 'exact_rustc_pin_required' };
                 if (capability === 'lint') {
                   check.clippyVersion = config.tools.clippy?.version ?? null;
-                  if (!check.clippyVersion)
+                  if (!check.clippyVersion && exact(channel)) check.toolchain = channel;
+                  else if (!check.clippyVersion)
                     check = { ...check, status: 'missing', reason: 'exact_clippy_pin_required' };
                 }
               }
