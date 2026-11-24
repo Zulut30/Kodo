@@ -1799,3 +1799,39 @@ test('W2: Rust workspace >= 3 requires architecture.policy.json in Wave 0, order
     `virtual root + 2 crates must not trigger contract/policy findings, got ${JSON.stringify(virtualFindings)}`,
   );
 });
+
+test('W4: include in .cargo/config(.toml) blocks fail-closed with unsupported-cargo-config-include pointing to source config', async t => {
+  const fx = await rustFixture(t);
+  await fx.put('.cargo/extra-patch.toml', '[patch.crates-io]\nserde = { path = "crates/render" }\n');
+  await fx.put('.cargo/config.toml', 'include = ["extra-patch.toml"]\n');
+  const head1 = fx.commit('add .cargo/config.toml with include');
+
+  const res1 = await checkArchitecture({
+    project: fx.project,
+    baseSha: fx.baseSha,
+    headSha: head1,
+    evidenceDir: fx.artifacts,
+  });
+  assert.equal(res1.status, 'blocked');
+  assert.ok(
+    res1.unsupported.some(u => u.reason === 'unsupported-cargo-config-include' && u.file === '.cargo/config.toml'),
+    `expected unsupported-cargo-config-include on .cargo/config.toml, got ${JSON.stringify(res1.unsupported)}`,
+  );
+
+  // Nested .cargo/config with string include also blocks with its exact source path.
+  await fx.put('crates/app/.cargo/config', 'include = "override.toml"\n');
+  const head2 = fx.commit('add nested .cargo/config with include');
+  const res2 = await checkArchitecture({
+    project: fx.project,
+    baseSha: fx.baseSha,
+    headSha: head2,
+    evidenceDir: fx.artifacts,
+  });
+  assert.equal(res2.status, 'blocked');
+  assert.ok(
+    res2.unsupported.some(
+      u => u.reason === 'unsupported-cargo-config-include' && u.file === 'crates/app/.cargo/config',
+    ),
+    `expected unsupported-cargo-config-include on crates/app/.cargo/config, got ${JSON.stringify(res2.unsupported)}`,
+  );
+});

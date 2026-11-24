@@ -161,6 +161,7 @@ function checkUnsupportedOverrides({ files, contents, rootDoc, unknown }) {
     }
     if (doc?.patch !== undefined) unknown('workspace', entry.path, 'unsupported-cargo-patch');
     if (doc?.replace !== undefined) unknown('workspace', entry.path, 'unsupported-cargo-replace');
+    if (doc?.include !== undefined) unknown('workspace', entry.path, 'unsupported-cargo-config-include');
   }
 }
 
