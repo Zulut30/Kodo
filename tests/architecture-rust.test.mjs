@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, rm, readdir, readFile } from 'node:fs/promises';
 import { validateArchitecturePolicy, evaluateArchitecture } from '../runtime/architecture-policy.mjs';
 import { readArchitectureGraph } from '../runtime/architecture-graph.mjs';
 import { checkArchitecture, architectureCli } from '../runtime/architecture-cli.mjs';
@@ -771,4 +771,50 @@ test('E1: Wave 0 from scratch (base without Cargo.toml or policy) passes checkAr
   assert.equal(receipt.status, 'passed', `expected passed receipt, got ${JSON.stringify(receipt)}`);
   assert.equal(receipt.passed, true);
   assert.equal(await isCurrentArchitectureReceipt(receipt, gateOptions), true);
+});
+
+test('E2: cargo-workspace resolves workspace members matching real Cargo 1.96 metadata fixtures offline', async () => {
+  const mod = await import('../runtime/cargo-workspace.mjs');
+  const fixturesDir = path.join(import.meta.dirname, 'fixtures', 'cargo-metadata');
+  const entries = (await readdir(fixturesDir)).filter(name => name.endsWith('.json')).sort();
+  assert.ok(entries.length >= 7, 'expected at least 7 cargo metadata fixtures');
+  for (const name of entries) {
+    const fixture = JSON.parse(await readFile(path.join(fixturesDir, name), 'utf8'));
+    const contents = new Map(
+      Object.entries(fixture.manifests).map(([file, text]) => [file, Buffer.from(text, 'utf8')]),
+    );
+    const resolved = mod.resolveCargoWorkspace({ manifests: contents, startDir: fixture.startDir || '' });
+    assert.deepEqual(
+      resolved.unsupported,
+      [],
+      `${name}: unexpected unsupported ${JSON.stringify(resolved.unsupported)}`,
+    );
+    assert.equal(resolved.root, fixture.workspace_root, `${name}: workspace root mismatch`);
+    assert.deepEqual(
+      resolved.members.map(member => ({ name: member.name, manifest: member.manifest })),
+      fixture.workspace_members,
+      `${name}: workspace members mismatch`,
+    );
+  }
+
+  // Malformed glob -> unsupported-member-glob; unexcluded nested [workspace] -> nested-workspace-root.
+  const badGlob = mod.resolveCargoWorkspace({
+    manifests: new Map([
+      ['Cargo.toml', '[workspace]\nmembers = ["crates/[unclosed"]\n'],
+      ['crates/a/Cargo.toml', '[package]\nname = "a"\nversion = "0.1.0"\n'],
+    ]),
+  });
+  assert.ok(badGlob.unsupported.some(row => row.reason === 'unsupported-member-glob'));
+
+  const nestedConflict = mod.resolveCargoWorkspace({
+    manifests: new Map([
+      ['Cargo.toml', '[workspace]\nmembers = ["crates/a"]\n'],
+      [
+        'crates/a/Cargo.toml',
+        '[package]\nname = "a"\nversion = "0.1.0"\n[dependencies]\nsub = { path = "../subws" }\n',
+      ],
+      ['crates/subws/Cargo.toml', '[package]\nname = "sub"\nversion = "0.1.0"\n[workspace]\n'],
+    ]),
+  });
+  assert.ok(nestedConflict.unsupported.some(row => row.reason === 'nested-workspace-root'));
 });

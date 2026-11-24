@@ -1,0 +1,53 @@
+{
+  "cargoVersion": "cargo 1.96.0 (30a34c682 2026-05-25)",
+  "startDir": "",
+  "workspace_root": "",
+  "workspace_members": [
+    {
+      "name": "game",
+      "manifest": "crates/game/Cargo.toml"
+    },
+    {
+      "name": "games",
+      "manifest": "crates/games/Cargo.toml"
+    },
+    {
+      "name": "lib-a",
+      "manifest": "crates/lib-a/Cargo.toml"
+    },
+    {
+      "name": "lib-b",
+      "manifest": "crates/lib-b/Cargo.toml"
+    },
+    {
+      "name": "mod-1",
+      "manifest": "crates/mod-1/Cargo.toml"
+    },
+    {
+      "name": "only-y",
+      "manifest": "crates/only-y/Cargo.toml"
+    },
+    {
+      "name": "leaf0",
+      "manifest": "nested/leaf/Cargo.toml"
+    },
+    {
+      "name": "leaf2",
+      "manifest": "nested/x/y/leaf/Cargo.toml"
+    }
+  ],
+  "manifests": {
+    "Cargo.toml": "[workspace]\nresolver = \"2\"\nmembers = [\"crates/game*\", \"crates/mod-?\", \"crates/lib-[ab]\", \"crates/only-[!x]\", \"nested/**/leaf\"]\n",
+    "crates/game/Cargo.toml": "[package]\nname = \"game\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    "crates/games/Cargo.toml": "[package]\nname = \"games\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    "crates/lib-a/Cargo.toml": "[package]\nname = \"lib-a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    "crates/lib-b/Cargo.toml": "[package]\nname = \"lib-b\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    "crates/lib-c/Cargo.toml": "[package]\nname = \"lib-c\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    "crates/mod-1/Cargo.toml": "[package]\nname = \"mod-1\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    "crates/mod-12/Cargo.toml": "[package]\nname = \"mod-12\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    "crates/only-x/Cargo.toml": "[package]\nname = \"only-x\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    "crates/only-y/Cargo.toml": "[package]\nname = \"only-y\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    "nested/leaf/Cargo.toml": "[package]\nname = \"leaf0\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    "nested/x/y/leaf/Cargo.toml": "[package]\nname = \"leaf2\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+  }
+}

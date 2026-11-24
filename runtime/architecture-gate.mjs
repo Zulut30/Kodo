@@ -54,6 +54,7 @@ async function pins() {
     'architecture-policy.mjs',
     'architecture-debt.mjs',
     'architecture-rust.mjs',
+    'cargo-workspace.mjs',
     'contract-registry.mjs',
     'javascript-dependencies.mjs',
     'ci-graph.mjs',
