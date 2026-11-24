@@ -1334,3 +1334,36 @@ test('E8: disabled gate ignores invalid taskPaths, normalizes ./ in taskPaths, e
     },
   );
 });
+
+test('E7: SKILL.md and BLUEPRINT.md document Wave 0 architecture.policy.json writePaths, architecture.enabled in kodo.config.json, and accurate apply-spec remediation', async () => {
+  const skill = await readFile(
+    path.join(import.meta.dirname, '..', 'skills', 'kodo-project-director', 'SKILL.md'),
+    'utf8',
+  );
+  const blueprintDoc = await readFile(path.join(import.meta.dirname, '..', 'docs', 'BLUEPRINT.md'), 'utf8');
+  for (const [label, text] of [
+    ['SKILL.md', skill],
+    ['docs/BLUEPRINT.md', blueprintDoc],
+  ]) {
+    assert.match(
+      text,
+      /architecture\.enabled|"architecture"\s*:\s*\{\s*"enabled"\s*:\s*true\s*\}/,
+      `${label}: must instruct enabling architecture gate in kodo.config.json`,
+    );
+    assert.match(
+      text,
+      /architecture\.policy\.json[^\n]*writePaths|writePaths[^\n]*architecture\.policy\.json/,
+      `${label}: must require Wave 0 task to include architecture.policy.json in writePaths`,
+    );
+    assert.match(text, /contract_scope_too_broad/, `${label}: must document contract_scope_too_broad`);
+  }
+  const applySpecLine = skill
+    .split('\n')
+    .find(line => line.includes('contract_crate_required') && line.includes('blueprint_findings'));
+  assert.ok(applySpecLine, 'SKILL.md must explain contract_crate_required in apply-spec remediation');
+  assert.equal(
+    applySpecLine.includes('добавь его в `contractCrates` в `architecture.policy.json`'),
+    false,
+    'SKILL.md apply-spec step must not tell coordinator to edit non-existent architecture.policy.json before Wave 0',
+  );
+});

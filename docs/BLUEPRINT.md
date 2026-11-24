@@ -31,7 +31,7 @@
 7. **Эпики без циклов.** Граф эпиков — ребро X → Y, если задача эпика X зависит от задачи другого эпика Y. Задачи могут быть ацикличны, а эпики — нет (A1 → B1 → A2 → B2); такой волновой проект Store отклоняет (`project_epic_cycle`), поэтому lint сообщает об этом раньше: одна находка на каждую сильно связную группу эпиков, эпики — в сообщении, в `taskIds` — задачи, чьи зависимости ведут в другой эпик той же группы.
 
 8. **Нет пустых контейнеров.** В каждом майлстоуне есть эпик, в каждом эпике — задача. Пустой эпик никогда не получит гейт и остался бы `proposed`; такой волновой проект Store отклоняет (`project_container_empty`), lint сообщает раньше: одна находка со списком пустых контейнеров в сообщении.
-9. **Контрактный крейт Волны 0 для Rust workspace (≥ 3 крейтов).** В многомодульных Rust-проектах (3 и более крейтов в `writePaths`, например `crates/<name>`) Волна 0 (`foundation`) должна содержать задачу, создающую компилируемый крейт контрактов (`crates/<name>-contracts`: `pub trait`, общие типы данных, ошибки, базовые conformance-тесты), а `architecture.policy.json` (`schemaVersion: 2, language: "rust"`) включает его в `contractCrates` и нижний слой `layers`. Без такой задачи в Волне 0 lint и `apply-spec` возвращают `contract_crate_required`.
+9. **Контрактный крейт Волны 0 и защита области записи для Rust workspace (≥ 3 крейтов).** Крейты группируются по общему корню Cargo workspace (корневой `Cargo.toml` в `writePaths`, явная декларация `workspaceRoot:` / `Cargo workspace` в `PROJECT.md` или `constraints`, либо существующая политика v2; независимые утилиты со своими `Cargo.toml` без общего корня не считаются одним workspace). В едином workspace с ≥ 3 крейтами Волна 0 (`foundation`) должна содержать задачу, чьи `writePaths` покрывают `Cargo.toml` и `src/**` компилируемого контрактного крейта (по имени `*-contracts` или по явной декларации `Контрактный крейт: crates/<name>` / `contractCrates: …` в `PROJECT.md` либо `contractCrates` в `architecture.policy.json`), а также пишет `architecture.policy.json` (`schemaVersion: 2, language: "rust"`) и включает `architecture.policy.json` в свои `writePaths`. Координатор включает `"architecture": {"enabled": true}` в `kodo.config.json` в исходном коммите до `apply-spec` (иначе архитектурный гейт остаётся `disabled`, а после исправления Волны 0 с нуля отсутствие `Cargo.toml` на базе не блокирует проверку). Обычным задачам запрещено накрывать контрактный крейт широкой маской (`crates/**`, `crates` → `contract_scope_too_broad`); без компилируемого контрактного крейта в Волне 0 возвращается `contract_crate_required`.
 
 ## Коды findings
 
@@ -53,7 +53,8 @@ Finding — `{ code, taskIds?, message }`; сообщения не содерж�
 | `blueprint_wave0_missing` | нет `foundation` или в нём нет задач |
 | `blueprint_wave0_bypassed` | задача вне Волны 0 не зависит от неё транзитивно |
 | `blueprint_wave0_order` | задача Волны 0 зависит от задачи вне неё |
-| `contract_crate_required` | Rust workspace с ≥ 3 крейтами без задачи создания контрактного крейта (`crates/<name>-contracts`) в Волне 0 (правило 9) |
+| `contract_crate_required` | единый Rust workspace с ≥ 3 крейтами без задачи Волны 0, покрывающей `Cargo.toml` и `src/**` контрактного крейта (правило 9) |
+| `contract_scope_too_broad` | путь записи обычной задачи накрывает контрактный крейт широкой маской без явного указания его каталога (правило 9) |
 | `blueprint_container_empty` | майлстоун без эпиков или эпик без задач (правило 8) |
 | `blueprint_epic_cycle` | эпики зависят друг от друга по кругу через задачи (правило 7) |
 | `blueprint_parallel_overlap` | пара параллельных задач с пересекающимися `writePaths` |
