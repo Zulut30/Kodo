@@ -1343,9 +1343,11 @@ test('E7: SKILL.md and BLUEPRINT.md document Wave 0 architecture.policy.json wri
     'utf8',
   );
   const blueprintDoc = await readFile(path.join(import.meta.dirname, '..', 'docs', 'BLUEPRINT.md'), 'utf8');
+  const bootstrapSrc = await readFile(path.join(import.meta.dirname, '..', 'runtime', 'project-bootstrap.mjs'), 'utf8');
   for (const [label, text] of [
     ['SKILL.md', skill],
     ['docs/BLUEPRINT.md', blueprintDoc],
+    ['runtime/project-bootstrap.mjs', bootstrapSrc],
   ]) {
     assert.match(
       text,
@@ -1358,6 +1360,16 @@ test('E7: SKILL.md and BLUEPRINT.md document Wave 0 architecture.policy.json wri
       `${label}: must require Wave 0 task to include architecture.policy.json in writePaths`,
     );
     assert.match(text, /contract_scope_too_broad/, `${label}: must document contract_scope_too_broad`);
+    assert.match(
+      text,
+      /members\s*=\s*\["crates\/\*"\]/,
+      `${label}: must instruct Wave 0 to set members = ["crates/*"]`,
+    );
+    assert.match(
+      text,
+      /layers[^\n]*(?:все|ВСЕ|карты модулей|будущ)/i,
+      `${label}: must instruct Wave 0 to pre-populate all module crates in layers`,
+    );
   }
   const applySpecLine = skill
     .split('\n')
@@ -1368,4 +1380,128 @@ test('E7: SKILL.md and BLUEPRINT.md document Wave 0 architecture.policy.json wri
     false,
     'SKILL.md apply-spec step must not tell coordinator to edit non-existent architecture.policy.json before Wave 0',
   );
+});
+
+test('W1: end-to-end Wave 0 (contracts + all planned crates in layers, members=["crates/*"]) -> Wave 1 adds crates/world -> PASS; ordinary contract edit -> blocked; migration -> PASS with requiresReview', async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'kodo-rust-w1-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const project = path.join(root, 'repo');
+  const artifacts = path.join(root, 'artifacts');
+  await mkdir(project, { recursive: true });
+  await mkdir(artifacts, { recursive: true });
+  const put = async (rel, content) => {
+    const full = path.join(project, rel);
+    await mkdir(path.dirname(full), { recursive: true });
+    await writeFile(full, typeof content === 'string' ? content : JSON.stringify(content, null, 2), 'utf8');
+  };
+  const runGit = (...args) =>
+    execFileSync('git', args, { cwd: project, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+
+  // Initial commit before Wave 0: only kodo.config.json (architecture.enabled = true), no Cargo.toml, no policy.
+  runGit('init');
+  runGit('config', 'user.email', 'test@example.com');
+  runGit('config', 'user.name', 'Test');
+  await put('kodo.config.json', { client: 'codex', architecture: { enabled: true } });
+  runGit('add', '-A');
+  runGit('commit', '-m', 'initial');
+  const base0 = runGit('rev-parse', 'HEAD');
+
+  // Wave 0: creates Cargo.toml with members = ["crates/*"], contract crate only,
+  // and architecture.policy.json listing ALL planned module crates in layers.
+  await put('Cargo.toml', '[workspace]\nresolver = "2"\nmembers = ["crates/*"]\n');
+  await put(
+    'crates/game-contracts/Cargo.toml',
+    '[package]\nname = "game-contracts"\nversion = "0.1.0"\nedition = "2021"\n',
+  );
+  await put('crates/game-contracts/src/lib.rs', 'pub struct WorldId(pub u64);\n');
+  await put('architecture.policy.json', {
+    schemaVersion: 2,
+    version: 1,
+    language: 'rust',
+    productRoots: ['crates'],
+    layers: [
+      { id: 'contracts', crates: ['game-contracts'] },
+      { id: 'domain', crates: ['world', 'combat'] },
+      { id: 'app', crates: ['game-cli'] },
+    ],
+    cycles: 'forbid',
+    allowedExternalCrates: ['serde'],
+    allowedDevExternalCrates: [],
+    contractCrates: ['game-contracts'],
+    baseline: [],
+    exceptions: [],
+    protectedPaths: ['architecture.policy.json'],
+  });
+  runGit('add', '-A');
+  runGit('commit', '-m', 'wave 0: contracts and full layers policy');
+  const wave0Head = runGit('rev-parse', 'HEAD');
+
+  const wave0Receipt = await runArchitectureChecks({
+    cwd: project,
+    baseSha: base0,
+    headSha: wave0Head,
+    config: { enabled: true },
+    artifacts,
+    taskPaths: [
+      'Cargo.toml',
+      'crates/game-contracts/Cargo.toml',
+      'crates/game-contracts/src/**',
+      'architecture.policy.json',
+    ],
+  });
+  assert.equal(wave0Receipt.status, 'passed', `Wave 0 failed: ${JSON.stringify(wave0Receipt.report)}`);
+  assert.equal(wave0Receipt.passed, true);
+
+  // Wave 1: ordinary task adds crates/world without touching Cargo.toml or architecture.policy.json -> PASS.
+  await put(
+    'crates/world/Cargo.toml',
+    '[package]\nname = "world"\nversion = "0.1.0"\nedition = "2021"\n[dependencies]\ngame-contracts = { path = "../game-contracts" }\n',
+  );
+  await put('crates/world/src/lib.rs', 'pub use game_contracts::WorldId;\n');
+  runGit('add', '-A');
+  runGit('commit', '-m', 'wave 1: add crates/world');
+  const wave1Head = runGit('rev-parse', 'HEAD');
+
+  const wave1Receipt = await runArchitectureChecks({
+    cwd: project,
+    baseSha: wave0Head,
+    headSha: wave1Head,
+    config: { enabled: true },
+    artifacts,
+    taskPaths: ['crates/world/**'],
+  });
+  assert.equal(wave1Receipt.status, 'passed', `Wave 1 failed: ${JSON.stringify(wave1Receipt.report)}`);
+  assert.equal(wave1Receipt.passed, true);
+  assert.equal(wave1Receipt.requiresReview, false);
+
+  // Ordinary task edits protected contract crate -> blocked with contract_change_not_allowed.
+  await put('crates/game-contracts/src/lib.rs', 'pub struct WorldId(pub u128);\n');
+  runGit('add', '-A');
+  runGit('commit', '-m', 'contract change');
+  const contractEditHead = runGit('rev-parse', 'HEAD');
+
+  const ordinaryReceipt = await runArchitectureChecks({
+    cwd: project,
+    baseSha: wave1Head,
+    headSha: contractEditHead,
+    config: { enabled: true },
+    artifacts,
+    taskPaths: ['crates/world/**'],
+  });
+  assert.equal(ordinaryReceipt.status, 'failed');
+  assert.ok(ordinaryReceipt.report.findings.some(f => f.ruleId === 'contract_change_not_allowed'));
+
+  // Explicit contract migration task -> PASS with requiresReview = true & fullVerificationRequired = true.
+  const migrationReceipt = await runArchitectureChecks({
+    cwd: project,
+    baseSha: wave1Head,
+    headSha: contractEditHead,
+    config: { enabled: true },
+    artifacts,
+    taskPaths: ['crates/game-contracts/**'],
+  });
+  assert.equal(migrationReceipt.status, 'passed', `Migration failed: ${JSON.stringify(migrationReceipt.report)}`);
+  assert.equal(migrationReceipt.passed, true);
+  assert.equal(migrationReceipt.requiresReview, true);
+  assert.equal(migrationReceipt.fullVerificationRequired, true);
 });
