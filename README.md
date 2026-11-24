@@ -14,7 +14,7 @@ kodo init
 kodo doctor --json
 ```
 
-Если npm запрещает удалённые архивы (`EALLOWREMOTE`), скачай файл релиза, сверь SHA-256 с `SHA256SUMS` и установи его локально: `gh release download v1.0.1 -R Zulut30/Kodo`, затем `npm install -g .zulut30-kodo-1.0.1.tgz`.
+Если npm запрещает удалённые архивы (`EALLOWREMOTE`), скачай файл релиза, сверь SHA-256 с `SHA256SUMS` и установи его локально: `gh release download v1.0.1 -R Zulut30/Kodo`, затем `npm install -g ./zulut30-kodo-1.0.1.tgz`.
 
 `kodo init` включает [все 13 стандартных навыков](docs/DEFAULT-SKILLS.md) для Codex, Claude Code и OpenCode. Они также входят во все пресеты. Движок рассматривает их на каждом этапе; React/Next.js и monorepo-рекомендации применяются к соответствующим проектам.
 
