@@ -1,6 +1,7 @@
 import path from 'node:path';
 import { parse } from 'smol-toml';
 import { execute } from './command.mjs';
+import { rustSourcePaths } from './rust-source-paths.mjs';
 
 const posix = path.posix;
 const folder = name => (posix.dirname(name) === '.' ? '' : posix.dirname(name));
@@ -12,7 +13,9 @@ const normalized = dir =>
     .replace(/^\.$/, '');
 const matches = (dir, patterns = []) =>
   patterns.some(pattern => dir === normalized(pattern) || posix.matchesGlob(dir, normalized(pattern)));
-const inDirectory = (dir, file) => !dir || file === dir || file.startsWith(dir + '/');
+const pathKey = file => (process.platform === 'win32' ? file.toLowerCase() : file);
+const inDirectory = (dir, file) =>
+  !dir || pathKey(file) === pathKey(dir) || pathKey(file).startsWith(pathKey(dir) + '/');
 function ancestors(dir) {
   const parts = dir.split('/');
   return parts.map((_, i) => parts.slice(0, i + 1).join('/'));
@@ -90,28 +93,6 @@ function sourceOwner(file, dirs, members) {
   return standard || targetPaths(members.get(dir)).includes(local) ? dir : null;
 }
 
-// A dynamic expression, escape sequence, or unfamiliar spelling cannot prove confinement.
-function hiddenSourcePath(text, file, dir, dirs) {
-  for (const match of text.matchAll(/\b(include(?:_bytes|_str)?|path)\b/g)) {
-    const rest = text.slice(match.index + match[0].length);
-    const attribute = match[0] === 'path';
-    if (!/^\s*(?:!|=|\/[*/])/.test(rest)) continue;
-    const prefix = attribute ? /^\s*=\s*/ : /^\s*!\s*[(\[{]\s*/;
-    const start = prefix.exec(rest);
-    if (!start) return true;
-    const value = /^(?:"([^"\\]*)"|r(#*)"([^"]*)"\2)/.exec(rest.slice(start[0].length));
-    if (!value) return true;
-    const relative = value[1] ?? value[3];
-    if (relative.includes('\\') || posix.isAbsolute(relative) || /^[A-Za-z]:/.test(relative)) return true;
-    // Attribute paths may be relative to an enclosing inline module or a #[path] module.
-    if (attribute && relative.split('/').includes('..')) return true;
-    if ((attribute || match[0] === 'include') && !relative.endsWith('.rs')) return true;
-    const resolved = normalized(posix.join(folder(file), relative));
-    if (outside(resolved) || dirs.find(candidate => inDirectory(candidate, resolved)) !== dir) return true;
-  }
-  return false;
-}
-
 function extraTargetFiles(members) {
   const files = new Set();
   for (const [dir, doc] of members)
@@ -119,38 +100,100 @@ function extraTargetFiles(members) {
   return files;
 }
 
-function hiddenEdge(members, owners, snapshot, dirs) {
-  const extraTargets = extraTargetFiles(members);
-  for (const [dir, doc] of members) {
+// Resolve paths relative to the source containing the macro. Module attributes
+// have a second, lexical base inside inline modules, so uncertain paths widen.
+function sourceInputs(file, dir, refs, { dirs, members, changed, links, selected }) {
+  for (const { kind, value } of refs) {
+    if (!value || value.includes('\\') || posix.isAbsolute(value) || /^[A-Za-z]:/.test(value))
+      return 'cargo-source-path';
     if (
-      targetPaths(doc).some(
-        name => outside(name) || dirs.find(candidate => inDirectory(candidate, posix.join(dir, name))) !== dir,
-      )
+      kind === 'path' &&
+      (value.split('/').includes('..') || dirs.some(other => other !== dir && inDirectory(dir, other)))
     )
-      return 'cargo-external-target';
-    const script = doc.package.build;
-    if (
-      (typeof script === 'string' || (script !== false && snapshot.sources.has(posix.join(dir, 'build.rs')))) &&
-      [...owners].some(owner => owner !== dir)
-    )
-      return 'cargo-build-script-input';
+      return 'cargo-source-path';
+    let resolved = folder(file);
+    for (const component of value.split('/')) {
+      resolved = normalized(posix.join(resolved, component));
+      if (links.has(pathKey(resolved))) return 'cargo-linked-input';
+      if (resolved === '..' || resolved.startsWith('../')) return 'cargo-source-path';
+    }
+    if (outside(resolved)) return 'cargo-source-path';
+    const targetDir = dirs.find(candidate => inDirectory(candidate, resolved));
+    if (targetDir !== dir && (targetDir !== undefined || resolved.endsWith('.rs'))) return 'cargo-source-path';
+    if (kind === 'path' && !resolved.endsWith('.rs')) return 'cargo-source-path';
+    if (changed.has(pathKey(resolved))) {
+      if (!members.has(dir)) return 'cargo-source-path';
+      selected.add(dir);
+    }
   }
-  for (const { mode } of snapshot.entries) if (mode === '120000') return 'cargo-linked-input';
+  return null;
+}
+
+function cargoLink(link, members, declaredTargets, workspace) {
+  if ([...members.keys()].some(dir => dir && inDirectory(dir, link))) return true;
+  if (members.has('') && /^(?:src|tests|benches|examples)(?:\/|$)|^build\.rs$/.test(link)) return true;
+  if (
+    link === '.cargo' ||
+    (shared(link) && (folder(link) === '' || link.startsWith('.cargo/') || matches(folder(link), workspace?.members)))
+  )
+    return true;
+  if (declaredTargets.some(target => target && inDirectory(link, target))) return true;
+  if (ancestors(link).some(dir => matches(dir, workspace?.exclude))) return false;
+  const patterns = workspace?.members ?? [];
+  return patterns.some(pattern => matches(link, ancestors(normalized(pattern))));
+}
+
+function hiddenEdge(members, selected, snapshot, dirs, changed, buildScripts, root, links) {
+  const extraTargets = extraTargetFiles(members);
+  const declaredTargets = [...members.keys()];
+  for (const [dir, doc] of members) {
+    for (const name of targetPaths(doc)) {
+      const target = posix.join(dir, name);
+      if (outside(name) || dirs.find(candidate => inDirectory(candidate, target)) !== dir)
+        return 'cargo-external-target';
+      declaredTargets.push(target);
+    }
+    const script = doc.package.build;
+    if (typeof script === 'string' || (script !== false && snapshot.sources.has(posix.join(dir, 'build.rs'))))
+      buildScripts.add(dir);
+  }
+  if (links.some(link => cargoLink(link, members, declaredTargets, root?.workspace))) return 'cargo-linked-input';
+  const context = { dirs, members, changed, links: new Set(links.map(pathKey)), selected };
+  const visited = new Set();
+  function inspect(file, dir) {
+    const key = JSON.stringify([file, dir]);
+    if (visited.has(key)) return null;
+    visited.add(key);
+    const text = snapshot.sources.get(file);
+    if (text === undefined) return 'cargo-source-path';
+    const refs = snapshot.references?.get(file) ?? rustSourcePaths(text);
+    const reason = sourceInputs(file, dir, refs, context);
+    if (reason) return reason;
+    for (const { kind, value } of refs)
+      if (kind === 'include') {
+        const reason = inspect(normalized(posix.join(folder(file), value)), dir);
+        if (reason) return reason;
+      }
+    return null;
+  }
   for (const [file, text] of snapshot.sources) {
     if (/(?:^|\/)\.cargo\/config[^/]*$/.test(file)) {
       const config = parse(text);
       if (config.patch || config.source || config.paths || config.include) return 'cargo-config-dependencies';
     }
     if (file.endsWith('.rs') || extraTargets.has(file)) {
-      const dir = dirs.find(candidate => inDirectory(candidate, file));
-      if (dir === undefined || hiddenSourcePath(text, file, dir, dirs)) return 'cargo-source-path';
+      const reason = inspect(
+        file,
+        dirs.find(candidate => inDirectory(candidate, file)),
+      );
+      if (reason) return reason;
     }
   }
   return null;
 }
-
 function packageSpec(doc, root) {
-  const version = doc.package.version?.workspace === true ? root?.workspace?.package?.version : doc.package.version;
+  const version =
+    doc.package.version?.workspace === true ? root?.workspace?.package?.version : (doc.package.version ?? '0.0.0');
   return typeof version === 'string' && /^\d+\.\d+\.\d+(?:-[\w.-]+)?(?:\+[\w.-]+)?$/.test(version)
     ? doc.package.name + '@' + version
     : null;
@@ -172,16 +215,32 @@ export function affectedCrates(documents, changed, snapshot = { entries: [], sou
   const dirs = [...documents.keys()]
     .filter(file => posix.basename(file) === 'Cargo.toml')
     .map(folder)
+    .filter(dir => dir || root?.package)
     .sort((a, b) => b.length - a.length);
   const selected = new Set();
+  const links = snapshot.entries.filter(entry => entry.mode === '120000').map(entry => entry.file);
   for (const file of changed) {
+    // Cargo links are classified against manifests and literal paths below.
+    if (links.includes(file)) continue;
     if (shared(file)) return full('cargo-workspace-input');
     const owner = sourceOwner(file, dirs, members);
-    if (owner === null) return full('cargo-unowned-input');
-    selected.add(owner);
+    if (owner !== null) selected.add(owner);
+    else if (file.endsWith('.rs') || dirs.some(dir => inDirectory(dir, file))) return full('cargo-unowned-input');
   }
-  const reason = hiddenEdge(members, selected, snapshot, dirs);
+  const buildScripts = new Set();
+  const reason = hiddenEdge(
+    members,
+    selected,
+    snapshot,
+    dirs,
+    new Set(changed.map(pathKey)),
+    buildScripts,
+    root,
+    links,
+  );
   if (reason) return full(reason);
+  const reasons = [...buildScripts].some(dir => !selected.has(dir)) ? ['cargo-build-script-input'] : [];
+  for (const dir of buildScripts) selected.add(dir);
   const consumers = new Map();
   for (const [dir, doc] of members)
     for (const dep of dependencies(doc, root, dir, '')) {
@@ -206,7 +265,8 @@ export function affectedCrates(documents, changed, snapshot = { entries: [], sou
     )
   )
     return full('cargo-ambiguous-package');
-  return { affectedCrates: packages.map(doc => doc.package.name), packageSpecs, fallback: false, reasons: [] };
+  if (!packages.length) reasons.push('cargo-no-affected-crates');
+  return { affectedCrates: packages.map(doc => doc.package.name), packageSpecs, fallback: false, reasons };
 }
 
 // Read manifest blobs at the submitted commit. A rename contributes both paths.
@@ -234,5 +294,29 @@ export async function cargoPlanAt(cwd, baseSha, headSha) {
     const targets = await readSourceSnapshot(cwd, headSha, file => extra.has(file));
     for (const [file, text] of targets.sources) snapshot.sources.set(file, text);
   }
-  return { changed, ...affectedCrates(docs, changed, snapshot) };
+  // An include! fragment can itself read files. Read only such source blobs,
+  // never arbitrary include_bytes! assets, and keep the submitting crate as owner.
+  const references = new Map();
+  let pending = [...snapshot.sources.keys()].filter(file => file.endsWith('.rs') || extra.has(file));
+  while (pending.length) {
+    const fragments = new Set();
+    for (const file of pending) {
+      const refs = rustSourcePaths(snapshot.sources.get(file));
+      references.set(file, refs);
+      for (const { kind, value } of refs)
+        if (kind === 'include' && value && !outside(normalized(posix.join(folder(file), value)))) {
+          const target = normalized(posix.join(folder(file), value));
+          if (!snapshot.sources.has(target)) fragments.add(target);
+        }
+    }
+    if (!fragments.size) break;
+    const more = await readSourceSnapshot(cwd, headSha, file => fragments.has(file));
+    pending = [...more.sources.keys()];
+    for (const [file, text] of more.sources) snapshot.sources.set(file, text);
+  }
+  const scope = affectedCrates(docs, changed, { ...snapshot, references });
+  const unrelatedLinks = scope.fallback
+    ? []
+    : snapshot.entries.filter(entry => entry.mode === '120000').map(entry => entry.file);
+  return { changed, ...scope, unrelatedLinks };
 }

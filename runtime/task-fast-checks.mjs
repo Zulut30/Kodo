@@ -19,6 +19,7 @@ import { git } from './workspace.mjs';
 import { FAST_CHECK_TIMEOUT_MS, fastCheckTimeout, validateCommandTimeouts } from './config.mjs';
 import { stateHome, workerEnvironment } from './security.mjs';
 import { inspectCurrentSource, planAffected } from './ci-graph.mjs';
+import { cargoFetchError, cargoLockFailure, cargoOfflineMiss, warmCargoDependencies } from './cargo-fetch.mjs';
 import { cacheFingerprint, readCheckCache, writeCheckCache } from './ci-cache.mjs';
 
 export const TASK_FAST_PROFILE = 'task-fast';
@@ -712,10 +713,21 @@ const cargoCommand = step => {
   const name = path.basename(step.command);
   return process.platform === 'win32' ? /^cargo(?:\.exe)?$/i.test(name) : name === 'cargo';
 };
-const plainCargo = step =>
-  cargoCommand(step) &&
-  step.args[0] === 'test' &&
-  (step.args.length === 1 || (step.args.length === 2 && step.args[1] === '--workspace'));
+const cargoToolchain = step => (step.args?.[0]?.startsWith('+') ? step.args[0] : undefined);
+const cargoInvocation = step => JSON.stringify([step.command, cargoToolchain(step)]);
+function plainCargo(step) {
+  if (!cargoCommand(step)) return false;
+  const args = step.args ?? [];
+  const index = cargoToolchain(step) ? 1 : 0;
+  return args[index] === 'test' && args.slice(index + 1).every(arg => arg === '--workspace' || arg === '--locked');
+}
+function selectCargoPackages(step, selector) {
+  if (!plainCargo(step)) return step;
+  const toolchain = cargoToolchain(step);
+  const prefix = toolchain ? [toolchain] : [];
+  if (selector.length) return { ...step, args: [...prefix, 'test', ...selector, '--locked'] };
+  return { ...step, kind: 'metadata', args: [...prefix, 'metadata', '--locked', '--no-deps', '--format-version', '1'] };
+}
 async function rustFastPlan({ run, cwd, baseSha, headSha, configured }) {
   const manifest = await lstat(path.join(cwd, 'Cargo.toml')).catch(() => null);
   if (!manifest?.isFile() && !manifest?.isSymbolicLink()) return null;
@@ -738,13 +750,14 @@ async function rustFastPlan({ run, cwd, baseSha, headSha, configured }) {
     graph = { changed: [], affectedCrates: [], fallback: true, reasons: ['cargo-graph-error'] };
   }
   const selector = graph.fallback ? ['--workspace'] : graph.packageSpecs.flatMap(spec => ['-p', spec]);
-  const commands = fullCommands(selected, timeoutMs).map(step =>
-    plainCargo(step) ? { ...step, args: ['test', ...selector] } : step,
-  );
+  const commands = fullCommands(selected, timeoutMs).map(step => selectCargoPackages(step, selector));
   return {
     schemaVersion: 1,
     profile: TASK_FAST_PROFILE,
     rust: true,
+    ...(graph.unrelatedLinks?.length && selected.every(plainCargo)
+      ? { unrelatedCargoLinks: graph.unrelatedLinks }
+      : {}),
     baseSha,
     headSha,
     changed: graph.changed.slice(0, LIST_LIMIT),
@@ -824,8 +837,15 @@ export function fastEnvironment() {
   return env;
 }
 
-async function assertClean(cwd, headSha, message) {
-  if ((await inspectCurrentSource({ project: cwd, headSha })) !== 'clean') throw fail(message, 'dirty_worktree');
+async function assertClean(cwd, headSha, message, unrelatedCargoLinks = undefined) {
+  if (
+    (await inspectCurrentSource({
+      project: cwd,
+      headSha,
+      unrelatedCargoLinks: unrelatedCargoLinks && new Set(unrelatedCargoLinks),
+    })) !== 'clean'
+  )
+    throw fail(message, 'dirty_worktree');
 }
 
 /** The freshly observed command context for the private cache. Unknown context means no cache. */
@@ -911,7 +931,7 @@ const rowBase = step => ({ kind: step.kind, command: step.command, args: step.ar
  * (countNpmScript): the row adds `countVersion` and `count`, the log `count` with `testEvents`, and a
  * confirmed zero fails the check (`fast_check_no_tests`).
  */
-async function runStep({ engine, run, step, headSha, env, cache, counting, signal }) {
+async function runStep({ engine, run, step, headSha, env, cache, counting, signal, unrelatedCargoLinks }) {
   const base = rowBase(step);
   const input =
     cache && step.kind === 'test'
@@ -980,14 +1000,17 @@ async function runStep({ engine, run, step, headSha, env, cache, counting, signa
       ),
     };
   }
-  await assertClean(run.cwd, headSha, 'Команда проверки изменила проверяемый commit или файлы');
+  await assertClean(run.cwd, headSha, 'Команда проверки изменила проверяемый commit или файлы', unrelatedCargoLinks);
   if (result.code !== 0)
     return {
       row,
-      error: fail(
-        `Проверка ${step.kind} не пройдена (exit ${result.code}): ${(value.stdout + value.stderr).slice(-6000)}`,
-        'check_failed',
-      ),
+      cargoOfflineMiss: cargoCommand(step) && cargoOfflineMiss(value.stderr),
+      error:
+        (cargoCommand(step) ? cargoLockFailure(value.stderr) : null) ??
+        fail(
+          `Проверка ${step.kind} не пройдена (exit ${result.code}): ${(value.stdout + value.stderr).slice(-6000)}`,
+          'check_failed',
+        ),
     };
   if (npm?.error?.code === 'cancelled') return { row, error: npm.error };
   // npm passed, but its plain `node --test` passed no test by Kodo's events: not a pass. A counting run
@@ -1031,7 +1054,7 @@ export function fullFastFallback(run, plan) {
   const timeoutMs = fastCheckTimeout(run, plan.rust ? 600000 : FAST_CHECK_TIMEOUT_MS);
   const configured = run.config.commands.test || [];
   const commands = fullCommands(configured, timeoutMs).map(step =>
-    plan.rust && plainCargo(step) ? { ...step, args: ['test', '--workspace'] } : step,
+    plan.rust ? selectCargoPackages(step, ['--workspace']) : step,
   );
   return { ...plan, affected: [], testFiles: [], fallback: true, reasons: ['no-tests-executed'], commands };
 }
@@ -1046,8 +1069,13 @@ export async function runFastChecks({ engine, run, signal, maxHeavyBuilds = 1 })
   validateCommandTimeouts(run.config.commands);
   await engine.setup(run.cwd, run, signal);
   const headSha = await git(run.cwd, ['rev-parse', 'HEAD']);
-  await assertClean(run.cwd, headSha, 'Проверка commit требует чистого integration worktree');
   let plan = await planFastChecks({ run, cwd: run.cwd, baseSha: run.baseSha, headSha });
+  await assertClean(
+    run.cwd,
+    headSha,
+    'Проверка commit требует чистого integration worktree',
+    'unrelatedCargoLinks' in plan ? plan.unrelatedCargoLinks : undefined,
+  );
   if (!plan.commands.length) throw new Error('Не настроена команда проверки результата');
   let outcome = await executePlan({ engine, run, plan, headSha, signal, maxHeavyBuilds });
   if (outcome.noTests) {
@@ -1135,19 +1163,30 @@ async function executePlanSteps({ engine, run, plan, headSha, signal }, env) {
     results,
   };
   engine.save(run);
+  const refreshers = new Map();
   if (plan.rust) {
-    const { warmCargoDependencies } = await import('./cargo-fetch.mjs');
-    const step = plan.commands.find(cargoCommand);
-    await warmCargoDependencies({
-      home: engine.store.home,
-      cwd: run.cwd,
-      command: step.command,
-      env,
-      signal,
-      timeoutMs: step.timeoutMs,
-      secrets: engine.secrets,
-    });
-    await assertClean(run.cwd, headSha, 'После cargo fetch изменились проверяемые файлы или HEAD');
+    for (const step of plan.commands.filter(cargoCommand)) {
+      const key = cargoInvocation(step);
+      if (refreshers.has(key)) continue;
+      const refresh = await warmCargoDependencies({
+        headSha,
+        home: engine.store.home,
+        cwd: run.cwd,
+        command: step.command,
+        toolchain: cargoToolchain(step),
+        env,
+        signal,
+        timeoutMs: step.timeoutMs,
+        secrets: engine.secrets,
+      });
+      refreshers.set(key, refresh);
+    }
+    await assertClean(
+      run.cwd,
+      headSha,
+      'После cargo fetch изменились проверяемые файлы или HEAD',
+      plan.unrelatedCargoLinks,
+    );
   }
   const cache = plan.rust || plan.fallback ? null : await cacheContext(run, plan, headSha, env);
   const tests = plan.commands.filter(step => step.kind === 'test');
@@ -1161,16 +1200,36 @@ async function executePlanSteps({ engine, run, plan, headSha, signal }, env) {
   for (const [index, step] of plan.commands.entries()) {
     engine.checkCancelled(run, signal);
     const counting = plans[index];
-    const { row, error, noTests, unknown } = await runStep({
-      engine,
-      run,
-      step,
-      headSha,
-      env,
-      cache,
-      counting,
-      signal,
-    });
+    const executeStep = () =>
+      runStep({
+        unrelatedCargoLinks: plan.unrelatedCargoLinks,
+        engine,
+        run,
+        step,
+        headSha,
+        env,
+        cache,
+        counting,
+        signal,
+      });
+    let outcome = await executeStep();
+    if (outcome.cargoOfflineMiss && refreshers.has(cargoInvocation(step))) {
+      const first = outcome.row;
+      results.push(first);
+      engine.save(run);
+      await refreshers.get(cargoInvocation(step))();
+      await assertClean(
+        run.cwd,
+        headSha,
+        'После повторного cargo fetch изменились проверяемые файлы или HEAD',
+        plan.unrelatedCargoLinks,
+      );
+      outcome = await executeStep();
+      results.pop();
+      Object.assign(outcome.row, { previousAttempt: first.evidence });
+      if (outcome.cargoOfflineMiss) outcome.error = cargoFetchError(outcome.error.message);
+    }
+    const { row, error, noTests, unknown } = outcome;
     results.push(row);
     engine.save(run);
     if (error) throw error;

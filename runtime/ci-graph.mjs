@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { lstat, open, realpath } from 'node:fs/promises';
+import { lstat, open, realpath, readlink } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { isBuiltin } from 'node:module';
 import { inspectJavaScriptModule } from './javascript-dependencies.mjs';
@@ -153,8 +153,35 @@ export async function inspectCurrentSource(input = {}) {
     const entries = treeObservation.value.split('\0').filter(Boolean);
     if (!entries.length || entries.length > 50000) return 'unknown';
     let total = 0;
+    let checkoutUsesSymlinks;
+    const gitHash = data =>
+      createHash(headSha.length === 40 ? 'sha1' : 'sha256')
+        .update(`blob ${data.length}\0`)
+        .update(data)
+        .digest('hex');
+    const matchesBlob = (bytes, mode, oid) => {
+      if (gitHash(bytes) === oid) return true;
+      if (mode === '120000') return false;
+      // Match CRLF checkout bytes without invoking project-defined filters.
+      const text = bytes.toString('utf8');
+      return Buffer.from(text).equals(bytes) && gitHash(Buffer.from(text.replaceAll('\r\n', '\n'))) === oid;
+    };
+    const inspectLink = async (file, name, oid) => {
+      if (!input.unrelatedCargoLinks?.has(name)) return 'unknown';
+      await noLinks(path.dirname(file));
+      checkoutUsesSymlinks ??=
+        (await git(project, ['config', '--type=bool', '--default=true', '--get', 'core.symlinks'])).trim() === 'true';
+      const isLink = (await lstat(file)).isSymbolicLink();
+      if (isLink !== checkoutUsesSymlinks) return 'dirty';
+      if (isLink) {
+        const target = await readlink(file, { encoding: 'buffer' });
+        return gitHash(target) === oid ? 'clean' : 'dirty';
+      }
+      // With core.symlinks=false verify the regular file containing the link text.
+      return 'regular';
+    };
     for (const entry of entries) {
-      const match = /^(100644|100755) blob ([a-f0-9]+)\t([\s\S]+)$/.exec(entry);
+      const match = /^(100644|100755|120000) blob ([a-f0-9]+)\t([\s\S]+)$/.exec(entry);
       if (!match || match[2].length !== headSha.length) return 'unknown';
       const [, mode, oid, name] = match;
       relative(name);
@@ -166,12 +193,18 @@ export async function inspectCurrentSource(input = {}) {
       )
         return 'unknown';
       const file = path.join(project, name);
+      if (mode === '120000') {
+        const result = await inspectLink(file, name, oid);
+        if (result === 'clean') continue;
+        if (result !== 'regular') return result;
+      }
       await noLinks(file);
       const info = await lstat(file);
       if (!info.isFile() || info.nlink !== 1) return 'unknown';
       total += info.size;
       if (info.size > 16 * 1024 ** 2 || total > 128 * 1024 ** 2) return 'unknown';
-      if (process.platform !== 'win32' && Boolean(info.mode & 0o111) !== (mode === '100755')) return 'dirty';
+      if (mode !== '120000' && process.platform !== 'win32' && Boolean(info.mode & 0o111) !== (mode === '100755'))
+        return 'dirty';
       // Read at most the observed size plus one byte. A growing/replaced file
       // cannot turn a bounded verification into an unbounded readFile().
       const handle = await open(file, 'r');
@@ -196,18 +229,7 @@ export async function inspectCurrentSource(input = {}) {
       } finally {
         await handle.close();
       }
-      const gitHash = data =>
-        createHash(headSha.length === 40 ? 'sha1' : 'sha256')
-          .update(`blob ${data.length}\0`)
-          .update(data)
-          .digest('hex');
-      if (gitHash(bytes) !== oid) {
-        // Match security-gates' normal CRLF checkout compatibility without
-        // invoking any project-defined clean/smudge filter or logging bytes.
-        const text = bytes.toString('utf8');
-        if (!Buffer.from(text).equals(bytes) || gitHash(Buffer.from(text.replaceAll('\r\n', '\n'))) !== oid)
-          return 'dirty';
-      }
+      if (!matchesBlob(bytes, mode, oid)) return 'dirty';
     }
     return (await state()) ? 'dirty' : 'clean';
   } catch {

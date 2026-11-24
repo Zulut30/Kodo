@@ -90,6 +90,7 @@ test('task-fast plans transitive consumers, workspace inputs and Rust timeouts',
       assert.equal(plan.commands.length, 1);
       const [kind, ...args] = plan.commands[0].args;
       assert.equal(kind, 'test');
+      assert.equal(args.pop(), '--locked');
       if (specs) {
         assert.deepEqual(
           args.filter((_, i) => i % 2 === 0),
@@ -184,7 +185,7 @@ test('task-fast executes the crate plan with a warm target through a fake cargo 
     assert.deepEqual(checks.plan.affectedCrates, ['app']);
     assert.deepEqual(
       logs.map(row => JSON.parse(row.stdout)),
-      [{ args: ['-p', 'app@0.1.0'], target, offline: 'true' }],
+      [{ args: ['-p', 'app@0.1.0', '--locked'], target, offline: 'true' }],
     );
   }
   assert.deepEqual(
@@ -300,7 +301,7 @@ for (const [name, contents] of [
     const base = await git(project, ['rev-parse', 'HEAD']);
     if (name === 'manifest-link') {
       const oid = await git(project, ['rev-parse', 'HEAD:Cargo.toml']);
-      await git(project, ['update-index', '--add', '--cacheinfo', '120000,' + oid + ',shadow/Cargo.toml']);
+      await git(project, ['update-index', '--add', '--cacheinfo', '120000,' + oid + ',crates/shadow/Cargo.toml']);
     }
     await put(project, 'crates/world/src/lib.rs', 'pub fn changed() {}');
     await git(project, ['add', 'crates/world/src/lib.rs']);
@@ -333,7 +334,20 @@ for (const [name, contents] of [
         'source',
       ]);
     }
-    assert.equal((await cargoPlanAt(project, from, await git(project, ['rev-parse', 'HEAD']))).fallback, true);
+    const plan = await cargoPlanAt(project, from, await git(project, ['rev-parse', 'HEAD']));
+    if (name === 'build-script') {
+      assert.equal(plan.fallback, false);
+      assert.deepEqual(plan.affectedCrates.sort(), ['app', 'world']);
+      assert.deepEqual(plan.reasons, ['cargo-build-script-input']);
+    } else {
+      const expected = {
+        patch: 'cargo-config-dependencies',
+        source: 'cargo-config-dependencies',
+        'manifest-link': 'cargo-linked-input',
+      };
+      assert.equal(plan.fallback, true);
+      assert.deepEqual(plan.reasons, [expected[name] ?? 'cargo-source-path']);
+    }
   });
 }
 test('Cargo membership stops at excludes and nested workspace roots', async () => {
@@ -387,7 +401,7 @@ test('Rust selectors distinguish a registry dependency with the same name', asyn
   });
   assert.deepEqual(
     plan.commands.map(c => c.args),
-    [['test', '-p', 'config@2.0.0']],
+    [['test', '-p', 'config@2.0.0', '--locked']],
   );
 });
 test('optional Rust settings validate without adding absent policy keys', async () => {
@@ -414,7 +428,7 @@ test('Rust noTests fallback keeps the Rust default and explicit limit', async ()
     const plan = fullFastFallback(run, { rust: true });
     assert.deepEqual(
       plan.commands.map(c => [c.args, c.timeoutMs]),
-      [[['test', '--workspace'], timeout ?? 600000]],
+      [[['test', '--workspace', '--locked'], timeout ?? 600000]],
     );
   }
 });
