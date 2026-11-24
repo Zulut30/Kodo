@@ -331,11 +331,12 @@ export async function isCurrentArchitectureReceipt(
     config = normalizeArchitectureConfig(config);
     if (!config.enabled) return true; // Neutral, never an enabled PASS.
     const expectedTaskPaths = normalizeTaskPaths(taskPaths);
-    const actualTaskPaths = receipt?.taskPaths === undefined ? [] : normalizeTaskPaths(receipt.taskPaths);
-    const allowedTaskPaths = expectedTaskPaths ?? [];
-    // A receipt produced without taskPaths ran under the strictest contract-protection mode;
-    // any path granted during the check must remain authorized by the caller's expectedTaskPaths.
-    if (actualTaskPaths.some(item => !allowedTaskPaths.includes(item))) return false;
+    if (expectedTaskPaths !== undefined) {
+      const actualTaskPaths = receipt?.taskPaths === undefined ? [] : normalizeTaskPaths(receipt.taskPaths);
+      // A receipt produced without taskPaths ran under the strictest contract-protection mode;
+      // any path granted during the check must remain authorized by the caller's expectedTaskPaths.
+      if (actualTaskPaths.some(item => !expectedTaskPaths.includes(item))) return false;
+    }
     if (
       receipt?.schemaVersion !== 1 ||
       receipt.status !== 'passed' ||

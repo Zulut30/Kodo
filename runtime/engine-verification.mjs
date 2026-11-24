@@ -201,7 +201,7 @@ const reusableChecks = (run, headSha, fingerprint, expected, plans) =>
 function planTaskPaths(run) {
   return Array.isArray(run.plan?.tasks)
     ? run.plan.tasks.flatMap(task => (Array.isArray(task.writePaths) ? task.writePaths : []))
-    : undefined;
+    : [];
 }
 
 function reviewArchitectureNotice(run) {

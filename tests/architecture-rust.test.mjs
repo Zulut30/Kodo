@@ -1239,7 +1239,7 @@ test('E8: disabled gate ignores invalid taskPaths, normalizes ./ in taskPaths, e
     await isCurrentArchitectureReceipt(receipt, { ...dotSlashOpts, taskPaths: ['crates/game-contracts'] }),
     true,
   );
-  assert.equal(await isCurrentArchitectureReceipt(receipt, { ...dotSlashOpts, taskPaths: undefined }), false);
+  assert.equal(await isCurrentArchitectureReceipt(receipt, { ...dotSlashOpts, taskPaths: [] }), false);
   assert.equal(await isCurrentArchitectureReceipt(receipt, { ...dotSlashOpts, taskPaths: ['crates/world'] }), false);
 
   // 3) Engine passes run.plan.tasks[].writePaths to runArchitectureChecks & isCurrentArchitectureReceipt,
