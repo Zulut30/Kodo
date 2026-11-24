@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { buildDiagnosticPack, formatDiagnosticPack } from '../runtime/diagnostic-pack.mjs';
+import { buildDiagnosticPack, formatDiagnosticPack, hasStructuredDiagnostics } from '../runtime/diagnostic-pack.mjs';
 
 const fixturesDir = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures', 'diagnostics');
 
@@ -129,4 +129,32 @@ test('diagnostic-pack parses Kodo gate failures, redacts secrets, and enforces m
   const rendered = formatDiagnosticPack(pack);
   assert.doesNotMatch(rendered, /sk-super-secret-value-987654321/);
   assert.match(rendered, /truncated|omitted/i);
+});
+
+test('diagnostic-pack preserves review fix and does not treat a single generic check_failed as structured diagnostics', () => {
+  const reviewPack = buildDiagnosticPack({
+    review: {
+      passed: false,
+      findings: [
+        {
+          file: 'src/api.mjs',
+          severity: 'major',
+          problem: 'Missing null guard on payload',
+          fix: 'Return 400 when payload is null',
+        },
+      ],
+    },
+  });
+  assert.equal(hasStructuredDiagnostics(reviewPack), true);
+  assert.equal(reviewPack.items[0].fix, 'Return 400 when payload is null');
+  assert.match(formatDiagnosticPack(reviewPack), /Return 400 when payload is null/);
+
+  const pytestLog = `${'collected item ...\n'.repeat(200)}FAILED tests/test_math.py::test_sum\nE       assert 2 == 1\n`;
+  const genericPack = buildDiagnosticPack({
+    stdout: pytestLog,
+    error: Object.assign(new Error(`Проверка test не пройдена (exit 1): ${pytestLog.slice(-6000)}`), {
+      code: 'check_failed',
+    }),
+  });
+  assert.equal(hasStructuredDiagnostics(genericPack), false);
 });

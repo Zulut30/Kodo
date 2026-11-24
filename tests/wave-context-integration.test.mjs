@@ -15,6 +15,7 @@ import { completeTask, nextWave } from '../runtime/project-external.mjs';
 import { recordGateLesson } from '../runtime/wave-verifier.mjs';
 import { MAX_TASK_MODULES, MAX_TASK_WRITE_PATHS, compileBlueprint } from '../runtime/project-blueprint.mjs';
 import { buildContextManifest } from '../runtime/context-manifest.mjs';
+import { buildDiagnosticPack } from '../runtime/diagnostic-pack.mjs';
 
 const blueprintFixtures = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures', 'blueprint');
 
@@ -396,4 +397,145 @@ test('wave brief embeds mandatory API card via ContextManifest, attaches diagnos
   assert.ok(storage2Brief.verifiedLessons?.length === 1);
   assert.match(storage2Brief.prompt, /Keep storage helpers pure/);
   assert.match(storage2Brief.prompt, /export function deleteItem\(id\)/);
+});
+
+test('repairVerification preserves legacy 6000-char prompt outside waves and uses diagnostic pack + log tail inside waves', async t => {
+  const dir = await realpath(await mkdtemp(path.join(os.tmpdir(), 'kodo-15d-repair-')));
+  const project = path.join(dir, 'repo');
+  const home = path.join(dir, 'home');
+  await mkdir(project, { recursive: true });
+  git(project, 'init', '-b', 'main');
+  git(project, 'config', 'user.name', 'Test');
+  git(project, 'config', 'user.email', 'test@example.invalid');
+  const head = await commit(project, { 'src/app.mjs': 'export const ok = true;\n' }, 'init');
+
+  const store = new Store(home);
+  t.after(async () => {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  });
+  const prompts = [];
+  const engine = new Engine({
+    store,
+    provider: {
+      runSession: async req => {
+        prompts.push(req.prompt);
+        return { sessionId: `s-${prompts.length}`, output: { summary: 'fixed', checks: [], complete: true } };
+      },
+    },
+  });
+
+  const makeRun = (id, extra = {}) => {
+    const run = {
+      id,
+      project,
+      cwd: project,
+      client: 'codex',
+      artifacts: path.join(home, 'runs', id),
+      task: 'Fix module behavior',
+      state: 'verifying',
+      baseSha: head,
+      headSha: head,
+      models: [{ id: 'codex:gpt-6.1-sol', client: 'codex', model: 'gpt-6.1-sol', available: true }],
+      config: {
+        client: 'codex',
+        concurrency: 1,
+        repairRounds: 3,
+        researchBudget: 0,
+        commands: { test: [], build: [], deploy: [], smoke: [] },
+      },
+      plan: { tasks: [{ id: 't1', role: 'developer', writePaths: ['src/app.mjs'] }] },
+      verification: { attempt: 1, cycle: 1, pendingRepair: null },
+      ...extra,
+    };
+    store.createRun(run);
+    return run;
+  };
+
+  // 1. Ordinary (non-wave) run: keeps raw 6000-char problem including review findings JSON with fix, no Diagnostic pack wrapper.
+  const reviewFindingsJson = JSON.stringify([
+    {
+      file: 'src/app.mjs',
+      severity: 'major',
+      problem: 'Missing validation guard',
+      fix: 'Check input type before parsing',
+    },
+  ]);
+  const legacyRun = makeRun('repair-legacy', {
+    verification: {
+      attempt: 1,
+      cycle: 1,
+      pendingRepair: {
+        headSha: head,
+        researched: true,
+        problem: reviewFindingsJson,
+        diagnostics: buildDiagnosticPack({
+          review: {
+            passed: false,
+            findings: [
+              {
+                file: 'src/app.mjs',
+                severity: 'major',
+                problem: 'Missing validation guard',
+                fix: 'Check input type before parsing',
+              },
+            ],
+          },
+        }),
+      },
+    },
+  });
+  await engine.repairVerification(legacyRun);
+  assert.doesNotMatch(prompts[0], /Diagnostic pack/);
+  assert.ok(prompts[0].includes(reviewFindingsJson), 'legacy run must receive full review JSON with fix');
+
+  // 2. Wave run with pytest-like log ending in `assert 2 == 1` (only generic check_failed): must NOT use Diagnostic pack, must keep tail.
+  const pytestLog = `HEAD_NOISE_START\n${'collected item ...\n'.repeat(180)}FAILED tests/test_calc.py::test_add\nE       assert 2 == 1\n`;
+  const wavePytestRun = makeRun('repair-wave-pytest', {
+    verificationProfile: 'task-fast',
+    verification: {
+      attempt: 1,
+      cycle: 1,
+      pendingRepair: {
+        headSha: head,
+        researched: true,
+        problem: pytestLog,
+        diagnostics: buildDiagnosticPack({
+          stdout: pytestLog,
+          error: Object.assign(new Error(pytestLog.slice(-6000)), { code: 'check_failed' }),
+        }),
+      },
+    },
+  });
+  await engine.repairVerification(wavePytestRun);
+  assert.doesNotMatch(prompts[1], /Diagnostic pack/);
+  assert.match(prompts[1], /assert 2 == 1/);
+
+  // 3. Wave gate run with structured review finding + long log: uses Diagnostic pack with fix + log TAIL (not head).
+  const longProblem = `HEAD_MARKER_SHOULD_DROP\n${'x'.repeat(2500)}\nTAIL_MARKER_MUST_SURVIVE\n`;
+  const waveStructuredRun = makeRun('repair-wave-structured', {
+    directorBinding: { kind: 'gate', projectId: 'p', gateId: 'g', headSha: head },
+    verification: {
+      attempt: 1,
+      cycle: 1,
+      pendingRepair: {
+        headSha: head,
+        researched: true,
+        problem: longProblem,
+        diagnostics: buildDiagnosticPack({
+          review: {
+            passed: false,
+            findings: [
+              { file: 'src/app.mjs', severity: 'major', problem: 'Unchecked null', fix: 'Add explicit null check' },
+            ],
+          },
+        }),
+      },
+    },
+  });
+  await engine.repairVerification(waveStructuredRun);
+  assert.match(prompts[2], /Diagnostic pack/);
+  assert.match(prompts[2], /Add explicit null check/);
+  assert.match(prompts[2], /TAIL_MARKER_MUST_SURVIVE/);
+  assert.doesNotMatch(prompts[2], /HEAD_MARKER_SHOULD_DROP/);
 });

@@ -6,7 +6,7 @@ import { execute } from './command.mjs';
 import { git, commitChanges, diffHash } from './workspace.mjs';
 import { inspectCurrentSource } from './ci-graph.mjs';
 import { compactReviewEvidence } from './context-pack.mjs';
-import { buildDiagnosticPack, formatDiagnosticPack } from './diagnostic-pack.mjs';
+import { buildDiagnosticPack, formatDiagnosticPack, hasStructuredDiagnostics } from './diagnostic-pack.mjs';
 import { normalizeArchitectureConfig } from './architecture-gate.mjs';
 import {
   compareWithBaseline,
@@ -114,6 +114,9 @@ function reviewOf(contract, output) {
 const currentBaseline = run =>
   run.baseline?.status === 'complete' && run.baseline.headSha === run.baseSha ? run.baseline : null;
 
+/** Whether a run executes in wave mode (task-fast or wave gate). */
+const isWaveRun = run => run?.verificationProfile === TASK_FAST_PROFILE || run?.directorBinding?.kind === 'gate';
+
 /** The error of a failed check. Labelled against the baseline when one exists; still a failure. */
 function failedCheck(run, kind, result, comparison) {
   // Old defects are never ignored automatically: the label only tells which failure the change introduced.
@@ -124,12 +127,12 @@ function failedCheck(run, kind, result, comparison) {
       : classification === 'regression'
         ? '[regression: passed on the base commit] '
         : '';
-  const diagnostics = buildDiagnosticPack({ stdout: result.stdout, stderr: result.stderr });
+  const diagnostics = isWaveRun(run) ? buildDiagnosticPack({ stdout: result.stdout, stderr: result.stderr }) : null;
   return Object.assign(
     new Error(
       `Проверка ${kind} не пройдена (exit ${result.code}): ${label}${(result.stdout + result.stderr).slice(-6000)}`,
     ),
-    { code: 'check_failed', diagnostics, ...(classification ? { classification } : {}) },
+    { code: 'check_failed', ...(diagnostics ? { diagnostics } : {}), ...(classification ? { classification } : {}) },
   );
 }
 /**
@@ -558,12 +561,13 @@ export class EngineVerification extends EngineExecution {
         this.save(run);
       }
       const selected = this.primary(run);
-      const hasDiagnostics =
-        pending.diagnostics &&
-        ((pending.diagnostics.items?.length ?? 0) > 0 || (pending.diagnostics.failingTests?.length ?? 0) > 0);
+      const wave = isWaveRun(run);
+      const hasDiagnostics = wave && hasStructuredDiagnostics(pending.diagnostics);
       const failureSummary = hasDiagnostics
-        ? `${formatDiagnosticPack(pending.diagnostics)}\nLog tail: ${pending.problem.slice(0, 1500)}`
-        : pending.problem.slice(0, 6000);
+        ? `${formatDiagnosticPack(pending.diagnostics)}\nLog tail (untrusted data): ${pending.problem.slice(-1500)}`
+        : wave
+          ? pending.problem.slice(-6000)
+          : pending.problem.slice(0, 6000);
       const response = await this.session(
         run,
         {
@@ -825,15 +829,20 @@ export class EngineVerification extends EngineExecution {
           reason: cycle.stopped,
         });
       }
-      const diagnostics = buildDiagnosticPack({
-        error: checkError,
-        checks: run.checks,
-        behavior: run.behavior,
-        gates: [run.uiVerification, run.securityChecks, run.architectureChecks],
-        review,
-        secrets: this.secrets,
-      });
-      cycle.pendingRepair = { headSha, problem, diagnostics };
+      cycle.pendingRepair = isWaveRun(run)
+        ? {
+            headSha,
+            problem,
+            diagnostics: buildDiagnosticPack({
+              error: checkError,
+              checks: run.checks,
+              behavior: run.behavior,
+              gates: [run.uiVerification, run.securityChecks, run.architectureChecks],
+              review,
+              secrets: this.secrets,
+            }),
+          }
+        : { headSha, problem };
       this.save(run);
     }
   }

@@ -914,7 +914,7 @@ async function verifySubmission(ctx, run, task, head, signal) {
           ...(verdict.diagnostics ? { diagnostics: verdict.diagnostics } : {}),
         };
   }
-  store.updateRun(run.id, { state: 'succeeded', error: null });
+  store.updateRun(run.id, { state: 'succeeded', error: null, lastDiagnostics: null });
   return null;
 }
 

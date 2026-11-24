@@ -539,6 +539,7 @@ export async function verifyTaskFastOnce({ engine, run: input, signal }) {
       if (run.behavior.headSha !== run.checks.headSha)
         throw fail('HEAD изменился между быстрыми проверками и behaviour gate', 'stale_checks');
       run.headSha = run.checks.headSha;
+      run.lastDiagnostics = null;
       engine.save(run);
       return { passed: true, headSha: run.headSha, checks: run.checks, behavior: run.behavior };
     } catch (caught) {
