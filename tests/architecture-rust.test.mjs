@@ -790,7 +790,18 @@ test('E2: cargo-workspace resolves workspace members matching real Cargo 1.96 me
     const contents = new Map(
       Object.entries(fixture.manifests).map(([file, text]) => [file, Buffer.from(text, 'utf8')]),
     );
-    const resolved = mod.resolveCargoWorkspace({ manifests: contents, startDir: fixture.startDir || '' });
+    const resolved = mod.resolveCargoWorkspace({
+      manifests: contents,
+      files: fixture.files,
+      startDir: fixture.startDir || '',
+    });
+    if (fixture.ok === false) {
+      assert.ok(
+        resolved.unsupported.some(row => row.reason === fixture.expectedReason),
+        `${name}: expected unsupported reason ${fixture.expectedReason}, got ${JSON.stringify(resolved.unsupported)}`,
+      );
+      continue;
+    }
     assert.deepEqual(
       resolved.unsupported,
       [],
@@ -1833,5 +1844,70 @@ test('W4: include in .cargo/config(.toml) blocks fail-closed with unsupported-ca
       u => u.reason === 'unsupported-cargo-config-include' && u.file === 'crates/app/.cargo/config',
     ),
     `expected unsupported-cargo-config-include on crates/app/.cargo/config, got ${JSON.stringify(res2.unsupported)}`,
+  );
+});
+
+test('W5: workspace member globs inspect snapshot directories (member-glob-no-match, member-without-manifest, exclude, sibling file)', async t => {
+  const fx = await rustFixture(t);
+  await fx.put('crates/readme/README.md', '# Notes\n');
+  const headNoManifest = fx.commit('add crates/readme without Cargo.toml');
+  const resNoManifest = await checkArchitecture({
+    project: fx.project,
+    baseSha: fx.baseSha,
+    headSha: headNoManifest,
+    evidenceDir: fx.artifacts,
+  });
+  assert.equal(resNoManifest.status, 'blocked');
+  assert.ok(
+    resNoManifest.unsupported.some(
+      u => u.reason === 'member-without-manifest' && u.file === 'crates/readme/Cargo.toml',
+    ),
+    `expected member-without-manifest for crates/readme, got ${JSON.stringify(resNoManifest.unsupported)}`,
+  );
+
+  await fx.put(
+    'Cargo.toml',
+    defaultWorkspaceFiles()['Cargo.toml'].replace(
+      'members = ["crates/*"]',
+      'members = ["crates/*"]\nexclude = ["crates/readme"]',
+    ),
+  );
+  const headExcluded = fx.commit('exclude crates/readme');
+  const resExcluded = await checkArchitecture({
+    project: fx.project,
+    baseSha: fx.baseSha,
+    headSha: headExcluded,
+    evidenceDir: fx.artifacts,
+  });
+  assert.equal(resExcluded.status, 'passed', `excluded non-crate dir must pass: ${JSON.stringify(resExcluded)}`);
+
+  await fx.put('crates/README.md', '# Workspace\n');
+  const headSibling = fx.commit('add crates/README.md file');
+  const resSibling = await checkArchitecture({
+    project: fx.project,
+    baseSha: fx.baseSha,
+    headSha: headSibling,
+    evidenceDir: fx.artifacts,
+  });
+  assert.equal(resSibling.status, 'passed', `sibling file must pass: ${JSON.stringify(resSibling)}`);
+
+  await fx.put(
+    'Cargo.toml',
+    defaultWorkspaceFiles()['Cargo.toml'].replace(
+      'members = ["crates/*"]',
+      'members = ["crates/*", "missing/*"]\nexclude = ["crates/readme"]',
+    ),
+  );
+  const headNoMatch = fx.commit('add unmatched glob');
+  const resNoMatch = await checkArchitecture({
+    project: fx.project,
+    baseSha: fx.baseSha,
+    headSha: headNoMatch,
+    evidenceDir: fx.artifacts,
+  });
+  assert.equal(resNoMatch.status, 'blocked');
+  assert.ok(
+    resNoMatch.unsupported.some(u => u.reason === 'member-glob-no-match' && u.file === 'Cargo.toml'),
+    `expected member-glob-no-match, got ${JSON.stringify(resNoMatch.unsupported)}`,
   );
 });

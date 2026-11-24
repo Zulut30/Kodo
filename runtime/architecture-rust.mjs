@@ -178,14 +178,16 @@ export function parseCargoWorkspace({ files, contents }) {
   };
   const regular = entry => entry.mode === '100644' || entry.mode === '100755';
   const manifests = new Map();
+  const trackedFiles = [];
   for (const entry of files) {
     if (!regular(entry)) continue;
+    trackedFiles.push(entry.path);
     if (entry.path === 'Cargo.toml' || entry.path.endsWith('/Cargo.toml')) {
       const raw = contents.get(entry.path);
       if (raw !== undefined) manifests.set(entry.path, raw);
     }
   }
-  const resolved = resolveCargoWorkspace({ manifests, startDir: '' });
+  const resolved = resolveCargoWorkspace({ manifests, files: trackedFiles, startDir: '' });
   for (const item of resolved.unsupported) unsupported.set(item.id, item);
   checkUnsupportedOverrides({ files, contents, rootDoc: resolved.rootDoc, unknown });
   if (!resolved.hasWorkspace) {

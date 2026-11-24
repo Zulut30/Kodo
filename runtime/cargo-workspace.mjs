@@ -381,7 +381,17 @@ function parseExcludePrefixes(workspace, rootDir, rootManifest, unknown) {
   return prefixes;
 }
 
-function collectDeclaredMembers({ workspace, rootDir, rootManifest, manifestDirs, parsedCache, isExcluded, unknown }) {
+function collectDeclaredMembers({
+  workspace,
+  rootDir,
+  rootManifest,
+  manifestDirs,
+  snapshotDirs,
+  snapshotFiles,
+  parsedCache,
+  isExcluded,
+  unknown,
+}) {
   const selected = new Set();
   if (workspace.members === undefined) return selected;
   if (!Array.isArray(workspace.members)) {
@@ -412,9 +422,26 @@ function collectDeclaredMembers({ workspace, rootDir, rootManifest, manifestDirs
       unknown('workspace', rootManifest, 'unsupported-member-glob');
       continue;
     }
-    for (const dir of [...manifestDirs.keys()].sort(compare)) {
-      const rel = relativeToRoot(rootDir, dir);
-      if (rel === null || !regex.test(rel) || isExcluded(dir)) continue;
+    const matchedDirs = [...snapshotDirs]
+      .filter(dir => {
+        const rel = relativeToRoot(rootDir, dir);
+        return rel !== null && regex.test(rel);
+      })
+      .sort(compare);
+    const matchedAnyFile = [...snapshotFiles].some(file => {
+      const rel = relativeToRoot(rootDir, file);
+      return rel !== null && regex.test(rel);
+    });
+    if (!matchedDirs.length && !matchedAnyFile) {
+      unknown('workspace', rootManifest, 'member-glob-no-match');
+      continue;
+    }
+    for (const dir of matchedDirs) {
+      if (isExcluded(dir)) continue;
+      if (!manifestDirs.has(dir)) {
+        unknown('workspace', joinRel(dir, 'Cargo.toml'), 'member-without-manifest');
+        continue;
+      }
       if (dir !== rootDir && hasNestedWorkspaceBoundary(rootDir, dir, manifestDirs, parsedCache)) {
         unknown('workspace', `${dir}/Cargo.toml`, 'nested-workspace-root');
         continue;
@@ -512,13 +539,30 @@ function emptyWorkspaceResult(rootDir, rootManifest, rootManifestHash, rootDoc, 
   };
 }
 
+function collectSnapshotEntries(rawMap, files) {
+  const snapshotFiles = new Set();
+  const snapshotDirs = new Set();
+  const addFile = raw => {
+    const cleaned = normalizeScopePath(typeof raw === 'string' ? raw : raw?.path);
+    if (!cleaned) return;
+    snapshotFiles.add(cleaned);
+    const parent = path.posix.dirname(cleaned);
+    for (const dir of ancestorsOf(parent === '.' ? '' : parent)) snapshotDirs.add(dir);
+  };
+  for (const file of rawMap.keys()) addFile(file);
+  if (Array.isArray(files)) {
+    for (const entry of files) addFile(entry);
+  }
+  return { snapshotDirs, snapshotFiles };
+}
+
 /**
- * Pure offline Cargo workspace membership resolver over an in-memory map of `Cargo.toml` manifests.
- * Follows Cargo semantics without invoking `cargo` or touching the filesystem/network.
- * @param {{ manifests: Map<string, Buffer | string> | Record<string, Buffer | string>, startDir?: string }} input
+ * Resolve a Cargo workspace offline using Cargo's member/exclude/path-dependency rules.
+ * @param {{ manifests: Map<string, Buffer | string> | Record<string, Buffer | string>, files?: Array<string | { path: string }>, startDir?: string }} input
  */
-export function resolveCargoWorkspace({ manifests, startDir = '' }) {
+export function resolveCargoWorkspace({ manifests, files, startDir = '' }) {
   const rawMap = toManifestMap(manifests);
+  const { snapshotDirs, snapshotFiles } = collectSnapshotEntries(rawMap, files);
   const manifestDirs = new Map();
   for (const manifestPath of rawMap.keys()) {
     const normalized = manifestPath.replaceAll('\\', '/');
@@ -570,7 +614,17 @@ export function resolveCargoWorkspace({ manifests, startDir = '' }) {
   const isExcluded = dir => excludePrefixes.some(ex => (ex === '' ? true : dir === ex || dir.startsWith(`${ex}/`)));
 
   const selected = hasWorkspace
-    ? collectDeclaredMembers({ workspace, rootDir, rootManifest, manifestDirs, parsedCache, isExcluded, unknown })
+    ? collectDeclaredMembers({
+        workspace,
+        rootDir,
+        rootManifest,
+        manifestDirs,
+        snapshotDirs,
+        snapshotFiles,
+        parsedCache,
+        isExcluded,
+        unknown,
+      })
     : new Set();
   if (hasRootPackage) selected.add(rootDir);
 
