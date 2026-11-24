@@ -846,12 +846,13 @@ async function listTreeBlobs(cwd, baseSha, cache) {
   const blobs = [];
   for (const row of result.stdout.split('\0')) {
     if (!row) continue;
-    const match = /^(\d+) (\w+) ([a-f0-9]+)\s+(\d+|-)\t([\s\S]+)$/.exec(row);
+    const match = /^(\d+) (\w+) ([a-f0-9]+)\s+(\S+)\t([\s\S]+)$/.exec(row);
     if (!match) continue;
     const [, mode, type, oid, sizeRaw, filePath] = match;
     if (type !== 'blob' || !/^100(?:644|755)$/.test(mode)) continue;
-    const size = sizeRaw === '-' ? null : Number(sizeRaw);
-    blobs.push({ path: filePath, oid, size: Number.isFinite(size) ? size : null });
+    const validSize = /^\d+$/.test(sizeRaw);
+    const size = validSize ? Number(sizeRaw) : null;
+    blobs.push({ path: filePath, oid, size, unreadable: !validSize || !Number.isSafeInteger(size) });
   }
   cache?.trees?.set(treeKey, blobs);
   return blobs;
@@ -862,16 +863,24 @@ function parseCatFileBatchOutput(buffer) {
   let pos = 0;
   while (pos < buffer.length) {
     const lineEnd = buffer.indexOf(0x0a, pos);
-    if (lineEnd === -1) break;
+    if (lineEnd === -1) {
+      throw Object.assign(new Error('Truncated git cat-file --batch header'), { code: 'api_cards_missing_object' });
+    }
     const header = buffer.subarray(pos, lineEnd).toString('utf8').replace(/\r$/, '');
     pos = lineEnd + 1;
     if (!header) continue;
-    if (header.endsWith(' missing')) continue;
+    if (header.endsWith(' missing') || header.endsWith(' ambiguous')) {
+      throw Object.assign(new Error(`Unreadable git object: ${header}`), { code: 'api_cards_missing_object' });
+    }
     const parts = header.split(' ');
-    if (parts.length < 3) break;
+    if (parts.length < 3) {
+      throw Object.assign(new Error('Malformed git cat-file --batch header'), { code: 'api_cards_missing_object' });
+    }
     const [oid, type, sizeStr] = parts;
     const size = Number(sizeStr);
-    if (!Number.isSafeInteger(size) || size < 0 || pos + size > buffer.length) break;
+    if (!Number.isSafeInteger(size) || size < 0 || pos + size > buffer.length) {
+      throw Object.assign(new Error('Truncated git cat-file --batch payload'), { code: 'api_cards_missing_object' });
+    }
     if (type === 'blob' && size <= MAX_SOURCE_BYTES) {
       contents.set(oid, buffer.subarray(pos, pos + size).toString('utf8'));
     }
@@ -939,7 +948,19 @@ function readBlobsBatch(cwd, oids) {
         );
         return;
       }
-      finish(null, parseCatFileBatchOutput(Buffer.concat(chunks, totalBytes)));
+      try {
+        const contents = parseCatFileBatchOutput(Buffer.concat(chunks, totalBytes));
+        for (const oid of unique) {
+          if (!contents.has(oid)) {
+            throw Object.assign(new Error(`Missing git object in batch response: ${oid}`), {
+              code: 'api_cards_missing_object',
+            });
+          }
+        }
+        finish(null, contents);
+      } catch (error) {
+        finish(error);
+      }
     });
     child.stdin.on('error', () => {
       // Child close/error handler reports failure.
@@ -1189,15 +1210,19 @@ function packApiCard({ baseSha, invariants, modules, maxBytes }) {
   };
 }
 
-const isReadableBlob = blob => Boolean(blob && blob.size !== null && blob.size <= MAX_SOURCE_BYTES);
+const isReadableBlob = blob => Boolean(blob && !blob.unreadable && blob.size !== null && blob.size <= MAX_SOURCE_BYTES);
 
 function selectInvariantTargets(blobByPath) {
   const targets = [];
   for (const invPath of INVARIANT_FILES) {
     const blob = blobByPath.get(invPath);
+    if (blob?.unreadable)
+      throw Object.assign(new Error(`Unreadable git object: ${invPath}`), { code: 'api_cards_missing_object' });
     if (isReadableBlob(blob)) targets.push({ blob, sectionOnly: false });
   }
   const projectMdBlob = blobByPath.get(PROJECT_MD);
+  if (projectMdBlob?.unreadable)
+    throw Object.assign(new Error(`Unreadable git object: ${PROJECT_MD}`), { code: 'api_cards_missing_object' });
   if (isReadableBlob(projectMdBlob)) targets.push({ blob: projectMdBlob, sectionOnly: true });
   return targets;
 }
@@ -1285,17 +1310,18 @@ export async function buildApiCards({
     const blobByPath = new Map(blobs.map(b => [b.path, b]));
     const invTargets = selectInvariantTargets(blobByPath);
     const scopes = await resolveDependencyScopes({ task, tasks, paths, home, cache });
-    const sourceTargets = scopes.length
-      ? blobs
-          .filter(
-            blob =>
-              isReadableBlob(blob) &&
-              !IGNORED_DIRS.test(blob.path) &&
-              detectLanguage(blob.path) !== null &&
-              ownsPath(scopes, blob.path),
-          )
-          .sort((a, b) => compare(a.path, b.path))
+    const scopedSourceBlobs = scopes.length
+      ? blobs.filter(
+          blob => !IGNORED_DIRS.test(blob.path) && detectLanguage(blob.path) !== null && ownsPath(scopes, blob.path),
+        )
       : [];
+    const missingBlob = scopedSourceBlobs.find(blob => blob.unreadable);
+    if (missingBlob) {
+      throw Object.assign(new Error(`Unreadable dependency git object: ${missingBlob.path}`), {
+        code: 'api_cards_missing_object',
+      });
+    }
+    const sourceTargets = scopedSourceBlobs.filter(isReadableBlob).sort((a, b) => compare(a.path, b.path));
 
     const oidsToRead = [
       ...invTargets

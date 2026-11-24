@@ -474,3 +474,27 @@ test('buildApiCards resolves module names from verified apply-spec interface evi
   });
   assert.deepEqual(tampered.modules, []);
 });
+
+test('buildApiCards degrades to unavailable when a dependency blob is missing (ls-tree BAD or cat-file missing)', async t => {
+  const { dir, baseSha } = await createRepo(t, {
+    'src/dep/mod.mjs': 'export function helper() { return 42; }\n',
+    'src/other/keep.mjs': 'export const OK = true;\n',
+  });
+  const oid = git(dir, 'rev-parse', `${baseSha}:src/dep/mod.mjs`);
+  const objectFile = path.join(dir, '.git', 'objects', oid.slice(0, 2), oid.slice(2));
+
+  // Prime a cache with the intact tree, then remove the loose blob object so cat-file --batch sees "missing".
+  const cachedTree = createApiCardCache();
+  await buildApiCards({ cwd: dir, baseSha, paths: ['src/other'], cache: cachedTree });
+  await rm(objectFile, { force: true });
+
+  // Case 1: fresh ls-tree -l sees BAD size for src/dep/mod.mjs -> MUST return unavailable (not empty success).
+  const fromLsTree = await buildApiCards({ cwd: dir, baseSha, paths: ['src/dep'] });
+  assert.equal(fromLsTree.unavailable, true);
+  assert.equal(fromLsTree.code, 'api_cards_missing_object');
+
+  // Case 2: cached tree skips ls-tree, so cat-file --batch requests the deleted OID -> MUST verify all OIDs and return unavailable.
+  const fromBatch = await buildApiCards({ cwd: dir, baseSha, paths: ['src/dep'], cache: cachedTree });
+  assert.equal(fromBatch.unavailable, true);
+  assert.equal(fromBatch.code, 'api_cards_missing_object');
+});
