@@ -1038,3 +1038,159 @@ test('E4: contract protection checks base U head (moved crate & root deleted fil
   assert.ok(broadFinding, `expected contract_scope_too_broad, got ${JSON.stringify(broadLint.findings)}`);
   assert.deepEqual(broadFinding.taskIds, ['broad-task']);
 });
+
+test('E5: contract_crate_required requires Cargo.toml + src/**, supports explicit contract crate declaration (crates/protocol), and ignores independent crates without shared workspace', async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'kodo-rust-e5-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const criterion = id => ({ id, text: 'cargo test passes', evidenceKinds: ['checks'] });
+  const mkTask = (id, epicId, dependsOn, writePaths) => ({
+    id,
+    epicId,
+    title: `Task ${id}`,
+    description: `Implement ${id}`,
+    owner: 'developer',
+    dependsOn,
+    writePaths,
+    acceptance: [criterion(`${id}-done`)],
+    interfaceRefs: [],
+    priority: 50,
+    userValue: 3,
+    risk: 1,
+    estimatedEffort: 1,
+    riskApprovalRequired: false,
+  });
+  const baseSpec = tasks => ({
+    schemaVersion: 1,
+    id: 'rust-e5',
+    root,
+    title: 'Rust E5',
+    definitionOfDone: [criterion('done')],
+    constraints: [],
+    businessContext: 'Rust project',
+    architectureRefs: [],
+    execution: { cadence: 'wave', integration: 'branch' },
+    milestones: [
+      { id: 'foundation', title: 'Wave 0', acceptance: [criterion('f-done')], releaseRequired: false },
+      { id: 'mvp', title: 'MVP', acceptance: [criterion('m-done')], releaseRequired: false },
+    ],
+    epics: [
+      { id: 'foundation', milestoneId: 'foundation', title: 'Setup', acceptance: [criterion('fe-done')] },
+      { id: 'mvp', milestoneId: 'mvp', title: 'MVP', acceptance: [criterion('me-done')] },
+    ],
+    tasks,
+  });
+  const wsMarkdown = [
+    '# Game',
+    '## Цель',
+    'Игра.',
+    '## Модули',
+    'core, world, render.',
+    '## Стек',
+    'Rust 2024, Cargo workspace.',
+    '## Критерии готовности',
+    '- cargo test',
+  ].join('\n');
+
+  // 1) README.md alone in Wave 0 does NOT satisfy contract_crate_required
+  const readmeOnly = lintFactorySpec(
+    baseSpec([
+      mkTask('w0', 'foundation', [], ['Cargo.toml', 'architecture.policy.json', 'crates/game-contracts/README.md']),
+      mkTask('core', 'mvp', ['w0'], ['crates/core']),
+      mkTask('world', 'mvp', ['core'], ['crates/world']),
+      mkTask('render', 'mvp', ['world'], ['crates/render']),
+    ]),
+    { interfaces: [], projectMarkdown: wsMarkdown },
+  );
+  assert.equal(readmeOnly.ok, false);
+  assert.ok(
+    readmeOnly.findings.some(row => row.code === 'contract_crate_required'),
+    `README.md alone must not satisfy contract_crate_required, got ${JSON.stringify(readmeOnly.findings)}`,
+  );
+
+  // Explicit Cargo.toml + src/** in Wave 0 DOES satisfy contract_crate_required
+  const manifestAndSrc = lintFactorySpec(
+    baseSpec([
+      mkTask(
+        'w0',
+        'foundation',
+        [],
+        ['Cargo.toml', 'architecture.policy.json', 'crates/game-contracts/Cargo.toml', 'crates/game-contracts/src/**'],
+      ),
+      mkTask('core', 'mvp', ['w0'], ['crates/core']),
+      mkTask('world', 'mvp', ['core'], ['crates/world']),
+      mkTask('render', 'mvp', ['world'], ['crates/render']),
+    ]),
+    { interfaces: [], projectMarkdown: wsMarkdown },
+  );
+  assert.deepEqual(manifestAndSrc.findings, []);
+  assert.equal(manifestAndSrc.ok, true);
+
+  // 2) Explicitly declared contract crate without *-contracts suffix (crates/protocol) passes
+  const protocolMarkdown = wsMarkdown + '\nКонтрактный крейт: `crates/protocol`\n';
+  const withProtocol = lintFactorySpec(
+    baseSpec([
+      mkTask('w0', 'foundation', [], ['Cargo.toml', 'architecture.policy.json', 'crates/protocol']),
+      mkTask('core', 'mvp', ['w0'], ['crates/core']),
+      mkTask('world', 'mvp', ['core'], ['crates/world']),
+      mkTask('render', 'mvp', ['world'], ['crates/render']),
+    ]),
+    { interfaces: [], projectMarkdown: protocolMarkdown },
+  );
+  assert.deepEqual(
+    withProtocol.findings,
+    [],
+    `explicitly declared crates/protocol must pass, got ${JSON.stringify(withProtocol.findings)}`,
+  );
+  assert.equal(withProtocol.ok, true);
+
+  // Also works when contract crate is declared via architecturePolicy option (policy.contractCrates)
+  const withPolicyDecl = lintFactorySpec(
+    baseSpec([
+      mkTask('w0', 'foundation', [], ['Cargo.toml', 'architecture.policy.json', 'crates/protocol']),
+      mkTask('core', 'mvp', ['w0'], ['crates/core']),
+      mkTask('world', 'mvp', ['core'], ['crates/world']),
+      mkTask('render', 'mvp', ['world'], ['crates/render']),
+    ]),
+    {
+      interfaces: [],
+      projectMarkdown: wsMarkdown,
+      architecturePolicy: rustPolicy({
+        layers: [
+          { id: 'contracts', crates: ['protocol'] },
+          { id: 'core', crates: ['core'] },
+          { id: 'world', crates: ['world'] },
+          { id: 'render', crates: ['render'] },
+        ],
+        contractCrates: ['protocol'],
+      }),
+    },
+  );
+  assert.deepEqual(withPolicyDecl.findings, []);
+
+  // 3) Three independent Rust CLI tools without a shared workspace root are NOT a workspace
+  const independentToolsMarkdown = [
+    '# Rust Tools',
+    '## Цель',
+    'Набор независимых утилит.',
+    '## Модули',
+    'tools/lint, tools/fmt, tools/gen.',
+    '## Стек',
+    'Rust 2024.',
+    '## Критерии готовности',
+    '- cargo test в каждой утилите',
+  ].join('\n');
+  const independentTools = lintFactorySpec(
+    baseSpec([
+      mkTask('w0', 'foundation', [], ['scripts/check.mjs']),
+      mkTask('lint', 'mvp', ['w0'], ['tools/lint/Cargo.toml', 'tools/lint/src/**']),
+      mkTask('fmt', 'mvp', ['lint'], ['tools/fmt/Cargo.toml', 'tools/fmt/src/**']),
+      mkTask('gen', 'mvp', ['fmt'], ['tools/gen/Cargo.toml', 'tools/gen/src/**']),
+    ]),
+    { interfaces: [], projectMarkdown: independentToolsMarkdown },
+  );
+  assert.equal(
+    independentTools.findings.some(row => row.code === 'contract_crate_required'),
+    false,
+    `independent tools without workspace root must not trigger contract_crate_required, got ${JSON.stringify(independentTools.findings)}`,
+  );
+});

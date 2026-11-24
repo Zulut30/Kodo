@@ -737,11 +737,19 @@ function interfaceFindings(spec, interfaces) {
 const RUST_CONTRACT_CRATE_MIN = 3;
 const CONTRACT_CRATE_NAME = /(?:^|[-_])contracts$/i;
 
+function normalizeRelScope(raw) {
+  if (typeof raw !== 'string') return '';
+  return raw
+    .replaceAll('\\', '/')
+    .replace(/^(?:\.\/)+/, '')
+    .replace(/\/+$/, '');
+}
+
 function crateFromWritePath(raw) {
-  if (typeof raw !== 'string') return null;
-  const cleaned = raw.replaceAll('\\', '/').replace(/\/+$/, '');
-  const cratesMatch = /^crates\/([A-Za-z0-9][A-Za-z0-9_-]*)(?:\/|$)/.exec(cleaned);
-  if (cratesMatch) return { name: cratesMatch[1], root: `crates/${cratesMatch[1]}` };
+  const cleaned = normalizeRelScope(raw);
+  if (!cleaned) return null;
+  const cratesMatch = /^((?:[^/*?[{]+\/)*crates\/([A-Za-z0-9][A-Za-z0-9_-]*))(?:\/|$)/.exec(cleaned);
+  if (cratesMatch) return { name: cratesMatch[2], root: cratesMatch[1] };
   const cargoMatch = /^([^/*?[{]+(?:\/[^/*?[{]+)*)\/Cargo\.toml$/.exec(cleaned);
   if (cargoMatch) {
     const root = cargoMatch[1];
@@ -750,7 +758,8 @@ function crateFromWritePath(raw) {
   return null;
 }
 
-function isRustBlueprint(spec, projectMarkdown) {
+function isRustBlueprint(spec, projectMarkdown, architecturePolicy) {
+  if (architecturePolicy?.schemaVersion === 2 && architecturePolicy?.language === 'rust') return true;
   if (typeof projectMarkdown === 'string' && /\b(?:rust|cargo)\b/i.test(projectMarkdown)) return true;
   if (
     spec.tasks.some(task =>
@@ -762,12 +771,102 @@ function isRustBlueprint(spec, projectMarkdown) {
   return /\b(?:rust|cargo)\b/i.test(meta);
 }
 
+function declaredTokens(sources, pattern) {
+  const tokens = new Set();
+  for (const source of sources) {
+    if (typeof source !== 'string' || !source) continue;
+    for (const match of source.matchAll(pattern)) {
+      for (const raw of match[1].split(/[,;]/)) {
+        const cleaned = raw
+          .trim()
+          .replace(/^[`'"]+|[`'"]+$/g, '')
+          .replaceAll('\\', '/')
+          .replace(/^(?:\.\/)+/, '')
+          .replace(/\/+$/, '');
+        if (cleaned) tokens.add(cleaned);
+      }
+    }
+  }
+  return tokens;
+}
+
+function declaredContractTokens(spec, projectMarkdown, architecturePolicy) {
+  const tokens = declaredTokens(
+    [projectMarkdown, ...(spec.constraints ?? [])],
+    /^\s*(?:[-*]\s*)?(?:contractCrates?|контрактн(?:ый|ые)\s+крейт(?:ы)?)\s*:\s*(.+)$/gim,
+  );
+  if (
+    architecturePolicy?.schemaVersion === 2 &&
+    architecturePolicy?.language === 'rust' &&
+    Array.isArray(architecturePolicy.contractCrates)
+  ) {
+    for (const name of architecturePolicy.contractCrates) {
+      if (typeof name === 'string' && name.trim()) tokens.add(name.trim());
+    }
+  }
+  return tokens;
+}
+
+function declaredWorkspaceRoots(spec, projectMarkdown, architecturePolicy, allCrates) {
+  const roots = new Set();
+  if (architecturePolicy?.schemaVersion === 2 && architecturePolicy?.language === 'rust') roots.add('');
+  for (const token of declaredTokens(
+    [projectMarkdown, ...(spec.constraints ?? [])],
+    /^\s*(?:[-*]\s*)?(?:workspaceRoot|cargoWorkspace|workspace)\s*:\s*(.+)$/gim,
+  )) {
+    if (/^(?:none|no|false)$/i.test(token)) continue;
+    roots.add(token === '.' || token === 'Cargo.toml' ? '' : token.replace(/\/Cargo\.toml$/, ''));
+  }
+  const hasRootWorkspaceText = /\bcargo\s+workspace\b/i.test([projectMarkdown, ...(spec.constraints ?? [])].join('\n'));
+  if (hasRootWorkspaceText) roots.add('');
+  for (const task of spec.tasks) {
+    for (const raw of task.writePaths ?? []) {
+      const cleaned = normalizeRelScope(raw);
+      if (cleaned === 'Cargo.toml') roots.add('');
+      else if (cleaned.endsWith('/Cargo.toml')) {
+        const dir = cleaned.slice(0, -'/Cargo.toml'.length);
+        if ([...allCrates.keys()].some(crateRoot => crateRoot !== dir && crateRoot.startsWith(`${dir}/`)))
+          roots.add(dir);
+      }
+    }
+  }
+  return roots;
+}
+
+function scopeMatchesFile(scope, filePath) {
+  return (
+    path.posix.matchesGlob(filePath, scope) ||
+    filePath === scope ||
+    filePath.startsWith(`${scope.replace(/\/\*\*$/, '')}/`)
+  );
+}
+
+function scopeExplicitlyTargetsContract(rawScope, contractRoot) {
+  const scope = normalizeRelScope(rawScope);
+  if (!scope) return null;
+  const staticPrefix = scope.split(/[*?[{]/)[0].replace(/\/+$/, '');
+  if (staticPrefix !== contractRoot && !staticPrefix.startsWith(`${contractRoot}/`)) return null;
+  return scope;
+}
+
+function taskCreatesCompilableContractCrate(task, contractRoot) {
+  let coversManifest = false;
+  let coversSource = false;
+  for (const rawScope of task.writePaths ?? []) {
+    const scope = scopeExplicitlyTargetsContract(rawScope, contractRoot);
+    if (!scope) continue;
+    if (scopeMatchesFile(scope, `${contractRoot}/Cargo.toml`)) coversManifest = true;
+    if (
+      scopeMatchesFile(scope, `${contractRoot}/src/lib.rs`) ||
+      (scope.startsWith(`${contractRoot}/src/`) && /\.rs$/i.test(scope))
+    )
+      coversSource = true;
+  }
+  return coversManifest && coversSource;
+}
+
 function scopeCoversContractWithoutNamingIt(rawScope, contractRoot) {
-  if (typeof rawScope !== 'string') return false;
-  const scope = rawScope
-    .replaceAll('\\', '/')
-    .replace(/^(?:\.\/)+/, '')
-    .replace(/\/+$/, '');
+  const scope = normalizeRelScope(rawScope);
   if (!scope) return false;
   const staticPrefix = scope.split(/[*?[{]/)[0].replace(/\/+$/, '');
   if (staticPrefix === contractRoot || staticPrefix.startsWith(`${contractRoot}/`)) return false;
@@ -801,48 +900,78 @@ function broadContractScopeFindings(spec, contractRoots) {
   ];
 }
 
-/** Multi-crate Rust workspaces (>= 3 crates) must create a compilable contract crate
- * (e.g. `crates/<name>-contracts`) in Wave 0 so parallel tasks compile against frozen traits/types. */
-export function rustContractCrateFindings(spec, projectMarkdown = '') {
-  if (!isRustBlueprint(spec, projectMarkdown)) return [];
-  const crates = new Map();
-  const contractRoots = new Set();
+function selectContractRootsForCrates(cratesMap, explicitTokens) {
+  const roots = new Set();
+  for (const [root, name] of cratesMap.entries()) {
+    if (explicitTokens.has(root) || explicitTokens.has(name) || CONTRACT_CRATE_NAME.test(name)) roots.add(root);
+  }
+  for (const token of explicitTokens) {
+    if (token.includes('/')) roots.add(token);
+  }
+  return roots;
+}
+
+/** Multi-crate Rust workspaces (>= 3 crates sharing a workspace root) must create a compilable
+ * contract crate (`Cargo.toml` + `src/**`) in Wave 0 so parallel tasks compile against frozen traits/types. */
+export function rustContractCrateFindings(spec, projectMarkdown = '', architecturePolicy = null) {
+  if (!isRustBlueprint(spec, projectMarkdown, architecturePolicy)) return [];
+  const allCrates = new Map();
   for (const task of spec.tasks) {
     for (const scope of task.writePaths ?? []) {
       const crate = crateFromWritePath(scope);
-      if (crate) {
-        crates.set(crate.root, crate.name);
-        if (CONTRACT_CRATE_NAME.test(crate.name)) contractRoots.add(crate.root);
-      }
+      if (crate) allCrates.set(crate.root, crate.name);
     }
   }
-  const findings = [...broadContractScopeFindings(spec, contractRoots)];
-  if (crates.size < RUST_CONTRACT_CRATE_MIN) return findings;
+  const explicitTokens = declaredContractTokens(spec, projectMarkdown, architecturePolicy);
+  const allContractRoots = selectContractRootsForCrates(allCrates, explicitTokens);
+  const findings = [...broadContractScopeFindings(spec, allContractRoots)];
+
+  const workspaceRoots = [...declaredWorkspaceRoots(spec, projectMarkdown, architecturePolicy, allCrates)].sort(
+    (a, b) => b.length - a.length || compare(a, b),
+  );
+  if (!workspaceRoots.length) return findings;
+
+  const byWorkspace = new Map(workspaceRoots.map(wsRoot => [wsRoot, new Map()]));
+  for (const [crateRoot, crateName] of allCrates.entries()) {
+    const ownerWs = workspaceRoots.find(wsRoot => (wsRoot === '' ? true : crateRoot.startsWith(`${wsRoot}/`)));
+    if (ownerWs !== undefined) byWorkspace.get(ownerWs).set(crateRoot, crateName);
+  }
+
   const waveZeroEpics = new Set(
     spec.epics.filter(epic => epic.id === FOUNDATION_ID || epic.milestoneId === FOUNDATION_ID).map(epic => epic.id),
   );
   const waveZeroTasks = spec.tasks.filter(task => waveZeroEpics.has(task.epicId));
   if (!waveZeroTasks.length) return findings;
-  const hasWaveZeroContractCrate = waveZeroTasks.some(task =>
-    (task.writePaths ?? []).some(scope => {
-      const crate = crateFromWritePath(scope);
-      return crate !== null && contractRoots.has(crate.root);
-    }),
-  );
-  if (hasWaveZeroContractCrate) return findings;
-  findings.push(
-    finding(
-      'contract_crate_required',
-      'Для Rust workspace с ≥ 3 крейтами Волна 0 (foundation) должна содержать задачу, ' +
-        'создающую компилируемый контрактный крейт (crates/<name>-contracts: pub trait, типы данных, ошибки, ' +
-        'conformance-тесты), защищённый через contractCrates в architecture.policy.json',
-    ),
-  );
+
+  for (const wsCrates of byWorkspace.values()) {
+    if (wsCrates.size < RUST_CONTRACT_CRATE_MIN) continue;
+    const wsContracts = selectContractRootsForCrates(wsCrates, explicitTokens);
+    const satisfied = waveZeroTasks.some(task =>
+      [...wsContracts].some(contractRoot => taskCreatesCompilableContractCrate(task, contractRoot)),
+    );
+    if (!satisfied) {
+      findings.push(
+        finding(
+          'contract_crate_required',
+          'Для Rust workspace с ≥ 3 крейтами Волна 0 (foundation) должна содержать задачу, ' +
+            'создающую компилируемый контрактный крейт (Cargo.toml и src/** в crates/<name>-contracts ' +
+            'или явно объявленном контрактном крейте), защищённый через contractCrates в architecture.policy.json',
+        ),
+      );
+      break;
+    }
+  }
   return findings;
 }
 
 function analyzeFactorySpec(spec, options = {}) {
-  const { contracts = projectContracts, knownValues = [], interfaces = [], projectMarkdown = '' } = options;
+  const {
+    contracts = projectContracts,
+    knownValues = [],
+    interfaces = [],
+    projectMarkdown = '',
+    architecturePolicy = null,
+  } = options;
   const base = normalizeFactory(spec, { contracts, knownValues });
   const findings = [...base.findings, ...sectionFindings(projectMarkdown)];
   if (!base.spec) return { spec: null, findings };
@@ -850,7 +979,7 @@ function analyzeFactorySpec(spec, options = {}) {
   findings.push(
     ...ownerFindings(base.spec.tasks),
     ...waveZeroFindings(base.spec, ancestors),
-    ...rustContractCrateFindings(base.spec, projectMarkdown),
+    ...rustContractCrateFindings(base.spec, projectMarkdown, architecturePolicy),
     ...containerFindings(base.spec),
     ...epicCycleFindings(base.spec.tasks),
     ...overlapFindings(parallelOverlaps(base.spec.tasks, { ancestors })),
@@ -946,12 +1075,25 @@ async function resolveSource({ root, spec, interfaces }) {
   return { value, findings };
 }
 
+async function readOptionalArchitecturePolicy(root) {
+  try {
+    const file = await readBoundedFile(path.join(root, 'architecture.policy.json'), BLUEPRINT_LIMITS.spec);
+    const parsed = JSON.parse(file.text);
+    return isPlain(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Read, resolve and lint the blueprint. Returns the compiled ProjectSpec
  * (with execution) even when findings exist; ok is the only acceptance signal.
  * `specFile` optionally replaces .kodo/blueprint/spec.json. Nothing is written to disk.
  * @param {string} root
- * @param {{ contracts?: typeof projectContracts, knownValues?: string[], specFile?: string }} [options] */
-export async function compileBlueprint(root, { contracts = projectContracts, knownValues = [], specFile } = {}) {
+ * @param {{ contracts?: typeof projectContracts, knownValues?: string[], specFile?: string, architecturePolicy?: Record<string, any> | null }} [options] */
+export async function compileBlueprint(
+  root,
+  { contracts = projectContracts, knownValues = [], specFile, architecturePolicy } = {},
+) {
   let blueprint;
   try {
     blueprint = await readBlueprint(root, { specFile });
@@ -961,11 +1103,14 @@ export async function compileBlueprint(root, { contracts = projectContracts, kno
     throw error;
   }
   const source = await resolveSource(blueprint);
+  const policy =
+    architecturePolicy === undefined ? await readOptionalArchitecturePolicy(blueprint.root) : architecturePolicy;
   const analysis = analyzeFactorySpec(source.value, {
     contracts,
     knownValues,
     interfaces: blueprint.interfaces,
     projectMarkdown: blueprint.project.text,
+    architecturePolicy: policy,
   });
   const findings = [...source.findings, ...analysis.findings];
   return { ok: findings.length === 0, spec: analysis.spec, interfaces: blueprint.interfaces, findings };
