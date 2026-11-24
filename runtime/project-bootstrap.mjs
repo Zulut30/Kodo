@@ -131,7 +131,7 @@ const FRAMEWORKS = [
   'mocha',
   '@playwright/test',
 ];
-const SESSION_SCHEMA = {
+export const SESSION_SCHEMA = {
   type: 'object',
   additionalProperties: false,
   required: ['status', 'summary'],
@@ -972,7 +972,7 @@ export async function prepareExtend(options = {}) {
   };
 }
 
-const MILESTONE_SESSION_SCHEMA = {
+export const MILESTONE_SESSION_SCHEMA = {
   type: 'object',
   additionalProperties: false,
   required: ['status', 'summary', 'milestone'],

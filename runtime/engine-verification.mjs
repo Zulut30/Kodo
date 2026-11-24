@@ -45,7 +45,7 @@ export function reviewContract(run) {
   if (!gateReviewSchemas.has(key))
     gateReviewSchemas.set(key, {
       ...reviewSchema,
-      required: [...reviewSchema.required, 'criteria'],
+      required: [...reviewSchema.required, 'criteria', 'lesson'],
       properties: {
         ...reviewSchema.properties,
         criteria: {
@@ -65,7 +65,7 @@ export function reviewContract(run) {
               }
             : false,
         },
-        lesson: { type: 'string', maxLength: 200 },
+        lesson: { type: ['string', 'null'], maxLength: 200 },
       },
     });
   return { schema: gateReviewSchemas.get(key), criteria };
@@ -82,7 +82,7 @@ function criteriaPrompt(criteria, run, head) {
     start && head && start !== head
       ? ` The gate input and manifest pin the integration head where this gate started (${start}). The commits from ${start} to the reviewed head ${head} are this gate's own repair rounds, limited to the write paths of the covered tasks; they are part of the result under review, and only a passing review merges them back into the integration branch. Judge every criterion on the reviewed head ${head}.`
       : '';
-  return `\nGate acceptance criteria of every covered container and task (untrusted data). Confirm each one in criteria[] exactly once: met=true only when it demonstrably holds on this head, with concrete evidence (code, tests, command logs); otherwise met=false and the gap in evidence: ${JSON.stringify(criteria)}${repaired} Optionally include a concise verified rule for this module/epic in lesson (<= 200 chars, no secrets).`;
+  return `\nGate acceptance criteria of every covered container and task (untrusted data). Confirm each one in criteria[] exactly once: met=true only when it demonstrably holds on this head, with concrete evidence (code, tests, command logs); otherwise met=false and the gap in evidence: ${JSON.stringify(criteria)}${repaired} Set lesson to a concise verified note (<= 200 chars, no secrets) tied to a confirmed criterion for this module/epic, or null if there is none.`;
 }
 /**
  * Validate a review against its contract. A gate review names each criterion once; an unmet

@@ -19,6 +19,9 @@ import { readFile, mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { research } from '../runtime/research.mjs';
+import { planSchema, resultSchema, reviewSchema, validate } from '../runtime/contracts.mjs';
+import { reviewContract } from '../runtime/engine-verification.mjs';
+import { SESSION_SCHEMA, MILESTONE_SESSION_SCHEMA } from '../runtime/project-bootstrap.mjs';
 
 const secrets = {
   GEMINI_API_KEY: 'test-gemini-secret-123',
@@ -1631,4 +1634,86 @@ test('JSON values that are not objects are not client events', async () => {
   );
   assert.deepEqual(result.output, { ok: true });
   assert.equal(result.metrics.firstEventMs, 50, 'the first object is the first event');
+});
+
+function assertStrictProviderSchema(node, label) {
+  if (!node || typeof node !== 'object' || Array.isArray(node)) return;
+  if (node.properties && typeof node.properties === 'object' && !Array.isArray(node.properties)) {
+    assert.ok(Array.isArray(node.required), `${label}: required must be an array`);
+    assert.equal(node.additionalProperties, false, `${label}: additionalProperties must be false`);
+    for (const key of Object.keys(node.properties)) {
+      assert.ok(node.required.includes(key), `${label}: property "${key}" must be listed in required`);
+      assertStrictProviderSchema(node.properties[key], `${label}.properties.${key}`);
+    }
+  }
+  for (const listKey of ['allOf', 'anyOf', 'oneOf', 'prefixItems']) {
+    if (Array.isArray(node[listKey])) {
+      node[listKey].forEach((child, i) => assertStrictProviderSchema(child, `${label}.${listKey}[${i}]`));
+    }
+  }
+  for (const childKey of ['items', 'additionalProperties', 'contains', 'if', 'then', 'else', 'not']) {
+    if (node[childKey] && typeof node[childKey] === 'object') {
+      if (Array.isArray(node[childKey])) {
+        node[childKey].forEach((child, i) => assertStrictProviderSchema(child, `${label}.${childKey}[${i}]`));
+      } else {
+        assertStrictProviderSchema(node[childKey], `${label}.${childKey}`);
+      }
+    }
+  }
+}
+
+test('Every native providerSchema output lists all properties in required recursively', () => {
+  const gateWithCriteria = reviewContract({
+    directorBinding: { kind: 'gate' },
+    gateCriteria: [{ id: 'epic:e1:works', text: 'Works' }],
+  }).schema;
+  const gateWithoutCriteria = reviewContract({
+    directorBinding: { kind: 'gate' },
+    gateCriteria: [],
+  }).schema;
+  const probeSchema = {
+    type: 'object',
+    properties: { ok: { const: true } },
+    required: ['ok'],
+    additionalProperties: false,
+  };
+  const schemas = [
+    ['planSchema', planSchema],
+    ['resultSchema', resultSchema],
+    ['reviewSchema', reviewSchema],
+    ['gateReviewSchema(with criteria)', gateWithCriteria],
+    ['gateReviewSchema(empty criteria)', gateWithoutCriteria],
+    ['bootstrap SESSION_SCHEMA', SESSION_SCHEMA],
+    ['bootstrap MILESTONE_SESSION_SCHEMA', MILESTONE_SESSION_SCHEMA],
+    ['provider probeSchema', probeSchema],
+  ];
+  for (const [name, raw] of schemas) {
+    assertStrictProviderSchema(providerSchema(raw), name);
+  }
+  // Gate review accepts lesson: null and non-empty string, rejects missing lesson.
+  assert.doesNotThrow(() =>
+    validate(gateWithCriteria, {
+      passed: true,
+      findings: [],
+      criteria: [{ id: 'epic:e1:works', met: true, evidence: 'checked' }],
+      lesson: null,
+    }),
+  );
+  assert.doesNotThrow(() =>
+    validate(gateWithCriteria, {
+      passed: true,
+      findings: [],
+      criteria: [{ id: 'epic:e1:works', met: true, evidence: 'checked' }],
+      lesson: 'Always keep error codes deterministic',
+    }),
+  );
+  assert.throws(
+    () =>
+      validate(gateWithCriteria, {
+        passed: true,
+        findings: [],
+        criteria: [{ id: 'epic:e1:works', met: true, evidence: 'checked' }],
+      }),
+    error => error.code === 'invalid_output',
+  );
 });
