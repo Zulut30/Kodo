@@ -5,6 +5,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { withPullLease } from '../runtime/project-controller-lease.mjs';
 import { Store } from '../runtime/store.mjs';
 import { Engine } from '../runtime/engine.mjs';
 import * as contracts from '../runtime/project-contracts.mjs';
@@ -14,6 +16,7 @@ import { ensureIntegration, mergeTask } from '../runtime/project-integration.mjs
 import { withIntegrationLease } from '../runtime/project-integration-lease.mjs';
 import { completeTask, nextWave, runProjectGates } from '../runtime/project-external.mjs';
 import { createProjectTransitionAuthorizer } from '../runtime/project-director.mjs';
+import { gateHolds } from '../runtime/project-director-waves.mjs';
 import { workerRole, WORKER_ROLES } from '../runtime/worker-roles.mjs';
 
 function git(cwd, ...args) {
@@ -120,7 +123,7 @@ async function integrateLeased(f, { projectId, taskId, run }) {
   };
 }
 
-async function fixture(t, { wave = true } = {}) {
+async function fixture(t, { wave = true, stateInGit = false, edit = () => {} } = {}) {
   const temp = await realpath(await mkdtemp(path.join(os.tmpdir(), 'kodo-external-')));
   const stores = [];
   t.after(async () => {
@@ -202,6 +205,7 @@ async function fixture(t, { wave = true } = {}) {
       taskSpec('task-d', { dependsOn: ['task-a'], writePaths: ['src/d.mjs'], priority: 60 }),
     ],
   };
+  edit(spec);
   const created = await repo.apply({
     schemaVersion: 1,
     commandId: randomUUID(),
@@ -246,6 +250,9 @@ async function fixture(t, { wave = true } = {}) {
   f.complete = (taskId, head, input = {}) =>
     completeTask(f.ctx, { projectId: f.projectId, taskId, head, ports: f.ports, ...input });
   f.snapshot = () => repo.snapshot(f.projectId);
+  // A state home that became a Git work tree after its project store was created: the Engine
+  // then keeps Run artifacts and worktrees beside a temporary home unless KODO_WORKTREE_HOME is set.
+  if (stateInGit) git(home, 'init', '-b', 'main');
   f.integrationHead = () => git(root, 'rev-parse', `refs/heads/kodo/project/${f.projectId}`);
   return f;
 }
@@ -294,9 +301,12 @@ test('next-wave reserves non-overlapping tasks on the integration head; a repeat
     assert.equal(git(row.worktree, 'rev-parse', 'HEAD'), head);
     assert.equal(git(row.worktree, 'branch', '--show-current'), `kodo/${row.runId}`);
     assert.equal(row.branch, `kodo/${row.runId}`);
-    assert.equal(row.chatTitle, `Kodo · [e] Task ${row.taskId}`);
+    assert.equal(row.chatTitle, `Kodo · [e] Task ${row.taskId} · попытка 1`);
     assert.deepEqual(row.writePaths, task.writePaths);
-    assert.equal(row.completeCommand, `kodo project complete-task ${f.projectId} ${row.taskId} --head <SHA>`);
+    assert.equal(
+      row.completeCommand,
+      `kodo project complete-task ${f.projectId} ${row.taskId} --head <SHA> --attempt ${row.attemptId} --defer-gate`,
+    );
     assert.equal(row.selfCheck, `kodo ci feedback --base ${head} --project "${row.worktree}" --json`);
     assert.ok(
       row.prompt.startsWith(contracts.buildDirectorTaskInput({ project: snapshot.project, task }, { knownValues: [] })),
@@ -335,6 +345,142 @@ test('next-wave reserves non-overlapping tasks on the integration head; a repeat
   );
 });
 
+test('next-wave briefs call the CLI of their caller; a library call keeps the kodo default', async t => {
+  const f = await fixture(t);
+  const cli = `node "${fileURLToPath(new URL('../cli/index.mjs', import.meta.url))}"`;
+  const result = await f.wave({ limit: 1, cli });
+  assert.equal(result.cli, cli);
+  const [row] = result.briefs;
+  assert.equal(row.selfCheck, `${cli} ci feedback --base ${row.baseSha} --project "${row.worktree}" --json`);
+  assert.equal(
+    row.completeCommand,
+    `${cli} project complete-task ${f.projectId} ${row.taskId} --head <SHA> --attempt ${row.attemptId} --defer-gate`,
+  );
+  assert.equal(
+    row.abandonCommand,
+    `${cli} project complete-task ${f.projectId} ${row.taskId} --head <SHA> --abandon --attempt ${row.attemptId}`,
+  );
+  assert.ok(row.prompt.includes(row.selfCheck));
+  contracts.assertDirectorSafe(row, { knownValues: [] });
+  // The same attempt without a CLI context: the library default prefix.
+  const plain = await f.wave({ limit: 1 });
+  assert.equal(plain.cli, 'kodo');
+  assert.equal(plain.briefs[0].attemptId, row.attemptId);
+  assert.equal(plain.briefs[0].selfCheck, row.selfCheck.replace(cli, 'kodo'));
+  // An unusable prefix is refused before the lease or any reservation.
+  const before = (await f.snapshot()).revision;
+  for (const bad of ['', ' ', 'node "x"\nkodo', 42, null, 'npx kodo', 'kodo --x', `node ${cli.slice(6, -1)}`])
+    await assert.rejects(f.wave({ cli: bad }), { code: 'project_cli_invalid' }, String(bad));
+  assert.equal((await f.snapshot()).revision, before);
+});
+
+// Shells expand these even inside double quotes: $ and backtick (PowerShell, bash), % and ! (cmd);
+// a quote ends the argument. A path a brief command would carry is refused before any state change.
+const unsafeNames = ['wt $(calc)', 'wt $x', 'wt %PATH%', 'wt `id`', 'wt !x!'];
+
+test('next-wave refuses a worktree home or CLI path a shell would expand, before any state change', async t => {
+  const f = await fixture(t);
+  const before = await f.snapshot();
+  const saved = process.env.KODO_WORKTREE_HOME;
+  t.after(() => {
+    if (saved === undefined) delete process.env.KODO_WORKTREE_HOME;
+    else process.env.KODO_WORKTREE_HOME = saved;
+  });
+  for (const name of unsafeNames) {
+    process.env.KODO_WORKTREE_HOME = path.join(f.temp, name);
+    await assert.rejects(f.wave(), { code: 'project_path_unsafe' }, name);
+  }
+  if (saved === undefined) delete process.env.KODO_WORKTREE_HOME;
+  else process.env.KODO_WORKTREE_HOME = saved;
+  for (const name of [...unsafeNames, 'relative'])
+    await assert.rejects(
+      f.wave({ cli: `node "${name === 'relative' ? 'cli/index.mjs' : path.join(f.temp, name, 'index.mjs')}"` }),
+      { code: 'project_path_unsafe' },
+      name,
+    );
+  await assert.rejects(f.wave({ cli: `node "${path.join(f.temp, 'wt "q', 'index.mjs')}"` }), {
+    code: 'project_cli_invalid',
+  });
+  // Windows: only a fully qualified local path (drive letter, colon, separator); a network share, a drive root or a path
+  // without a drive letter is refused with the advice to move the project below a local drive.
+  if (process.platform === 'win32')
+    for (const location of [
+      '/tools/cli/index.mjs',
+      path.win32.join('//server/share', 'cli', 'index.mjs'),
+      path.win32.resolve('C:/'),
+    ])
+      await assert.rejects(
+        f.wave({ cli: `node "${location}"` }),
+        error => error.code === 'project_path_unsafe' && /подкаталог локального диска/.test(error.message),
+        location,
+      );
+  const after = await f.snapshot();
+  assert.equal(after.revision, before.revision);
+  assert.deepEqual(after.currentAttempts, []);
+  // A path with spaces and Cyrillic is an ordinary quoted argument.
+  process.env.KODO_WORKTREE_HOME = path.join(f.temp, 'рабочие копии');
+  const wave = await f.wave({ limit: 1 });
+  assert.ok(wave.briefs[0].selfCheck.includes(`--project "${wave.briefs[0].worktree}" --json`));
+  assert.ok(wave.briefs[0].worktree.startsWith(path.join(f.temp, 'рабочие копии')));
+});
+
+test('next-wave checks an explicit KODO_WORKTREE_HOME of a state home inside Git before any reservation', async t => {
+  const f = await fixture(t, { stateInGit: true });
+  const saved = process.env.KODO_WORKTREE_HOME;
+  t.after(() => {
+    if (saved === undefined) delete process.env.KODO_WORKTREE_HOME;
+    else process.env.KODO_WORKTREE_HOME = saved;
+  });
+  const before = await f.snapshot();
+  // The Engine puts worktrees in an explicit KODO_WORKTREE_HOME first, even for a state home in Git.
+  process.env.KODO_WORKTREE_HOME = path.join(f.temp, 'wt %PATH%');
+  await assert.rejects(f.wave(), { code: 'project_path_unsafe' });
+  const after = await f.snapshot();
+  assert.equal(after.revision, before.revision);
+  assert.deepEqual(after.currentAttempts, []);
+  process.env.KODO_WORKTREE_HOME = path.join(f.temp, 'рабочие копии');
+  const wave = await f.wave({ limit: 1 });
+  assert.ok(wave.briefs[0].worktree.startsWith(path.join(f.temp, 'рабочие копии')));
+});
+
+test('next-wave checks the CLI against known values before the lease and guards its whole result', async t => {
+  const f = await fixture(t);
+  const cli = `node "${fileURLToPath(new URL('../cli/index.mjs', import.meta.url))}"`;
+  const calls = [];
+  const C = {
+    ...contracts,
+    assertDirectorSafe: (value, options) => {
+      calls.push(typeof value === 'string' ? value : Object.keys(value).sort().join());
+      return contracts.assertDirectorSafe(value, options);
+    },
+  };
+  const acquire = f.store.acquireLease;
+  f.store.acquireLease = (...args) => {
+    calls.push('lease');
+    return acquire.apply(f.store, args);
+  };
+  t.after(() => {
+    f.store.acquireLease = acquire;
+  });
+  const input = { projectId: f.projectId, host: 't3', ports: f.ports, limit: 1 };
+  await nextWave({ ...f.ctx, contracts: C }, { ...input, cli });
+  assert.equal(calls[0], cli, 'the prefix is checked first');
+  assert.ok(calls.indexOf('lease') > 0);
+  assert.equal(calls.at(-1), 'blocked,briefs,cli,projectId,revision', 'the whole result is guarded');
+  // A prefix carrying a known secret value is refused before the lease.
+  calls.length = 0;
+  const secrets = f.engine.secrets;
+  f.engine.secrets = { FIXTURE_TOKEN: 'knownfixturevalue42' };
+  t.after(() => {
+    f.engine.secrets = secrets;
+  });
+  await assert.rejects(
+    nextWave({ ...f.ctx, contracts: C }, { ...input, cli: `node "${path.join(f.temp, 'knownfixturevalue42.mjs')}"` }),
+    { code: 'project_unsafe' },
+  );
+  assert.ok(!calls.includes('lease'));
+});
+
 test('complete-task rejects a commit outside its write paths, a foreign branch, a dirty or unrelated worktree and a deleted test', async t => {
   const f = await fixture(t);
   const wave = await f.wave({ limit: 3 });
@@ -345,6 +491,9 @@ test('complete-task rejects a commit outside its write paths, a foreign branch, 
     assert.equal(result.status, 'checks_failed', JSON.stringify(result));
     if (code instanceof RegExp) assert.match(result.code, code);
     else assert.equal(result.code, code);
+    // Every refusal tells the worker chat what to fix (docs/T3-HOST.md: checks_failed has `message`).
+    if (result.code.startsWith('external_'))
+      assert.ok(typeof result.message === 'string' && result.message.trim(), JSON.stringify(result));
     const snapshot = await f.snapshot();
     assert.equal(snapshot.currentAttempts.find(row => row.taskId === 'task-a').status, 'running');
     return result;
@@ -364,6 +513,9 @@ test('complete-task rejects a commit outside its write paths, a foreign branch, 
   await write(a.worktree, 'notes.txt', 'scratch\n');
   await expectFailure(good, 'external_worktree_dirty');
   await rm(path.join(a.worktree, 'notes.txt'));
+  git(a.worktree, 'checkout', '-q', '--detach');
+  await expectFailure(good, 'external_worktree_mismatch');
+  git(a.worktree, 'checkout', '-q', a.branch);
 
   const orphan = git(a.worktree, 'commit-tree', `${good}^{tree}`, '-m', 'Unrelated history');
   git(a.worktree, 'reset', '--hard', orphan);
@@ -374,6 +526,9 @@ test('complete-task rejects a commit outside its write paths, a foreign branch, 
   git(a.worktree, 'rm', '-q', 'tests/a.test.mjs');
   const deleted = await commit(a.worktree, { 'src/a.mjs': 'export const a = 3;\n' }, 'Drop the test');
   await expectFailure(deleted, /^behavior_/);
+  // Review finding (minor): a deleted worktree directory made git throw ENOENT (project_blocked).
+  await rm(a.worktree, { recursive: true, force: true });
+  await expectFailure(deleted, 'external_worktree_missing');
   assert.deepEqual(f.calls.integrate, [], 'nothing reached integration');
   assert.equal(f.store.getRun(a.runId).state, 'executing');
 });
@@ -536,6 +691,7 @@ test('abandon blocks the attempt and cancels its Run; retry-failed reserves a ne
   const fresh = brief(retried, 'task-a');
   assert.ok(fresh, JSON.stringify(retried));
   assert.notEqual(fresh.attemptId, a.attemptId);
+  assert.equal(fresh.chatTitle, 'Kodo · [e] Task task-a · попытка 2');
   assert.notEqual(fresh.runId, a.runId);
   assert.notEqual(fresh.worktree, a.worktree);
   snapshot = await f.snapshot();
@@ -585,7 +741,8 @@ test('next-wave never hands out a task whose interface proofs do not verify', as
     selected.briefs.map(row => row.taskId),
     ['task-a'],
   );
-  assert.deepEqual(selected.blocked, [], 'it was never selected, so no attempt was reserved for it');
+  // It was never selected, so no attempt was reserved for it; the wave still names why it waits.
+  assert.deepEqual(selected.blocked, [{ taskId: 'task-b', code: 'project_interface_unverified' }]);
   // Even a selector that ignores availability cannot reserve it.
   const forced = await f.wave({ limit: 3 });
   assert.deepEqual(forced.blocked, [{ taskId: 'task-b', code: 'project_interface_unverified' }]);
@@ -618,6 +775,325 @@ test('next-wave --retry-failed retries only attempts of its own host', async t =
     ['task-a'],
   );
   assert.notEqual(brief(own, 'task-a').runId, a.runId);
+});
+
+test('next-wave names why open tasks wait: a missing risk approval and an abandoned attempt', async t => {
+  // Audit finding 4a: the director's selection dropped the planner's reasons, so an empty or short
+  // wave came back with `blocked: []` and the host could not tell what to do next.
+  const f = await fixture(t, {
+    edit(spec) {
+      spec.tasks.find(row => row.id === 'task-b').riskApprovalRequired = true;
+    },
+  });
+  const sorted = rows => [...rows].sort((x, y) => (x.taskId < y.taskId ? -1 : 1));
+  const first = await f.wave({ limit: 3, ports: undefined });
+  assert.deepEqual(
+    first.briefs.map(row => row.taskId),
+    ['task-a'],
+  );
+  assert.deepEqual(first.blocked, [{ taskId: 'task-b', code: 'project_risk_unapproved' }]);
+  assert.equal(
+    (await f.snapshot()).currentAttempts.some(row => row.taskId === 'task-b'),
+    false,
+    'an explanation reserves nothing',
+  );
+  const a = brief(first, 'task-a');
+  assert.equal((await f.complete('task-a', a.baseSha, { abandon: true, attemptId: a.attemptId })).status, 'abandoned');
+  const second = await f.wave({ limit: 3, ports: undefined });
+  assert.deepEqual(
+    second.briefs.map(row => row.taskId),
+    ['task-c'],
+  );
+  assert.deepEqual(sorted(second.blocked), [
+    { taskId: 'task-a', code: 'project_retry_required' },
+    { taskId: 'task-b', code: 'project_risk_unapproved' },
+  ]);
+  // Waiting for a dependency, an in-flight attempt or the wave limit is not a blocker.
+  const repeat = await f.wave({ limit: 1, ports: undefined });
+  assert.deepEqual(sorted(repeat.blocked), sorted(second.blocked));
+});
+
+test('next-wave names a pending epic gate and answers an accepted project with its own code', async t => {
+  // Audit finding 4a/4b: every task integrated with deferred gates left an empty wave without a
+  // reason, and an accepted project was refused as project_control_blocked like a paused one.
+  const f = await fixture(t, {
+    edit(spec) {
+      spec.tasks = spec.tasks.filter(row => ['task-a', 'task-b'].includes(row.id));
+    },
+  });
+  const wave = await f.wave({ limit: 3, ports: undefined });
+  for (const [taskId, file] of [
+    ['task-a', 'src/a.mjs'],
+    ['task-b', 'src/b.mjs'],
+  ]) {
+    const head = await commit(brief(wave, taskId).worktree, { [file]: `export const ${taskId.at(-1)} = 2;\n` });
+    assert.equal((await f.complete(taskId, head, { deferGate: true })).status, 'integrated');
+  }
+  const pending = await f.wave({ limit: 3, ports: undefined });
+  assert.deepEqual(pending.briefs, []);
+  assert.deepEqual(pending.blocked, [{ code: 'project_gate_pending', kind: 'epic', id: 'e' }]);
+
+  const real = f.repo.snapshot.bind(f.repo);
+  const as = (status, paused = false) =>
+    Object.create(f.repo, {
+      snapshot: { value: id => ({ ...real(id), project: { ...real(id).project, status, paused } }) },
+    });
+  const accepted = await nextWave({ ...f.ctx, repo: as('accepted') }, { projectId: f.projectId, host: 't3' });
+  assert.deepEqual(accepted, {
+    projectId: f.projectId,
+    revision: real(f.projectId).revision,
+    cli: 'kodo',
+    code: 'project_accepted',
+    briefs: [],
+    blocked: [],
+  });
+  await assert.rejects(
+    nextWave({ ...f.ctx, repo: as('running', true) }, { projectId: f.projectId, host: 't3' }),
+    { code: 'project_control_blocked' },
+    'a pause stays a control stop',
+  );
+  // Review finding (minor): the worktree home is checked only when work may be handed out; a
+  // settled project needs no worktree, so an unusable KODO_WORKTREE_HOME never hides its code.
+  const saved = process.env.KODO_WORKTREE_HOME;
+  const restore = () => {
+    if (saved === undefined) delete process.env.KODO_WORKTREE_HOME;
+    else process.env.KODO_WORKTREE_HOME = saved;
+  };
+  t.after(restore);
+  process.env.KODO_WORKTREE_HOME = path.join(f.temp, unsafeNames[0]);
+  for (const status of ['accepted', 'released'])
+    assert.equal(
+      (await nextWave({ ...f.ctx, repo: as(status) }, { projectId: f.projectId, host: 't3' })).code,
+      `project_${status}`,
+    );
+  await assert.rejects(
+    nextWave({ ...f.ctx, repo: as('running') }, { projectId: f.projectId, host: 't3' }),
+    { code: 'project_path_unsafe' },
+    'an open project still refuses it before the lease',
+  );
+  restore();
+});
+
+test('next-wave names a stopped task or epic instead of an empty wave', async t => {
+  // Review finding (major): a task failed before any reservation or a blocked epic left
+  // briefs: [] and blocked: [] — the planner's task_failed and epic_blocked were skipped.
+  const f = await fixture(t, {
+    edit(spec) {
+      spec.epics.push({ id: 'e2', milestoneId: 'm', title: 'Second epic', acceptance: [criterion] });
+      spec.tasks = spec.tasks.filter(row => ['task-a', 'task-b'].includes(row.id));
+      spec.tasks.find(row => row.id === 'task-b').epicId = 'e2';
+    },
+  });
+  const stop = async (kind, id, to) =>
+    f.repo.apply({
+      schemaVersion: 1,
+      commandId: randomUUID(),
+      projectId: f.projectId,
+      expectedRevision: (await f.snapshot()).revision,
+      actor: 'owner',
+      reason: 'Stop a record for the test',
+      action: { op: 'transition', kind, id, to, evidence: [], mappings: [] },
+    });
+  await stop('task', 'task-a', 'failed');
+  await stop('epic', 'e2', 'blocked');
+  const wave = await f.wave({ limit: 3, ports: undefined });
+  assert.deepEqual(wave.briefs, []);
+  assert.deepEqual(wave.blocked, [
+    { taskId: 'task-a', code: 'project_task_failed' },
+    { code: 'project_epic_blocked', kind: 'epic', id: 'e2' },
+  ]);
+  assert.deepEqual((await f.snapshot()).currentAttempts, [], 'an explanation reserves nothing');
+});
+
+test('next-wave reads interface evidence once when nothing was reserved', async t => {
+  // Review finding (minor): the explanation read every interface proof again at the same revision.
+  const f = await fixture(t);
+  const first = await f.wave({ limit: 3 });
+  assert.deepEqual(
+    first.briefs.map(row => row.taskId),
+    ['task-a', 'task-b'],
+  );
+  const reads = [];
+  const assertEvidence = f.engine.assertEvidence.bind(f.engine);
+  f.engine.assertEvidence = async ref => {
+    reads.push(ref.path);
+    return assertEvidence(ref);
+  };
+  const revision = (await f.snapshot()).revision;
+  const repeat = await f.wave({ limit: 3 });
+  assert.equal(repeat.revision, revision, 'nothing new was reserved');
+  assert.deepEqual(reads, [f.iface.path], 'one availability pass for the selection and the explanation');
+});
+
+test('The gate classification names a gate Run blocked by its acceptance with its code', () => {
+  // Review finding (major): a gate Run blocked after a failed acceptance (error.code only, no
+  // blocker record) must still name its gate, its Run and that code in next-wave's blocked.
+  const snapshot = {
+    project: { projectId: 'p', status: 'integrated' },
+    milestones: [{ id: 'm', status: 'integrated' }],
+    epics: [{ id: 'e', milestoneId: 'm', status: 'integrated' }],
+    tasks: [{ id: 't', epicId: 'e', status: 'integrated', dependsOn: [] }],
+    currentAttempts: [],
+    gates: [{ id: 'g1', number: 1, runId: 'r1', containers: [{ kind: 'epic', id: 'e' }] }],
+  };
+  const runs = { r1: { id: 'r1', state: 'blocked', error: { code: 'wave_gate_proof_missing', message: 'no proof' } } };
+  const store = {
+    getRun: id => {
+      if (runs[id]) return runs[id];
+      throw new Error(`Запуск не найден: ${id}`);
+    },
+  };
+  assert.deepEqual(gateHolds({ store }, snapshot), [
+    { code: 'wave_gate_proof_missing', kind: 'epic', id: 'e', gateId: 'g1', runId: 'r1', state: 'blocked' },
+  ]);
+});
+
+test('The gate classification follows the chain past an accepted epic and honours a replacing gate', () => {
+  // Review finding (major): a gate over epic → milestone → project accepted its epic, then the
+  // milestone lacked proof; the Run stayed blocked with that code, but the accepted epic hid it.
+  const chain = [
+    { kind: 'epic', id: 'e' },
+    { kind: 'milestone', id: 'm' },
+    { kind: 'project', id: 'p' },
+  ];
+  const base = {
+    project: { projectId: 'p', status: 'integrated' },
+    milestones: [{ id: 'm', status: 'integrated' }],
+    epics: [{ id: 'e', milestoneId: 'm', status: 'accepted' }],
+    tasks: [{ id: 't', epicId: 'e', status: 'accepted', dependsOn: [] }],
+    currentAttempts: [],
+  };
+  const runs = {
+    r1: { id: 'r1', state: 'blocked', error: { code: 'wave_gate_proof_missing', message: 'no milestone proof' } },
+    r2: { id: 'r2', state: 'executing' },
+    r3: { id: 'r3', state: 'blocked', error: { code: 'wave_gate_proof_missing', message: 'still none' } },
+  };
+  const store = {
+    getRun: id => {
+      if (runs[id]) return runs[id];
+      throw new Error(`Запуск не найден: ${id}`);
+    },
+  };
+  const gate = (id, number, runId) => ({ id, number, runId, containers: chain });
+  const holds = gates => gateHolds({ store }, { ...base, gates });
+  assert.deepEqual(holds([gate('g1', 1, 'r1')]), [
+    { code: 'wave_gate_proof_missing', kind: 'milestone', id: 'm', gateId: 'g1', runId: 'r1', state: 'blocked' },
+  ]);
+  // A retry of the chain replaces the stopped gate: while it runs nothing is held, and a stop of
+  // the retry is named by its own gate and Run.
+  assert.deepEqual(holds([gate('g1', 1, 'r1'), gate('g2', 2, 'r2')]), []);
+  assert.deepEqual(holds([gate('g1', 1, 'r1'), gate('g3', 2, 'r3')]), [
+    { code: 'wave_gate_proof_missing', kind: 'milestone', id: 'm', gateId: 'g3', runId: 'r3', state: 'blocked' },
+  ]);
+});
+
+test('The gate classification names a verified gate whose acceptance stopped mid-chain as pending', () => {
+  // Review finding (minor): a stop after the epic's acceptance and before the milestone's left a
+  // succeeded gate Run; `project gates` resumes the chain, but next-wave gave no reason at all.
+  const snapshot = {
+    project: { projectId: 'p', status: 'integrated' },
+    milestones: [{ id: 'm', status: 'integrated' }],
+    epics: [{ id: 'e', milestoneId: 'm', status: 'accepted' }],
+    tasks: [{ id: 't', epicId: 'e', status: 'accepted', dependsOn: [] }],
+    currentAttempts: [],
+    gates: [
+      {
+        id: 'g1',
+        number: 1,
+        runId: 'r1',
+        containers: [
+          { kind: 'epic', id: 'e' },
+          { kind: 'milestone', id: 'm' },
+          { kind: 'project', id: 'p' },
+        ],
+      },
+    ],
+  };
+  const store = { getRun: id => ({ id, state: 'succeeded' }) };
+  assert.deepEqual(gateHolds({ store }, snapshot), [
+    { code: 'project_gate_pending', kind: 'milestone', id: 'm', gateId: 'g1', runId: 'r1' },
+  ]);
+  // Review finding (minor): after append-milestone the accepted chain is finished, the project is
+  // running again and the new milestone is proposed — the old gate is not resumable or pending.
+  const appended = {
+    ...snapshot,
+    project: { projectId: 'p', status: 'running' },
+    milestones: [
+      { id: 'm', status: 'accepted' },
+      { id: 'm2', status: 'proposed' },
+    ],
+    epics: [...snapshot.epics, { id: 'e2', milestoneId: 'm2', status: 'proposed' }],
+    tasks: [...snapshot.tasks, { id: 't2', epicId: 'e2', status: 'proposed', dependsOn: [] }],
+  };
+  assert.deepEqual(gateHolds({ store }, appended), []);
+  // Review finding (minor): an epic's finished chain never names the project's own gate. With the
+  // epic and milestone accepted and the project integrated, the project gate is pending on its own.
+  const projectGate = {
+    ...snapshot,
+    milestones: [{ id: 'm', status: 'accepted' }],
+  };
+  assert.deepEqual(gateHolds({ store }, projectGate), [{ code: 'project_gate_pending', kind: 'project', id: 'p' }]);
+});
+
+test('next-wave names a blocked epic whose tasks are all integrated and a cancelled predecessor', async t => {
+  // Review finding (major): the epic's rows came only from its open tasks, so a blocked epic with
+  // every task integrated vanished; a cancelled required predecessor looked like ordinary waiting.
+  const f = await fixture(t, {
+    edit(spec) {
+      spec.epics.push({ id: 'e2', milestoneId: 'm', title: 'Second epic', acceptance: [criterion] });
+      spec.tasks.find(row => row.id === 'task-b').epicId = 'e2';
+    },
+  });
+  const transition = async (kind, id, to) =>
+    f.repo.apply({
+      schemaVersion: 1,
+      commandId: randomUUID(),
+      projectId: f.projectId,
+      expectedRevision: (await f.snapshot()).revision,
+      actor: 'owner',
+      reason: 'Stop a record for the test',
+      action: { op: 'transition', kind, id, to, evidence: [], mappings: [] },
+    });
+  const first = await f.wave({ limit: 2, ports: undefined });
+  const b = brief(first, 'task-b');
+  const head = await commit(b.worktree, { 'src/b.mjs': 'export const b = 2;\n' });
+  assert.equal((await f.complete('task-b', head, { deferGate: true })).status, 'integrated');
+  await transition('epic', 'e2', 'blocked');
+  // task-a is cancelled before it ran; task-d needs it and can never start.
+  const a = brief(first, 'task-a');
+  assert.equal((await f.complete('task-a', a.baseSha, { abandon: true, attemptId: a.attemptId })).status, 'abandoned');
+  await transition('task', 'task-a', 'cancelled');
+  const wave = await f.wave({ limit: 3, ports: undefined });
+  assert.deepEqual(
+    wave.briefs.map(row => row.taskId),
+    ['task-c'],
+  );
+  assert.deepEqual(wave.blocked, [
+    { taskId: 'task-d', code: 'project_dependency_cancelled', dependencyId: 'task-a' },
+    { code: 'project_epic_blocked', kind: 'epic', id: 'e2' },
+  ]);
+});
+
+test('next-wave checks a refused interface proof again before it names it', async t => {
+  // Review finding (minor): a reused negative proof check can be stale without a new revision
+  // (the evidence file was restored); only a fresh refusal is reported.
+  const f = await fixture(t, {
+    edit(spec) {
+      spec.tasks = spec.tasks.filter(row => row.id === 'task-b');
+    },
+  });
+  const reads = [];
+  const assertEvidence = f.engine.assertEvidence.bind(f.engine);
+  f.engine.assertEvidence = async ref => {
+    reads.push(ref.path);
+    if (reads.length === 1)
+      throw Object.assign(new Error('Fixture: evidence briefly unreadable'), { code: 'evidence' });
+    return assertEvidence(ref);
+  };
+  const wave = await f.wave({ limit: 1, ports: undefined });
+  assert.deepEqual(wave.briefs, [], 'the selection saw the refusal');
+  assert.deepEqual(wave.blocked, [], 'the proof verifies again before it would be named');
+  assert.deepEqual(reads, [f.iface.path, f.iface.path]);
 });
 
 test('gates runs the pending epic gates outside a completion and retries a blocked gate only on request', async t => {
@@ -744,4 +1220,33 @@ test('Worker roles are short profiles; an unknown owner gets the developer profi
   }
   assert.deepEqual(workerRole('mystery'), workerRole('developer'));
   assert.deepEqual(workerRole(undefined), workerRole('developer'));
+});
+
+test('Cancellation interrupts project lease reacquisition after a private gate run', async () => {
+  for (const abortDuringWait of [false, true]) {
+    const controller = new AbortController();
+    let attempts = 0;
+    const released = [];
+    const store = {
+      acquireLease(name) {
+        if (name === 'project:p' && ++attempts > 1 && attempts < 4) {
+          setTimeout(() => controller.abort(), 5);
+          return null;
+        }
+        return name;
+      },
+      renewLease: () => true,
+      releaseLease: token => released.push(token),
+    };
+    await assert.rejects(
+      withPullLease(store, 'p', true, outsideLease =>
+        outsideLease(async () => {
+          if (!abortDuringWait) controller.abort();
+        }, controller.signal),
+      ),
+      { code: 'project_cancelled' },
+    );
+    assert.equal(attempts, abortDuringWait ? 2 : 1);
+    assert.deepEqual(released, ['project:p', 'project-gates:p']);
+  }
 });

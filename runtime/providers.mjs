@@ -54,6 +54,9 @@ const defaults = {
  * @property {(event: any) => void} [onEvent]
  * @property {NodeJS.ProcessEnv} [env]
  * @property {number} [timeoutMs]
+ * @property {number} [startupTimeoutMs] Limit from process start to the first JSON event; one restart without events.
+ * @property {Map<string, Promise<any>>} [subscriptionChecks] Login checks of one Engine run, by client.
+ * @property {(details: { reason: string }) => unknown} [onStartupRetry] Admits an automatic restart; a throw refuses it.
  */
 
 /**
@@ -201,7 +204,7 @@ export async function subscriptionStatus(
 
 /**
  * @param {{ client?: string, providers?: string, primaryModel?: string }} [request]
- * @param {{ config?: Record<string, any>, live?: boolean, secrets?: import('./security.mjs').Secrets, statusImpl?: typeof subscriptionStatus, cacheImpl?: typeof readCodexModelCache, sessionImpl?: typeof runSession }} [deps]
+ * @param {{ config?: Record<string, any>, live?: boolean, secrets?: import('./security.mjs').Secrets, statusImpl?: typeof subscriptionStatus, cacheImpl?: typeof readCodexModelCache, sessionImpl?: typeof runSession, subscriptionChecks?: Map<string, Promise<any>> }} [deps]
  */
 export async function discoverProviders(
   { client = 'codex', providers = 'current', primaryModel } = {},
@@ -212,6 +215,7 @@ export async function discoverProviders(
     statusImpl = subscriptionStatus,
     cacheImpl = readCodexModelCache,
     sessionImpl = runSession,
+    subscriptionChecks,
   } = {},
 ) {
   const selectedClient = client === 'opencode' ? config.backend || 'codex' : client;
@@ -229,7 +233,8 @@ export async function discoverProviders(
   for (const current of clients) {
     let availability;
     try {
-      availability = await statusImpl(current);
+      // The login check of a run is shared with its sessions (`subscriptionChecks`).
+      availability = await checkedSubscription(subscriptionChecks, current, () => statusImpl(current));
     } catch (error) {
       availability = { available: false, error: error.message, code: error.code };
     }
@@ -379,9 +384,13 @@ export function sessionInvocation({ client, model, cwd, schemaPath, schema, sess
 /**
  * @param {string} client
  * @param {any[]} events
- * @param {{ schema?: Record<string, any>, sessionId?: string, model?: string, durationMs?: number }} [details]
+ * @param {{ schema?: Record<string, any>, sessionId?: string, model?: string, durationMs?: number, firstEventMs?: number | null, startupRetries?: number }} [details]
  */
-export function parseSessionEvents(client, events, { schema, sessionId, model, durationMs } = {}) {
+export function parseSessionEvents(
+  client,
+  events,
+  { schema, sessionId, model, durationMs, firstEventMs, startupRetries } = {},
+) {
   let output,
     usage,
     failure,
@@ -431,7 +440,83 @@ export function parseSessionEvents(client, events, { schema, sessionId, model, d
         'invalid_output',
       );
   }
-  return { sessionId, output, usage, model, metrics: sessionMetrics(client, events, { durationMs, usage }) };
+  return {
+    sessionId,
+    output,
+    usage,
+    model,
+    metrics: sessionMetrics(client, events, { durationMs, usage, firstEventMs, startupRetries }),
+  };
+}
+
+/**
+ * One login check per client and cache; only a passed check (`available: true`) is remembered.
+ * @param {Map<string, Promise<any>> | undefined} cache
+ * @param {string} client
+ * @param {() => any} check
+ */
+function checkedSubscription(cache, client, check) {
+  if (!(cache instanceof Map)) return check();
+  if (!cache.has(client)) {
+    // Always a promise, even for a synchronous check, so a failure can be forgotten below.
+    const pending = Promise.resolve().then(check);
+    cache.set(client, pending);
+    const forget = () => {
+      if (cache.get(client) === pending) cache.delete(client);
+    };
+    pending.then(status => {
+      if (status?.available !== true) forget();
+    }, forget);
+  }
+  return cache.get(client);
+}
+
+/** A client event is a JSON object; other JSON values and text are not. */
+const eventOf = line => {
+  try {
+    const value = JSON.parse(line);
+    return value !== null && typeof value === 'object' && !Array.isArray(value) ? value : undefined;
+  } catch {
+    return undefined;
+  }
+};
+const jsonLine = line => eventOf(line) !== undefined;
+
+/**
+ * The executable of a passed login check, shared by the run when `cache` is given.
+ * @param {Map<string, Promise<any>> | undefined} cache
+ * @param {string} client
+ * @param {() => Promise<any>} check
+ */
+async function subscribedExecutable(cache, client, check) {
+  const { executable } = (await checkedSubscription(cache, client, check)) ?? {};
+  // A shared check that passed without an executable cannot start the client: check here.
+  return executable ?? (await check()).executable;
+}
+
+/**
+ * Settles a failed start: only a first silence (no event, no earlier restart) may start again, and
+ * only once the caller admits it (its session budget). Otherwise the failure is thrown.
+ * @param {any} error
+ * @param {{ answered: boolean, aborted?: boolean, client: string, startupTimeoutMs: number, onStartupRetry?: (details: { reason: string }) => unknown }} state
+ */
+async function restartAfterSilence(error, { answered, aborted, client, startupTimeoutMs, onStartupRetry }) {
+  if (error?.code !== 'KODO_STARTUP_TIMEOUT' || aborted) throw error;
+  // A client that never answered did no work. A second silence, or a silence after events, fails
+  // the session as unavailable, which spends no repair round.
+  if (answered)
+    throw Object.assign(
+      new ProviderError(`Клиент ${client} не прислал первое событие за ${startupTimeoutMs} мс`, 'unavailable'),
+      { startupTimeout: true },
+    );
+  // Every native start is admitted by the caller; a refusal keeps its reason.
+  try {
+    await onStartupRetry?.({ reason: 'startup_timeout' });
+  } catch (refusal) {
+    throw refusal instanceof ProviderError
+      ? refusal
+      : new ProviderError(redact(refusal?.message ?? String(refusal)), refusal?.code || 'unavailable');
+  }
 }
 
 /**
@@ -439,48 +524,83 @@ export function parseSessionEvents(client, events, { schema, sessionId, model, d
  * @param {ProcessDeps & { nowImpl?: () => number }} [deps]
  */
 export async function runSession(
-  { client, model, cwd, prompt, schema, sessionId, readOnly = false, signal, onEvent, env, timeoutMs = 1800000 },
+  {
+    client,
+    model,
+    cwd,
+    prompt,
+    schema,
+    sessionId,
+    readOnly = false,
+    signal,
+    onEvent,
+    env,
+    timeoutMs = 1800000,
+    startupTimeoutMs = 120000,
+    subscriptionChecks,
+    onStartupRetry,
+  },
   { processImpl = runProcess, resolveClientImpl = resolveClient, nowImpl = () => performance.now() } = {},
 ) {
   signal?.throwIfAborted();
   const started = nowImpl(),
     events = [];
-  let directory;
+  let directory,
+    firstEventMs = null,
+    startupRetries = 0;
   const environment = subscriptionEnvironment(env);
   try {
-    const { executable } = await subscriptionStatus(client, { env: environment, processImpl, resolveClientImpl });
+    const executable = await subscribedExecutable(subscriptionChecks, client, () =>
+      subscriptionStatus(client, { env: environment, processImpl, resolveClientImpl }),
+    );
     directory = await mkdtemp(path.join(os.tmpdir(), 'kodo-provider-'));
     const schemaPath = schema ? path.join(directory, 'output.schema.json') : undefined;
     if (schema) await writeFile(schemaPath, JSON.stringify(providerSchema(schema)), { mode: 0o600 });
-    const invocation = sessionInvocation({ client, model, cwd, schemaPath, schema, sessionId, readOnly });
-    if (client === 'codex')
-      invocation.args.splice(invocation.args.indexOf('exec'), 0, ...(await codexIsolationOverrides(cwd, environment)));
-    const result = await processImpl({
-      ...executable,
-      args: [...executable.args, ...invocation.args],
-      cwd,
-      input: prompt,
-      env: environment,
-      signal,
-      timeoutMs,
-      onLine: line => {
-        if (!line.trim()) return;
-        let event;
-        try {
-          event = JSON.parse(line);
-        } catch {
-          return;
-        }
-        events.push(event);
-        // Stream lifecycle only. Command/output payloads may contain repository secrets.
-        onEvent?.({
-          type: event.type,
-          subtype: event.subtype,
-          sessionId: event.thread_id ?? event.session_id ?? invocation.sessionId,
-          model,
+    const isolation = client === 'codex' ? await codexIsolationOverrides(cwd, environment) : [];
+    let invocation, result;
+    for (;;) {
+      // A restart is a fresh invocation: a new Claude session id, the same resumed Codex thread.
+      invocation = sessionInvocation({ client, model, cwd, schemaPath, schema, sessionId, readOnly });
+      if (client === 'codex') invocation.args.splice(invocation.args.indexOf('exec'), 0, ...isolation);
+      const current = invocation;
+      try {
+        result = await processImpl({
+          ...executable,
+          args: [...executable.args, ...current.args],
+          cwd,
+          input: prompt,
+          env: environment,
+          signal,
+          timeoutMs,
+          startupTimeoutMs,
+          startedBy: jsonLine,
+          onLine: line => {
+            if (!line.trim()) return;
+            const event = eventOf(line);
+            if (!event) return;
+            firstEventMs ??= nowImpl() - started;
+            events.push(event);
+            // Stream lifecycle only. Command/output payloads may contain repository secrets.
+            onEvent?.({
+              type: event.type,
+              subtype: event.subtype,
+              sessionId: event.thread_id ?? event.session_id ?? current.sessionId,
+              model,
+            });
+          },
         });
-      },
-    });
+        break;
+      } catch (error) {
+        await restartAfterSilence(error, {
+          answered: events.length > 0 || startupRetries > 0,
+          aborted: signal?.aborted,
+          client,
+          startupTimeoutMs,
+          onStartupRetry,
+        });
+        startupRetries++;
+      }
+    }
     if (result.exitCode !== 0) {
       try {
         parseSessionEvents(client, events, { schema, sessionId: invocation.sessionId, model });
@@ -494,14 +614,24 @@ export async function runSession(
       sessionId: invocation.sessionId,
       model,
       durationMs: nowImpl() - started,
+      firstEventMs,
+      startupRetries,
     });
   } catch (error) {
     const failure =
       error instanceof ProviderError || signal?.aborted
         ? error
-        : new ProviderError(redact(error.message), 'unavailable');
+        : // An unconfirmed stop of the client's processes keeps its reason: no restart, no repair.
+          new ProviderError(
+            redact(error.message),
+            error?.code === 'process_teardown' ? 'process_teardown' : 'unavailable',
+          );
     if (failure instanceof Error && Object.isExtensible(failure))
-      failure.metrics = sessionMetrics(client, events, { durationMs: nowImpl() - started });
+      failure.metrics = sessionMetrics(client, events, {
+        durationMs: nowImpl() - started,
+        firstEventMs,
+        startupRetries,
+      });
     throw failure;
   } finally {
     if (
@@ -673,39 +803,43 @@ export async function decideJev({ task, models, node, attempt = 0 }, { secrets =
   }
 }
 
-/** @param {{ secrets?: import('./security.mjs').Secrets, config?: Record<string, any>, live?: boolean, signal?: AbortSignal }} [options] */
-export async function doctorProviders({ secrets = {}, config = {}, live = false, signal } = {}) {
-  const checks = [];
-  for (const client of Object.keys(defaults)) {
-    try {
-      await subscriptionStatus(client);
-      checks.push({ provider: client, ok: true, auth: 'subscription', live: false });
-    } catch (error) {
-      checks.push({ provider: client, ok: false, code: error.code, error: redact(error.message, secrets) });
-    }
-  }
-  for (const [provider, name] of Object.entries({
-    gemini: 'GEMINI_API_KEY',
-    jev: 'TYPESAFE_API_KEY',
-    scrape: 'SCRAPEDO_TOKEN',
-    reddit: 'REDDIT_API_KEY',
-    x: 'GETX_API_KEY',
-  }))
-    checks.push({
-      provider,
-      ok: Boolean(secrets[name]),
-      configured: Boolean(secrets[name]),
-      live: false,
-      ...(!secrets[name] ? { code: 'auth', error: `Не настроен ${name}` } : {}),
-    });
-  if (!live) return checks;
-  for (const client of Object.keys(defaults)) {
-    const check = checks.find(item => item.provider === client);
+const doctorProviderKeys = Object.freeze({
+  gemini: 'GEMINI_API_KEY',
+  jev: 'TYPESAFE_API_KEY',
+  scrape: 'SCRAPEDO_TOKEN',
+  reddit: 'REDDIT_API_KEY',
+  x: 'GETX_API_KEY',
+});
+
+function requiredProviderKeys(config = {}) {
+  const uiTools =
+    config.uiVerification?.enabled && Array.isArray(config.uiVerification.cases)
+      ? config.uiVerification.cases.map(item => item?.tool)
+      : [];
+  const uiNeedsGemini = uiTools.some(tool => ['browser-use', 'vibetest', 'jev-ultrafast'].includes(tool));
+  return {
+    gemini: ['standard', 'deep'].includes(config.executionMode) || uiNeedsGemini,
+    jev: uiTools.includes('jev-ultrafast'),
+    scrape: false,
+    reddit: false,
+    x: false,
+  };
+}
+
+const doctorResearchSources = Object.freeze({
+  scrape: ['github', 'hackernews', 'docs'],
+  reddit: ['reddit'],
+  x: ['x'],
+});
+
+async function doctorLiveProviders(checks, { clients, secrets, config, signal }, deps) {
+  for (const selected of clients) {
+    const check = checks.find(item => item.provider === selected);
     if (!check.ok) continue;
     try {
-      const result = await runSession({
-        client,
-        model: config.primaryModels?.[client] || defaults[client][0],
+      const result = await (deps.runSessionImpl || runSession)({
+        client: selected,
+        model: config.primaryModels?.[selected] || defaults[selected][0],
         cwd: config.project || process.cwd(),
         prompt: 'Return only {"ok":true}. Do not use tools, read files or change anything.',
         schema: { type: 'object', properties: { ok: { const: true } }, required: ['ok'], additionalProperties: false },
@@ -713,15 +847,21 @@ export async function doctorProviders({ secrets = {}, config = {}, live = false,
         timeoutMs: 120000,
         signal,
       });
-      Object.assign(check, { live: true, model: result.model, sessionId: result.sessionId });
+      Object.assign(check, { live: true, status: 'ok', ok: true, model: result.model, sessionId: result.sessionId });
     } catch (error) {
-      Object.assign(check, { ok: false, live: true, code: error.code, error: redact(error.message, secrets) });
+      Object.assign(check, {
+        ok: false,
+        status: 'error',
+        live: true,
+        code: error.code,
+        error: redact(error.message, secrets),
+      });
     }
   }
   const gemini = checks.find(item => item.provider === 'gemini');
-  if (gemini.ok) {
+  if (gemini.configured) {
     try {
-      const result = await analyzeGemini(
+      const result = await (deps.analyzeGeminiImpl || analyzeGemini)(
         {
           task: 'Check connectivity only. Analyze the provided tiny text, do not infer any repository.',
           files: [{ path: 'health.txt', content: 'Kodo provider connectivity check.' }],
@@ -729,44 +869,108 @@ export async function doctorProviders({ secrets = {}, config = {}, live = false,
         },
         { secrets },
       );
-      Object.assign(gemini, { live: true, model: result.model });
+      Object.assign(gemini, { live: true, status: 'ok', ok: true, model: result.model });
     } catch (error) {
-      Object.assign(gemini, { ok: false, live: true, code: error.code, error: redact(error.message, secrets) });
+      Object.assign(gemini, {
+        ok: false,
+        status: 'error',
+        live: true,
+        code: error.code,
+        error: redact(error.message, secrets),
+      });
     }
   }
   const jev = checks.find(item => item.provider === 'jev');
-  if (jev.ok) {
-    const result = await decideJev(
+  if (jev.configured) {
+    const primaryClient = clients[0];
+    const primaryModel = config.primaryModels?.[primaryClient] || defaults[primaryClient][0];
+    const result = await (deps.decideJevImpl || decideJev)(
       {
         task: 'Connectivity check',
         node: { id: 'health', writeScope: [] },
-        models: [{ id: 'codex:gpt-6.1-sol', client: 'codex', model: 'gpt-6.1-sol', available: true }],
+        models: [
+          { id: `${primaryClient}:${primaryModel}`, client: primaryClient, model: primaryModel, available: true },
+        ],
       },
       { secrets },
     );
     Object.assign(jev, {
       ok: !result.fallback,
+      status: result.fallback ? 'error' : 'ok',
       live: true,
       model: result.jevModel,
       ...(result.fallback ? { error: result.reason } : {}),
     });
   }
-  // Read-only service health uses the same bounded search path as real runs.
-  const { research } = await import('./research.mjs');
-  const result = await research({ task: 'nodejs sqlite library', budget: 5, signal }, { secrets });
-  for (const [provider, sources] of Object.entries({
-    scrape: ['github', 'hackernews', 'docs'],
-    reddit: ['reddit'],
-    x: ['x'],
-  })) {
-    const check = checks.find(item => item.provider === provider);
-    if (!check.configured) continue;
-    const errors = result.errors.filter(error => sources.includes(error.source));
-    Object.assign(check, {
-      live: true,
-      ok: errors.length === 0,
-      ...(errors.length ? { error: errors.map(error => error.error).join('; ') } : {}),
+  if (
+    Object.keys(doctorResearchSources).some(provider => checks.find(item => item.provider === provider)?.configured)
+  ) {
+    // Read-only service health uses the same bounded search path as real runs.
+    const researchFn = deps.researchImpl || (await import('./research.mjs')).research;
+    const result = await researchFn({ task: 'nodejs sqlite library', budget: 5, signal }, { secrets });
+    for (const [provider, sources] of Object.entries(doctorResearchSources)) {
+      const check = checks.find(item => item.provider === provider);
+      if (!check.configured) continue;
+      const errors = result.errors.filter(error => sources.includes(error.source));
+      Object.assign(check, {
+        live: true,
+        ok: errors.length === 0,
+        status: errors.length === 0 ? 'ok' : 'error',
+        ...(errors.length ? { error: errors.map(error => error.error).join('; ') } : {}),
+      });
+    }
+  }
+}
+
+/**
+ * @param {{ secrets?: import('./security.mjs').Secrets, config?: Record<string, any>, client?: string, live?: boolean, signal?: AbortSignal }} [options]
+ * @param {{
+ *   subscriptionStatusImpl?: (client: string) => Promise<any>,
+ *   runSessionImpl?: typeof runSession,
+ *   analyzeGeminiImpl?: typeof analyzeGemini,
+ *   decideJevImpl?: typeof decideJev,
+ *   researchImpl?: Function,
+ * }} [deps]
+ */
+export async function doctorProviders({ secrets = {}, config = {}, client, live = false, signal } = {}, deps = {}) {
+  const clients = client ? [client] : Object.keys(defaults);
+  for (const selected of clients)
+    if (!Object.hasOwn(defaults, selected)) throw new Error(`Неизвестный клиент: ${selected}`);
+  const checkSubscription = deps.subscriptionStatusImpl || (selected => subscriptionStatus(selected));
+  const checks = [];
+  for (const selected of clients) {
+    try {
+      await checkSubscription(selected);
+      checks.push({ provider: selected, required: true, status: 'ok', ok: true, auth: 'subscription', live: false });
+    } catch (error) {
+      checks.push({
+        provider: selected,
+        required: true,
+        status: 'error',
+        ok: false,
+        code: error.code,
+        error: redact(error.message, secrets),
+      });
+    }
+  }
+  const requiredKeys = requiredProviderKeys(config);
+  for (const [provider, name] of Object.entries(doctorProviderKeys)) {
+    const configured = Boolean(secrets[name]);
+    const required = Boolean(requiredKeys[provider]);
+    checks.push({
+      provider,
+      required,
+      status: configured ? 'ok' : required ? 'error' : 'warning',
+      ok: configured || !required,
+      configured,
+      live: false,
+      ...(!configured
+        ? required
+          ? { code: 'auth', error: `Не настроен ${name}` }
+          : { code: 'auth', warning: `Не настроен ${name} (необязателен для выбранного маршрута)` }
+        : {}),
     });
   }
+  if (live) await doctorLiveProviders(checks, { clients, secrets, config, signal }, deps);
   return checks;
 }

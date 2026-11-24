@@ -11,6 +11,7 @@ import {
   discoverProviders,
   analyzeGemini,
   decideJev,
+  doctorProviders,
   classifyProviderFailure,
   providerSchema,
 } from '../runtime/providers.mjs';
@@ -1055,4 +1056,579 @@ test('Research bounds the outgoing query and filters off-source HTML links', asy
     result.items.map(item => item.source),
     ['github', 'hackernews', 'docs'],
   );
+});
+
+test('doctorProviders checks only the selected client and warns on missing optional keys', async () => {
+  const checkedClients = [];
+  const checks = await doctorProviders(
+    {
+      client: 'claude-code',
+      secrets: { GEMINI_API_KEY: secrets.GEMINI_API_KEY },
+      config: { client: 'claude-code' },
+    },
+    {
+      subscriptionStatusImpl: async selected => {
+        checkedClients.push(selected);
+        if (selected !== 'claude-code') throw new ProviderError('codex not logged in', 'auth');
+        return { client: selected, available: true, auth: 'subscription' };
+      },
+    },
+  );
+  assert.deepEqual(checkedClients, ['claude-code']);
+  assert.equal(
+    checks.some(item => item.provider === 'codex'),
+    false,
+  );
+  const byProvider = Object.fromEntries(checks.map(item => [item.provider, item]));
+  assert.equal(byProvider['claude-code'].ok, true);
+  assert.equal(byProvider['claude-code'].status, 'ok');
+  assert.equal(byProvider['claude-code'].required, true);
+  assert.equal(byProvider.gemini.ok, true);
+  assert.equal(byProvider.gemini.status, 'ok');
+  assert.equal(byProvider.gemini.required, false);
+  for (const optional of ['jev', 'scrape', 'reddit', 'x']) {
+    assert.equal(byProvider[optional].ok, true, optional);
+    assert.equal(byProvider[optional].status, 'warning', optional);
+    assert.equal(byProvider[optional].required, false, optional);
+    assert.equal(byProvider[optional].configured, false, optional);
+    assert.equal(typeof byProvider[optional].warning, 'string', optional);
+  }
+});
+
+test('doctorProviders requires Gemini only for explicit standard/deep or model UI gates, warning in auto and quick', async () => {
+  const subscriptionStatusImpl = async selected => ({ client: selected, available: true, auth: 'subscription' });
+  const autoMissing = await doctorProviders(
+    { client: 'codex', secrets: {}, config: { client: 'codex' } },
+    { subscriptionStatusImpl },
+  );
+  for (const provider of ['gemini', 'jev', 'scrape', 'reddit', 'x']) {
+    const check = autoMissing.find(item => item.provider === provider);
+    assert.equal(check.ok, true, `auto:${provider}`);
+    assert.equal(check.status, 'warning', `auto:${provider}`);
+    assert.equal(check.required, false, `auto:${provider}`);
+  }
+
+  for (const mode of ['standard', 'deep']) {
+    const explicitMissing = await doctorProviders(
+      { client: 'codex', secrets: {}, config: { client: 'codex', executionMode: mode } },
+      { subscriptionStatusImpl },
+    );
+    const gemini = explicitMissing.find(item => item.provider === 'gemini');
+    assert.equal(gemini.ok, false, mode);
+    assert.equal(gemini.status, 'error', mode);
+    assert.equal(gemini.required, true, mode);
+    assert.equal(gemini.code, 'auth', mode);
+  }
+
+  const quickMissing = await doctorProviders(
+    { client: 'codex', secrets: {}, config: { client: 'codex', executionMode: 'quick' } },
+    { subscriptionStatusImpl },
+  );
+  for (const provider of ['gemini', 'jev', 'scrape', 'reddit', 'x']) {
+    const check = quickMissing.find(item => item.provider === provider);
+    assert.equal(check.ok, true, provider);
+    assert.equal(check.status, 'warning', provider);
+    assert.equal(check.required, false, provider);
+  }
+
+  const uiJev = await doctorProviders(
+    {
+      client: 'codex',
+      secrets: {},
+      config: {
+        client: 'codex',
+        executionMode: 'quick',
+        uiVerification: { enabled: true, cases: [{ id: 'ui', tool: 'jev-ultrafast' }] },
+      },
+    },
+    { subscriptionStatusImpl },
+  );
+  for (const provider of ['gemini', 'jev']) {
+    const check = uiJev.find(item => item.provider === provider);
+    assert.equal(check.ok, false, provider);
+    assert.equal(check.status, 'error', provider);
+    assert.equal(check.required, true, provider);
+  }
+  const uiBrowser = await doctorProviders(
+    {
+      client: 'codex',
+      secrets: {},
+      config: {
+        client: 'codex',
+        uiVerification: { enabled: true, cases: [{ id: 'ui', tool: 'browser-use' }] },
+      },
+    },
+    { subscriptionStatusImpl },
+  );
+  assert.equal(uiBrowser.find(item => item.provider === 'gemini').required, true);
+  assert.equal(uiBrowser.find(item => item.provider === 'gemini').status, 'error');
+  assert.equal(uiBrowser.find(item => item.provider === 'jev').required, false);
+  assert.equal(uiBrowser.find(item => item.provider === 'jev').status, 'warning');
+});
+
+test('doctorProviders live mode skips unconfigured optional keys and unselected clients', async () => {
+  const called = [];
+  const checks = await doctorProviders(
+    {
+      client: 'claude-code',
+      live: true,
+      secrets: { GEMINI_API_KEY: secrets.GEMINI_API_KEY },
+      config: { client: 'claude-code' },
+    },
+    {
+      subscriptionStatusImpl: async selected => {
+        called.push(`status:${selected}`);
+        return { client: selected, available: true, auth: 'subscription' };
+      },
+      runSessionImpl: async request => {
+        called.push(`session:${request.client}`);
+        return { model: request.model, sessionId: 'live-session-1', output: { ok: true } };
+      },
+      analyzeGeminiImpl: async () => {
+        called.push('gemini');
+        return { model: 'gemini-fixture' };
+      },
+      decideJevImpl: async () => {
+        called.push('jev');
+        return { fallback: false, jevModel: 'jev-fixture' };
+      },
+      researchImpl: async () => {
+        called.push('research');
+        return { items: [], errors: [] };
+      },
+    },
+  );
+  assert.deepEqual(called, ['status:claude-code', 'session:claude-code', 'gemini']);
+  assert.equal(checks.find(item => item.provider === 'claude-code').live, true);
+  assert.equal(checks.find(item => item.provider === 'gemini').live, true);
+  assert.equal(checks.find(item => item.provider === 'jev').live, false);
+  assert.equal(checks.find(item => item.provider === 'jev').status, 'warning');
+});
+const claudeLoggedIn = JSON.stringify({ loggedIn: true, authMethod: 'claude.ai' });
+const claudeResult = id =>
+  JSON.stringify({ type: 'result', subtype: 'success', structured_output: { ok: true }, session_id: id });
+
+const jsonObjectLine = line => {
+  try {
+    const value = JSON.parse(line);
+    return value !== null && typeof value === 'object' && !Array.isArray(value);
+  } catch {
+    return false;
+  }
+};
+
+test('Process runner stops a client without a first JSON line at the startup limit', async () => {
+  const started = performance.now();
+  await assert.rejects(
+    runProcess({
+      command: process.execPath,
+      // A banner that is not an event does not count as a start.
+      args: ['-e', "process.stdout.write('warming up\\n');setInterval(()=>{},1000)"],
+      timeoutMs: 60000,
+      startupTimeoutMs: 300,
+      startedBy: jsonObjectLine,
+    }),
+    error => error.code === 'KODO_STARTUP_TIMEOUT',
+  );
+  assert.ok(performance.now() - started < 30000, 'the startup limit, not the session limit, stopped it');
+});
+
+test('The first JSON line clears the startup limit, whatever the cold start costs', async () => {
+  // The client outlives the limit counted from its own first line, so the run proves the limit
+  // was cleared. A cold start slower than the limit prints nothing before it fires: that attempt
+  // is inconclusive and repeats with a doubled limit. A timeout after the first line is a failure.
+  for (let limit = 1500; ; limit *= 2) {
+    let firstLine = null;
+    const spawned = performance.now();
+    try {
+      const result = await runProcess({
+        command: process.execPath,
+        args: ['-e', `process.stdout.write('{"type":"init"}\\n');setTimeout(()=>{},${limit + 500})`],
+        timeoutMs: 120000,
+        startupTimeoutMs: limit,
+        startedBy: jsonObjectLine,
+        onLine: () => {
+          firstLine ??= performance.now();
+        },
+      });
+      assert.equal(result.exitCode, 0);
+      assert.ok(performance.now() - spawned > limit, 'the client outlived the startup limit');
+      return;
+    } catch (error) {
+      if (error.code !== 'KODO_STARTUP_TIMEOUT' || firstLine !== null || limit >= 12000) throw error;
+    }
+  }
+});
+
+/** Waits until `pid` is gone; false if it is still alive after `ms`. */
+async function gone(pid, ms = 5000) {
+  for (const until = performance.now() + ms; performance.now() < until;) {
+    try {
+      process.kill(pid, 0);
+    } catch {
+      return true;
+    }
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  return false;
+}
+
+/** Stops a run as soon as `ready` sees its line: no fixed wait for the descendant to start. */
+function stopWhenReady(ready) {
+  const controller = new AbortController();
+  return {
+    signal: controller.signal,
+    onLine: line => {
+      if (ready(line)) controller.abort(Object.assign(new Error('descendant ready'), { code: 'TEST_STOP' }));
+    },
+  };
+}
+
+test('A stopped client takes the descendant that inherited its stdout with it', { timeout: 60000 }, async t => {
+  let descendant;
+  t.after(() => {
+    try {
+      if (descendant) process.kill(descendant, 'SIGKILL');
+    } catch {}
+  });
+  const launcher = `const { spawn } = require('node:child_process');
+const child = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: ['ignore', 'inherit', 'inherit'], windowsHide: true });
+process.stdout.write('descendant ' + child.pid + '\\n');
+setInterval(()=>{},1000);`;
+  const started = performance.now();
+  await assert.rejects(
+    runProcess({
+      command: process.execPath,
+      args: ['-e', launcher],
+      timeoutMs: 120000,
+      ...stopWhenReady(line => (descendant ??= Number(/^descendant (\d+)$/.exec(line)?.[1]) || undefined)),
+    }),
+    error => error.code === 'TEST_STOP',
+  );
+  assert.ok(performance.now() - started < 30000, 'the runner did not wait for the inherited pipe');
+  assert.ok(descendant, 'the descendant reported itself');
+  assert.equal(await gone(descendant), true, 'the whole process tree or group was stopped');
+});
+
+test('A descendant that escaped the tree cannot hold a stopped session open', { timeout: 60000 }, async t => {
+  let escaped;
+  t.after(() => {
+    try {
+      if (escaped) process.kill(escaped, 'SIGKILL');
+    } catch {}
+  });
+  // The middle process starts a detached grandchild that inherits stdout and exits at once: the
+  // grandchild is outside the client's tree (Windows) and process group (POSIX).
+  const middle = `const g = require('node:child_process').spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: ['ignore', 'inherit', 'inherit'], detached: true, windowsHide: true });
+process.stdout.write('escaped ' + g.pid + '\\n');
+g.unref();`;
+  const launcher = `require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(middle)}], { stdio: ['ignore', 'inherit', 'inherit'], windowsHide: true });
+setInterval(()=>{},1000);`;
+  const started = performance.now();
+  await assert.rejects(
+    runProcess({
+      command: process.execPath,
+      args: ['-e', launcher],
+      timeoutMs: 120000,
+      ...stopWhenReady(line => (escaped ??= Number(/^escaped (\d+)$/.exec(line)?.[1]) || undefined)),
+    }),
+    error => error.code === 'TEST_STOP',
+  );
+  assert.ok(performance.now() - started < 30000, 'a bounded wait, not the pipe, ended the session');
+  assert.ok(escaped, 'the escaped descendant reported itself');
+});
+
+test('A stopped attempt ends only after its processes are confirmed stopped', { timeout: 60000 }, async () => {
+  let confirmed = false;
+  await assert.rejects(
+    runProcess({
+      command: process.execPath,
+      args: ['-e', "process.stdout.write('up\\n');setInterval(()=>{},1000)"],
+      timeoutMs: 120000,
+      ...stopWhenReady(line => line === 'up'),
+      stopImpl: async child => {
+        await new Promise(resolve => setTimeout(resolve, 300));
+        child.kill('SIGKILL');
+        confirmed = true;
+      },
+    }),
+    error => {
+      assert.equal(error.code, 'TEST_STOP');
+      assert.equal(confirmed, true, 'the attempt did not end before the stop was confirmed');
+      return true;
+    },
+  );
+});
+
+test(
+  'The first stop reason stays: the startup limit does not replace an output limit',
+  { timeout: 60000 },
+  async () => {
+    // The stop is held past the startup limit, so a startup timer still armed would fire during it.
+    // A cold start slower than the limit reaches no output first: inconclusive, the limit doubles.
+    for (let limit = 1500; ; limit *= 2) {
+      let stoppedAt = null;
+      const spawned = performance.now();
+      const failure = await runProcess({
+        command: process.execPath,
+        args: ['-e', "process.stdout.write('x'.repeat(4096));setInterval(()=>{},1000)"],
+        timeoutMs: 120000,
+        maxOutputBytes: 100,
+        startupTimeoutMs: limit,
+        startedBy: jsonObjectLine,
+        stopImpl: async child => {
+          stoppedAt = performance.now() - spawned;
+          await new Promise(resolve => setTimeout(resolve, Math.max(0, limit - stoppedAt) + 300));
+          child.kill('SIGKILL');
+        },
+      }).then(
+        () => null,
+        error => error,
+      );
+      if (stoppedAt !== null && stoppedAt < limit) {
+        assert.equal(failure?.code, 'KODO_OUTPUT_LIMIT', 'the first reason is kept, no restart is allowed');
+        return;
+      }
+      assert.ok(limit < 12000, 'the client never started within the limit');
+    }
+  },
+);
+
+test('An unconfirmed stop is reported as such and never followed by a restart', { timeout: 60000 }, async t => {
+  let client;
+  t.after(() => {
+    try {
+      if (client?.pid) process.kill(client.pid, 'SIGKILL');
+    } catch {}
+  });
+  await assert.rejects(
+    runProcess({
+      command: process.execPath,
+      args: ['-e', 'setInterval(()=>{},1000)'],
+      timeoutMs: 120000,
+      startupTimeoutMs: 300,
+      startedBy: jsonObjectLine,
+      stopImpl: async child => {
+        client = child;
+        throw new Error('access denied');
+      },
+    }),
+    error => error.code === 'process_teardown' && /не подтверждена/.test(error.message),
+  );
+  let starts = 0,
+    restarts = 0;
+  await assert.rejects(
+    runSession(
+      {
+        client: 'claude-code',
+        cwd: process.cwd(),
+        prompt: 'fixture task',
+        schema,
+        startupTimeoutMs: 50,
+        onStartupRetry: () => {
+          restarts++;
+        },
+      },
+      {
+        resolveClientImpl: async () => ({ command: 'fixture', args: [] }),
+        processImpl: async invocation => {
+          if (invocation.args.includes('status')) return { exitCode: 0, stdout: claudeLoggedIn, stderr: '' };
+          starts++;
+          throw Object.assign(new Error('Остановка процессов клиента не подтверждена'), { code: 'process_teardown' });
+        },
+      },
+    ),
+    error => error.code === 'process_teardown',
+  );
+  assert.deepEqual([starts, restarts], [1, 0], 'no restart after an unconfirmed stop');
+});
+
+test('A session without any event is started again exactly once with a fresh native session', async () => {
+  const exec = [];
+  let status = 0,
+    now = 0;
+  const deps = timeouts => ({
+    nowImpl: () => now,
+    resolveClientImpl: async () => ({ command: 'fixture', args: [] }),
+    processImpl: async invocation => {
+      if (invocation.args.includes('status')) {
+        status++;
+        return { exitCode: 0, stdout: claudeLoggedIn, stderr: '' };
+      }
+      exec.push(invocation.args);
+      assert.equal(invocation.startupTimeoutMs, 50);
+      assert.equal(invocation.startedBy('{"type":"system"}'), true);
+      assert.equal(invocation.startedBy('Loading'), false);
+      // Only a JSON object is an event; other JSON values are not a start.
+      for (const value of ['null', '42', '"text"', '[1]']) assert.equal(invocation.startedBy(value), false, value);
+      if (exec.length <= timeouts) {
+        now += 50;
+        throw Object.assign(new Error('no first event'), { code: 'KODO_STARTUP_TIMEOUT' });
+      }
+      now += 7;
+      invocation.onLine(claudeResult(invocation.args[invocation.args.indexOf('--session-id') + 1]));
+      return { exitCode: 0, stdout: '', stderr: '' };
+    },
+  });
+  const request = { client: 'claude-code', cwd: process.cwd(), prompt: 'fixture task', schema, startupTimeoutMs: 50 };
+  const result = await runSession(request, deps(1));
+  assert.deepEqual(result.output, { ok: true });
+  assert.equal(exec.length, 2, 'one automatic restart');
+  assert.equal(status, 1, 'the restart does not check the login again');
+  const ids = exec.map(args => args[args.indexOf('--session-id') + 1]);
+  assert.notEqual(ids[0], ids[1], 'the restart is a fresh native session');
+  assert.equal(result.sessionId, ids[1]);
+  assert.equal(result.metrics.startupRetries, 1);
+  assert.equal(result.metrics.firstEventMs, 57, 'measured from the start of the session');
+
+  exec.length = 0;
+  now = 0;
+  await assert.rejects(runSession(request, deps(5)), error => {
+    assert.equal(exec.length, 2, 'exactly one restart, never a second');
+    assert.deepEqual([error.code, error.startupTimeout], ['unavailable', true]);
+    assert.equal(error.metrics.firstEventMs, null, 'no event was observed');
+    assert.equal(error.metrics.startupRetries, 1);
+    return true;
+  });
+});
+
+test('A session that already produced events is never restarted', async () => {
+  let exec = 0;
+  const deps = {
+    resolveClientImpl: async () => ({ command: 'fixture', args: [] }),
+    processImpl: async invocation => {
+      if (invocation.args.includes('status')) return { exitCode: 0, stdout: 'Logged in using ChatGPT', stderr: '' };
+      exec++;
+      invocation.onLine(JSON.stringify(codexEvents[0]));
+      throw Object.assign(new Error('late'), { code: 'KODO_STARTUP_TIMEOUT' });
+    },
+  };
+  await assert.rejects(
+    runSession({ client: 'codex', cwd: process.cwd(), prompt: 'fixture task', schema, startupTimeoutMs: 50 }, deps),
+    error => error.code === 'unavailable' && error.startupTimeout === true && error.metrics.firstEventMs !== null,
+  );
+  assert.equal(exec, 1);
+});
+
+test('A shared run cache checks the subscription login once per client and forgets a failed check', async () => {
+  let status = 0,
+    loggedIn = false;
+  const deps = {
+    resolveClientImpl: async () => ({ command: 'fixture', args: [] }),
+    processImpl: async invocation => {
+      if (invocation.args.includes('status')) {
+        status++;
+        return loggedIn
+          ? { exitCode: 0, stdout: claudeLoggedIn, stderr: '' }
+          : { exitCode: 0, stdout: JSON.stringify({ loggedIn: false }), stderr: '' };
+      }
+      invocation.onLine(claudeResult(invocation.args[invocation.args.indexOf('--session-id') + 1]));
+      return { exitCode: 0, stdout: '', stderr: '' };
+    },
+  };
+  const subscriptionChecks = new Map();
+  const request = { client: 'claude-code', cwd: process.cwd(), prompt: 'fixture task', schema, subscriptionChecks };
+  await assert.rejects(runSession(request, deps), error => error.code === 'auth');
+  loggedIn = true;
+  await runSession(request, deps);
+  await runSession(request, deps);
+  assert.equal(status, 2, 'a failed check is not remembered; a passed one is reused');
+  await runSession({ ...request, subscriptionChecks: undefined }, deps);
+  assert.equal(status, 3, 'without a run cache every session checks');
+
+  // Model discovery of the same run fills the cache that its sessions use.
+  const shared = new Map();
+  let discovered = 0;
+  const statusImpl = async client => {
+    discovered++;
+    return subscriptionStatus(client, deps);
+  };
+  const pool = await discoverProviders(
+    { client: 'claude-code' },
+    { statusImpl, cacheImpl: async () => [], subscriptionChecks: shared },
+  );
+  assert.ok(pool.every(entry => entry.available));
+  await runSession({ ...request, subscriptionChecks: shared }, deps);
+  await runSession({ ...request, subscriptionChecks: shared }, deps);
+  assert.deepEqual([discovered, status], [1, 4], 'one login check for discovery and every session');
+
+  // Only a passed check is remembered: an unavailable answer without an exception is not.
+  const unavailable = new Map();
+  await discoverProviders(
+    { client: 'claude-code' },
+    { statusImpl: async () => ({ available: false }), cacheImpl: async () => [], subscriptionChecks: unavailable },
+  );
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(unavailable.has('claude-code'), false);
+  await runSession({ ...request, subscriptionChecks: unavailable }, deps);
+  assert.equal(status, 5, 'the session checks the login itself');
+  // A passed check without an executable cannot start a client: the session checks itself.
+  const incomplete = new Map([['claude-code', Promise.resolve({ available: true })]]);
+  await runSession({ ...request, subscriptionChecks: incomplete }, deps);
+  assert.equal(status, 6);
+});
+
+test('Each restart is admitted by the caller, and a refused restart starts nothing', async () => {
+  const order = [];
+  const deps = {
+    resolveClientImpl: async () => ({ command: 'fixture', args: [] }),
+    processImpl: async invocation => {
+      if (invocation.args.includes('status')) return { exitCode: 0, stdout: claudeLoggedIn, stderr: '' };
+      order.push('start');
+      if (order.filter(item => item === 'start').length === 1)
+        throw Object.assign(new Error('no first event'), { code: 'KODO_STARTUP_TIMEOUT' });
+      invocation.onLine(claudeResult(invocation.args[invocation.args.indexOf('--session-id') + 1]));
+      return { exitCode: 0, stdout: '', stderr: '' };
+    },
+  };
+  const request = { client: 'claude-code', cwd: process.cwd(), prompt: 'fixture task', schema, startupTimeoutMs: 50 };
+  const result = await runSession(
+    {
+      ...request,
+      onStartupRetry: async details => {
+        order.push(details.reason);
+      },
+    },
+    deps,
+  );
+  assert.deepEqual(result.output, { ok: true });
+  assert.deepEqual(order, ['start', 'startup_timeout', 'start'], 'admission comes before the restart');
+
+  order.length = 0;
+  await assert.rejects(
+    runSession(
+      {
+        ...request,
+        onStartupRetry: async () => {
+          throw Object.assign(new Error('Исчерпан лимит сессий запуска: 2'), { code: 'budget' });
+        },
+      },
+      deps,
+    ),
+    error => error.code === 'budget' && error.startupTimeout === undefined,
+  );
+  assert.deepEqual(order, ['start'], 'no second start after a refusal');
+});
+
+test('JSON values that are not objects are not client events', async () => {
+  let now = 0;
+  const result = await runSession(
+    { client: 'claude-code', cwd: process.cwd(), prompt: 'fixture task', schema },
+    {
+      nowImpl: () => now,
+      resolveClientImpl: async () => ({ command: 'fixture', args: [] }),
+      processImpl: async invocation => {
+        if (invocation.args.includes('status')) return { exitCode: 0, stdout: claudeLoggedIn, stderr: '' };
+        for (const line of ['null', '42', '"text"', '[1]']) {
+          now += 10;
+          invocation.onLine(line);
+        }
+        now += 10;
+        invocation.onLine(claudeResult(invocation.args[invocation.args.indexOf('--session-id') + 1]));
+        return { exitCode: 0, stdout: '', stderr: '' };
+      },
+    },
+  );
+  assert.deepEqual(result.output, { ok: true });
+  assert.equal(result.metrics.firstEventMs, 50, 'the first object is the first event');
 });

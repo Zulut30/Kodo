@@ -25,6 +25,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { execute } from './command.mjs';
 import { makeWorktree, worktreeHomeFor } from './workspace.mjs';
 import { scopesOverlap } from './contracts.mjs';
+import { redact } from './security.mjs';
 import * as projectContracts from './project-contracts.mjs';
 import { planProjectHorizon } from './project-planner.mjs';
 import {
@@ -37,9 +38,10 @@ import {
   mergeTask,
   waveFrontier,
 } from './project-integration.mjs';
+import { withGateController } from './project-controller-lease.mjs';
 import { withIntegrationLease as withLease } from './project-integration-lease.mjs';
 import { GATE_WATCHDOG, createGateRunDraft, runEpicGate } from './wave-verifier.mjs';
-import { normalizeWatchdogConfig } from './watchdog.mjs';
+import { normalizeWatchdogConfig, recordBlocker } from './watchdog.mjs';
 import { applyWavePolicy, assertWavePolicy } from './wave-policy.mjs';
 import {
   bindingFor,
@@ -575,7 +577,12 @@ async function reserveGate(ctx, snapshot, containers, retry) {
       commandFor(await snapshotOf(ctx, projectId), { op: 'reserveGate', containers, baseSha, headSha, merges, retry }),
     );
     const gate = (await snapshotOf(ctx, projectId)).gates.find(row => row.id === result.entity.id);
-    return { gate, run: await installGate(ctx, projectId, gate) };
+    // The first install is refused like a later one (installOrReplace): the caller reports it.
+    try {
+      return { gate, run: await installGate(ctx, projectId, gate) };
+    } catch (error) {
+      return { gate, refused: installRefusal(ctx, gate, containers, error) };
+    }
   });
 }
 
@@ -596,6 +603,22 @@ async function installGate(ctx, projectId, gate) {
   });
 }
 
+// A refused install of a reserved gate (gate_invalid) as a blocker row; any other error is thrown.
+// No gate Run exists yet: the row names the reserved Run, the stage and the install's own
+// diagnosis (the gate checks of wave-verifier name fields and task ids, never file contents).
+function installRefusal(ctx, gate, containers, error) {
+  if (error?.code !== 'gate_invalid') throw error;
+  return {
+    code: error.code,
+    kind: containers[0].kind,
+    id: containers[0].id,
+    gateId: gate.id,
+    ...(typeof gate.runId === 'string' ? { runId: gate.runId } : {}),
+    stage: 'install',
+    message: redact(String(error.message), ctx.engine.secrets ?? {}).slice(0, 500),
+  };
+}
+
 // A reservation whose install was interrupted is installed now; when the branch has moved past
 // its head, a new reservation on the current head replaces it (the store marks it superseded).
 async function installOrReplace(ctx, snapshot, gate, containers, out) {
@@ -603,8 +626,7 @@ async function installOrReplace(ctx, snapshot, gate, containers, out) {
     return { gate, run: await installGate(ctx, snapshot.project.projectId, gate) };
   } catch (error) {
     if (error?.code === 'gate_head_stale') return reserveGate(ctx, snapshot, containers, false);
-    if (error?.code !== 'gate_invalid') throw error;
-    out.blocked.push({ code: error.code, kind: containers[0].kind, id: containers[0].id });
+    out.blocked.push(installRefusal(ctx, gate, containers, error));
     return null;
   }
 }
@@ -617,20 +639,22 @@ async function accept(ctx, snapshot, kind, record, criteria, refs, out) {
     actor: 'project-director',
     reason: 'The wave gate verified the integrated result',
   }));
-  if (mappings.some(row => !row.refs.length)) {
-    out.blocked.push({ code: 'wave_gate_proof_missing', kind, id });
-    return false;
-  }
+  const missing = mappings.find(row => !row.refs.length);
+  if (missing)
+    return {
+      code: 'wave_gate_proof_missing',
+      kind,
+      id,
+      message: `Gate evidence does not cover criterion ${missing.criterionId} of ${kind} ${id}`,
+    };
   try {
     await ctx.repo.apply(commandFor(snapshot, transitionAction(kind, id, 'accepted', refs, mappings)));
   } catch (error) {
     // The branch moved while the project proof was checked: the project gate follows.
-    if (kind === 'project' && (await projectHeadMoved(snapshot, refs[0]?.headSha))) return false;
-    out.blocked.push({ code: error?.code || 'project_transition_blocked', kind, id });
-    return false;
+    if (kind === 'project' && (await projectHeadMoved(snapshot, refs[0]?.headSha))) return;
+    return { code: error?.code || 'project_transition_blocked', kind, id };
   }
   out.accepted.push({ kind, id });
-  return true;
 }
 
 const projectHeadMoved = async (snapshot, verifiedHead) =>
@@ -639,7 +663,7 @@ const projectHeadMoved = async (snapshot, verifiedHead) =>
 // Every repair commit of a gate (`gate.headSha..run.headSha`), not only the verified result, would
 // enter the branch: each must stay inside the covered tasks' write paths, without secret files,
 // links or known secret values (`inspectHistory`). A defect blocks the gate Run (a retry reserves a
-// new gate on the branch head) and is returned as its blocker code; null when the history is clean.
+// new gate on the branch head). Return its code and diagnostic, or null for clean history.
 async function gateHistoryDefect(ctx, snapshot, gate, run, worktree) {
   if (run.headSha === gate.headSha) return null;
   const writePaths = gate.merges.flatMap(merge => taskOf(snapshot, merge.taskId)?.writePaths ?? []);
@@ -656,29 +680,22 @@ async function gateHistoryDefect(ctx, snapshot, gate, run, worktree) {
   const code =
     found.kind === 'unverifiable' ? 'project_integration_history_unverifiable' : 'project_integration_history';
   const where = found.commit ? `commit ${found.commit.slice(0, 12)}` : 'the repair history';
-  ctx.store.updateRun(run.id, {
-    state: 'blocked',
-    error: { code, message: `Gate repair history is unsafe (${found.kind}) in ${where}` },
-  });
-  return code;
+  return { code, message: `Gate repair history is unsafe (${found.kind}) in ${where}` };
 }
 
 // Bring the verified gate head back, then accept the covered tasks and containers, all under one
 // integration lease held until each acceptance commits: the authorizer's Git proof (merges,
 // range, verified head on the branch) cannot go stale in between. The project is accepted only
 // while the branch head is the gate's verified head; otherwise a project gate follows.
-async function acceptGate(ctx, projectId, gate, run, out) {
-  await withIntegrationLease(ctx, projectId, undefined, async () => {
+async function acceptGate(ctx, projectId, gate, run, out, signal) {
+  return withIntegrationLease(ctx, projectId, signal, async () => {
     const before = await snapshotOf(ctx, projectId);
     const { worktree } = await integrationOf(ctx, before);
     const unsafe = await gateHistoryDefect(ctx, before, gate, run, worktree);
-    if (unsafe) {
-      const [gated] = gate.containers;
-      out.blocked.push({ code: unsafe, kind: gated.kind, id: gated.id });
-      return;
-    }
+    if (unsafe) return { ...unsafe, ...gate.containers[0] };
     // Fast-forward while the branch still stands on the gate head; otherwise the
     // in-scope repairs are merged `--no-ff`.
+    if (signal?.aborted || controlState(await snapshotOf(ctx, projectId))) return;
     await mergeBackGate({ worktree, expectedHead: gate.headSha, gateHead: run.headSha });
     const refs = await persistRefs(ctx, run, gateKinds);
     for (const merge of gate.merges)
@@ -687,62 +704,140 @@ async function acceptGate(ctx, projectId, gate, run, out) {
         const task = taskOf(snapshot, merge.taskId),
           record = kind === 'attempt' ? currentOf(snapshot, merge.taskId) : task;
         if (settled(record.status)) continue;
-        if (!(await accept(ctx, snapshot, kind, record, task.acceptance, refs, out))) return;
+        const refusal = await accept(ctx, snapshot, kind, record, task.acceptance, refs, out);
+        if (refusal) return refusal;
       }
-    await advanceContainers(ctx, projectId);
+    const blockers = await advanceContainers(ctx, projectId);
+    const blocked = blockers.find(row =>
+      gate.containers.some(container => container.kind === row.kind && container.id === row.id),
+    );
+    if (blocked) return blocked;
     for (const container of gate.containers) {
       const snapshot = await snapshotOf(ctx, projectId);
       const record = recordOf(snapshot, container.kind, container.id);
       if (settled(record.status)) continue;
       if (container.kind === 'project' && (await projectHeadMoved(snapshot, run.headSha))) return;
       const criteria = container.kind === 'project' ? record.definitionOfDone : record.acceptance;
-      if (!(await accept(ctx, snapshot, container.kind, record, criteria, refs, out))) return;
+      const refusal = await accept(ctx, snapshot, container.kind, record, criteria, refs, out);
+      if (refusal) return refusal;
     }
   });
+}
+
+// Acceptance commits children before parents. If a wider container refused this gate,
+// finish the same chain even though the epic itself is already accepted.
+function unfinishedEpicGate(ctx, snapshot, epic) {
+  if (!settled(epic.status)) return false;
+  const gate = latestGate(snapshot, 'epic', epic.id);
+  const open = gate?.containers.find(item => !settled(recordOf(snapshot, item.kind, item.id).status));
+  if (
+    !open ||
+    snapshot.gates.some(
+      other =>
+        other.number > gate.number && other.containers.some(item => item.kind === open.kind && item.id === open.id),
+    )
+  )
+    return false;
+  // When only the project head moved, the normal project gate follows. An extension
+  // also reopens the project, but its tasks are outside the old gate's coverage.
+  return (
+    open.kind !== 'project' ||
+    (gate.merges.length === snapshot.tasks.length && storedRun(ctx.store, gate.runId)?.state !== 'succeeded')
+  );
 }
 
 // The current gate of an epic and its Run: the latest one, a new one, or a retry.
 async function epicGate(ctx, snapshot, epic, retryFailed, out) {
   const gate = latestGate(snapshot, 'epic', epic.id),
     run = gate && storedRun(ctx.store, gate.runId);
+  const containers = settled(epic.status) ? gate.containers : gateContainers(snapshot, epic);
   if (gate && run && retryStates.includes(run.state)) {
-    if (retryFailed) return reserveGate(ctx, snapshot, gateContainers(snapshot, epic), true);
+    if (retryFailed) return reserveGate(ctx, snapshot, containers, true);
     out.gates.push({ gateId: gate.id, runId: run.id, state: run.state });
-    out.blocked.push({ code: blockerOf(run), kind: 'epic', id: epic.id });
+    out.blocked.push({ code: blockerOf(run), kind: 'epic', id: epic.id, gateId: gate.id, runId: run.id });
     return null;
   }
-  if (!gate) return reserveGate(ctx, snapshot, gateContainers(snapshot, epic), false);
+  if (!gate) return reserveGate(ctx, snapshot, containers, false);
   if (run) return { gate, run };
-  return installOrReplace(ctx, snapshot, gate, gateContainers(snapshot, epic), out);
+  return installOrReplace(ctx, snapshot, gate, containers, out);
 }
 
-// Execute an installed gate Run once, then accept what it verified.
+// Failures of Git merge-back and immutable evidence publication that invalidate this Run.
+const gateReturnErrors = {
+  project_integration_conflict: 'Verified gate repairs conflict with the current integration head',
+  project_integration_invalid: 'The gate head cannot be integrated on the current branch history',
+  evidence_integrity: 'The immutable acceptance evidence of this gate failed its integrity check',
+};
+
+const temporaryAcceptanceCodes = new Set([
+  'project_revision_conflict',
+  'project_control_blocked',
+  'project_busy',
+  'project_cancelled',
+  'project_integration_busy',
+  'project_integration_branch_busy',
+  'project_integration_worktree_invalid',
+  'project_snapshot_incomplete',
+  'project_database_corrupt',
+  'project_integration_lease_required',
+  'project_lease_lost',
+]);
+
+// Execute an installed gate Run once, then accept what it verified. Every blocker of this gate
+// names it (`gateId`, `runId`): the host reads the gate Run behind the code.
 async function runAndAccept(ctx, projectId, { gate, run }, signal, out, entity) {
-  if (run.state !== 'succeeded') run = await runEpicGate({ engine: ctx.engine, run, signal });
+  if (run.state !== 'succeeded') run = await (ctx.runGate ?? runEpicGate)({ engine: ctx.engine, run, signal });
   if (run.state !== 'succeeded') {
     out.gates.push({ gateId: gate.id, runId: run.id, state: run.state });
     out.blocked.push({
       code: run.state === 'waiting_limits' ? 'quota' : blockerOf(run),
       ...entity,
+      gateId: gate.id,
+      runId: run.id,
       state: run.state,
     });
     return;
   }
+  const before = out.blocked.length;
+  let refusal;
   try {
-    await acceptGate(ctx, projectId, gate, run, out);
+    refusal = await acceptGate(ctx, projectId, gate, run, out, signal);
   } catch (error) {
-    if (!['project_integration_conflict', 'project_integration_invalid'].includes(error?.code)) throw error;
-    out.blocked.push({ code: error.code, ...entity });
-  } finally {
-    // Acceptance may still block the Run (for example a repair history defect): report the saved state.
-    const saved = storedRun(ctx.store, run.id) ?? run;
-    out.gates.push({ gateId: gate.id, runId: saved.id, state: saved.state });
+    const code = error?.code;
+    if (!Object.hasOwn(gateReturnErrors, code)) throw error;
+    refusal = { ...entity, code, message: gateReturnErrors[code] };
   }
+  if (refusal) {
+    const { code, kind, id } = refusal;
+    out.blocked.push({ code, kind, id });
+    // A control/lease race or a storage error can resume the same verified proof.
+    // A rejected transition or invalid immutable proof needs a new reservation.
+    if (/^[a-z][a-z0-9_]*$/.test(code) && !temporaryAcceptanceCodes.has(code)) {
+      const message = refusal.message ?? `Gate acceptance of ${kind} ${id} failed (${code})`;
+      run = ctx.store.updateRun(run.id, {
+        state: 'blocked',
+        error: { code, message },
+        blocker: recordBlocker(run.blocker, {
+          code,
+          message,
+          scope: 'integration',
+          headSha: run.headSha,
+          at: ctx.clock(),
+        }),
+      });
+    }
+  }
+  // Acceptance may still block the Run (for example a repair history defect): report the saved state.
+  const saved = storedRun(ctx.store, run.id) ?? run;
+  out.gates.push({ gateId: gate.id, runId: saved.id, state: saved.state });
+  for (const row of out.blocked.slice(before)) Object.assign(row, { gateId: gate.id, runId: saved.id });
 }
 
 async function gateEpic(ctx, snapshot, epic, { signal, retryFailed }, out) {
   const current = await epicGate(ctx, snapshot, epic, retryFailed, out);
-  if (current) await runAndAccept(ctx, snapshot.project.projectId, current, signal, out, { kind: 'epic', id: epic.id });
+  if (current?.refused) out.blocked.push(current.refused);
+  else if (current)
+    await runAndAccept(ctx, snapshot.project.projectId, current, signal, out, { kind: 'epic', id: epic.id });
 }
 
 // The project gate's Run: the latest one, a new one (none yet, a stale reservation, or a verified
@@ -757,7 +852,7 @@ async function projectGateRun(ctx, snapshot, { retryFailed, stale }, out) {
   if (!retryStates.includes(run.state)) return { gate, run };
   if (retryFailed) return reserveGate(ctx, snapshot, containers, true);
   out.gates.push({ gateId: gate.id, runId: run.id, state: run.state });
-  out.blocked.push({ code: blockerOf(run), kind: 'project', id: projectId });
+  out.blocked.push({ code: blockerOf(run), kind: 'project', id: projectId, gateId: gate.id, runId: run.id });
   return null;
 }
 
@@ -784,6 +879,10 @@ async function gateProject(ctx, { projectId, signal, retryFailed }, out) {
     const blocked = out.blocked.length;
     const current = await projectGateRun(ctx, snapshot, { retryFailed, stale }, out);
     if (!current) return;
+    if (current.refused) {
+      out.blocked.push(current.refused);
+      return;
+    }
     await runAndAccept(ctx, projectId, current, signal, out, { kind: 'project', id: projectId });
     if (out.blocked.length > blocked) return;
   }
@@ -806,13 +905,82 @@ export async function runPendingGates(ctx, { projectId, signal, retryFailed = fa
     const snapshot = await snapshotOf(ctx, projectId);
     requireValue(waveProject(ctx, snapshot), 'wave_not_enabled');
     if (controlState(snapshot) || signal?.aborted) return out;
-    const epic = snapshot.epics.find(row => !handled.has(row.id) && gateCandidate(snapshot, row));
+    const epic = snapshot.epics.find(
+      row => !handled.has(row.id) && (gateCandidate(snapshot, row) || unfinishedEpicGate(ctx, snapshot, row)),
+    );
     if (!epic) break;
     handled.add(epic.id);
     await gateEpic(ctx, snapshot, epic, { signal, retryFailed }, out);
   }
   if (!out.blocked.length) await gateProject(ctx, { projectId, signal, retryFailed }, out);
   return out;
+}
+
+const heldGateStates = [...retryStates, 'waiting_limits'];
+
+/**
+ * Read-only: the gates that hold a wave project, rows like `runPendingGates().blocked`. A gate whose
+ * Run stopped without acceptance (blocked, failed, cancelled; `quota` for waiting_limits) names the
+ * first not yet accepted container of its chain (an epic, or its milestone or the project when the
+ * epic was accepted first), unless a later gate covers that container. An epic or the project that
+ * is ready for a gate that has not run or finished yet is `project_gate_pending` (`kodo project
+ * gates` runs it). Used by next-wave.
+ * @param {{ store: any }} ctx
+ * @param {any} snapshot
+ */
+export function gateHolds(ctx, snapshot) {
+  const rows = [],
+    held = new Set();
+  const key = item => `${item.kind}:${item.id}`;
+  const gates = snapshot.gates ?? [];
+  // A gate holds the first container of its chain (epic → milestone → project) that is not
+  // accepted yet, until a later gate covers that container (a retry or a replacement).
+  for (const gate of gates) {
+    const open = gate.containers.find(item => !settled(recordOf(snapshot, item.kind, item.id)?.status));
+    if (
+      !open ||
+      gates.some(other => other.number > gate.number && other.containers.some(item => key(item) === key(open)))
+    )
+      continue;
+    const run = storedRun(ctx.store, gate.runId);
+    // A verified gate whose acceptance stopped mid-chain (for example after a crash between the
+    // epic and its milestone): `kodo project gates` resumes the chain, so the host is told to run it.
+    // Only while that container is still integrated: after append-milestone the project is
+    // running again and an old finished chain is no longer resumable. The project itself is never
+    // resumed from an epic's chain: its own gate is reported by pending('project') below.
+    if (
+      run?.state === 'succeeded' &&
+      open.kind !== 'project' &&
+      reached(recordOf(snapshot, open.kind, open.id)?.status, 'integrated')
+    ) {
+      for (const item of gate.containers) held.add(key(item));
+      rows.push({ code: 'project_gate_pending', kind: open.kind, id: open.id, gateId: gate.id, runId: run.id });
+      continue;
+    }
+    if (!run || !heldGateStates.includes(run.state)) continue;
+    for (const item of gate.containers) held.add(key(item));
+    rows.push({
+      code: run.state === 'waiting_limits' ? 'quota' : blockerOf(run),
+      kind: open.kind,
+      id: open.id,
+      gateId: gate.id,
+      runId: run.id,
+      state: run.state,
+    });
+  }
+  const pending = (kind, id) => {
+    if (!held.has(key({ kind, id }))) rows.push({ code: 'project_gate_pending', kind, id });
+  };
+  for (const epic of snapshot.epics)
+    if (!settled(epic.status) && gateCandidate(snapshot, epic)) pending('epic', epic.id);
+  const project = snapshot.project;
+  if (
+    !settled(project.status) &&
+    snapshot.milestones.every(row => settled(row.status)) &&
+    reached(project.status, 'integrated')
+  )
+    pending('project', project.projectId);
+  return rows;
 }
 
 // --- drain ------------------------------------------------------------------------------------
@@ -909,7 +1077,7 @@ async function installTaskRun(ctx, projectId, attempt, options, control) {
   }
   requireValue(run.task === input && isDeepStrictEqual(run.directorBinding, bindingFor(attempt)), 'binding_invalid');
   // Worktrees are created one by one; Engine reuses an existing one.
-  await makeWorktree(run.project, run.cwd, run.branch, run.baseSha);
+  await makeWorktree(run.project, run.cwd, run.branch, run.baseSha, { signal: control.signal });
   return run;
 }
 
@@ -1190,7 +1358,15 @@ export async function drain(ctx, projectId, options = {}) {
     requireValue(early !== 'blocked', 'control_blocked');
     return finish(ctx, projectId, state, early);
   }
-  return withProjectControl(ctx, projectId, signal, control =>
-    drainLoop(ctx, projectId, { maxWaves, concurrency, retryFailed: retryFailed === true, commandId }, control, state),
+  return withGateController(ctx.store, projectId, () =>
+    withProjectControl(ctx, projectId, signal, control =>
+      drainLoop(
+        ctx,
+        projectId,
+        { maxWaves, concurrency, retryFailed: retryFailed === true, commandId },
+        control,
+        state,
+      ),
+    ),
   );
 }

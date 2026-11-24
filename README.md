@@ -127,14 +127,17 @@ OpenCode может загрузить тот же навык и передат�
 
 ```powershell
 kodo project bootstrap "Сервис заметок с поиском" --root "D:\Projects\notes" --prepare --json
-kodo project apply-spec --root "D:\Projects\notes" --json
+kodo project apply-spec --root "D:\Projects\notes" --command-id <UUID-из-команды-bootstrap> --json
 kodo project next-wave <projectId> --host t3 --limit 3 --json      # брифы для видимых воркер-чатов T3
-kodo project complete-task <projectId> <taskId> --head <SHA> --json
+kodo project complete-task <projectId> <taskId> --head <SHA> --attempt <attemptId> --defer-gate --json
+kodo project gates <projectId> --json                               # диспетчер запускает после сдачи
 kodo project gates <projectId> --retry-failed --json                # повтор заблокированного гейта после исправления
 kodo project drain <projectId> --concurrency 2 --json               # без T3: волны нативными сессиями
 kodo project extend <projectId> "Теги заметок" --prepare --json
-kodo project append-milestone <projectId> --file <bundle>\milestone.json --json
+kodo project append-milestone <projectId> --file <bundle>\milestone.json --command-id <UUID> --json
 ```
+
+`kodo project --help` показывает справку проектных команд. Команды в брифах `next-wave` и подсказках `next` вызывают тот же пакет: `node "<абсолютный путь к cli/index.mjs>" …`, поэтому другая версия `kodo` на PATH им не мешает. Воркер-чат главный чат архивирует сразу после итога его задачи.
 
 Формат чертежа и проверки — [BLUEPRINT.md](docs/BLUEPRINT.md), протокол воркер-чатов — [T3-HOST.md](docs/T3-HOST.md), решения — [ADR-0014](docs/decisions/0014-wave-factory.md) и [ADR-0015](docs/decisions/0015-t3-pull-host.md).
 
@@ -176,7 +179,9 @@ MCP-шаблоны лежат в `.kodo/components/mcp/<name>/`. Они не п�
 
 ```powershell
 npm run test:fast   # быстрые модульные тесты, меньше минуты
-npm run check       # validate, формат, lint, типы и полная suite — как в CI
+npm run check       # validate, формат, lint, типы и suite — шаг L2 в CI
+npm run test:waves  # сквозные наборы фабрики волн — отдельный шаг CI
+npm run test:final  # финальные сценарии приёмки — отдельный шаг CI
 ```
 
 [Оглавление документации](docs/README.md) делит её на руководство, ADR и архив проверок; там же описаны команды разработки.

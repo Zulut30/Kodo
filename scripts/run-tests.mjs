@@ -10,12 +10,18 @@ import { readdirSync, lstatSync } from 'node:fs';
 const extensions = process.features.typescript ? 'js,mjs,cjs,ts,mts,cts' : 'js,mjs,cjs';
 const defaultPattern = `**/{test,test/**/*,test-*,*[._-]test}.{${extensions}}`;
 
-// Source821 Windows/Node24.22.1 receipt c9b54c3c: all completed files >=90000 ms
-// in descending durationMs, not reporter delivery order. Static observations,
-// not runtime weights; environment/overlap differ and no speedup is implied.
-// Scheduling has only a case-work lower bound; retain lighter prior entries.
-// See docs/archive/WINDOWS-TEST-SPEED.md for provenance and the incomplete full check.
+// The two wave factory suites (real Engine, Git and director work; project-wave-director alone took
+// >=1008474.9099 ms in Windows run 44577524507) run in their own step, `npm run test:waves`, like
+// `npm run test:final`: with them, one L2 command reached its fixed deadline on Windows CI
+// (runs 45410439061 and 45418257242, ~2400 s). Default discovery skips them; explicit paths run them.
+export const separateSuites = ['tests/project-wave-director.test.mjs', 'tests/project-wave-e2e.test.mjs'];
+
 const priority = [
+  // Source821 Windows/Node24.22.1 receipt c9b54c3c: all completed files >=90000 ms
+  // in descending durationMs, not reporter delivery order. Static observations,
+  // not runtime weights; environment/overlap differ and no speedup is implied.
+  // Scheduling has only a case-work lower bound; retain lighter prior entries.
+  // See docs/archive/WINDOWS-TEST-SPEED.md for provenance and the incomplete full check.
   'tests/delivery.test.mjs', // 434779.5897 ms
   'tests/project-director.test.mjs', // 375928.3714 ms
   'tests/architecture-gate-integration.test.mjs', // 314342.0235 ms
@@ -46,12 +52,8 @@ const priority = [
   'tests/task-fast-checks.test.mjs', // ~167000 ms
   'tests/wave-verifier.test.mjs', // ~72000 ms
   'tests/engine-fast-profile.test.mjs', // ~38000 ms
-  // Wave drain: sum of case durations from one local Windows run (Node 24), not a receipt.
-  'tests/project-wave-director.test.mjs', // ~320000 ms
   // External pull protocol: one local Windows run (Node 24), not a receipt and no speed claim.
   'tests/project-external.test.mjs', // ~69000 ms
-  // Wave end to end (drain, T3 pull path, reservation ownership): one local Windows run (Node 24), not a receipt.
-  'tests/project-wave-e2e.test.mjs', // ~165000 ms
   // Project factory CLI: sum of case durations from one local Windows run (Node 24), not a receipt.
   'tests/project-cli-blueprint.test.mjs', // ~16000 ms
   // Factory end to end (apply-spec, drain, append-milestone, drain): one local Windows run (Node 24), not a receipt.
@@ -141,7 +143,8 @@ export function discoverTests(cwd = process.cwd()) {
       const relative = path.relative(cwd, file).replaceAll('\\', '/');
       // Like Node's default glob, ** does not descend into hidden directories.
       if (entry.isDirectory() && !entry.name.startsWith('.')) visit(file);
-      else if (entry.isFile() && path.matchesGlob(relative, defaultPattern)) files.push(file);
+      else if (entry.isFile() && path.matchesGlob(relative, defaultPattern) && !separateSuites.includes(relative))
+        files.push(file);
     }
   }
   visit(cwd);
@@ -200,7 +203,12 @@ export async function runTests({
 } = {}) {
   // Never accept Node's recursive-run warning as a successful empty suite.
   if (process.env.NODE_TEST_CONTEXT !== undefined) throw new Error('Unsupported recursive test runner invocation');
-  const files = paths.length ? explicitTests(cwd, paths) : discoverTests(cwd);
+  // A full coverage run keeps the separate wave suites; `--fast` and explicit paths select their own.
+  const files = paths.length
+    ? explicitTests(cwd, paths)
+    : coverage
+      ? orderTests([...discoverTests(cwd), ...explicitTests(cwd, separateSuites)], cwd)
+      : discoverTests(cwd);
   const aborted = () => {
     process.exitCode = 1;
   };

@@ -65,6 +65,21 @@ function argumentsFor(argv) {
   return { action, projectId: positional[0] || null, taskId: positional[1], flags, json: flags['--json'] === true };
 }
 
+/**
+ * The blockers of `kodo report --project` (telemetry): task and attempt blockers of the current
+ * attempts' Runs and, in a wave project, gate Runs that stopped without acceptance.
+ */
+async function statusBlockers(store, snapshot) {
+  const { storedRun } = await import('./project-director.mjs');
+  const { buildProjectReport } = await import('./telemetry.mjs');
+  const runs = new Map();
+  for (const { runId } of [...snapshot.currentAttempts, ...(snapshot.gates ?? [])]) {
+    const run = typeof runId === 'string' && !runs.has(runId) ? storedRun(store, runId) : null;
+    if (run) runs.set(runId, run);
+  }
+  return buildProjectReport(snapshot, runs, {}).blockers;
+}
+
 function human(report) {
   const { result } = report;
   const heading = `Project: ${report.projectId ?? 'unknown'}; revision: ${report.revision ?? 'unknown'}`;
@@ -97,6 +112,9 @@ async function waveCommand(argv) {
  * Ports belong to the coordinator/test harness, never to decoded CLI data.
  */
 export async function projectCli(argv, ports = {}) {
+  // Help precedes strict parsing, credentials and state of every project action.
+  const help = (await import('./project-help.mjs')).projectHelp(argv);
+  if (help) return help;
   const wave = await waveCommand(argv);
   if (wave) return wave(argv, ports);
   let options,
@@ -170,11 +188,13 @@ export async function projectCli(argv, ports = {}) {
       const snapshot = await repo.snapshot(projectId);
       safety(snapshot);
       const { buildProjectProgress } = await import('./project-progress.mjs');
+      const blockers = await statusBlockers(store, snapshot);
       result = {
         status: snapshot.project.status,
         paused: snapshot.project.paused,
         completeness: snapshot.completeness,
-        progress: buildProjectProgress(snapshot),
+        blockers,
+        progress: buildProjectProgress(snapshot, blockers),
       };
       report = { schemaVersion: 1, projectId, revision: snapshot.revision, result };
     } else if (options.action === 'plan') {

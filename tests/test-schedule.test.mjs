@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { mkdtemp, mkdir, writeFile, readFile, rm, symlink } from 'node:fs/promises';
+import { readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -160,6 +161,24 @@ test('Scheduler orders observed file durations longest first and retains every d
   assert.deepEqual(orderTests([...input].reverse(), temp), expected);
 });
 
+test('The wave factory suites run in their own command and CI step, outside default discovery', async () => {
+  const { discoverTests, separateSuites } = await import(scheduleUrl);
+  // With them, one L2 command reached its fixed Windows deadline (runs 45410439061, 45418257242).
+  assert.deepEqual(separateSuites, ['tests/project-wave-director.test.mjs', 'tests/project-wave-e2e.test.mjs']);
+  const discovered = discoverTests(root).map(file => path.relative(root, file).replaceAll('\\', '/'));
+  for (const suite of separateSuites) {
+    assert.ok(!discovered.includes(suite), `${suite} is not in the default suite`);
+    assert.ok(statSync(path.join(root, suite)).isFile(), `${suite} exists`);
+  }
+  const scripts = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8')).scripts;
+  assert.equal(scripts['test:waves'], `node scripts/run-tests.mjs ${separateSuites.join(' ')}`);
+  const workflow = readFileSync(path.join(root, '.github/workflows/ci.yml'), 'utf8');
+  // The step belongs to the required check job of both platforms, not to the optional fast job.
+  const [fast, rest] = workflow.split('\n  check:');
+  const check = rest.split(/\n {2}[A-Za-z0-9_-]+:\n/)[0];
+  assert.doesNotMatch(fast, /npm run test:waves/);
+  assert.match(check, /\n {6}- name: Wave factory suites\n {8}run: npm run test:waves\n/);
+});
 test(
   'Scheduler starts heuristic heavy files before lexical files in real isolated children',
   { timeout: 15000 },

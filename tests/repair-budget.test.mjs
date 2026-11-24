@@ -28,7 +28,7 @@ test('Repair budget defaults to five preserves explicit lower limits and rejects
   }
 });
 
-async function nodeBudgetFixture(t, limit, { untracked = false } = {}) {
+async function nodeBudgetFixture(t, limit, { untracked = false, profile, stray = false, complete = false } = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'kodo-node-budget-'));
   const project = path.join(directory, 'project'),
     home = path.join(directory, 'state');
@@ -84,9 +84,10 @@ async function nodeBudgetFixture(t, limit, { untracked = false } = {}) {
       requests.push(request);
       assert.equal(request.readOnly, undefined, 'incomplete nodes must never reach review');
       await writeFile(path.join(request.cwd, workerFile), `export const value = ${requests.length};\n`);
+      if (stray) await writeFile(path.join(request.cwd, 'stray.txt'), `outside the scope ${requests.length}\n`);
       return {
         sessionId: `budget-fixture-${requests.length}`,
-        output: { summary: 'The same acceptance requirement remains unresolved', checks: [], complete: false },
+        output: { summary: 'The same acceptance requirement remains unresolved', checks: [], complete },
       };
     },
   };
@@ -111,6 +112,7 @@ async function nodeBudgetFixture(t, limit, { untracked = false } = {}) {
     },
     plan: { summary: 'Implement the finite value', tasks: [task] },
     nodes: {},
+    ...(profile ? { verificationProfile: profile } : {}),
   });
   const worktreeRoot = path.join(directory, 'worktrees');
   Object.assign(run, {
@@ -224,4 +226,31 @@ test('Engine progress fingerprint ignores timestamp-only rewrites but detects ch
   await writeFile(file, 'export const value = 2;\n');
   await utimes(file, new Date(0), new Date(1000));
   assert.notDeepEqual(await fx.engine.failureFingerprint(fx.project), first);
+});
+
+// A wave task Run (verificationProfile task-fast) owns only its writePaths: a write outside them
+// is its blocker at once, even with a larger repair budget and an incomplete worker report.
+// An ordinary Run keeps repairing the same conflict within repairRounds.
+test('A task-fast node writing outside its scope stops at once with scope_conflict', async t => {
+  for (const complete of [true, false])
+    await t.test(complete ? 'complete report' : 'incomplete report', async subtest => {
+      const fx = await nodeBudgetFixture(subtest, 3, { profile: 'task-fast', stray: true, complete });
+      const blocked = await fx.engine.run(fx.run.id);
+      assert.equal(blocked.state, 'blocked');
+      assert.equal(fx.requests.length, 1, 'no repair session');
+      assert.equal(blocked.nodes.feature.attempt, 1);
+      assert.equal(blocked.nodes.feature.stopped, 'scope_conflict');
+      assert.equal(blocked.blocker.current.code, 'scope_conflict');
+      assert.match(blocked.nodes.feature.error, /stray\.txt/);
+    });
+});
+
+test('An ordinary node still repairs a scope conflict within its repair budget', async t => {
+  const fx = await nodeBudgetFixture(t, 2, { stray: true, complete: true });
+  const blocked = await fx.engine.run(fx.run.id);
+  assert.equal(blocked.state, 'blocked');
+  assert.equal(fx.requests.length, 2, 'the conflict spends a repair round');
+  assert.equal(blocked.nodes.feature.attempt, 2);
+  assert.equal(blocked.nodes.feature.stopped, 'repair_budget_exhausted');
+  assert.match(blocked.nodes.feature.error, /stray\.txt/);
 });

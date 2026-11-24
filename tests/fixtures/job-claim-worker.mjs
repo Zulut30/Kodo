@@ -1,24 +1,26 @@
-// Child process for tests/job-concurrency.test.mjs: claim and complete jobs from
-// a shared state database until the queue has nothing left to hand out. Every
-// child starts claiming at the same wall-clock instant so they really contend.
+// One real store connection per OS process. The parent releases all claimants
+// together for each round and closes stdin after observing an empty queue.
+import { createInterface } from 'node:readline';
 import { Store } from '../../runtime/store.mjs';
 import { openJobStore } from '../../runtime/job-store.mjs';
 
-const [home, queue, owner, startAt] = process.argv.slice(2);
+const [home, queue, owner] = process.argv.slice(2);
 const store = new Store(home);
-const jobs = openJobStore({ store });
-const claimed = [];
-const pause = new Int32Array(new SharedArrayBuffer(4));
-Atomics.wait(pause, 0, 0, Math.max(0, Number(startAt) - Date.now()));
-for (;;) {
-  const run = jobs.claim(queue, { owner, limits: { workers: 8, pools: {} } });
-  if (run.job) {
-    claimed.push(run.job.id);
-    jobs.complete(run.job.id, run.token, { owner });
-    // SQLite hands a released lock back to its last holder; yield so the others interleave.
-    Atomics.wait(pause, 0, 0, 5);
-  } else if (jobs.list(queue).some(job => job.state === 'queued' || job.state === 'running')) Atomics.wait(pause, 0, 0, 2);
-  else break;
+try {
+  const jobs = openJobStore({ store });
+  const rounds = createInterface({ input: process.stdin });
+  process.stdout.write('ready\n');
+  let run;
+  for await (const command of rounds) {
+    if (command === 'claim' && !run) {
+      run = jobs.claim(queue, { owner, limits: { workers: 8, pools: {} } });
+      process.stdout.write(JSON.stringify(run.job?.id ?? null) + '\n');
+    } else if (command === 'complete' && run) {
+      if (run.job) jobs.complete(run.job.id, run.token, { owner });
+      process.stdout.write(JSON.stringify(run.job?.id ?? null) + '\n');
+      run = null;
+    } else throw new Error('Unexpected worker command');
+  }
+} finally {
+  store.close();
 }
-store.close();
-process.stdout.write(JSON.stringify(claimed));

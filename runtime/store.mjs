@@ -357,7 +357,10 @@ export class Store {
       const run = { ...current, ...patch, updatedAt: new Date().toISOString() };
       if (preserveCancellation) {
         run.cancelRequested = Boolean(current.cancelRequested);
-        if (run.cancelRequested && !run.release?.published) run.state = 'cancelled';
+        if (run.cancelRequested && !run.release?.published) {
+          run.state = 'cancelled';
+          delete run.nextRetryAt;
+        }
       }
       this.db
         .prepare('UPDATE runs SET body=?,updated=? WHERE id=?')

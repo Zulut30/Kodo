@@ -1,11 +1,19 @@
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { redact, secretFile } from './security.mjs';
 import { validate, validatePlan, planSchema, routingSchema, scopesOverlap } from './contracts.mjs';
 import { git, makeWorktree, collectFiles } from './workspace.mjs';
 import { maxTaskContractBytes, validateTaskContract } from './task-context.mjs';
 import { assessTask, resolveMode } from './modes.mjs';
-import { FAST_PATH_VERSION, classifyLocalTask, fastPathAllowsPlan } from './fast-path.mjs';
+import {
+  FAST_PATH_VERSION,
+  classifyLocalTask,
+  fastPathAllowsPlan,
+  fastPathOutdated,
+  fastPathPlan,
+  fastPathScope,
+} from './fast-path.mjs';
 import { EngineCore, contentHash, defaultModel, evidencePrompt, lstatSafe } from './engine-core.mjs';
 
 /** Assessment, research, planning and routing stages. */
@@ -122,21 +130,51 @@ export class EnginePlanning extends EngineCore {
    * ordinary route. Returns true when the mode was re-resolved.
    */
   async fastPathGuard(run, candidate, signal) {
-    if (run.executionMode?.source !== 'fast-path' || fastPathAllowsPlan(candidate, run.fastPath.files)) return false;
+    if (run.executionMode?.source !== 'fast-path' || fastPathAllowsPlan(candidate, fastPathScope(run.fastPath)))
+      return false;
+    await this.revokeFastPath(run, 'plan_outside_proof', signal);
+    return true;
+  }
+  /** Restore the saved budgets and take the ordinary route (assessment, analysis) from the start. */
+  async revokeFastPath(run, reason, signal) {
     for (const key of budgetKeys) {
       if (run.fastPath.budgets[key] === null) delete run.config[key];
       else run.config[key] = run.fastPath.budgets[key];
     }
-    run.fastPath = { ...run.fastPath, revoked: 'plan_outside_proof' };
+    run.fastPath = { ...run.fastPath, revoked: reason };
     delete run.executionMode;
     delete run.completed.analysis;
-    this.log(run, 'fast_path_revoked', { reason: run.fastPath.revoked });
+    this.log(run, 'fast_path_revoked', { reason });
     this.save(run);
     await this.prepare(run, signal);
-    return true;
+  }
+  /**
+   * A saved code proof of an unreleased intermediate format (no write list, or test paths beyond
+   * its files) is not migrated: before any worker starts, its plan is dropped and the ordinary
+   * route plans again. Once a node has worked under it, the run stops with that reason instead.
+   */
+  async revokeOutdatedFastPath(run, signal) {
+    if (run.executionMode?.source !== 'fast-path' || !fastPathOutdated(run.fastPath)) return;
+    // A started session counts, whatever the counters say after quota or a retry cycle.
+    if (
+      (run.sessionAttempts || []).some(attempt => attempt.node) ||
+      Object.values(run.nodes || {}).some(
+        node => node.attempt > 0 || node.previousAttempts > 0 || ['completed', 'integrated'].includes(node.status),
+      )
+    )
+      throw Object.assign(
+        new Error(
+          'Сохранённое доказательство быстрого пути устарело, а работа по его плану уже начата; нужен новый запуск',
+        ),
+        { code: 'fast_path_outdated' },
+      );
+    delete run.plan;
+    delete run.planSource;
+    run.nodes = {};
+    await this.revokeFastPath(run, 'proof_outdated', signal);
   }
   async prepare(run, signal) {
-    await makeWorktree(run.project, run.cwd, run.branch, run.baseSha);
+    await makeWorktree(run.project, run.cwd, run.branch, run.baseSha, { signal });
     let bundle;
     if (!run.executionMode) {
       if (run.completed.analysis) {
@@ -168,6 +206,8 @@ export class EnginePlanning extends EngineCore {
           run.fastPath = {
             version: FAST_PATH_VERSION,
             files: local.files,
+            // The one list the plan and the actual diff may write.
+            writePaths: local.writePaths,
             reason: local.reason,
             // Restored if the plan leaves the proof and the ordinary route takes over.
             budgets: Object.fromEntries(budgetKeys.map(key => [key, run.config[key] ?? null])),
@@ -190,7 +230,10 @@ export class EnginePlanning extends EngineCore {
             requests: 0,
             requested: run.requestedMode ?? null,
             source: 'fast-path',
-            reason: 'Deterministic local proof: the task names only existing tracked style files',
+            reason:
+              local.reason === 'style_only'
+                ? 'Deterministic local proof: the task names only existing tracked style files'
+                : 'Deterministic local proof: the task names one to three small tracked source files',
           };
         } else run.executionMode = await this.assessedMode(run, context, signal);
         for (const key of budgetKeys) run.config[key] = run.executionMode.profile[key];
@@ -204,21 +247,35 @@ export class EnginePlanning extends EngineCore {
       bundle ||= await collectFiles(run.cwd, run.task, this.secrets);
       const standards = await this.policy(run, 'analyze');
       const context = await this.toolContext(run, 'analyze');
-      const analysis = run.executionMode.profile.gemini
-        ? await this.logical(run, 'analysis', () =>
+      const local = limitation => ({
+        kind: 'local',
+        summary:
+          'Local project map without external analysis; implementation and independent review must verify the requested behavior',
+        model: null,
+        files: bundle.files.map(file => file.path),
+        limitations: [limitation],
+      });
+      let analysis;
+      if (!run.executionMode.profile.gemini) analysis = local('No external analysis or research in quick mode');
+      else
+        try {
+          analysis = await this.logical(run, 'analysis', () =>
             this.provider.analyzeGemini(
               { task: `${run.task}\n${standards}\n${context}`, files: bundle.files, signal },
               { secrets: this.secrets },
             ),
-          )
-        : {
-            kind: 'local',
-            summary:
-              'Quick local project map; implementation and independent review must verify the requested behavior',
-            model: null,
-            files: bundle.files.map(file => file.path),
-            limitations: ['No external analysis or research in quick mode'],
-          };
+          );
+        } catch (error) {
+          // Without a Gemini key an automatically selected mode continues on the local map; an
+          // explicitly requested standard/deep mode keeps its contract and stops as before.
+          if (error?.code !== 'auth' || !['fallback', 'jev', 'fast-path'].includes(run.executionMode.source))
+            throw error;
+          run.analysisFallback = 'auth';
+          this.log(run, 'analysis_fallback', { code: 'auth', source: run.executionMode.source });
+          analysis = local(
+            'Gemini analysis unavailable (auth: GEMINI_API_KEY missing or rejected); local project map only',
+          );
+        }
       const evidence = { items: [], requests: 0, errors: [], cache: [] };
       run.research = evidence;
       if (run.config.researchBudget > 0) await this.moreResearch(run, analysis.researchQuery || run.task, signal);
@@ -235,10 +292,23 @@ export class EnginePlanning extends EngineCore {
       });
     }
   }
-  async plan(run, planFile, signal) {
+  async plan(run, planInput, signal) {
     await this.policy(run, 'plan');
-    if (planFile) {
-      const candidate = JSON.parse(await readFile(planFile, 'utf8'));
+    await this.revokeOutdatedFastPath(run, signal);
+    if (planInput) {
+      let raw;
+      if (typeof planInput === 'string') {
+        raw = await readFile(planInput, 'utf8');
+      } else {
+        if (
+          typeof planInput?.raw !== 'string' ||
+          typeof planInput?.sha256 !== 'string' ||
+          createHash('sha256').update(planInput.raw).digest('hex') !== planInput.sha256
+        )
+          throw Object.assign(new Error('Повреждён снимок ожидающего плана'), { code: 'evidence_integrity' });
+        raw = planInput.raw;
+      }
+      const candidate = JSON.parse(raw);
       // A broken, oversized or forbidden plan is refused before it can change the mode of the run.
       // Only the task count depends on the mode; it is checked after the mode is settled.
       const legacy = Boolean(run.plan && contentHash(candidate) === contentHash(run.plan));
@@ -253,10 +323,26 @@ export class EnginePlanning extends EngineCore {
       this.validateModePlan(run, candidate, { legacy });
       run.plan = candidate;
       run.planSource = 'host';
+      run.pendingPlan = undefined;
+      run.pendingPrepare = undefined;
       this.save(run);
+      delete run.pendingPlan;
+      delete run.pendingPrepare;
     }
     if (run.plan) {
       this.validateModePlan(run, run.plan, { legacy: true });
+      return;
+    }
+    if (run.executionMode.source === 'fast-path') {
+      // The proof already names the whole write scope: one developer node, built locally and
+      // deterministically. No planner session; the plan still passes the ordinary validator.
+      const local = fastPathPlan(run.task, run.fastPath);
+      if (!fastPathAllowsPlan(local, fastPathScope(run.fastPath)))
+        throw new Error('Локальный план быстрого пути вышел за доказательство');
+      run.plan = this.validateModePlan(run, local);
+      run.planSource = 'fast-path';
+      this.save(run);
+      this.log(run, 'fast_path_planned', { reason: run.fastPath.reason, files: run.fastPath.files });
       return;
     }
     run.state = 'planning';
@@ -292,9 +378,11 @@ export class EnginePlanning extends EngineCore {
   planInstructions(run) {
     // The fast path was proven for named files only: a plan that writes anything else revokes it.
     const proven =
-      run.executionMode.source === 'fast-path'
-        ? ` This run was admitted for a style-only change: writePaths must be exactly these files and nothing else: ${JSON.stringify(run.fastPath.files)}. Do not add test or documentation files; state their checks as acceptance of the same task.`
-        : '';
+      run.executionMode.source !== 'fast-path'
+        ? ''
+        : run.fastPath.reason === 'small_local'
+          ? ` This run was admitted for a small local code change of ${JSON.stringify(run.fastPath.files)}: every writePaths entry must be one of these exact paths and nothing else: ${JSON.stringify(fastPathScope(run.fastPath))}. A behaviour change needs an added or updated regression test at one of the listed test paths, if any are listed. Do not add documentation or other files.`
+          : ` This run was admitted for a style-only change: writePaths must be exactly these files and nothing else: ${JSON.stringify(run.fastPath.files)}. Do not add test or documentation files; state their checks as acceptance of the same task.`;
     return (
       `Execution mode ${run.executionMode.selected}; at most ${run.executionMode.profile.maxTasks} tasks. Keep each mandatory node contract below ${maxTaskContractBytes} UTF-8 bytes; decompose oversized contracts without losing criteria. Prefer small cohesive deliverables and early scoped tests; a tiny change needs no artificial split. ` +
       (run.executionMode.selected === 'quick'

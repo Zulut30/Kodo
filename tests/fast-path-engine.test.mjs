@@ -1,9 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { readConfig } from '../runtime/config.mjs';
 import { manifestFreshness } from '../runtime/context-manifest.mjs';
+import { buildAuditReport } from '../runtime/audit.mjs';
 import { fixture, git, task } from './helpers/mode-engine-fixture.mjs';
 
 const css = 'styles/button.css';
@@ -46,8 +47,8 @@ test('A proven style-only task skips Jev, Gemini and research and still gets an 
   assert.equal(result.state, 'succeeded', result.error?.message);
   assert.deepEqual(
     fx.calls.filter(call => call !== 'discovery'),
-    ['plan', 'worker', 'review'],
-    'no assessment, analysis, research or routing call',
+    ['worker', 'review'],
+    'no assessment, analysis, research, routing or planner call',
   );
   assert.deepEqual(
     [result.executionMode.selected, result.executionMode.source, result.executionMode.requested],
@@ -64,16 +65,131 @@ test('A proven style-only task skips Jev, Gemini and research and still gets an 
   assert.equal(result.analysis.kind, 'local');
   assert.equal(await readFile(path.join(result.cwd, css), 'utf8'), '.button { color: blue; }\n');
   assert.equal(result.review.passed, true, 'the review gate is not skipped');
-  // The planner is told the boundary of the proof, so an honest plan does not revoke it.
-  assert.match(
-    fx.sessions[0].prompt,
-    /writePaths must be exactly these files and nothing else: \["styles\/button\.css"\]/,
+  // The plan is built locally: one developer node that owns exactly the proven file.
+  assert.equal(result.planSource, 'fast-path');
+  assert.equal(result.plannerSession, undefined);
+  assert.deepEqual(
+    result.plan.tasks.map(node => [node.role, node.writePaths]),
+    [['developer', [css]]],
   );
+  assert.deepEqual(
+    result.sessionAttempts.map(attempt => attempt.stage),
+    ['developer', 'review'],
+  );
+  assert.match(fx.sessions[0].prompt, /Make the button in styles\/button\.css blue/, 'the task reached the worker');
+  assert.equal(buildAuditReport(result).skills.complete, true, 'kodo audit stays complete');
+});
+
+test('A small local code task plans locally, writes only its named file and runs two sessions', async t => {
+  const fx = await fixture(t);
+  const run = await fx.engine.create('Set the exported value to one in value.mjs', { project: fx.project });
+  const result = await fx.engine.run(run.id);
+  assert.equal(result.state, 'succeeded', result.error?.message);
+  assert.deepEqual(
+    fx.calls.filter(call => call !== 'discovery'),
+    ['worker', 'review'],
+  );
+  assert.deepEqual(
+    [result.executionMode.selected, result.executionMode.source, result.fastPath.reason],
+    ['quick', 'fast-path', 'small_local'],
+  );
+  assert.deepEqual(result.fastPath.files, ['value.mjs']);
+  assert.deepEqual(result.fastPath.writePaths, ['value.mjs'], 'the proof writes only what it names');
+  assert.equal(result.planSource, 'fast-path');
+  assert.deepEqual(result.plan.tasks[0].writePaths, ['value.mjs'], 'the plan uses the same list');
+  assert.doesNotMatch(fx.sessions[0].prompt, /regression test/, 'no test is demanded when none is named');
+  assert.equal(result.review.passed, true);
+  assert.equal(buildAuditReport(result).skills.complete, true);
+});
+
+test('The actual diff of a fast path may touch only the named files, exactly, and never delete one', async t => {
+  for (const [name, setup, task] of [
+    ['an unnamed test', 'tests/value.test.mjs', 'Set the exported value to one in value.mjs'],
+    ['a deleted named file', null, cssTask],
+  ])
+    await t.test(name, async subtest => {
+      const fx = setup ? await fixture(subtest) : await styled(subtest);
+      const session = fx.provider.runSession;
+      fx.provider.runSession = async request => {
+        const result = await session(request);
+        if (!request.schema.properties.tasks && !request.schema.properties.passed) {
+          if (setup) {
+            await mkdir(path.dirname(path.join(request.cwd, setup)), { recursive: true });
+            await writeFile(path.join(request.cwd, setup), 'export {};\n');
+          } else await rm(path.join(request.cwd, css));
+        }
+        return result;
+      };
+      const result = await fx.engine.run((await fx.engine.create(task, { project: fx.project })).id);
+      assert.equal(result.executionMode.source, 'fast-path');
+      assert.notEqual(result.state, 'succeeded', `${name} must not pass the scope check`);
+      assert.match(Object.values(result.nodes)[0].error ?? '', /вне области|быстрого пути/);
+    });
+});
+
+test('Edits found before execution pass the same exact check before any commit', async t => {
+  const fx = await styled(t);
+  const run = await fx.engine.create(cssTask, { project: fx.project });
+  const prepared = await fx.engine.run(run.id, { prepare: true });
+  assert.equal(prepared.state, 'awaiting_plan');
+  // An interrupted session replaced the named file with a directory of the same name.
+  await rm(path.join(prepared.cwd, css));
+  await mkdir(path.join(prepared.cwd, css));
+  await writeFile(path.join(prepared.cwd, css, 'evil.json'), '{}\n');
+  const result = await fx.engine.run(run.id);
+  assert.notEqual(result.state, 'succeeded');
+  assert.equal(result.error.code, 'scope_conflict');
+  assert.doesNotMatch(git(prepared.cwd, 'log', '--format=%s'), /Kodo recover/, 'nothing was committed');
+  assert.equal(fx.sessions.length, 0);
+});
+
+test('A saved code proof of the unreleased intermediate format is revoked before any worker', async t => {
+  const fx = await fixture(t);
+  const run = await fx.engine.create('Set the exported value to one in value.mjs', { project: fx.project });
+  const prepared = await fx.engine.run(run.id, { prepare: true });
+  assert.equal(prepared.fastPath.reason, 'small_local');
+  // The format of faed900: no write list, and a local plan with test masks.
+  const outdated = {
+    fastPath: { version: 2, files: ['value.mjs'], reason: 'small_local', budgets: prepared.fastPath.budgets },
+    plan: {
+      summary: 'Fast path (small_local)',
+      tasks: [{ ...task('change'), writePaths: ['value.mjs', '**/tests/**', '**/*.test.*'] }],
+    },
+    planSource: 'fast-path',
+  };
+  fx.store.updateRun(run.id, outdated);
+  const result = await fx.engine.run(run.id);
+  assert.equal(result.state, 'succeeded', result.error?.message);
+  assert.equal(result.fastPath.revoked, 'proof_outdated');
+  assert.deepEqual([result.executionMode.source, result.planSource], ['jev', 'cli'], 'the ordinary route replanned');
+  assert.deepEqual(result.plan.tasks[0].writePaths, ['value.mjs']);
+  assert.ok(fx.calls.includes('assessment') && fx.calls.includes('plan'));
+  assert.equal(
+    fx.store
+      .events(run.id)
+      .filter(event => event.type === 'fast_path_revoked' && event.data.reason === 'proof_outdated').length,
+    1,
+  );
+
+  // A proof whose node already worked cannot be replanned silently: the run stops with its reason.
+  const started = await fixture(t);
+  const second = await started.engine.create('Set the exported value to one in value.mjs', {
+    project: started.project,
+  });
+  const ready = await started.engine.run(second.id, { prepare: true });
+  started.store.updateRun(second.id, {
+    ...outdated,
+    fastPath: { ...outdated.fastPath, budgets: ready.fastPath.budgets },
+    nodes: { change: { id: 'change', attempt: 1, status: 'pending' } },
+  });
+  const blocked = await started.engine.run(second.id);
+  assert.deepEqual([blocked.state, blocked.error.code], ['blocked', 'fast_path_outdated']);
+  assert.equal(started.sessions.length, 0);
 });
 
 test('Doubt takes the ordinary route: a non-style path, a risk word or an explicit wider mode', async t => {
   for (const [name, text, options] of [
-    ['non-style path', `Make ${css} blue and update value.mjs`, {}],
+    ['non-source path', `Make ${css} blue as described in docs/design.md`, {}],
     ['risk word', `Hide the login button in ${css}`, {}],
     ['explicit standard', cssTask, { mode: 'standard' }],
   ])
@@ -89,18 +205,26 @@ test('Doubt takes the ordinary route: a non-style path, a risk word or an explic
 });
 
 test('A plan that leaves the proven files revokes the fast path and restores the ordinary budgets', async t => {
-  const fx = await styled(t, {
-    config: { repairRounds: 3, researchBudget: 7 },
-    plan: () => ({ summary: 'Also touch code', tasks: [{ ...task('code'), writePaths: ['value.mjs'] }] }),
-  });
+  const outside = () => ({ summary: 'Also touch code', tasks: [{ ...task('code'), writePaths: ['value.mjs'] }] });
+  // The native planner is never asked on a proven fast path, so it cannot leave the proof.
+  const local = await styled(t, { plan: outside });
+  const planned = await local.engine.run((await local.engine.create(cssTask, { project: local.project })).id);
+  assert.equal(planned.state, 'succeeded', planned.error?.message);
+  assert.deepEqual([planned.planSource, planned.fastPath.revoked], ['fast-path', undefined]);
+  assert.ok(!local.calls.includes('plan'));
+
+  const fx = await styled(t, { config: { repairRounds: 3, researchBudget: 7 } });
   const run = await fx.engine.create(cssTask, { project: fx.project });
-  const result = await fx.engine.run(run.id);
+  const planFile = path.join(fx.root, 'outside.json');
+  await writeFile(planFile, JSON.stringify(outside()));
+  const result = await fx.engine.run(run.id, { planFile });
   assert.equal(result.state, 'succeeded', result.error?.message);
   assert.deepEqual(
     fx.calls.filter(call => ['plan', 'assessment'].includes(call)),
-    ['plan', 'assessment', 'plan'],
-    'the ordinary route assesses and plans again',
+    ['assessment'],
+    'the ordinary route assesses, then takes the host plan under its own mode',
   );
+  assert.equal(result.planSource, 'host');
   assert.equal(result.fastPath.revoked, 'plan_outside_proof');
   // The fixture assessment is confidently low and local, so the ordinary route also selects quick,
   // but from Jev and from the project's own budgets, not from the fast-path clamp.
@@ -110,22 +234,22 @@ test('A plan that leaves the proven files revokes the fast path and restores the
 });
 
 test('A session cap is persisted: resume and a retry cycle cannot start another session', async t => {
-  const fx = await styled(t, { config: { budgets: { sessions: 2 } } });
+  const fx = await styled(t, { config: { budgets: { sessions: 1 } } });
   const run = await fx.engine.create(cssTask, { project: fx.project });
   const blocked = await fx.engine.run(run.id);
   assert.deepEqual([blocked.state, blocked.error.code], ['blocked', 'budget']);
   assert.deepEqual(
     blocked.sessionAttempts.map(attempt => attempt.stage),
-    ['plan', 'developer'],
+    ['developer'],
     'the review session was refused before it started',
   );
-  assert.equal(fx.sessions.length, 2);
-  assert.equal(blocked.config.budgets.sessions, 2);
+  assert.equal(fx.sessions.length, 1);
+  assert.equal(blocked.config.budgets.sessions, 1);
   for (const options of [{}, { retryFailed: true }]) {
     const again = await fx.engine.run(run.id, options);
     assert.deepEqual([again.state, again.error.code], ['blocked', 'budget']);
-    assert.equal(again.sessionAttempts.length, 2);
-    assert.equal(fx.sessions.length, 2, 'no provider session after the cap');
+    assert.equal(again.sessionAttempts.length, 1);
+    assert.equal(fx.sessions.length, 1, 'no provider session after the cap');
   }
 });
 
@@ -147,7 +271,7 @@ test('Every session leaves a manifest bound to its contract and head; a context 
   const run = await fx.engine.create(cssTask, { project: fx.project });
   const result = await fx.engine.run(run.id);
   assert.equal(result.state, 'succeeded', result.error?.message);
-  assert.equal(result.sessionAttempts.length, 3);
+  assert.equal(result.sessionAttempts.length, 2);
   for (const attempt of result.sessionAttempts) {
     const { manifest } = attempt;
     assert.equal(manifest.kind, 'context-manifest');
@@ -162,7 +286,11 @@ test('Every session leaves a manifest bound to its contract and head; a context 
   assert.equal(manifest.mandatory.contract.sha256, contract.sha256);
   const context = manifest.sections.find(section => section.name === 'task-context');
   assert.equal(context.mandatory, true);
-  assert.match(fx.sessions[1].prompt, /Make the button blue/, 'the full task description reached the worker');
+  assert.match(
+    fx.sessions[0].prompt,
+    /Make the button in styles\/button\.css blue/,
+    'the full task reached the worker',
+  );
   const hashes = Object.fromEntries(manifest.references.map(item => [item.file, item.sha256]));
   assert.equal(manifestFreshness(manifest, { headSha: manifest.headSha, hashes }).status, 'fresh');
   assert.equal(manifestFreshness(manifest, { headSha: result.headSha, hashes }).status, 'stale');
@@ -219,4 +347,70 @@ test('A broken or forbidden host plan is refused without revoking the fast path'
   assert.deepEqual([oversized.state, oversized.error.code], ['blocked', 'task_contract_too_large']);
   assert.deepEqual([oversized.executionMode.source, oversized.fastPath.revoked], ['fast-path', undefined]);
   assert.ok(!fx.calls.includes('assessment'), 'no assessment, analysis or research was spent on it');
+});
+
+test('A clean merge of the target branch is checked against the named files before the base is saved', async t => {
+  const fx = await fixture(t);
+  const origin = path.join(fx.root, 'origin.git');
+  git(fx.root, 'init', '--bare', origin);
+  git(fx.project, 'remote', 'add', 'origin', origin);
+  git(fx.project, 'push', '-u', 'origin', 'main');
+  const run = await fx.engine.create('Set the exported value to one in value.mjs', { project: fx.project });
+  const result = await fx.engine.run(run.id);
+  assert.deepEqual([result.state, result.fastPath.reason], ['succeeded', 'small_local'], result.error?.message);
+  // Upstream renames the named file: Git carries the change into the new name without a conflict.
+  git(fx.project, 'mv', 'value.mjs', 'lib.mjs');
+  git(fx.project, 'commit', '-m', 'Rename upstream');
+  git(fx.project, 'push', 'origin', 'main');
+  await assert.rejects(fx.engine.synchronizeBase(fx.store.getRun(run.id)), error => error.code === 'scope_conflict');
+  assert.equal(fx.store.getRun(run.id).baseSha, result.baseSha, 'the new base was not saved');
+});
+
+test('Integration merges the recorded node commit, not a later tip of the node branch', async t => {
+  const fx = await styled(t);
+  const integrate = fx.engine.integrateNode.bind(fx.engine);
+  fx.engine.integrateNode = async (run, node, signal) => {
+    const state = run.nodes[node.id];
+    await writeFile(path.join(state.cwd, 'extra.mjs'), 'export const extra = 1;\n');
+    git(state.cwd, 'add', 'extra.mjs');
+    git(state.cwd, 'commit', '-m', 'A later commit on the node branch');
+    return integrate(run, node, signal);
+  };
+  const result = await fx.engine.run((await fx.engine.create(cssTask, { project: fx.project })).id);
+  assert.equal(result.state, 'succeeded', result.error?.message);
+  assert.deepEqual(git(result.cwd, 'diff', '--name-only', result.baseSha, result.headSha).split('\n'), [css]);
+});
+
+test('A fast-path diff may not change the Git mode of a named file', async t => {
+  const fx = await styled(t);
+  const session = fx.provider.runSession;
+  fx.provider.runSession = async request => {
+    const result = await session(request);
+    if (!request.schema.properties.tasks && !request.schema.properties.passed) {
+      await chmod(path.join(request.cwd, css), 0o755);
+      git(request.cwd, 'update-index', '--chmod=+x', css);
+    }
+    return result;
+  };
+  const result = await fx.engine.run((await fx.engine.create(cssTask, { project: fx.project })).id);
+  assert.notEqual(result.state, 'succeeded', 'a mode change must not pass');
+  assert.match(Object.values(result.nodes)[0].error ?? '', /режим/i);
+});
+
+test('An outdated code proof whose node already started a session stops the run, after quota and retry too', async t => {
+  const fx = await fixture(t, { failedWorker: true });
+  const run = await fx.engine.create('Set the exported value to one in value.mjs', { project: fx.project });
+  const waiting = await fx.engine.run(run.id);
+  assert.equal(waiting.state, 'waiting_limits');
+  assert.equal(Object.values(waiting.nodes)[0].attempt, 0, 'quota gave the attempt back');
+  fx.store.updateRun(run.id, {
+    fastPath: { version: 2, files: ['value.mjs'], reason: 'small_local', budgets: waiting.fastPath.budgets },
+  });
+  const sessions = fx.sessions.length;
+  for (const options of [{}, { retryFailed: true }]) {
+    const blocked = await fx.engine.run(run.id, options);
+    assert.deepEqual([blocked.state, blocked.error.code], ['blocked', 'fast_path_outdated'], JSON.stringify(options));
+    assert.equal(blocked.fastPath.revoked, undefined, 'the plan the session worked on is not replaced');
+  }
+  assert.equal(fx.sessions.length, sessions, 'no new session');
 });

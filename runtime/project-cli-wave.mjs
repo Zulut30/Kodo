@@ -5,6 +5,13 @@ const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 const invalid = () => {
   throw Object.assign(new Error('Invalid project arguments'), { code: 'project_arguments' });
 };
+// Constant refusals of the drain itself: reported as they are, never data, paths or provider output.
+const reported = new Set([
+  'project_wave_not_enabled',
+  'project_wave_delivery_unsupported',
+  'project_control_blocked',
+  'project_busy',
+]);
 const bounded = (value, min, max) =>
   value === undefined || (/^(0|[1-9][0-9]*)$/.test(value) && Number(value) >= min && Number(value) <= max);
 
@@ -105,6 +112,10 @@ export async function projectWaveCli(argv, ports = {}) {
       'project_drain_invalid',
     ].includes(error?.code);
     exitCode = argumentError || phase === 'input' || dataError ? 1 : 2;
+    const blockedCode =
+      reported.has(error?.code) && (error.code !== 'project_busy' || phase === 'operation')
+        ? error.code
+        : 'project_blocked';
     // Constant diagnostics only. Never echo paths, arguments, provider output or matching secrets.
     report = {
       schemaVersion: 1,
@@ -112,7 +123,7 @@ export async function projectWaveCli(argv, ports = {}) {
       revision: null,
       result: {
         status: exitCode === 1 ? 'invalid' : 'blocked',
-        code: argumentError ? 'project_arguments' : exitCode === 1 ? 'project_invalid' : 'project_blocked',
+        code: argumentError ? 'project_arguments' : exitCode === 1 ? 'project_invalid' : blockedCode,
       },
     };
   } finally {

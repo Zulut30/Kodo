@@ -4,9 +4,12 @@ import { spawnSync } from 'node:child_process';
 import { mkdtemp, mkdir, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { projectCli } from '../runtime/project-cli.mjs';
 import { projectExternalCli } from '../runtime/project-cli-external.mjs';
+import { workerEnvironment } from '../runtime/security.mjs';
 
+const cli = fileURLToPath(new URL('../cli/index.mjs', import.meta.url));
 const id = '11111111-1111-4111-8111-111111111111';
 const head = 'a'.repeat(40);
 
@@ -201,14 +204,17 @@ test('Project CLI delegates next-wave and complete-task to the pull protocol', a
   const [brief] = next.report.result.briefs;
   assert.equal(brief.taskId, 'task-a');
   assert.equal(brief.role, 'architect');
-  assert.equal(brief.chatTitle, 'Kodo · [e] Task a');
+  assert.equal(brief.chatTitle, 'Kodo · [e] Task a · попытка 1');
   assert.deepEqual(JSON.parse(next.output), next.report);
+  // Without a CLI context (a library caller) the commands keep the `kodo` prefix.
+  assert.equal(next.report.result.cli, 'kodo');
+  assert.ok(brief.completeCommand.startsWith('kodo project complete-task '));
 
   const human = await projectCli(['next-wave', waveId, '--host', 'orca'], { ...base, wave });
   assert.equal(human.exitCode, 0);
   assert.match(
     human.output,
-    /^Project: [0-9a-f-]{36}; revision: \d+\n- Kodo · \[e\] Task a \(architect\)\n {2}worktree: /,
+    /^Project: [0-9a-f-]{36}; revision: \d+\n- Kodo · \[e\] Task a · попытка 1 \(architect\)\n {2}worktree: /,
   );
   assert.ok(human.output.includes(brief.completeCommand));
   const other = await projectCli(['next-wave', waveId, '--host', 't3', '--json'], { ...base, wave });
@@ -244,4 +250,125 @@ test('Project CLI delegates next-wave and complete-task to the pull protocol', a
     [blocked.report.result.status, blocked.report.result.code],
     ['blocked', 'project_attempt_not_running'],
   );
+  // An empty wave names its cause in both formats: the abandoned attempt waits for --retry-failed.
+  const waiting = await projectCli(['next-wave', waveId, '--host', 'orca'], { ...base, wave });
+  assert.equal(waiting.exitCode, 2);
+  assert.deepEqual(waiting.report.result.blocked, [{ taskId: 'task-a', code: 'project_retry_required' }]);
+  assert.match(waiting.output, /\n- blocked task-a: project_retry_required$/);
+});
+
+test(
+  'The real CLI issues next-wave briefs whose commands call its own absolute entry',
+  { timeout: 180000 },
+  async t => {
+    const temp = await realpath(await mkdtemp(path.join(os.tmpdir(), 'kodo-external-cli-')));
+    t.after(() => rm(temp, { recursive: true, force: true }));
+    const isolated = path.join(temp, 'empty-home');
+    await mkdir(isolated);
+    await writeFile(path.join(isolated, 'gitconfig'), '');
+    const env = {
+      ...workerEnvironment(),
+      HOME: isolated,
+      USERPROFILE: isolated,
+      LOCALAPPDATA: isolated,
+      XDG_CONFIG_HOME: isolated,
+      KODO_HOME: path.join(temp, 'state'),
+      KODO_CREDENTIAL_HOME: path.join(temp, 'credentials'),
+      // Spaces and Cyrillic: an ordinary quoted argument in every shell.
+      KODO_WORKTREE_HOME: path.join(temp, 'рабочие копии'),
+      GIT_CONFIG_NOSYSTEM: '1',
+      GIT_CONFIG_GLOBAL: path.join(isolated, 'gitconfig'),
+      GIT_TERMINAL_PROMPT: '0',
+    };
+    // `node` without a path, as the main chat's shell finds it.
+    const pathKey = Object.keys(env).find(key => key.toUpperCase() === 'PATH') ?? 'PATH';
+    env[pathKey] = [path.dirname(process.execPath), env[pathKey]].filter(Boolean).join(path.delimiter);
+    const kodo = (...args) => {
+      const result = spawnSync(process.execPath, [cli, 'project', ...args, '--json'], {
+        env,
+        encoding: 'utf8',
+        timeout: 60000,
+        windowsHide: true,
+      });
+      assert.equal(result.error, undefined);
+      return { exitCode: result.status, report: JSON.parse(result.stdout) };
+    };
+    const created = kodo('create', '--file', await project(t, temp, 'wave', true));
+    assert.equal(created.exitCode, 0, JSON.stringify(created.report));
+    const projectId = created.report.projectId;
+    const next = kodo('next-wave', projectId, '--host', 't3');
+    assert.equal(next.exitCode, 0, JSON.stringify(next.report));
+    const prefix = `node "${cli}"`;
+    assert.equal(next.report.result.cli, prefix);
+    const [brief] = next.report.result.briefs;
+    assert.equal(brief.selfCheck, `${prefix} ci feedback --base ${brief.baseSha} --project "${brief.worktree}" --json`);
+    const shaCommand = /\(git -C "[^"]+" rev-parse HEAD\)/.exec(brief.prompt)?.[0].slice(1, -1);
+    assert.equal(shaCommand, `git -C "${brief.worktree}" rev-parse HEAD`);
+    assert.equal(
+      spawnSync(shaCommand, { shell: true, cwd: temp, env, encoding: 'utf8', windowsHide: true }).stdout.trim(),
+      brief.baseSha,
+    );
+    assert.equal(
+      brief.completeCommand,
+      `${prefix} project complete-task ${projectId} task-a --head <SHA> --attempt ${brief.attemptId} --defer-gate`,
+    );
+    assert.equal(
+      brief.abandonCommand,
+      `${prefix} project complete-task ${projectId} task-a --head <SHA> --abandon --attempt ${brief.attemptId}`,
+    );
+    assert.ok(brief.worktree.startsWith(path.join(temp, 'рабочие копии')));
+    // The brief's commands run as written in the platform shell (cmd.exe on Windows, sh elsewhere).
+    const shell = command =>
+      spawnSync(command, { shell: true, env, encoding: 'utf8', timeout: 60000, windowsHide: true });
+    const feedback = shell(brief.selfCheck);
+    assert.equal(JSON.parse(feedback.stdout).project, brief.worktree, feedback.stdout + feedback.stderr);
+    const abandon = spawnSync(`${brief.abandonCommand.replace('<SHA>', brief.baseSha)} --json`, {
+      shell: true,
+      env,
+      encoding: 'utf8',
+      timeout: 60000,
+      windowsHide: true,
+    });
+    assert.equal(abandon.status, 0, abandon.stdout + abandon.stderr);
+    assert.equal(JSON.parse(abandon.stdout).result.status, 'abandoned');
+  },
+);
+
+test('next-wave refuses an unusable CLI prefix port before the Store opens', async () => {
+  const closed = { secrets: {}, openStore: () => assert.fail('the Store stays closed') };
+  for (const [cli, code] of [
+    [null, 'project_cli_invalid'],
+    ['npx kodo', 'project_cli_invalid'],
+    ['node "cli/index.mjs"', 'project_path_unsafe'],
+    [`node "${path.join(os.tmpdir(), 'kodo $(calc)', 'index.mjs')}"`, 'project_path_unsafe'],
+  ]) {
+    const result = await projectCli(['next-wave', id, '--host', 't3', '--json'], { ...closed, cli });
+    assert.equal(result.exitCode, 1, String(cli));
+    assert.equal(result.report.result.code, code, String(cli));
+    if (code === 'project_path_unsafe') assert.match(result.report.result.message, /переименуйте или переместите/);
+  }
+});
+
+test('Pull CLI reports known operation errors without leaking exception details', async t => {
+  for (const code of [
+    'project_integration_branch_busy',
+    'project_integration_worktree_invalid',
+    'project_integration_busy',
+    'project_integration_invalid',
+    'project_frontier_integration_missing',
+    'project_wave_policy_invalid',
+    'project_wave_policy_unsafe',
+    'project_entity_not_found',
+  ])
+    await t.test(code, async () => {
+      const result = await projectExternalCli(['gates', id, '--json'], {
+        secrets: {},
+        openStore: () => {
+          throw Object.assign(new Error('private detail'), { code });
+        },
+      });
+      assert.equal(result.report.result.code, code);
+      assert.equal(result.exitCode, code === 'project_entity_not_found' ? 1 : 2);
+      assert.ok(!result.output.includes('private detail'));
+    });
 });

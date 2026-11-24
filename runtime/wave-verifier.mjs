@@ -292,9 +292,9 @@ async function withRunLease(engine, id, signal, action) {
 }
 
 /** The gate worktree starts at the integrated head; repairs only add commits on top of it. */
-async function gateWorktree(run) {
+async function gateWorktree(run, leased) {
   const { headSha } = run.directorBinding;
-  await makeWorktree(run.project, run.cwd, run.branch, headSha);
+  await makeWorktree(run.project, run.cwd, run.branch, headSha, { signal: leased });
   const contained = await execute('git', ['merge-base', '--is-ancestor', headSha, 'HEAD'], {
     cwd: run.cwd,
     allowFailure: true,
@@ -413,7 +413,7 @@ export async function runEpicGate({ engine, run: input, signal }) {
     run.blocker = resolveBlocker(run.blocker, { at: new Date().toISOString(), outcome: 'resumed' });
     try {
       validateCommandTimeouts(run.config.commands);
-      await gateWorktree(run);
+      await gateWorktree(run, leased);
       engine.checkCancelled(run, leased);
       await engine.selectModels(run);
       await engine.verify(run, leased);

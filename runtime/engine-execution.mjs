@@ -8,14 +8,71 @@ import { execute } from './command.mjs';
 import { git, makeWorktree, changedFiles, commitChanges } from './workspace.mjs';
 import { taskContract } from './task-context.mjs';
 import { runReadyQueue } from './task-scheduler.mjs';
+import { TASK_FAST_PROFILE } from './task-fast-checks.mjs';
 import { executeDurableTasks } from './engine-jobs.mjs';
 import { normalizeWatchdogConfig, unchanged } from './watchdog.mjs';
 import { EnginePlanning } from './engine-planning.mjs';
 import { contentHash, evidencePrompt, lstatSafe } from './engine-core.mjs';
+import { fastPathScope } from './fast-path.mjs';
 
 /** Node execution, integration and base synchronization stages. */
 export class EngineExecution extends EnginePlanning {
-  async checkScope(cwd, baseSha, scopes) {
+  /** The node (or repair) scope check; a wave task Run (task-fast) also keeps its actual
+   * changes inside the frozen ProjectTask writePaths, not only inside the plan's node scopes. */
+  async checkTaskScope(run, cwd, baseSha, scopes) {
+    if (run.verificationProfile !== TASK_FAST_PROFILE || !run.directorBinding)
+      return this.checkScope(cwd, baseSha, scopes);
+    const { directorTaskWritePaths } = await import('./project-contracts.mjs');
+    const knownValues = Object.values(this.secrets || {}).filter(value => typeof value === 'string');
+    return this.checkScope(cwd, baseSha, scopes, directorTaskWritePaths(run.task, { knownValues }));
+  }
+  /**
+   * A fast-path diff may contain only the proof's named files, compared literally (a scope check by
+   * prefix would also accept the contents of a directory named like a file), and a named file stays
+   * a regular file of the same Git mode: deleting it, replacing it with a directory, a link or a
+   * submodule, or changing its mode, is refused. `extra` are the coordinator's own version-metadata
+   * files that a commit may also carry.
+   * @param {any} run
+   * @param {string} cwd
+   * @param {string} base
+   * @param {string[]} files
+   * @param {string[]} [extra]
+   */
+  async assertFastPathDiff(run, cwd, base, files, extra = []) {
+    if (run.executionMode?.source !== 'fast-path') return files;
+    const listed = new Set(fastPathScope(run.fastPath));
+    const outside = files.filter(name => !listed.has(name) && !extra.includes(name));
+    if (outside.length)
+      throw Object.assign(new Error(`Изменены файлы вне списка быстрого пути: ${outside.join(', ')}`), {
+        code: 'scope_conflict',
+      });
+    const named = files.filter(item => listed.has(item));
+    if (named.length) {
+      const { stdout } = await execute('git', ['diff', '--raw', '--no-renames', base, '--', ...named], { cwd });
+      for (const line of stdout.split('\n').filter(Boolean)) {
+        const [, from, to, name] = /^:(\d{6}) (\d{6}) \S+ \S+ \S+\t(.*)$/.exec(line) ?? [];
+        if (to !== '000000' && (from !== to || !/^100(?:644|755)$/.test(to)))
+          throw Object.assign(new Error(`Режим файла быстрого пути изменён: ${name} ${from} → ${to}`), {
+            code: 'scope_conflict',
+          });
+      }
+    }
+    for (const name of named)
+      if (!(await lstatSafe(path.join(cwd, name)))?.isFile())
+        throw Object.assign(new Error(`Файл быстрого пути удалён или заменён: ${name}`), { code: 'scope_conflict' });
+    return files;
+  }
+  /**
+   * The scope check before every commit of executor changes: the ordinary scope check and, for a
+   * fast path, the exact check of the same changes. `base` is the incoming base, so its own
+   * changes are not counted as the executor's.
+   */
+  async checkRunScope(run, cwd, base, scopes, extra = []) {
+    return this.assertFastPathDiff(run, cwd, base, await this.checkTaskScope(run, cwd, base, scopes), extra);
+  }
+  /** One scan of the changes since baseSha; every file must be inside `scopes` and, when
+   * given, inside the frozen task scope too. */
+  async checkScope(cwd, baseSha, scopes, frozen = null) {
     const tracked = await changedFiles(cwd, baseSha);
     // Never trimmed: a NUL-separated name may begin with whitespace or U+FEFF.
     const untracked = (
@@ -24,7 +81,9 @@ export class EngineExecution extends EnginePlanning {
       .split('\0')
       .filter(Boolean);
     const files = [...new Set([...tracked, ...untracked])];
-    const outside = files.filter(name => !ownsPath(scopes, name) || secretFile(name));
+    const outside = files.filter(
+      name => !ownsPath(scopes, name) || (frozen && !ownsPath(frozen, name)) || secretFile(name),
+    );
     if (outside.length)
       throw Object.assign(new Error(`Изменены файлы вне области задачи: ${outside.join(', ')}`), {
         code: 'scope_conflict',
@@ -93,7 +152,7 @@ export class EngineExecution extends EnginePlanning {
         allowFailure: true,
       });
       if (pending.code !== 0 && included.code === 0) {
-        await this.checkScope(node.cwd, target, task.writePaths);
+        await this.checkRunScope(run, node.cwd, target, task.writePaths);
         node.baseSha = target;
         delete node.pendingRefresh;
         this.save(run);
@@ -101,7 +160,7 @@ export class EngineExecution extends EnginePlanning {
       }
       let merged = { code: 1 };
       if (pending.code !== 0) {
-        await this.checkScope(node.cwd, node.baseSha, task.writePaths);
+        await this.checkRunScope(run, node.cwd, node.baseSha, task.writePaths);
         await commitChanges(node.cwd, `Kodo preserve ${task.id} before base refresh`);
         node.pendingRefresh = { headSha: target, model: selected.id };
         this.save(run);
@@ -142,11 +201,14 @@ export class EngineExecution extends EnginePlanning {
             undefined,
             state,
           );
+          // A wave task checks the resolver's actual diff before its completion report.
+          if (run.verificationProfile === TASK_FAST_PROFILE)
+            await this.checkRunScope(run, node.cwd, target, task.writePaths);
           if (!result.output.complete) throw new Error('Конфликт обновления задачи не разрешён');
           state.sessionId = result.sessionId;
           this.save(run);
         }
-        await this.checkScope(node.cwd, target, task.writePaths);
+        await this.checkRunScope(run, node.cwd, target, task.writePaths);
         await git(node.cwd, ['add', '-A']);
         await execute(
           'git',
@@ -161,7 +223,7 @@ export class EngineExecution extends EnginePlanning {
         );
         await commitChanges(node.cwd, `Kodo refresh ${task.id}`);
       }
-      await this.checkScope(node.cwd, target, task.writePaths);
+      await this.checkRunScope(run, node.cwd, target, task.writePaths);
       node.baseSha = target;
       delete node.pendingRefresh;
       this.save(run);
@@ -197,7 +259,7 @@ export class EngineExecution extends EnginePlanning {
         node.cwd = path.join(run.worktreeRoot || path.dirname(run.cwd), task.id);
         node.branch = `kodo/${run.id}-${task.id}`;
       }
-      await makeWorktree(run.project, node.cwd, node.branch, node.baseSha);
+      await makeWorktree(run.project, node.cwd, node.branch, node.baseSha, { signal });
       const integratedHead = await git(run.cwd, ['rev-parse', 'HEAD']);
       await this.refreshNode(run, task, node, integratedHead, selected, signal);
       await this.setup(node.cwd, run, signal);
@@ -245,8 +307,14 @@ export class EngineExecution extends EnginePlanning {
         node.model = selected.id;
         node.sessionId = result.sessionId;
         node.result = validate(resultSchema, result.output);
+        // A wave task checks its worktree first: a write outside writePaths is its blocker
+        // even when the worker reports an incomplete result. The one scan is reused below.
+        const scanned =
+          run.verificationProfile === TASK_FAST_PROFILE
+            ? await this.checkRunScope(run, node.cwd, node.baseSha, task.writePaths)
+            : null;
         if (!node.result.complete) throw new Error(`Исполнитель не завершил задачу: ${node.result.summary}`);
-        node.changedFiles = await this.checkScope(node.cwd, node.baseSha, task.writePaths);
+        node.changedFiles = scanned ?? (await this.checkRunScope(run, node.cwd, node.baseSha, task.writePaths));
         if (normalizeWatchdogConfig(run.config.watchdog).rejectUnchanged && (await unchanged(node.cwd, node.baseSha)))
           throw new Error('Узел ничего не изменил: его рабочее дерево совпадает с базой');
         node.headSha = await commitChanges(node.cwd, `Kodo ${task.id}: ${run.task.slice(0, 100)}`);
@@ -270,6 +338,8 @@ export class EngineExecution extends EnginePlanning {
             'budget',
             'context_budget',
             'context_manifest_invalid',
+            // Processes of the client may still run: never start it again next to them.
+            'process_teardown',
           ].includes(error.code)
         ) {
           node.attempt--;
@@ -287,8 +357,15 @@ export class EngineExecution extends EnginePlanning {
         const repeated = node.lastFailure === signature;
         node.lastFailure = signature;
         this.save(run);
-        if (repeated || node.attempt >= run.config.repairRounds) {
-          node.stopped = node.attempt >= run.config.repairRounds ? 'repair_budget_exhausted' : 'no_progress';
+        // A wave task (task-fast) owns only its writePaths: a write outside them is the task's
+        // blocker with its own code, not a defect for another repair session.
+        const scopeStop = error.code === 'scope_conflict' && run.verificationProfile === TASK_FAST_PROFILE;
+        if (scopeStop || repeated || node.attempt >= run.config.repairRounds) {
+          node.stopped = scopeStop
+            ? 'scope_conflict'
+            : node.attempt >= run.config.repairRounds
+              ? 'repair_budget_exhausted'
+              : 'no_progress';
           node.status = 'blocked';
           this.assess(run, { scope: task.id, attempts: node.attempt, reason: node.stopped, problem: node.error });
           throw Object.assign(new Error(`Нет прогресса в ${task.id}: ${node.error}`), {
@@ -324,10 +401,28 @@ export class EngineExecution extends EnginePlanning {
       const beforeMerge = await git(run.cwd, ['rev-parse', 'HEAD']);
       run.pendingMerge = { kind: 'node', sha: node.headSha, nodeId: task.id };
       this.save(run);
+      // The recorded commit, never a later tip of the node branch. A fast-path merge is not committed
+      // by Git: it passes the same exact check as conflicts before the coordinator commits it.
+      const fastPath = run.executionMode?.source === 'fast-path';
       const merged = mergeInProgress
         ? { code: 1 }
-        : await execute('git', ['merge', '--no-ff', '--no-edit', node.branch], { cwd: run.cwd, allowFailure: true });
-      if (merged.code) {
+        : await execute(
+            'git',
+            // The subject stays the one of a branch merge: queues and reports recognise merges by it.
+            [
+              'merge',
+              '--no-ff',
+              ...(fastPath ? ['--no-commit'] : []),
+              '-m',
+              `Merge branch '${node.branch}'`,
+              node.headSha,
+            ],
+            {
+              cwd: run.cwd,
+              allowFailure: true,
+            },
+          );
+      if (merged.code || fastPath) {
         const conflicts = (await git(run.cwd, ['diff', '--name-only', '--diff-filter=U'])).split('\n').filter(Boolean);
         const pending =
           (await execute('git', ['rev-parse', '--verify', 'MERGE_HEAD'], { cwd: run.cwd, allowFailure: true })).code ===
@@ -348,7 +443,8 @@ export class EngineExecution extends EnginePlanning {
           );
           if (!response.output.complete) throw new Error('Конфликт интеграции не разрешён');
         }
-        await this.checkScope(
+        await this.checkRunScope(
+          run,
           run.cwd,
           beforeMerge,
           run.plan.tasks.flatMap(item => item.writePaths),
@@ -453,14 +549,18 @@ export class EngineExecution extends EnginePlanning {
     run.architectureChecks = null;
     run.pendingMerge = { kind: 'base', sha: base, baseSha: base };
     this.save(run);
+    // A fast-path merge of the incoming base is not committed by Git: its result is checked against
+    // the named files before it is committed and before the new base is saved.
+    const fastPath = run.executionMode?.source === 'fast-path';
     const merged =
       pending.code === 0
         ? { code: 1 }
-        : await execute('git', ['merge', '--no-edit', `origin/${run.config.baseBranch}`], {
-            cwd: run.cwd,
-            allowFailure: true,
-          });
-    if (merged.code) {
+        : await execute(
+            'git',
+            ['merge', ...(fastPath ? ['--no-ff', '--no-commit'] : []), '--no-edit', `origin/${run.config.baseBranch}`],
+            { cwd: run.cwd, allowFailure: true },
+          );
+    if (merged.code || fastPath) {
       const conflicts = (await git(run.cwd, ['diff', '--name-only', '--diff-filter=U'])).split('\n').filter(Boolean);
       if (
         (await execute('git', ['rev-parse', '--verify', 'MERGE_HEAD'], { cwd: run.cwd, allowFailure: true })).code !== 0
@@ -481,7 +581,15 @@ export class EngineExecution extends EnginePlanning {
         );
         if (!result.output.complete) throw new Error('Конфликт целевой ветки не разрешён');
       }
-      await this.checkScope(run.cwd, base, [...run.plan.tasks.flatMap(task => task.writePaths), ...conflicts]);
+      // Known limitation: with an assigned release version the version files are in scope whole.
+      const metadata = run.releaseAssignment?.version ? ['package.json', 'package-lock.json', 'registry.json'] : [];
+      await this.checkRunScope(
+        run,
+        run.cwd,
+        base,
+        [...run.plan.tasks.flatMap(task => task.writePaths), ...conflicts, ...(fastPath ? metadata : [])],
+        metadata,
+      );
       await git(run.cwd, ['add', '-A']);
       await execute(
         'git',
@@ -515,7 +623,8 @@ export class EngineExecution extends EnginePlanning {
       }
     }
     if (await git(run.cwd, ['status', '--porcelain'])) {
-      const scopes = run.plan.tasks.flatMap(task => task.writePaths);
+      const scopes = run.plan.tasks.flatMap(task => task.writePaths),
+        metadata = [];
       if (run.config.delivery.release && run.releaseAssignment?.version) {
         const changed = await changedFiles(run.cwd, 'HEAD');
         for (const name of ['package.json', 'package-lock.json', 'registry.json'].filter(
@@ -539,9 +648,10 @@ export class EngineExecution extends EnginePlanning {
               code: 'scope_conflict',
             });
           scopes.push(name);
+          metadata.push(name);
         }
       }
-      await this.checkScope(run.cwd, 'HEAD', scopes);
+      await this.checkRunScope(run, run.cwd, 'HEAD', scopes, metadata);
       run.headSha = await commitChanges(run.cwd, 'Kodo recover scoped interrupted repair');
       run.checks = null;
       run.review = null;

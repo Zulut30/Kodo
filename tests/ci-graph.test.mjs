@@ -506,8 +506,9 @@ test('Current source detects real HEAD and untracked changes between its two sta
   for (const change of ['HEAD', 'untracked'])
     await t.test(change, async t => {
       const fx = await fixture(t);
+      let statuses = 0;
       observeGit(t, (child, args) => {
-        if (!args.includes('ls-tree')) return;
+        if (!args.includes('status') || ++statuses !== 1) return;
         child.once('close', () => {
           if (change === 'HEAD') git(fx.project, 'commit', '--allow-empty', '-qm', 'move HEAD during inspection');
           else
@@ -518,6 +519,7 @@ test('Current source detects real HEAD and untracked changes between its two sta
         });
       });
       assert.equal(await inspectCurrentSource({ project: fx.project, headSha: fx.baseSha }), 'dirty');
+      assert.equal(statuses, 2, 'the second fence observed the change');
     });
 });
 

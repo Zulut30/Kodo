@@ -4,6 +4,7 @@
 // no API fallback. The report envelope matches runtime/project-cli.mjs.
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
+import { DEFAULT_CLI, PATH_UNSAFE_MESSAGE, assertCliPrefix, quotePath } from './cli-command.mjs';
 
 export const BLUEPRINT_ACTIONS = Object.freeze(['bootstrap', 'apply-spec', 'extend', 'append-milestone']);
 
@@ -20,6 +21,7 @@ const DATA_CODES = [
   'project_entity_not_found',
   'project_task_missing',
   'project_command_conflict',
+  'project_path_unsafe',
 ];
 // positional: [count, kinds]; values/booleans: allowed flags; required flags.
 const GRAMMAR = {
@@ -186,9 +188,29 @@ async function sessionProvider(ctx) {
   return ctx.ports.provider || engine.provider;
 }
 
+// A path that a next hint quotes is checked before anything is written (a missing one is
+// left to its own refusal): runtime/cli-command.mjs.
+async function commandPath(value) {
+  const { realpath } = await import('node:fs/promises');
+  const real = await realpath(value).catch(() => null);
+  if (real) quotePath(real);
+}
+
+// Wave checks run under kodo.config.json of the committed base (runtime/wave-policy.mjs): without it
+// the defaults apply (client codex, commands.test npm test), whatever the stack or subscription, so
+// apply-spec refuses a HEAD without the file (blueprint_config_missing, gitFindings).
+const configStep = (root, template, config) =>
+  `До apply-spec создай ${path.join(root, 'kodo.config.json')} по шаблону ${template} или проверь существующий: ` +
+  'client — подписочный клиент гейтов (codex или claude-code), commands.test — команда тестов стека (rules.md); ' +
+  'закоммить его вместе с исходным состоянием, иначе apply-spec ответит blueprint_config_missing.' +
+  (config.commands.test.length
+    ? ''
+    : ' В шаблоне commands.test пуст: стек не определён однозначно — задай команду тестов сам.');
+
 async function bootstrap(ctx) {
   const { options, ports } = ctx;
   const root = path.resolve(options.flags['--root']);
+  await commandPath(root);
   const bootstrapModule = await import('./project-bootstrap.mjs');
   const inputs = await contextInputs(ctx, root, options.idea);
   if (options.prepare) {
@@ -202,6 +224,7 @@ async function bootstrap(ctx) {
       ...inputs,
     });
     const target = path.join(bundle.summary.root, '.kodo', 'blueprint');
+    const apply = `${ctx.cli} project apply-spec --root ${quotePath(bundle.summary.root)} --command-id ${randomUUID()} --json`;
     return envelope(null, null, {
       status: 'prepared',
       bundle: { id: bundle.id, dir: bundle.dir, files: bundle.files },
@@ -210,8 +233,15 @@ async function bootstrap(ctx) {
       next: [
         `Прочитай context.md, rules.md и templates/ в ${bundle.dir}.`,
         `Напиши чертёж только в ${target}: PROJECT.md, interfaces/<module>.md, spec.json (root = ${bundle.summary.root}).`,
+        configStep(bundle.summary.root, path.join(bundle.dir, 'templates', 'kodo.config.json'), bundle.config),
         'Перед регистрацией root — корень Git-репозитория с коммитом; всё вне .kodo/blueprint закоммичено или в .gitignore.',
-        `Проверь и зарегистрируй проект: kodo project apply-spec --root "${bundle.summary.root}" --json`,
+        `Проверь и зарегистрируй проект: ${apply}`,
+      ],
+      commands: [
+        {
+          command: apply,
+          why: 'После записи чертежа и коммита kodo.config.json: проверить и зарегистрировать проект (без закоммиченного kodo.config.json — blueprint_config_missing)',
+        },
       ],
     });
   }
@@ -230,12 +260,22 @@ async function bootstrap(ctx) {
   });
   const extra = { bundle: { id: generated.id }, session: generated.session, scopeChecked: generated.scopeChecked };
   if (!generated.ok) return findingsReport(generated.findings, extra);
+  const apply = `${ctx.cli} project apply-spec --root ${quotePath(generated.spec.root)} --command-id ${randomUUID()} --json`;
   return envelope(null, null, {
     status: 'compiled',
     ...extra,
     blueprint: path.join(generated.spec.root, '.kodo', 'blueprint'),
     modules: moduleMap(generated.spec),
-    next: [`Проверь чертёж и зарегистрируй проект: kodo project apply-spec --root "${generated.spec.root}" --json`],
+    next: [
+      configStep(generated.spec.root, path.join(generated.dir, 'templates', 'kodo.config.json'), generated.config),
+      `Проверь чертёж и зарегистрируй проект: ${apply}`,
+    ],
+    commands: [
+      {
+        command: apply,
+        why: 'После проверки чертежа и коммита kodo.config.json: зарегистрировать проект (без закоммиченного kodo.config.json — blueprint_config_missing)',
+      },
+    ],
   });
 }
 
@@ -265,18 +305,36 @@ async function gitFindings(root, finding) {
     return required('root должен быть корнем Git-репозитория: выполните git init в каталоге проекта');
   if ((await run(['rev-parse', '--verify', '--quiet', 'HEAD^{commit}'])).code !== 0)
     return required('В репозитории нет коммита: закоммитьте исходное состояние проекта до apply-spec');
+  // The wave verification policy comes from the committed kodo.config.json (runtime/wave-policy.mjs):
+  // without it every wave would run the defaults (codex, npm test) whatever the stack. Only a regular
+  // file of HEAD counts (mode 100644/100755): a directory, a link or a submodule of that name does not.
+  const tree = await run(['ls-tree', '-z', 'HEAD', '--', 'kodo.config.json']);
+  const config =
+    tree.code === 0 && /^100(?:644|755) blob [0-9a-f]+\tkodo\.config\.json\0?$/.test(tree.stdout)
+      ? []
+      : [
+          finding(
+            'blueprint_config_missing',
+            'В коммите HEAD нет kodo.config.json: создайте его по templates/kodo.config.json пакета bootstrap ' +
+              '(client, commands.test; правила в rules.md) или проверьте существующий и закоммитьте до apply-spec',
+          ),
+        ];
   const status = await run(['status', '--porcelain=v1', '-z', '--untracked-files=all', '--no-renames']);
-  if (status.code !== 0) return required('git status завершился ошибкой: проверьте репозиторий проекта');
+  if (status.code !== 0)
+    return [...config, ...required('git status завершился ошибкой: проверьте репозиторий проекта')];
   const dirty = status.stdout
     .split('\0')
     .filter(Boolean)
     .filter(entry => !entry.slice(3).startsWith(BLUEPRINT_PREFIX));
   return dirty.length
-    ? required(
-        `Изменения вне ${BLUEPRINT_PREFIX} не закоммичены (файлов: ${dirty.length}); ` +
-          'закоммитьте их или добавьте в .gitignore — задачи волн начинаются от коммита HEAD',
-      )
-    : [];
+    ? [
+        ...config,
+        ...required(
+          `Изменения вне ${BLUEPRINT_PREFIX} не закоммичены (файлов: ${dirty.length}); ` +
+            'закоммитьте их или добавьте в .gitignore — задачи волн начинаются от коммита HEAD',
+        ),
+      ]
+    : config;
 }
 
 async function applySpec(ctx) {
@@ -289,6 +347,7 @@ async function applySpec(ctx) {
   });
   const findings = [...compiled.findings, ...(await gitFindings(options.flags['--root'], finding))];
   if (findings.length) return findingsReport(findings);
+  quotePath(compiled.spec.root); // The root of the next hints, before evidence or the project is written.
   safety(compiled.spec);
   const { engine, repo } = await openState(ctx);
   // Content-addressed private envelopes in Kodo home; the batch prepares ACLs once.
@@ -313,19 +372,33 @@ async function applySpec(ctx) {
     action: { op: 'create', spec: bound.spec },
   });
   const snapshot = await repo.snapshot(created.projectId);
+  // Workers' self-check (ci feedback) lints JS/TS with the managed oxlint (TypeScript also needs
+  // typescript); without it the feedback is blocked, never feedback_ready. Installing is the
+  // coordinator's step, not a worker's.
+  const tool = id => `${ctx.cli} tools install ${id} --project ${quotePath(snapshot.project.root)} --json`;
+  const wave = `${ctx.cli} project next-wave ${created.projectId} --host t3 --limit 3 --json`;
   return envelope(created.projectId, snapshot.revision, {
     status: created.replayed ? 'replayed' : 'created',
     replayed: created.replayed === true,
     execution: snapshot.project.execution ?? null,
     interfaces: bound.interfaces.map(item => ({ module: item.module, sha256: item.sha256 })),
     modules: moduleMap(snapshot),
+    next: [
+      `Перед первой волной установи управляемый линтер самопроверки воркеров (один раз на машину, нужна сеть): ${tool('oxlint')} — для JS/TS, для TypeScript ещё typescript. Без него ci feedback воркера отвечает blocked, а не feedback_ready.`,
+      `Запусти волну: ${wave}`,
+    ],
+    commands: [
+      { command: tool('oxlint'), why: 'JS/TS-проект: линтер самопроверки воркеров, один раз на машину, нужна сеть' },
+      { command: tool('typescript'), why: 'Только TypeScript-проект: проверка типов в самопроверке воркеров' },
+      { command: wave, why: 'Первая волна для воркер-чатов T3' },
+    ],
   });
 }
 
 async function appendFromFile(ctx, projectId, file, extra = {}) {
   const { options, contracts, knownValues, safety } = ctx;
   const { readMilestoneFile, lintMilestone } = await import('./project-bootstrap.mjs');
-  const { repo } = await openState(ctx);
+  const { repo, engine } = await openState(ctx);
   const snapshot = await repo.snapshot(projectId);
   safety(snapshot);
   const at = { projectId, revision: snapshot.revision };
@@ -339,6 +412,36 @@ async function appendFromFile(ctx, projectId, file, extra = {}) {
   safety(input);
   const lint = lintMilestone(input, snapshot, { contracts, knownValues });
   if (!lint.ok) return findingsReport(lint.findings, extra, at);
+  // lintMilestone admits only Refs the project already bound; their evidence must still verify, as
+  // next-wave requires of every interface proof (verifyRef), or the new task would never run.
+  const { verifyRef } = await import('./project-director.mjs');
+  const verified = async ref => {
+    try {
+      await verifyRef(engine, ref);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const unverified = [];
+  for (const task of input.tasks)
+    for (const ref of task.interfaceRefs)
+      if (!(await verified(ref))) {
+        unverified.push(String(task.id));
+        break;
+      }
+  if (unverified.length)
+    return findingsReport(
+      [
+        {
+          code: 'milestone_interface_unbound',
+          taskIds: unverified,
+          message: 'Evidence ссылки interfaceRefs не прошло проверку: уберите эту ссылку (interfaceRefs: [])',
+        },
+      ],
+      extra,
+      at,
+    );
   const applied = await repo.apply({
     schemaVersion: 1,
     commandId: options.flags['--command-id'] || randomUUID(),
@@ -362,9 +465,15 @@ async function appendFromFile(ctx, projectId, file, extra = {}) {
 
 async function extend(ctx) {
   const { options, ports, safety } = ctx;
+  // The hint quotes a file of the bundle in Kodo home.
+  if (options.prepare) quotePath(await realHome(ctx.home));
   const { repo } = await openState(ctx);
   const snapshot = await repo.snapshot(options.projectId);
   safety(snapshot);
+  // The reopen rule of append-milestone (assertProjectReopen): refuse before a bundle is written or a
+  // session starts.
+  if (!ctx.contracts.projectReopenable(snapshot))
+    throw Object.assign(new Error('Project append blocked'), { code: 'project_append_blocked' });
   const root = snapshot.project.root;
   const bootstrapModule = await import('./project-bootstrap.mjs');
   const common = {
@@ -378,9 +487,15 @@ async function extend(ctx) {
     ...(await contextInputs(ctx, root, options.idea)),
   };
   if (options.prepare) {
-    const bundle = await bootstrapModule.prepareExtend(common);
+    // The hint's milestone file is checked before its bundle directory exists (a junction in
+    // Kodo home may resolve elsewhere): an unusable path writes no bundle.
+    const bundle = await bootstrapModule.prepareExtend({
+      ...common,
+      checkDir: dir => quotePath(path.join(dir, 'milestone.json')),
+    });
     const template = path.join(bundle.dir, 'templates', 'milestone.json');
     const file = path.join(bundle.dir, 'milestone.json');
+    const append = `${ctx.cli} project append-milestone ${options.projectId} --file ${quotePath(file)} --command-id ${randomUUID()} --json`;
     return envelope(options.projectId, snapshot.revision, {
       status: 'prepared',
       bundle: { id: bundle.id, dir: bundle.dir, files: bundle.files },
@@ -389,8 +504,9 @@ async function extend(ctx) {
       next: [
         `Прочитай context.md и rules.md в ${bundle.dir}; форма майлстоуна — ${template}.`,
         `Запиши майлстоун в ${file} (вне репозитория).`,
-        `Проверь и добавь: kodo project append-milestone ${options.projectId} --file "${file}" --json`,
+        `Проверь и добавь: ${append}`,
       ],
+      commands: [{ command: append, why: 'После записи milestone.json: проверить и добавить майлстоун' }],
     });
   }
   const generated = await bootstrapModule.generateMilestone({
@@ -404,6 +520,11 @@ async function extend(ctx) {
   if (!generated.ok)
     return findingsReport(generated.findings, extra, { projectId: options.projectId, revision: snapshot.revision });
   return appendFromFile(ctx, options.projectId, generated.file, extra);
+}
+
+async function realHome(home) {
+  const { realpath } = await import('node:fs/promises');
+  return realpath(path.resolve(home)).catch(() => path.resolve(home));
 }
 
 const HANDLERS = {
@@ -426,6 +547,7 @@ function failureReport(error, phase) {
       status: exitCode === 1 ? 'invalid' : 'blocked',
       code: argumentError ? 'project_arguments' : exitCode === 1 ? 'project_invalid' : 'project_blocked',
       ...(!argumentError && code && code !== 'project_arguments' ? { reason: code } : {}),
+      ...(code === 'project_path_unsafe' ? { message: PATH_UNSAFE_MESSAGE } : {}),
     },
     exitCode,
   );
@@ -433,7 +555,8 @@ function failureReport(error, phase) {
 
 /** Explicit, lazy composition of the project factory actions. Ports belong to
  * the coordinator/test harness: secrets, loadSecrets, home, store, openStore,
- * createEngine, provider, architecture, knowledge, now, signal. */
+ * createEngine, provider, architecture, knowledge, now, signal and cli (command
+ * prefix of the `next` hints, runtime/cli-command.mjs). */
 export async function projectBlueprintCli(argv, ports = {}) {
   let options,
     outcome,
@@ -456,8 +579,13 @@ export async function projectBlueprintCli(argv, ports = {}) {
       knownValues,
       safety,
       home: ports.home || ports.store?.home || security.stateHome(),
+      // Only an absent port means a library caller; null or anything else is checked and refused.
+      cli: ports.cli === undefined ? DEFAULT_CLI : ports.cli,
     });
     phase = 'operation';
+    // Actions with next hints check the prefix before the Store, a bundle or any evidence is written.
+    if (options.action !== 'append-milestone' && (options.action !== 'extend' || options.prepare))
+      safety(assertCliPrefix(ctx.cli));
     outcome = await HANDLERS[options.action](ctx);
     safety(outcome.report); // Guard every output value before either format.
   } catch (error) {

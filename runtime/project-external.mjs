@@ -19,8 +19,9 @@
  */
 import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
+import { stat } from 'node:fs/promises';
 import { execute } from './command.mjs';
-import { git, makeWorktree } from './workspace.mjs';
+import { git, makeWorktree, plannedWorktreeHome } from './workspace.mjs';
 import { scopesOverlap } from './contracts.mjs';
 import { redact } from './security.mjs';
 import { isPullHost } from './job-contracts.mjs';
@@ -34,9 +35,12 @@ import {
 import { withIntegrationLease } from './project-integration-lease.mjs';
 import { bindingFor, known, storedRun, verifyRef } from './project-director.mjs';
 import * as waves from './project-director-waves.mjs';
-import { verifyTaskFastOnce } from './wave-verifier.mjs';
+import { withPullLease } from './project-controller-lease.mjs';
+import { runEpicGate, verifyTaskFastOnce } from './wave-verifier.mjs';
 import { workerRole } from './worker-roles.mjs';
 import { applyWavePolicy } from './wave-policy.mjs';
+import { DEFAULT_CLI, assertCliPrefix, quotePath } from './cli-command.mjs';
+import { planProjectHorizon } from './project-planner.mjs';
 
 /** The largest batch one `nextWave` call returns. */
 export const MAX_WAVE_LIMIT = 5;
@@ -99,26 +103,6 @@ async function ancestor(cwd, base, head) {
   return result.code === 0;
 }
 
-// Lease `project:<id>` held for one protocol call, renewed while long checks run.
-async function withProjectLease(store, projectId, work) {
-  const token = store.acquireLease(`project:${projectId}`, randomUUID(), { ttlMs: 60000, limit: 1 });
-  need(token, 'busy');
-  const timer = setInterval(() => {
-    try {
-      store.renewLease(token);
-    } catch {
-      /* A lost renewal surfaces on the next acquisition. */
-    }
-  }, 10000);
-  timer.unref();
-  try {
-    return await work(token);
-  } finally {
-    clearInterval(timer);
-    store.releaseLease(token);
-  }
-}
-
 // Merge commits of integrated tasks; the frontier must contain each of them.
 function integratedMerges(snapshot, store) {
   const merges = [];
@@ -130,8 +114,6 @@ function integratedMerges(snapshot, store) {
   return merges;
 }
 
-const quote = value => `"${value.replaceAll('"', '\\"')}"`;
-
 function workerContract(run, writePaths, selfCheck) {
   return [
     'Worker contract (Kodo external task):',
@@ -140,23 +122,24 @@ function workerContract(run, writePaths, selfCheck) {
     '- Do not delete, skip or weaken existing tests; add tests for new behaviour.',
     `- Commit your work on ${run.branch}. Do not push, open pull requests, merge or rebase onto other branches.`,
     `- Before finishing run the self-check: ${selfCheck}`,
-    '- Finish with a clean worktree and report the full SHA of the final commit (git rev-parse HEAD).',
+    `- Finish with a clean worktree and report the full SHA of the final commit (git -C ${quotePath(run.cwd)} rev-parse HEAD).`,
   ].join('\n');
 }
 
 function briefFor(state, attempt, task, run) {
-  const { C, options } = state,
+  const { C, options, cli } = state,
     project = state.snapshot.project;
   const input = C.buildDirectorTaskInput({ project, task }, options);
   need(run.task === input, 'binding_invalid');
   const { role, instructions } = workerRole(task.owner);
-  const selfCheck = `kodo ci feedback --base ${run.baseSha} --project ${quote(run.cwd)} --json`;
+  // The caller's CLI (`cli`): a chat runs the same Kodo package that issued the brief.
+  const selfCheck = `${cli} ci feedback --base ${run.baseSha} --project ${quotePath(run.cwd)} --json`;
   const brief = {
     projectId: project.projectId,
     taskId: task.id,
     attemptId: attempt.id,
     runId: run.id,
-    chatTitle: `Kodo · [${task.epicId}] ${task.title}`,
+    chatTitle: `Kodo · [${task.epicId}] ${task.title} · попытка ${attempt.number}`,
     role,
     roleInstructions: instructions,
     writePaths: [...task.writePaths],
@@ -166,8 +149,8 @@ function briefFor(state, attempt, task, run) {
     interfaces: task.interfaceRefs.map(ref => ref.path),
     prompt: `${input}\n\n${workerContract(run, task.writePaths, selfCheck)}`,
     selfCheck,
-    completeCommand: `kodo project complete-task ${project.projectId} ${task.id} --head <SHA>`,
-    abandonCommand: `kodo project complete-task ${project.projectId} ${task.id} --head <SHA> --abandon --attempt ${attempt.id}`,
+    completeCommand: `${cli} project complete-task ${project.projectId} ${task.id} --head <SHA> --attempt ${attempt.id} --defer-gate`,
+    abandonCommand: `${cli} project complete-task ${project.projectId} ${task.id} --head <SHA> --abandon --attempt ${attempt.id}`,
   };
   C.assertDirectorSafe(brief, options);
   return brief;
@@ -356,11 +339,14 @@ async function reserveSelected(state, limit, ports) {
   const remaining = limit - state.briefs.length;
   if (remaining <= 0) return;
   const W = wavePorts(ports, ['selectWave']);
-  // Like drain: a task whose interface proofs do not verify is never selected.
+  // Like drain: a task whose interface proofs do not verify is never selected. The rows are kept
+  // for the explanation of the same revision; a reservation still checks its proofs right before.
+  const availability = await waves.waveAvailability(state.ctx, state.snapshot);
+  state.availability = { revision: state.snapshot.revision, rows: availability };
   const selected = W.selectWave(state.snapshot, {
     limit: remaining,
     inFlight: [...state.inFlight],
-    availability: await waves.waveAvailability(state.ctx, state.snapshot),
+    availability,
     now: (state.ctx.clock ?? (() => new Date().toISOString()))(),
   });
   need(Array.isArray(selected), 'wave_ports_invalid');
@@ -379,21 +365,136 @@ async function reserveSelected(state, limit, ports) {
   }
 }
 
+// Planner reasons of a task the host can act on, in next-wave's codes and in this order of
+// preference (a failed task with a failed attempt is retried). Waiting for a dependency, for work in
+// flight or for the wave limit is not a blocker.
+const actionable = [
+  ['retry_required', 'project_retry_required'],
+  ['attempt_revision_mismatch', 'project_retry_required'],
+  ['risk_approval_required', 'project_risk_unapproved'],
+  ['interfaces_unverified', 'project_interface_unverified'],
+  ['split_required', 'project_split_required'],
+  ['task_failed', 'project_task_failed'],
+  ['task_blocked', 'project_task_blocked'],
+];
+const stoppedStates = ['blocked', 'failed', 'cancelled'];
+const openTask = task => !['integrated', 'cancelled', ...settled].includes(task.status);
+
+// Stopped epics and milestones, one row each, straight from the snapshot (even when every task of
+// the epic is integrated): blocked or failed, or cancelled while it still holds a live task.
+function stoppedContainers(snapshot) {
+  const live = epicId => snapshot.tasks.some(task => task.epicId === epicId && task.status !== 'cancelled');
+  const holds = {
+    epic: epic => live(epic.id),
+    milestone: milestone => snapshot.epics.some(epic => epic.milestoneId === milestone.id && live(epic.id)),
+  };
+  return [
+    ['epic', snapshot.epics],
+    ['milestone', snapshot.milestones],
+  ].flatMap(([kind, rows]) =>
+    rows
+      .filter(row => stoppedStates.includes(row.status) && (row.status !== 'cancelled' || holds[kind](row)))
+      .map(row => ({ code: `project_${kind}_${row.status}`, kind, id: row.id })),
+  );
+}
+
+// The nearest cancelled task among the unmet transitive dependencies of `task`: a requirement that
+// is never met. A dependency still on its way is ordinary waiting (null).
+function cancelledPredecessor(C, snapshot, task) {
+  const seen = new Set(),
+    queue = [...task.dependsOn];
+  while (queue.length) {
+    const id = queue.shift();
+    const dependency = snapshot.tasks.find(row => row.id === id);
+    if (seen.has(id) || !dependency) continue;
+    seen.add(id);
+    if (dependency.status === 'cancelled') return dependency.id;
+    if (!C.dependencySatisfied(snapshot.project, dependency.status)) queue.push(...dependency.dependsOn);
+  }
+  return null;
+}
+
+// The selection's proof checks at the same revision are reused; a refused proof may have been
+// restored since, so it is checked again before it is named.
+async function explanationAvailability(state, snapshot) {
+  if (state.availability?.revision !== snapshot.revision) return waves.waveAvailability(state.ctx, snapshot);
+  const rows = [];
+  for (const row of state.availability.rows) {
+    const task = !row.interfacesVerified && snapshot.tasks.find(item => item.id === row.taskId);
+    const verified = row.interfacesVerified || (Boolean(task) && (await interfacesVerified(state, task)));
+    rows.push(verified === row.interfacesVerified ? row : { ...row, interfacesVerified: true, reason: null });
+  }
+  return rows;
+}
+
+// Why open tasks are not handed out and which containers and gates hold the project, so that a
+// short or empty wave always names its cause. Read-only: nothing is reserved or run here.
+async function explainWave(state, snapshot) {
+  const { ctx, C } = state;
+  const horizon = planProjectHorizon(
+    {
+      snapshot,
+      limit: 24,
+      availability: await explanationAvailability(state, snapshot),
+      now: (ctx.clock ?? (() => new Date().toISOString()))(),
+    },
+    { contracts: C, knownValues: state.options.knownValues },
+  );
+  const named = new Set([...state.blocked.map(row => row.taskId), ...state.briefs.map(row => row.taskId)]);
+  for (const row of horizon.blocked) {
+    const task = snapshot.tasks.find(item => item.id === row.taskId);
+    if (!task || !openTask(task) || named.has(task.id)) continue;
+    if (inFlightStates.has(currentOf(snapshot, task.id)?.status)) continue;
+    const cancelled = cancelledPredecessor(C, snapshot, task);
+    if (cancelled) {
+      state.blocked.push({ taskId: task.id, code: 'project_dependency_cancelled', dependencyId: cancelled });
+      continue;
+    }
+    const found = actionable.find(([reason]) => row.reasons.includes(reason));
+    if (found) state.blocked.push({ taskId: task.id, code: found[1] });
+  }
+  state.blocked.push(...stoppedContainers(snapshot), ...waves.gateHolds({ store: storeOf(ctx) }, snapshot));
+}
+
 /**
  * Reserve the next wave for an external host: the briefs of this host's running
- * attempts, then new non-overlapping tasks up to `limit` (1..5).
+ * attempts, then new non-overlapping tasks up to `limit` (1..5). `cli` is the command
+ * prefix of the brief commands and is returned with them (default `kodo`). `blocked` names why
+ * the rest waits: task rows `{taskId, code}` and gate rows `{code, kind, id, gateId?, runId?}`
+ * (`gateHolds`). An accepted project returns `code: 'project_accepted'` and no briefs.
  * @param {{ repo: any, engine: any, store?: any, contracts?: any, clock?: () => string }} ctx
- * @param {{ projectId: string, host: string, limit?: number, retryFailed?: boolean, ports?: any }} input
+ * @param {{ projectId: string, host: string, limit?: number, retryFailed?: boolean, ports?: any, cli?: string }} input
  */
 export async function nextWave(ctx, input) {
-  const { projectId, host, limit = 3, retryFailed = false, ports } = input;
+  const { projectId, host, limit = 3, retryFailed = false, ports, cli = DEFAULT_CLI } = input;
   need(isPullHost(host), 'host_unsupported');
   need(Number.isSafeInteger(limit) && limit >= 1 && limit <= MAX_WAVE_LIMIT, 'limit_invalid');
+  assertCliPrefix(cli);
   const C = await contractsOf(ctx),
     store = storeOf(ctx);
+  const options = { knownValues: known(ctx.engine) };
+  C.assertDirectorSafe(cli, options);
   const snapshot = await snapshotOf(ctx, projectId);
   need(C.isWaveProject(snapshot.project), 'wave_required');
+  // An accepted project has nothing left to hand out (and needs no worktree): its own code,
+  // never a pause or a stop.
+  if (settled.has(snapshot.project.status)) {
+    const done = {
+      projectId,
+      revision: snapshot.revision,
+      cli,
+      code: `project_${snapshot.project.status}`,
+      briefs: [],
+      blocked: [],
+    };
+    C.assertDirectorSafe(done, options);
+    return done;
+  }
   controlOf(snapshot);
+  // Every brief command names its worktree: the directory new Runs get (the Engine's own
+  // priority, KODO_WORKTREE_HOME first) is refused before the lease or any reservation.
+  const home = (ctx.engine.store ?? store)?.home;
+  if (typeof home === 'string') quotePath(await plannedWorktreeHome(home));
   const token = store.acquireLease(`project:${projectId}`, randomUUID(), { ttlMs: 60000, limit: 1 });
   need(token, 'busy');
   try {
@@ -406,9 +507,10 @@ export async function nextWave(ctx, input) {
       ctx,
       C,
       host,
+      cli,
       token,
       integration,
-      options: { knownValues: known(ctx.engine) },
+      options,
       snapshot: await snapshotOf(ctx, projectId),
       inFlight: new Set(),
       briefs: [],
@@ -417,8 +519,12 @@ export async function nextWave(ctx, input) {
     await resumeInFlight(state);
     if (retryFailed) await reserveRetries(state, limit);
     await reserveSelected(state, limit, ports);
-    const revision = (await snapshotOf(ctx, projectId)).revision;
-    return { projectId, revision, briefs: state.briefs, blocked: state.blocked };
+    const final = await snapshotOf(ctx, projectId);
+    await explainWave(state, final);
+    const revision = final.revision;
+    const result = { projectId, revision, cli, briefs: state.briefs, blocked: state.blocked };
+    C.assertDirectorSafe(result, options);
+    return result;
   } finally {
     store.releaseLease(token);
   }
@@ -433,9 +539,26 @@ async function specialEntries(cwd, base, head) {
     .filter(line => /^:\d{6} (?:120000|160000) /.test(line));
 }
 
+// What the worker chat has to fix for each refusal of the submitted commit (constant text).
+const submissionMessages = {
+  external_branch_mismatch: 'The brief branch does not point at --head: commit on brief.branch and submit its head.',
+  external_worktree_missing: 'The brief worktree is missing or is not a Git work tree.',
+  external_worktree_mismatch:
+    'The brief worktree is not on brief.branch at --head: check out brief.branch there and submit its head.',
+  external_worktree_dirty: 'The brief worktree has uncommitted or untracked files: commit or remove them.',
+  external_no_changes: '--head equals brief.baseSha: commit the change before submitting.',
+  external_not_descendant: 'brief.baseSha is not an ancestor of --head: commit on top of brief.baseSha without rebase.',
+  external_symlink: 'The change adds a symbolic link or a submodule: replace it with regular files.',
+  external_head_changed: 'The worktree head moved while the checks ran: submit the current head again.',
+};
+
 const problem = (code, error, secrets = {}) => ({
   code,
-  ...(error ? { message: redact(String(error.message), secrets).slice(0, 2000) } : {}),
+  ...(error
+    ? { message: redact(String(error.message), secrets).slice(0, 2000) }
+    : submissionMessages[code]
+      ? { message: submissionMessages[code] }
+      : {}),
 });
 
 const historyCodes = {
@@ -472,6 +595,9 @@ async function inspectSubmission(engine, run, task, head) {
     allowFailure: true,
   });
   if (branch.code !== 0 || branch.stdout.trim() !== head) return problem('external_branch_mismatch');
+  // A deleted worktree directory: git cannot even start there (ENOENT), so it is checked first.
+  const directory = await stat(run.cwd).catch(() => null);
+  if (!directory?.isDirectory()) return problem('external_worktree_missing');
   const worktreeHead = await execute('git', ['rev-parse', 'HEAD'], { cwd: run.cwd, allowFailure: true });
   if (worktreeHead.code !== 0) return problem('external_worktree_missing');
   if (
@@ -595,7 +721,8 @@ async function runGates(W, waveCtx, projectId, signal, retryFailed = false) {
 /**
  * Run the pending epic gates of a wave project outside a task completion. A blocked gate is
  * retried (a new gate reservation) only with `retryFailed`: the T3 host's way to continue after
- * the cause of a blocked gate was fixed. Holds lease `project:<id>` like `completeTask`.
+ * the cause of a blocked gate was fixed. Project mutations are serialized; verification in the
+ * gate's own worktree leaves the pull protocol available.
  * @param {{ repo: any, engine: any, store?: any, contracts?: any }} ctx
  * @param {{ projectId: string, retryFailed?: boolean, ports?: any, signal?: AbortSignal }} input
  */
@@ -603,7 +730,7 @@ export async function runProjectGates(ctx, input) {
   const { projectId, retryFailed = false, signal } = input;
   const C = await contractsOf(ctx);
   need(C.isWaveProject((await snapshotOf(ctx, projectId)).project), 'wave_required');
-  return withProjectLease(storeOf(ctx), projectId, async () => {
+  return withPullLease(storeOf(ctx), projectId, true, async outsideLease => {
     // The same control states complete-task refuses: a gate pass never reports success for them.
     const controlled = project => project.paused || ['cancelled', 'failed', 'blocked'].includes(project.status);
     const snapshot = await snapshotOf(ctx, projectId);
@@ -611,7 +738,17 @@ export async function runProjectGates(ctx, input) {
       return { status: 'blocked', code: 'project_control_blocked', revision: snapshot.revision };
     if (signal?.aborted) return { status: 'blocked', code: 'project_cancelled', revision: snapshot.revision };
     const W = wavePorts(input.ports, ['createWaveContext', 'runPendingGates']);
-    const gates = await runGates(W, waveContextOf(ctx, C, W), projectId, signal, retryFailed === true);
+    const waveCtx = {
+      ...waveContextOf(ctx, C, W),
+      runGate: input => outsideLease(() => runEpicGate(input), signal),
+    };
+    let gates;
+    try {
+      gates = await runGates(W, waveCtx, projectId, signal, retryFailed === true);
+    } catch (error) {
+      if (error?.code !== 'project_cancelled') throw error;
+      return { status: 'blocked', code: error.code, revision: (await snapshotOf(ctx, projectId)).revision };
+    }
     // A pause, cancel or block during the pass (`project pause` takes no gate lease) or an
     // interrupted pass may stop the gates before any ran: never `passed`.
     const after = await snapshotOf(ctx, projectId);
@@ -755,7 +892,7 @@ export async function completeTask(ctx, input) {
   need(attemptId === undefined || uuidPattern.test(attemptId), 'arguments');
   const C = await contractsOf(ctx);
   await externalAttempt(ctx, C, projectId, taskId);
-  return withProjectLease(storeOf(ctx), projectId, async () => {
+  return withPullLease(storeOf(ctx), projectId, !deferGate && !abandon, async () => {
     const current = await externalAttempt(ctx, C, projectId, taskId);
     const { snapshot, task, attempt, run } = current;
     if (abandon) return abandonTarget(ctx, current, { head, attemptId, commandId });

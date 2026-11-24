@@ -3,6 +3,7 @@ import { access, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, writeFil
 import os from 'node:os';
 import path from 'node:path';
 import { sha256, fail, parse } from './delivery-process.mjs';
+import { withWorktreeLock } from './workspace.mjs';
 import { operationIntent, operationOutcome } from './delivery-operations.mjs';
 import {
   context,
@@ -405,7 +406,11 @@ export async function releasePackage(options) {
     }
     source = path.join(directory, 'source');
     await ctx.command('git', ['fetch', 'origin', ctx.baseBranch, '--tags']);
-    await ctx.command('git', ['worktree', 'add', '--detach', source, candidate]);
+    await withWorktreeLock(
+      ctx.cwd,
+      () => ctx.command('git', ['worktree', 'add', '--detach', source, candidate]),
+      ctx.signal,
+    );
     const manifest = parse(await readFile(path.join(source, 'package.json'), 'utf8'), 'package.json');
     const version = manifest.version;
     const inventory = await releaseInventory(ctx);
@@ -630,7 +635,9 @@ export async function releasePackage(options) {
             if (error.code === 'ENOENT') return;
             throw error;
           }
-          await ctx.command('git', ['worktree', 'remove', '--force', source], { ignoreAbort: true, reconcile: true });
+          await withWorktreeLock(ctx.cwd, () =>
+            ctx.command('git', ['worktree', 'remove', '--force', source], { ignoreAbort: true, reconcile: true }),
+          );
         },
         async () => {
           if (primaryError?.teardownError) return; // Keep the source for safe recovery.

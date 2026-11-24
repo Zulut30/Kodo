@@ -105,7 +105,12 @@ export function validatePlan(plan) {
   }
   for (const node of plan.tasks) {
     visit(node.id);
-    for (const scope of node.writePaths)
+    for (const scope of node.writePaths) {
+      // `dir/` owns no file (ownsPath): a directory scope is written `dir/**`.
+      if (scope.endsWith('/'))
+        throw new Error(
+          `Область записи не может заканчиваться «/»: ${scope}; для каталога укажи ${scope.replace(/\/+$/, '')}/**`,
+        );
       if (
         scope.includes('\\') ||
         scope.startsWith('/') ||
@@ -114,6 +119,7 @@ export function validatePlan(plan) {
         /(^|\/)(\.git|\.env[^/]*)(\/|$)/.test(scope)
       )
         throw new Error(`Недопустимая область записи: ${scope}`);
+    }
   }
   return plan;
 }

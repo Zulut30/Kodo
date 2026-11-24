@@ -3,6 +3,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadCatalog, resolveComponents } from './catalog.mjs';
 import { planInstallation, applyInstallation } from './installer.mjs';
+import { PROJECT_USAGE } from '../runtime/project-help.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const help = `Kodo — Codex / Claude Code / OpenCode
@@ -16,27 +17,12 @@ node cli/index.mjs validate [--json]
 kodo registry stats [--json]
 
 kodo init [--project PATH]
-kodo doctor [--live] [--json]
-kodo run "TASK" --client codex|claude-code [--model MODEL] [--mode quick|standard|deep] [--providers both] [--prepare] [--delivery none|pr|release]
+kodo doctor [--client codex|claude-code] [--mode quick|standard|deep] [--live] [--json]
+kodo run "TASK" --client codex|claude-code [--model MODEL] [--mode quick|standard|deep] [--providers both] [--prepare] [--plan FILE] [--no-wait] [--delivery none|pr|release] [--json]
 kodo benchmark run --models MODEL,... [--client codex|claude-code] [--mode quick|standard|deep] [--repeats N] [--seed N] [--output ABSOLUTE_DIR] [--json]
 kodo benchmark resume|report PATH [--json]
-kodo status|logs|resume|cancel RUN_ID [--json]
-kodo project create --file SPEC [--command-id UUID] [--json]
-kodo project status PROJECT_ID [--json]
-kodo project plan PROJECT_ID [--limit 1..24] [--dry-run] [--json]
-kodo project resume PROJECT_ID [--retry-failed] [--command-id UUID] [--json]
-kodo project drain PROJECT_ID [--max-waves 1..100] [--concurrency 1..5] [--retry-failed] [--command-id UUID] [--json]
-kodo project cancel|pause PROJECT_ID [--command-id UUID] [--json]
-kodo project reprioritize PROJECT_ID TASK_ID --priority 0..100 [--command-id UUID] [--json]
-kodo project approve-risk PROJECT_ID TASK_ID --reason TEXT [--command-id UUID] [--json]
-kodo project next-wave PROJECT_ID --host t3|orca [--limit 1..5] [--retry-failed] [--json]
-kodo project complete-task PROJECT_ID TASK_ID --head SHA [--defer-gate|--abandon] [--command-id UUID] [--json]
-kodo project gates PROJECT_ID [--retry-failed] [--json]
-kodo project bootstrap "IDEA" --root PATH [--prepare] [--client codex|claude-code] [--model MODEL] [--json]
-kodo project apply-spec --root PATH [--file SPEC_JSON] [--command-id UUID] [--json]
-kodo project extend PROJECT_ID "FEATURE" [--prepare] [--client codex|claude-code] [--model MODEL] [--command-id UUID] [--json]
-kodo project append-milestone PROJECT_ID --file MILESTONE_JSON [--command-id UUID] [--json]
-kodo project report PROJECT_ID [--json]
+kodo status|logs|cancel RUN_ID [--json]
+${PROJECT_USAGE.join('\n')}
 kodo report RUN_ID [--json]
 kodo report --project PROJECT_ID [--json]
 kodo jobs list [--queue QUEUE] [--json]
@@ -54,7 +40,7 @@ kodo architecture check --base FULL_SHA [--evidence-dir ABSOLUTE_PATH]
 kodo quality run [--mode quick|standard|deep] [--changed PATH] [--affected PATH] [--capability NAME] [--evidence-dir PATH]
 kodo ui verify [--project PATH] [--json]
 kodo security verify [--project PATH] [--json]
-kodo resume RUN_ID --plan FILE
+kodo resume RUN_ID [--plan FILE] [--retry-failed] [--no-wait] [--json]
 kodo migrate --target PROJECT
 
 Клиенты: codex, claude-code, opencode. В install и init --preset --client можно повторять или указать all; init без пресета принимает один --client (или all); run, doctor, benchmark run, project bootstrap и extend — один --client, обе подписки в run — --providers both.
@@ -99,17 +85,26 @@ function checkOptions(command, options) {
 // oxlint-disable-next-line max-lines-per-function, complexity -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
 async function main() {
   const [command, ...argv] = process.argv.slice(2);
-  if (!command || ['help', '--help', '-h'].includes(command)) return console.log(help);
+  if (!command) return console.log(help);
+  if (['help', '--help', '-h'].includes(command)) {
+    if (argv.length) throw new Error(`${command} не принимает дополнительные аргументы`);
+    return console.log(help);
+  }
   // Offline reports and argument errors must not initialize the runtime's
   // SQLite store or credential/provider startup path.
   if (command === 'project') {
     const { projectCli } = await import('../runtime/project-cli.mjs');
+    // Briefs and next hints call this same entry (`node "<absolute cli/index.mjs>"`).
+    const { cliCommand } = await import('../runtime/cli-command.mjs');
     const controller = new AbortController(),
       abort = () => controller.abort();
     process.once('SIGINT', abort);
     process.once('SIGTERM', abort);
     try {
-      const result = await projectCli(argv, { signal: controller.signal });
+      const result = await projectCli(argv, {
+        signal: controller.signal,
+        cli: cliCommand(fileURLToPath(import.meta.url)),
+      });
       console.log(result.output);
       process.exitCode = result.exitCode;
     } finally {

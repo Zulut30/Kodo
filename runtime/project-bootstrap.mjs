@@ -38,11 +38,15 @@ const CLOSED = ['accepted', 'released'];
 const REDACTED = '[REDACTED]';
 // A whole PEM private key block; an unterminated header redacts to the end.
 const PEM_BLOCK = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/gi;
+// Agent client folders: installed skills, roles and settings, not project source. The file
+// map skips them; a native session that changes them is still out of scope (generateBlueprint).
+const AGENT_DIRS = ['.agents', '.claude', '.codex', '.opencode'];
 const SKIP_DIRS = new Set([
   '.git',
   '.hg',
   '.svn',
   '.kodo',
+  ...AGENT_DIRS,
   'node_modules',
   'dist',
   'build',
@@ -71,7 +75,7 @@ const MARKERS = [
   [/^go\.mod$/, 'Go'],
   [/^(?:pyproject\.toml|requirements[^/]*\.txt|setup\.py|Pipfile)$/, 'Python'],
   [/^(?:pom\.xml|build\.gradle(?:\.kts)?|settings\.gradle(?:\.kts)?)$/, 'JVM (Maven/Gradle)'],
-  [/\.(?:csproj|fsproj|sln)$/, '.NET'],
+  [/\.(?:csproj|fsproj|slnx?)$/, '.NET'],
   [/^composer\.json$/, 'PHP (Composer)'],
   [/^Gemfile$/, 'Ruby'],
   [/^CMakeLists\.txt$/, 'C/C++ (CMake)'],
@@ -80,6 +84,29 @@ const MARKERS = [
   [/^Package\.swift$/, 'Swift'],
   [/^kodo\.config\.json$/, 'Kodo config'],
 ];
+// Stack manifests for commands.test of the kodo.config.json template (configTemplate); `test: null`
+// is a stack Kodo knows no test command for.
+/** @type {Array<{ stack: string, pattern: RegExp, test: { command: string, args: string[] } | null }>} */
+const STACK_MANIFESTS = [
+  { stack: 'deno', pattern: /^deno\.jsonc?$/, test: { command: 'deno', args: ['test'] } },
+  { stack: 'node', pattern: /^package\.json$/, test: { command: 'npm', args: ['test'] } },
+  {
+    stack: 'python',
+    pattern: /^(?:pyproject\.toml|requirements[^/]*\.txt|setup\.py|Pipfile)$/,
+    test: { command: 'python', args: ['-m', 'pytest'] },
+  },
+  { stack: 'rust', pattern: /^Cargo\.toml$/, test: { command: 'cargo', args: ['test'] } },
+  { stack: 'go', pattern: /^go\.mod$/, test: { command: 'go', args: ['test', './...'] } },
+  { stack: 'dotnet', pattern: /\.(?:csproj|fsproj|slnx?)$/, test: { command: 'dotnet', args: ['test'] } },
+  { stack: 'maven', pattern: /^pom\.xml$/, test: { command: 'mvn', args: ['test'] } },
+  { stack: 'gradle', pattern: /^(?:build|settings)\.gradle(?:\.kts)?$/, test: { command: 'gradle', args: ['test'] } },
+  { stack: 'php', pattern: /^composer\.json$/, test: null },
+  { stack: 'ruby', pattern: /^Gemfile$/, test: null },
+  { stack: 'cmake', pattern: /^CMakeLists\.txt$/, test: null },
+  { stack: 'dart', pattern: /^pubspec\.yaml$/, test: null },
+  { stack: 'swift', pattern: /^Package\.swift$/, test: null },
+];
+const CONFIG_TEMPLATE = 'templates/kodo.config.json';
 const FRAMEWORKS = [
   'react',
   'next',
@@ -149,8 +176,9 @@ async function existingRoot(root) {
 const isoTime = now => new Date(typeof now === 'function' ? now() : (now ?? Date.now())).toISOString();
 
 /** Bounded, link-free walk without content reads; skips VCS, dependency and
- * build directories and Kodo state (.kodo). Files are in byte-sorted DFS order. */
-async function scanProject(root) {
+ * build directories, Kodo state (.kodo) and agent client folders unless named in
+ * `watch`. Files are in byte-sorted DFS order. */
+async function scanProject(root, { watch = [] } = {}) {
   const files = [],
     state = { links: 0, skippedDirs: 0, complete: true };
   async function visit(directory, prefix, depth) {
@@ -171,7 +199,7 @@ async function scanProject(root) {
       const relative = prefix + entry.name;
       if (entry.isSymbolicLink()) state.links++;
       else if (entry.isDirectory()) {
-        if (SKIP_DIRS.has(entry.name)) state.skippedDirs++;
+        if (SKIP_DIRS.has(entry.name) && !watch.includes(entry.name)) state.skippedDirs++;
         else if (depth >= SCAN_DEPTH) {
           state.skippedDirs++;
           state.complete = false;
@@ -211,6 +239,38 @@ async function detectStack(root, files) {
     }
   }
   return { labels: [...found.keys()], lines };
+}
+
+// A real test script of the root package.json: not absent and not npm init's failing placeholder.
+async function npmTestScript(root) {
+  try {
+    const pkg = JSON.parse((await readBoundedFile(path.join(root, 'package.json'), 256 * 1024)).text);
+    const script = pkg?.scripts?.test;
+    return typeof script === 'string' && script.trim() !== '' && !/no test specified/i.test(script);
+  } catch {
+    return false;
+  }
+}
+
+/** kodo.config.json for the coordinator to commit before apply-spec: the client of the gate Runs and
+ * the test command of the stack. An empty folder is a new Node project (the spec template's scaffold
+ * writes package.json): `npm test`. One stack whose manifest is in the root: its command (npm only
+ * with a test script). A nested manifest alone, several stacks, a stack without a known command or
+ * no manifest: `[]`, which the coordinator must replace (an empty commands.test is never a pass).
+ * An incomplete walk (scan limits, unreadable folders) may hide the stack: `[]` as well. */
+async function configTemplate(root, { files, complete }, client) {
+  const config = test => ({ schemaVersion: 1, client, commands: { test, build: [], deploy: [], smoke: [] } });
+  if (!complete) return config([]);
+  if (!files.length) return config([{ command: 'npm', args: ['test'] }]);
+  const found = files.flatMap(file => {
+    const item = STACK_MANIFESTS.find(entry => entry.pattern.test(file.path.split('/').at(-1)));
+    return item ? [{ ...item, root: !file.path.includes('/') }] : [];
+  });
+  const stacks = new Set(found.map(item => item.stack));
+  const manifest = found.find(item => item.root);
+  if (stacks.size !== 1 || !manifest?.test) return config([]);
+  if (manifest.stack === 'node' && !(await npmTestScript(root))) return config([]);
+  return config([structuredClone(manifest.test)]);
 }
 
 function fenced(text, info = '') {
@@ -311,7 +371,9 @@ function redactContext(text, { contracts = projectContracts, knownValues = [] } 
  * inside the project root: the repository is not changed by preparation. Every
  * file is redacted (redactContext) before the first write.
  * @returns {Promise<{ id: string, dir: string, files: string[], redacted: boolean }>} */
-async function writeBundle({ home, root, kind, now, files: raw, safety }) {
+// `checkDir(dir)` sees the final bundle directory (Kodo home and its bootstrap folder resolved)
+// before it is created: a caller that quotes a bundle path refuses an unusable one first.
+async function writeBundle({ home, root, kind, now, files: raw, safety, checkDir = undefined }) {
   const checked = raw.map(([name, content]) => [name, redactContext(content, safety)]);
   const files = checked.map(([name, item]) => [name, item.text]);
   if (typeof home !== 'string' || !path.isAbsolute(home))
@@ -326,6 +388,7 @@ async function writeBundle({ home, root, kind, now, files: raw, safety }) {
     throw failure('bootstrap_home_inside_root', 'Контекст-пакет не создаётся внутри каталога проекта');
   const id = `${kind}-${isoTime(now).replace(/[-:.]/g, '')}-${randomBytes(4).toString('hex')}`;
   const dir = path.join(realBase, id);
+  checkDir?.(dir);
   await mkdir(dir, { mode: 0o700 });
   for (const [name, content] of files) {
     const target = path.join(dir, ...name.split('/'));
@@ -350,10 +413,21 @@ const RULES = `# Правила чертежа Kodo
 1. **Волна 0.** Есть майлстоун или эпик с id \`${FOUNDATION_ID}\`: каркас, линтеры, стенд проверки, общие интерфейсы. Каждая задача вне Волны 0 транзитивно зависит хотя бы от одной её задачи; задачи Волны 0 зависят только друг от друга.
 2. **Параллельные задачи не пересекаются по writePaths.** Две задачи без пути по \`dependsOn\` могут идти одновременно; их \`writePaths\` не должны пересекаться (вложенные пути и glob — тоже пересечение). Добавьте зависимость или разведите пути.
 3. **Не больше ${MAX_TASK_INPUT_BYTES} байт на задачу.** Полный вход задачи (контекст проекта, описание, критерии, пути, ссылки) — до ${MAX_TASK_INPUT_BYTES} байт UTF-8. Kodo задачи не режет: делите их сами на несколько задач с зависимостями.
-4. **Роли через owner:** ${FACTORY_ROLES.map(role => `\`${role}\``).join(', ')}.
+4. **Роли через owner:** ${FACTORY_ROLES.map(role => `\`${role}\``).join(', ')}. Хвостовую задачу \`reviewer\` в эпик не добавляйте: ревью делает gate Run эпика, а лишняя задача — ещё одна волна и чат.
 5. **Интерфейсы.** \`interfaceRefs\` указывают на \`interfaces/<module>.md\`. Короткая форма \`{ "kind": "interface", "path": "interfaces/<module>.md" }\`: Kodo подставит абсолютный путь, \`runId\`/\`headSha\` = null и sha256 текущего файла. Явный sha256 должен совпадать с файлом.
 6. \`root\` — абсолютный путь каталога проекта; id — slug; остальные поля строго по ProjectSpec v1.
 7. **Эпики без циклов.** Если задача эпика X зависит от задачи эпика Y, никакая задача Y не должна зависеть (через задачи любых эпиков) от задач X: гейты эпиков закрываются по порядку.
+8. **Минимальный тест в Волне 0.** Первая задача Волны 0 создаёт минимальный проходящий тест, его путь — в её \`writePaths\`: без тестов проверка задачи ничего не доказывает, а прогон \`node --test\` без единого теста — отказ (\`fast_check_no_tests\`).
+
+## kodo.config.json — до apply-spec
+
+\`kodo.config.json\` создаёт координатор (главный чат) после чертежа; сессия, которая пишет чертёж, этот файл не создаёт и не меняет.
+
+Политику проверки волн (\`commands\` и гейты) Kodo берёт из \`kodo.config.json\` в коммите, от которого стартует проект; правка файла в рабочей копии после регистрации проверку волн не меняет. Поэтому до \`apply-spec\` координатор создаёт \`<root>/kodo.config.json\` по шаблону \`templates/kodo.config.json\` пакета (или проверяет существующий) и коммитит его вместе с исходным состоянием. Без файла в коммите HEAD \`apply-spec\` отвечает \`blueprint_config_missing\`.
+
+- \`client\` — подписочный клиент, который исполняет гейты: \`codex\` или \`claude-code\` (есть только подписка Claude Code — \`claude-code\`).
+- \`commands.test\` — команда тестов стека из «Стек»: \`{ "command": "<программа>", "args": [...] }\`. Шаблон: пустой каталог — \`npm test\` (новый Node-проект); один стек с манифестом в корне — его команда (Node — \`npm test\`, только если в package.json есть \`scripts.test\`; Python — \`python -m pytest\`, Rust — \`cargo test\`, Go — \`go test ./...\`, .NET — \`dotnet test\`, Maven — \`mvn test\`, Gradle — \`gradle test\`, Deno — \`deno test\`). Манифест только во вложенном каталоге, несколько стеков, package.json без \`scripts.test\`, стек без известной команды, нераспознанный стек или неполный обход каталога — в шаблоне \`commands.test: []\`: задайте команду сами. Пустой \`commands.test\` гейт не принимает.
+- \`kodo.config.json\` уже есть — проверьте в нём \`client\` и \`commands.test\` и не перезаписывайте остальное.
 
 ## Коды проверки
 
@@ -371,6 +445,7 @@ const RULES = `# Правила чертежа Kodo
 | \`blueprint_parallel_overlap\` | Пересечение writePaths параллельных задач |
 | \`split_required\` | Разделить задачу |
 | \`blueprint_interface_missing\`, \`blueprint_interface_stale\` | Ссылки на interfaces/*.md |
+| \`blueprint_config_missing\` | (apply-spec) В коммите HEAD нет kodo.config.json: создать по шаблону и закоммитить |
 `;
 
 const PROJECT_TEMPLATE = `# <Название проекта>
@@ -466,10 +541,25 @@ function specTemplate(root) {
       { id: 'core', milestoneId: 'mvp', title: '<Модуль core>', acceptance: [criterion('core-done', '<Критерий>')] },
     ],
     tasks: [
-      templateTask('scaffold', 'foundation-setup', 'architect', [], ['package.json', 'src/shared'], ['core']),
+      {
+        ...templateTask(
+          'scaffold',
+          'foundation-setup',
+          'architect',
+          [],
+          ['package.json', 'src/shared', 'tests/smoke'],
+          ['core'],
+        ),
+        acceptance: [
+          criterion('scaffold-done', '<Проверяемый критерий>'),
+          criterion(
+            'scaffold-tests',
+            'commands.test из kodo.config.json выполняет хотя бы один проходящий тест (минимальный тест из writePaths)',
+          ),
+        ],
+      },
       templateTask('quality-bench', 'foundation-setup', 'developer', ['scaffold'], ['tests/support', 'tooling'], []),
       templateTask('core-module', 'core', 'developer', ['quality-bench'], ['src/core'], ['core']),
-      templateTask('core-review', 'core', 'reviewer', ['core-module'], ['docs/reviews/core.md'], ['core']),
     ],
   };
 }
@@ -493,7 +583,7 @@ function bootstrapContext({ prompt, root, at, scan, stack, architecture, knowled
     '## Карта файлов',
     '',
     scan.files.length
-      ? `Показано файлов: ${listed.length}${more ? ' (список неполный)' : ''}. Пропущены каталоги VCS, зависимостей, сборки и .kodo (${scan.skippedDirs}), ссылки (${scan.links}).`
+      ? `Показано файлов: ${listed.length}${more ? ' (список неполный)' : ''}. Пропущены каталоги VCS, зависимостей, сборки, .kodo и клиентов агентов (${AGENT_DIRS.join(', ')}) (${scan.skippedDirs}), ссылки (${scan.links}).`
       : 'Каталог пуст.',
     ...(listed.length ? ['', fenced(listed.join('\n'), 'text')] : []),
     '',
@@ -512,12 +602,15 @@ function bootstrapContext({ prompt, root, at, scan, stack, architecture, knowled
  * context.md, rules.md and templates/. Returns { id, dir, files, summary }.
  * @param {Record<string, any>} [options] */
 export async function prepareBootstrap(options = {}) {
-  const { prompt, root, home, now, architecture, knowledge, contracts, knownValues } = options;
+  const { prompt, root, home, now, architecture, knowledge, contracts, knownValues, client = 'codex' } = options;
   checkPrompt(prompt);
+  if (!BOOTSTRAP_CLIENTS.includes(client))
+    throw failure('bootstrap_client_invalid', `client — один из ${BOOTSTRAP_CLIENTS.join(', ')}`);
   const real = await existingRoot(root);
   const at = isoTime(now);
   const scan = await scanProject(real);
   const stack = await detectStack(real, scan.files);
+  const config = await configTemplate(real, scan, client);
   const graph = await architectureSection(architecture);
   const facts = knowledgeSection(knowledge, prompt);
   const { redacted, ...bundle } = await writeBundle({
@@ -532,10 +625,12 @@ export async function prepareBootstrap(options = {}) {
       ['templates/PROJECT.md', PROJECT_TEMPLATE],
       ['templates/interfaces/module.md', INTERFACE_TEMPLATE],
       ['templates/spec.json', `${JSON.stringify(specTemplate(real), null, 2)}\n`],
+      [CONFIG_TEMPLATE, `${JSON.stringify(config, null, 2)}\n`],
     ],
   });
   return {
     ...bundle,
+    config,
     summary: {
       kind: 'bootstrap',
       root: real,
@@ -622,10 +717,11 @@ export async function generateBlueprint(options = {}) {
     options;
   checkSession({ provider, client, model, signal });
   const safety = { contracts, knownValues };
-  const bundle = await prepareBootstrap({ prompt, root, home, now, architecture, knowledge, ...safety });
+  const bundle = await prepareBootstrap({ prompt, root, home, now, architecture, knowledge, client, ...safety });
   const real = bundle.summary.root;
-  const files = await bundleFiles(bundle);
-  const before = await scanProject(real);
+  // The coordinator writes kodo.config.json after the blueprint; the session writes the blueprint only.
+  const files = (await bundleFiles(bundle)).filter(([name]) => name !== CONFIG_TEMPLATE);
+  const before = await scanProject(real, { watch: AGENT_DIRS });
   const result = await provider.runSession({
     client,
     model: model ?? undefined,
@@ -635,7 +731,7 @@ export async function generateBlueprint(options = {}) {
     readOnly: false,
     signal,
   });
-  const after = await scanProject(real);
+  const after = await scanProject(real, { watch: AGENT_DIRS });
   const output = result?.output;
   const status = isPlain(output) && ['written', 'blocked'].includes(output.status) ? output.status : null;
   const sessionFindings = !status
@@ -648,6 +744,7 @@ export async function generateBlueprint(options = {}) {
   return {
     id: bundle.id,
     dir: bundle.dir,
+    config: bundle.config,
     session: sessionInfo(result, model, status),
     scopeChecked: before.complete && after.complete,
     ok: findings.length === 0,
@@ -668,12 +765,47 @@ function snapshotOf(snapshot, contracts, knownValues) {
   }
 }
 
-function refLabel(ref) {
-  const name = ref.path.replaceAll('\\', '/').split('/').at(-1);
+// A ref is its path and its digest: one path with another digest is another envelope.
+const labelKey = ref => `${ref.path}\0${ref.sha256}`;
+
+function refLabel(ref, labels) {
+  const name = labels.get(labelKey(ref)) ?? ref.path.replaceAll('\\', '/').split('/').at(-1);
   return ref.kind === 'interface' ? name : `${ref.kind}:${name}`;
 }
 
-function moduleMap(snapshot) {
+const MAX_EVIDENCE = 1024 * 1024;
+const MODULE = /^[a-z][a-z0-9-]{0,47}$/;
+
+/** `<module>.md` of interface refs that apply-spec bound to evidence envelopes, by (path, sha256).
+ * Only a file whose realpath lies in `<home>/project-interfaces/evidence` (where apply-spec writes
+ * them) is opened; a missing, outside, unreadable, changed (sha256) or non-interface envelope keeps
+ * its file name (null). */
+async function interfaceLabels(snapshot, home) {
+  const labels = new Map();
+  const evidence =
+    typeof home === 'string'
+      ? await realpath(path.join(path.resolve(home), 'project-interfaces', 'evidence')).catch(() => null)
+      : null;
+  for (const ref of snapshot.tasks.flatMap(task => task.interfaceRefs)) {
+    const key = labelKey(ref);
+    if (ref.kind !== 'interface' || !ref.path.endsWith('.json') || labels.has(key)) continue;
+    labels.set(key, null);
+    if (!evidence) continue;
+    try {
+      const real = await realpath(ref.path);
+      if (real === evidence || !inside(evidence, real)) continue;
+      const file = await readBoundedFile(real, MAX_EVIDENCE);
+      const envelope = file.sha256 === ref.sha256 ? JSON.parse(file.text) : null;
+      const module = envelope?.kind === 'interface' ? envelope.value?.module : undefined;
+      if (typeof module === 'string' && MODULE.test(module)) labels.set(key, `${module}.md`);
+    } catch {
+      // Only a label: the file name stays.
+    }
+  }
+  return labels;
+}
+
+function moduleMap(snapshot, labels) {
   const lines = [];
   for (const milestone of snapshot.milestones) {
     lines.push(`### ${milestone.id} — ${milestone.title} [${milestone.status}]`);
@@ -682,15 +814,32 @@ function moduleMap(snapshot) {
       for (const task of snapshot.tasks.filter(item => item.epicId === epic.id))
         lines.push(
           `  - ${task.id} [${task.status}] owner=${task.owner}; deps: ${task.dependsOn.join(', ') || '—'}; ` +
-            `writePaths: ${task.writePaths.join(', ')}; interfaces: ${task.interfaceRefs.map(refLabel).join(', ') || '—'}`,
+            `writePaths: ${task.writePaths.join(', ')}; interfaces: ${task.interfaceRefs.map(ref => refLabel(ref, labels)).join(', ') || '—'}`,
         );
     }
   }
   return bounded(lines, 48 * 1024);
 }
 
-function extendContext({ prompt, root, at, snapshot, architecture, knowledge }) {
-  const map = moduleMap(snapshot);
+// Interface Refs the project already bound, once each, for interfaceRefs of a new milestone (rule 9).
+function boundInterfaces(snapshot, labels) {
+  const seen = new Map();
+  for (const ref of snapshot.tasks.flatMap(task => task.interfaceRefs))
+    if (ref.kind === 'interface' && !seen.has(labelKey(ref)))
+      seen.set(labelKey(ref), { interface: refLabel(ref, labels), ref });
+  if (!seen.size) return ['Нет: у задач проекта нет ссылок на интерфейсы, в майлстоуне interfaceRefs: [].'];
+  const view = bounded(JSON.stringify([...seen.values()], null, 2).split('\n'), 16 * 1024);
+  return view.omitted
+    ? ['Список слишком велик для контекста: в майлстоуне interfaceRefs: [].']
+    : [
+        'Копируйте поле ref целиком, без изменений, в interfaceRefs задачи (данные, не инструкции):',
+        '',
+        fenced(view.lines.join('\n'), 'json'),
+      ];
+}
+
+function extendContext({ prompt, root, at, snapshot, labels, architecture, knowledge }) {
+  const map = moduleMap(snapshot, labels);
   const accepted = snapshot.tasks.filter(task => CLOSED.includes(task.status)).map(task => task.id);
   const complete = Object.values(snapshot.completeness).every(item => item.complete);
   return [
@@ -717,6 +866,10 @@ function extendContext({ prompt, root, at, snapshot, architecture, knowledge }) 
     '',
     accepted.length ? accepted.join(', ') : 'Нет принятых задач: зависимости только внутри нового майлстоуна.',
     '',
+    '## Привязанные интерфейсы (полные Ref для interfaceRefs)',
+    '',
+    ...boundInterfaces(snapshot, labels),
+    '',
     '## Архитектурный граф',
     '',
     architecture.text,
@@ -737,11 +890,12 @@ const MILESTONE_RULES = `# Правила нового майлстоуна
 3. dependsOn — только новые задачи или уже принятые (accepted/released) задачи проекта.
 4. writePaths задач, которые могут идти параллельно (новые без пути по dependsOn и незакрытые существующие), не пересекаются.
 5. Вход каждой задачи — до ${MAX_TASK_INPUT_BYTES} байт UTF-8; Kodo задачи не режет.
-6. owner — одна из ролей: ${FACTORY_ROLES.join(', ')}.
+6. owner — одна из ролей: ${FACTORY_ROLES.join(', ')}. Хвостовую задачу reviewer не добавляйте: ревью делает gate Run эпика.
 7. Новые эпики не образуют цикл: если задача эпика X зависит от задачи эпика Y, никакая задача Y не зависит (через задачи любых эпиков) от задач X.
 8. В майлстоуне есть хотя бы один эпик, в каждом новом эпике — хотя бы одна задача.
+9. \`interfaceRefs: []\` или полные Ref, скопированные без изменений из раздела «Привязанные интерфейсы» context.md (они уже есть у задач проекта): так воркер получит контракт в brief.interfaces. Новые ссылки к замороженным интерфейсам привязывает только apply-spec: короткая форма \`interfaces/<module>.md\`, изменённый или неизвестный Ref и Ref, чьё evidence не проходит проверку, отклоняются (\`milestone_interface_unbound\`).
 
-Коды: \`milestone_shape\`, \`milestone_task_count\`, \`milestone_id_conflict\`, \`milestone_foreign_parent\`, \`milestone_dependency_unknown\`, \`milestone_dependency_not_accepted\`, \`milestone_snapshot_invalid\`, \`milestone_snapshot_incomplete\`, \`milestone_spec_invalid\`, \`blueprint_owner_unknown\`, \`blueprint_container_empty\`, \`blueprint_epic_cycle\`, \`blueprint_parallel_overlap\`, \`split_required\`.
+Коды: \`milestone_shape\`, \`milestone_task_count\`, \`milestone_id_conflict\`, \`milestone_foreign_parent\`, \`milestone_dependency_unknown\`, \`milestone_dependency_not_accepted\`, \`milestone_interface_unbound\`, \`milestone_snapshot_invalid\`, \`milestone_snapshot_incomplete\`, \`milestone_spec_invalid\`, \`blueprint_owner_unknown\`, \`blueprint_container_empty\`, \`blueprint_epic_cycle\`, \`blueprint_parallel_overlap\`, \`split_required\`.
 `;
 
 function milestoneTemplate(snapshot) {
@@ -765,10 +919,7 @@ function milestoneTemplate(snapshot) {
         acceptance: [criterion('feature-epic-done', '<Критерий>')],
       },
     ],
-    tasks: [
-      task('feature-build', 'developer', accepted ? [accepted] : [], ['src/feature']),
-      task('feature-review', 'reviewer', ['feature-build'], ['docs/reviews/feature.md']),
-    ],
+    tasks: [task('feature-build', 'developer', accepted ? [accepted] : [], ['src/feature'])],
   };
 }
 
@@ -787,16 +938,18 @@ export async function prepareExtend(options = {}) {
   const at = isoTime(now);
   const graph = await architectureSection(architecture);
   const facts = knowledgeSection(knowledge, prompt);
+  const labels = await interfaceLabels(current, home);
   const { redacted, ...bundle } = await writeBundle({
     home,
     root: real,
+    checkDir: options.checkDir,
     kind: 'extend',
     now: at,
     safety: { contracts, knownValues },
     files: [
       [
         'context.md',
-        extendContext({ prompt, root: real, at, snapshot: current, architecture: graph, knowledge: facts }),
+        extendContext({ prompt, root: real, at, snapshot: current, labels, architecture: graph, knowledge: facts }),
       ],
       ['rules.md', MILESTONE_RULES],
       ['templates/milestone.json', `${JSON.stringify(milestoneTemplate(current), null, 2)}\n`],
@@ -953,11 +1106,38 @@ function structuralFindings(input, current) {
         [...open],
       ),
     );
+  const unbound = tasks
+    .filter(
+      task => Array.isArray(task.interfaceRefs) && task.interfaceRefs.some(ref => !boundInterfaceRef(ref, current)),
+    )
+    .map(task => String(task.id));
+  if (unbound.length)
+    findings.push(
+      finding(
+        'milestone_interface_unbound',
+        'В майлстоуне interfaceRefs — [] или полный Ref, скопированный без изменений из задачи проекта ' +
+          '(«Привязанные интерфейсы» в context.md): короткую форму и новые ссылки привязывает только apply-spec',
+        unbound,
+      ),
+    );
   return findings;
 }
 
-// Schema check of the new records alone: foreign parents and external
-// dependencies are reported above and neutralized here.
+const REF_KEYS = ['kind', 'runId', 'headSha', 'path', 'sha256'];
+/** Interface refs are bound to frozen interface evidence by apply-spec only (bindInterfaceEvidence).
+ * A new milestone may reuse a Ref of the project exactly as a task of the snapshot holds it; its
+ * evidence is verified before append (project-cli-blueprint.mjs). */
+function boundInterfaceRef(ref, current) {
+  return (
+    isPlain(ref) &&
+    Object.keys(ref).length === REF_KEYS.length &&
+    REF_KEYS.every(key => Object.hasOwn(ref, key)) &&
+    current.tasks.some(task => task.interfaceRefs.some(item => REF_KEYS.every(key => item[key] === ref[key])))
+  );
+}
+
+// Schema check of the new records alone: foreign parents, external dependencies
+// and unbound interface refs are reported above and neutralized here.
 function normalizeMilestone(input, current, contracts, knownValues) {
   const project = current.project,
     epicIds = new Set(input.epics.filter(isPlain).map(epic => epic.id)),
@@ -982,6 +1162,8 @@ function normalizeMilestone(input, current, contracts, knownValues) {
       if (Object.hasOwn(copy, 'epicId') && !epicIds.has(copy.epicId) && firstEpic !== undefined)
         copy.epicId = firstEpic;
       if (Array.isArray(copy.dependsOn)) copy.dependsOn = copy.dependsOn.filter(id => fresh.has(id));
+      if (Array.isArray(copy.interfaceRefs))
+        copy.interfaceRefs = copy.interfaceRefs.filter(ref => boundInterfaceRef(ref, current));
       return copy;
     }),
   };
