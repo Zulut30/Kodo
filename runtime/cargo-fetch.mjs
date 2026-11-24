@@ -107,10 +107,15 @@ async function fetchGeneration(filename, options, staleGeneration) {
       });
       signal?.throwIfAborted();
       if (result.code !== 0) {
-        const detail = String(result.stderr || result.stdout || 'Cargo завершился без успешного кода выхода').slice(
-          -6000,
-        );
-        throw cargoLockFailure(detail) ?? cargoFetchError(detail);
+        const output = String(result.stderr || result.stdout || 'Cargo завершился без успешного кода выхода');
+        const defect = cargoLockFailure(output);
+        if (defect) throw defect;
+        const parseError = /failed to (?:parse (?:manifest|lock file)|load manifest)\b/i.exec(output);
+        if (parseError)
+          throw Object.assign(new Error(output.slice(parseError.index, parseError.index + 6000)), {
+            code: 'check_failed',
+          });
+        throw cargoFetchError(output.slice(-6000));
       }
     } catch (error) {
       // Closing an uncommitted transaction would restore the stale ready mark.

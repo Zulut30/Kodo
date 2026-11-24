@@ -44,12 +44,38 @@ const closing = new Map([
   ['[', ']'],
   ['{', '}'],
 ]);
+// Return the inclusive end of a token tree. An incomplete declaration stays
+// uncertain through EOF; delimiters in comments and strings are already opaque.
+function groupEnd(tokens, start) {
+  const stack = [closing.get(tokens[start])];
+  for (let i = start + 1; i < tokens.length; i++) {
+    const token = tokens[i];
+    if (closing.has(token)) stack.push(closing.get(token));
+    else if (token === stack.at(-1)) {
+      stack.pop();
+      if (!stack.length) return i;
+    } else if ([')', ']', '}'].includes(token)) break;
+  }
+  return tokens.length;
+}
+
+function macroEnd(tokens, start) {
+  const rules = tokens[start] === 'macro_rules' && tokens[start + 1] === '!';
+  if (!rules && tokens[start] !== 'macro') return -1;
+  let name = start + (rules ? 2 : 1);
+  if (tokens[name] === 'r' && tokens[name + 1] === '#') name += 2;
+  const open = name + 1;
+  if (!closing.has(tokens[open])) return -1;
+  const end = groupEnd(tokens, open);
+  return !rules && tokens[open] === '(' && tokens[end + 1] === '{' ? groupEnd(tokens, end + 1) : end;
+}
+
 // cfg_attr(predicate, attr, ...) permits nesting. Only top-level attribute
 // arguments after its predicate are attributes; route(path=...) is opaque.
-function attributePaths(tokens, start, paths) {
+function attributePaths(tokens, start, paths, inMacro) {
   if (tokens[start] === 'r' && tokens[start + 1] === '#') start += 2;
   if (tokens[start] === 'path' && tokens[start + 1] === '=') {
-    paths.push({ kind: 'path', value: tokens[start + 2]?.literal ?? null });
+    paths.push({ kind: 'path', value: inMacro ? null : (tokens[start + 2]?.literal ?? null) });
     return;
   }
   if (tokens[start] !== 'cfg_attr' || tokens[start + 1] !== '(') return;
@@ -60,7 +86,7 @@ function attributePaths(tokens, start, paths) {
     else if (token === ')' || token === ']' || token === '}') {
       if (!depth) break;
       depth--;
-    } else if (!depth && token === ',') attributePaths(tokens, i + 1, paths);
+    } else if (!depth && token === ',') attributePaths(tokens, i + 1, paths, inMacro);
   }
 }
 
@@ -69,17 +95,24 @@ export function rustSourcePaths(text) {
   const tokens = tokensOf(text);
   if (!tokens) return [{ kind: 'unknown', value: null }];
   const paths = [];
+  let declarationEnd = -1;
   for (let i = 0; i < tokens.length; i++) {
     const name = tokens[i];
+    if (i > declarationEnd && (name === 'macro_rules' || name === 'macro')) declarationEnd = macroEnd(tokens, i);
+    const inMacro = i <= declarationEnd;
     if (name === '#') {
       const bracket = tokens[i + 1] === '!' ? i + 2 : i + 1;
-      if (tokens[bracket] === '[') attributePaths(tokens, bracket + 1, paths);
+      if (tokens[bracket] === '[') attributePaths(tokens, bracket + 1, paths, inMacro);
     }
     if (!['include', 'include_str', 'include_bytes'].includes(name) || tokens[i + 1] !== '!') continue;
     const end = closing.get(tokens[i + 2]);
-    if (!end) continue;
+    if (!end) {
+      // A transcriber can supply the whole delimited argument as a metavariable.
+      if (inMacro && tokens[i + 2] !== '=') paths.push({ kind: name, value: null });
+      continue;
+    }
     const last = tokens[i + 4] === ',' ? i + 5 : i + 4;
-    paths.push({ kind: name, value: tokens[last] === end ? (tokens[i + 3]?.literal ?? null) : null });
+    paths.push({ kind: name, value: !inMacro && tokens[last] === end ? (tokens[i + 3]?.literal ?? null) : null });
   }
   return paths;
 }

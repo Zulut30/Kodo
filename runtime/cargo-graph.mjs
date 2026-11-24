@@ -89,7 +89,7 @@ function sourceOwner(file, dirs, members) {
   const dir = dirs.find(candidate => inDirectory(candidate, file));
   if (!members.has(dir) || shared(file)) return null;
   const local = dir ? file.slice(dir.length + 1) : file;
-  const standard = /^(?:src|examples|benches|tests)\/.+\.rs$/.test(local) || local === 'build.rs';
+  const standard = /^(?:src|examples|benches|tests)\/.+\.rs$/.test(local) || pathKey(local) === 'build.rs';
   return standard || targetPaths(members.get(dir)).includes(local) ? dir : null;
 }
 
@@ -102,7 +102,7 @@ function extraTargetFiles(members) {
 
 // Resolve paths relative to the source containing the macro. Module attributes
 // have a second, lexical base inside inline modules, so uncertain paths widen.
-function sourceInputs(file, dir, refs, { dirs, members, changed, links, selected }) {
+function sourceInputs(file, dir, refs, { dirs, members, changed, links, selected, readers }) {
   for (const { kind, value } of refs) {
     if (!value || value.includes('\\') || posix.isAbsolute(value) || /^[A-Za-z]:/.test(value))
       return 'cargo-source-path';
@@ -124,12 +124,15 @@ function sourceInputs(file, dir, refs, { dirs, members, changed, links, selected
     if (changed.has(pathKey(resolved))) {
       if (!members.has(dir)) return 'cargo-source-path';
       selected.add(dir);
+      readers.add(pathKey(resolved));
     }
   }
   return null;
 }
 
 function cargoLink(link, members, declaredTargets, workspace) {
+  if (pathKey(link).endsWith('.rs')) return true;
+  if (members.has('') && targetPaths(members.get('')).some(target => inDirectory(folder(target), link))) return true;
   if ([...members.keys()].some(dir => dir && inDirectory(dir, link))) return true;
   if (members.has('') && /^(?:src|tests|benches|examples)(?:\/|$)|^build\.rs$/.test(link)) return true;
   if (
@@ -143,7 +146,9 @@ function cargoLink(link, members, declaredTargets, workspace) {
   return patterns.some(pattern => matches(link, ancestors(normalized(pattern))));
 }
 
-function hiddenEdge(members, selected, snapshot, dirs, changed, buildScripts, root, links) {
+function hiddenEdge(context, snapshot, buildScripts, root, linkPaths) {
+  const { members, dirs } = context;
+  const sourceNames = new Set([...snapshot.sources.keys()].map(pathKey));
   const extraTargets = extraTargetFiles(members);
   const declaredTargets = [...members.keys()];
   for (const [dir, doc] of members) {
@@ -154,11 +159,10 @@ function hiddenEdge(members, selected, snapshot, dirs, changed, buildScripts, ro
       declaredTargets.push(target);
     }
     const script = doc.package.build;
-    if (typeof script === 'string' || (script !== false && snapshot.sources.has(posix.join(dir, 'build.rs'))))
+    if (typeof script === 'string' || (script !== false && sourceNames.has(pathKey(posix.join(dir, 'build.rs')))))
       buildScripts.add(dir);
   }
-  if (links.some(link => cargoLink(link, members, declaredTargets, root?.workspace))) return 'cargo-linked-input';
-  const context = { dirs, members, changed, links: new Set(links.map(pathKey)), selected };
+  if (linkPaths.some(link => cargoLink(link, members, declaredTargets, root?.workspace))) return 'cargo-linked-input';
   const visited = new Set();
   function inspect(file, dir) {
     const key = JSON.stringify([file, dir]);
@@ -181,7 +185,7 @@ function hiddenEdge(members, selected, snapshot, dirs, changed, buildScripts, ro
       const config = parse(text);
       if (config.patch || config.source || config.paths || config.include) return 'cargo-config-dependencies';
     }
-    if (file.endsWith('.rs') || extraTargets.has(file)) {
+    if (pathKey(file).endsWith('.rs') || extraTargets.has(file)) {
       const reason = inspect(
         file,
         dirs.find(candidate => inDirectory(candidate, file)),
@@ -191,6 +195,89 @@ function hiddenEdge(members, selected, snapshot, dirs, changed, buildScripts, ro
   }
   return null;
 }
+const documentation = file =>
+  /\.md$/i.test(file) || /^(?:LICENSE|CHANGELOG)/.test(posix.basename(file)) || file.startsWith('docs/');
+
+const hasGlob = value => /[*?[]/.test(value);
+const uncertainPath = value => typeof value !== 'string' || !value || /[\\{}$\0]|^[A-Za-z]:|^\/\//.test(value);
+
+// Cargo include patterns use gitignore syntax. Prefix each path component in
+// both operands so Node's glob matcher also considers leading dots.
+function packagePattern(local, pattern) {
+  const directoryOnly = pattern.endsWith('/');
+  const parts = pathKey(pattern)
+    .split('/')
+    .filter(part => part && part !== '.');
+  const anywhere = parts.length === 1 && !pattern.startsWith('/');
+  const glob = parts.map(part => (part === '**' ? part : 'x' + part)).join('/');
+  const candidates = ancestors(local);
+  if (directoryOnly) candidates.pop();
+  return candidates.some(ancestor => {
+    const candidate = ancestor
+      .split('/')
+      .map(part => 'x' + part)
+      .join('/');
+    return posix.matchesGlob(candidate, glob) || (anywhere && posix.matchesGlob(candidate, '**/' + glob));
+  });
+}
+
+// Handle each include list in declaration order. An exclusion in this package
+// cannot cancel a readme/license reference or a reader in another package.
+function manifestInput(field, value, dir, base, { changed, links, dirs }, reads) {
+  const include = field === 'include';
+  if (uncertainPath(value)) return 'cargo-manifest-path';
+  const negative = include && value.startsWith('!');
+  const pattern = negative ? value.slice(1) : value;
+  if (pattern.startsWith('/') && !include) return 'cargo-manifest-path';
+  const parts = pattern.replace(/^\//, '').split('/');
+  const glob = hasGlob(pattern);
+  if (glob && (!include || parts.includes('..') || /[()]/.test(pattern))) return 'cargo-manifest-path';
+  let resolved = base;
+  for (const part of parts) {
+    resolved = normalized(posix.join(resolved, part));
+    if (outside(resolved) && resolved !== '') return 'cargo-manifest-path';
+    if (links.has(pathKey(resolved))) return 'cargo-linked-input';
+  }
+  for (const file of changed) {
+    const local = posix.relative(pathKey(base) || '.', file);
+    let match = !glob && pathKey(resolved) === file && !pattern.endsWith('/');
+    if (include && !outside(local)) {
+      // Cargo excludes nested packages and the package's root target directory.
+      if (dirs.find(other => inDirectory(other, file)) !== dir || inDirectory('target', local)) continue;
+      match ||= packagePattern(local, pattern);
+    }
+    if (match) {
+      if (negative) reads.delete(file);
+      else reads.add(file);
+    }
+  }
+  return null;
+}
+
+function manifestInputs(context, workspacePackage, reads) {
+  for (const [dir, { package: pkg }] of context.members) {
+    for (const field of ['readme', 'license-file', 'include']) {
+      let value = pkg[field];
+      if (value === undefined) continue;
+      const inherited = value?.workspace === true;
+      if (inherited) value = workspacePackage?.[field];
+      if (field === 'readme' && value === false) continue;
+      const base = inherited && field !== 'include' ? '' : dir;
+      let names = field === 'include' ? value : [value];
+      if (field === 'readme' && value === true) names = ['README.md', 'README.txt', 'README'];
+      if (!Array.isArray(names)) return 'cargo-manifest-path';
+      const fieldReads = new Set();
+      for (const name of names) {
+        const reason = manifestInput(field, name, dir, base, context, fieldReads);
+        if (reason) return reason;
+      }
+      if (fieldReads.size) context.selected.add(dir);
+      for (const file of fieldReads) reads.add(file);
+    }
+  }
+  return null;
+}
+
 function packageSpec(doc, root) {
   const version =
     doc.package.version?.workspace === true ? root?.workspace?.package?.version : (doc.package.version ?? '0.0.0');
@@ -218,28 +305,31 @@ export function affectedCrates(documents, changed, snapshot = { entries: [], sou
     .filter(dir => dir || root?.package)
     .sort((a, b) => b.length - a.length);
   const selected = new Set();
-  const links = snapshot.entries.filter(entry => entry.mode === '120000').map(entry => entry.file);
+  const linkPaths = snapshot.entries.filter(entry => entry.mode === '120000').map(entry => entry.file);
+  const links = new Set(linkPaths.map(pathKey));
+  const unowned = [];
   for (const file of changed) {
-    // Cargo links are classified against manifests and literal paths below.
-    if (links.includes(file)) continue;
-    if (shared(file)) return full('cargo-workspace-input');
+    if (shared(file) && !links.has(pathKey(file))) return full('cargo-workspace-input');
     const owner = sourceOwner(file, dirs, members);
     if (owner !== null) selected.add(owner);
-    else if (file.endsWith('.rs') || dirs.some(dir => inDirectory(dir, file))) return full('cargo-unowned-input');
+    else unowned.push(file);
   }
+  const readers = new Set();
+  const context = { dirs, members, changed: new Set(changed.map(pathKey)), links, selected, readers };
   const buildScripts = new Set();
-  const reason = hiddenEdge(
-    members,
-    selected,
-    snapshot,
-    dirs,
-    new Set(changed.map(pathKey)),
-    buildScripts,
-    root,
-    links,
-  );
+  const reason = hiddenEdge(context, snapshot, buildScripts, root, linkPaths);
   if (reason) return full(reason);
-  const reasons = [...buildScripts].some(dir => !selected.has(dir)) ? ['cargo-build-script-input'] : [];
+  const manifestReads = new Set();
+  const manifestReason = manifestInputs(context, root?.workspace?.package, manifestReads);
+  if (manifestReason) return full(manifestReason);
+  for (const file of unowned) {
+    const key = pathKey(file);
+    if (manifestReads.has(key)) continue;
+    if (dirs.some(dir => inDirectory(dir, file)) && !links.has(key)) return full('cargo-unowned-input');
+    if (key.endsWith('.rs') || (!readers.has(key) && !documentation(file))) return full('cargo-unowned-input');
+  }
+  const reasons = manifestReads.size ? ['cargo-manifest-input'] : [];
+  if ([...buildScripts].some(dir => !selected.has(dir))) reasons.push('cargo-build-script-input');
   for (const dir of buildScripts) selected.add(dir);
   const consumers = new Map();
   for (const [dir, doc] of members)
@@ -283,7 +373,7 @@ export async function cargoPlanAt(cwd, baseSha, headSha) {
     headSha,
     file =>
       posix.basename(file) === 'Cargo.toml' ||
-      file.endsWith('.rs') ||
+      pathKey(file).endsWith('.rs') ||
       file === 'Cargo.lock' ||
       /(?:^|\/)\.cargo\/config[^/]*$/.test(file),
   );
@@ -297,7 +387,7 @@ export async function cargoPlanAt(cwd, baseSha, headSha) {
   // An include! fragment can itself read files. Read only such source blobs,
   // never arbitrary include_bytes! assets, and keep the submitting crate as owner.
   const references = new Map();
-  let pending = [...snapshot.sources.keys()].filter(file => file.endsWith('.rs') || extra.has(file));
+  let pending = [...snapshot.sources.keys()].filter(file => pathKey(file).endsWith('.rs') || extra.has(file));
   while (pending.length) {
     const fragments = new Set();
     for (const file of pending) {

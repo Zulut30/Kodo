@@ -146,6 +146,7 @@ test('a documentation-only change gets a real metadata receipt with no crate com
   const f = await fakeRun(t);
   await f.commit('README.md');
   const checks = await f.go();
+  assert.deepEqual(checks.plan.reasons, ['cargo-no-affected-crates']);
   assert.deepEqual(checks.plan.affectedCrates, []);
   assert.equal(checks.results.length, 1);
   assert.equal(checks.results[0].kind, 'metadata');
@@ -157,7 +158,7 @@ test('task-fast verifies an unrelated Git symlink without following it or wideni
   const f = await fakeRun(t);
   await f.commit('crates/a/src/lib.rs');
   const oid = await git(f.cwd, ['hash-object', '-w', 'README.md']);
-  await git(f.cwd, ['update-index', '--add', '--cacheinfo', '120000,' + oid + ',notes-link']);
+  await git(f.cwd, ['update-index', '--add', '--cacheinfo', '120000,' + oid + ',notes.md']);
   await git(f.cwd, [
     '-c',
     'user.name=test',
@@ -170,18 +171,18 @@ test('task-fast verifies an unrelated Git symlink without following it or wideni
     'link',
   ]);
   // Use Git's link representation on this checkout (including core.symlinks=false on Windows).
-  await git(f.cwd, ['checkout-index', '--force', '--', 'notes-link']);
+  await git(f.cwd, ['checkout-index', '--force', '--', 'notes.md']);
   const checks = await f.go();
   assert.deepEqual(checks.plan.affectedCrates, ['a']);
   assert.equal(checks.plan.fallback, false);
   assert.deepEqual(checks.results[0].args, ['test', '-p', 'a@1.0.0', '--locked']);
-  await git(f.cwd, ['update-index', '--assume-unchanged', 'notes-link']);
-  await unlink(path.join(f.cwd, 'notes-link'));
-  await put(f.cwd, 'notes-link', 'hello');
+  await git(f.cwd, ['update-index', '--assume-unchanged', 'notes.md']);
+  await unlink(path.join(f.cwd, 'notes.md'));
+  await put(f.cwd, 'notes.md', 'hello');
   await git(f.cwd, ['config', 'core.symlinks', 'true']);
   await assert.rejects(f.go(), { code: 'dirty_worktree' });
   await git(f.cwd, ['config', 'core.symlinks', 'false']);
-  await put(f.cwd, 'notes-link', 'different');
+  await put(f.cwd, 'notes.md', 'different');
   await assert.rejects(f.go(), { code: 'dirty_worktree' });
 });
 
@@ -269,4 +270,32 @@ test('task-fast warms each configured Cargo toolchain before offline steps', asy
     '+stable test',
     '+nightly test',
   ]);
+});
+
+for (const reason of [
+  'failed to parse manifest at crates/a/Cargo.toml',
+  'failed to load manifest for workspace member a',
+  'failed to parse lock file at Cargo.lock',
+]) {
+  test('cold fetch reports submission defect: ' + reason, async t => {
+    const { base: home, project: cwd } = await fixture(t, { 'Cargo.lock': 'version=4' });
+    const runCommand = async (_cmd, args) =>
+      args[0] === 'fetch' ? { code: 101, stderr: 'error: ' + reason } : { code: 0, stdout: 'cargo 1.96' };
+    await assert.rejects(
+      warmCargoDependencies({ home, cwd, command: 'fake', env: {}, timeoutMs: 1000, runCommand }),
+      error => error.code === 'check_failed' && error.message.includes(reason),
+    );
+  });
+}
+
+test('an unowned asset at the submitted head runs a locked workspace test', async t => {
+  const f = await fakeRun(t, true, { 'assets/level.json': '{}' });
+  await f.commit('assets/level.json');
+  const checks = await f.go();
+  assert.deepEqual(checks.plan.reasons, ['cargo-unowned-input']);
+  assert.equal(checks.plan.fallback, true);
+  assert.deepEqual(
+    checks.results.map(step => step.args),
+    [['test', '--workspace', '--locked']],
+  );
 });
