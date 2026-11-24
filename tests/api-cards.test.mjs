@@ -498,3 +498,33 @@ test('buildApiCards degrades to unavailable when a dependency blob is missing (l
   assert.equal(fromBatch.unavailable, true);
   assert.equal(fromBatch.code, 'api_cards_missing_object');
 });
+
+test('extractJsTsPublicApi distinguishes string literal return types, function type arrows and object return types from bodies', () => {
+  const ts = `
+export function mode(): "fast" | "slow" {
+  return "fast";
+}
+export function get(): { x: number } {
+  return { x: 1 };
+}
+export function labeled(): { kind: "a" } | "none" {
+  return { kind: "a" };
+}
+export const run: (input: string) => number = (input) => {
+  return input.length;
+};
+export const runInline: (input: string) => number = (input) => input.length;
+export const buildObj: (id: string) => { x: number } = (id) => ({ x: id.length });
+export const next = (v: number): "ok" | "err" => (v > 0 ? "ok" : "err");
+`;
+  const sigs = extractJsTsPublicApi(ts);
+  assert.deepEqual(sigs, [
+    'export function mode(): "fast" | "slow"',
+    'export function get(): { x: number }',
+    'export function labeled(): { kind: "a" } | "none"',
+    'export const run: (input: string) => number',
+    'export const runInline: (input: string) => number',
+    'export const buildObj: (id: string) => { x: number }',
+    'export const next = (v: number): "ok" | "err" =>',
+  ]);
+});

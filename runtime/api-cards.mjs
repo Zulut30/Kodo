@@ -412,7 +412,7 @@ function maskJsTs(source) {
           break;
         } else j++;
       }
-      blank(code, i, j);
+      blank(code, i + 1, Math.max(i + 1, j - 1));
       i = j;
       continue;
     }
@@ -438,7 +438,7 @@ function maskJsTs(source) {
           break;
         } else j++;
       }
-      blank(code, i, j);
+      blank(code, i + 1, Math.max(i + 1, j - 1));
       i = j;
       continue;
     }
@@ -447,10 +447,25 @@ function maskJsTs(source) {
   return { code: code.join(''), noComments: noComments.join('') };
 }
 
+function isQuote(ch) {
+  return ch === '"' || ch === "'" || ch === '`';
+}
+
+function skipStringLiteral(code, start) {
+  const quote = code[start];
+  let i = start + 1;
+  while (i < code.length && code[i] !== quote) i++;
+  return i < code.length ? i + 1 : code.length;
+}
+
 function skipBalanced(code, start, open, close) {
   let depth = 0;
   let i = start;
   while (i < code.length) {
+    if (isQuote(code[i])) {
+      i = skipStringLiteral(code, i);
+      continue;
+    }
     if (code[i] === open) depth++;
     else if (code[i] === close && !(close === '>' && code[i - 1] === '=')) {
       depth--;
@@ -508,6 +523,11 @@ function scanReturnTypeEnd(code, start) {
         return { sigEnd: i, skipTo: i + 1 };
       }
       i++;
+      continue;
+    }
+    if (isQuote(ch)) {
+      i = skipStringLiteral(code, i);
+      expectType = false;
       continue;
     }
     if (ch === ';') return { sigEnd: i, skipTo: i + 1 };
@@ -658,7 +678,8 @@ function looksLikeArrowReturnType(code, bracePos) {
     if (code[i] === '=' && code[i + 1] === '>') return true;
     if (code[i] === '|' || code[i] === '&') {
       i = skipWs(code, i + 1);
-      if (code[i] === '{') i = skipWs(code, skipBalanced(code, i, '{', '}'));
+      if (isQuote(code[i])) i = skipWs(code, skipStringLiteral(code, i));
+      else if (code[i] === '{') i = skipWs(code, skipBalanced(code, i, '{', '}'));
       else if (code[i] === '(') i = skipWs(code, skipBalanced(code, i, '(', ')'));
       else if (code[i] === '[') i = skipWs(code, skipBalanced(code, i, '[', ']'));
       else {
@@ -670,6 +691,34 @@ function looksLikeArrowReturnType(code, bracePos) {
     return false;
   }
   return false;
+}
+
+function skipArrowBody(code, noComments, start) {
+  const first = skipWs(code, start);
+  if (code[first] === '{') return skipBalanced(code, first, '{', '}');
+  let paren = 0,
+    bracket = 0,
+    brace = 0,
+    i = first;
+  while (i < code.length) {
+    const ch = code[i];
+    if (isQuote(ch)) {
+      i = skipStringLiteral(code, i);
+      continue;
+    }
+    if (ch === '(') paren++;
+    else if (ch === ')' && paren > 0) paren--;
+    else if (ch === '[') bracket++;
+    else if (ch === ']' && bracket > 0) bracket--;
+    else if (ch === '{') brace++;
+    else if (ch === '}' && brace > 0) brace--;
+    else if (paren === 0 && bracket === 0 && brace === 0) {
+      if (ch === ';') return i + 1;
+      if (ch === '\n' && isConstAsiEnd(code, noComments, i)) return i + 1;
+    }
+    i++;
+  }
+  return code.length;
 }
 
 function finalizeConstExport(noComments, eqPos, end) {
@@ -686,33 +735,54 @@ function isConstAsiEnd(code, noComments, nlIndex) {
   return code[nextIdx] === '}' || STMT_START.test(code.slice(nextIdx));
 }
 
+function stepBracketDepth(depth, ch, prevCh, inType) {
+  if (ch === '(') depth.paren++;
+  else if (ch === ')' && depth.paren > 0) depth.paren--;
+  else if (ch === '[') depth.bracket++;
+  else if (ch === ']' && depth.bracket > 0) depth.bracket--;
+  else if (ch === '<' && inType && depth.paren === 0 && depth.bracket === 0 && depth.brace === 0) depth.angle++;
+  else if (ch === '>' && depth.angle > 0 && prevCh !== '=') depth.angle--;
+  else if (ch === '}' && depth.brace > 0) depth.brace--;
+  else return false;
+  return true;
+}
+
 function findConstExportEnd(code, noComments, start) {
-  let paren = 0,
-    bracket = 0,
-    brace = 0,
+  const depth = { paren: 0, bracket: 0, brace: 0, angle: 0 };
+  const atTop = () => depth.paren === 0 && depth.bracket === 0 && depth.brace === 0 && depth.angle === 0;
+  let hasTypeAnnotation = false,
     eqPos = -1,
     i = start;
   while (i < code.length) {
     const ch = code[i];
-    if (ch === '(') paren++;
-    else if (ch === ')' && paren > 0) paren--;
-    else if (ch === '[') bracket++;
-    else if (ch === ']' && bracket > 0) bracket--;
-    else if (ch === '{') {
-      if (paren === 0 && bracket === 0 && brace === 0 && eqPos !== -1) {
+    if (isQuote(ch)) {
+      i = skipStringLiteral(code, i);
+      continue;
+    }
+    if (stepBracketDepth(depth, ch, code[i - 1], eqPos === -1)) {
+      i++;
+      continue;
+    }
+    if (ch === '{') {
+      if (atTop() && eqPos !== -1) {
         if (looksLikeArrowReturnType(code, i)) {
           i = skipBalanced(code, i, '{', '}');
           continue;
         }
         return { sigEnd: eqPos, skipTo: i };
       }
-      brace++;
-    } else if (ch === '}' && brace > 0) brace--;
-    else if (paren === 0 && bracket === 0 && brace === 0) {
-      if (ch === '=' && code[i + 1] === '>') return { sigEnd: i + 2, skipTo: i + 2 };
-      if (ch === '=' && code[i - 1] !== '=' && code[i + 1] !== '=' && eqPos === -1) eqPos = i;
-      if (ch === ';') return { sigEnd: finalizeConstExport(noComments, eqPos, i), skipTo: i + 1 };
-      if (ch === '\n' && eqPos !== -1 && isConstAsiEnd(code, noComments, i)) {
+      depth.brace++;
+    } else if (atTop()) {
+      if (ch === ':' && eqPos === -1) hasTypeAnnotation = true;
+      else if (ch === '=' && code[i + 1] === '>') {
+        if (eqPos === -1) {
+          i += 2;
+          continue;
+        }
+        return { sigEnd: hasTypeAnnotation ? eqPos : i + 2, skipTo: skipArrowBody(code, noComments, i + 2) };
+      } else if (ch === '=' && code[i - 1] !== '=' && code[i + 1] !== '=' && eqPos === -1) eqPos = i;
+      else if (ch === ';') return { sigEnd: finalizeConstExport(noComments, eqPos, i), skipTo: i + 1 };
+      else if (ch === '\n' && eqPos !== -1 && isConstAsiEnd(code, noComments, i)) {
         return { sigEnd: finalizeConstExport(noComments, eqPos, i), skipTo: i + 1 };
       }
     }
@@ -748,6 +818,10 @@ export function extractJsTsPublicApi(source) {
 
   for (let i = 0; i < code.length; i++) {
     const ch = code[i];
+    if (isQuote(ch)) {
+      i = skipStringLiteral(code, i) - 1;
+      continue;
+    }
     if (ch === '{') {
       brace++;
       continue;
