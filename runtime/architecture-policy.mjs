@@ -370,13 +370,15 @@ function inspectGraph(graph) {
 
 function safeScope(value) {
   text(value);
+  const cleaned = value.replace(/^(?:\.\/)+/, '').replace(/\/+$/, '');
   if (
-    /[\\:\x00-\x1f\x7f]/.test(value) ||
-    value.startsWith('/') ||
-    value.split('/').some(part => !part || part === '.' || part === '..')
+    !cleaned ||
+    /[\\:\x00-\x1f\x7f]/.test(cleaned) ||
+    cleaned.startsWith('/') ||
+    cleaned.split('/').some(part => !part || part === '.' || part === '..')
   )
     fail('unsafe_path');
-  return value;
+  return cleaned;
 }
 
 function inspectRustGraph(graph) {
@@ -502,19 +504,19 @@ function rustCycleFindings({ crates, adjacency, crossEdges, add }) {
 
 function evaluateRustContractChanges({ normalized, basePolicy, crates, baseCrates, changedPaths, taskPaths, add }) {
   if (!changedPaths.length) return;
-  const protectedContracts = new Map();
+  const protectedInstances = [];
   const collect = (policyObj, crateMap) => {
     if (!policyObj || policyObj.schemaVersion !== 2 || !crateMap) return;
     for (const name of policyObj.contractCrates) {
       const crate = crateMap.get(name);
-      if (crate && !protectedContracts.has(name)) protectedContracts.set(name, crate);
+      if (crate) protectedInstances.push(crate);
     }
   };
   collect(normalized, crates);
   collect(basePolicy, baseCrates);
-  if (!protectedContracts.size) return;
+  if (!protectedInstances.length) return;
   for (const changedFile of changedPaths) {
-    for (const crate of protectedContracts.values()) {
+    for (const crate of protectedInstances) {
       const insideCrate = crate.root ? within(changedFile, crate.root) : crate.files.includes(changedFile);
       if (!insideCrate) continue;
       const authorized = taskPaths.some(scope => isExplicitContractScope(scope, crate.root, changedFile));
@@ -572,6 +574,10 @@ function evaluateRustArchitecture(input) {
   for (const crate of crates.values()) {
     if (!layerIndexByCrate.has(crate.name))
       add('ownership.unowned', crate.manifest, null, crate.name, null, [], [crate.manifest]);
+  }
+  for (const contractName of normalized.contractCrates) {
+    if (!crates.has(contractName))
+      add('contract_crate_missing', 'Cargo.toml', null, contractName, null, [], ['Cargo.toml']);
   }
   const allowedProd = new Set(normalized.allowedExternalCrates);
   const allowedDev = new Set([...normalized.allowedExternalCrates, ...normalized.allowedDevExternalCrates]);

@@ -22,6 +22,7 @@ const rules = new Set([
   'contract.dependent',
   'contract.tests',
   'contract_change_not_allowed',
+  'contract_crate_missing',
 ]);
 const findingKeys = [
   'id',

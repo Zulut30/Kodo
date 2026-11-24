@@ -762,38 +762,83 @@ function isRustBlueprint(spec, projectMarkdown) {
   return /\b(?:rust|cargo)\b/i.test(meta);
 }
 
+function scopeCoversContractWithoutNamingIt(rawScope, contractRoot) {
+  if (typeof rawScope !== 'string') return false;
+  const scope = rawScope
+    .replaceAll('\\', '/')
+    .replace(/^(?:\.\/)+/, '')
+    .replace(/\/+$/, '');
+  if (!scope) return false;
+  const staticPrefix = scope.split(/[*?[{]/)[0].replace(/\/+$/, '');
+  if (staticPrefix === contractRoot || staticPrefix.startsWith(`${contractRoot}/`)) return false;
+  const hasGlob = /[*?[{]/.test(scope);
+  if (!hasGlob) return scope === '.' || contractRoot === scope || contractRoot.startsWith(`${scope}/`);
+  return (
+    path.posix.matchesGlob(contractRoot, scope) ||
+    path.posix.matchesGlob(`${contractRoot}/Cargo.toml`, scope) ||
+    path.posix.matchesGlob(`${contractRoot}/src/lib.rs`, scope)
+  );
+}
+
+function broadContractScopeFindings(spec, contractRoots) {
+  if (!contractRoots.size) return [];
+  const offending = new Set();
+  for (const task of spec.tasks) {
+    for (const scope of task.writePaths ?? []) {
+      for (const contractRoot of contractRoots) {
+        if (scopeCoversContractWithoutNamingIt(scope, contractRoot)) offending.add(task.id);
+      }
+    }
+  }
+  if (!offending.size) return [];
+  return [
+    finding(
+      'contract_scope_too_broad',
+      'Путь записи задачи накрывает защищённый контрактный крейт слишком широкой маской; ' +
+        'укажите конкретный каталог модуля или явно назовите каталог контрактного крейта в задаче контракта',
+      [...offending].sort(compare),
+    ),
+  ];
+}
+
 /** Multi-crate Rust workspaces (>= 3 crates) must create a compilable contract crate
  * (e.g. `crates/<name>-contracts`) in Wave 0 so parallel tasks compile against frozen traits/types. */
 export function rustContractCrateFindings(spec, projectMarkdown = '') {
   if (!isRustBlueprint(spec, projectMarkdown)) return [];
   const crates = new Map();
+  const contractRoots = new Set();
   for (const task of spec.tasks) {
     for (const scope of task.writePaths ?? []) {
       const crate = crateFromWritePath(scope);
-      if (crate) crates.set(crate.root, crate.name);
+      if (crate) {
+        crates.set(crate.root, crate.name);
+        if (CONTRACT_CRATE_NAME.test(crate.name)) contractRoots.add(crate.root);
+      }
     }
   }
-  if (crates.size < RUST_CONTRACT_CRATE_MIN) return [];
+  const findings = [...broadContractScopeFindings(spec, contractRoots)];
+  if (crates.size < RUST_CONTRACT_CRATE_MIN) return findings;
   const waveZeroEpics = new Set(
     spec.epics.filter(epic => epic.id === FOUNDATION_ID || epic.milestoneId === FOUNDATION_ID).map(epic => epic.id),
   );
   const waveZeroTasks = spec.tasks.filter(task => waveZeroEpics.has(task.epicId));
-  if (!waveZeroTasks.length) return [];
+  if (!waveZeroTasks.length) return findings;
   const hasWaveZeroContractCrate = waveZeroTasks.some(task =>
     (task.writePaths ?? []).some(scope => {
       const crate = crateFromWritePath(scope);
-      return crate !== null && CONTRACT_CRATE_NAME.test(crate.name);
+      return crate !== null && contractRoots.has(crate.root);
     }),
   );
-  if (hasWaveZeroContractCrate) return [];
-  return [
+  if (hasWaveZeroContractCrate) return findings;
+  findings.push(
     finding(
       'contract_crate_required',
       'Для Rust workspace с ≥ 3 крейтами Волна 0 (foundation) должна содержать задачу, ' +
         'создающую компилируемый контрактный крейт (crates/<name>-contracts: pub trait, типы данных, ошибки, ' +
         'conformance-тесты), защищённый через contractCrates в architecture.policy.json',
     ),
-  ];
+  );
+  return findings;
 }
 
 function analyzeFactorySpec(spec, options = {}) {

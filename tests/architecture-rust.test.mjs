@@ -903,3 +903,138 @@ test('E3: underscore dep tables, workspace=true package conflict, and [patch]/[r
     `expected unsupported-cargo-patch for .cargo/config.toml, got ${JSON.stringify(blocked.unsupported)}`,
   );
 });
+
+test('E4: contract protection checks base U head (moved crate & root deleted file), missing contract crate, and contract_scope_too_broad', async t => {
+  // 1) Moving contract crate with the same package name: base path must still be protected.
+  const fxMove = await rustFixture(t);
+  await fxMove.put(
+    'Cargo.toml',
+    defaultWorkspaceFiles()['Cargo.toml'].replace('crates/game-contracts', 'crates/moved-contracts'),
+  );
+  await fxMove.put('crates/moved-contracts/Cargo.toml', defaultWorkspaceFiles()['crates/game-contracts/Cargo.toml']);
+  await fxMove.put(
+    'crates/moved-contracts/src/lib.rs',
+    'pub trait WorldView { fn tick(&self) -> u64; fn extra(&self); }\n',
+  );
+  await rm(path.join(fxMove.project, 'crates/game-contracts'), { recursive: true, force: true });
+  fxMove.commit('move game-contracts to crates/moved-contracts');
+  const moveReport = await checkArchitecture({
+    project: fxMove.project,
+    baseSha: fxMove.baseSha,
+    taskPaths: ['crates/moved-contracts'],
+  });
+  assert.equal(moveReport.status, 'failed');
+  assert.ok(
+    moveReport.findings.some(
+      row => row.ruleId === 'contract_change_not_allowed' && row.file === 'crates/game-contracts/src/lib.rs',
+    ),
+    `expected base contract location to be protected on move, got ${JSON.stringify(moveReport.findings)}`,
+  );
+
+  // 2) Root contract crate deleting src/old.rs must be caught via base crate file list.
+  const rootPolicy = rustPolicy({
+    productRoots: ['src'],
+    layers: [
+      { id: 'contracts', crates: ['root-contracts'] },
+      { id: 'app', crates: ['app'] },
+    ],
+    contractCrates: ['root-contracts'],
+  });
+  const fxRoot = await rustFixture(t, {
+    policy: rootPolicy,
+    files: {
+      'Cargo.toml':
+        '[package]\nname = "root-contracts"\nversion = "0.1.0"\nedition = "2024"\n[workspace]\nmembers = ["crates/app"]\n',
+      'src/lib.rs': 'pub mod old;\n',
+      'src/old.rs': 'pub trait Legacy {}\n',
+      'crates/app/Cargo.toml':
+        '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2024"\n[dependencies]\nroot-contracts = { path = "../.." }\n',
+      'crates/app/src/main.rs': 'fn main() {}\n',
+    },
+  });
+  await rm(path.join(fxRoot.project, 'src/old.rs'));
+  fxRoot.commit('delete root contract file src/old.rs');
+  const rootDeleteReport = await checkArchitecture({
+    project: fxRoot.project,
+    baseSha: fxRoot.baseSha,
+    taskPaths: ['crates/app'],
+  });
+  assert.equal(rootDeleteReport.status, 'failed');
+  assert.ok(
+    rootDeleteReport.findings.some(row => row.ruleId === 'contract_change_not_allowed' && row.file === 'src/old.rs'),
+    `expected deleted root contract file src/old.rs to trigger contract_change_not_allowed, got ${JSON.stringify(rootDeleteReport.findings)}`,
+  );
+
+  // 3) Declared contractCrates entry that is not an actual workspace member on head -> contract_crate_missing.
+  const fxMissing = await rustFixture(t, {
+    policy: rustPolicy({
+      layers: [
+        { id: 'contracts', crates: ['game-contracts', 'ghost-contracts'] },
+        { id: 'core', crates: ['core'] },
+        { id: 'world', crates: ['world'] },
+        { id: 'render', crates: ['render'] },
+        { id: 'app', crates: ['app'] },
+      ],
+      contractCrates: ['game-contracts', 'ghost-contracts'],
+    }),
+  });
+  const missingReport = await checkArchitecture({ project: fxMissing.project, baseSha: fxMissing.baseSha });
+  assert.equal(missingReport.status, 'failed');
+  assert.ok(
+    missingReport.findings.some(row => row.ruleId === 'contract_crate_missing' && row.fromModule === 'ghost-contracts'),
+    `expected contract_crate_missing for ghost-contracts, got ${JSON.stringify(missingReport.findings)}`,
+  );
+
+  // 4) Blueprint rule: ordinary task writePaths covering contract crate (e.g. crates/**) -> contract_scope_too_broad.
+  const root = await mkdtemp(path.join(os.tmpdir(), 'kodo-rust-broad-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const criterion = id => ({ id, text: 'cargo test passes', evidenceKinds: ['checks'] });
+  const mkTask = (id, epicId, dependsOn, writePaths) => ({
+    id,
+    epicId,
+    title: `Task ${id}`,
+    description: `Implement ${id}`,
+    owner: 'developer',
+    dependsOn,
+    writePaths,
+    acceptance: [criterion(`${id}-done`)],
+    interfaceRefs: [],
+    priority: 50,
+    userValue: 3,
+    risk: 1,
+    estimatedEffort: 1,
+    riskApprovalRequired: false,
+  });
+  const broadSpec = {
+    schemaVersion: 1,
+    id: 'broad-rust',
+    root,
+    title: 'Broad Rust',
+    definitionOfDone: [criterion('done')],
+    constraints: [],
+    businessContext: 'Rust workspace',
+    architectureRefs: [],
+    execution: { cadence: 'wave', integration: 'branch' },
+    milestones: [
+      { id: 'foundation', title: 'Wave 0', acceptance: [criterion('f-done')], releaseRequired: false },
+      { id: 'mvp', title: 'MVP', acceptance: [criterion('m-done')], releaseRequired: false },
+    ],
+    epics: [
+      { id: 'foundation', milestoneId: 'foundation', title: 'Setup', acceptance: [criterion('fe-done')] },
+      { id: 'mvp', milestoneId: 'mvp', title: 'MVP', acceptance: [criterion('me-done')] },
+    ],
+    tasks: [
+      mkTask('wave0-contracts', 'foundation', [], ['Cargo.toml', 'architecture.policy.json', 'crates/game-contracts']),
+      mkTask('broad-task', 'mvp', ['wave0-contracts'], ['crates/**']),
+      mkTask('render-task', 'mvp', ['broad-task'], ['crates/render']),
+    ],
+  };
+  const broadLint = lintFactorySpec(broadSpec, {
+    interfaces: [],
+    projectMarkdown: '# Game\n## Цель\nИгра.\n## Модули\ncore.\n## Стек\nRust Cargo.\n## Критерии готовности\n- ok\n',
+  });
+  assert.equal(broadLint.ok, false);
+  const broadFinding = broadLint.findings.find(row => row.code === 'contract_scope_too_broad');
+  assert.ok(broadFinding, `expected contract_scope_too_broad, got ${JSON.stringify(broadLint.findings)}`);
+  assert.deepEqual(broadFinding.taskIds, ['broad-task']);
+});
