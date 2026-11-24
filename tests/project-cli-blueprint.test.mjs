@@ -261,7 +261,7 @@ test('blueprint actions reject invalid arguments before credentials, state or pr
     ['bootstrap', 'Идея', 'ещё', '--root', 'r'],
     ['bootstrap', ' ', '--root', 'r'],
     ['bootstrap', 'x'.repeat(65537), '--root', 'r'],
-    ['bootstrap', 'Идея', '--root', 'r', '--prepare', '--client', 'codex'],
+    ['bootstrap', 'Идея', '--root', 'r', '--prepare', '--client', 'gpt'],
     ['bootstrap', 'Идея', '--root', 'r', '--prepare', '--model', 'm'],
     ['bootstrap', 'Идея', '--root', 'r', '--client', 'api'],
     ['bootstrap', 'Идея', '--root', 'r', '--model', 'bad model'],
@@ -435,6 +435,22 @@ test('bootstrap runs one native session through the Engine provider and compiles
   });
   assert.equal(failed.exitCode, 2);
   assert.deepEqual(failed.report.result, { status: 'blocked', code: 'project_blocked' });
+});
+
+test('bootstrap --prepare --client names the gate client of the kodo.config.json template', async t => {
+  // Live T3 smoke of 1.0.1: --prepare refused --client (project_arguments), so a Claude-only user
+  // got a template with codex. The bundle's template now carries the chosen client.
+  const f = await fixture(t);
+  const root = await f.root();
+  for (const client of ['claude-code', 'codex']) {
+    const prepared = await f.run(['bootstrap', 'Notes', '--root', root, '--prepare', '--client', client]);
+    assert.equal(prepared.exitCode, 0, JSON.stringify(prepared.report));
+    assert.equal(prepared.report.result.status, 'prepared');
+    const template = JSON.parse(
+      await readFile(path.join(prepared.report.result.bundle.dir, 'templates', 'kodo.config.json'), 'utf8'),
+    );
+    assert.equal(template.client, client);
+  }
 });
 
 test('apply-spec creates a wave project with verifiable interfaces and replays by command id', async t => {

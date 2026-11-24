@@ -73,8 +73,10 @@ function argumentsFor(argv) {
   if (flags['--command-id'] !== undefined && !uuid.test(flags['--command-id'])) invalid();
   if (flags['--client'] !== undefined && !CLIENTS.includes(flags['--client'])) invalid();
   if (flags['--model'] !== undefined && !modelName.test(flags['--model'])) invalid();
-  // Preparation only writes a bundle: session and write options are meaningless there.
-  if (flags['--prepare'] && ['--client', '--model', '--command-id'].some(flag => flags[flag] !== undefined)) invalid();
+  // Preparation only writes a bundle: session and write options are meaningless there. Bootstrap
+  // keeps --client: it names the gate client of the bundle's kodo.config.json template.
+  const prepareOnly = action === 'bootstrap' ? ['--model', '--command-id'] : ['--client', '--model', '--command-id'];
+  if (flags['--prepare'] && prepareOnly.some(flag => flags[flag] !== undefined)) invalid();
   return {
     action,
     projectId: kinds.project ?? null,
@@ -221,6 +223,7 @@ async function bootstrap(ctx) {
       now: ports.now,
       contracts: ctx.contracts,
       knownValues: ctx.knownValues,
+      ...(options.flags['--client'] ? { client: options.flags['--client'] } : {}),
       ...inputs,
     });
     const target = path.join(bundle.summary.root, '.kodo', 'blueprint');
