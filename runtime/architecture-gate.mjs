@@ -1,7 +1,7 @@
 /** Coordinator gate for fresh, offline Architecture Guardian evidence. */
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, writeFile, lstat, realpath } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, writeFile, lstat, realpath } from 'node:fs/promises';
 import { execute } from './command.mjs';
 import { workerEnvironment } from './security.mjs';
 import { assertPrivateArtifactPath } from './progress.mjs';
@@ -98,12 +98,18 @@ async function pins() {
     'report-state.mjs',
   ];
   const lock = new URL('../package-lock.json', import.meta.url);
+  const tomlEntry = new URL(import.meta.resolve('smol-toml'));
+  const tomlDir = new URL('./', tomlEntry);
+  const tomlFiles = (await readdir(tomlDir))
+    .filter(name => /\.(?:[cm]?js)$/.test(name))
+    .sort()
+    .map(name => new URL(name, tomlDir));
   const urls = [
     ...files.map(file => new URL(file, import.meta.url)),
     new URL('../package.json', import.meta.url),
     lock,
     new URL(import.meta.resolve('acorn')),
-    new URL(import.meta.resolve('smol-toml')),
+    ...(tomlFiles.length ? tomlFiles : [tomlEntry]),
   ];
   return hash(
     await Promise.all(
