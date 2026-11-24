@@ -204,14 +204,24 @@ const snapshot = receipt => Object.fromEntries(Object.entries(receipt).filter(([
 const staticReport = report =>
   Object.fromEntries(Object.entries(report).filter(([key]) => !['status', 'passed', 'receipts'].includes(key)));
 
-const normalizeTaskPaths = value =>
-  value === undefined
-    ? undefined
-    : Array.isArray(value) && value.every(item => typeof item === 'string' && item.trim().length > 0)
-      ? [...new Set(value)].sort()
-      : (() => {
-          throw failure('configuration');
-        })();
+const normalizeTaskPath = item =>
+  item
+    .trim()
+    .replaceAll('\\', '/')
+    .replace(/^(?:\.\/)+/, '')
+    .replace(/\/+$/, '');
+
+const normalizeTaskPaths = value => {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) throw failure('configuration');
+  const normalized = value.map(item => {
+    if (typeof item !== 'string') throw failure('configuration');
+    const cleaned = normalizeTaskPath(item);
+    if (!cleaned) throw failure('configuration');
+    return cleaned;
+  });
+  return [...new Set(normalized)].sort();
+};
 
 /**
  * @typedef {object} ArchitectureGateOptions
@@ -235,7 +245,6 @@ export async function runArchitectureChecks({
   signal,
 } = {}) {
   config = normalizeArchitectureConfig(config);
-  const boundTaskPaths = normalizeTaskPaths(taskPaths);
   /** @type {Record<string, any>} */
   const receipt = {
     schemaVersion: 1,
@@ -244,9 +253,10 @@ export async function runArchitectureChecks({
     headSha,
     baseSha,
     configHash: architectureConfigHash(config),
-    ...(boundTaskPaths !== undefined ? { taskPaths: boundTaskPaths } : {}),
   };
   if (!config.enabled) return receipt;
+  const boundTaskPaths = normalizeTaskPaths(taskPaths);
+  if (boundTaskPaths !== undefined) receipt.taskPaths = boundTaskPaths;
   const directory = await privateDirectory(artifacts, cwd, signal);
   Object.assign(receipt, {
     status: 'blocked',
@@ -272,6 +282,8 @@ export async function runArchitectureChecks({
     receipt.status =
       receipt.report.passed === true ? 'passed' : receipt.report.status === 'failed' ? 'failed' : 'blocked';
     receipt.passed = receipt.status === 'passed';
+    receipt.requiresReview = Boolean(receipt.report.requiresReview);
+    receipt.fullVerificationRequired = Boolean(receipt.report.fullVerificationRequired);
     if (receipt.pinsHash !== (await pins()) || hash(receipt.runtime) !== hash(runtime()))
       throw failure('checker_changed');
   } catch (error) {

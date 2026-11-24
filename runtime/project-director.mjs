@@ -201,6 +201,9 @@ async function assertFullReceipts(engine, run) {
       run.review.diffHash === (await diffHash(run.cwd, run.baseSha)),
     'review_stale',
   );
+  const archTaskPaths = Array.isArray(run.plan?.tasks)
+    ? run.plan.tasks.flatMap(task => (Array.isArray(task.writePaths) ? task.writePaths : []))
+    : undefined;
   for (const [field, setting, method] of [
     ['uiVerification', 'uiVerification', 'isCurrentUIReceipt'],
     ['securityChecks', 'security', 'isCurrentSecurityReceipt'],
@@ -216,6 +219,7 @@ async function assertFullReceipts(engine, run) {
             headSha: run.headSha,
             baseSha: run.baseSha,
             config,
+            ...(field === 'architectureChecks' && archTaskPaths ? { taskPaths: archTaskPaths } : {}),
           })) === true,
         'gate_stale',
       );

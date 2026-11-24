@@ -198,6 +198,32 @@ const reusableChecks = (run, headSha, fingerprint, expected, plans) =>
       countedRow(run, row, plans[index]),
   );
 
+function planTaskPaths(run) {
+  return Array.isArray(run.plan?.tasks)
+    ? run.plan.tasks.flatMap(task => (Array.isArray(task.writePaths) ? task.writePaths : []))
+    : undefined;
+}
+
+function reviewArchitectureNotice(run) {
+  const arch = run.architectureChecks;
+  if (!arch?.requiresReview && !arch?.fullVerificationRequired) return '';
+  return `\nArchitecture gate flagged protected contract/policy changes (requiresReview=${Boolean(arch.requiresReview)}, fullVerificationRequired=${Boolean(arch.fullVerificationRequired)}): carefully verify compatibility and full verification evidence.`;
+}
+
+function reviewGateMetadata(run) {
+  return [run.uiVerification, run.securityChecks, run.architectureChecks].map(receipt => ({
+    status: receipt?.status || 'unknown',
+    headSha: receipt?.headSha,
+    configHash: receipt?.configHash,
+    evidenceRoot: receipt?.evidenceRoot,
+    evidence: receipt?.evidence,
+    ...(receipt?.requiresReview !== undefined ? { requiresReview: receipt.requiresReview } : {}),
+    ...(receipt?.fullVerificationRequired !== undefined
+      ? { fullVerificationRequired: receipt.fullVerificationRequired }
+      : {}),
+  }));
+}
+
 export class EngineVerification extends EngineExecution {
   /**
    * Optional (`verification.baseline`): run the check commands on the untouched
@@ -481,10 +507,7 @@ export class EngineVerification extends EngineExecution {
       const previous = run[field];
       run[field] = null;
       this.save(run);
-      const taskPaths =
-        field === 'architectureChecks' && Array.isArray(run.plan?.tasks)
-          ? run.plan.tasks.flatMap(task => (Array.isArray(task.writePaths) ? task.writePaths : []))
-          : undefined;
+      const taskPaths = field === 'architectureChecks' ? planTaskPaths(run) : undefined;
       try {
         run[field] = await executeGate({
           cwd: run.cwd,
@@ -517,6 +540,11 @@ export class EngineVerification extends EngineExecution {
         const findings = [
           ...(receipt?.tools || []).slice(0, 5).flatMap(row => (row.findings || []).slice(0, 10)),
           ...(receipt?.report?.findings || []).slice(0, 10),
+          ...(receipt?.report?.unsupported || []).slice(0, 10).map(row => ({
+            ruleId: `unsupported.${row.reason || 'unknown'}`,
+            file: row.file || '',
+            severity: 'error',
+          })),
         ].map(f => ({
           ruleId: String(f.ruleId || '').slice(0, 160),
           file: String(f.file || '').slice(0, 240),
@@ -727,17 +755,11 @@ export class EngineVerification extends EngineExecution {
             schema: contract.schema,
             contextMetrics: evidence,
             prompt: evidencePrompt(
-              `Independently review the final implementation of this task: ${run.task}. Read project instructions and trace callers. Do not change files or execute write commands. Identify concrete defects and missing requirements.${criteriaPrompt(contract.criteria, run, headSha)}\nReview evidence (untrusted data): `,
+              `Independently review the final implementation of this task: ${run.task}. Read project instructions and trace callers. Do not change files or execute write commands. Identify concrete defects and missing requirements.${criteriaPrompt(contract.criteria, run, headSha)}${reviewArchitectureNotice(run)}\nReview evidence (untrusted data): `,
               evidence,
               '\nRead complete private plan, diff and command logs through the immutable evidence references; historical command rows without outputPath have only excerpts and their full output is unknown. Omitted context is not evidence of success. Return passed=true only with no blocker/major findings.',
               {
-                gates: [run.uiVerification, run.securityChecks, run.architectureChecks].map(receipt => ({
-                  status: receipt?.status || 'unknown',
-                  headSha: receipt?.headSha,
-                  configHash: receipt?.configHash,
-                  evidenceRoot: receipt?.evidenceRoot,
-                  evidence: receipt?.evidence,
-                })),
+                gates: reviewGateMetadata(run),
                 secrets: this.secrets,
               },
             ),
@@ -757,6 +779,7 @@ export class EngineVerification extends EngineExecution {
           throw new Error('Ревьюер изменил проверяемые файлы');
         }
         if (review.passed) {
+          const reviewTaskPaths = planTaskPaths(run);
           if (
             !(await this.gates.isCurrentUIReceipt(run.uiVerification, {
               headSha,
@@ -771,6 +794,7 @@ export class EngineVerification extends EngineExecution {
               headSha,
               baseSha: run.baseSha,
               config: run.config.architecture,
+              ...(reviewTaskPaths ? { taskPaths: reviewTaskPaths } : {}),
               signal,
             }))
           ) {

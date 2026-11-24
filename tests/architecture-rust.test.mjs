@@ -8,6 +8,13 @@ import { validateArchitecturePolicy, evaluateArchitecture } from '../runtime/arc
 import { readArchitectureGraph } from '../runtime/architecture-graph.mjs';
 import { checkArchitecture, architectureCli } from '../runtime/architecture-cli.mjs';
 import { runArchitectureChecks, isCurrentArchitectureReceipt } from '../runtime/architecture-gate.mjs';
+import { Engine } from '../runtime/engine.mjs';
+import {
+  fixture as engineFixture,
+  fakeServices,
+  node as planNode,
+  git as fixtureGit,
+} from './helpers/engine-fixture.mjs';
 import { applyArchitectureDebt } from '../runtime/architecture-debt.mjs';
 import { compileBlueprint, lintFactorySpec } from '../runtime/project-blueprint.mjs';
 import { projectBlueprintCli } from '../runtime/project-cli-blueprint.mjs';
@@ -1192,5 +1199,138 @@ test('E5: contract_crate_required requires Cargo.toml + src/**, supports explici
     independentTools.findings.some(row => row.code === 'contract_crate_required'),
     false,
     `independent tools without workspace root must not trigger contract_crate_required, got ${JSON.stringify(independentTools.findings)}`,
+  );
+});
+
+test('E8: disabled gate ignores invalid taskPaths, normalizes ./ in taskPaths, exposes unsupported reasons and requiresReview in Engine', async t => {
+  const fx = await rustFixture(t);
+  await fx.put(
+    'crates/game-contracts/src/lib.rs',
+    'pub trait WorldView { fn tick(&self) -> u64; fn v2(&self) -> u32; }\n',
+  );
+  const headSha = fx.commit('contract edit for E8');
+
+  // 1) Disabled gate returns disabled even if taskPaths is invalid (no throw).
+  const disabled = await runArchitectureChecks({
+    cwd: fx.project,
+    baseSha: fx.baseSha,
+    headSha,
+    config: { enabled: false },
+    artifacts: fx.artifacts,
+    taskPaths: /** @type {any} */ ([123]),
+  });
+  assert.equal(disabled.status, 'disabled');
+
+  // 2) ./ prefix in taskPaths is normalized and binds freshness + exposes requiresReview/fullVerificationRequired.
+  const dotSlashOpts = {
+    cwd: fx.project,
+    baseSha: fx.baseSha,
+    headSha,
+    config: { enabled: true },
+    artifacts: fx.artifacts,
+    taskPaths: ['./crates/game-contracts/'],
+  };
+  const receipt = await runArchitectureChecks(dotSlashOpts);
+  assert.equal(receipt.status, 'passed');
+  assert.equal(receipt.requiresReview, true);
+  assert.equal(receipt.fullVerificationRequired, true);
+  assert.deepEqual(receipt.taskPaths, ['crates/game-contracts']);
+  assert.equal(
+    await isCurrentArchitectureReceipt(receipt, { ...dotSlashOpts, taskPaths: ['crates/game-contracts'] }),
+    true,
+  );
+
+  // 3) Engine passes run.plan.tasks[].writePaths to runArchitectureChecks & isCurrentArchitectureReceipt,
+  //    forwards requiresReview/fullVerificationRequired to review prompt, and surfaces unsupported reasons on blocked.
+  const observed = { run: null, current: [] };
+  const efx = await engineFixture(t, {
+    config: { architecture: { enabled: true }, repairRounds: 1, researchBudget: 0, concurrency: 1 },
+    testScript: 'process.exit(0);\n',
+  });
+  const services = fakeServices();
+  const engine = new Engine({
+    store: efx.openStore(),
+    ...services,
+    gates: {
+      runArchitectureChecks: async opts => {
+        observed.run = opts;
+        return runArchitectureChecks(opts);
+      },
+      isCurrentArchitectureReceipt: async (r, opts) => {
+        observed.current.push(opts);
+        return isCurrentArchitectureReceipt(r, opts);
+      },
+    },
+  });
+  const run = await engine.create('Update Rust contract crate', {
+    project: efx.project,
+    mode: 'quick',
+    model: 'gpt-6.1-sol',
+  });
+  await engine.prepare(run);
+  run.models = await services.provider.discoverProviders();
+  run.plan = {
+    summary: 'Enroll Rust workspace and contract crate',
+    tasks: [
+      planNode('contract-task', 'developer', ['./Cargo.toml', './architecture.policy.json', './crates/game-contracts']),
+    ],
+  };
+  const putRun = async (file, content) => {
+    const full = path.join(run.cwd, file);
+    await mkdir(path.dirname(full), { recursive: true });
+    await writeFile(full, typeof content === 'string' ? content : JSON.stringify(content, null, 2) + '\n', 'utf8');
+  };
+  for (const [file, content] of Object.entries(defaultWorkspaceFiles())) await putRun(file, content);
+  await putRun('architecture.policy.json', rustPolicy());
+  fixtureGit(run.cwd, 'add', '.');
+  fixtureGit(run.cwd, 'commit', '-m', 'Wave 0 Rust workspace and contract crate');
+  run.headSha = fixtureGit(run.cwd, 'rev-parse', 'HEAD');
+  engine.save(run);
+
+  await engine.verify(run);
+  assert.deepEqual(observed.run?.taskPaths, ['./Cargo.toml', './architecture.policy.json', './crates/game-contracts']);
+  assert.ok(observed.current.length >= 2, 'expected freshness check both in gate and after review');
+  assert.deepEqual(observed.current[0]?.taskPaths, [
+    './Cargo.toml',
+    './architecture.policy.json',
+    './crates/game-contracts',
+  ]);
+  assert.deepEqual(observed.current.at(-1)?.taskPaths, [
+    './Cargo.toml',
+    './architecture.policy.json',
+    './crates/game-contracts',
+  ]);
+  assert.equal(run.architectureChecks.status, 'passed');
+  assert.equal(run.architectureChecks.requiresReview, true);
+  assert.ok(
+    services.calls.review.some(
+      req => req.prompt.includes('requiresReview') && req.prompt.includes('fullVerificationRequired'),
+    ),
+    'reviewer prompt must surface requiresReview/fullVerificationRequired',
+  );
+
+  // Blocked architecture gate with unsupported reason must surface unsupported.<reason> in gate error findings.
+  await putRun('.cargo/config.toml', '[patch.crates-io]\nserde = { path = "crates/render" }\n');
+  fixtureGit(run.cwd, 'add', '.');
+  fixtureGit(run.cwd, 'commit', '-m', 'Add unsupported cargo patch');
+  run.headSha = fixtureGit(run.cwd, 'rev-parse', 'HEAD');
+  engine.save(run);
+  await engine.checks(run);
+  await assert.rejects(
+    () => engine.verificationGates(run),
+    err => {
+      assert.equal(err.code, 'verification_failed');
+      const failures = JSON.parse(err.message.slice(err.message.indexOf('[')));
+      const archFailure = failures.find(f => f.gate === 'architectureChecks');
+      assert.ok(archFailure, `expected architectureChecks failure, got ${err.message}`);
+      assert.equal(archFailure.status, 'blocked');
+      assert.ok(
+        archFailure.findings.some(
+          f => f.ruleId === 'unsupported.unsupported-cargo-patch' && f.file === '.cargo/config.toml',
+        ),
+        `expected unsupported.unsupported-cargo-patch in failure findings, got ${JSON.stringify(archFailure.findings)}`,
+      );
+      return true;
+    },
   );
 });
