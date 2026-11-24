@@ -170,13 +170,18 @@ const blockerOf = run => run.blocker?.current?.code ?? run.error?.code ?? `run_$
  * Serialize merges, frontier reads and every transition whose proof reads the integration
  * branch (`project-integration:<id>`, reentrant): the authorizer requires it for
  * task/attempt → integrated and for every acceptance, and it is held until the store commits.
+ * A caller that does not hold `project:<id>` itself (complete-task, `kodo project gates`) passes
+ * `ctx.exclusive`: each such section then also runs in that short project section (taken first).
  */
-const withIntegrationLease = (ctx, projectId, signal, work) =>
-  withLease(ctx.store, projectId, work, {
-    signal,
-    waitMs: INTEGRATION_WAIT_MS,
-    heartbeatMs: ctx.engine.leaseHeartbeatMs || 10000,
-  });
+const withIntegrationLease = (ctx, projectId, signal, work) => {
+  const leased = () =>
+    withLease(ctx.store, projectId, work, {
+      signal,
+      waitMs: INTEGRATION_WAIT_MS,
+      heartbeatMs: ctx.engine.leaseHeartbeatMs || 10000,
+    });
+  return typeof ctx.exclusive === 'function' ? ctx.exclusive(leased) : leased();
+};
 
 /** The foreground lease `project:<id>` with heartbeat and cancellation polling, as in `resume`. */
 async function withProjectControl(ctx, projectId, signal, work) {
@@ -890,10 +895,118 @@ async function gateProject(ctx, { projectId, signal, retryFailed }, out) {
     out.blocked.push({ code: 'wave_project_head_mismatch', kind: 'project', id: projectId });
 }
 
+// --- gate leases -------------------------------------------------------------------------------
+
+/**
+ * The lease of one gate container: `project-gate:<projectId>:<epicId>` for an epic,
+ * `project-gate:<projectId>:<kind>:<id>` for a milestone or the project.
+ * @param {string} projectId
+ * @param {{ kind: string, id: string }} item
+ */
+export const gateLeaseName = (projectId, item) =>
+  item.kind === 'epic' ? `project-gate:${projectId}:${item.id}` : `project-gate:${projectId}:${item.kind}:${item.id}`;
+
+// The leases of a gate over `containers`: each container's own and, for a milestone or the project,
+// those of every epic (and milestone) inside it. A gate that accepts a milestone or the project is
+// therefore exclusive to the gates of its epics; gates of independent epics share no lease.
+function gateLeaseNames(snapshot, containers) {
+  const projectId = snapshot.project.projectId,
+    names = new Set();
+  for (const item of containers) {
+    names.add(gateLeaseName(projectId, item));
+    if (item.kind === 'epic') continue;
+    for (const epic of snapshot.epics)
+      if (item.kind === 'project' || epic.milestoneId === item.id)
+        names.add(gateLeaseName(projectId, { kind: 'epic', id: epic.id }));
+    if (item.kind === 'project')
+      for (const milestone of snapshot.milestones)
+        names.add(gateLeaseName(projectId, { kind: 'milestone', id: milestone.id }));
+  }
+  return [...names].sort();
+}
+
+// Every container the epic's next gate may cover: its current gate's chain and a new reservation's.
+function plannedContainers(snapshot, epic) {
+  const gate = latestGate(snapshot, 'epic', epic.id);
+  const chains = [
+    ...(gate ? [gate.containers] : []),
+    ...(settled(epic.status) ? [] : [gateContainers(snapshot, epic)]),
+  ];
+  return chains.flat();
+}
+
+// Take every lease in `names` (sorted, all or none, never waiting); null when one is held elsewhere.
+async function withGateLeases(ctx, names, work) {
+  const tokens = [];
+  for (const name of names) {
+    const token = ctx.store.acquireLease(name, randomUUID(), { ttlMs: 60000, limit: 1 });
+    if (!token) {
+      for (const held of tokens) ctx.store.releaseLease(held);
+      return null;
+    }
+    tokens.push(token);
+  }
+  const timer = setInterval(() => {
+    for (const token of tokens)
+      try {
+        ctx.store.renewLease(token);
+      } catch {
+        /* A transient Store failure must not throw from the timer. */
+      }
+  }, ctx.engine.leaseHeartbeatMs || 10000);
+  timer.unref();
+  try {
+    return { value: await work() };
+  } finally {
+    clearInterval(timer);
+    for (const token of tokens) ctx.store.releaseLease(token);
+  }
+}
+
+const gateRunning = (kind, id) => ({ code: 'project_gate_running', kind, id });
+
+// One epic's gate under its leases, on a snapshot read after they were taken. A gate held by
+// another holder (`project_gate_running`) is reported, not waited for.
+async function gateEpicLeased(ctx, projectId, epicId, options, out) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const before = await snapshotOf(ctx, projectId);
+    const names = gateLeaseNames(before, plannedContainers(before, recordOf(before, 'epic', epicId)));
+    const held = await withGateLeases(ctx, names, async () => {
+      const snapshot = await snapshotOf(ctx, projectId);
+      const epic = recordOf(snapshot, 'epic', epicId);
+      if (controlState(snapshot) || options.signal?.aborted) return 'done';
+      if (!gateCandidate(snapshot, epic) && !unfinishedEpicGate(ctx, snapshot, epic)) return 'done';
+      // Another epic settled meanwhile and the chain now reaches its milestone: take those leases too.
+      if (gateLeaseNames(snapshot, plannedContainers(snapshot, epic)).some(name => !names.includes(name)))
+        return 'widened';
+      await gateEpic(ctx, snapshot, epic, options, out);
+      return 'done';
+    });
+    if (held?.value === 'done') return;
+    if (!held) break;
+  }
+  out.blocked.push(gateRunning('epic', epicId));
+}
+
+// The epics whose gates run together: every candidate, except that the last open epic of a
+// milestone waits while a sibling's gate runs. Its own gate then also accepts the milestone; two
+// sibling gates that ran together would leave the milestone to no gate.
+function concurrentEpics(snapshot, candidates) {
+  const chosen = new Set(candidates.map(row => row.id));
+  for (const milestone of snapshot.milestones) {
+    const open = snapshot.epics.filter(row => row.milestoneId === milestone.id && !settled(row.status));
+    const together = open.filter(row => chosen.has(row.id));
+    if (together.length > 1 && together.length === open.length) chosen.delete(together.at(-1).id);
+  }
+  return candidates.filter(row => chosen.has(row.id));
+}
+
 /**
  * Run the gates of every epic whose tasks are all integrated and not covered by its current
  * gate, then accept what a successful gate verified; then the project gate when only the
- * project is left. A failed gate is retried only with `retryFailed`.
+ * project is left. A failed gate is retried only with `retryFailed`. Gates of independent epics
+ * run concurrently, each under its epic lease (`gateLeaseName`); their Git and state changes stay
+ * serialized by the integration lease.
  * @param {any} ctx
  * @param {{ projectId: string, signal?: AbortSignal, retryFailed?: boolean }} input
  */
@@ -901,18 +1014,38 @@ export async function runPendingGates(ctx, { projectId, signal, retryFailed = fa
   const out = { gates: [], accepted: [], blocked: [] };
   const handled = new Set();
   for (;;) {
-    await advanceContainers(ctx, projectId);
+    await withIntegrationLease(ctx, projectId, signal, () => advanceContainers(ctx, projectId));
     const snapshot = await snapshotOf(ctx, projectId);
     requireValue(waveProject(ctx, snapshot), 'wave_not_enabled');
     if (controlState(snapshot) || signal?.aborted) return out;
-    const epic = snapshot.epics.find(
+    const candidates = snapshot.epics.filter(
       row => !handled.has(row.id) && (gateCandidate(snapshot, row) || unfinishedEpicGate(ctx, snapshot, row)),
     );
-    if (!epic) break;
-    handled.add(epic.id);
-    await gateEpic(ctx, snapshot, epic, { signal, retryFailed }, out);
+    if (!candidates.length) break;
+    const batch = concurrentEpics(snapshot, candidates);
+    for (const epic of batch) handled.add(epic.id);
+    // Each gate reports into its own rows; they are joined in epic order.
+    const parts = batch.map(() => ({ gates: [], accepted: [], blocked: [] }));
+    const results = await Promise.allSettled(
+      batch.map((epic, index) => gateEpicLeased(ctx, projectId, epic.id, { signal, retryFailed }, parts[index])),
+    );
+    for (const part of parts) for (const key of Object.keys(out)) out[key].push(...part[key]);
+    const failure = results.find(result => result.status === 'rejected');
+    if (failure) throw failure.reason;
   }
-  if (!out.blocked.length) await gateProject(ctx, { projectId, signal, retryFailed }, out);
+  if (out.blocked.length) return out;
+  // The project gate (when only the project is left) holds every gate lease of the project.
+  const snapshot = await snapshotOf(ctx, projectId);
+  if (
+    settled(snapshot.project.status) ||
+    !reached(snapshot.project.status, 'integrated') ||
+    !snapshot.milestones.every(row => settled(row.status))
+  )
+    return out;
+  const held = await withGateLeases(ctx, gateLeaseNames(snapshot, [{ kind: 'project', id: projectId }]), () =>
+    gateProject(ctx, { projectId, signal, retryFailed }, out),
+  );
+  if (!held) out.blocked.push(gateRunning('project', projectId));
   return out;
 }
 

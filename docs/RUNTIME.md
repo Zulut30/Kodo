@@ -78,6 +78,22 @@ kodo project append-milestone PROJECT_ID --file MILESTONE_JSON [--command-id UUI
 
 `bootstrap`/`extend` с `--prepare` готовят контекст-пакет в Kodo home, не меняя репозиторий; `apply-spec` проверяет чертёж (findings — exit 1) и создаёт проект; `drain` исполняет волны нативными сессиями, `next-wave`/`complete-task` отдают их видимым воркер-чатам T3; `append-milestone` добавляет новую фичу в принятый проект. Задачи проходят профиль `task-fast` в режиме quick, полные проверки и ревью — у gate Run эпика. Подробно: [BLUEPRINT.md](BLUEPRINT.md), [PROJECTS.md](PROJECTS.md#волновой-режим-исполнение-drain), [T3-HOST.md](T3-HOST.md); алгоритм главного чата — навык `kodo-project-director`.
 
+#### Параллельные сдачи, очередь интеграции и гейты эпиков
+
+Блокировки фабрики при массовых сдачах (подробно — [T3-HOST.md](T3-HOST.md#параллельные-сдачи)):
+
+| Блокировка | Кто держит и сколько | При занятости |
+| --- | --- | --- |
+| `project:<id>` | `next-wave`, `drain` — весь вызов; `complete-task`, дренаж очереди и проход `project gates` — только короткие секции изменения состояния (реентерабельно, `withProjectSection`) | `next-wave`/`drain` — сразу `project_busy`; секции ждут до 120 с, затем `project_busy` |
+| `machine-build:<machineId>` | `task-fast` сдачи, семафор на `maxHeavyBuilds` слотов (по умолчанию `local`, 1) | ожидание слота, до 2 ч — `project_build_busy` |
+| `project-integration:<id>` | слияние и переходы с Git-доказательством; дренаж очереди держит его на пакет | ожидающая сдача остаётся в очереди, `project_integration_busy` ей не возвращается |
+| `project-gates:<id>` | один проход гейтов (`gates`, `drain`, сдача без `--defer-gate`) | `project_busy` |
+| `project-gate:<id>:<epicId>` | гейт эпика; гейт майлстоуна/проекта — ещё и lease всех эпиков внутри | `blocked` строка `project_gate_running` |
+
+Очередь интеграции (`runtime/project-integration-queue.mjs`) — таблица `kodo_integration_queue` в SQLite состояния со своей версионной миграцией `kodo_integration_queue_migrations` (миграция Project Store не меняется). Порядок — `priority` (по умолчанию 0), затем порядок постановки; один дренаж сливает пакет строк с непересекающимися `writePaths`. Конфликт отклоняет только свою строку (`project_integration_conflict`), устаревшая строка — `project_submission_stale`; строки, оставленные упавшим дренажом в `merging`, следующий дренаж повторяет первыми без второго слияния. Ожидание очереди: `project_integration_queue_timeout` (предел, по умолчанию 30 мин) и `project_integration_queue_cancelled` (отмена); строка остаётся в очереди. Незнакомая версия таблицы — `project_integration_queue_unsupported`.
+
+Гейты эпиков (`runPendingGates`) идут параллельно внутри одного прохода: каждый под своим lease эпика, последний открытый эпик майлстоуна ждёт гейтов соседей, чтобы его гейт принял майлстоун; гейт проекта держит lease всех эпиков и майлстоунов. Резерв, установка и приёмка гейтов сериализованы lease интеграции, запуск gate Run — параллелен.
+
 ## Два способа планирования
 
 В CLI команда `kodo run "<задача>" --client codex` выбирает режим, выполняет соответствующий анализ и вызывает планировщик через указанный клиент. `--mode quick|standard|deep` задаёт режим явно. `--model` имеет приоритет над настроенной основной моделью и фиксирует модель для всех native-этапов, включая ревью и повторы. `--providers both` разрешает обе подписки, но не снимает явную фиксацию модели.
