@@ -987,6 +987,34 @@ test('The gate classification follows the chain past an accepted epic and honour
   ]);
 });
 
+test('The gate classification names a verified gate whose acceptance stopped mid-chain as pending', () => {
+  // Review finding (minor): a stop after the epic's acceptance and before the milestone's left a
+  // succeeded gate Run; `project gates` resumes the chain, but next-wave gave no reason at all.
+  const snapshot = {
+    project: { projectId: 'p', status: 'integrated' },
+    milestones: [{ id: 'm', status: 'integrated' }],
+    epics: [{ id: 'e', milestoneId: 'm', status: 'accepted' }],
+    tasks: [{ id: 't', epicId: 'e', status: 'accepted', dependsOn: [] }],
+    currentAttempts: [],
+    gates: [
+      {
+        id: 'g1',
+        number: 1,
+        runId: 'r1',
+        containers: [
+          { kind: 'epic', id: 'e' },
+          { kind: 'milestone', id: 'm' },
+          { kind: 'project', id: 'p' },
+        ],
+      },
+    ],
+  };
+  const store = { getRun: id => ({ id, state: 'succeeded' }) };
+  assert.deepEqual(gateHolds({ store }, snapshot), [
+    { code: 'project_gate_pending', kind: 'milestone', id: 'm', gateId: 'g1', runId: 'r1' },
+  ]);
+});
+
 test('next-wave names a blocked epic whose tasks are all integrated and a cancelled predecessor', async t => {
   // Review finding (major): the epic's rows came only from its open tasks, so a blocked epic with
   // every task integrated vanished; a cancelled required predecessor looked like ordinary waiting.

@@ -943,6 +943,13 @@ export function gateHolds(ctx, snapshot) {
     )
       continue;
     const run = storedRun(ctx.store, gate.runId);
+    // A verified gate whose acceptance stopped mid-chain (for example after a crash between the
+    // epic and its milestone): `kodo project gates` resumes the chain, so the host is told to run it.
+    if (run?.state === 'succeeded') {
+      for (const item of gate.containers) held.add(key(item));
+      rows.push({ code: 'project_gate_pending', kind: open.kind, id: open.id, gateId: gate.id, runId: run.id });
+      continue;
+    }
     if (!run || !heldGateStates.includes(run.state)) continue;
     for (const item of gate.containers) held.add(key(item));
     rows.push({
