@@ -18,6 +18,7 @@ import {
 import { integrationLeaseHeld } from './project-integration-lease.mjs';
 import { WAVE_POLICY_FIELDS, assertWavePolicy } from './wave-policy.mjs';
 import { isCurrentBehaviorReceipt } from './behavior-gate.mjs';
+import { architectureTaskPathsForRun } from './architecture-gate.mjs';
 import {
   TEST_COUNT_VERSION,
   countingPlan,
@@ -201,9 +202,7 @@ async function assertFullReceipts(engine, run) {
       run.review.diffHash === (await diffHash(run.cwd, run.baseSha)),
     'review_stale',
   );
-  const archTaskPaths = Array.isArray(run.plan?.tasks)
-    ? run.plan.tasks.flatMap(task => (Array.isArray(task.writePaths) ? task.writePaths : []))
-    : [];
+  const archTaskPaths = architectureTaskPathsForRun(run);
   for (const [field, setting, method] of [
     ['uiVerification', 'uiVerification', 'isCurrentUIReceipt'],
     ['securityChecks', 'security', 'isCurrentSecurityReceipt'],

@@ -223,6 +223,13 @@ const normalizeTaskPaths = value => {
   return [...new Set(normalized)].sort();
 };
 
+/** Extract task writePaths from a Run for architecture gate execution and freshness checks. */
+export function architectureTaskPathsForRun(run) {
+  return Array.isArray(run?.plan?.tasks)
+    ? run.plan.tasks.flatMap(task => (Array.isArray(task.writePaths) ? task.writePaths : []))
+    : [];
+}
+
 /**
  * @typedef {object} ArchitectureGateOptions
  * @property {string} [cwd] Checked project checkout.

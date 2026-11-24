@@ -3,7 +3,11 @@ import os from 'node:os';
 import path from 'node:path';
 import { isCurrentUIReceipt, uiConfigHash } from './ui-verification.mjs';
 import { isCurrentSecurityReceipt, securityConfigHash } from './security-gates.mjs';
-import { isCurrentArchitectureReceipt, architectureConfigHash } from './architecture-gate.mjs';
+import {
+  isCurrentArchitectureReceipt,
+  architectureConfigHash,
+  architectureTaskPathsForRun,
+} from './architecture-gate.mjs';
 import { sha256, fail, parse, wait } from './delivery-process.mjs';
 import { operationIntent, operationOutcome } from './delivery-operations.mjs';
 import {
@@ -120,9 +124,6 @@ async function verifyReview(ctx) {
     !isCurrentSecurityReceipt(ctx.run.securityChecks, { headSha: head, config: securityConfig })
   )
     throw fail('stale_security_checks', 'Current security evidence is required for delivery');
-  const deliveryTaskPaths = Array.isArray(ctx.run.plan?.tasks)
-    ? ctx.run.plan.tasks.flatMap(task => (Array.isArray(task.writePaths) ? task.writePaths : []))
-    : [];
   if (
     architectureConfig?.enabled &&
     !(await isCurrentArchitectureReceipt(ctx.run.architectureChecks, {
@@ -130,7 +131,7 @@ async function verifyReview(ctx) {
       headSha: head,
       baseSha: ctx.run.baseSha,
       config: architectureConfig,
-      taskPaths: deliveryTaskPaths,
+      taskPaths: architectureTaskPathsForRun(ctx.run),
       signal: ctx.signal,
     }))
   )

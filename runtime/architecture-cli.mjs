@@ -586,14 +586,17 @@ async function compose(options, ports, plan) {
       now: now(),
     });
   const unsupported = new Map();
-  for (const [graph, registry] of [...(baseGraph ? [[baseGraph, baseRegistry]] : []), [headGraph, headRegistry]])
+  for (const [snapshot, graph, registry] of [
+    ...(baseGraph ? [['base', baseGraph, baseRegistry]] : []),
+    ['head', headGraph, headRegistry],
+  ])
     for (const row of graph.unsupported) {
       if (
         row.scope !== 'exports' ||
         graph.nodes.some(node => node.path === row.file && node.public) ||
         registry?.contracts.some(contract => contract.entry === row.file)
       )
-        unsupported.set(row.id, row);
+        unsupported.set(`${snapshot}:${row.id}`, { ...row, snapshot });
     }
   report = {
     ...report,
@@ -603,7 +606,9 @@ async function compose(options, ports, plan) {
       registry: isRust ? hash(null) : hash(normalizedRegistry(headRegistry)),
     },
     baseRulesEvaluated: isRust ? baseIsRust : basePolicy !== null,
-    unsupported: [...unsupported.values()].sort((a, b) => compare(a.id, b.id)),
+    unsupported: [...unsupported.values()].sort(
+      (a, b) => compare(a.snapshot ?? '', b.snapshot ?? '') || compare(a.id, b.id),
+    ),
     requiredTests: contracts.requiredTests,
     requiresReview: report.requiresReview || rustContractChanged,
     fullVerificationRequired: report.fullVerificationRequired || rustContractChanged,

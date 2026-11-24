@@ -2284,3 +2284,97 @@ test('W8: blueprint declarations ignore code fences and prose like "No Cargo wor
   };
   assert.deepEqual(rustContractCrateFindings(protoSpec, outsideMd, matchingPolicy), []);
 });
+
+test('W9: architectureTaskPathsForRun is shared, gate error surfaces snapshot (base/head) and hint for unsupported', async t => {
+  const gateMod = await import('../runtime/architecture-gate.mjs');
+  assert.equal(typeof gateMod.architectureTaskPathsForRun, 'function');
+  assert.deepEqual(gateMod.architectureTaskPathsForRun(null), []);
+  assert.deepEqual(gateMod.architectureTaskPathsForRun({ plan: { tasks: [{ writePaths: ['a'] }, {}] } }), ['a']);
+
+  // Verify snapshot ('head' and 'base') and hint in Engine gate failure findings.
+  const efx = await engineFixture(t, {
+    config: { architecture: { enabled: true }, repairRounds: 1, researchBudget: 0, concurrency: 1 },
+    testScript: 'process.exit(0);\n',
+  });
+  const engine = new Engine({ store: efx.openStore(), ...fakeServices() });
+  const run = await engine.create('W9 unsupported diagnostics', {
+    project: efx.project,
+    mode: 'quick',
+    model: 'gpt-6.1-sol',
+  });
+  await engine.prepare(run);
+  run.models = await engine.provider.discoverProviders();
+  run.plan = {
+    summary: 'Add patch config',
+    tasks: [
+      planNode('w9', 'developer', [
+        'Cargo.toml',
+        'crates/game-contracts/**',
+        'architecture.policy.json',
+        '.cargo/config.toml',
+      ]),
+    ],
+  };
+  const put = async (rel, content) => {
+    const full = path.join(run.cwd, rel);
+    await mkdir(path.dirname(full), { recursive: true });
+    await writeFile(full, typeof content === 'string' ? content : JSON.stringify(content, null, 2), 'utf8');
+  };
+  await put('Cargo.toml', '[workspace]\nresolver = "2"\nmembers = ["crates/*"]\n');
+  await put(
+    'crates/game-contracts/Cargo.toml',
+    '[package]\nname = "game-contracts"\nversion = "0.1.0"\nedition = "2021"\n',
+  );
+  await put('crates/game-contracts/src/lib.rs', 'pub struct Id(pub u64);\n');
+  await put('architecture.policy.json', {
+    schemaVersion: 2,
+    version: 1,
+    language: 'rust',
+    productRoots: ['crates'],
+    layers: [{ id: 'contracts', crates: ['game-contracts'] }],
+    cycles: 'forbid',
+    allowedExternalCrates: [],
+    allowedDevExternalCrates: [],
+    contractCrates: ['game-contracts'],
+    baseline: [],
+    exceptions: [],
+    protectedPaths: ['architecture.policy.json'],
+  });
+  await put('.cargo/config.toml', 'include = ["extra.toml"]\n');
+  fixtureGit(run.cwd, 'add', '-A');
+  fixtureGit(run.cwd, 'commit', '-m', 'add workspace with include config');
+
+  await engine.checks(run);
+  await assert.rejects(engine.verificationGates(run), err => {
+    assert.equal(err.code, 'verification_failed');
+    const failures = JSON.parse(err.message.slice(err.message.indexOf('[')));
+    const finding = failures
+      .flatMap(entry => entry.findings || [])
+      .find(row => row.ruleId === 'unsupported.unsupported-cargo-config-include');
+    assert.ok(finding, `expected unsupported.unsupported-cargo-config-include in ${err.message}`);
+    assert.equal(finding.snapshot, 'head');
+    assert.equal(typeof finding.hint, 'string');
+    assert.ok(finding.hint.length > 10, `expected non-empty hint, got ${JSON.stringify(finding)}`);
+    return true;
+  });
+
+  // Also verify snapshot === 'base' when unsupported construct exists on base commit.
+  const baseWithInclude = fixtureGit(run.cwd, 'rev-parse', 'HEAD');
+  await rm(path.join(run.cwd, '.cargo/config.toml'));
+  fixtureGit(run.cwd, 'add', '-A');
+  fixtureGit(run.cwd, 'commit', '-m', 'remove include config on head');
+  const headClean = fixtureGit(run.cwd, 'rev-parse', 'HEAD');
+  const baseRes = await checkArchitecture({
+    project: run.cwd,
+    baseSha: baseWithInclude,
+    headSha: headClean,
+    evidenceDir: run.artifacts,
+  });
+  assert.equal(baseRes.status, 'blocked');
+  assert.ok(
+    baseRes.unsupported.some(
+      u => u.reason === 'unsupported-cargo-config-include' && u.snapshot === 'base' && u.file === '.cargo/config.toml',
+    ),
+    `expected snapshot="base" on base unsupported, got ${JSON.stringify(baseRes.unsupported)}`,
+  );
+});
