@@ -703,3 +703,72 @@ test('apply-spec CLI surfaces contract_crate_required with exit 1 for Rust works
   assert.equal(res.report.result.code, 'blueprint_findings');
   assert.ok(res.report.result.findings.some(row => row.code === 'contract_crate_required'));
 });
+
+test('E1: Wave 0 from scratch (base without Cargo.toml or policy) passes checkArchitecture and runArchitectureChecks', async t => {
+  const scratch = await mkdtemp(path.join(os.tmpdir(), 'kodo-arch-rust-w0-'));
+  const project = path.join(scratch, 'project');
+  const artifacts = path.join(scratch, 'artifacts');
+  await mkdir(project);
+  await mkdir(artifacts);
+  t.after(() => rm(scratch, { recursive: true, force: true }));
+  const env = Object.fromEntries(
+    Object.entries(process.env).filter(([key]) => !/^(GIT_|NODE_OPTIONS|NODE_TEST_CONTEXT)/.test(key)),
+  );
+  await writeFile(path.join(scratch, 'empty.gitconfig'), '');
+  env.GIT_CONFIG_NOSYSTEM = '1';
+  env.GIT_CONFIG_GLOBAL = path.join(scratch, 'empty.gitconfig');
+  const git = args =>
+    execFileSync('git', ['-c', 'core.hooksPath=' + path.join(scratch, 'no-hooks'), ...args], {
+      cwd: project,
+      env,
+      encoding: 'utf8',
+      windowsHide: true,
+    }).trim();
+  git(['init', '-q']);
+  git(['config', 'user.name', 'Wave0 Fixture']);
+  git(['config', 'user.email', 'wave0@example.invalid']);
+  git(['config', 'core.autocrlf', 'false']);
+  git(['config', 'commit.gpgSign', 'false']);
+  const put = async (file, content) => {
+    const full = path.join(project, file);
+    await mkdir(path.dirname(full), { recursive: true });
+    await writeFile(full, typeof content === 'string' ? content : JSON.stringify(content, null, 2) + '\n', 'utf8');
+  };
+  const commit = message => {
+    git(['add', '-A']);
+    git(['commit', '-qm', message]);
+    return git(['rev-parse', 'HEAD']);
+  };
+
+  // Base commit: no Cargo.toml, no architecture.policy.json (initial repo before Wave 0)
+  await put('README.md', '# New Rust Project\n');
+  await put('kodo.config.json', { client: 'codex', architecture: { enabled: true } });
+  const baseSha = commit('initial commit before wave 0');
+
+  // Head commit: Wave 0 creates Cargo workspace, contract crate, and architecture.policy.json v2
+  for (const [file, content] of Object.entries(defaultWorkspaceFiles())) await put(file, content);
+  await put('architecture.policy.json', rustPolicy());
+  const headSha = commit('wave 0 workspace and contracts');
+
+  const taskPaths = ['Cargo.toml', 'architecture.policy.json', 'crates/game-contracts'];
+  const report = await checkArchitecture({ project, baseSha, taskPaths });
+  assert.equal(report.status, 'passed', `expected passed, got ${JSON.stringify(report)}`);
+  assert.equal(report.passed, true);
+  assert.equal(report.basePolicyState, 'absent');
+  assert.equal(report.baseRulesEvaluated, false);
+  assert.deepEqual(report.unsupported, []);
+  assert.deepEqual(report.findings, []);
+
+  const gateOptions = {
+    cwd: project,
+    baseSha,
+    headSha,
+    config: { enabled: true },
+    artifacts,
+    taskPaths,
+  };
+  const receipt = await runArchitectureChecks(gateOptions);
+  assert.equal(receipt.status, 'passed', `expected passed receipt, got ${JSON.stringify(receipt)}`);
+  assert.equal(receipt.passed, true);
+  assert.equal(await isCurrentArchitectureReceipt(receipt, gateOptions), true);
+});

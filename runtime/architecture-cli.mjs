@@ -533,26 +533,33 @@ async function compose(options, ports, plan) {
   validateLayout(headFiles, headPolicy);
   if (basePolicy) validateLayout(baseFiles, basePolicy);
   const isRust = headPolicy.schemaVersion === 2 && headPolicy.language === 'rust';
+  const baseIsRust = Boolean(basePolicy && basePolicy.schemaVersion === 2 && basePolicy.language === 'rust');
   const baseRegistry =
     !isRust && basePolicy && basePolicy.schemaVersion === 1
       ? await document(project, baseFiles, basePolicy.contracts, context)
       : null;
   const headRegistry = isRust ? null : await document(project, headFiles, headPolicy.contracts, context);
-  const baseGraph = await readArchitectureGraph({
-    project,
-    headSha: options.baseSha,
-    policy: basePolicy ?? headPolicy,
-  });
+  const baseGraph =
+    isRust && !baseIsRust
+      ? null
+      : await readArchitectureGraph({
+          project,
+          headSha: options.baseSha,
+          policy: basePolicy ?? headPolicy,
+        });
   const headGraph = await readArchitectureGraph({ project, headSha, policy: headPolicy });
   context.checkpoint();
-  const baseFindings = basePolicy ? evaluateArchitecture({ policy: basePolicy, graph: baseGraph }).findings : [];
+  const baseFindings =
+    basePolicy && baseGraph && (!isRust || baseIsRust)
+      ? evaluateArchitecture({ policy: basePolicy, graph: baseGraph }).findings
+      : [];
   const headFindings = isRust
     ? evaluateArchitecture({
         policy: headPolicy,
         graph: headGraph,
         changedPaths,
         taskPaths: options.taskPaths ?? ports.taskPaths ?? [],
-        basePolicy,
+        basePolicy: baseIsRust ? basePolicy : null,
         baseGraph,
       }).findings
     : evaluateArchitecture({ policy: headPolicy, graph: headGraph }).findings;
@@ -567,10 +574,7 @@ async function compose(options, ports, plan) {
       });
   const rustContractChanged =
     isRust &&
-    touchedRustContractCrate(changedPaths, [
-      [basePolicy, baseGraph],
-      [headPolicy, headGraph],
-    ]);
+    touchedRustContractCrate(changedPaths, [...(baseIsRust ? [[basePolicy, baseGraph]] : []), [headPolicy, headGraph]]);
   const now = ports.now ?? (() => new Date().toISOString());
   const debtAt = () =>
     applyArchitectureDebt({
@@ -582,10 +586,7 @@ async function compose(options, ports, plan) {
       now: now(),
     });
   const unsupported = new Map();
-  for (const [graph, registry] of [
-    [baseGraph, baseRegistry],
-    [headGraph, headRegistry],
-  ])
+  for (const [graph, registry] of [...(baseGraph ? [[baseGraph, baseRegistry]] : []), [headGraph, headRegistry]])
     for (const row of graph.unsupported) {
       if (
         row.scope !== 'exports' ||
@@ -601,7 +602,7 @@ async function compose(options, ports, plan) {
       policy: hash(headPolicy),
       registry: isRust ? hash(null) : hash(normalizedRegistry(headRegistry)),
     },
-    baseRulesEvaluated: basePolicy !== null,
+    baseRulesEvaluated: isRust ? baseIsRust : basePolicy !== null,
     unsupported: [...unsupported.values()].sort((a, b) => compare(a.id, b.id)),
     requiredTests: contracts.requiredTests,
     requiresReview: report.requiresReview || rustContractChanged,
