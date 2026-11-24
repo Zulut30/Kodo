@@ -116,6 +116,7 @@ impl<T: Copy> Chunk<T> {
     'pub struct Chunk<T> where T: Copy',
     'pub enum ChunkState',
     'pub trait WorldStore: Send + Sync',
+    'pub trait WorldStore: Send + Sync :: fn get_block(&self, x: i32, y: i32) -> BlockId',
     'pub async fn load_chunk( x: i32, z: i32, ) -> Result<Chunk<u16>, String>',
     'impl<T: Copy> Chunk<T> :: pub fn len(&self) -> usize',
   ]);
@@ -325,4 +326,103 @@ test('buildApiCards batches blob reads and caches tree by baseSha and signatures
   const cachedMs = performance.now() - started;
   assert.deepEqual(second, first);
   assert.ok(cachedMs < 200, `cached rebuild should be fast, got ${cachedMs.toFixed(1)}ms`);
+});
+
+test('extractRustPublicApi handles pub use trees, pub trait methods, pub mod paths, #[macro_export] and excludes #[cfg(test)]', () => {
+  const rust = `
+pub use a::{B, C};
+pub use crate::net::{Client, Server as Srv};
+
+pub trait Store: Send {
+    fn get(&self, id: u32) -> Option<String>;
+    fn clear(&mut self) {
+        let _ = 1;
+    }
+}
+
+pub mod nested {
+    pub struct Item {
+        pub id: u32,
+    }
+    pub fn build() -> Item {
+        Item { id: 1 }
+    }
+    pub mod deep {
+        pub const FLAG: bool = true;
+    }
+    fn hidden_in_mod() {}
+}
+
+mod private_mod {
+    pub fn not_publicly_reachable() {}
+}
+
+#[macro_export]
+macro_rules! my_macro {
+    ($x:expr) => { $x };
+}
+
+macro_rules! local_macro {
+    () => {};
+}
+
+#[cfg(test)]
+pub fn direct_test_helper() {}
+
+#[cfg(test)]
+pub mod tests {
+    pub struct TestFixture;
+    pub fn test_only() {}
+}
+`;
+  const sigs = extractRustPublicApi(rust);
+  assert.deepEqual(sigs, [
+    'pub use a::{B, C}',
+    'pub use crate::net::{Client, Server as Srv}',
+    'pub trait Store: Send',
+    'pub trait Store: Send :: fn get(&self, id: u32) -> Option<String>',
+    'pub trait Store: Send :: fn clear(&mut self)',
+    'pub mod nested',
+    'nested :: pub struct Item',
+    'nested :: pub fn build() -> Item',
+    'nested :: pub mod deep',
+    'nested::deep :: pub const FLAG: bool = true',
+    '#[macro_export] macro_rules! my_macro',
+  ]);
+  for (const sig of sigs) {
+    assert.doesNotMatch(
+      sig,
+      /hidden_in_mod|not_publicly_reachable|local_macro|direct_test_helper|TestFixture|test_only/,
+    );
+  }
+});
+
+test('extractJsTsPublicApi preserves full TS type annotations and splits semicolon-free export const declarations', () => {
+  const ts = `
+export type Config = { retries: number };
+export type Handler = (req: { id: string }) => { ok: boolean }
+export function get(): { x: number } {
+  return { x: 1 };
+}
+export function pick(): { a: number } | { b: string } {
+  return { a: 1 };
+}
+export const A = 1
+export const B = 'two'
+export const C: { count: number } = { count: 3 }
+export const make = (v: number): { x: number } => {
+  return { x: v }
+}
+`;
+  const sigs = extractJsTsPublicApi(ts);
+  assert.deepEqual(sigs, [
+    'export type Config = { retries: number }',
+    'export type Handler = (req: { id: string }) => { ok: boolean }',
+    'export function get(): { x: number }',
+    'export function pick(): { a: number } | { b: string }',
+    'export const A = 1',
+    "export const B = 'two'",
+    'export const C: { count: number }',
+    'export const make = (v: number): { x: number } =>',
+  ]);
 });

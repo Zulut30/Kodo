@@ -136,21 +136,25 @@ function maskRust(source) {
   return { code: code.join(''), noComments: noComments.join('') };
 }
 
-function skipRustAttributes(text) {
+function parseRustAttributes(text) {
+  const attrs = [];
   let i = 0;
   while (i < text.length) {
     while (i < text.length && /\s/.test(text[i])) i++;
     if (text[i] !== '#') break;
     let j = i + 1;
-    if (text[j] === '!') j++;
+    const inner = text[j] === '!';
+    if (inner) j++;
     while (j < text.length && /\s/.test(text[j])) j++;
     if (text[j] !== '[') break;
+    const start = j + 1;
     let depth = 0;
     while (j < text.length) {
       if (text[j] === '[') depth++;
       else if (text[j] === ']') {
         depth--;
         if (depth === 0) {
+          attrs.push({ inner, body: text.slice(start, j).trim() });
           j++;
           break;
         }
@@ -159,13 +163,55 @@ function skipRustAttributes(text) {
     }
     i = j;
   }
-  return i;
+  return { offset: i, attrs };
+}
+
+function stripNotGroups(text) {
+  let out = '';
+  let i = 0;
+  while (i < text.length) {
+    if (text.startsWith('not', i) && !isIdentChar(text[i - 1]) && !isIdentChar(text[i + 3])) {
+      let j = i + 3;
+      while (j < text.length && /\s/.test(text[j])) j++;
+      if (text[j] === '(') {
+        let depth = 0;
+        while (j < text.length) {
+          if (text[j] === '(') depth++;
+          else if (text[j] === ')') {
+            depth--;
+            if (depth === 0) {
+              j++;
+              break;
+            }
+          }
+          j++;
+        }
+        i = j;
+        continue;
+      }
+    }
+    out += text[i++];
+  }
+  return out;
+}
+
+function hasCfgTestAttr(attrs) {
+  return attrs.some(({ body }) => {
+    const match = /^cfg\s*\(([\s\S]*)\)$/.exec(body);
+    return Boolean(match && /\btest\b/.test(stripNotGroups(match[1])));
+  });
+}
+
+function hasMacroExportAttr(attrs) {
+  return attrs.some(({ inner, body }) => !inner && /^macro_export\b/.test(body));
 }
 
 const RUST_PUB_TOP =
   /^pub\s+(?:(?:unsafe|async|const|extern(?:\s+"[^"]*")?)\s+)*(?:struct|enum|trait|fn|type|const|static|mod|use)\b/;
 const RUST_PUB_IMPL = /^pub\s+(?:(?:unsafe|async|const|extern(?:\s+"[^"]*")?)\s+)*(?:fn|const|type)\b/;
+const RUST_TRAIT_ITEM = /^(?:(?:unsafe|async|const|extern(?:\s+"[^"]*")?)\s+)*(?:fn|const|type)\b/;
 const RUST_IMPL_HEAD = /^(?:unsafe\s+)?impl\b/;
+const RUST_MACRO_RULES = /^macro_rules!\s+([A-Za-z_][A-Za-z0-9_]*)/;
 
 function cleanRustSignature(raw, endedWithBrace) {
   let sig = collapse(raw);
@@ -173,10 +219,92 @@ function cleanRustSignature(raw, endedWithBrace) {
   return sig.replace(/;\s*$/, '').trim();
 }
 
+function activeModPath(frames) {
+  const parts = [];
+  for (const frame of frames) if (frame.kind === 'mod') parts.push(frame.name);
+  return parts.join('::');
+}
+
+function qualifyMod(frames, sig) {
+  const modPath = activeModPath(frames);
+  return modPath ? `${modPath} :: ${sig}` : sig;
+}
+
+function isRustUseStatement(code, stmtStart) {
+  const { offset } = parseRustAttributes(code.slice(stmtStart));
+  const rest = code.slice(stmtStart + offset).trimStart();
+  return /^pub\s+use\b/.test(rest);
+}
+
+function classifyRustBlock(frames, trimmedCode, rawHeader, attrs) {
+  if (hasCfgTestAttr(attrs)) return { kind: 'skip' };
+  const parent = frames.at(-1);
+  if (parent && parent.kind !== 'mod') {
+    if (parent.kind === 'trait' && RUST_TRAIT_ITEM.test(trimmedCode)) {
+      const sig = cleanRustSignature(rawHeader, true);
+      if (sig) return { kind: 'other', emit: `${parent.label} :: ${sig}` };
+    }
+    if (parent.kind === 'impl' && !/^pub\s*\(/.test(trimmedCode) && RUST_PUB_IMPL.test(trimmedCode)) {
+      const sig = cleanRustSignature(rawHeader, true);
+      if (sig) return { kind: 'other', emit: `${parent.label} :: ${sig}` };
+    }
+    return { kind: 'other' };
+  }
+  const macroMatch = RUST_MACRO_RULES.exec(trimmedCode);
+  if (macroMatch) {
+    return hasMacroExportAttr(attrs)
+      ? { kind: 'skip', emit: qualifyMod(frames, `#[macro_export] macro_rules! ${macroMatch[1]}`) }
+      : { kind: 'skip' };
+  }
+  if (RUST_IMPL_HEAD.test(trimmedCode)) {
+    const implHead = cleanRustSignature(rawHeader, true);
+    return { kind: 'impl', label: qualifyMod(frames, implHead) };
+  }
+  if (/^(?:pub\s*\([^)]*\)\s+)?mod\b/.test(trimmedCode) && !/^pub\s+mod\b/.test(trimmedCode)) {
+    return { kind: 'skip' };
+  }
+  if (!/^pub\s*\(/.test(trimmedCode) && RUST_PUB_TOP.test(trimmedCode)) {
+    const sig = cleanRustSignature(rawHeader, true);
+    const qualified = qualifyMod(frames, sig);
+    const modMatch = /^pub\s+mod\s+([A-Za-z_][A-Za-z0-9_]*)\b/.exec(trimmedCode);
+    if (modMatch) return { kind: 'mod', name: modMatch[1], emit: qualified };
+    if (/^pub\s+(?:unsafe\s+)?trait\b/.test(trimmedCode)) return { kind: 'trait', label: qualified, emit: qualified };
+    return { kind: 'other', emit: qualified };
+  }
+  return { kind: 'skip' };
+}
+
+function inspectRustSemicolon(frames, trimmedCode, rawHeader, attrs) {
+  if (hasCfgTestAttr(attrs)) return null;
+  const parent = frames.at(-1);
+  if (parent && parent.kind !== 'mod') {
+    if (parent.kind === 'trait' && RUST_TRAIT_ITEM.test(trimmedCode)) {
+      const sig = cleanRustSignature(rawHeader, false);
+      return sig ? `${parent.label} :: ${sig}` : null;
+    }
+    if (parent.kind === 'impl' && !/^pub\s*\(/.test(trimmedCode) && RUST_PUB_IMPL.test(trimmedCode)) {
+      const sig = cleanRustSignature(rawHeader, false);
+      return sig ? `${parent.label} :: ${sig}` : null;
+    }
+    return null;
+  }
+  const macroMatch = RUST_MACRO_RULES.exec(trimmedCode);
+  if (macroMatch) {
+    return hasMacroExportAttr(attrs) ? qualifyMod(frames, `#[macro_export] macro_rules! ${macroMatch[1]}`) : null;
+  }
+  if (!/^pub\s*\(/.test(trimmedCode) && RUST_PUB_TOP.test(trimmedCode)) {
+    const sig = cleanRustSignature(rawHeader, false);
+    return sig ? qualifyMod(frames, sig) : null;
+  }
+  return null;
+}
+
 /**
- * Extract top-level public Rust items (`pub struct/enum/trait/fn/type/const/static/mod/use`)
- * and inherent `impl` `pub fn/const/type` methods as single-line signatures without bodies.
- * Excludes non-pub items and restricted visibility (`pub(crate)`, `pub(super)`, `pub(in ...)`).
+ * Extract public Rust items (`pub struct/enum/trait/fn/type/const/static/mod/use`,
+ * `pub trait` methods, `pub mod` nested items with module paths, `#[macro_export] macro_rules!`,
+ * and inherent `impl` `pub fn/const/type` methods) as single-line signatures without bodies.
+ * Excludes non-pub items, restricted visibility (`pub(crate)`, `pub(super)`, `pub(in ...)`),
+ * and anything guarded by `#[cfg(test)]`.
  * @param {string} source
  * @returns {string[]}
  */
@@ -184,33 +312,13 @@ export function extractRustPublicApi(source) {
   if (typeof source !== 'string' || !source) return [];
   const { code, noComments } = maskRust(source);
   const signatures = [];
-  let depth = 0,
-    paren = 0,
+  const frames = [];
+  let paren = 0,
     bracket = 0,
-    stmtStart = 0,
-    activeImpl = null;
+    useBrace = 0,
+    stmtStart = 0;
 
-  const inspect = (end, endedWithBrace) => {
-    if (depth !== 0 && !(depth === 1 && activeImpl)) return;
-    const sliceCode = code.slice(stmtStart, end);
-    const offset = skipRustAttributes(sliceCode);
-    const trimmedCode = sliceCode.slice(offset).trim();
-    if (!trimmedCode) return;
-    const rawHeader = noComments.slice(stmtStart + offset, end);
-    if (depth === 0) {
-      if (endedWithBrace && RUST_IMPL_HEAD.test(trimmedCode)) {
-        activeImpl = cleanRustSignature(rawHeader, true);
-        return;
-      }
-      if (!/^pub\s*\(/.test(trimmedCode) && RUST_PUB_TOP.test(trimmedCode)) {
-        const sig = cleanRustSignature(rawHeader, endedWithBrace);
-        if (sig) signatures.push(sig);
-      }
-    } else if (depth === 1 && activeImpl && !/^pub\s*\(/.test(trimmedCode) && RUST_PUB_IMPL.test(trimmedCode)) {
-      const sig = cleanRustSignature(rawHeader, endedWithBrace);
-      if (sig) signatures.push(`${activeImpl} :: ${sig}`);
-    }
-  };
+  const skipped = () => frames.some(f => f.kind === 'skip' || f.kind === 'other');
 
   for (let i = 0; i < code.length; i++) {
     const ch = code[i];
@@ -219,15 +327,40 @@ export function extractRustPublicApi(source) {
     else if (ch === '[') bracket++;
     else if (ch === ']' && bracket > 0) bracket--;
     else if (ch === '{' && paren === 0 && bracket === 0) {
-      inspect(i, true);
-      depth++;
+      if (useBrace > 0 || (!skipped() && isRustUseStatement(code, stmtStart))) {
+        useBrace++;
+        continue;
+      }
+      if (skipped()) {
+        frames.push({ kind: 'other' });
+      } else {
+        const sliceCode = code.slice(stmtStart, i);
+        const { offset, attrs } = parseRustAttributes(sliceCode);
+        const trimmedCode = sliceCode.slice(offset).trim();
+        const rawHeader = noComments.slice(stmtStart + offset, i);
+        const info = trimmedCode ? classifyRustBlock(frames, trimmedCode, rawHeader, attrs) : { kind: 'other' };
+        if (info.emit) signatures.push(info.emit);
+        frames.push(info);
+      }
       stmtStart = i + 1;
     } else if (ch === '}' && paren === 0 && bracket === 0) {
-      if (depth > 0) depth--;
-      if (depth === 0) activeImpl = null;
+      if (useBrace > 0) {
+        useBrace--;
+        continue;
+      }
+      if (frames.length > 0) frames.pop();
       stmtStart = i + 1;
-    } else if (ch === ';' && paren === 0 && bracket === 0 && (depth === 0 || (depth === 1 && activeImpl))) {
-      inspect(i, false);
+    } else if (ch === ';' && paren === 0 && bracket === 0 && useBrace === 0) {
+      if (!skipped()) {
+        const sliceCode = code.slice(stmtStart, i);
+        const { offset, attrs } = parseRustAttributes(sliceCode);
+        const trimmedCode = sliceCode.slice(offset).trim();
+        const rawHeader = noComments.slice(stmtStart + offset, i);
+        if (trimmedCode) {
+          const emitted = inspectRustSemicolon(frames, trimmedCode, rawHeader, attrs);
+          if (emitted) signatures.push(emitted);
+        }
+      }
       stmtStart = i + 1;
     }
   }
@@ -307,6 +440,35 @@ function maskJsTs(source) {
   return { code: code.join(''), noComments: noComments.join('') };
 }
 
+function skipBalanced(code, start, open, close) {
+  let depth = 0;
+  let i = start;
+  while (i < code.length) {
+    if (code[i] === open) depth++;
+    else if (code[i] === close && !(close === '>' && code[i - 1] === '=')) {
+      depth--;
+      if (depth === 0) return i + 1;
+    }
+    i++;
+  }
+  return code.length;
+}
+
+function skipWs(code, i) {
+  while (i < code.length && /\s/.test(code[i])) i++;
+  return i;
+}
+
+function nextNonSpaceOnSameOrLaterLine(code, i) {
+  return skipWs(code, i);
+}
+
+function lastNonSpaceBefore(code, i) {
+  let j = i - 1;
+  while (j >= 0 && /[ \t\r]/.test(code[j])) j--;
+  return j;
+}
+
 function findReexportEnd(code, start) {
   let brace = 0,
     i = start;
@@ -317,6 +479,98 @@ function findReexportEnd(code, start) {
     else if (brace === 0 && (ch === ';' || (ch === '\n' && /\bfrom\b|\}/.test(code.slice(start, i))))) break;
     i++;
   }
+  return { sigEnd: i, skipTo: i };
+}
+
+const TYPE_START_WORDS = new Set(['is', 'asserts', 'keyof', 'readonly', 'typeof', 'infer', 'extends', 'new', 'unique']);
+const TYPE_CONT_CHARS = new Set([':', '|', '&', '?', ',']);
+
+function scanReturnTypeEnd(code, start) {
+  let i = start;
+  let expectType = true;
+  while (i < code.length) {
+    const ch = code[i];
+    if (ch === ' ' || ch === '\t' || ch === '\r') {
+      i++;
+      continue;
+    }
+    if (ch === '\n') {
+      const nextIdx = nextNonSpaceOnSameOrLaterLine(code, i + 1);
+      const nextChar = code[nextIdx];
+      if (!expectType && nextChar !== '{' && nextChar !== '|' && nextChar !== '&' && nextChar !== '?') {
+        return { sigEnd: i, skipTo: i + 1 };
+      }
+      i++;
+      continue;
+    }
+    if (ch === ';') return { sigEnd: i, skipTo: i + 1 };
+    if (ch === '{') {
+      if (!expectType) return { sigEnd: i, skipTo: i };
+      i = skipBalanced(code, i, '{', '}');
+      expectType = false;
+      continue;
+    }
+    if (ch === '(') {
+      i = skipBalanced(code, i, '(', ')');
+      expectType = false;
+      continue;
+    }
+    if (ch === '[') {
+      i = skipBalanced(code, i, '[', ']');
+      expectType = false;
+      continue;
+    }
+    if (ch === '<') {
+      i = skipBalanced(code, i, '<', '>');
+      expectType = false;
+      continue;
+    }
+    if (ch === '=' && code[i + 1] === '>') {
+      expectType = true;
+      i += 2;
+      continue;
+    }
+    if (TYPE_CONT_CHARS.has(ch)) {
+      expectType = true;
+      i++;
+      continue;
+    }
+    if (isIdentChar(ch)) {
+      let j = i;
+      while (j < code.length && isIdentChar(code[j])) j++;
+      const word = code.slice(i, j);
+      expectType = TYPE_START_WORDS.has(word);
+      i = j;
+      continue;
+    }
+    expectType = false;
+    i++;
+  }
+  return { sigEnd: code.length, skipTo: code.length };
+}
+
+function findFunctionDeclEnd(code, start) {
+  let i = start;
+  let sawParams = false;
+  while (i < code.length) {
+    const ch = code[i];
+    if (ch === '<') {
+      i = skipBalanced(code, i, '<', '>');
+      continue;
+    }
+    if (ch === '(') {
+      i = skipBalanced(code, i, '(', ')');
+      sawParams = true;
+      break;
+    }
+    if (ch === '{' || ch === ';') return { sigEnd: i, skipTo: i };
+    i++;
+  }
+  if (!sawParams) return { sigEnd: code.length, skipTo: code.length };
+  const after = skipWs(code, i);
+  if (code[after] === '{') return { sigEnd: after, skipTo: after };
+  if (code[after] === ';') return { sigEnd: after, skipTo: after + 1 };
+  if (code[after] === ':') return scanReturnTypeEnd(code, after + 1);
   return { sigEnd: i, skipTo: i };
 }
 
@@ -339,25 +593,90 @@ function findNamedDeclEnd(code, start) {
   return { sigEnd: code.length, skipTo: code.length };
 }
 
-function findTypeAliasEnd(code, start) {
+function isTypeLineContinuation(code, noComments, nlIndex) {
+  const prevIdx = lastNonSpaceBefore(noComments, nlIndex);
+  const prev = noComments[prevIdx];
+  if (prev === '=' || prev === '|' || prev === '&' || prev === ',' || prev === '?' || prev === ':') return true;
+  if (prev === '>' && noComments[prevIdx - 1] === '=') return true;
+  const nextIdx = nextNonSpaceOnSameOrLaterLine(code, nlIndex + 1);
+  const next = code[nextIdx];
+  return next === '|' || next === '&' || next === '?' || next === ':' || code.startsWith('extends', nextIdx);
+}
+
+function findTypeAliasEnd(code, noComments, start) {
   let paren = 0,
     bracket = 0,
     brace = 0,
+    angle = 0,
+    sawEq = false,
+    sawRhs = false,
     i = start;
   while (i < code.length) {
     const ch = code[i];
-    if (ch === '(') paren++;
-    else if (ch === ')' && paren > 0) paren--;
-    else if (ch === '[') bracket++;
-    else if (ch === ']' && bracket > 0) bracket--;
+    if (ch === '(') {
+      paren++;
+      if (sawEq) sawRhs = true;
+    } else if (ch === ')' && paren > 0) paren--;
+    else if (ch === '[') {
+      bracket++;
+      if (sawEq) sawRhs = true;
+    } else if (ch === ']' && bracket > 0) bracket--;
     else if (ch === '{') {
-      if (paren === 0 && bracket === 0 && brace === 0) return { sigEnd: i, skipTo: i };
       brace++;
+      if (sawEq) sawRhs = true;
     } else if (ch === '}' && brace > 0) brace--;
-    else if (paren === 0 && bracket === 0 && brace === 0 && ch === ';') return { sigEnd: i, skipTo: i };
+    else if (ch === '<' && paren === 0 && brace === 0) {
+      angle++;
+      if (sawEq) sawRhs = true;
+    } else if (ch === '>' && angle > 0 && code[i - 1] !== '=') angle--;
+    else if (paren === 0 && bracket === 0 && brace === 0 && angle === 0) {
+      if (ch === '=' && code[i + 1] !== '>' && !sawEq) sawEq = true;
+      else if (ch === ';') return { sigEnd: i, skipTo: i + 1 };
+      else if (ch === '\n' && sawEq && sawRhs && !isTypeLineContinuation(code, noComments, i)) {
+        return { sigEnd: i, skipTo: i + 1 };
+      } else if (sawEq && !/\s/.test(noComments[i])) sawRhs = true;
+    }
     i++;
   }
   return { sigEnd: code.length, skipTo: code.length };
+}
+
+const STMT_START = /^(?:export|import|const|let|var|function|class|interface|type|enum|async|declare|abstract)\b/;
+const EXPR_CONT = new Set(['=', '+', '-', '*', '/', '%', '?', ':', ',', '|', '&', '.']);
+
+function looksLikeArrowReturnType(code, bracePos) {
+  const afterBrace = skipBalanced(code, bracePos, '{', '}');
+  let i = skipWs(code, afterBrace);
+  while (i < code.length) {
+    if (code[i] === '=' && code[i + 1] === '>') return true;
+    if (code[i] === '|' || code[i] === '&') {
+      i = skipWs(code, i + 1);
+      if (code[i] === '{') i = skipWs(code, skipBalanced(code, i, '{', '}'));
+      else if (code[i] === '(') i = skipWs(code, skipBalanced(code, i, '(', ')'));
+      else if (code[i] === '[') i = skipWs(code, skipBalanced(code, i, '[', ']'));
+      else {
+        while (i < code.length && !/[\s|&=;{]/.test(code[i])) i++;
+        i = skipWs(code, i);
+      }
+      continue;
+    }
+    return false;
+  }
+  return false;
+}
+
+function finalizeConstExport(noComments, eqPos, end) {
+  const rhs = eqPos !== -1 ? noComments.slice(eqPos + 1, end).trim() : '';
+  const keepValue = Boolean(rhs && !rhs.includes('\n') && rhs.length <= 80 && !/[{[]/.test(rhs));
+  return eqPos !== -1 && !keepValue ? eqPos : end;
+}
+
+function isConstAsiEnd(code, noComments, nlIndex) {
+  const prevIdx = lastNonSpaceBefore(noComments, nlIndex);
+  if (prevIdx >= 0 && EXPR_CONT.has(noComments[prevIdx])) return false;
+  const nextIdx = nextNonSpaceOnSameOrLaterLine(code, nlIndex + 1);
+  if (nextIdx >= code.length) return true;
+  return code[nextIdx] === '}' || STMT_START.test(code.slice(nextIdx));
 }
 
 function findConstExportEnd(code, noComments, start) {
@@ -373,33 +692,36 @@ function findConstExportEnd(code, noComments, start) {
     else if (ch === '[') bracket++;
     else if (ch === ']' && bracket > 0) bracket--;
     else if (ch === '{') {
-      if (paren === 0 && bracket === 0 && brace === 0) return { sigEnd: eqPos !== -1 ? eqPos : i, skipTo: i };
+      if (paren === 0 && bracket === 0 && brace === 0 && eqPos !== -1) {
+        if (looksLikeArrowReturnType(code, i)) {
+          i = skipBalanced(code, i, '{', '}');
+          continue;
+        }
+        return { sigEnd: eqPos, skipTo: i };
+      }
       brace++;
     } else if (ch === '}' && brace > 0) brace--;
     else if (paren === 0 && bracket === 0 && brace === 0) {
       if (ch === '=' && code[i + 1] === '>') return { sigEnd: i + 2, skipTo: i + 2 };
       if (ch === '=' && code[i - 1] !== '=' && code[i + 1] !== '=' && eqPos === -1) eqPos = i;
-      if (ch === ';') {
-        const rhs = eqPos !== -1 ? noComments.slice(eqPos + 1, i).trim() : '';
-        const keepValue = rhs && !rhs.includes('\n') && rhs.length <= 80 && !/[{[]/.test(rhs);
-        return { sigEnd: eqPos !== -1 && !keepValue ? eqPos : i, skipTo: i };
+      if (ch === ';') return { sigEnd: finalizeConstExport(noComments, eqPos, i), skipTo: i + 1 };
+      if (ch === '\n' && eqPos !== -1 && isConstAsiEnd(code, noComments, i)) {
+        return { sigEnd: finalizeConstExport(noComments, eqPos, i), skipTo: i + 1 };
       }
     }
     i++;
   }
-  return { sigEnd: code.length, skipTo: code.length };
+  return { sigEnd: finalizeConstExport(noComments, eqPos, code.length), skipTo: code.length };
 }
 
 function findExportHeaderEnd(code, noComments, start) {
   const rest = code.slice(start);
   if (/^export\s+(?:type\s+)?(?:\{|\*)/.test(rest)) return findReexportEnd(code, start);
-  if (
-    /^export\s+(?:default\s+)?(?:declare\s+)?(?:(?:abstract|async|const)\s+)?(?:function|class|interface|enum)\b/.test(
-      rest,
-    )
-  )
+  if (/^export\s+(?:default\s+)?(?:declare\s+)?(?:async\s+)?function\b/.test(rest))
+    return findFunctionDeclEnd(code, start);
+  if (/^export\s+(?:default\s+)?(?:declare\s+)?(?:(?:abstract|const)\s+)?(?:class|interface|enum)\b/.test(rest))
     return findNamedDeclEnd(code, start);
-  if (/^export\s+(?:declare\s+)?type\b/.test(rest)) return findTypeAliasEnd(code, start);
+  if (/^export\s+(?:declare\s+)?type\b/.test(rest)) return findTypeAliasEnd(code, noComments, start);
   return findConstExportEnd(code, noComments, start);
 }
 
