@@ -1,5 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtemp, rm } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { Store } from '../runtime/store.mjs';
 import {
   compactPlanEvidence,
   compactReviewEvidence,
@@ -390,4 +394,107 @@ test('Wave gate lessons use full module paths, require criterion binding, dedupl
     ['Keep   errors   typed', 'Use i32 coordinates', 'Avoid unwrap in public API'],
   );
   assert.deepEqual(selected[0].criterionIds, ['epic:core-rs:ok']);
+});
+
+test('G7: dotted module directory names stay distinct, gate-lesson requires own check receipt object, and store filters kind in SQL', async t => {
+  assert.deepEqual(modulesFromWritePaths(['packages/core.api/src/index.ts']), ['packages/core.api']);
+  assert.deepEqual(modulesFromWritePaths(['packages/core.ui/src/index.ts']), ['packages/core.ui']);
+  assert.deepEqual(modulesFromWritePaths(['packages/core.api', 'packages/core.ui']), [
+    'packages/core.api',
+    'packages/core.ui',
+  ]);
+
+  const sha = 'b'.repeat(40);
+  const apiLesson = {
+    runId: 'gate-api',
+    headSha: sha,
+    summary: 'API package invariant',
+    kind: 'gate-lesson',
+    projectId: 'p1',
+    epicIds: ['api'],
+    modules: ['packages/core.api'],
+    writePaths: ['packages/core.api'],
+    criterionIds: ['epic:api:ok'],
+    checks: { complete: true, headSha: sha, results: [{ command, exitCode: 0, status: 'passed' }] },
+    review: { passed: true, headSha: sha },
+  };
+  assert.equal(
+    selectWaveVerifiedLessons([apiLesson], {
+      task: { epicId: 'ui', writePaths: ['packages/core.ui/src/app.ts'] },
+      projectId: 'p1',
+    }).length,
+    0,
+  );
+  assert.equal(
+    selectWaveVerifiedLessons([apiLesson], {
+      task: { epicId: 'api-next', writePaths: ['packages/core.api/src/routes.ts'] },
+      projectId: 'p1',
+    }).length,
+    1,
+  );
+
+  // gate-lesson MUST reject bare array checks (no selector synthesis of complete/headSha),
+  // as well as receipt missing complete:true or headSha; legacy array stays valid for ordinary lessons.
+  const bareArrayGate = { ...apiLesson, runId: 'gate-arr', checks: [{ command, exitCode: 0 }] };
+  const missingCompleteGate = {
+    ...apiLesson,
+    runId: 'gate-inc',
+    checks: { headSha: sha, results: [{ command, exitCode: 0, status: 'passed' }] },
+  };
+  const wrongHeadGate = {
+    ...apiLesson,
+    runId: 'gate-head',
+    checks: { complete: true, headSha: 'c'.repeat(40), results: [{ command, exitCode: 0, status: 'passed' }] },
+  };
+  assert.deepEqual(
+    selectWaveVerifiedLessons([bareArrayGate, missingCompleteGate, wrongHeadGate], {
+      task: { epicId: 'api', writePaths: ['packages/core.api/src/routes.ts'] },
+      projectId: 'p1',
+    }),
+    [],
+  );
+  const ordinaryLegacy = {
+    runId: 'ord-1',
+    headSha: sha,
+    summary: 'Ordinary legacy array check lesson',
+    checks: [{ command, exitCode: 0 }],
+    review: { passed: true, headSha: sha },
+  };
+  const ordinaryPlan = parse(compactPlanEvidence({ analysis: { summary: 'ok', priorLessons: [ordinaryLegacy] } }));
+  assert.equal(ordinaryPlan.analysis.verifiedLessons.length, 1);
+
+  // Store filters kind in SQL BEFORE ORDER BY ... LIMIT.
+  const home = await mkdtemp(path.join(os.tmpdir(), 'kodo-g7-store-'));
+  const store = new Store(home);
+  t.after(async () => {
+    store.close();
+    await rm(home, { recursive: true, force: true });
+  });
+  const project = path.join(home, 'repo');
+  for (let i = 0; i < 4; i++) {
+    store.rememberLesson(project, `ord-${i}`, { runId: `ord-${i}`, summary: `Ordinary ${i}` });
+  }
+  for (let i = 0; i < 15; i++) {
+    store.rememberLesson(project, `gate-${i}`, { runId: `gate-${i}`, kind: 'gate-lesson', summary: `Gate ${i}` });
+  }
+  const origPrepare = store.db.prepare.bind(store.db);
+  const seenSql = [];
+  store.db.prepare = sql => {
+    seenSql.push(sql);
+    return origPrepare(sql);
+  };
+  const ord = store.lessons(project, 3);
+  const gates = store.gateLessons(project, 4);
+  assert.equal(ord.length, 3);
+  assert.ok(ord.every(row => row.kind !== 'gate-lesson'));
+  assert.equal(gates.length, 4);
+  assert.ok(gates.every(row => row.kind === 'gate-lesson'));
+  assert.ok(
+    seenSql.some(sql => /json_extract\(body,\s*'\$\.kind'\)/.test(sql) && /LIMIT\s*\?/i.test(sql)),
+    `Expected SQL json_extract + LIMIT in store queries, got: ${JSON.stringify(seenSql)}`,
+  );
+  assert.equal(
+    seenSql.filter(sql => /json_extract\(body,\s*'\$\.kind'\)/.test(sql) && /LIMIT\s*\?/i.test(sql)).length,
+    2,
+  );
 });

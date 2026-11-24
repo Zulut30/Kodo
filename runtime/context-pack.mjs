@@ -109,6 +109,21 @@ function addStrings(fields, owner, key, value, field) {
   fields.push([owner, key, field]);
 }
 
+function verifiedLessonChecks(lesson) {
+  const isGate = lesson.kind === 'gate-lesson';
+  if (isGate) {
+    if (!record(lesson.checks) || lesson.checks.complete !== true || lesson.checks.headSha !== lesson.headSha)
+      return false;
+    const results = lesson.checks.results;
+    if (!Array.isArray(results) || !results.length || !Array.from(results).every(record)) return false;
+    return checkEvidence(lesson.checks, lesson.headSha, []).status === 'passed';
+  }
+  const results = Array.isArray(lesson.checks) ? lesson.checks : lesson.checks?.results;
+  if (!Array.isArray(results) || !results.length || !Array.from(results).every(record)) return false;
+  const checks = Array.isArray(lesson.checks) ? { complete: true, headSha: lesson.headSha, results } : lesson.checks;
+  return checkEvidence(checks, lesson.headSha, []).status === 'passed';
+}
+
 // The caller supplies relevant project-scoped lessons in priority order. This
 // projects existing recorded evidence; it performs no new review or storage.
 export function verifiedLessonSummaries(
@@ -137,13 +152,7 @@ export function verifiedLessonSummaries(
       ? [...new Set(lesson.criterionIds.filter(id => typeof id === 'string' && id.trim()).map(id => id.trim()))]
       : [];
     if (requireCriteria && !criterionIds.length) continue;
-    const results = Array.isArray(lesson.checks) ? lesson.checks : lesson.checks?.results;
-    if (!Array.isArray(results) || !results.length || !Array.from(results).every(record)) continue;
-    // Stored knowledge uses command/exit arrays. Also accept complete receipts
-    // only when their own head matches; unknown, skipped or failed checks do
-    // not establish verified knowledge, even alongside a passing review.
-    const checks = Array.isArray(lesson.checks) ? { complete: true, headSha: lesson.headSha, results } : lesson.checks;
-    if (checkEvidence(checks, lesson.headSha, []).status !== 'passed') continue;
+    if (!verifiedLessonChecks(lesson)) continue;
     const trimmed = lesson.summary.trim();
     if (deduplicate) {
       const norm = trimmed.replace(/\s+/g, ' ').toLowerCase();
@@ -171,7 +180,7 @@ export function modulesFromWritePaths(writePaths) {
     const normalized = raw.replaceAll('\\', '/').replace(/^\.\//, '').replace(/\/+$/, '');
     const match = MODULE_CONTAINER.exec(normalized);
     if (!match) continue;
-    const mod = match[1].replace(/\.[a-z0-9]+$/i, '').toLowerCase();
+    const mod = match[1].toLowerCase();
     if (mod) modules.add(mod);
   }
   return [...modules];
