@@ -10,8 +10,10 @@
  */
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
+import { parse as parseToml } from 'smol-toml';
 import { execute } from './command.mjs';
 import { stateHome, workerEnvironment } from './security.mjs';
 import { withWorktreeLock } from './workspace.mjs';
@@ -244,6 +246,26 @@ export function rustCrateDir(file) {
   return (at >= 0 ? parts.slice(0, at) : parts).join('/');
 }
 
+/**
+ * The Cargo target a Rust file belongs to, read from its path, for comparing tests statically:
+ * `''` for `src/**` (the library and the main binary), `bin x` for `src/bin/x…`, `test t` for
+ * `tests/t.rs` and `tests/t/**` next to `tests/t/main.rs`, `test *` for a module shared by the
+ * test targets (`tests/common/mod.rs`), and the same for `benches/` and `examples/`. A test that
+ * moves to another target is a removed test and a new one, as libtest sees it.
+ * @param {string} file
+ * @param {boolean} [nestedCrate] The file's first directory under `tests/`, `benches/` or `examples/` has a `main.rs`.
+ */
+export function rustTargetGroup(file, nestedCrate = false) {
+  const crate = rustCrateDir(file),
+    parts = (crate ? file.slice(crate.length + 1) : file).split('/'),
+    stem = name => name.replace(/\.rs$/i, '');
+  if (parts[0] === 'src') return parts[1] === 'bin' && parts.length >= 3 ? `bin ${stem(parts[2])}` : '';
+  const kind = { tests: 'test', benches: 'bench', examples: 'example' }[parts[0]];
+  if (!kind) return '';
+  if (parts.length === 2) return `${kind} ${stem(parts[1])}`;
+  return nestedCrate || (parts.length === 3 && parts[2] === 'main.rs') ? `${kind} ${parts[1]}` : `${kind} *`;
+}
+
 /** The path of an attribute (`tokio::test`) and the tokens after it. */
 function attributePath(attribute) {
   const parts = [];
@@ -283,17 +305,27 @@ function evaluateCfg(tokens, depth = 0) {
 }
 
 /**
- * The attributes an attribute stands for in a test build: `cfg_attr(<true>, a, b)` is `a` and
- * `b` (also nested), `cfg_attr(<false or unknown>, …)` is nothing the reading may count on.
- * @returns {string[][]}
+ * The attributes an attribute stands for in a test build. `sure`: the attribute itself, or what
+ * `cfg_attr(<true>, a, b)` applies, also nested. `maybe`: what `cfg_attr(<unknown>, …)` may
+ * apply. `cfg_attr(<false>, …)` applies nothing.
+ * @returns {{ sure: string[][], maybe: string[][] }}
  */
 function expand(attribute, depth = 0) {
   const { path: name, rest } = attributePath(attribute);
-  if (name !== 'cfg_attr') return [attribute];
-  if (depth > 8 || rest[0] !== '(' || groupEnd(rest, 0) !== rest.length - 1) return [];
+  if (name !== 'cfg_attr') return { sure: [attribute], maybe: [] };
+  if (depth > 8 || rest[0] !== '(' || groupEnd(rest, 0) !== rest.length - 1) return { sure: [], maybe: [] };
   const [predicate, ...applied] = split(rest.slice(1, -1));
-  if (!predicate || evaluateCfg(predicate) !== 'T') return [];
-  return applied.flatMap(part => expand(part, depth + 1));
+  const value = predicate ? evaluateCfg(predicate) : 'F';
+  const sure = [],
+    maybe = [];
+  if (value === 'F') return { sure, maybe };
+  for (const part of applied) {
+    const inner = expand(part, depth + 1);
+    if (value === 'T') sure.push(...inner.sure);
+    else maybe.push(...inner.sure);
+    maybe.push(...inner.maybe);
+  }
+  return { sure, maybe };
 }
 
 /** `#[cfg(…)]` whose predicate is provably false in a test build. */
@@ -308,6 +340,11 @@ function cfgOff(attribute) {
 function isTestAttribute(attribute) {
   const { path: name, rest } = attributePath(attribute);
   return (name === 'test' || name.endsWith('::test')) && (!rest.length || rest[0] === '(');
+}
+
+/** `#[ignore]` in a test build (after `cfg_attr` is expanded). */
+function ignores(attribute) {
+  return attributePath(attribute).path === 'ignore';
 }
 
 /**
@@ -345,14 +382,24 @@ function bodyStart(tokens, from) {
   return { stop: tokens.length };
 }
 
+/** Where a macro call's name ends: `name!`, `std::name!`, `::core::name!`. The index of `!`, or -1. */
+function macroBang(statement) {
+  let at = statement[0] === '::' ? 1 : 0;
+  if (!isIdentifier(statement[at])) return -1;
+  while (statement[at + 1] === '::' && isIdentifier(statement[at + 2])) at += 2;
+  return statement[at + 1] === '!' ? at + 1 : -1;
+}
+
 /** Statements of a body: they end at a top-level `;` or with a block that closes a block-like statement. */
 function statements(tokens) {
   const list = [];
   let current = [],
     depth = 0;
-  const blockLike = statement =>
-    ['if', 'match', 'loop', 'while', 'for', 'unsafe', '{'].includes(statement[0]) ||
-    (statement[1] === '!' && statement[2] === '{');
+  const blockLike = statement => {
+    if (['if', 'match', 'loop', 'while', 'for', 'unsafe', '{'].includes(statement[0])) return true;
+    const bang = macroBang(statement);
+    return bang > 0 && statement[bang + 1] === '{';
+  };
   for (let at = 0; at < tokens.length; at++) {
     const token = tokens[at];
     if (token === ';' && depth === 0) {
@@ -375,28 +422,30 @@ function statements(tokens) {
   return list;
 }
 
-const literalPattern = /^(?:"[0-9a-f]{8}"|'[0-9a-f]{8}'|\d[\p{XID_Continue}.]*)$/u;
+/** A literal: a number, `true`/`false`, a character or a string (by the fingerprint of its text). */
+const literalPattern = /^(?:"[0-9a-f]{8}"|'[0-9a-f]{8}'|\d[\p{XID_Continue}.]*|true|false)$/u;
 /** Tokens without the parentheses that only wrap them: `((true))` is `true`. */
 function unwrap(tokens) {
   let inner = tokens;
   while (inner[0] === '(' && inner.length > 1 && groupEnd(inner, 0) === inner.length - 1) inner = inner.slice(1, -1);
   return inner;
 }
-/** A literal, `true`/`false`, a negative number or one plain name: an operand that cannot change between reads. */
-function constant(tokens) {
+/** A literal operand, also negative: a name or a path (`f32::NAN`, a `const`) is not one. */
+function literal(tokens) {
   const inner = unwrap(tokens);
-  if (inner.length === 2 && inner[0] === '-') return literalPattern.test(inner[1]);
-  return inner.length === 1 && (literalPattern.test(inner[0]) || isIdentifier(inner[0]));
+  if (inner.length === 2 && inner[0] === '-') return literalPattern.test(inner[1]) && inner[1] !== 'true';
+  return inner.length === 1 && literalPattern.test(inner[0]);
 }
-const sameConstant = (left, right) =>
-  left !== undefined && right !== undefined && constant(left) && unwrap(left).join(' ') === unwrap(right).join(' ');
+const sameLiteral = (left, right) =>
+  left !== undefined && right !== undefined && literal(left) && unwrap(left).join(' ') === unwrap(right).join(' ');
 
 const trivialMacros = new Set(['assert', 'debug_assert', 'assert_eq', 'debug_assert_eq']);
 
 /**
- * An assertion that cannot fail: `assert!(true)`, `assert!(!false)`, `assert!((true))`,
- * `assert!(x == x)` and `assert_eq!(x, x)` with constant operands (a literal or one plain name;
- * `assert_eq!(read(), read())` may fail), also through `std::`/`core::` and with any delimiter.
+ * An assertion that cannot fail: `assert!(true)`, `assert!(!false)`, `assert!((true))`, and
+ * `assert!(x == x)` / `assert_eq!(x, x)` with the same literal on both sides (a number, a bool, a
+ * character, a string). Names and paths are not literals: `assert_eq!(ACTUAL, ACTUAL)` with
+ * `const ACTUAL: f32 = f32::NAN` fails. Also through `std::`/`core::` and with any delimiter.
  */
 function trivialAssertion(statement) {
   let at = statement[0] === '::' ? 1 : 0;
@@ -406,12 +455,12 @@ function trivialAssertion(statement) {
   const close = groupEnd(statement, at + 2);
   if (close !== statement.length - 1) return false;
   const args = split(statement.slice(at + 3, close));
-  if (name.endsWith('_eq')) return sameConstant(args[0], args[1]);
+  if (name.endsWith('_eq')) return sameLiteral(args[0], args[1]);
   const first = unwrap(args[0] ?? []);
   if (first.length === 1 && first[0] === 'true') return true;
   if (first[0] === '!' && unwrap(first.slice(1)).join(' ') === 'false') return true;
   const sides = split(first, '==');
-  return sides.length === 2 && sameConstant(sides[0], sides[1]);
+  return sides.length === 2 && sameLiteral(sides[0], sides[1]);
 }
 
 /** A closure nobody calls or passes on: `|| …;`, `let check = || …;` with `check` never named again. */
@@ -485,6 +534,18 @@ export function rustWeakness(body) {
   return found === 'live' ? null : found === 'returns' ? 'returns before any check' : 'only checks that cannot fail';
 }
 
+/** Macros a token stream calls: `name!(`, `name! {`, `name! [` (comments and strings are already gone). */
+function collectCalls(tokens, calls) {
+  for (let at = 0; at < tokens.length - 2; at++)
+    if (
+      isIdentifier(tokens[at]) &&
+      tokens[at + 1] === '!' &&
+      OPENING.has(tokens[at + 2]) &&
+      tokens[at] !== 'macro_rules'
+    )
+      calls.add(tokens[at]);
+}
+
 /** The tests a `macro_rules!` body would define: `#[test] fn name` or `#[test] fn $name`, with their bodies. */
 function templateTests(tokens) {
   const tests = [];
@@ -493,7 +554,7 @@ function templateTests(tokens) {
     const token = tokens[at];
     if (token === '#' && tokens[at + 1] === '[') {
       const close = groupEnd(tokens, at + 1);
-      attributes.push(...expand(tokens.slice(at + 2, close)));
+      attributes.push(...expand(tokens.slice(at + 2, close)).sure);
       at = close;
     } else if (token === 'fn') {
       const name = tokens[at + 1] === '$' ? `$${tokens[at + 2]}` : tokens[at + 1];
@@ -519,10 +580,13 @@ function templateTests(tokens) {
  * `;`, `{` or `}` belong to the next `fn`. With a test attribute it is a case
  * named as libtest prints it: the module path of the file, the inline `mod`
  * blocks around it, the function. `cfg_attr(<true>, …)` is expanded, also
- * nested. A test is switched off by `#[ignore]` (`off: 'ignore'`) or by a `cfg`
- * provably false in a test build on the function, a module around it or the
- * file (`off: 'cfg'`). A `macro_rules!` body is a template: its tests are kept
- * apart (`templates`), with the macros the file calls (`calls`).
+ * nested; a test only through `cfg_attr(<unknown>, test)` is a case that may or
+ * may not exist (`maybe`): the reading never reports it gone, the registry
+ * judges it. A test is switched off by `#[ignore]` (`off: 'ignore'`) or by a
+ * `cfg` provably false in a test build on the function, a module around it or
+ * the file (`off: 'cfg'`). A `macro_rules!` body is a template: its tests are
+ * kept apart (`templates`, with `exported` for `#[macro_export]`), with the
+ * macros the file calls (`calls`).
  * @param {string} file
  * @param {string} source
  * @param {{ nestedCrate?: boolean }} [options]
@@ -538,8 +602,13 @@ export function rustCases(file, source, { nestedCrate = false } = {}) {
     scopes = [{ name: '', depth: 0, off: false }];
   let depth = 0,
     attributes = [],
+    maybes = [],
     pending = null,
     index = 0;
+  const reset = () => {
+    attributes = [];
+    maybes = [];
+  };
   while (index < length) {
     const token = tokens[index];
     if (token === '#' && (tokens[index + 1] === '[' || (tokens[index + 1] === '!' && tokens[index + 2] === '['))) {
@@ -548,44 +617,49 @@ export function rustCases(file, source, { nestedCrate = false } = {}) {
         close = groupEnd(tokens, open),
         effective = expand(tokens.slice(open + 1, close));
       // An inner attribute (`#![cfg(…)]`) belongs to the module or file it stands in.
-      if (inner) scopes[scopes.length - 1].off ||= effective.some(cfgOff);
-      else attributes.push(...effective);
+      if (inner) scopes[scopes.length - 1].off ||= effective.sure.some(cfgOff);
+      else {
+        attributes.push(...effective.sure);
+        maybes.push(...effective.maybe);
+      }
       index = close + 1;
     } else if (token === 'macro_rules' && tokens[index + 1] === '!') {
       let open = index + 2;
       const name = isIdentifier(tokens[open]) ? tokens[open++] : '';
       const close = OPENING.has(tokens[open]) ? groupEnd(tokens, open) : open - 1;
       const tests = close > open ? templateTests(tokens.slice(open + 1, close)) : [];
-      if (name && tests.length) templates.push({ name, tests });
+      if (name && tests.length)
+        templates.push({ name, tests, exported: attributes.some(item => attributePath(item).path === 'macro_export') });
       index = close + 1;
-      attributes = [];
+      reset();
     } else if (token === '{') {
       depth++;
       if (pending) scopes.push({ ...pending, depth });
       pending = null;
-      attributes = [];
+      reset();
       index++;
     } else if (token === '}') {
       if (scopes.length > 1 && scopes[scopes.length - 1].depth === depth) scopes.pop();
       depth = Math.max(0, depth - 1);
       pending = null;
-      attributes = [];
+      reset();
       index++;
     } else if (token === ';') {
       pending = null;
-      attributes = [];
+      reset();
       index++;
     } else if (token === 'mod') {
       const name = tokens[index + 1];
       pending = isIdentifier(name) ? { name, off: attributes.some(cfgOff) } : null;
-      attributes = [];
+      reset();
       index += 2;
     } else if (token === 'fn') {
       const name = tokens[index + 1],
-        own = attributes;
-      attributes = [];
+        own = attributes,
+        maybe = !own.some(isTestAttribute) && maybes.some(isTestAttribute);
+      reset();
       index += 2;
-      if (!isIdentifier(name) || !own.some(isTestAttribute)) continue;
+      if (!isIdentifier(name) || (!maybe && !own.some(isTestAttribute))) continue;
       const { open, stop } = bodyStart(tokens, index);
       if (open === undefined) {
         index = /** @type {number} */ (stop) + 1;
@@ -593,14 +667,17 @@ export function rustCases(file, source, { nestedCrate = false } = {}) {
       }
       const close = groupEnd(tokens, open),
         body = tokens.slice(open + 1, close);
+      collectCalls(body, calls);
       bodies.push(body.join(' '));
       const off = own.some(cfgOff) || scopes.some(scope => scope.off) ? 'cfg' : own.some(ignores) ? 'ignore' : null;
       cases.push({
         name: [...prefix, ...scopes.slice(1).map(scope => scope.name), name].join('::'),
         skipped: off !== null,
         off,
+        ...(maybe ? { maybe: true } : {}),
         body: body.join(' '),
-        weak: rustWeakness(body),
+        // Whether a test that may not exist checks anything is the registry's question.
+        weak: maybe ? null : rustWeakness(body),
         panics: panics(own),
       });
       index = close + 1;
@@ -613,11 +690,6 @@ export function rustCases(file, source, { nestedCrate = false } = {}) {
   return { code: bodies.join('\n'), cases, templates, calls };
 }
 
-/** `#[ignore]` in a test build (after `cfg_attr` is expanded). */
-function ignores(attribute) {
-  return attributePath(attribute).path === 'ignore';
-}
-
 /**
  * The Rust tests of a file as `{ name, skipped }`, named as libtest prints them.
  * @param {string} file Repository-relative path: it gives the module path.
@@ -626,6 +698,9 @@ function ignores(attribute) {
  */
 export const rustTestCases = (file, source, options = {}) =>
   rustCases(file, source, options).cases.map(({ name, skipped }) => ({ name, skipped }));
+
+/** The macros a Rust source calls, read as tokens: a call in a comment or a string is no call. */
+export const rustMacroCalls = source => rustCases('src/lib.rs', source).calls;
 
 /** The package name in a Cargo package id: `path+file:///…/game#0.1.0`, `…#engine@0.1.0`, `game 0.1.0 (…)`. */
 export function packageName(id) {
@@ -638,50 +713,44 @@ export function packageName(id) {
   return decodeURIComponent(url.slice(url.lastIndexOf('/') + 1));
 }
 
-/** A path as the file system names it: symbolic links, `/private/var`, 8.3 names and `\\?\` resolved. */
-function canonical(value) {
+/**
+ * A path as the file system names it, case kept: symbolic links, `/private/var`, 8.3 names and
+ * `\\?\` resolved. For `path.relative` and the directories the receipt shows.
+ */
+function canonicalPath(value) {
   let resolved;
   try {
     resolved = realpathSync.native(value);
   } catch {
     resolved = path.resolve(value);
   }
-  resolved = resolved.replace(/^\\\\\?\\(?!UNC\\)/, '');
-  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+  return resolved.replace(/^\\\\\?\\(?!UNC\\)/, '');
 }
+/** A key to compare paths with: case-insensitive on Windows, where the file system is. */
+const pathKey = value => (process.platform === 'win32' ? value.toLowerCase() : value);
+const canonicalKey = value => pathKey(canonicalPath(value));
 
 /** The kind of a Cargo target as the registry compares it. */
 const kindOf = kinds => ['bin', 'test', 'bench', 'example'].find(kind => kinds.split(',').includes(kind)) ?? 'lib';
 
 /**
- * Targets declared with `harness = false` in a manifest: libtest does not run them, so their
- * `--list` says nothing. Read line by line from the `[lib]`, `[[bin]]`, `[[test]]`, `[[bench]]`
- * and `[[example]]` tables. @returns {Set<string>} `kind:name`
+ * Targets declared with `harness = false` in a manifest, read with a TOML parser: libtest does
+ * not run them, so their `--list` says nothing. @returns {Set<string>} `kind:name`
  */
 export function harnessFreeTargets(manifest, packageNameValue) {
   const found = new Set();
-  let section = null;
-  const close = () => {
-    if (section?.harness === false)
-      found.add(
-        `${section.kind}:${section.name ?? (section.kind === 'lib' ? packageNameValue.replace(/-/g, '_') : '')}`,
-      );
-  };
-  for (const raw of manifest.split(/\r?\n/)) {
-    const line = raw.replace(/#.*$/, '').trim();
-    const header = /^\[\[?\s*([\w.-]+)\s*\]\]?$/.exec(line);
-    if (header) {
-      close();
-      const kind = { lib: 'lib', bin: 'bin', test: 'test', bench: 'bench', example: 'example' }[header[1]];
-      section = kind ? { kind } : null;
-      continue;
-    }
-    if (!section) continue;
-    const name = /^name\s*=\s*"([^"]*)"/.exec(line);
-    if (name) section.name = name[1];
-    if (/^harness\s*=\s*false\b/.test(line)) section.harness = false;
+  let value;
+  try {
+    value = parseToml(manifest);
+  } catch {
+    return found;
   }
-  close();
+  const lib = value.lib;
+  if (lib && typeof lib === 'object' && lib.harness === false)
+    found.add(`lib:${typeof lib.name === 'string' ? lib.name : packageNameValue.replace(/-/g, '_')}`);
+  for (const kind of ['bin', 'test', 'bench', 'example'])
+    for (const target of Array.isArray(value[kind]) ? value[kind] : [])
+      if (target && target.harness === false && typeof target.name === 'string') found.add(`${kind}:${target.name}`);
   return found;
 }
 
@@ -702,13 +771,14 @@ const LIST_TIMEOUT_MS = 120000;
 
 /**
  * The test registry of one checkout: `cargo test --workspace --no-run
- * --message-format=json` names the test executables, and each one lists its
- * tests (`--list --format terse`) and its ignored tests (`… --ignored`). A
- * `harness = false` target is not run: it is one entry with an empty name, so
- * the target itself is tracked.
+ * --message-format=json` names the test executables with their package, target
+ * and root file (`target.src_path`), and each one lists its tests (`--list
+ * --format terse`) and its ignored tests (`… --ignored`). A `harness = false`
+ * target is not run: it is one entry with an empty name, so the target itself
+ * is tracked.
  * @param {{ checkout: string, targetDir?: string, runner: any, signal?: AbortSignal, secrets?: any,
  *   env: Record<string, string> }} input `targetDir`: a target directory of its own (the base).
- * @returns {Promise<{ entries: { package: string, kind: string, target: string, dir: string, name: string, ignored: boolean }[] } | { reason: string }>}
+ * @returns {Promise<any>} `{ entries }`, each `{ package, kind, target, dir, src, name, ignored }`, or `{ reason }`.
  */
 async function listRegistry({ checkout, targetDir, runner, signal, secrets, env }) {
   const run = async (command, args, options) => {
@@ -737,7 +807,8 @@ async function listRegistry({ checkout, targetDir, runner, signal, secrets, env 
     if (message.reason !== 'compiler-artifact' || message.profile?.test !== true || !message.executable) continue;
     executables.set(message.executable, message);
   }
-  const root = canonical(checkout),
+  const root = canonicalPath(checkout),
+    relative = value => path.relative(root, canonicalPath(value)).split(path.sep).join('/'),
     manifests = new Map(),
     entries = [];
   for (const [executable, message] of executables) {
@@ -746,8 +817,14 @@ async function listRegistry({ checkout, targetDir, runner, signal, secrets, env 
       packageValue = packageName(String(message.package_id ?? '')),
       kind = [].concat(message.target?.kind ?? []).join(','),
       target = String(message.target?.name ?? '');
-    // Both sides canonical: a manifest path through `/private/var`, an 8.3 name or `\\?\` is the same directory.
-    const dir = path.relative(root, canonical(where)).split(path.sep).join('/');
+    // Both sides canonical, case kept: a path through `/private/var`, an 8.3 name or `\\?\` is the same.
+    const entry = {
+      package: packageValue,
+      kind,
+      target,
+      dir: relative(where),
+      src: message.target?.src_path ? relative(message.target.src_path) : '',
+    };
     if (!manifests.has(manifest)) {
       let text = '';
       try {
@@ -757,7 +834,6 @@ async function listRegistry({ checkout, targetDir, runner, signal, secrets, env 
       }
       manifests.set(manifest, harnessFreeTargets(text, packageValue));
     }
-    const entry = { package: packageValue, kind, target, dir };
     if (manifests.get(manifest).has(`${kindOf(kind)}:${target}`)) {
       entries.push({ ...entry, name: '', ignored: false });
       continue;
@@ -783,85 +859,72 @@ async function listRegistry({ checkout, targetDir, runner, signal, secrets, env 
   return { entries };
 }
 
-const samePath = (left, right) => canonical(left) === canonical(right);
-
-/** Remove a base checkout, also after a cancelled gate: no signal, a bounded wait. The reason it failed, or null. */
-async function removeCheckout(cwd, checkout) {
+/** A checkout of its own: its `.git` exists and Git names it as the top of its work tree. */
+async function healthyCheckout(checkout) {
+  if (!existsSync(path.join(checkout, '.git'))) return false;
   try {
-    await withWorktreeLock(
-      cwd,
-      async () => {
-        await execute('git', ['worktree', 'remove', '--force', checkout], {
-          cwd,
-          allowFailure: true,
-          timeoutMs: 60000,
-        });
-        // A checkout deleted behind Git's back stays registered until it is pruned.
-        await execute('git', ['worktree', 'prune'], { cwd, allowFailure: true, timeoutMs: 60000 });
-      },
-      undefined,
-      60000,
-    );
-    const listed = (await execute('git', ['worktree', 'list', '--porcelain'], { cwd, timeoutMs: 60000 })).stdout;
-    if (
-      listed
-        .split(/\r?\n/)
-        .filter(line => line.startsWith('worktree '))
-        .some(line => samePath(line.slice(9), checkout))
-    )
-      return 'worktree is still registered';
-    rmSync(checkout, { recursive: true, force: true });
-    return null;
-  } catch (error) {
-    return String(error.message).slice(0, 300);
+    const top = await execute('git', ['rev-parse', '--show-toplevel'], {
+      cwd: checkout,
+      allowFailure: true,
+      timeoutMs: 60000,
+    });
+    return top.code === 0 && canonicalKey(top.stdout.trim()) === canonicalKey(checkout);
+  } catch {
+    return false;
   }
 }
 
 /**
- * The base checkout at a stable path, at `baseSha`, clean. A stable path keeps Cargo's
- * fingerprints of the workspace crates, so a repeated base builds incrementally. A checkout
- * that is missing, unregistered or broken is removed and added again.
+ * Remove and add the base checkout again, under the repository's worktree lock, also after a
+ * cancelled gate (no signal, bounded waits): `worktree remove --force --force`; a directory that
+ * survives is deleted only when it lies inside the registry home; then `worktree prune` and `add`.
  */
-async function prepareCheckout(cwd, checkout, baseSha, signal) {
-  const listed = (await execute('git', ['worktree', 'list', '--porcelain'], { cwd })).stdout;
-  const registered = listed
-    .split(/\r?\n/)
-    .filter(line => line.startsWith('worktree '))
-    .some(line => samePath(line.slice(9), checkout));
-  if (registered && existsSync(checkout)) {
+async function rebuildCheckout(cwd, home, checkout, baseSha) {
+  const inside = !path.relative(canonicalPath(home), canonicalPath(checkout)).startsWith('..');
+  await withWorktreeLock(
+    cwd,
+    async () => {
+      const options = { cwd, allowFailure: true, timeoutMs: 60000 };
+      await execute('git', ['worktree', 'remove', '--force', '--force', checkout], options);
+      if (existsSync(checkout)) {
+        if (!inside) throw new Error(`base checkout ${checkout} is outside the registry home`);
+        rmSync(checkout, { recursive: true, force: true });
+      }
+      await execute('git', ['worktree', 'prune'], options);
+      await execute('git', ['worktree', 'add', '--detach', '--quiet', checkout, baseSha], { cwd, timeoutMs: 600000 });
+    },
+    undefined,
+    120000,
+  );
+}
+
+/**
+ * The base checkout at a stable path, at `baseSha`, clean. A stable path keeps Cargo's
+ * fingerprints of the workspace crates, so a repeated base builds incrementally. Git is run
+ * inside it only when its own `.git` is there: otherwise Git would climb to an outer repository.
+ */
+async function prepareCheckout(cwd, home, checkout, baseSha, signal) {
+  if (await healthyCheckout(checkout)) {
     try {
-      const moved = await execute('git', ['checkout', '--detach', '--force', '--quiet', baseSha], {
-        cwd: checkout,
-        allowFailure: true,
-        signal,
-      });
-      const cleaned =
-        moved.code === 0 && (await execute('git', ['clean', '-ffdxq'], { cwd: checkout, allowFailure: true, signal }));
+      const options = { cwd: checkout, allowFailure: true, signal };
+      const moved = await execute('git', ['checkout', '--detach', '--force', '--quiet', baseSha], options);
+      const cleaned = moved.code === 0 && (await execute('git', ['clean', '-ffdxq'], options));
       if (cleaned && cleaned.code === 0) return;
     } catch (error) {
       if (signal?.aborted || error.code === 'cancelled') throw error;
       // A broken checkout is added again below.
     }
   }
-  const failure = await removeCheckout(cwd, checkout);
-  if (failure && registered) throw new Error(`base checkout cleanup: ${failure}`);
-  rmSync(checkout, { recursive: true, force: true });
-  await withWorktreeLock(
-    cwd,
-    async () => {
-      await execute('git', ['worktree', 'prune'], { cwd, allowFailure: true });
-      await execute('git', ['worktree', 'add', '--detach', '--quiet', checkout, baseSha], { cwd });
-    },
-    signal,
-  );
+  await rebuildCheckout(cwd, home, checkout, baseSha);
+  if (!(await healthyCheckout(checkout))) throw new Error('base checkout could not be prepared');
 }
 
 /**
- * A lock across processes on the base build directory, for the whole build and listing: two
- * gates must not overwrite each other's base executables (the same path for different
- * bases). An SQLite write transaction, as the worktree lock: process death releases it.
+ * A lock across processes on the base build directory, for the whole preparation, build and
+ * listing: two gates must not overwrite each other's base executables (the same path for
+ * different bases). An SQLite write transaction, as the worktree lock: process death releases it.
  */
-async function withBaseLock(home, action, signal, waitMs = 4 * 60 * 60 * 1000) {
+export async function withBaseLock(home, action, signal = undefined, waitMs = 4 * 60 * 60 * 1000) {
   const { DatabaseSync } = await import('node:sqlite');
   mkdirSync(home, { recursive: true });
   const guard = new DatabaseSync(path.join(home, 'registry-base.lock.sqlite'), { timeout: 0 });
@@ -879,7 +942,7 @@ async function withBaseLock(home, action, signal, waitMs = 4 * 60 * 60 * 1000) {
         throw Object.assign(new Error('Timed out waiting for the base build of the test registry'), {
           code: 'timeout',
         });
-      await delay(200, undefined, { signal });
+      await delay(Math.min(200, waitMs), undefined, { signal });
     }
     return await action();
   } finally {
@@ -892,70 +955,84 @@ async function registryHomeFor(cwd) {
   const common = (
     await execute('git', ['rev-parse', '--path-format=absolute', '--git-common-dir'], { cwd, rawOutput: true })
   ).stdout.replace(/\r?\n$/, '');
-  const key = createHash('sha256').update(canonical(common)).digest('hex').slice(0, 16);
+  const key = createHash('sha256').update(canonicalKey(common)).digest('hex').slice(0, 16);
   return path.join(stateHome(), 'registry', key);
 }
 
-/** Where a file stands in a package: the target kind and name a test in it belongs to. */
-function targetOf(file, dir, nested) {
-  const parts = (dir ? file.slice(dir.length + 1) : file).split('/'),
-    stem = name => name.replace(/\.rs$/i, '');
-  if (parts[0] === 'src') {
-    if (parts[1] === 'bin') return { kind: 'bin', target: parts.length === 3 ? stem(parts[2]) : parts[2] };
-    if (parts.length === 2 && parts[1] === 'main.rs') return { kind: 'bin', target: null };
-    return { kind: 'lib-or-main', target: null };
-  }
-  const kind = { tests: 'test', benches: 'bench', examples: 'example' }[parts[0]];
-  if (!kind) return { kind: 'lib-or-main', target: null };
-  if (parts.length === 2) return { kind, target: stem(parts[1]) };
-  // `tests/<t>/main.rs` and its modules are target `<t>`; another directory is a module shared by any test target.
-  return { kind, target: nested || parts[parts.length - 1] === 'main.rs' ? parts[1] : null };
-}
-
-/** Whether a test of `file` can be the registry entry: same package directory, same target. */
-function sameTarget(item, entry, owner) {
-  if (owner(item.file) !== entry.dir) return false;
-  const { kind, target } = targetOf(item.file, entry.dir, item.nested),
-    entryKind = kindOf(entry.kind),
-    main = entryKind === 'bin' && entry.target.replace(/-/g, '_') === entry.package.replace(/-/g, '_');
-  if (kind === 'lib-or-main') return entryKind === 'lib' || main;
-  if (kind === 'bin') return entryKind === 'bin' && (target === null ? main : entry.target === target);
-  return entryKind === kind && (target === null || entry.target === target);
+/** The directory whose files are modules of a target root: `src/lib.rs` → `src`, `tests/t.rs` → `tests/t`. */
+function moduleDir(src) {
+  const dir = path.posix.dirname(src),
+    base = path.posix.basename(src);
+  return ['lib.rs', 'main.rs', 'mod.rs'].includes(base)
+    ? dir
+    : `${dir === '.' ? '' : `${dir}/`}${base.replace(/\.rs$/i, '')}`;
 }
 
 /**
- * Compare the registry of the base and the head. A test gone from the head, or ignored there
- * and not on the base, that the reading of the source has not explained is a finding. Every
- * explanation and every permission is matched to one base entry by (package, target kind,
- * target, name) and used once: removals (also moves and a `cfg` provably false) explain gone
- * tests, ignores explain ignored ones, and a permission covers only a test that is gone from
- * its permitted file on the head. A `harness = false` target is one entry with an empty name.
- * @param {{ base: any[], head: any[], removals: any[], skips: any[], permissions: any[] }} input
+ * The Cargo targets a file can belong to, from the roots Cargo reported (`target.src_path`): the
+ * target whose root it is; else the targets whose module directory holds it most closely
+ * (`src/util.rs` of a package with a library and a binary: both); else, for a module shared by
+ * the test targets (`tests/common/mod.rs`), every target of that kind in its package.
  */
-export function compareRegistry({ base, head, removals, skips, permissions }) {
-  const key = entry => `${entry.package}\u0000${entry.kind}\u0000${entry.target}\u0000${entry.name}`;
-  const dirs = [...new Set([...base, ...head].map(entry => entry.dir))];
-  const owner = file =>
-    dirs
-      .filter(dir => dir === '' || file === dir || file.startsWith(`${dir}/`))
-      .reduce(
-        (best, dir) => (best === null || dir.length > best.length ? dir : best),
-        /** @type {string|null} */ (null),
-      );
-  const byName = list => {
-    const map = new Map();
-    for (const item of list) {
-      if (!map.has(item.name)) map.set(item.name, []);
-      map.get(item.name).push(item);
+function targetsOf(targets) {
+  const memo = new Map();
+  const prefix = dir => (dir ? `${pathKey(dir)}/` : '');
+  return file => {
+    const key = pathKey(file);
+    if (memo.has(key)) return memo.get(key);
+    let found = targets.filter(target => target.src && pathKey(target.src) === key);
+    if (!found.length) {
+      const covering = targets
+        .filter(target => target.src && key.startsWith(prefix(moduleDir(target.src))))
+        .map(target => ({ target, depth: moduleDir(target.src).length }));
+      const deepest = Math.max(-1, ...covering.map(item => item.depth));
+      found = covering.filter(item => item.depth === deepest).map(item => item.target);
     }
-    return map;
+    if (!found.length) {
+      const owner = targets
+        .filter(target => key.startsWith(prefix(target.dir)))
+        .reduce((best, target) => (best === null || target.dir.length > best.length ? target.dir : best), null);
+      const kind =
+        owner === null
+          ? null
+          : { tests: 'test', benches: 'bench', examples: 'example' }[key.slice(prefix(owner).length).split('/')[0]];
+      if (kind) found = targets.filter(target => target.dir === owner && target.kind === kind);
+    }
+    const result = new Set(found.map(target => target.key));
+    memo.set(key, result);
+    return result;
   };
-  const pools = { removals: byName(removals), skips: byName(skips), permissions: byName(permissions) };
-  const take = (pool, entry) => {
-    const list = pool.get(entry.name);
-    const at = list ? list.findIndex(item => sameTarget(item, entry, owner)) : -1;
-    return at < 0 ? null : list.splice(at, 1)[0];
-  };
+}
+
+/**
+ * Compare the registry of the base and the head. A test gone from the head, or ignored there and
+ * not on the base, that the reading of the source has not explained is a finding. Every
+ * explanation is matched to one base entry — (package, target kind, target, name), the target
+ * from the roots Cargo reported — and used once:
+ * - `reported`, `cfg`: a removal or a provably false `cfg` the reading already reported as a
+ *   finding; it may stand for any target its file can belong to.
+ * - `skips`: an `#[ignore]` the reading reported; only for a test ignored now.
+ * - `moved`: a test the reading saw move to another file of the same target; it explains the
+ *   loss only when the registry of the head shows the test gained in that file's target.
+ * - `permitted`: a removal this run may make (`testRemovalAllowed`, also a whole permitted file
+ *   that is gone: an empty name). It covers a loss only in a target confirmed for its file: the
+ *   file's one target, or the one target of the file that had that test on the base.
+ * A `harness = false` target is one entry with an empty name.
+ * @param {{ base: any[], head: any[], reported?: any[], cfg?: any[], skips?: any[], moved?: any[], permitted?: any[] }} input
+ */
+export function compareRegistry({ base, head, reported = [], cfg = [], skips = [], moved = [], permitted = [] }) {
+  const targetKey = entry => `${entry.package}\u0000${entry.kind}\u0000${entry.target}`;
+  const key = entry => `${targetKey(entry)}\u0000${entry.name}`;
+  const targets = new Map();
+  for (const entry of [...base, ...head])
+    if (!targets.has(targetKey(entry)))
+      targets.set(targetKey(entry), {
+        key: targetKey(entry),
+        dir: entry.dir,
+        src: entry.src ?? '',
+        kind: kindOf(entry.kind),
+      });
+  const candidates = targetsOf([...targets.values()]);
   const tally = list => {
     const map = new Map();
     for (const entry of list) {
@@ -968,23 +1045,61 @@ export function compareRegistry({ base, head, removals, skips, permissions }) {
   };
   const before = tally(base),
     after = tally(head);
+  const gains = new Map();
+  for (const [slot, counts] of after) {
+    const more = counts.total - (before.get(slot)?.total ?? 0);
+    if (more > 0) gains.set(slot, more);
+  }
+  const byName = list => {
+    const map = new Map();
+    for (const item of list) {
+      if (!map.has(item.name)) map.set(item.name, []);
+      map.get(item.name).push(item);
+    }
+    return map;
+  };
+  const pools = {
+    reported: byName([...reported, ...cfg]),
+    skips: byName(skips),
+    moved: byName(moved),
+    permitted: byName(permitted),
+  };
+  const take = (pool, entry, accept) => {
+    const list = pool.get(entry.name);
+    const at = list ? list.findIndex(item => candidates(item.file).has(targetKey(entry)) && accept(item)) : -1;
+    return at < 0 ? null : list.splice(at, 1)[0];
+  };
+  const any = () => true;
+  const gainedIn = item =>
+    [...candidates(item.to)].find(target => (gains.get(`${target}\u0000${item.name}`) ?? 0) > 0) ?? null;
+  const confirmed = entry => item => {
+    const own = [...candidates(item.file)];
+    return own.length === 1 || own.filter(target => before.has(`${target}\u0000${entry.name}`)).length === 1;
+  };
   const gone = [],
     off = [],
-    permitted = new Map();
+    allowedByFile = new Map();
   for (const [slot, counts] of before) {
     const now = after.get(slot) ?? { total: 0, active: 0 };
     const removed = Math.max(0, counts.total - now.total);
     const switched = Math.max(0, Math.max(0, counts.active - removed) - now.active);
     for (let left = removed; left > 0; left--) {
-      if (take(pools.removals, counts.entry)) continue;
-      const item = take(pools.permissions, counts.entry);
+      if (take(pools.reported, counts.entry, any)) continue;
+      const move = take(pools.moved, counts.entry, item => gainedIn(item) !== null);
+      if (move) {
+        const target = /** @type {string} */ (gainedIn(move));
+        gains.set(`${target}\u0000${move.name}`, /** @type {number} */ (gains.get(`${target}\u0000${move.name}`)) - 1);
+        continue;
+      }
+      const item = take(pools.permitted, counts.entry, confirmed(counts.entry));
       if (!item) gone.push(counts.entry);
-      else {
-        if (!permitted.has(item.file)) permitted.set(item.file, new Set());
-        permitted.get(item.file).add(counts.entry);
+      // A permitted removal the reading saw is already in `allowed`; only a target the reading cannot see is added.
+      else if (item.name === '') {
+        if (!allowedByFile.has(item.file)) allowedByFile.set(item.file, new Set());
+        allowedByFile.get(item.file).add(counts.entry);
       }
     }
-    for (let left = switched; left > 0; left--) if (!take(pools.skips, counts.entry)) off.push(counts.entry);
+    for (let left = switched; left > 0; left--) if (!take(pools.skips, counts.entry, any)) off.push(counts.entry);
   }
   const label = entry => `${entry.package} ${entry.kind} ${entry.target}: ${entry.name || '(target, harness = false)'}`;
   const names = list =>
@@ -1008,7 +1123,7 @@ export function compareRegistry({ base, head, removals, skips, permissions }) {
   const count = map => [...map.values()].reduce((sum, item) => sum + item.total, 0);
   return {
     findings,
-    permitted: [...permitted].map(([file, list]) => ({
+    permitted: [...allowedByFile].map(([file, list]) => ({
       rule: 'test_deleted',
       file,
       detail: `test registry: tests are gone: ${names([...list])}`,
@@ -1018,18 +1133,52 @@ export function compareRegistry({ base, head, removals, skips, permissions }) {
   };
 }
 
-/** What a cached base registry depends on: the commit, the lock file, the toolchain, the flags. */
-async function cacheKey(cwd, baseSha, toolchain) {
-  const lock = await execute('git', ['show', `${baseSha}:Cargo.lock`], { cwd, allowFailure: true, rawOutput: true });
+/** Variables of the worker's environment that change what Cargo builds; output and network settings do not. */
+const buildVariable = name =>
+  /^(?:CARGO_|RUST)/i.test(name) && !/^(?:CARGO_TERM_|CARGO_HTTP_|CARGO_NET_|RUST_LOG$|RUST_BACKTRACE$)/i.test(name);
+
+/** A file's SHA-256, or null when it does not exist. */
+function fileHash(file) {
+  try {
+    return createHash('sha256').update(readFileSync(file)).digest('hex');
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * What a cached base registry depends on: the commit, its `Cargo.lock`, the build variables of
+ * the worker's environment (`RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, `CARGO_BUILD_*`,
+ * `CARGO_TARGET_*_RUSTFLAGS`, `CARGO_UNSTABLE_*`, `RUSTC`, `RUSTUP_TOOLCHAIN`, …), Cargo's own
+ * configuration in `CARGO_HOME`, and the `cargo` and `rustc` versions as the base checkout
+ * selects them (its `rust-toolchain`).
+ */
+async function cacheKey({ checkout, baseSha, env, runner, signal, secrets }) {
+  const version = async command => {
+    try {
+      const result = await runner(command, ['--version'], { cwd: checkout, env, signal, secrets, allowFailure: true });
+      return result.code === 0 ? String(result.stdout).trim() : `exit_${result.code}`;
+    } catch (error) {
+      if (signal?.aborted || error.code === 'cancelled') throw error;
+      return 'unavailable';
+    }
+  };
+  const variables = Object.entries(env)
+    .filter(([name]) => buildVariable(name))
+    .map(([name, value]) => [name.toUpperCase(), value])
+    .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
+  const cargoHome = env.CARGO_HOME || path.join(os.homedir(), '.cargo');
   return createHash('sha256')
     .update(
       JSON.stringify([
-        1,
+        2,
         baseSha,
-        lock.code === 0 ? createHash('sha256').update(lock.stdout).digest('hex') : null,
-        toolchain,
-        process.env.RUSTFLAGS ?? null,
-        process.env.CARGO_BUILD_TARGET ?? null,
+        fileHash(path.join(checkout, 'Cargo.lock')),
+        variables,
+        fileHash(path.join(cargoHome, 'config')),
+        fileHash(path.join(cargoHome, 'config.toml')),
+        await version('cargo'),
+        await version('rustc'),
       ]),
     )
     .digest('hex');
@@ -1056,13 +1205,50 @@ function writeCache(file, entries) {
 }
 
 /**
+ * The base registry under the base lock: the stable checkout is prepared, the cache key is
+ * computed in it, and a cached registry is used or the base is built and listed.
+ */
+async function baseRegistry({ cwd, home, baseSha, runner, signal, secrets, env }) {
+  return withBaseLock(
+    home,
+    async () => {
+      const checkout = path.join(home, 'base-checkout');
+      try {
+        await prepareCheckout(cwd, home, checkout, baseSha, signal);
+      } catch (error) {
+        if (signal?.aborted || error.code === 'cancelled') throw error;
+        return { reason: `checkout: ${String(error.message).slice(0, 300)}` };
+      }
+      const cache = path.join(
+        home,
+        'cache',
+        `${await cacheKey({ checkout, baseSha, env, runner, signal, secrets })}.json`,
+      );
+      const ready = readCache(cache);
+      if (ready) return { ...ready, cached: true };
+      const listed = await listRegistry({
+        checkout,
+        targetDir: path.join(home, 'registry-base'),
+        runner,
+        signal,
+        secrets,
+        env,
+      });
+      if (!('reason' in listed)) writeCache(cache, listed.entries);
+      return listed;
+    },
+    signal,
+  );
+}
+
+/**
  * The registry check of a full gate on a Rust project: a root `Cargo.toml` on the base or the
  * head. A side without it is an empty registry (a new crate; a manifest removed). The head is
  * listed in the checked worktree. The base is listed in a checkout at a stable path under
  * Kodo's state directory, built into its own target directory (`registry-base`), never the
- * head's, under a lock across processes for the whole build and listing; a finished base
- * registry is cached by commit, `Cargo.lock`, toolchain and flags. `incomplete` — Cargo
- * missing, a build or a listing failed, the checkout broken — is never a pass.
+ * head's, under a lock across processes for the whole preparation, build and listing; a
+ * finished base registry is cached (see `cacheKey`). `incomplete` — Cargo missing, a build or a
+ * listing failed, the checkout broken — is never a pass.
  */
 export async function rustRegistryCheck({
   cwd,
@@ -1073,16 +1259,11 @@ export async function rustRegistryCheck({
   registryHome,
   baseIsRust,
   headIsRust,
-  removals,
-  skips,
-  permissions,
+  pools = {},
 }) {
   const env = workerEnvironment();
-  let toolchain;
   try {
-    toolchain = String(
-      (await runner('cargo', ['--version'], { cwd, signal, env, secrets, allowFailure: false })).stdout,
-    ).trim();
+    await runner('cargo', ['--version'], { cwd, signal, env, secrets, allowFailure: false });
   } catch (error) {
     if (signal?.aborted || error.code === 'cancelled') throw error;
     return { registry: { status: 'incomplete', reason: 'cargo_unavailable' } };
@@ -1092,51 +1273,18 @@ export async function rustRegistryCheck({
     after = await listRegistry({ checkout: cwd, runner, signal, secrets, env });
     if ('reason' in after) return { registry: { status: 'incomplete', reason: `head_${after.reason}` } };
   }
-  let before = /** @type {any} */ ({ entries: [] }),
-    cached = false;
+  let before = /** @type {any} */ ({ entries: [] });
   if (baseIsRust) {
-    const home = registryHome ?? (await registryHomeFor(cwd)),
-      cache = path.join(home, 'cache', `${await cacheKey(cwd, baseSha, toolchain)}.json`);
-    const hit = readCache(cache);
-    if (hit) {
-      before = hit;
-      cached = true;
-    } else {
-      try {
-        before = await withBaseLock(
-          home,
-          async () => {
-            // Another gate may have built this base while this one waited.
-            const ready = readCache(cache);
-            if (ready) {
-              cached = true;
-              return ready;
-            }
-            const checkout = path.join(home, 'base-checkout');
-            await prepareCheckout(cwd, checkout, baseSha, signal);
-            const listed = await listRegistry({
-              checkout,
-              targetDir: path.join(home, 'registry-base'),
-              runner,
-              signal,
-              secrets,
-              env,
-            });
-            if (!('reason' in listed)) writeCache(cache, listed.entries);
-            return listed;
-          },
-          signal,
-        );
-      } catch (error) {
-        if (signal?.aborted || error.code === 'cancelled') throw error;
-        return {
-          registry: { status: 'incomplete', reason: `base_checkout: ${String(error.message).slice(0, 300)}` },
-        };
-      }
-      if ('reason' in before) return { registry: { status: 'incomplete', reason: `base_${before.reason}` } };
+    try {
+      const home = registryHome ?? (await registryHomeFor(cwd));
+      before = await baseRegistry({ cwd, home, baseSha, runner, signal, secrets, env });
+    } catch (error) {
+      if (signal?.aborted || error.code === 'cancelled') throw error;
+      before = { reason: `checkout: ${String(error.message).slice(0, 300)}` };
     }
+    if ('reason' in before) return { registry: { status: 'incomplete', reason: `base_${before.reason}` } };
   }
-  const compared = compareRegistry({ base: before.entries, head: after.entries, removals, skips, permissions });
+  const compared = compareRegistry({ base: before.entries, head: after.entries, ...pools });
   return {
     registry: {
       status: 'compared',
@@ -1144,35 +1292,36 @@ export async function rustRegistryCheck({
       head: compared.head,
       ...(baseIsRust ? {} : { baseRegistry: 'absent' }),
       ...(headIsRust ? {} : { headRegistry: 'absent' }),
-      ...(cached ? { baseCached: true } : {}),
+      ...(before.cached ? { baseCached: true } : {}),
     },
     findings: compared.findings,
     permitted: compared.permitted,
   };
 }
 
-/** The packages a plain `cargo test` selects: `default-members`, else the root package, else every member. */
+/**
+ * The packages a plain `cargo test` selects, from a manifest read with a TOML parser:
+ * `default-members`, else the root package, else every member. Paths are compared as written
+ * (`./` and a trailing `/` dropped), globs are not expanded. Null for a manifest that is not TOML.
+ */
 function defaultSelection(manifest) {
-  const sections = new Map();
-  let current = '';
-  for (const raw of manifest.split(/\r?\n/)) {
-    const header = /^\s*\[\s*([\w.-]+)\s*\]\s*(?:#.*)?$/.exec(raw);
-    if (header) current = header[1];
-    else sections.set(current, `${sections.get(current) ?? ''}${raw}\n`);
+  let value;
+  try {
+    value = parseToml(manifest);
+  } catch {
+    return null;
   }
-  const list = (text, key) => {
-    const match = new RegExp(`(?:^|\\n)\\s*${key}\\s*=\\s*\\[([^\\]]*)\\]`).exec(text ?? '');
-    return match ? [...match[1].matchAll(/"([^"]*)"/g)].map(item => item[1].replace(/\/+$/, '') || '.') : null;
-  };
-  const workspace = sections.get('workspace');
-  return (
-    list(workspace, 'default-members') ?? (sections.has('package') ? ['.'] : (list(workspace, 'members') ?? ['.']))
-  );
+  const clean = list =>
+    Array.isArray(list)
+      ? list.filter(item => typeof item === 'string').map(item => item.replace(/^\.\/+/, '').replace(/\/+$/, '') || '.')
+      : null;
+  const workspace = value.workspace && typeof value.workspace === 'object' ? value.workspace : {};
+  return clean(workspace['default-members']) ?? (value.package ? ['.'] : (clean(workspace.members) ?? ['.']));
 }
 
 /**
- * `test_selection_narrowed`: the project tests with a plain `cargo test` (no `--workspace`,
- * no `--all`), and the root manifest now selects fewer packages by default.
+ * `test_selection_narrowed`: the project tests with a plain `cargo test` (no `--workspace`, no
+ * `--all`, no `-p`/`--package`), and the root manifest now selects fewer packages by default.
  * @param {{ base: string | null, head: string | null, commands: { command: string, args?: string[] }[] }} input
  */
 export function selectionNarrowed({ base, head, commands }) {
@@ -1180,10 +1329,13 @@ export function selectionNarrowed({ base, head, commands }) {
     item =>
       /(?:^|[\\/])cargo(?:\.exe)?$/i.test(item.command) &&
       (item.args ?? []).includes('test') &&
-      !(item.args ?? []).some(arg => arg === '--workspace' || arg === '--all'),
+      !(item.args ?? []).some(arg => /^(?:--workspace|--all|-p.*|--package(?:=.*)?)$/.test(arg)),
   );
   if (!plain || base === null || head === null) return null;
-  const after = new Set(defaultSelection(head));
-  const lost = defaultSelection(base).filter(member => !after.has(member));
+  const before = defaultSelection(base),
+    after = defaultSelection(head);
+  if (!before || !after) return null;
+  const now = new Set(after);
+  const lost = before.filter(member => !now.has(member));
   return lost.length ? lost : null;
 }

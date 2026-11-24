@@ -24,7 +24,9 @@ import {
   rustCases,
   rustCrateDir,
   rustCrateRootProbe,
+  rustMacroCalls,
   rustRegistryCheck,
+  rustTargetGroup,
   selectionNarrowed,
 } from './behavior-rust.mjs';
 
@@ -834,15 +836,19 @@ function casesOf(file, source, options = {}) {
  * @returns {Promise<any>}
  */
 async function inspect(cwd, revision, file) {
+  if (!languageOf(file)) return { reason: 'unsupported_language' };
+  const rust = languageOf(file) === 'rs';
   let result;
   try {
+    // The size first: a file over the limit is never read into memory.
+    const size = await execute('git', ['cat-file', '-s', `${revision}:${file}`], { cwd, allowFailure: true });
+    if (size.code !== 0) return { reason: 'unreadable' };
+    if (Number(size.stdout.trim()) > (rust ? MAX_RUST_BYTES : MAX_INSPECTED_BYTES)) return { reason: 'too_large' };
     result = await execute('git', ['show', `${revision}:${file}`], { cwd, allowFailure: true, rawOutput: true });
   } catch {
     return { reason: 'unreadable' };
   }
   if (result.code !== 0) return { reason: 'unreadable' };
-  const rust = languageOf(file) === 'rs';
-  if (Buffer.byteLength(result.stdout) > (rust ? MAX_RUST_BYTES : MAX_INSPECTED_BYTES)) return { reason: 'too_large' };
   // A Rust file next to `tests/<dir>/main.rs` is a module of that crate, not of `<dir>`.
   const probe = rust ? rustCrateRootProbe(file) : null;
   const nestedCrate =
@@ -851,12 +857,12 @@ async function inspect(cwd, revision, file) {
   const parsed = casesOf(file, result.stdout, { nestedCrate });
   if (!parsed) return { reason: 'unsupported_language' };
   if (rust) {
-    // Compared with the crate: `tests::adds` of two crates are two tests. `test` keeps the libtest name.
-    const crate = rustCrateDir(file);
+    // Compared with the crate and the target: `tests::adds` of two crates, and `x` of `tests/a.rs`
+    // and of `tests/b.rs`, are two tests each. `test` keeps the libtest name.
+    const where = [rustCrateDir(file), rustTargetGroup(file, nestedCrate)].filter(Boolean).join(' ');
     for (const item of parsed.cases) {
       item.test = item.name;
-      item.nested = nestedCrate;
-      if (crate) item.name = `${crate}: ${item.name}`;
+      if (where) item.name = `${where}: ${item.name}`;
     }
   }
   return parsed;
@@ -990,10 +996,14 @@ function rustBodyFindings(base, head) {
   return { weak, weakened };
 }
 
+/** How many files a search for macro calls reads at most; past it the macro counts as called. */
+const MAX_CALL_FILES = 200;
+
 /**
  * `weak_or_empty_test` for a `macro_rules!` template: a test it defines that is new or changed
- * and cannot fail, in a macro the package calls somewhere (`name!(`, `name! {`, `name! [`). An
- * unused template defines no test.
+ * and cannot fail, in a macro that is called (`name!(`, `name! {`, `name! [`) — in its package,
+ * or anywhere in the repository for `#[macro_export]`. Calls are read as Rust tokens: a call in a
+ * comment or a string is none. An unused template defines no test.
  */
 async function templateFindings(cwd, headSha, base, head) {
   const before = new Map();
@@ -1004,16 +1014,29 @@ async function templateFindings(cwd, headSha, base, head) {
         if (!before.has(slot)) before.set(slot, new Set());
         before.get(slot).add(test.body);
       }
-  const called = async (name, file) => {
-    const crate = rustCrateDir(file);
-    if (head.some(entry => entry.calls?.has(name) && rustCrateDir(entry.file) === crate)) return true;
-    const pattern = `(^|[^A-Za-z0-9_])${name}[[:space:]]*![[:space:]]*[[({]`;
-    const pathspec = `${crate ? `${crate}/` : ''}*.rs`;
-    const grep = await execute('git', ['grep', '-q', '-E', pattern, headSha, '--', pathspec], {
+  const called = async (template, file) => {
+    const crate = rustCrateDir(file),
+      inScope = other => template.exported || rustCrateDir(other) === crate;
+    if (head.some(entry => entry.calls?.has(template.name) && inScope(entry.file))) return true;
+    // A text search finds the files that may call it; their tokens decide.
+    const pattern = `(^|[^A-Za-z0-9_])${template.name}[[:space:]]*![[:space:]]*[[({]`;
+    const pathspec = template.exported || !crate ? '*.rs' : `${crate}/*.rs`;
+    const listed = await execute('git', ['grep', '-l', '-E', pattern, headSha, '--', pathspec], {
       cwd,
       allowFailure: true,
     });
-    return grep.code === 0;
+    const files = listed.stdout
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map(line => line.slice(headSha.length + 1))
+      .filter(other => inScope(other) && !head.some(entry => entry.file === other));
+    if (files.length > MAX_CALL_FILES) return true;
+    for (const other of files) {
+      const text = await execute('git', ['show', `${headSha}:${other}`], { cwd, allowFailure: true, rawOutput: true });
+      if (text.code === 0 && text.stdout.length <= MAX_RUST_BYTES && rustMacroCalls(text.stdout).has(template.name))
+        return true;
+    }
+    return false;
   };
   const found = [];
   for (const entry of head) {
@@ -1022,7 +1045,7 @@ async function templateFindings(cwd, headSha, base, head) {
       const weak = template.tests.filter(
         test => test.weak && !before.get(`${entry.file}\u0000${template.name}\u0000${test.name}`)?.has(test.body),
       );
-      if (weak.length && (await called(template.name, entry.file)))
+      if (weak.length && (await called(template, entry.file)))
         fake.push(...weak.map(test => `${template.name}!: fn ${test.name} (${test.weak})`));
     }
     if (fake.length)
@@ -1036,35 +1059,60 @@ async function templateFindings(cwd, headSha, base, head) {
 }
 
 /**
- * What the registry comparison may count on from this reading, each item with its libtest name
- * and file: `removals`, Rust cases gone from their own file (removed, or moved to another file)
- * and cases a provably false `cfg` switched off; `skips`, cases newly `#[ignore]`d; and
- * `permissions`, base cases of a file this run may reduce that are gone from that file on the
- * head (plus the target of a permitted Rust file that is gone).
+ * What the registry comparison may count on from this reading, each Rust case once, with its
+ * libtest name and file:
+ * - `reported`: a case gone from its file that the reading reported as a finding;
+ * - `permitted`: a case gone from a file this run may reduce (and the target of a permitted file
+ *   that is gone, with an empty name);
+ * - `moved`: a case the reading saw move to another file of the same crate and target (`to`);
+ * - `cfg`, `skips`: cases switched off by a provably false `cfg`, or by `#[ignore]`.
  */
-function registryPools(base, head, missing, switchedOff, allowed) {
-  const removals = [],
-    permissions = [],
-    headCounts = new Map(head.map(entry => [entry.file, tally([entry])]));
+function registryPools(base, gone, switchedOff, allowed) {
+  const reported = [],
+    permitted = [],
+    moved = [];
   for (const [index, entry] of base.entries()) {
-    const items = new Map(entry.cases.map(item => [item.name, item]));
-    for (const name of missing[index]) {
-      const item = items.get(name);
-      if (item?.test !== undefined) removals.push({ name: item.test, file: entry.file, nested: item.nested });
-    }
-    if (!ownsPath(allowed, entry.file)) continue;
-    const left = new Map(entry.gone ? [] : (headCounts.get(entry.at) ?? []));
-    for (const item of entry.cases) {
+    const own = ownsPath(allowed, entry.file);
+    for (const { item, to } of gone[index]) {
       if (item.test === undefined) continue;
-      const still = left.get(item.name) ?? 0;
-      if (still > 0) left.set(item.name, still - 1);
-      else permissions.push({ name: item.test, file: entry.file, nested: item.nested });
+      if (to) moved.push({ name: item.test, file: entry.file, to });
+      else (own ? permitted : reported).push({ name: item.test, file: entry.file });
     }
-    if (entry.gone && languageOf(entry.file) === 'rs')
-      permissions.push({ name: '', file: entry.file, nested: entry.cases[0]?.nested ?? false });
+    if (own && entry.gone && languageOf(entry.file) === 'rs') permitted.push({ name: '', file: entry.file });
   }
-  for (const item of switchedOff) if (item.off === 'cfg') removals.push(item);
-  return { removals, skips: switchedOff.filter(item => item.off === 'ignore'), permissions };
+  return {
+    reported,
+    permitted,
+    moved,
+    cfg: switchedOff.filter(item => item.off === 'cfg'),
+    skips: switchedOff.filter(item => item.off === 'ignore'),
+  };
+}
+
+/**
+ * Base cases missing from their own file on the head, each with the file it moved to (`to`) or
+ * none. A case is first looked for in its own file, and only what is missing there can have
+ * moved: with the same name in two files, the file that lost the case is the one reported, and
+ * the one a permission must name. A Rust case that may not exist (`maybe`) is never missing.
+ */
+function missingCases(base, head) {
+  const pools = new Map(head.map(entry => [entry.file, tally([entry])]));
+  const take = (pool, name) => {
+    const left = pool?.get(name) ?? 0;
+    if (left > 0) pool.set(name, left - 1);
+    return left > 0;
+  };
+  const missing = base.map(entry => entry.cases.filter(item => !take(pools.get(entry.at), item.name) && !item.maybe));
+  // After every file has claimed its own cases it no longer matters much which file a moved case
+  // went to: what is left is kept per name, so the cost does not grow with the number of files.
+  const left = new Map();
+  for (const [file, pool] of pools)
+    for (const [name, number] of pool)
+      for (let count = number; count > 0; count--) {
+        if (!left.has(name)) left.set(name, []);
+        left.get(name).push(file);
+      }
+  return missing.map(items => items.map(item => ({ item, to: left.get(item.name)?.pop() ?? null })));
 }
 
 /**
@@ -1081,11 +1129,11 @@ function registryPools(base, head, missing, switchedOff, allowed) {
  * `.only` added to a file with existing tests stops the others.
  *
  * Rust files are read wherever they are: tests live in `#[cfg(test)]` modules
- * of `src/**.rs` too, and a Rust case is compared with its crate. A changed or
- * new Rust test that cannot fail (an empty body, `assert!(true)`, an empty
- * `return` before the first statement), also in a `macro_rules!` template the
- * package calls, is `weak_or_empty_test`; a `#[should_panic]` removed or
- * loosened is `test_weakened`.
+ * of `src/**.rs` too, and a Rust case is compared with its crate and target. A
+ * changed or new Rust test that cannot fail (an empty body, `assert!(true)`, an
+ * empty `return` before the first statement), also in a `macro_rules!`
+ * template that is called, is `weak_or_empty_test`; a `#[should_panic]`
+ * removed or loosened is `test_weakened`.
  *
  * What it cannot see is in the docs: a body emptied under the same name (except
  * Rust), an early `return`, a skip called inside the body, a renamed case
@@ -1136,26 +1184,9 @@ async function inspectTests({ cwd, baseSha, headSha, allowed = [] }) {
         unchecked.push({ file: to, reason: after.reason });
     }
   }
-  // Every base case must still exist among the changed test files. A case is first looked for
-  // in its own file, and only what is missing there can have moved: with the same name in two
-  // files, the file that lost the case is the one reported, and the one a permission must name.
-  const pools = new Map(head.map(entry => [entry.file, tally([entry])]));
-  const take = (pool, name) => {
-    const left = pool?.get(name) ?? 0;
-    if (left > 0) pool.set(name, left - 1);
-    return left > 0;
-  };
-  const missing = base.map(entry =>
-    entry.cases.map(item => item.name).filter(name => !take(pools.get(entry.at), name)),
-  );
-  // After every file has claimed its own cases it no longer matters which file a moved case went
-  // to: what is left is counted once, so the cost does not grow with the number of files.
-  const left = new Map();
-  for (const pool of pools.values())
-    for (const [name, number] of pool) if (number > 0) left.set(name, (left.get(name) ?? 0) + number);
-  const moved = name => take(left, name);
+  const gone = missingCases(base, head);
   for (const [index, entry] of base.entries()) {
-    const removed = missing[index].filter(name => !moved(name));
+    const removed = gone[index].filter(item => !item.to).map(({ item }) => item.name);
     if (removed.length)
       report(
         entry.gone
@@ -1193,13 +1224,7 @@ async function inspectTests({ cwd, baseSha, headSha, allowed = [] }) {
   const bodies = rustBodyFindings(base, head);
   findings.push(...bodies.weak, ...(await templateFindings(cwd, headSha, base, head)));
   bodies.weakened.forEach(report);
-  return {
-    findings,
-    allowed: permitted,
-    warnings,
-    unchecked,
-    pools: registryPools(base, head, missing, switchedOff, allowed),
-  };
+  return { findings, allowed: permitted, warnings, unchecked, pools: registryPools(base, gone, switchedOff, allowed) };
 }
 
 /**
@@ -1236,22 +1261,31 @@ async function selectionFinding({ cwd, baseSha, headSha, config }) {
 }
 
 /**
- * The Rust part of a full gate, when the base or the head has a root `Cargo.toml`: a changed Rust
- * file too large to read and a registry that could not be compared make the gate incomplete.
+ * `test_inspection_incomplete` on a full gate: a changed Rust file too large or unreadable, once per file.
+ * Its tests were not read, so nothing about them can pass.
  */
+function inspectionIncomplete(unchecked) {
+  const files = [
+    ...new Set(
+      unchecked
+        .filter(item => (item.reason === 'too_large' || item.reason === 'unreadable') && languageOf(item.file) === 'rs')
+        .map(item => item.file),
+    ),
+  ];
+  return files.map(file => ({
+    rule: 'test_inspection_incomplete',
+    file,
+    detail: `its tests were not read (larger than ${MAX_RUST_BYTES} bytes, or unreadable); split the file`,
+  }));
+}
+
+/** The registry part of a full gate, when the base or the head has a root `Cargo.toml`. */
 async function rustFullGate({ cwd, baseSha, headSha, signal, secrets, runner, registryHome, tests }) {
   const exists = async revision =>
     (await execute('git', ['cat-file', '-e', `${revision}:Cargo.toml`], { cwd, allowFailure: true })).code === 0;
   const headIsRust = await exists(headSha),
     baseIsRust = await exists(baseSha);
   if (!headIsRust && !baseIsRust) return { findings: [], allowed: [] };
-  const findings = tests.unchecked
-    .filter(item => item.reason === 'too_large' && languageOf(item.file) === 'rs')
-    .map(item => ({
-      rule: 'test_inspection_incomplete',
-      file: item.file,
-      detail: `larger than ${MAX_RUST_BYTES} bytes, its tests were not read; split the file`,
-    }));
   const compared = await rustRegistryCheck({
     cwd,
     baseSha,
@@ -1261,8 +1295,9 @@ async function rustFullGate({ cwd, baseSha, headSha, signal, secrets, runner, re
     registryHome,
     baseIsRust,
     headIsRust,
-    ...tests.pools,
+    pools: tests.pools,
   });
+  const findings = [];
   // Not compared is never a pass: the gate is incomplete.
   if (compared.registry.status !== 'compared')
     findings.push({
@@ -1467,6 +1502,8 @@ export async function runBehaviorGate({
       const narrowed = await selectionFinding({ cwd, baseSha, headSha, config });
       if (narrowed) (ownsPath(verification.testRemovalAllowed, 'Cargo.toml') ? allowed : findings).push(narrowed);
     }
+    // A full gate reads every changed Rust file, whatever the registry setting.
+    if (registry) findings.push(...inspectionIncomplete(tests.unchecked));
     // A full gate of a Rust project (on the base or the head) compares the test registry, whatever changed.
     if (registry && verification.testRegistry) {
       const rust = await rustFullGate({ cwd, baseSha, headSha, signal, secrets, runner, registryHome, tests });

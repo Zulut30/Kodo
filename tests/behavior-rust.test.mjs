@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import {
   existsSync,
   mkdtempSync,
@@ -23,6 +23,7 @@ import {
   testWeakening,
   verificationConfigHash,
 } from '../runtime/behavior-gate.mjs';
+import { withBaseLock } from '../runtime/behavior-rust.mjs';
 
 /** A Git repository with one commit; `change` edits the tree and commits the head. */
 function repository(t, files = {}) {
@@ -210,7 +211,7 @@ test('Rust tests inside src/**/*.rs are protected', async t => {
       repo.change({ 'tests/multi/helper.rs': helper.replace(/#\[test\]\nfn other[\s\S]*$/, '') }),
     );
     assert.deepEqual(rules(findings), ['tests_removed:tests/multi/helper.rs']);
-    assert.match(findings[0].detail, /"helper::other"/);
+    assert.match(findings[0].detail, /"test multi: helper::other"/);
   });
   await t.test('editing production code next to unchanged tests passes', async s => {
     const repo = repository(s, { 'src/lib.rs': lib, 'src/plain.rs': 'pub fn one() -> i32 {\n    1\n}\n' });
@@ -365,12 +366,15 @@ test('weak_or_empty_test refuses only tests that cannot fail', async t => {
     ['assert!(true)', '        assert!(true);\n'],
     ['assert![true] and assert!{true}', '        assert![true];\n        debug_assert!{ true }\n'],
     ['assert!(!false) with a message', '        assert!(!false, "always");\n'],
-    ['the same literal on both sides', '        assert_eq!(-2, -2);\n        assert_eq!("x", ("x"));\n'],
-    ['the same plain name on both sides of ==', '        assert!(EXPECTED == EXPECTED);\n'],
+    [
+      'the same literal on both sides',
+      '        assert_eq!(-2, -2);\n        assert_eq!("x", ("x"));\n        assert!(\'c\' == \'c\');\n        assert_eq!(true, true);\n',
+    ],
     [
       'std::assert! and core::assert! with extra parentheses',
       '        std::assert!((true));\n        ::core::assert!(!(false));\n',
     ],
+    ['std::assert! { true } as a block statement', '        std::assert! { true }\n        assert!(true);\n'],
     ['a return before the first statement', '        return;\n        assert_eq!(add(-1, -1), -2);\n'],
     ['return ()', '        return ();\n'],
     ['return Ok(())', '        return Ok(());\n        assert_eq!(add(-1, -1), -2);\n'],
@@ -405,6 +409,8 @@ test('weak_or_empty_test refuses only tests that cannot fail', async t => {
     ['a turbofish helper', '        assert_close::<f32>(add(-1, -1) as f32, -2.0);\n'],
     ['a call to an unknown function may check', '        let _ = add(-1, -1);\n'],
     ['the same call on both sides may differ between reads', '        assert_eq!(read(), read());\n'],
+    ['the same name on both sides is not a literal (NaN != NaN)', '        assert!(EXPECTED == EXPECTED);\n'],
+    ['the same path on both sides is not a literal', '        assert_eq!(f32::NAN, f32::NAN);\n'],
     ['the same call on both sides of ==', '        assert!(add(-1, -1) == add(-1, -1));\n'],
     ['a return with a call may check', '        return check_all(add(-1, -1));\n'],
     [
@@ -593,12 +599,13 @@ function fakeCargo(
         );
         executables.set(executable, target);
         const manifest = path.join(root, target.dir ?? '', 'Cargo.toml');
+        const src = path.join(root, target.dir ?? '', target.src ?? defaultRoot(target));
         lines.push(
           JSON.stringify({
             reason: 'compiler-artifact',
             package_id: `path+file:///${root.replace(/\\/g, '/')}/${target.dir ?? ''}#${target.package}@0.1.0`,
             manifest_path: manifest,
-            target: { kind: [target.kind], name: target.target },
+            target: { kind: [target.kind], name: target.target, src_path: src },
             profile: { test: true },
             executable,
           }),
@@ -620,6 +627,15 @@ function fakeCargo(
     return { code: 0, stdout: listed.map(name => `${name}: test\n`).join(''), stderr: '' };
   };
 }
+/** Where Cargo puts the root of a target by default. */
+const defaultRoot = target =>
+  target.kind === 'lib'
+    ? 'src/lib.rs'
+    : target.kind === 'bin'
+      ? target.target === target.package
+        ? 'src/main.rs'
+        : `src/bin/${target.target}.rs`
+      : `${{ test: 'tests', bench: 'benches', example: 'examples' }[target.kind]}/${target.target}.rs`;
 const registry = (...targets) => `${JSON.stringify(targets, null, 1)}\n`;
 const libTarget = (tests, ignored = []) => ({ package: 'game', kind: 'lib', target: 'game', tests, ignored });
 const baseBuilds = calls => calls.filter(call => call.command === 'cargo' && call.args[0] === 'test' && call.target);
@@ -662,7 +678,9 @@ test('The test registry from libtest is compared on a full gate of a Rust projec
       assert.deepEqual([receipt.status, receipt.testRegistry], ['failed', { status: 'compared', base: 4, head: 3 }]);
       const builds = calls.filter(call => call.command === 'cargo' && call.args[0] === 'test');
       assert.deepEqual(builds[0].args, ['test', '--workspace', '--no-run', '--message-format=json']);
-      const lists = calls.filter(call => call.command !== 'cargo').map(call => call.args.join(' '));
+      const lists = calls
+        .filter(call => call.command !== 'cargo' && call.command !== 'rustc')
+        .map(call => call.args.join(' '));
       assert.deepEqual([...new Set(lists)].sort(), ['--list --format terse', '--list --format terse --ignored']);
       const [base] = baseBuilds(calls);
       assert.equal(base.cwd, path.join(home, 'base-checkout'), 'the base checkout has a stable path');
@@ -1000,6 +1018,320 @@ test('A plain cargo test that selects fewer default members is test_selection_na
     config: { ...config(['test']), verification: { testRemovalAllowed: ['Cargo.toml'] } },
   });
   assert.deepEqual([allowed.findings, rules(allowed.allowed)], [[], ['test_selection_narrowed:Cargo.toml']]);
+});
+
+test('Round 4: targets, moves, cache, TOML, sizes, maybe-tests, macro calls, checkout repair, case', async t => {
+  const homes = s => {
+    const home = mkdtempSync(path.join(os.tmpdir(), 'kodo-registry-home-'));
+    s.after(() => rmSync(home, { recursive: true, force: true }));
+    return home;
+  };
+  const gate = async (s, head, options = {}) =>
+    runBehaviorGate({ ...head, config: {}, registry: true, registryHome: homes(s), runner: fakeCargo([]), ...options });
+  const x = name =>
+    `#[cfg(test)]\nmod tests {\n    #[test]\n    fn ${name}() {\n        assert!(crate::one());\n    }\n}\n`;
+  const gated = name => x(name).replace('    #[test]\n', '    #[cfg(feature = "slow")]\n    #[test]\n');
+  const libAndBin = (lib, bin) =>
+    registry(
+      { package: 'game', kind: 'lib', target: 'game', tests: lib },
+      { package: 'game', kind: 'bin', target: 'game', tests: bin },
+    );
+  await t.test('K1: a permission on src/lib.rs does not hide a loss in the binary', async s => {
+    const repo = repository(s, {
+      'Cargo.toml': cargoToml,
+      'src/lib.rs': `pub fn one() -> bool { true }\n${x('same')}`,
+      'src/main.rs': `fn main() {}\nfn one() -> bool { true }\n${x('same')}`,
+      'registry.json': libAndBin(['tests::same'], ['tests::same']),
+    });
+    const head = repo.change({
+      'src/lib.rs': 'pub fn one() -> bool { true }\n',
+      'src/main.rs': `fn main() {}\nfn one() -> bool { true }\n${gated('same')}`,
+      'registry.json': libAndBin([], []),
+    });
+    const receipt = await gate(s, head, { config: { verification: { testRemovalAllowed: ['src/lib.rs'] } } });
+    assert.deepEqual(
+      [rules(receipt.findings), rules(receipt.allowed)],
+      [['test_deleted:null'], ['tests_removed:src/lib.rs']],
+    );
+    assert.match(receipt.findings[0].detail, /"game bin game: tests::same"/);
+  });
+  await t.test('K1: a module of a library and a binary is ambiguous unless one target had the test', async s => {
+    const files = {
+      'Cargo.toml': cargoToml,
+      'src/lib.rs': 'pub mod util;\npub fn one() -> bool { true }\n',
+      'src/main.rs': 'mod util;\nfn main() {}\nfn one() -> bool { true }\n',
+      'src/util.rs': x('y'),
+    };
+    const allowed = { config: { verification: { testRemovalAllowed: ['src/util.rs'] } } };
+    const only = repository(s, { ...files, 'registry.json': libAndBin(['util::tests::y'], []) });
+    const confirmed = await gate(
+      s,
+      only.change({ 'src/util.rs': '// y removed\n', 'registry.json': libAndBin([], []) }),
+      allowed,
+    );
+    assert.deepEqual([rules(confirmed.findings), rules(confirmed.allowed)], [[], ['tests_removed:src/util.rs']]);
+    const both = repository(s, { ...files, 'registry.json': libAndBin(['util::tests::y'], ['util::tests::y']) });
+    const ambiguous = await gate(
+      s,
+      both.change({ 'src/util.rs': '// y removed\n', 'registry.json': libAndBin([], []) }),
+      allowed,
+    );
+    assert.deepEqual(rules(ambiguous.findings), ['test_deleted:null']);
+    assert.match(ambiguous.findings[0].detail, /2 tests are gone/);
+  });
+  await t.test('K2: a test "moved" into another target under an unknown cfg is a removal', async s => {
+    const test = '#[test]\nfn x() {\n    assert!(game::one());\n}\n';
+    const targets = (a, b) =>
+      registry(
+        { package: 'game', kind: 'test', target: 'a', tests: a },
+        { package: 'game', kind: 'test', target: 'b', tests: b },
+      );
+    const repo = repository(s, {
+      'Cargo.toml': cargoToml,
+      'tests/a.rs': test,
+      'tests/b.rs': '// empty\n',
+      'registry.json': targets(['x'], []),
+    });
+    const head = repo.change({
+      'tests/a.rs': '// moved out\n',
+      'tests/b.rs': test.replace('#[test]\n', '#[cfg(feature = "slow")]\n#[test]\n'),
+      'registry.json': targets([], []),
+    });
+    assert.deepEqual(await weakened(head), ['tests_removed:tests/a.rs'], 'task-fast sees it too');
+    const receipt = await gate(s, head);
+    assert.deepEqual(rules(receipt.findings), ['tests_removed:tests/a.rs']);
+  });
+  await t.test('K2: a move between the library and the binary counts only when the head registry shows it', async s => {
+    const files = {
+      'Cargo.toml': cargoToml,
+      'src/lib.rs': 'pub fn one() -> bool { true }\n',
+      'src/main.rs': `fn main() {}\nfn one() -> bool { true }\n${x('same')}`,
+    };
+    const after = lib => ({ 'src/main.rs': 'fn main() {}\n', 'src/lib.rs': `pub fn one() -> bool { true }\n${lib}` });
+    const repo = repository(s, { ...files, 'registry.json': libAndBin([], ['tests::same']) });
+    const moved = repo.change({ ...after(x('same')), 'registry.json': libAndBin(['tests::same'], []) });
+    assert.deepEqual([await weakened(moved), (await gate(s, moved)).findings], [[], []], 'a confirmed move');
+    const hidden = repository(s, { ...files, 'registry.json': libAndBin([], ['tests::same']) });
+    const lost = hidden.change({ ...after(gated('same')), 'registry.json': libAndBin([], []) });
+    assert.deepEqual(await weakened(lost), [], 'the reading sees a move');
+    const receipt = await gate(s, lost);
+    assert.deepEqual(rules(receipt.findings), ['test_deleted:null']);
+    assert.match(receipt.findings[0].detail, /"game bin game: tests::same"/);
+  });
+  await t.test(
+    'K3: the cache key follows the worker environment, CARGO_HOME and versions in the base checkout',
+    async s => {
+      const repo = repository(s, {
+        'Cargo.toml': cargoToml,
+        'src/lib.rs': lib,
+        'registry.json': registry(libTarget(['tests::adds'])),
+      });
+      const head = repo.change({ 'README.md': '# again\n' });
+      const home = homes(s),
+        cargoHome = homes(s),
+        calls = [];
+      const saved = { flags: process.env.CARGO_ENCODED_RUSTFLAGS, home: process.env.CARGO_HOME };
+      s.after(() => {
+        for (const [name, value] of [
+          ['CARGO_ENCODED_RUSTFLAGS', saved.flags],
+          ['CARGO_HOME', saved.home],
+        ])
+          if (value === undefined) delete process.env[name];
+          else process.env[name] = value;
+      });
+      process.env.CARGO_HOME = cargoHome;
+      const run = () =>
+        runBehaviorGate({ ...head, config: {}, registry: true, registryHome: home, runner: fakeCargo(calls) });
+      await run();
+      await run();
+      assert.equal(baseBuilds(calls).length, 1, 'a warm cache');
+      process.env.CARGO_ENCODED_RUSTFLAGS = '--cfg\u001fslow';
+      await run();
+      assert.equal(baseBuilds(calls).length, 2, 'CARGO_ENCODED_RUSTFLAGS changes the base');
+      writeFileSync(path.join(cargoHome, 'config.toml'), '[build]\nrustflags = ["--cfg", "fast"]\n');
+      await run();
+      assert.equal(baseBuilds(calls).length, 3, 'CARGO_HOME configuration changes the base');
+      const versions = calls.filter(
+        call => call.args[0] === '--version' && call.cwd === path.join(home, 'base-checkout'),
+      );
+      assert.deepEqual(
+        [...new Set(versions.map(call => call.command))].sort(),
+        ['cargo', 'rustc'],
+        'versions in the base checkout',
+      );
+    },
+  );
+  await t.test(
+    'K4: manifests are read as TOML: single quotes, comments in arrays; -p is not a plain cargo test',
+    async s => {
+      const manifest = `${cargoToml}\n[[test]]\nname = 'smoke' # single quotes\nharness = false\n`;
+      const repo = repository(s, {
+        'Cargo.toml': manifest,
+        'tests/smoke.rs': 'fn main() {}\n',
+        'registry.json': registry(libTarget(['tests::adds']), {
+          package: 'game',
+          kind: 'test',
+          target: 'smoke',
+          tests: ['would_run'],
+        }),
+      });
+      const calls = [];
+      const head = repo.change({ 'Cargo.toml': cargoToml, 'registry.json': registry(libTarget(['tests::adds'])) }, [
+        'tests/smoke.rs',
+      ]);
+      const receipt = await gate(s, head, { runner: fakeCargo(calls) });
+      assert.match(receipt.findings[0].detail, /"game test smoke: \(target, harness = false\)"/);
+      assert.equal(
+        calls.some(call => /smoke/.test(call.command)),
+        false,
+      );
+      const workspace = members =>
+        `[workspace]\nmembers = [\n  "crates/a", # the core\n  "crates/b",\n]\ndefault-members = [${members}]\n`;
+      const narrowed = repository(s, { 'Cargo.toml': workspace('\n  "crates/a", # first\n  "crates/b" # second\n') });
+      const changed = narrowed.change({ 'Cargo.toml': workspace('"crates/a", # only a\n') });
+      const plain = await runBehaviorGate({
+        ...changed,
+        config: { commands: { test: [{ command: 'cargo', args: ['test'] }] } },
+      });
+      assert.deepEqual(rules(plain.findings), ['test_selection_narrowed:Cargo.toml']);
+      assert.match(plain.findings[0].detail, /"crates\/b"/);
+      for (const args of [
+        ['test', '-p', 'a'],
+        ['test', '--package', 'a'],
+        ['test', '-pa'],
+      ]) {
+        const package_ = await runBehaviorGate({
+          ...changed,
+          config: { commands: { test: [{ command: 'cargo', args }] } },
+        });
+        assert.deepEqual(package_.findings, [], args.join(' '));
+      }
+    },
+  );
+  await t.test('K5: a changed Rust file too large to read: incomplete once, also with testRegistry: false', async s => {
+    const big = `${lib}${'// filler line of a generated table\n'.repeat(70000)}`;
+    const repo = repository(s, {
+      'Cargo.toml': cargoToml,
+      'src/lib.rs': lib,
+      'src/table.rs': big,
+      'registry.json': registry(libTarget(['tests::adds', 'tests::adds_negative'])),
+    });
+    const head = repo.change({ 'src/table.rs': `${big}// touched\n` });
+    const receipt = await gate(s, head, { config: { verification: { testRegistry: false } } });
+    assert.deepEqual(
+      [receipt.status, rules(receipt.findings)],
+      ['incomplete', ['test_inspection_incomplete:src/table.rs']],
+    );
+  });
+  await t.test('K6: a test only through cfg_attr(<unknown>, test) is left to the registry', async s => {
+    const repo = repository(s, { 'src/lib.rs': lib });
+    const maybe = lib.replace(
+      '    #[test]\n    fn adds_negative()',
+      '    #[cfg_attr(feature = "slow", test)]\n    fn adds_negative()',
+    );
+    assert.deepEqual(await weakened(repo.change({ 'src/lib.rs': maybe })), []);
+    const fromMaybe = repository(s, { 'src/lib.rs': maybe });
+    assert.deepEqual(
+      await weakened(fromMaybe.change({ 'src/lib.rs': withoutNegative })),
+      [],
+      'a maybe-test that goes is the registry’s',
+    );
+    assert.deepEqual(
+      rustTestCases('src/lib.rs', maybe).map(item => item.name),
+      ['tests::adds', 'tests::adds_negative'],
+    );
+  });
+  await t.test('K7: macro calls are tokens; an exported macro is looked for in the whole repository', async s => {
+    const template = body =>
+      `#[macro_export]\nmacro_rules! cases {\n    ($n:ident) => {\n        #[test]\n        fn $n() {${body}}\n    };\n}\n`;
+    const real = ' assert_eq!(1 + 1, 2); ';
+    const quoted = repository(s, {
+      'crates/a/src/lib.rs': `${template(real)}`,
+      'crates/b/src/lib.rs': '// cases!(gen_a);\nconst DOC: &str = "cases!(gen_b)";\n',
+    });
+    assert.deepEqual(
+      await weakened(quoted.change({ 'crates/a/src/lib.rs': template(' ') })),
+      [],
+      'comments and strings call nothing',
+    );
+    const used = repository(s, { 'crates/a/src/lib.rs': template(real), 'crates/b/src/lib.rs': 'a::cases!(gen_a);\n' });
+    assert.deepEqual(await weakened(used.change({ 'crates/a/src/lib.rs': template(' ') })), [
+      'weak_or_empty_test:crates/a/src/lib.rs',
+    ]);
+  });
+  await t.test('K9: a base checkout with a broken .git is rebuilt, never run in an outer repository', async s => {
+    // The registry home inside the repository: Git in a checkout without its own `.git` would climb to it.
+    const repo = repository(s, {
+      '.gitignore': '.kodo-home/\n',
+      'Cargo.toml': cargoToml,
+      'src/lib.rs': lib,
+      'registry.json': registry(libTarget(['tests::adds'])),
+    });
+    const home = path.join(repo.cwd, '.kodo-home');
+    const first = repo.change({ 'README.md': '# one\n' });
+    const second = repo.change({ 'README.md': '# two\n' });
+    const run = (head, baseSha) =>
+      runBehaviorGate({ ...head, baseSha, config: {}, registry: true, registryHome: home, runner: fakeCargo([]) });
+    assert.equal((await run(first, repo.baseSha)).testRegistry.status, 'compared');
+    // Git for Windows hides `.git`: a hidden file is replaced, not truncated.
+    rmSync(path.join(home, 'base-checkout', '.git'), { force: true });
+    writeFileSync(path.join(home, 'base-checkout', '.git'), 'gitdir: /nowhere/at/all\n');
+    assert.equal((await run(second, first.headSha)).testRegistry.status, 'compared');
+    assert.equal(repo.git('-C', path.join(home, 'base-checkout'), 'rev-parse', 'HEAD'), first.headSha);
+    rmSync(path.join(home, 'base-checkout', '.git'), { force: true });
+    const third = repo.change({ 'README.md': '# three\n' });
+    writeFileSync(path.join(repo.cwd, 'notes.local'), 'an untracked file of the outer repository\n');
+    assert.equal((await run(third, second.headSha)).testRegistry.status, 'compared');
+    assert.equal(repo.git('-C', path.join(home, 'base-checkout'), 'rev-parse', 'HEAD'), second.headSha);
+    assert.equal(repo.git('rev-parse', 'HEAD'), third.headSha, 'the outer repository was not moved');
+    assert.equal(existsSync(path.join(repo.cwd, 'notes.local')), true, 'nor cleaned');
+  });
+  await t.test('K10: a crate directory with capitals (crates/Core) matches on every platform', async s => {
+    const core = { package: 'core-lib', kind: 'lib', target: 'core_lib', dir: 'crates/Core' };
+    const repo = repository(s, {
+      'Cargo.toml': '[workspace]\nmembers = ["crates/Core"]\n',
+      'crates/Core/src/lib.rs': lib,
+      'registry.json': registry({ ...core, tests: ['tests::adds', 'tests::adds_negative'] }),
+    });
+    const head = repo.change({
+      'crates/Core/src/lib.rs': withoutNegative,
+      'registry.json': registry({ ...core, tests: ['tests::adds'] }),
+    });
+    const receipt = await gate(s, head, { runner: fakeCargo([], { canonicalManifest: true }) });
+    assert.deepEqual(rules(receipt.findings), ['tests_removed:crates/Core/src/lib.rs']);
+  });
+});
+
+test('The base build lock holds across processes and is released when its holder dies', async t => {
+  const home = mkdtempSync(path.join(os.tmpdir(), 'kodo-lock-'));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const module = new URL('../runtime/behavior-rust.mjs', import.meta.url).href;
+  const holder = spawn(
+    process.execPath,
+    [
+      '--input-type=module',
+      '-e',
+      `const { withBaseLock } = await import(${JSON.stringify(module)});
+       // The pending wait is kept reachable: a collected lock would close its connection and free the lock.
+       globalThis.held = withBaseLock(${JSON.stringify(home)}, async () => {
+         console.log('locked');
+         await new Promise(resolve => { globalThis.release = resolve; setInterval(() => {}, 1000); });
+       });`,
+    ],
+    { stdio: ['ignore', 'pipe', 'inherit'] },
+  );
+  t.after(() => holder.kill());
+  await new Promise((resolve, reject) => {
+    holder.stdout.on('data', data => String(data).includes('locked') && resolve());
+    holder.on('exit', code => reject(new Error(`holder exited ${code}`)));
+  });
+  await assert.rejects(
+    withBaseLock(home, async () => 'second', undefined, 400),
+    /Timed out waiting for the base build/,
+  );
+  holder.kill('SIGKILL');
+  await new Promise(resolve => holder.on('exit', resolve));
+  assert.equal(await withBaseLock(home, async () => 'second', undefined, 10000), 'second');
 });
 
 test('The hash of a default verification block is unchanged; a disabled registry changes it', () => {
