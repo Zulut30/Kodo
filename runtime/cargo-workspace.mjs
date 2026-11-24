@@ -268,26 +268,44 @@ export function parseWorkspaceDependencies(rawDeps) {
   return map;
 }
 
-export function collectManifestDependencies(doc) {
+export function resolvePackageEdition(doc, workspacePackage = null) {
+  const raw = doc?.package?.edition;
+  if (raw === undefined) return { edition: '2015', error: null };
+  if (typeof raw === 'string' && /^\d{4}$/.test(raw.trim())) return { edition: raw.trim(), error: null };
+  if (isPlainObject(raw) && raw.workspace === true) {
+    const inherited = workspacePackage?.edition;
+    if (typeof inherited === 'string' && /^\d{4}$/.test(inherited.trim()))
+      return { edition: inherited.trim(), error: null };
+    return { edition: null, error: 'unresolved-workspace-edition' };
+  }
+  return { edition: null, error: 'invalid-package-edition' };
+}
+
+export function collectManifestDependencies(doc, { edition = '2015', onUnsupported = null } = {}) {
   const rows = [];
+  const forbidUnderscore = edition !== null && Number(edition) >= 2024;
   const addSection = (table, kind) => {
     if (!isPlainObject(table)) return;
     for (const key of Object.keys(table).sort(compare)) rows.push({ key, spec: table[key], kind });
   };
+  const addAliasedSection = (area, hyphenKey, underscoreKey, kind) => {
+    if (!isPlainObject(area)) return;
+    const hasHyphen = area[hyphenKey] !== undefined;
+    const hasUnderscore = area[underscoreKey] !== undefined;
+    if (forbidUnderscore && hasUnderscore) onUnsupported?.('unsupported-underscore-dependencies');
+    if (hasHyphen) addSection(area[hyphenKey], kind);
+    else if (!forbidUnderscore && hasUnderscore) addSection(area[underscoreKey], kind);
+  };
   addSection(doc.dependencies, 'dependency');
-  addSection(doc['dev-dependencies'], 'dev-dependency');
-  addSection(doc.dev_dependencies, 'dev-dependency');
-  addSection(doc['build-dependencies'], 'build-dependency');
-  addSection(doc.build_dependencies, 'build-dependency');
+  addAliasedSection(doc, 'dev-dependencies', 'dev_dependencies', 'dev-dependency');
+  addAliasedSection(doc, 'build-dependencies', 'build_dependencies', 'build-dependency');
   if (isPlainObject(doc.target)) {
     for (const targetKey of Object.keys(doc.target).sort(compare)) {
       const section = doc.target[targetKey];
       if (!isPlainObject(section)) continue;
       addSection(section.dependencies, 'dependency');
-      addSection(section['dev-dependencies'], 'dev-dependency');
-      addSection(section.dev_dependencies, 'dev-dependency');
-      addSection(section['build-dependencies'], 'build-dependency');
-      addSection(section.build_dependencies, 'build-dependency');
+      addAliasedSection(section, 'dev-dependencies', 'dev_dependencies', 'dev-dependency');
+      addAliasedSection(section, 'build-dependencies', 'build_dependencies', 'build-dependency');
     }
   }
   return rows;
@@ -472,6 +490,7 @@ function expandPathMembers({
   selected,
   rootDir,
   workspaceDependencies,
+  workspacePackage,
   manifestDirs,
   parsedCache,
   isExcluded,
@@ -483,7 +502,8 @@ function expandPathMembers({
     const dir = queue.shift();
     const parsed = parsedCache(dir);
     if (parsed.error) continue;
-    for (const dep of collectManifestDependencies(parsed.doc)) {
+    const { edition } = resolvePackageEdition(parsed.doc, workspacePackage);
+    for (const dep of collectManifestDependencies(parsed.doc, { edition: edition ?? '2015' })) {
       const targetDir = resolveDepTargetDir(dep, dir, rootDir, workspaceDependencies);
       if (targetDir === null || !manifestDirs.has(targetDir) || isExcluded(targetDir)) continue;
       if (targetDir !== rootDir && hasNestedWorkspaceBoundary(rootDir, targetDir, manifestDirs, parsedCache)) {
@@ -501,7 +521,7 @@ function expandPathMembers({
   }
 }
 
-function loadMemberPackages(selected, parsedCache, unknown) {
+function loadMemberPackages(selected, parsedCache, workspacePackage, unknown) {
   const members = [];
   const seenNames = new Set();
   for (const dir of [...selected].sort(compare)) {
@@ -521,7 +541,13 @@ function loadMemberPackages(selected, parsedCache, unknown) {
       continue;
     }
     seenNames.add(name);
-    members.push({ name, root: dir, manifest, manifestHash: parsed.hash, doc: parsed.doc });
+    const { edition, error: editionError } = resolvePackageEdition(parsed.doc, workspacePackage);
+    if (editionError) unknown('manifest', manifest, editionError);
+    collectManifestDependencies(parsed.doc, {
+      edition: edition ?? '2015',
+      onUnsupported: reason => unknown('manifest', manifest, reason),
+    });
+    members.push({ name, root: dir, manifest, manifestHash: parsed.hash, edition: edition ?? '2015', doc: parsed.doc });
   }
   return members.sort((a, b) => compare(a.manifest, b.manifest));
 }
@@ -610,6 +636,7 @@ export function resolveCargoWorkspace({ manifests, files, startDir = '' }) {
 
   const workspace = hasWorkspace ? rootDoc.workspace : {};
   const workspaceDependencies = parseWorkspaceDependencies(workspace.dependencies);
+  const workspacePackage = isPlainObject(workspace.package) ? workspace.package : null;
   const excludePrefixes = parseExcludePrefixes(workspace, rootDir, rootManifest, unknown);
   const isExcluded = dir => excludePrefixes.some(ex => (ex === '' ? true : dir === ex || dir.startsWith(`${ex}/`)));
 
@@ -629,10 +656,19 @@ export function resolveCargoWorkspace({ manifests, files, startDir = '' }) {
   if (hasRootPackage) selected.add(rootDir);
 
   if (hasWorkspace) {
-    expandPathMembers({ selected, rootDir, workspaceDependencies, manifestDirs, parsedCache, isExcluded, unknown });
+    expandPathMembers({
+      selected,
+      rootDir,
+      workspaceDependencies,
+      workspacePackage,
+      manifestDirs,
+      parsedCache,
+      isExcluded,
+      unknown,
+    });
   }
 
-  const members = loadMemberPackages(selected, parsedCache, unknown);
+  const members = loadMemberPackages(selected, parsedCache, workspacePackage, unknown);
   return {
     root: rootDir,
     rootManifest,

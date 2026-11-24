@@ -1,0 +1,37 @@
+{
+  "cargoVersion": "cargo 1.96.0 (30a34c682 2026-05-25)",
+  "startDir": "",
+  "ok": true,
+  "workspace_root": "",
+  "workspace_members": [
+    {
+      "name": "a",
+      "manifest": "crates/a/Cargo.toml"
+    },
+    {
+      "name": "b",
+      "manifest": "crates/b/Cargo.toml"
+    }
+  ],
+  "member_dependencies": {
+    "a": [
+      {
+        "name": "b",
+        "kind": "dev-dependency"
+      }
+    ],
+    "b": []
+  },
+  "files": [
+    "Cargo.toml",
+    "crates/a/Cargo.toml",
+    "crates/a/src/lib.rs",
+    "crates/b/Cargo.toml",
+    "crates/b/src/lib.rs"
+  ],
+  "manifests": {
+    "Cargo.toml": "[workspace]\nresolver = \"2\"\nmembers = [\"crates/*\"]\n[workspace.package]\nedition = \"2021\"\n",
+    "crates/a/Cargo.toml": "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition.workspace = true\n[dev_dependencies]\nb = { path = \"../b\" }\n",
+    "crates/b/Cargo.toml": "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+  }
+}

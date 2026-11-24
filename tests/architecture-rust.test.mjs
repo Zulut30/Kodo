@@ -813,6 +813,29 @@ test('E2: cargo-workspace resolves workspace members matching real Cargo 1.96 me
       fixture.workspace_members,
       `${name}: workspace members mismatch`,
     );
+    if (fixture.member_dependencies) {
+      const parsed = parseWorkspace({
+        files: (fixture.files || Object.keys(fixture.manifests)).map(file => ({
+          path: file,
+          mode: '100644',
+          oid: 'a'.repeat(40),
+        })),
+        contents,
+      });
+      assert.deepEqual(parsed.unsupported, [], `${name}: parseWorkspace unexpected unsupported`);
+      const actualDeps = Object.fromEntries(
+        parsed.crates
+          .map(crate => [
+            crate.name,
+            parsed.edges
+              .filter(edge => edge.from === crate.name)
+              .map(edge => ({ name: edge.to ?? edge.externalCrate, kind: edge.kind }))
+              .sort((a, b) => a.name.localeCompare(b.name) || a.kind.localeCompare(b.kind)),
+          ])
+          .sort(([a], [b]) => a.localeCompare(b)),
+      );
+      assert.deepEqual(actualDeps, fixture.member_dependencies, `${name}: member dependencies mismatch`);
+    }
   }
 
   // Malformed glob -> unsupported-member-glob; unexcluded nested [workspace] -> nested-workspace-root.
@@ -1909,5 +1932,101 @@ test('W5: workspace member globs inspect snapshot directories (member-glob-no-ma
   assert.ok(
     resNoMatch.unsupported.some(u => u.reason === 'member-glob-no-match' && u.file === 'Cargo.toml'),
     `expected member-glob-no-match, got ${JSON.stringify(resNoMatch.unsupported)}`,
+  );
+});
+
+test('W6: edition-aware dependency tables (hyphen precedence over underscore in <2024; underscore blocked in >=2024 including edition.workspace=true and target.*)', async t => {
+  // 1) Edition 2021 with BOTH [dev-dependencies] and [dev_dependencies]: Cargo uses hyphen only -> no bogus edge/layer violation.
+  const fx2021 = await rustFixture(t);
+  await fx2021.put(
+    'crates/core/Cargo.toml',
+    [
+      '[package]',
+      'name = "core"',
+      'version = "0.1.0"',
+      'edition = "2021"',
+      '[dependencies]',
+      'game-contracts = { workspace = true }',
+      '[dev-dependencies]',
+      'proptest = { workspace = true }',
+      '[dev_dependencies]',
+      'app = { path = "../app" }',
+      "[target.'cfg(unix)'.build-dependencies]",
+      'serde = { workspace = true }',
+      "[target.'cfg(unix)'.build_dependencies]",
+      'render = { path = "../render" }',
+    ].join('\n') + '\n',
+  );
+  const head2021 = fx2021.commit('edition 2021 hyphen precedence');
+  const res2021 = await checkArchitecture({
+    project: fx2021.project,
+    baseSha: fx2021.baseSha,
+    headSha: head2021,
+    evidenceDir: fx2021.artifacts,
+  });
+  assert.equal(
+    res2021.status,
+    'passed',
+    `hyphen precedence in 2021 must not read underscore tables: ${JSON.stringify(res2021)}`,
+  );
+
+  // 2) Edition 2024 (direct or via edition.workspace = true) with underscore table -> blocked with unsupported-underscore-dependencies.
+  const fx2024 = await rustFixture(t);
+  await fx2024.put(
+    'crates/core/Cargo.toml',
+    [
+      '[package]',
+      'name = "core"',
+      'version = "0.1.0"',
+      'edition = "2024"',
+      '[dependencies]',
+      'game-contracts = { workspace = true }',
+      '[dev_dependencies]',
+      'proptest = { workspace = true }',
+    ].join('\n') + '\n',
+  );
+  const head2024 = fx2024.commit('edition 2024 underscore dev_dependencies');
+  const res2024 = await checkArchitecture({
+    project: fx2024.project,
+    baseSha: fx2024.baseSha,
+    headSha: head2024,
+    evidenceDir: fx2024.artifacts,
+  });
+  assert.equal(res2024.status, 'blocked');
+  assert.ok(
+    res2024.unsupported.some(
+      u => u.reason === 'unsupported-underscore-dependencies' && u.file === 'crates/core/Cargo.toml',
+    ),
+    `expected unsupported-underscore-dependencies in edition 2024, got ${JSON.stringify(res2024.unsupported)}`,
+  );
+
+  // 3) Inherited edition.workspace = true -> 2024 also blocks target.* build_dependencies.
+  await fx2024.put('Cargo.toml', `${defaultWorkspaceFiles()['Cargo.toml']}\n[workspace.package]\nedition = "2024"\n`);
+  await fx2024.put(
+    'crates/core/Cargo.toml',
+    [
+      '[package]',
+      'name = "core"',
+      'version = "0.1.0"',
+      'edition.workspace = true',
+      '[dependencies]',
+      'game-contracts = { workspace = true }',
+      "[target.'cfg(unix)'.build_dependencies]",
+      'serde = { workspace = true }',
+    ].join('\n') + '\n',
+  );
+  const headWs2024 = fx2024.commit('workspace edition 2024 target build_dependencies');
+  const resWs2024 = await checkArchitecture({
+    project: fx2024.project,
+    baseSha: fx2024.baseSha,
+    headSha: headWs2024,
+    evidenceDir: fx2024.artifacts,
+  });
+  assert.equal(resWs2024.status, 'blocked');
+  assert.ok(
+    resWs2024.unsupported.some(
+      u => u.reason === 'unsupported-underscore-dependencies' && u.file === 'crates/core/Cargo.toml',
+    ),
+    `expected unsupported-underscore-dependencies for inherited edition 2024, got ${JSON.stringify(resWs2024.unsupported)}`,
   );
 });

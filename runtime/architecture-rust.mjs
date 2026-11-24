@@ -204,6 +204,7 @@ export function parseCargoWorkspace({ files, contents }) {
   const crates = [];
   const crateByDir = new Map();
   const docs = new Map();
+  const editions = new Map();
   for (const member of resolved.members) {
     const crate = {
       name: member.name,
@@ -215,6 +216,7 @@ export function parseCargoWorkspace({ files, contents }) {
     crates.push(crate);
     crateByDir.set(member.root, crate);
     docs.set(member.name, member.doc);
+    editions.set(member.name, member.edition ?? '2015');
   }
   const sortedDirs = [...crateByDir.keys()].sort((a, b) => b.length - a.length || compare(a, b));
   for (const entry of files) {
@@ -226,7 +228,10 @@ export function parseCargoWorkspace({ files, contents }) {
   const edges = [];
   for (const crate of crates) {
     const doc = docs.get(crate.name);
-    for (const dep of collectManifestDependencies(doc)) {
+    for (const dep of collectManifestDependencies(doc, {
+      edition: editions.get(crate.name),
+      onUnsupported: reason => unknown('manifest', crate.manifest, reason),
+    })) {
       const edge = resolveDependencySpec({
         crate,
         dep,
