@@ -1318,3 +1318,105 @@ test('recordGateLesson rejects incomplete/failed/unbound receipts and real runEp
   assert.equal(js1Brief.verifiedLessons, undefined, 'packages/core must NOT receive crates/core lesson');
   assert.doesNotMatch(js1Brief.prompt, /allocation-free/);
 });
+
+test('nextWave issues integrator brief with dedicated role and roleInstructions for owner: integrator', async t => {
+  const temp = await realpath(await mkdtemp(path.join(os.tmpdir(), 'kodo-15d-integrator-')));
+  const project = path.join(temp, 'repo');
+  const home = path.join(temp, 'home');
+  await mkdir(project, { recursive: true });
+  git(project, 'init', '-b', 'main');
+  git(project, 'config', 'user.email', 'kodo@example.test');
+  git(project, 'config', 'user.name', 'Kodo Test');
+  await commit(
+    project,
+    {
+      'kodo.config.json': JSON.stringify({
+        schemaVersion: 1,
+        repository: 'fixture/Kodo',
+        client: 'codex',
+        baseBranch: 'main',
+        concurrency: 2,
+        repairRounds: 1,
+        researchBudget: 0,
+        commands: { test: [{ command: process.execPath, args: ['--test'] }], build: [], deploy: [], smoke: [] },
+        checks: [],
+        delivery: { enabled: false, release: false, firstVersion: '0.2.0' },
+      }),
+      'package.json': '{"name":"integ-demo","version":"1.0.0","type":"module"}\n',
+      'src/index.mjs': 'export const wired = false;\n',
+    },
+    'Init',
+  );
+  const store = new Store(home);
+  t.after(async () => {
+    store.close();
+    await rm(temp, { recursive: true, force: true });
+  });
+  const engine = new Engine({
+    store,
+    provider: {
+      discoverProviders: async () => [
+        { id: 'codex:gpt-6.1-sol', client: 'codex', model: 'gpt-6.1-sol', available: true },
+      ],
+    },
+  });
+  const repo = await openProjectStore({
+    store,
+    contracts,
+    authorizeTransition: createProjectTransitionAuthorizer({ store, engine, contracts }),
+  });
+  const crit = id => ({ id, text: `Criterion ${id}`, evidenceKinds: ['checks'] });
+  const created = await repo.apply({
+    schemaVersion: 1,
+    commandId: randomUUID(),
+    projectId: null,
+    expectedRevision: null,
+    actor: 'coordinator',
+    reason: 'Create integrator test project',
+    action: {
+      op: 'create',
+      spec: {
+        schemaVersion: 1,
+        id: 'integ-proj',
+        root: project,
+        title: 'Integrator brief test',
+        definitionOfDone: [crit('dod')],
+        constraints: ['Minimal shared wiring'],
+        businessContext: 'Test',
+        architectureRefs: [],
+        milestones: [{ id: 'm1', title: 'M1', acceptance: [crit('m1')], releaseRequired: false }],
+        epics: [{ id: 'e1', milestoneId: 'm1', title: 'E1', acceptance: [crit('e1')] }],
+        tasks: [
+          {
+            id: 'wire-root',
+            epicId: 'e1',
+            title: 'Wire shared entrypoint',
+            description: 'Export module entrypoints from src/index.mjs and package.json',
+            owner: 'integrator',
+            dependsOn: [],
+            writePaths: ['package.json', 'src/index.mjs'],
+            acceptance: [crit('wire-ok')],
+            interfaceRefs: [],
+            priority: 60,
+            userValue: 3,
+            risk: 1,
+            estimatedEffort: 1,
+            riskApprovalRequired: false,
+          },
+        ],
+        execution: { cadence: 'wave', integration: 'branch' },
+      },
+    },
+  });
+  const wave = await nextWave(
+    { repo, engine, store, contracts },
+    { projectId: created.projectId, host: 't3', limit: 1 },
+  );
+  assert.equal(wave.briefs.length, 1);
+  const brief = wave.briefs[0];
+  assert.equal(brief.role, 'integrator');
+  assert.match(brief.roleInstructions, /Role: integrator\./);
+  assert.match(brief.roleInstructions, /shared integration files/i);
+  assert.match(brief.roleInstructions, /minimal/i);
+  assert.match(brief.roleInstructions, /do not implement or rewrite module business logic/i);
+});

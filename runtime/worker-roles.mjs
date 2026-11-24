@@ -18,6 +18,12 @@ const ROLES = Object.freeze({
     'Keep the change minimal and focused; no drive-by cleanup outside the task.',
     'Handle errors explicitly and keep functions small and readable.',
   ],
+  integrator: [
+    'Role: integrator.',
+    'Wire completed modules together by editing only the assigned shared integration files (manifests, entrypoints, exports and routing tables).',
+    'Keep every change minimal and mechanical: do not implement or rewrite module business logic.',
+    'Verify the integrated wiring with targeted checks and leave existing module behaviour unchanged.',
+  ],
   'ui-qa': [
     'Role: UI quality.',
     'Verify and fix user-facing behaviour: layout at phone and desktop widths, keyboard access, focus order, labels and contrast.',
