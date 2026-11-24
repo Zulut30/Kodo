@@ -84,7 +84,7 @@ function transaction(db, mode, operation) {
   }
 }
 
-async function migrate(store) {
+async function migrate(store, skipMigration) {
   const db = store.db;
   requireValue(!db.isTransaction, 'transaction_active');
   requireValue(db.prepare('PRAGMA quick_check').get().quick_check === 'ok', 'database_corrupt');
@@ -105,8 +105,9 @@ async function migrate(store) {
         'database_corrupt',
       );
     }
-    if (current === migrations.length) return;
+    if (skipMigration || current === migrations.length) return;
   }
+  requireValue(!skipMigration, 'migration_unsupported');
   const location = db.location();
   requireValue(typeof location === 'string' && path.isAbsolute(location), 'database_invalid');
   // Node's SQLite backup API includes committed WAL pages. Never copy a live main file.
@@ -161,13 +162,14 @@ const gitGateRange = async ({ root, baseSha, headSha, mergeCommits }) =>
 /** Additive Project Director repository on the existing legacy Store connection.
  * `gateRange({ root, baseSha, headSha, mergeCommits })` (default: Git in the project root)
  * checks the commit range of a wave gate reservation before its transaction.
- * @param {{ store?: any, contracts?: any, authorizeTransition?: any,
+ * @param {{ store?: any, contracts?: any, authorizeTransition?: any, skipMigration?: boolean,
  *   gateRange?: (input: { root: string, baseSha: string, headSha: string, mergeCommits: string[] }) => Promise<boolean> }} [options]
  */
 export async function openProjectStore({
   store,
   contracts,
   authorizeTransition,
+  skipMigration = false,
   gateRange: range = gitGateRange,
 } = {}) {
   requireValue(store?.db && typeof store.createRun === 'function', 'store_invalid');
@@ -202,7 +204,7 @@ export async function openProjectStore({
   let validationBytes = 0,
     validationSecrets = structuredClone(store.secrets || {});
 
-  await migrate(store);
+  await migrate(store, skipMigration);
   const ctx = {
     store,
     contracts,
@@ -258,7 +260,13 @@ function readProfile(ctx, id) {
   get(ctx, id, 'project', id);
   const row = ctx.db.prepare('SELECT body FROM kodo_project_profiles WHERE project_id=?').get(id);
   refreshValidationContext(ctx);
-  return row ? validateExecutionProfile(JSON.parse(row.body), ctx.options) : null;
+  if (!row) return null;
+  try {
+    return validateExecutionProfile(JSON.parse(row.body), ctx.options);
+  } catch (error) {
+    if (error?.code === 'project_unsafe') throw error;
+    fail('database_corrupt');
+  }
 }
 function writeProfile(ctx, id, profile) {
   requireValue(isWave(ctx, get(ctx, id, 'project', id)), 'wave_required');

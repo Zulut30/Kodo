@@ -46,7 +46,8 @@ export function validateExecutionProfile(profile, options = { knownValues: [] })
         ['local', 't3-env', 'ssh'].includes(machine.kind) &&
         count(machine.maxWorkers) &&
         Number.isSafeInteger(machine.maxHeavyBuilds) &&
-        machine.maxHeavyBuilds >= 1,
+        machine.maxHeavyBuilds >= 1 &&
+        machine.maxHeavyBuilds <= machine.maxWorkers,
     );
     check(machine.environmentId === undefined || label(machine.environmentId));
   }
@@ -64,6 +65,46 @@ export function waveCapacity(profile, now) {
   return profile ? Math.min(total(active(profile, now), 'slots'), total(profile.machines, 'maxWorkers')) : 5;
 }
 
+function remaining(rows, key, kind, occupied) {
+  return rows.reduce(
+    (sum, row) => sum + Math.max(0, row[key] - occupied.filter(p => p?.[kind]?.id === row.id).length),
+    0,
+  );
+}
+
+export function freeWorkerSlots(profile, now, occupied) {
+  const pools = active(profile, now);
+  const subscriptions = remaining(pools, 'slots', 'subscription', occupied);
+  const machines = remaining(profile.machines, 'maxWorkers', 'machine', occupied);
+  const unknown = occupied.filter(
+    p =>
+      !profile.subscriptions.some(s => s.id === p?.subscription?.id) ||
+      !profile.machines.some(m => m.id === p?.machine?.id),
+  ).length;
+  return Math.max(0, Math.min(subscriptions, machines) - unknown);
+}
+
+// Charge this host's replayed briefs only against resources that can still serve
+// the batch. Shrinking a pool below occupancy must leave sibling pools usable.
+export function chargedBriefs(profile, now, briefs) {
+  const pools = active(profile, now);
+  const used = new Map(),
+    hosts = new Map();
+  let count = 0;
+  for (const brief of briefs) {
+    const pool = pools.find(s => s.id === brief.subscription?.id);
+    const host = profile.machines.find(m => m.id === brief.machine?.id);
+    if (!pool || !host) continue;
+    const p = used.get(pool.id) ?? 0,
+      m = hosts.get(host.id) ?? 0;
+    if (p >= pool.slots || m >= host.maxWorkers) continue;
+    used.set(pool.id, p + 1);
+    hosts.set(host.id, m + 1);
+    count++;
+  }
+  return count;
+}
+
 // Existing attempts keep their original placement. Unassigned attempts (e.g. native runs)
 // still consume global capacity; a paused pool receives no new assignments.
 export function assignWorker(profile, now, occupied, tiers) {
@@ -79,4 +120,5 @@ export function assignWorker(profile, now, occupied, tiers) {
     machine: { id: host.id, kind: host.kind, ...(host.environmentId && { environmentId: host.environmentId }) },
   };
 }
-export const waveHorizon = limit => Math.min(128, Math.max(24, limit * 2));
+export const waveHorizon = (remaining, occupied = 0, windowSize = 0) =>
+  Math.min(128, Math.max(24, 2 * Math.max(windowSize, remaining + occupied)));

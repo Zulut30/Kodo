@@ -613,9 +613,10 @@ test('A repeated drain after a crash mid-wave never duplicates merges', { timeou
 test('drain refuses a legacy project and invalid bounds', async t => {
   const f = await fixture(t, { tasks: [task('alpha')], execution: null });
   await assert.rejects(f.director.drain(f.id), { code: 'project_wave_not_enabled' });
+  await assert.rejects(f.director.drain(f.id, { concurrency: 8 }), { code: 'project_wave_not_enabled' });
   const ctx = createWaveContext({ repo: f.repo, engine: f.engine });
   assert.equal(ctx.store, f.store);
-  for (const options of [{ maxWaves: 0 }, { maxWaves: 101 }, { concurrency: 6 }, { concurrency: 1.5 }])
+  for (const options of [{ maxWaves: 0 }, { maxWaves: 101 }, { concurrency: 65 }, { concurrency: 1.5 }])
     await assert.rejects(f.director.drain(f.id, options), { code: 'project_drain_invalid' });
 });
 
@@ -823,3 +824,48 @@ test(
     assert.equal(gates[1].headSha, moved);
   },
 );
+
+const reviewProfile = workers => ({
+  subscriptions: [{ id: 'p', provider: 'codex', model: 'gpt', tier: 'standard', slots: workers }],
+  machines: [{ id: 'pc', kind: 'local', maxWorkers: workers, maxHeavyBuilds: 1 }],
+});
+test('A3 recovering native reservations respects external occupancy, including zero vacancies', async t => {
+  const ids = ['e-one', 'e-two', 'e-three', 'n-one', 'n-two'];
+  const f = await fixture(t, { tasks: ids.map(id => task(id)) });
+  for (const id of ids) {
+    await f.repo.apply(
+      f.command(f.repo.snapshot(f.id), { op: 'transition', kind: 'task', id, to: 'ready', evidence: [], mappings: [] }),
+    );
+    await f.repo.apply({
+      ...f.command(f.repo.snapshot(f.id), { op: 'reserveAttempt', taskId: id, retryFailed: false }),
+      actor: id.startsWith('n-') ? 'project-director' : 'project-external:t3',
+    });
+  }
+  f.repo.setProfile(f.id, reviewProfile(3));
+  const wait = await f.director.drain(f.id, { concurrency: 3, maxWaves: 1 });
+  assert.deepEqual([wait.status, wait.waves, f.calls.worker.length], ['waiting_limits', 0, 0]);
+  f.repo.setProfile(f.id, reviewProfile(4));
+  const partial = await f.director.drain(f.id, { concurrency: 4, maxWaves: 1 });
+  assert.equal(partial.waves, 1);
+  assert.equal(f.calls.worker.length, 1);
+});
+test('A8 pause during a native wave takes effect on the next iteration; A5 resume waits', async t => {
+  const { projectCli } = await import('../runtime/project-cli.mjs');
+  let paused;
+  const f = await fixture(t, {
+    tasks: [task('alpha'), task('beta')],
+    hooks: {
+      onWorker: async () => {
+        paused = await projectCli(
+          ['profile', 'pause-pool', f.id, '--subscription', 'p', '--until', '2099-01-01T00:00:00Z'],
+          { home: f.home, secrets: {} },
+        );
+      },
+    },
+  });
+  f.repo.setProfile(f.id, reviewProfile(1));
+  const result = await f.director.drain(f.id, { concurrency: 1 });
+  assert.equal(paused.exitCode, 0, paused.output);
+  assert.deepEqual([result.status, result.waves, f.calls.worker.length], ['waiting_limits', 1, 1]);
+  assert.equal((await f.director.resume(f.id)).status, 'waiting_limits');
+});

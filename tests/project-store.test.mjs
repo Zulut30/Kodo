@@ -1019,3 +1019,19 @@ test('Opening a v1 database applies only the profile migration and preserves exi
     ),
   );
 });
+
+test('A9 corrupt stored profile is distinguished from unsafe data', async t => {
+  const f = await fixture(t, { secrets: { fixture: 'hiddenfixturevalue' } });
+  const { repo, store } = await f.open();
+  const {
+    result: { projectId },
+  } = await create(repo, f.project);
+  for (const [body, code] of [
+    ['{', 'project_database_corrupt'],
+    ['{}', 'project_database_corrupt'],
+    ['{"id":"hiddenfixturevalue"}', 'project_unsafe'],
+  ]) {
+    store.db.prepare('INSERT OR REPLACE INTO kodo_project_profiles VALUES(?,?)').run(projectId, body);
+    assert.throws(() => repo.getProfile(projectId), { code });
+  }
+});

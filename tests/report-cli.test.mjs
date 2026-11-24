@@ -956,3 +956,22 @@ test('the text report shows a stage whose only saved attempt has no duration', a
   assert.equal(exitCode, 0, output);
   assert.match(output, /planning: unknown \(0\/unknown known; unknown sessions; session-attempts\)/);
 });
+
+test('A11 project reports read v2 and legacy v1 without changing either database', async t => {
+  const f = await fixture(t);
+  for (const version of [2, 1]) {
+    const db = new DatabaseSync(path.join(f.home, 'state.sqlite'));
+    try {
+      if (version === 1)
+        db.exec('DROP TABLE kodo_project_profiles;DELETE FROM kodo_project_migrations WHERE version=2');
+      assert.equal(db.prepare('SELECT MAX(version) AS v FROM kodo_project_migrations').get().v, version);
+    } finally {
+      db.close();
+    }
+    const before = inventory(f.home);
+    const result = await reportCli(['--project', f.projectId, '--json'], { home: f.home, secrets: {} });
+    assert.equal(result.exitCode, 0, result.output);
+    assert.equal(result.report.projectId, f.projectId);
+    assert.deepEqual(inventory(f.home), before);
+  }
+});

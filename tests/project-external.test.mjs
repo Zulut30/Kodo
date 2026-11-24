@@ -838,7 +838,7 @@ test('next-wave names a pending epic gate and answers an accepted project with i
     Object.create(f.repo, {
       snapshot: { value: id => ({ ...real(id), project: { ...real(id).project, status, paused } }) },
     });
-  const accepted = await nextWave({ ...f.ctx, repo: as('accepted') }, { projectId: f.projectId, host: 't3' });
+  const accepted = await nextWave({ ...f.ctx, repo: as('accepted') }, { projectId: f.projectId, host: 't3', limit: 8 });
   assert.deepEqual(accepted, {
     projectId: f.projectId,
     revision: real(f.projectId).revision,
@@ -1201,7 +1201,7 @@ test('next-wave and complete-task require a pull host, a bound limit and a wave 
   const f = await fixture(t, { wave: false });
   for (const [input, code] of [
     [{ host: 'codex' }, 'project_host_unsupported'],
-    [{ limit: 6 }, 'project_limit_invalid'],
+    [{ limit: 6 }, 'project_wave_required'],
     [{ limit: 0 }, 'project_limit_invalid'],
     [{}, 'project_wave_required'],
   ])
@@ -1287,4 +1287,62 @@ test('Profile fills eight slots across hosts and refills a completed slot before
     ['task-8'],
   );
   assert.equal(next.briefs[0].subscription.id, 'deep');
+});
+
+test('A1 A5 paused or oversubscribed assignments leave the other pool usable', async t => {
+  const f = await fixture(t, {
+    edit(spec) {
+      spec.tasks = Array.from({ length: 8 }, (_, i) => taskSpec('t-' + i));
+    },
+  });
+  const profile = {
+    subscriptions: ['a', 'b'].map(id => ({ id, slots: 4, provider: 'codex', model: 'gpt', tier: 'fast' })),
+    machines: [{ id: 'pc', kind: 'local', maxWorkers: 8, maxHeavyBuilds: 1 }],
+  };
+  f.repo.setProfile(f.projectId, profile);
+  const first = await f.wave({ limit: 4 });
+  assert.equal(first.briefs.length, 4);
+  assert.ok(first.briefs.every(b => b.subscription.id === 'a'));
+  profile.subscriptions[0].slots = 1;
+  f.repo.setProfile(f.projectId, profile);
+  const shrink = await f.wave({ limit: 8 });
+  assert.equal(shrink.briefs.filter(b => b.subscription.id === 'b').length, 4);
+  f.repo.pausePool(f.projectId, 'a', '2099-01-01T00:00:00Z');
+  f.repo.pausePool(f.projectId, 'b', '2099-01-01T00:00:00Z');
+  const replay = await f.wave({ limit: 8 });
+  assert.equal(replay.code, 'waiting_limits');
+  assert.equal(replay.briefs.length, 8);
+});
+test('A1 paused busy pool does not consume the active batch limit', async t => {
+  const f = await fixture(t);
+  const profile = {
+    subscriptions: ['a', 'b'].map(id => ({ id, slots: 1, provider: 'codex', model: 'gpt', tier: 'fast' })),
+    machines: [{ id: 'pc', kind: 'local', maxWorkers: 2, maxHeavyBuilds: 1 }],
+  };
+  f.repo.setProfile(f.projectId, profile);
+  assert.equal((await f.wave({ limit: 1 })).briefs[0].subscription.id, 'a');
+  f.repo.pausePool(f.projectId, 'a', '2099-01-01T00:00:00Z');
+  const result = await f.wave({ limit: 1 });
+  assert.deepEqual(
+    result.briefs.map(b => b.subscription.id),
+    ['a', 'b'],
+  );
+});
+test('A7 abandoned critical root is assigned heavy on retry', async t => {
+  const f = await fixture(t, {
+    edit(spec) {
+      spec.tasks = [
+        taskSpec('root'),
+        taskSpec('middle', { dependsOn: ['root'] }),
+        taskSpec('leaf', { dependsOn: ['middle'] }),
+      ];
+    },
+  });
+  f.repo.setProfile(f.projectId, {
+    subscriptions: ['standard', 'heavy'].map(tier => ({ id: tier, slots: 1, provider: 'codex', model: 'gpt', tier })),
+    machines: [{ id: 'pc', kind: 'local', maxWorkers: 2, maxHeavyBuilds: 1 }],
+  });
+  const [a] = (await f.wave({ limit: 1 })).briefs;
+  await f.complete('root', a.baseSha, { abandon: true, attemptId: a.attemptId });
+  assert.equal((await f.wave({ limit: 1, retryFailed: true })).briefs[0].subscription.tier, 'heavy');
 });

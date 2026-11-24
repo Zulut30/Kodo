@@ -131,7 +131,21 @@ test('Project drain reports a blocked wave project and refuses a legacy one with
     }),
   );
   assert.equal((await projectCli(['profile', 'set', waveId, '--file', file], ports)).exitCode, 0);
-  assert.equal((await drainEight()).report.result.code, 'risk_approval_required');
+  assert.equal(
+    (await projectCli(['drain', waveId, '--concurrency', '64', '--json'], ports)).report.result.code,
+    'risk_approval_required',
+  );
+  assert.equal(
+    (
+      await projectCli(
+        ['profile', 'pause-pool', waveId, '--subscription', 'a', '--until', '2099-01-01T00:00:00Z'],
+        ports,
+      )
+    ).exitCode,
+    0,
+  );
+  assert.equal((await drainEight()).report.result.status, 'waiting_limits');
+  assert.equal((await projectCli(['resume', waveId, '--json'], ports)).report.result.status, 'waiting_limits');
   const legacyId = await create('legacy');
   const legacy = await projectCli(['drain', legacyId, '--json'], ports);
   assert.equal(legacy.exitCode, 2);

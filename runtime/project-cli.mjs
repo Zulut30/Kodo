@@ -140,7 +140,7 @@ async function readProjectInput(options, contracts, secrets, safety) {
 
 function profileOperation(store, repo, { action, projectId, flags }, input) {
   if (action === 'show') return repo.getProfile(projectId);
-  const lease = store.acquireLease('project:' + projectId, randomUUID(), { ttlMs: 60000, limit: 1 });
+  const lease = store.acquireLease('project-profile:' + projectId, randomUUID(), { ttlMs: 60000, limit: 1 });
   if (!lease) throw Object.assign(new Error('Project busy'), { code: 'project_busy' });
   try {
     return action === 'set'
@@ -173,7 +173,14 @@ function projectFailure(error, phase, action) {
     result: {
       status: exitCode === 1 ? 'invalid' : 'blocked',
       code:
-        profile && ['project_busy', 'project_profile_invalid', 'project_wave_required'].includes(error?.code)
+        profile &&
+        [
+          'project_busy',
+          'project_profile_invalid',
+          'project_wave_required',
+          'project_database_corrupt',
+          'project_unsafe',
+        ].includes(error?.code)
           ? error.code
           : argumentError
             ? 'project_arguments'

@@ -187,7 +187,7 @@ test('Project CLI delegates next-wave and complete-task to the pull protocol', a
       .cooldownUntil,
     until,
   );
-  assert.equal((await pullLarge()).report.result.code, 'project_limit_invalid');
+  assert.equal((await pullLarge()).report.result.code, 'waiting_limits');
   assert.equal((await profileCli('set', '--file', file)).exitCode, 0);
   assert.match((await projectCli(['--help'])).output, /profile pause-pool/);
   const selected = [];

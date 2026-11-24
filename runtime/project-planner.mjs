@@ -1,19 +1,53 @@
 import { dependencySatisfied } from './project-contracts.mjs';
 
-export function waveRanks(tasks) {
-  const children = new Map(tasks.map(t => [t.id, []]));
-  for (const task of tasks) for (const dep of task.dependsOn) children.get(dep).push(task.id);
-  const ranks = new Map();
-  function rank(id) {
-    if (!ranks.has(id)) {
-      const successors = children.get(id);
-      const depth = successors.reduce((n, child) => Math.max(n, 1 + rank(child).depth), 0);
-      ranks.set(id, { depth, children: successors.length });
+function dependencyGraph(tasks, byId) {
+  const globalReasons = [];
+  const children = new Map(tasks.map(task => [task.id, []]));
+  const incoming = new Map(tasks.map(task => [task.id, task.dependsOn.length]));
+  for (const task of tasks) {
+    if (new Set(task.dependsOn).size !== task.dependsOn.length) globalReasons.push('dependency_duplicate:' + task.id);
+    for (const id of task.dependsOn) {
+      if (!byId.has(id)) globalReasons.push('dependency_missing:' + id);
+      else children.get(id).push(task.id);
     }
-    return ranks.get(id);
   }
-  for (const task of tasks) rank(task.id);
+  if (globalReasons.length) return { children, topological: [], reasons: globalReasons.sort(compareId) };
+  const topological = tasks.filter(task => incoming.get(task.id) === 0).map(task => task.id);
+  for (let index = 0; index < topological.length; index++) {
+    for (const id of children.get(topological[index])) {
+      incoming.set(id, incoming.get(id) - 1);
+      if (incoming.get(id) === 0) topological.push(id);
+    }
+  }
+  if (topological.length !== tasks.length) globalReasons.push('dependency_cycle');
+  return { children, topological, reasons: globalReasons };
+}
+function ranksOf(byId, { children, topological }) {
+  const ranks = new Map();
+  for (let i = topological.length - 1; i >= 0; i--) {
+    const id = topological[i];
+    if (byId.get(id).status === 'cancelled') continue;
+    let depth = 0,
+      count = 0;
+    for (const child of children.get(id)) {
+      const rank = ranks.get(child);
+      if (!rank) continue;
+      count++;
+      depth = Math.max(depth, 1 + rank.depth);
+    }
+    ranks.set(id, { depth, children: count });
+  }
   return ranks;
+}
+
+export function waveRanks(tasks) {
+  const byId = new Map(tasks.map(t => [t.id, t]));
+  const graph = dependencyGraph(tasks, byId);
+  if (graph.reasons.length) {
+    const reason = graph.reasons[0];
+    throw Object.assign(new Error(reason), { code: 'project_' + reason.split(':')[0] });
+  }
+  return ranksOf(byId, graph);
 }
 
 const sets = ['milestones', 'epics', 'tasks', 'currentAttempts', 'riskApprovals'];
@@ -164,24 +198,9 @@ export function planProjectHorizon(input, ports) {
 
   // Kahn ordering validates the complete graph before any task is considered.
   // Iteration is bounded by the complete <=1000-task snapshot, never a query.
-  const children = new Map(tasks.map(task => [task.id, []]));
-  const incoming = new Map(tasks.map(task => [task.id, task.dependsOn.length]));
-  for (const task of tasks) {
-    if (new Set(task.dependsOn).size !== task.dependsOn.length) globalReasons.push('dependency_duplicate:' + task.id);
-    for (const id of task.dependsOn) {
-      if (!byId.has(id)) globalReasons.push('dependency_missing:' + id);
-      else children.get(id).push(task.id);
-    }
-  }
-  if (globalReasons.length) return allBlocked(globalReasons.sort(compareId));
-  const topological = tasks.filter(task => incoming.get(task.id) === 0).map(task => task.id);
-  for (let index = 0; index < topological.length; index++) {
-    for (const id of children.get(topological[index])) {
-      incoming.set(id, incoming.get(id) - 1);
-      if (incoming.get(id) === 0) topological.push(id);
-    }
-  }
-  if (topological.length !== tasks.length) return allBlocked(['dependency_cycle']);
+  const graph = dependencyGraph(tasks, byId);
+  if (graph.reasons.length) return allBlocked(graph.reasons);
+  const { children, topological } = graph;
   const path = new Map(),
     unaccepted = new Map();
   for (const id of topological) {
@@ -197,14 +216,19 @@ export function planProjectHorizon(input, ports) {
   }
   for (const id of [...topological].reverse()) {
     let downstream = 0n;
-    for (const child of children.get(id)) if (path.get(child) > downstream) downstream = path.get(child);
+    for (const child of children.get(id))
+      if (
+        !(project.execution?.cadence === 'wave' && byId.get(child).status === 'cancelled') &&
+        path.get(child) > downstream
+      )
+        downstream = path.get(child);
     // Individual efforts are safe integers; a whole path can exceed that range.
     path.set(
       id,
       (dependencySatisfied(project, byId.get(id).status) ? 0n : BigInt(byId.get(id).estimatedEffort)) + downstream,
     );
   }
-  const ranks = project.execution?.cadence === 'wave' ? waveRanks(tasks) : new Map();
+  const ranks = project.execution?.cadence === 'wave' ? ranksOf(byId, graph) : new Map();
   for (const task of tasks) if (!['proposed', 'ready'].includes(task.status)) ranks.delete(task.id);
   const ranked = [...tasks].sort(
     (a, b) =>

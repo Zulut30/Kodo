@@ -40,7 +40,14 @@ import { runEpicGate, verifyTaskFastOnce } from './wave-verifier.mjs';
 import { workerRole } from './worker-roles.mjs';
 import { applyWavePolicy } from './wave-policy.mjs';
 import { DEFAULT_CLI, assertCliPrefix, quotePath } from './cli-command.mjs';
-import { assignWorker, waveCapacity, waveHorizon, MAX_WORKERS } from './execution-profile.mjs';
+import {
+  chargedBriefs,
+  freeWorkerSlots,
+  assignWorker,
+  waveCapacity,
+  waveHorizon,
+  MAX_WORKERS,
+} from './execution-profile.mjs';
 import { planProjectHorizon, waveRanks } from './project-planner.mjs';
 
 /** The largest batch one `nextWave` call returns. */
@@ -174,7 +181,7 @@ async function installExternalRun(state, attempt, task) {
       installRun: async value => {
         // External chats implement; Kodo only verifies once (task-fast) and never delivers.
         if (state.profile) {
-          const placement = placementFor(state, task);
+          const placement = placementFor(state, task, attempt.id);
           need(placement, 'pool_unavailable');
           value.runDraft.workerPlacement = placement;
         }
@@ -292,10 +299,7 @@ function initializePlacements(state) {
   if (!state.profile) return;
   const { tasks, currentAttempts } = state.snapshot;
   state.ranks = waveRanks(tasks);
-  state.maxDepth = Math.max(
-    0,
-    ...tasks.filter(t => ['ready', 'proposed'].includes(t.status)).map(t => state.ranks.get(t.id).depth),
-  );
+  state.maxDepth = Math.max(0, ...tasks.filter(openTask).map(t => state.ranks.get(t.id).depth));
   state.placements = new Map();
   for (const attempt of currentAttempts) {
     if (inFlightStates.has(attempt.status))
@@ -303,27 +307,29 @@ function initializePlacements(state) {
   }
 }
 
-function placementFor(state, task) {
+function placementFor(state, task, reservationId = null) {
   const { snapshot, ranks } = state;
   const depth = ranks.get(task.id).depth;
   const foundation = snapshot.epics.some(
     e => e.id === task.epicId && (e.id === 'foundation' || e.milestoneId === 'foundation'),
   );
-  const heavy = foundation || (depth > 0 && depth === state.maxDepth);
+  const heavy = foundation || (depth > 0 && depth >= state.maxDepth);
   const tiers = heavy
     ? ['heavy', 'standard', 'fast']
     : depth
       ? ['standard', 'heavy', 'fast']
       : ['fast', 'standard', 'heavy'];
-  return assignWorker(state.profile, state.now, [...state.placements.values()], tiers);
+  const occupied = [...state.placements].filter(([id]) => id !== reservationId).map(([, placement]) => placement);
+  if (!freeWorkerSlots(state.profile, state.now, occupied)) return null;
+  return assignWorker(state.profile, state.now, occupied, tiers);
 }
 function freeSlots(state) {
-  const batchRemaining = state.limit - state.briefs.length;
-  return state.profile ? Math.min(batchRemaining, state.maximum - state.inFlight.size) : batchRemaining;
+  if (!state.profile) return state.limit - state.briefs.length;
+  const batch = state.limit - chargedBriefs(state.profile, state.now, state.briefs);
+  return Math.min(batch, freeWorkerSlots(state.profile, state.now, [...state.placements.values()]));
 }
 async function reserve(state, task, retryFailed) {
   if (freeSlots(state) <= 0) return;
-  if (state.profile && !placementFor(state, task)) return;
   const reason =
     admissible(state, task) ?? ((await interfacesVerified(state, task)) ? null : 'project_interface_unverified');
   if (reason) {
@@ -345,6 +351,7 @@ async function reserve(state, task, retryFailed) {
       ),
     );
     state.inFlight.add(task.id);
+    state.placements?.set(attempt.id, undefined);
     state.snapshot = await snapshotOf(ctx, task.projectId);
     await prepareAttempt(state, attempt);
   });
@@ -388,7 +395,7 @@ async function reserveSelected(state, ports) {
   const availability = await waves.waveAvailability(state.ctx, state.snapshot);
   state.availability = { revision: state.snapshot.revision, rows: availability };
   const selected = W.selectWave(state.snapshot, {
-    ...(state.profile && { profiledWave: true }),
+    ...(state.profile && { profiledWave: true, windowSize: state.maximum }),
     limit: remaining,
     inFlight: [...state.inFlight],
     availability,
@@ -479,7 +486,7 @@ async function explainWave(state, snapshot) {
   const horizon = planProjectHorizon(
     {
       snapshot,
-      limit: state.profile ? waveHorizon(state.limit) : 24,
+      limit: state.profile ? waveHorizon(Math.max(0, freeSlots(state)), state.inFlight.size, state.maximum) : 24,
       profiledWave: Boolean(state.profile),
       availability: await explanationAvailability(state, snapshot),
       now: (ctx.clock ?? (() => new Date().toISOString()))(),
@@ -525,13 +532,6 @@ export async function nextWave(ctx, input) {
   const options = { knownValues: known(ctx.engine) };
   C.assertDirectorSafe(cli, options);
   const snapshot = await snapshotOf(ctx, projectId);
-  if (input.limit !== undefined) {
-    const maximum = waveCapacity(
-      ctx.repo.getProfile(projectId),
-      Date.parse((ctx.clock ?? (() => new Date().toISOString()))()),
-    );
-    need(input.limit <= maximum, 'limit_invalid');
-  }
   need(C.isWaveProject(snapshot.project), 'wave_required');
   // An accepted project has nothing left to hand out (and needs no worktree): its own code,
   // never a pause or a stop.
@@ -558,8 +558,8 @@ export async function nextWave(ctx, input) {
     const now = Date.parse((ctx.clock ?? (() => new Date().toISOString()))());
     const profile = ctx.repo.getProfile(projectId);
     const maximum = waveCapacity(profile, now);
-    const limit = input.limit ?? Math.min(3, maximum);
-    need(limit <= maximum, 'limit_invalid');
+    need(profile || (input.limit ?? 3) <= maximum, 'limit_invalid');
+    const limit = Math.min(input.limit ?? 3, maximum);
     const integration = await ensureIntegration({
       root: snapshot.project.root,
       projectId,
@@ -590,7 +590,14 @@ export async function nextWave(ctx, input) {
     const final = await snapshotOf(ctx, projectId);
     await explainWave(state, final);
     const revision = final.revision;
-    const result = { projectId, revision, cli, briefs: state.briefs, blocked: state.blocked };
+    const result = {
+      projectId,
+      revision,
+      cli,
+      briefs: state.briefs,
+      blocked: state.blocked,
+      ...(!maximum && { code: 'waiting_limits' }),
+    };
     C.assertDirectorSafe(result, options);
     return result;
   } finally {

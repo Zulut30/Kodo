@@ -14,6 +14,10 @@ const flagsFor = {
 };
 // Constant codes of the protocol itself; never data, paths or provider output.
 const reported = new Set([
+  'project_dependency_cycle',
+  'project_dependency_missing',
+  'project_dependency_duplicate',
+  'project_database_corrupt',
   'project_wave_required',
   'project_host_unsupported',
   'project_limit_invalid',
