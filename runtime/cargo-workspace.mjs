@@ -349,35 +349,32 @@ function parseManifestEntry(raw) {
   }
 }
 
-function findWorkspaceRoot(startDir, manifestDirs, parsedCache) {
+function findCandidateRoots(startDir, manifestDirs, parsedCache) {
   const chain = ancestorsOf(startDir);
-  let fallbackPackageDir = null;
+  let workspaceCandidate = null;
+  let packageCandidate = null;
   for (const dir of chain) {
     if (!manifestDirs.has(dir)) continue;
     const entry = parsedCache(dir);
     if (entry.error) {
-      if (dir === startDir || dir === '') return { rootDir: dir, entry };
+      if (dir === startDir || dir === '') return { workspaceCandidate: { rootDir: dir, entry }, packageCandidate };
       continue;
     }
-    if (isPlainObject(entry.doc.workspace)) return { rootDir: dir, entry };
-    if (fallbackPackageDir === null && isPlainObject(entry.doc.package)) fallbackPackageDir = { rootDir: dir, entry };
+    if (isPlainObject(entry.doc.workspace) && workspaceCandidate === null) {
+      workspaceCandidate = { rootDir: dir, entry };
+    }
+    if (isPlainObject(entry.doc.package) && packageCandidate === null) {
+      packageCandidate = { rootDir: dir, entry };
+    }
+    if (workspaceCandidate !== null) break;
   }
-  if (fallbackPackageDir) return fallbackPackageDir;
-  return { rootDir: startDir, entry: manifestDirs.has(startDir) ? parsedCache(startDir) : { error: 'missing' } };
+  return { workspaceCandidate, packageCandidate };
 }
 
-function hasNestedWorkspaceBoundary(rootDir, candidateDir, manifestDirs, parsedCache) {
-  if (candidateDir === rootDir) return false;
-  let current = candidateDir;
-  while (current && current !== rootDir) {
-    if (manifestDirs.has(current)) {
-      const parsed = parsedCache(current);
-      if (!parsed.error && isPlainObject(parsed.doc.workspace)) return true;
-    }
-    const slash = current.lastIndexOf('/');
-    current = slash === -1 ? '' : current.slice(0, slash);
-  }
-  return false;
+function isNestedWorkspaceRoot(rootDir, candidateDir, manifestDirs, parsedCache) {
+  if (candidateDir === rootDir || !manifestDirs.has(candidateDir)) return false;
+  const parsed = parsedCache(candidateDir);
+  return !parsed.error && isPlainObject(parsed.doc.workspace);
 }
 
 function parseExcludePrefixes(workspace, rootDir, rootManifest, unknown) {
@@ -428,7 +425,7 @@ function collectDeclaredMembers({
         unknown('workspace', rootManifest, 'missing-workspace-member');
         continue;
       }
-      if (memberDir !== rootDir && hasNestedWorkspaceBoundary(rootDir, memberDir, manifestDirs, parsedCache)) {
+      if (isNestedWorkspaceRoot(rootDir, memberDir, manifestDirs, parsedCache)) {
         unknown('workspace', `${memberDir}/Cargo.toml`, 'nested-workspace-root');
         continue;
       }
@@ -460,7 +457,7 @@ function collectDeclaredMembers({
         unknown('workspace', joinRel(dir, 'Cargo.toml'), 'member-without-manifest');
         continue;
       }
-      if (dir !== rootDir && hasNestedWorkspaceBoundary(rootDir, dir, manifestDirs, parsedCache)) {
+      if (isNestedWorkspaceRoot(rootDir, dir, manifestDirs, parsedCache)) {
         unknown('workspace', `${dir}/Cargo.toml`, 'nested-workspace-root');
         continue;
       }
@@ -506,10 +503,8 @@ function expandPathMembers({
     for (const dep of collectManifestDependencies(parsed.doc, { edition: edition ?? '2015' })) {
       const targetDir = resolveDepTargetDir(dep, dir, rootDir, workspaceDependencies);
       if (targetDir === null || !manifestDirs.has(targetDir) || isExcluded(targetDir)) continue;
-      if (targetDir !== rootDir && hasNestedWorkspaceBoundary(rootDir, targetDir, manifestDirs, parsedCache)) {
-        const targetEntry = parsedCache(targetDir);
-        if (!targetEntry.error && isPlainObject(targetEntry.doc.workspace))
-          unknown('workspace', `${targetDir}/Cargo.toml`, 'nested-workspace-root');
+      if (isNestedWorkspaceRoot(rootDir, targetDir, manifestDirs, parsedCache)) {
+        unknown('workspace', `${targetDir}/Cargo.toml`, 'nested-workspace-root');
         continue;
       }
       if (!visited.has(targetDir)) {
@@ -582,46 +577,29 @@ function collectSnapshotEntries(rawMap, files) {
   return { snapshotDirs, snapshotFiles };
 }
 
-/**
- * Resolve a Cargo workspace offline using Cargo's member/exclude/path-dependency rules.
- * @param {{ manifests: Map<string, Buffer | string> | Record<string, Buffer | string>, files?: Array<string | { path: string }>, startDir?: string }} input
- */
-export function resolveCargoWorkspace({ manifests, files, startDir = '' }) {
-  const rawMap = toManifestMap(manifests);
-  const { snapshotDirs, snapshotFiles } = collectSnapshotEntries(rawMap, files);
-  const manifestDirs = new Map();
-  for (const manifestPath of rawMap.keys()) {
-    const normalized = manifestPath.replaceAll('\\', '/');
-    if (normalized === 'Cargo.toml' || normalized.endsWith('/Cargo.toml')) {
-      const dir = path.posix.dirname(normalized);
-      manifestDirs.set(dir === '.' ? '' : dir, manifestPath);
-    }
-  }
-  const cache = new Map();
-  const parsedCache = dir => {
-    if (cache.has(dir)) return cache.get(dir);
-    const key = manifestDirs.get(dir);
-    const parsed = parseManifestEntry(key !== undefined ? rawMap.get(key) : undefined);
-    cache.set(dir, parsed);
-    return parsed;
-  };
+function resolveWorkspaceAtRoot({ rootDir, rootEntry, manifestDirs, snapshotDirs, snapshotFiles, parsedCache }) {
   const unsupported = new Map();
   const unknown = (scope, file, reason, offset = null) => {
     const id = hash([scope, file, reason, offset]);
     unsupported.set(id, { id, scope, file, reason, offset });
   };
-
-  const cleanStart = normalizeWorkspacePath(startDir === '' ? '.' : startDir) ?? '';
-  const { rootDir, entry: rootEntry } = findWorkspaceRoot(cleanStart, manifestDirs, parsedCache);
   const rootManifest = rootDir ? `${rootDir}/Cargo.toml` : 'Cargo.toml';
 
   if (rootEntry.error === 'missing') {
     unknown('workspace', rootManifest, 'missing-cargo-workspace');
-    return emptyWorkspaceResult(rootDir, rootManifest, null, null, unsupported);
+    return {
+      result: emptyWorkspaceResult(rootDir, rootManifest, null, null, unsupported),
+      selected: new Set(),
+      isExcluded: () => false,
+    };
   }
   if (rootEntry.error) {
     unknown('manifest', rootManifest, 'parse-error', 0);
-    return emptyWorkspaceResult(rootDir, rootManifest, rootEntry.hash ?? null, null, unsupported);
+    return {
+      result: emptyWorkspaceResult(rootDir, rootManifest, rootEntry.hash ?? null, null, unsupported),
+      selected: new Set(),
+      isExcluded: () => false,
+    };
   }
 
   const rootDoc = rootEntry.doc;
@@ -631,7 +609,11 @@ export function resolveCargoWorkspace({ manifests, files, startDir = '' }) {
 
   if (!hasWorkspace && !hasRootPackage) {
     unknown('workspace', rootManifest, 'missing-cargo-workspace');
-    return emptyWorkspaceResult(rootDir, rootManifest, rootManifestHash, rootDoc, unsupported);
+    return {
+      result: emptyWorkspaceResult(rootDir, rootManifest, rootManifestHash, rootDoc, unsupported),
+      selected: new Set(),
+      isExcluded: () => false,
+    };
   }
 
   const workspace = hasWorkspace ? rootDoc.workspace : {};
@@ -670,13 +652,84 @@ export function resolveCargoWorkspace({ manifests, files, startDir = '' }) {
 
   const members = loadMemberPackages(selected, parsedCache, workspacePackage, unknown);
   return {
-    root: rootDir,
-    rootManifest,
-    rootManifestHash,
-    hasWorkspace,
-    rootDoc,
-    workspaceDependencies,
-    members,
+    selected,
+    isExcluded,
+    result: {
+      root: rootDir,
+      rootManifest,
+      rootManifestHash,
+      hasWorkspace,
+      rootDoc,
+      workspaceDependencies,
+      members,
+      unsupported: [...unsupported.values()].sort(
+        (a, b) => compare(a.file ?? '', b.file ?? '') || (a.offset ?? -1) - (b.offset ?? -1) || compare(a.id, b.id),
+      ),
+    },
+  };
+}
+
+/**
+ * Resolve a Cargo workspace offline using Cargo's member/exclude/path-dependency rules.
+ * @param {{ manifests: Map<string, Buffer | string> | Record<string, Buffer | string>, files?: Array<string | { path: string }>, startDir?: string }} input
+ */
+export function resolveCargoWorkspace({ manifests, files, startDir = '' }) {
+  const rawMap = toManifestMap(manifests);
+  const { snapshotDirs, snapshotFiles } = collectSnapshotEntries(rawMap, files);
+  const manifestDirs = new Map();
+  for (const manifestPath of rawMap.keys()) {
+    const normalized = manifestPath.replaceAll('\\', '/');
+    if (normalized === 'Cargo.toml' || normalized.endsWith('/Cargo.toml')) {
+      const dir = path.posix.dirname(normalized);
+      manifestDirs.set(dir === '.' ? '' : dir, manifestPath);
+    }
+  }
+  const cache = new Map();
+  const parsedCache = dir => {
+    if (cache.has(dir)) return cache.get(dir);
+    const key = manifestDirs.get(dir);
+    const parsed = parseManifestEntry(key !== undefined ? rawMap.get(key) : undefined);
+    cache.set(dir, parsed);
+    return parsed;
+  };
+
+  const cleanStart = normalizeWorkspacePath(startDir === '' ? '.' : startDir) ?? '';
+  const { workspaceCandidate, packageCandidate } = findCandidateRoots(cleanStart, manifestDirs, parsedCache);
+  const resolveFrom = candidate =>
+    resolveWorkspaceAtRoot({
+      rootDir: candidate.rootDir,
+      rootEntry: candidate.entry,
+      manifestDirs,
+      snapshotDirs,
+      snapshotFiles,
+      parsedCache,
+    });
+
+  if (!workspaceCandidate) {
+    const fallback = packageCandidate ?? {
+      rootDir: cleanStart,
+      entry: manifestDirs.has(cleanStart) ? parsedCache(cleanStart) : { error: 'missing' },
+    };
+    return resolveFrom(fallback).result;
+  }
+
+  const wsResolved = resolveFrom(workspaceCandidate);
+  if (
+    !packageCandidate ||
+    packageCandidate.rootDir === workspaceCandidate.rootDir ||
+    wsResolved.selected.has(packageCandidate.rootDir)
+  ) {
+    return wsResolved.result;
+  }
+  if (wsResolved.isExcluded(packageCandidate.rootDir)) {
+    return resolveFrom(packageCandidate).result;
+  }
+  const pkgManifest = packageCandidate.rootDir ? `${packageCandidate.rootDir}/Cargo.toml` : 'Cargo.toml';
+  const unsupported = new Map(wsResolved.result.unsupported.map(item => [item.id, item]));
+  const id = hash(['workspace', pkgManifest, 'unlisted-workspace-member', null]);
+  unsupported.set(id, { id, scope: 'workspace', file: pkgManifest, reason: 'unlisted-workspace-member', offset: null });
+  return {
+    ...wsResolved.result,
     unsupported: [...unsupported.values()].sort(
       (a, b) => compare(a.file ?? '', b.file ?? '') || (a.offset ?? -1) - (b.offset ?? -1) || compare(a.id, b.id),
     ),

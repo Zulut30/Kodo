@@ -2030,3 +2030,72 @@ test('W6: edition-aware dependency tables (hyphen precedence over underscore in 
     `expected unsupported-underscore-dependencies for inherited edition 2024, got ${JSON.stringify(resWs2024.unsupported)}`,
   );
 });
+
+test('W7: path dep to package under nested [workspace] becomes root member while nested root itself conflicts; startDir checks membership and exclude', async t => {
+  const fx = await rustFixture(t);
+  await fx.put('nested/Cargo.toml', '[workspace]\nresolver = "2"\nmembers = ["other"]\n');
+  await fx.put('nested/other/Cargo.toml', '[package]\nname = "other"\nversion = "0.1.0"\nedition = "2021"\n');
+  await fx.put('nested/other/src/lib.rs', 'pub fn other() {}\n');
+  await fx.put('nested/b/Cargo.toml', '[package]\nname = "nested-b"\nversion = "0.1.0"\nedition = "2021"\n');
+  await fx.put('nested/b/src/lib.rs', 'pub fn b() {}\n');
+  await fx.put(
+    'crates/app/Cargo.toml',
+    [
+      '[package]',
+      'name = "app"',
+      'version = "0.1.0"',
+      'edition = "2024"',
+      '[dependencies]',
+      'game-contracts = { workspace = true }',
+      'render = { path = "../render" }',
+      'nested-b = { path = "../../nested/b" }',
+    ].join('\n') + '\n',
+  );
+  const headUnder = fx.commit('path dep into package under nested workspace');
+  const resUnder = await checkArchitecture({
+    project: fx.project,
+    baseSha: fx.baseSha,
+    headSha: headUnder,
+    evidenceDir: fx.artifacts,
+  });
+  // nested-b is now a real root workspace member (no nested-workspace-root error),
+  // and because it is not listed in layers, the gate catches ownership.unowned for nested/b/Cargo.toml!
+  assert.deepEqual(resUnder.unsupported, []);
+  assert.equal(resUnder.status, 'failed');
+  assert.ok(
+    resUnder.findings.some(f => f.ruleId === 'ownership.unowned' && f.file === 'nested/b/Cargo.toml'),
+    `expected ownership.unowned for nested-b member, got ${JSON.stringify(resUnder.findings)}`,
+  );
+
+  // Path dep pointing to the nested [workspace] root itself MUST fail with nested-workspace-root.
+  await fx.put(
+    'nested/Cargo.toml',
+    '[package]\nname = "nested-root"\nversion = "0.1.0"\nedition = "2021"\n[workspace]\n',
+  );
+  await fx.put('nested/src/lib.rs', 'pub fn root() {}\n');
+  await fx.put(
+    'crates/app/Cargo.toml',
+    [
+      '[package]',
+      'name = "app"',
+      'version = "0.1.0"',
+      'edition = "2024"',
+      '[dependencies]',
+      'game-contracts = { workspace = true }',
+      'render = { path = "../render" }',
+      'nested-root = { path = "../../nested" }',
+    ].join('\n') + '\n',
+  );
+  const headRoot = fx.commit('path dep to nested workspace root itself');
+  const resRoot = await checkArchitecture({
+    project: fx.project,
+    baseSha: fx.baseSha,
+    headSha: headRoot,
+    evidenceDir: fx.artifacts,
+  });
+  assert.equal(resRoot.status, 'blocked');
+  assert.ok(
+    resRoot.unsupported.some(u => u.reason === 'nested-workspace-root' && u.file === 'nested/Cargo.toml'),
+    `expected nested-workspace-root on nested/Cargo.toml, got ${JSON.stringify(resRoot.unsupported)}`,
+  );
+});

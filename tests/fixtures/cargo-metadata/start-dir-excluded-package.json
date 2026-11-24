@@ -1,0 +1,24 @@
+{
+  "cargoVersion": "cargo 1.96.0 (30a34c682 2026-05-25)",
+  "startDir": "crates/excluded",
+  "ok": true,
+  "workspace_root": "crates/excluded",
+  "workspace_members": [
+    {
+      "name": "excluded",
+      "manifest": "crates/excluded/Cargo.toml"
+    }
+  ],
+  "files": [
+    "Cargo.toml",
+    "crates/a/Cargo.toml",
+    "crates/a/src/lib.rs",
+    "crates/excluded/Cargo.toml",
+    "crates/excluded/src/lib.rs"
+  ],
+  "manifests": {
+    "Cargo.toml": "[workspace]\nresolver = \"2\"\nmembers = [\"crates/a\"]\nexclude = [\"crates/excluded\"]\n",
+    "crates/a/Cargo.toml": "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    "crates/excluded/Cargo.toml": "[package]\nname = \"excluded\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+  }
+}

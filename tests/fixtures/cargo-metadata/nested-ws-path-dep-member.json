@@ -1,0 +1,33 @@
+{
+  "cargoVersion": "cargo 1.96.0 (30a34c682 2026-05-25)",
+  "startDir": "",
+  "ok": true,
+  "workspace_root": "",
+  "workspace_members": [
+    {
+      "name": "a",
+      "manifest": "crates/a/Cargo.toml"
+    },
+    {
+      "name": "b",
+      "manifest": "nested/b/Cargo.toml"
+    }
+  ],
+  "files": [
+    "Cargo.toml",
+    "crates/a/Cargo.toml",
+    "crates/a/src/lib.rs",
+    "nested/Cargo.toml",
+    "nested/b/Cargo.toml",
+    "nested/b/src/lib.rs",
+    "nested/other/Cargo.toml",
+    "nested/other/src/lib.rs"
+  ],
+  "manifests": {
+    "Cargo.toml": "[workspace]\nresolver = \"2\"\nmembers = [\"crates/a\"]\n",
+    "crates/a/Cargo.toml": "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nb = { path = \"../../nested/b\" }\n",
+    "nested/b/Cargo.toml": "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    "nested/Cargo.toml": "[workspace]\nresolver = \"2\"\nmembers = [\"other\"]\n",
+    "nested/other/Cargo.toml": "[package]\nname = \"other\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+  }
+}
