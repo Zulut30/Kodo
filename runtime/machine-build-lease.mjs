@@ -34,10 +34,11 @@ export function machineBuildSettings(machine) {
 
 /**
  * Run `work` in one build slot of the machine: waits for a free slot (`project_build_busy` after
- * `waitMs`, `project_cancelled` on `signal`); the slot is renewed while `work` runs.
+ * `waitMs`, `project_cancelled` on `signal`); the slot is renewed while `work` runs, and `work`
+ * receives the signal that aborts when a renewal finds the slot gone (TTL expired).
  * @template T
  * @param {any} store the legacy Store (its lease table is shared by the state home)
- * @param {() => Promise<T>} work
+ * @param {(lost: AbortSignal) => Promise<T>} work
  * @param {{ machine?: { id?: string, maxHeavyBuilds?: number }, signal?: AbortSignal, waitMs?: number,
  *   pollMs?: number, heartbeatMs?: number }} [options]
  * @returns {Promise<T>}

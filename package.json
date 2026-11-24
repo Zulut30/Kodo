@@ -21,7 +21,7 @@
     "test:fast": "node scripts/run-tests.mjs --fast",
     "test:coverage": "node scripts/run-tests.mjs --coverage",
     "check": "npm run validate && npm run format:check && npm run lint && npm run typecheck && npm test",
-    "test:waves": "node scripts/run-tests.mjs tests/project-wave-director.test.mjs tests/project-wave-e2e.test.mjs",
+    "test:waves": "node scripts/run-tests.mjs tests/project-wave-director.test.mjs tests/project-wave-e2e.test.mjs tests/project-parallel-engine.test.mjs",
     "test:final": "node --test --test-reporter=spec tests/final-scenarios.mjs"
   },
   "files": [

@@ -41,54 +41,91 @@ export async function acquireLeaseWaiting(store, name, options = {}) {
   }
 }
 
+/** Whether `token` still names a live lease row (checking renews it). @param {any} store @param {string} token */
+export function leaseOwned(store, token) {
+  try {
+    return store.renewLease(token) === true;
+  } catch {
+    return false;
+  }
+}
+
 /**
- * Run `work` holding the lease `token`, renewed every `heartbeatMs`; release it afterwards.
+ * Run `work(lost)` holding the lease `token`, renewed every `heartbeatMs`; release it afterwards.
+ * A renewal that finds no lease row (it expired and another holder may have it) aborts `lost`:
+ * the work stops at its next check and confirms `leaseOwned` before it publishes anything.
  * @template T
  * @param {any} store
  * @param {string} token
- * @param {() => Promise<T>} work
+ * @param {(lost: AbortSignal) => Promise<T>} work
  * @param {number} [heartbeatMs]
  * @returns {Promise<T>}
  */
 export async function withHeldLease(store, token, work, heartbeatMs = 10000) {
+  const lost = new AbortController();
   const timer = setInterval(() => {
+    let renewed;
     try {
-      store.renewLease(token);
+      renewed = store.renewLease(token);
     } catch {
-      // A transient Store failure must not throw from the timer.
+      return; // A transient Store failure must not throw from the timer; the next beat retries.
     }
+    if (renewed === false) lost.abort();
   }, heartbeatMs);
   timer.unref();
   try {
-    return await work();
+    return await work(lost.signal);
   } finally {
     clearInterval(timer);
     store.releaseLease(token);
   }
 }
 
-// Short critical sections under `project:<id>`, reentrant within one async context.
+// Short critical sections under `project:<id>`, reentrant within one async context: name → token, lost signal.
 const sections = new AsyncLocalStorage();
+
+const sectionName = projectId => `project:${projectId}`;
+
+/**
+ * Whether the current async context holds a live `project:<id>` section (checking renews it).
+ * @param {any} store
+ * @param {string} projectId
+ */
+export function projectSectionHeld(store, projectId) {
+  const held = sections.getStore()?.get(sectionName(projectId));
+  return Boolean(held) && leaseOwned(store, held.token);
+}
 
 /**
  * Run `work` in a short critical section under lease `project:<id>`: waits for the lease (unlike
  * the pull controllers, which refuse at once) up to `waitMs`, then `project_busy`; a cancelled
  * `signal` stops the wait with `project_cancelled`. Nested sections of one holder reuse the lease.
  * Used for the parts of complete-task, the integration queue drain and external gate passes
- * that change project state; long work (task-fast, gate Runs) stays outside.
+ * that change project state; long work (task-fast, gate Runs) stays outside. A nested section
+ * confirms that the outer one still owns its lease (`project_lease_lost` otherwise); `work`
+ * receives the signal that aborts when a renewal finds the lease gone.
  * @template T
  * @param {any} store
  * @param {string} projectId
- * @param {() => Promise<T>} work
+ * @param {(lost: AbortSignal) => Promise<T>} work
  * @param {{ signal?: AbortSignal, waitMs?: number, pollMs?: number, heartbeatMs?: number }} [options]
  * @returns {Promise<T>}
  */
 export async function withProjectSection(store, projectId, work, options = {}) {
-  const name = `project:${projectId}`,
+  const name = sectionName(projectId),
     outer = sections.getStore();
-  if (outer?.has(name)) return work();
+  const held = outer?.get(name);
+  if (held) {
+    if (!leaseOwned(store, held.token)) throw coded('project_lease_lost');
+    return work(held.lost);
+  }
   const token = await acquireLeaseWaiting(store, name, options);
-  return withHeldLease(store, token, () => sections.run(new Set([...(outer ?? []), name]), work), options.heartbeatMs);
+  return withHeldLease(
+    store,
+    token,
+    lost => sections.run(new Map([...(outer ?? []), [name, { token, lost }]]), () => work(lost)),
+    options.heartbeatMs,
+  );
 }
 
 // Gate-producing controllers exclude each other even while a standalone gate releases

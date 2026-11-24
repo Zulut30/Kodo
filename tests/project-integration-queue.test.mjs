@@ -10,7 +10,7 @@ import {
   drainIntegrationQueue,
   openIntegrationQueue,
 } from '../runtime/project-integration-queue.mjs';
-import { acquireLeaseWaiting, withProjectSection } from '../runtime/project-controller-lease.mjs';
+import { acquireLeaseWaiting, projectSectionHeld, withProjectSection } from '../runtime/project-controller-lease.mjs';
 import { machineBuildLeaseName, machineBuildSettings, withMachineBuild } from '../runtime/machine-build-lease.mjs';
 
 const projectId = randomUUID();
@@ -41,6 +41,7 @@ const row = (taskId, priority = 0, head = 1) => ({
   taskId,
   attemptId: `attempt-${taskId}`,
   runId: `run-${taskId}`,
+  baseSha: sha(0),
   headSha: sha(head),
   priority,
 });
@@ -77,7 +78,7 @@ test('The queue is a versioned migration of its own and survives a reopened stat
   assert.throws(() => reopened.enqueue({ ...row('x'), priority: 1.5 }), { code: 'project_integration_queue_invalid' });
 });
 
-test('A drain integrates by priority, batches disjoint rows and isolates a refused row', async t => {
+test('A drain keeps priority and FIFO order: a claim ends at the first overlapping row', async t => {
   const queue = openIntegrationQueue((await home(t)).open());
   for (const [taskId, priority] of [
     ['a', 1],
@@ -100,26 +101,92 @@ test('A drain integrates by priority, batches disjoint rows and isolates a refus
       return { status: 'integrated' };
     },
   });
-  // c (priority 3) first; a overlaps c and waits for the next batch; b and d join c's batch.
-  assert.deepEqual(order, ['c', 'b', 'd', 'a']);
-  assert.equal(new Set(batches.slice(0, 3)).size, 1, 'one batch of disjoint rows');
-  assert.notEqual(batches[3], batches[0]);
+  // c (priority 3) first; a overlaps c, so c's claim ends there and a heads the next one.
+  assert.deepEqual(order, ['c', 'a', 'b', 'd']);
+  assert.notEqual(batches[0], batches[1]);
+  assert.equal(new Set(batches.slice(1)).size, 1, 'a, b and d are claimed together');
   assert.deepEqual(
     finished.map(entry => [entry.taskId, entry.status, entry.outcome.code ?? null]),
     [
       ['c', 'integrated', null],
+      ['a', 'integrated', null],
       ['b', 'rejected', 'project_integration_conflict'],
       ['d', 'failed', 'project_transition_blocked'],
-      ['a', 'integrated', null],
     ],
   );
-  // A refused or failed row is queued again by a new submission of the same head.
+  // A finished row stays for its readers; a new submission of the same head gets a new row.
   const again = queue.enqueue(row('b', 1));
   assert.equal(again.status, 'queued');
   assert.ok(again.seq > finished.at(-1).seq);
+  assert.equal(queue.get(finished[2].seq).status, 'rejected', 'the refused row is kept');
+  assert.deepEqual(queue.enqueue(row('b', 1)), again, 'one live row per Run and head');
+  assert.equal(queue.enqueue(row('a', 1)).seq, finished[1].seq, 'an integrated head answers with its row');
 });
 
-test('A drain stopped mid-batch resumes its rows first and never finishes a row twice', async t => {
+test('One drain integrates at most four rows, stopped drains keep their merging rows', async t => {
+  const queue = openIntegrationQueue((await home(t)).open());
+  for (let index = 0; index < 6; index++) queue.enqueue(row(`t${index}`, 0, index + 1));
+  // A crash left t0 merging (claimed, never finished).
+  const [orphan] = queue.claim(projectId, { maxBatch: 1 });
+  assert.equal(orphan.taskId, 't0');
+  // A cancelled drain never touches it: the orphan stays merging for the next holder.
+  assert.deepEqual(
+    await drainIntegrationQueue({ queue, projectId, stop: () => true, integrate: async () => assert.fail('stopped') }),
+    [],
+  );
+  assert.equal(queue.get(orphan.seq).status, 'merging');
+  // Without the leases at the end of a row its outcome is not recorded.
+  const lost = await drainIntegrationQueue({
+    queue,
+    projectId,
+    owned: () => false,
+    integrate: async () => ({ status: 'integrated' }),
+  });
+  assert.deepEqual(lost, []);
+  assert.equal(queue.get(orphan.seq).status, 'merging');
+  const seen = [];
+  const finished = await drainIntegrationQueue({
+    queue,
+    projectId,
+    integrate: async entry => {
+      seen.push(entry.taskId);
+      return { status: 'integrated' };
+    },
+  });
+  assert.deepEqual(seen, ['t0', 't1', 't2', 't3'], 'the orphan first, four rows in all');
+  assert.equal(finished.length, 4);
+  assert.deepEqual(
+    queue
+      .list(projectId)
+      .filter(entry => entry.status === 'queued')
+      .map(entry => entry.taskId),
+    ['t4', 't5'],
+  );
+  // A stop between rows returns the claimed rows that never started; nothing else.
+  let rows = 0;
+  await drainIntegrationQueue({
+    queue,
+    projectId,
+    stop: () => rows > 0,
+    integrate: async () => {
+      rows++;
+      return { status: 'integrated' };
+    },
+  });
+  assert.deepEqual(
+    queue.list(projectId).map(entry => [entry.taskId, entry.status]),
+    [
+      ['t0', 'integrated'],
+      ['t1', 'integrated'],
+      ['t2', 'integrated'],
+      ['t3', 'integrated'],
+      ['t4', 'integrated'],
+      ['t5', 'queued'],
+    ],
+  );
+});
+
+test('A drain stopped mid-row resumes its rows first and never finishes a row twice', async t => {
   const h = await home(t);
   const queue = openIntegrationQueue(h.open());
   for (const taskId of ['a', 'b', 'd']) queue.enqueue(row(taskId));
@@ -167,6 +234,11 @@ test('A drain stopped mid-batch resumes its rows first and never finishes a row 
     await drainIntegrationQueue({ queue: resumed, projectId, integrate: async () => assert.fail('nothing left') }),
     [],
   );
+  // A replay that found the recorded completion finishes the live row of its head.
+  const live = resumed.enqueue(row('e'));
+  resumed.claim(projectId);
+  resumed.settle(projectId, 'run-e', sha(1), { status: 'integrated' });
+  assert.equal(resumed.get(live.seq).status, 'integrated');
 });
 
 test('A waiting submission drains when it can and stops with its own codes', async t => {
@@ -196,6 +268,23 @@ test('A waiting submission drains when it can and stops with its own codes', asy
       pollMs: 1,
       now: () => (clock += 400),
       tryDrain: async () => false,
+    }),
+    { code: 'project_integration_queue_timeout' },
+  );
+  // The deadline is absolute: drains that end without this row never extend it.
+  clock = 0;
+  let drains = 0;
+  await assert.rejects(
+    awaitIntegration({
+      queue,
+      seq: waiting.seq,
+      waitMs: 1000,
+      pollMs: 1,
+      now: () => (clock += 300),
+      tryDrain: async () => {
+        assert.ok(++drains < 5, 'the deadline ends the loop');
+        return true;
+      },
     }),
     { code: 'project_integration_queue_timeout' },
   );
@@ -270,4 +359,39 @@ test('A short project section waits for the lease, is reentrant and stops on can
   controller.abort();
   await assert.rejects(cancelled, { code: 'project_cancelled' });
   store.releaseLease(held);
+});
+
+test('A lost lease aborts its holder, and a nested project section refuses to go on', async t => {
+  const store = (await home(t)).open();
+  const name = `project:${projectId}`;
+  const aborted = signal => new Promise(resolve => signal.addEventListener('abort', resolve, { once: true }));
+  let nested;
+  await withProjectSection(
+    store,
+    projectId,
+    async lost => {
+      assert.equal(projectSectionHeld(store, projectId), true);
+      // The TTL expired and another holder took the lease (limit 1): two holders for a moment.
+      store.db.prepare('DELETE FROM leases WHERE name=?').run(name);
+      const other = store.acquireLease(name, 'other', { ttlMs: 60000 });
+      assert.ok(other);
+      await aborted(lost);
+      assert.equal(projectSectionHeld(store, projectId), false);
+      nested = await withProjectSection(store, projectId, async () => 'ran').catch(error => error.code);
+      store.releaseLease(other);
+    },
+    { heartbeatMs: 5 },
+  );
+  assert.equal(nested, 'project_lease_lost');
+  // The same for a build slot: its work learns that the slot is gone.
+  const slot = await withMachineBuild(
+    store,
+    async lost => {
+      store.db.prepare('DELETE FROM leases WHERE name=?').run(machineBuildLeaseName('local'));
+      await aborted(lost);
+      return lost.aborted;
+    },
+    { heartbeatMs: 5 },
+  );
+  assert.equal(slot, true);
 });

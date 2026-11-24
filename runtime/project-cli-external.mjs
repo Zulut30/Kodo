@@ -26,6 +26,8 @@ const reported = new Set([
   'project_integration_queue_timeout',
   'project_integration_queue_cancelled',
   'project_integration_queue_unsupported',
+  'project_integration_queue_missing',
+  'project_lease_lost',
   'project_integration_branch_busy',
   'project_integration_worktree_invalid',
   'project_integration_busy',

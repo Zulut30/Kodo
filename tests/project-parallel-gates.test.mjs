@@ -9,18 +9,19 @@ import { runPendingGates } from '../runtime/project-director-waves.mjs';
 const projectId = randomUUID();
 const complete = rows => ({ total: rows.length, returned: rows.length, complete: true });
 
-// epics: [{ id, milestoneId, status? }]; every epic has one integrated task and one installed gate
-// (containers from `chains`, default the epic alone) whose Run has not run yet.
-function memoryProject({ milestones, epics, chains = {} }) {
+// epics: [{ id, milestoneId, status?, busy? }]; every epic has one integrated task and one
+// installed gate (containers from `chains`, default the epic alone) whose Run has not run yet. A
+// `busy` epic still has its task running: it is open but not ready for a gate.
+function memoryProject({ milestones, epics, chains = {}, leaseHeartbeatMs = 10000 }) {
   const tasks = epics.map(epic => ({
     id: `task-${epic.id}`,
     epicId: epic.id,
-    status: epic.status === 'accepted' ? 'accepted' : 'integrated',
+    status: epic.status === 'accepted' ? 'accepted' : epic.busy ? 'running' : 'integrated',
     dependsOn: [],
     writePaths: [`src/${epic.id}.mjs`],
   }));
   const gates = epics
-    .filter(epic => epic.status !== 'accepted')
+    .filter(epic => epic.status !== 'accepted' && !epic.busy)
     .map((epic, index) => ({
       id: `gate-${epic.id}`,
       number: index + 1,
@@ -32,7 +33,7 @@ function memoryProject({ milestones, epics, chains = {} }) {
     project: { projectId, status: 'running', paused: false, root: '/memory' },
     revision: 1,
     milestones: milestones.map(id => ({ id, status: 'running' })),
-    epics: epics.map(epic => ({ status: 'running', ...epic })),
+    epics: epics.map(({ busy, ...epic }) => ({ status: 'running', ...epic })),
     tasks,
     currentAttempts: [],
     gates,
@@ -65,7 +66,7 @@ function memoryProject({ milestones, epics, chains = {} }) {
   };
   const ctx = {
     repo: { snapshot: async () => structuredClone(snapshot), apply: async () => ({}) },
-    engine: { leaseHeartbeatMs: 10000 },
+    engine: { leaseHeartbeatMs },
     store,
     contracts: { isWaveProject: () => true },
     clock: () => new Date().toISOString(),
@@ -76,11 +77,13 @@ function memoryProject({ milestones, epics, chains = {} }) {
 const blockedGate = run => ({ ...run, state: 'blocked', error: { code: 'gate_red', message: 'red' } });
 
 test('Gates of two independent epics run at the same time', async () => {
+  // e3's task still runs: e1 and e2 are not the last open epics of the project.
   const { ctx, leases } = memoryProject({
-    milestones: ['m1', 'm2'],
+    milestones: ['m1', 'm2', 'm3'],
     epics: [
       { id: 'e1', milestoneId: 'm1' },
       { id: 'e2', milestoneId: 'm2' },
+      { id: 'e3', milestoneId: 'm3', busy: true },
     ],
   });
   let open;
@@ -171,4 +174,51 @@ test('An epic gate held elsewhere is reported, and a milestone gate waits for it
     'only the foreign lease remains',
   );
   store.releaseLease(elsewhere);
+});
+
+test('The last open epics of the project never gate together, in any number of milestones', async () => {
+  const { ctx } = memoryProject({
+    milestones: ['m1', 'm2'],
+    epics: [
+      { id: 'e1', milestoneId: 'm1' },
+      { id: 'e2', milestoneId: 'm2' },
+    ],
+  });
+  const events = [];
+  ctx.runGate = async ({ run }) => {
+    events.push(`start ${run.id}`);
+    await new Promise(resolve => setImmediate(resolve));
+    events.push(`end ${run.id}`);
+    return blockedGate(run);
+  };
+  const out = await runPendingGates(ctx, { projectId });
+  assert.deepEqual(events, ['start run-e1', 'end run-e1', 'start run-e2', 'end run-e2']);
+  assert.ok(!out.blocked.some(row => row.code === 'project_gate_running'), JSON.stringify(out.blocked));
+});
+
+test('A gate whose epic lease is lost stops and never accepts', async () => {
+  const { ctx, store, leases } = memoryProject({
+    milestones: ['m1', 'm2'],
+    epics: [
+      { id: 'e1', milestoneId: 'm1' },
+      { id: 'e2', milestoneId: 'm2', busy: true },
+    ],
+    leaseHeartbeatMs: 5,
+  });
+  const name = `project-gate:${projectId}:e1`;
+  let other;
+  ctx.runGate = async ({ run, signal }) => {
+    // The TTL expired and another holder took the epic lease.
+    for (const [token, row] of leases) if (row.name === name) leases.delete(token);
+    other = store.acquireLease(name, 'other');
+    await new Promise(resolve => signal.addEventListener('abort', resolve, { once: true }));
+    return { ...run, state: 'cancelled', error: { code: 'cancelled', message: 'lease lost' } };
+  };
+  const out = await runPendingGates(ctx, { projectId });
+  assert.ok(other, 'the other holder got the lease');
+  assert.deepEqual(
+    out.blocked.map(row => row.code),
+    ['cancelled', 'project_lease_lost'],
+  );
+  assert.deepEqual(out.accepted, []);
 });

@@ -946,17 +946,23 @@ async function withGateLeases(ctx, names, work) {
     }
     tokens.push(token);
   }
+  // A renewal that finds a lease row gone (TTL expired; another holder may have it) aborts `lost`:
+  // the gate stops at its next check (Run, acceptance) and never accepts without its leases.
+  const lost = new AbortController();
   const timer = setInterval(() => {
-    for (const token of tokens)
+    for (const token of tokens) {
+      let renewed;
       try {
-        ctx.store.renewLease(token);
+        renewed = ctx.store.renewLease(token);
       } catch {
-        /* A transient Store failure must not throw from the timer. */
+        continue; // A transient Store failure must not throw from the timer; the next beat retries.
       }
+      if (renewed === false) lost.abort();
+    }
   }, ctx.engine.leaseHeartbeatMs || 10000);
   timer.unref();
   try {
-    return { value: await work() };
+    return { value: await work(lost.signal) };
   } finally {
     clearInterval(timer);
     for (const token of tokens) ctx.store.releaseLease(token);
@@ -971,15 +977,17 @@ async function gateEpicLeased(ctx, projectId, epicId, options, out) {
   for (let attempt = 0; attempt < 3; attempt++) {
     const before = await snapshotOf(ctx, projectId);
     const names = gateLeaseNames(before, plannedContainers(before, recordOf(before, 'epic', epicId)));
-    const held = await withGateLeases(ctx, names, async () => {
+    const held = await withGateLeases(ctx, names, async lost => {
       const snapshot = await snapshotOf(ctx, projectId);
       const epic = recordOf(snapshot, 'epic', epicId);
-      if (controlState(snapshot) || options.signal?.aborted) return 'done';
+      const signal = options.signal ? AbortSignal.any([options.signal, lost]) : lost;
+      if (controlState(snapshot) || signal.aborted) return 'done';
       if (!gateCandidate(snapshot, epic) && !unfinishedEpicGate(ctx, snapshot, epic)) return 'done';
       // Another epic settled meanwhile and the chain now reaches its milestone: take those leases too.
       if (gateLeaseNames(snapshot, plannedContainers(snapshot, epic)).some(name => !names.includes(name)))
         return 'widened';
-      await gateEpic(ctx, snapshot, epic, options, out);
+      await gateEpic(ctx, snapshot, epic, { ...options, signal }, out);
+      if (lost.aborted) out.blocked.push({ code: 'project_lease_lost', kind: 'epic', id: epicId });
       return 'done';
     });
     if (held?.value === 'done') return;
@@ -990,14 +998,18 @@ async function gateEpicLeased(ctx, projectId, epicId, options, out) {
 
 // The epics whose gates run together: every candidate, except that the last open epic of a
 // milestone waits while a sibling's gate runs. Its own gate then also accepts the milestone; two
-// sibling gates that ran together would leave the milestone to no gate.
+// sibling gates that ran together would leave the milestone to no gate. Likewise, when the chosen
+// epics are all the open epics of the project, the last one waits: its gate would widen to the
+// project and collide with the leases of the gates running beside it.
 function concurrentEpics(snapshot, candidates) {
   const chosen = new Set(candidates.map(row => row.id));
-  for (const milestone of snapshot.milestones) {
-    const open = snapshot.epics.filter(row => row.milestoneId === milestone.id && !settled(row.status));
+  const deferLast = open => {
     const together = open.filter(row => chosen.has(row.id));
     if (together.length > 1 && together.length === open.length) chosen.delete(together.at(-1).id);
-  }
+  };
+  for (const milestone of snapshot.milestones)
+    deferLast(snapshot.epics.filter(row => row.milestoneId === milestone.id && !settled(row.status)));
+  deferLast(snapshot.epics.filter(row => !settled(row.status)));
   return candidates.filter(row => chosen.has(row.id));
 }
 
@@ -1042,8 +1054,8 @@ export async function runPendingGates(ctx, { projectId, signal, retryFailed = fa
     !snapshot.milestones.every(row => settled(row.status))
   )
     return out;
-  const held = await withGateLeases(ctx, gateLeaseNames(snapshot, [{ kind: 'project', id: projectId }]), () =>
-    gateProject(ctx, { projectId, signal, retryFailed }, out),
+  const held = await withGateLeases(ctx, gateLeaseNames(snapshot, [{ kind: 'project', id: projectId }]), lost =>
+    gateProject(ctx, { projectId, signal: signal ? AbortSignal.any([signal, lost]) : lost, retryFailed }, out),
   );
   if (!held) out.blocked.push(gateRunning('project', projectId));
   return out;

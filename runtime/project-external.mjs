@@ -32,10 +32,17 @@ import {
   mergeOnBranch,
   waveFrontier,
 } from './project-integration.mjs';
-import { withIntegrationLease } from './project-integration-lease.mjs';
+import { integrationLeaseHeld, withIntegrationLease } from './project-integration-lease.mjs';
 import { bindingFor, known, storedRun, verifyRef } from './project-director.mjs';
 import * as waves from './project-director-waves.mjs';
-import { withGateController, withProjectSection } from './project-controller-lease.mjs';
+import {
+  acquireLeaseWaiting,
+  leaseOwned,
+  projectSectionHeld,
+  withGateController,
+  withHeldLease,
+  withProjectSection,
+} from './project-controller-lease.mjs';
 import { withMachineBuild } from './machine-build-lease.mjs';
 import { awaitIntegration, drainIntegrationQueue, openIntegrationQueue } from './project-integration-queue.mjs';
 import { verifyTaskFastOnce } from './wave-verifier.mjs';
@@ -590,8 +597,9 @@ async function historyDefect(engine, run, task, head) {
   };
 }
 
-// Worker-fixable defects of the submitted commit, before any check runs.
-async function inspectSubmission(engine, run, task, head) {
+// The worker's branch and worktree still stand clean on `head`; the first defect otherwise. Checked
+// on submission and again by the queue drain right before the merge.
+async function workerStateDefect(run, head) {
   const branch = await execute('git', ['rev-parse', '--verify', '--quiet', `refs/heads/${run.branch}`], {
     cwd: run.project,
     allowFailure: true,
@@ -609,6 +617,13 @@ async function inspectSubmission(engine, run, task, head) {
     return problem('external_worktree_mismatch');
   if (await git(run.cwd, ['status', '--porcelain=v1', '--untracked-files=all']))
     return problem('external_worktree_dirty');
+  return null;
+}
+
+// Worker-fixable defects of the submitted commit, before any check runs.
+async function inspectSubmission(engine, run, task, head) {
+  const state = await workerStateDefect(run, head);
+  if (state) return state;
   if (head === run.baseSha) return problem('external_no_changes');
   if (!(await ancestor(run.project, run.baseSha, head))) return problem('external_not_descendant');
   const history = await historyDefect(engine, run, task, head);
@@ -799,59 +814,119 @@ async function mergeRecorded(projectId, run) {
 
 // A completion already recorded for this head is returned, not repeated; deferred gates may still
 // run (`finishCompletion`). The recorded merge is checked first under lease
-// `project-integration:<id>`: a merge that left the branch (reset, rewrite) is a recovery blocker,
-// never a replayed `integrated`. Runs in the caller's project section.
+// `project-integration:<id>` (reachable from the branch head with both recorded parents): a merge
+// that left the branch (reset, rewrite) is a recovery blocker, never a replayed `integrated`. A
+// queue row that a stopped drain left live for this head is finished with the same verdict.
+// Runs in the caller's project section.
 async function replayedMerge(ctx, input, run) {
-  const present = await withIntegrationLease(storeOf(ctx), input.projectId, () => mergeRecorded(input.projectId, run), {
+  const store = storeOf(ctx),
+    { projectId } = input;
+  const present = await withIntegrationLease(store, projectId, () => mergeRecorded(projectId, run), {
     signal: input.signal,
   });
-  if (present) return null;
+  const queue = openIntegrationQueue(store);
+  if (present) {
+    queue.settle(projectId, run.id, input.head, {
+      status: 'integrated',
+      integration: run.externalCompletion.integration,
+    });
+    return null;
+  }
+  queue.settle(projectId, run.id, input.head, { status: 'rejected', code: 'project_integration_missing' });
   return {
     status: 'blocked',
     code: 'project_integration_missing',
     integration: run.externalCompletion.integration,
-    revision: (await snapshotOf(ctx, input.projectId)).revision,
+    revision: (await snapshotOf(ctx, projectId)).revision,
     replayed: true,
   };
 }
 
-// Verify the submitted head once, in one build slot of the machine (`machine-build:<id>`) and
-// outside `project:<id>`; a pass leaves the Run succeeded on that head. An abandon that arrived
-// meanwhile wins: the Run stays as the abandon left it (`blocked`: project_submission_stale).
-async function verifySubmission(ctx, run, head, input) {
-  const store = storeOf(ctx);
+const integrationStarted = run => ['merged', 'pending'].includes(run.integration?.status);
+const cancelled = run => Boolean(run.externalAbandon) || run.cancelRequested === true || run.state === 'cancelled';
+
+// Where a submission of `head` stands now: `verified` (this head passed or is integrated), `stale`
+// (another attempt or Run, an abandon or cancel, another head integrated, the attempt stopped) or
+// `go` (verify it). Read in a project section.
+async function verificationState(ctx, C, input, attemptId, runId) {
+  const { attempt, run } = await externalAttempt(ctx, C, input.projectId, input.taskId);
+  const head = input.head;
+  if (attempt.id !== attemptId || run.id !== runId || cancelled(run)) return 'stale';
+  if (run.externalCompletion?.headSha === head) return 'verified';
+  if (integrationStarted(run))
+    return run.integration.mergedHead === head || run.headSha === head ? 'verified' : 'stale';
+  if (run.externalCompletion) return 'stale';
   if (run.state === 'succeeded' && run.headSha === head && run.checks?.headSha === head && run.checks.complete)
-    return null;
-  const verify = typeof input.ports?.verifyTaskFast === 'function' ? input.ports.verifyTaskFast : verifyTaskFastOnce;
-  const abandoned = () => {
-    const current = store.getRun(run.id);
-    return Boolean(current.externalAbandon) || current.state === 'cancelled';
-  };
-  let verdict;
-  try {
-    verdict = await withMachineBuild(store, () => verify({ engine: ctx.engine, run: run.id, signal: input.signal }), {
-      machine: input.machine,
-      signal: input.signal,
-    });
-  } catch (error) {
-    // Another call verifies the same Run right now (its lease `run:<id>`).
-    if (error?.code === 'run_busy') return { blocked: 'project_task_busy' };
-    if (abandoned()) return { blocked: 'project_submission_stale' };
-    throw error;
-  }
-  if (abandoned()) return { blocked: 'project_submission_stale' };
-  if (!verdict.passed || verdict.headSha !== head) {
-    store.updateRun(run.id, { state: 'executing' });
-    return verdict.passed ? problem('external_head_changed') : { code: verdict.code, message: verdict.message };
-  }
-  store.updateRun(run.id, { state: 'succeeded', error: null });
-  return null;
+    return 'verified';
+  return ['running', 'verifying'].includes(attempt.status) ? 'go' : 'stale';
 }
 
-// Integrate one queued head; the drain holds `project:<id>` and the integration lease. A row whose
-// attempt, Run or head changed since it was queued is refused (`project_submission_stale`). The
-// completion is recorded on the Run before the row finishes: a drain repeated after a crash, or a
-// replay, never integrates it again.
+// Verify the submitted head once. One verification per Run at a time (`project-verify:<runId>`,
+// taken before the machine slot): a duplicate submission waits for the first and then finds the
+// head verified. In one build slot of the machine (`machine-build:<id>`) the state is read again,
+// `task-fast` runs outside `project:<id>`, and the verdict is written in a short project section
+// that checks again for an abandon, a cancel, a recorded completion, an integration or another
+// head; a cancel is never overwritten (`preserveCancellation`). A lost lease stops the check.
+async function verifySubmission(ctx, C, step, input) {
+  const store = storeOf(ctx),
+    { projectId, head, signal } = input,
+    { attempt, run } = step;
+  const verify = typeof input.ports?.verifyTaskFast === 'function' ? input.ports.verifyTaskFast : verifyTaskFastOnce;
+  const section = work => withProjectSection(store, projectId, work, { signal });
+  const state = () => section(() => verificationState(ctx, C, input, attempt.id, run.id));
+  const stale = { blocked: 'project_submission_stale' };
+  const dedupe = await acquireLeaseWaiting(store, `project-verify:${run.id}`, { signal, waitMs: 2 * 3600000 });
+  return withHeldLease(store, dedupe, async dedupeLost => {
+    const before = await state();
+    if (before !== 'go') return before === 'verified' ? null : stale;
+    return withMachineBuild(
+      store,
+      async slotLost => {
+        const now = await state();
+        if (now !== 'go') return now === 'verified' ? null : stale;
+        const checked = AbortSignal.any([dedupeLost, slotLost, ...(signal ? [signal] : [])]);
+        let verdict;
+        try {
+          verdict = await verify({ engine: ctx.engine, run: run.id, signal: checked, expectedHeadSha: head });
+        } catch (error) {
+          // Another call verifies the same Run right now (its lease `run:<id>`).
+          if (error?.code === 'run_busy') return { blocked: 'project_task_busy' };
+          if (dedupeLost.aborted || slotLost.aborted) return { blocked: 'project_lease_lost' };
+          if (cancelled(store.getRun(run.id))) return stale;
+          throw error;
+        }
+        if (dedupeLost.aborted || slotLost.aborted || !leaseOwned(store, dedupe))
+          return { blocked: 'project_lease_lost' };
+        if (verdict.skipped)
+          return verdict.code === 'head_changed'
+            ? problem('external_head_changed')
+            : (await state()) === 'verified'
+              ? null
+              : stale;
+        return section(async () => {
+          const current = await verificationState(ctx, C, input, attempt.id, run.id);
+          const written = store.getRun(run.id);
+          if (current === 'stale' || integrationStarted(written) || written.externalCompletion) return stale;
+          if (!verdict.passed || verdict.headSha !== head) {
+            store.updateRun(run.id, { state: 'executing' }, { preserveCancellation: true });
+            return verdict.passed ? problem('external_head_changed') : { code: verdict.code, message: verdict.message };
+          }
+          store.updateRun(run.id, { state: 'succeeded', error: null }, { preserveCancellation: true });
+          return null;
+        });
+      },
+      { machine: input.machine, signal },
+    );
+  });
+}
+
+// Integrate one queued head; the drain holds `project:<id>` and the integration lease. Before any
+// Git change the row is checked against the current state: the attempt binding, the verified head
+// and base, no abandon or cancel, and the worker's branch and worktree still clean on that head
+// (`project_submission_stale` otherwise, nothing merged). A recorded completion is accepted only
+// while its merge is on the branch (`project_integration_missing` otherwise). A merge whose
+// transitions were refused is `failed`, never `rejected`: a repeated submission continues it.
+// The completion is recorded on the Run before the row finishes.
 async function integrateQueued(ctx, C, W, waveCtx, entry, signal) {
   const store = storeOf(ctx),
     { projectId, taskId, headSha } = entry;
@@ -859,79 +934,110 @@ async function integrateQueued(ctx, C, W, waveCtx, entry, signal) {
   const stale = { status: 'rejected', code: 'project_submission_stale' };
   if (attempt.id !== entry.attemptId || run.id !== entry.runId) return stale;
   if (run.externalCompletion?.headSha === headSha)
-    return { status: 'integrated', integration: run.externalCompletion.integration };
-  if (run.state !== 'succeeded' || run.headSha !== headSha) return stale;
+    return (await mergeRecorded(projectId, run))
+      ? { status: 'integrated', integration: run.externalCompletion.integration }
+      : { status: 'rejected', code: 'project_integration_missing' };
+  if (run.state !== 'succeeded' || run.headSha !== headSha || run.checks?.headSha !== headSha) return stale;
+  if (run.baseSha !== entry.baseSha) return stale;
   // A merge that a stopped drain started continues (integrateAndAdvance recovers it).
-  const interrupted = ['merged', 'pending'].includes(run.integration?.status);
-  if (!interrupted && !['running', 'verifying'].includes(attempt.status)) return stale;
+  if (!integrationStarted(run)) {
+    if (cancelled(run) || !['running', 'verifying'].includes(attempt.status)) return stale;
+    if (await workerStateDefect(run, headSha)) return stale;
+  }
   const integration = await W.integrateAndAdvance(waveCtx, { projectId, taskId, run: store.getRun(run.id), signal });
-  if (integration?.status !== 'integrated')
-    return {
-      status: 'rejected',
-      code: integration?.code ?? 'project_integration_blocked',
-      integration: integration ?? null,
-    };
+  if (integration?.status !== 'integrated') {
+    const code = integration?.code ?? 'project_integration_blocked';
+    const after = store.getRun(run.id);
+    if (after.integration?.status === 'merged' && after.integration.mergedHead === headSha)
+      return { status: 'failed', code, merged: true, integration: integration ?? null };
+    return { status: 'rejected', code, integration: integration ?? null };
+  }
   store.updateRun(run.id, { externalCompletion: { schemaVersion: 1, headSha, integration, gates: null } });
   return { status: 'integrated', integration };
 }
 
 // Drain the integration queue when this caller can take `project:<id>` and the integration lease
 // at once (never waiting for them): true after a drain, false while another holder has either.
-async function tryDrain(ctx, C, W, input) {
+// The caller's own cancel and deadline (`expired`) end the drain between rows; they never reach
+// the integration of rows other callers queued. A lost lease stops the drain, and a row's outcome
+// is recorded only while both leases are still owned.
+async function tryDrain(ctx, C, W, input, expired) {
   const { projectId, signal } = input,
     store = storeOf(ctx);
-  const waveCtx = sectionedContext(ctx, C, W, projectId, signal);
+  const waveCtx = sectionedContext(ctx, C, W, projectId, undefined);
   let entered = false;
   try {
     await withProjectSection(
       store,
       projectId,
-      () =>
+      lost =>
         withIntegrationLease(
           store,
           projectId,
           async () => {
             entered = true;
+            const owned = () =>
+              !lost.aborted && projectSectionHeld(store, projectId) && integrationLeaseHeld(store, projectId);
             const snapshot = await snapshotOf(ctx, projectId);
             const scopeOf = entry => snapshot.tasks.find(row => row.id === entry.taskId)?.writePaths ?? null;
             await drainIntegrationQueue({
               queue: openIntegrationQueue(store),
               projectId,
               scopeOf,
-              signal,
-              integrate: entry => integrateQueued(ctx, C, W, waveCtx, entry, signal),
+              stop: () => signal?.aborted === true || expired() || !owned(),
+              owned,
+              integrate: entry => integrateQueued(ctx, C, W, waveCtx, entry, lost),
             });
           },
-          { waitMs: 0, signal },
+          { waitMs: 0 },
         ),
-      { waitMs: 0, signal },
+      { waitMs: 0 },
     );
     return true;
   } catch (error) {
     if (entered) throw error;
-    if (signal?.aborted) fail('integration_queue_cancelled');
     if (['project_busy', 'project_integration_busy'].includes(error?.code)) return false;
     throw error;
   }
 }
 
+const controlledProject = project => project.paused || ['cancelled', 'failed', 'blocked'].includes(project.status);
+
 // After an integration: the pending gates unless deferred, in one gate pass (`project-gates:<id>`;
-// `project_busy` while another pass runs — a repeated completion runs them later).
+// `project_busy` while another pass runs — a repeated completion runs them later). The receipt is
+// read again inside the pass: recorded gates never run twice. A pass that a cancel, a pause, a
+// project stop or a block cut short records nothing (`gates` stays null for a safe repeat) and
+// answers `blocked` with that code.
 async function finishCompletion(ctx, C, input, run, replayed) {
   const store = storeOf(ctx),
     { projectId, signal } = input;
-  const completion = store.getRun(run.id).externalCompletion;
-  let gates = completion.gates;
+  const receipt = () => store.getRun(run.id).externalCompletion;
+  let completion = receipt(),
+    gates = completion.gates,
+    code = null;
   if (gates === null && !input.deferGate) {
     const W = wavePorts(input.ports, ['createWaveContext', 'runPendingGates']);
-    gates = await withGateController(store, projectId, () =>
-      runGates(W, sectionedContext(ctx, C, W, projectId, signal), projectId, signal),
-    );
-    store.updateRun(run.id, { externalCompletion: { ...completion, gates } });
+    ({ gates, code } = await withGateController(store, projectId, async () => {
+      completion = receipt();
+      if (completion.gates !== null) return { gates: completion.gates, code: null };
+      let result;
+      try {
+        result = await runGates(W, sectionedContext(ctx, C, W, projectId, signal), projectId, signal);
+      } catch (error) {
+        if (error?.code !== 'project_cancelled') throw error;
+        return { gates: null, code: error.code };
+      }
+      if (signal?.aborted) return { gates: null, code: 'project_cancelled' };
+      if (controlledProject((await snapshotOf(ctx, projectId)).project))
+        return { gates: null, code: 'project_control_blocked' };
+      store.updateRun(run.id, { externalCompletion: { ...receipt(), gates: result } });
+      return { gates: result, code: null };
+    }));
   }
   const revision = (await snapshotOf(ctx, projectId)).revision;
   return {
-    status: 'integrated',
+    status: code ? 'blocked' : 'integrated',
+    ...(code ? { code } : {}),
     integration: completion.integration,
     ...(gates ? { gates } : {}),
     revision,
@@ -967,11 +1073,9 @@ async function admitSubmission(ctx, C, input) {
     const missing = await replayedMerge(ctx, input, run);
     return missing ? { result: missing } : { replay: run };
   }
-  if (snapshot.project.paused || ['cancelled', 'failed', 'blocked'].includes(snapshot.project.status))
-    return blocked('project_control_blocked');
+  if (controlledProject(snapshot.project)) return blocked('project_control_blocked');
   // A verified head whose integration was interrupted (crash) continues where it stopped.
-  const interrupted =
-    run.state === 'succeeded' && run.headSha === head && ['merged', 'pending'].includes(run.integration?.status);
+  const interrupted = run.state === 'succeeded' && run.headSha === head && integrationStarted(run);
   if (interrupted) return { ...current, verified: true };
   if (!['running', 'verifying'].includes(attempt.status) || run.integration?.status === 'merged')
     return blocked('project_attempt_not_running');
@@ -991,10 +1095,11 @@ async function admitSubmission(ctx, C, input) {
  *
  * Concurrency: the Git, scope and secret checks run in a short section under `project:<id>`
  * (waited for; `project_busy` after the wait); `task-fast` runs outside it in one build slot of
- * the machine (`machine`: `{ id, maxHeavyBuilds }`, default one local slot). The verified head is
- * queued (`priority`, default 0) and merged by whichever submission drains the queue; this call
- * waits for its row (`integrationWaitMs`, then `project_integration_queue_timeout`;
- * `project_integration_queue_cancelled` on `signal` — the row stays queued for a repeat).
+ * the machine (`machine`: `{ id, maxHeavyBuilds }`, default one local slot), once per Run at a
+ * time. The verified head is queued (`priority`, default 0) and merged by whichever submission
+ * drains the queue; this call waits for its row (`integrationWaitMs`, then
+ * `project_integration_queue_timeout`; `project_integration_queue_cancelled` on `signal` — the
+ * row stays queued for a repeat).
  * @param {{ repo: any, engine: any, store?: any, contracts?: any, clock?: () => string }} ctx
  * @param {{ projectId: string, taskId: string, head: string, deferGate?: boolean, abandon?: boolean,
  *   commandId?: string, attemptId?: string, ports?: any, signal?: AbortSignal, priority?: number,
@@ -1019,10 +1124,18 @@ export async function completeTask(ctx, input) {
   if (step.replay) return finishCompletion(ctx, C, completion, step.replay, true);
   const { snapshot, attempt, run } = step;
   if (!step.verified) {
-    const defect = await verifySubmission(ctx, run, head, input);
+    const defect = await verifySubmission(ctx, C, step, input);
     if (defect && 'blocked' in defect)
       return { status: 'blocked', code: defect.blocked, revision: (await snapshotOf(ctx, projectId)).revision };
     if (defect) return { status: 'checks_failed', ...defect, revision: snapshot.revision };
+    // A duplicate submission may find this head integrated by the first one: a replay then.
+    const replay = await section(async () => {
+      const now = await externalAttempt(ctx, C, projectId, taskId);
+      if (now.run.externalCompletion?.headSha !== head) return null;
+      return (await replayedMerge(ctx, input, now.run)) ?? { replay: now.run };
+    });
+    if (replay?.replay) return finishCompletion(ctx, C, completion, replay.replay, true);
+    if (replay) return replay;
   }
   const W = wavePorts(input.ports, ['createWaveContext', 'integrateAndAdvance', 'runPendingGates']);
   const queue = openIntegrationQueue(store);
@@ -1031,6 +1144,7 @@ export async function completeTask(ctx, input) {
     taskId,
     attemptId: attempt.id,
     runId: run.id,
+    baseSha: run.baseSha,
     headSha: head,
     priority: input.priority ?? 0,
   });
@@ -1039,7 +1153,7 @@ export async function completeTask(ctx, input) {
     seq: entry.seq,
     signal,
     waitMs: input.integrationWaitMs,
-    tryDrain: () => tryDrain(ctx, C, W, input),
+    tryDrain: expired => tryDrain(ctx, C, W, input, expired),
   });
   const outcome = done.outcome;
   if (done.status === 'failed') throw Object.assign(new Error(`Project ${outcome.code}`), { code: outcome.code });

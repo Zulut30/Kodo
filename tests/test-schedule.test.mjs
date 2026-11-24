@@ -164,7 +164,12 @@ test('Scheduler orders observed file durations longest first and retains every d
 test('The wave factory suites run in their own command and CI step, outside default discovery', async () => {
   const { discoverTests, separateSuites } = await import(scheduleUrl);
   // With them, one L2 command reached its fixed Windows deadline (runs 45410439061, 45418257242).
-  assert.deepEqual(separateSuites, ['tests/project-wave-director.test.mjs', 'tests/project-wave-e2e.test.mjs']);
+  // Stage 15B added the parallel engine suite (concurrent completions with real task-fast and merges).
+  assert.deepEqual(separateSuites, [
+    'tests/project-wave-director.test.mjs',
+    'tests/project-wave-e2e.test.mjs',
+    'tests/project-parallel-engine.test.mjs',
+  ]);
   const discovered = discoverTests(root).map(file => path.relative(root, file).replaceAll('\\', '/'));
   for (const suite of separateSuites) {
     assert.ok(!discovered.includes(suite), `${suite} is not in the default suite`);
