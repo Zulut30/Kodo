@@ -250,6 +250,18 @@ function readYamlBlockScalar(lines, startIndex, baseIndent) {
   return { text: collected.join(' — '), nextIndex: k };
 }
 
+function splitTapDirective(rawDesc) {
+  for (let idx = 0; idx < rawDesc.length; idx++) {
+    if (rawDesc[idx] !== '#') continue;
+    let slashes = 0;
+    for (let k = idx - 1; k >= 0 && rawDesc[k] === '\\'; k--) slashes++;
+    if (slashes % 2 === 1) continue;
+    const match = /^\s*(TODO|SKIP)(?:\s|$)/i.exec(rawDesc.slice(idx + 1));
+    if (match) return { directive: match[1].toUpperCase(), name: rawDesc.slice(0, idx).trim() };
+  }
+  return { directive: null, name: rawDesc.trim() };
+}
+
 function parseNodeTestTap(text) {
   const items = [];
   const failingTests = [];
@@ -257,7 +269,15 @@ function parseNodeTestTap(text) {
   for (let i = 0; i < lines.length; i++) {
     const match = /^\s*not ok \d+\s*(?:-\s*)?(.+?)\s*$/.exec(lines[i]);
     if (!match) continue;
-    const testName = match[1].trim();
+    const { directive, name: testName } = splitTapDirective(match[1]);
+    if (directive === 'TODO' || directive === 'SKIP') {
+      if (lines[i + 1]?.trim() === '---') {
+        let j = i + 2;
+        while (j < lines.length && lines[j].trim() !== '...') j++;
+        i = j;
+      }
+      continue;
+    }
     if (!testName) continue;
     failingTests.push(testName);
     let file = null,

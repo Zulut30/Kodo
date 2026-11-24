@@ -244,3 +244,34 @@ test('diagnostic-pack redacts secrets before 320-char truncation, reserves room 
   assert.equal(rustPack.items[1].file, 'src/lib.rs');
   assert.equal(rustPack.items[1].line, 10);
 });
+
+test('G8: TAP # TODO and # SKIP directives are ignored before building items and failingTests (real Node 24 output)', async () => {
+  const realTapTodoSkip = await readFile(path.join(fixturesDir, 'node24-tap-todo-skip.txt'), 'utf8');
+  assert.match(realTapTodoSkip, /^# fail 1$/m);
+  assert.match(realTapTodoSkip, /^# todo 50$/m);
+  assert.match(realTapTodoSkip, /^# skipped 1$/m);
+
+  const pack = buildDiagnosticPack({ stdout: realTapTodoSkip });
+  assert.equal(pack.items.length, 1, `expected only the 1 real failure, got ${pack.items.length}`);
+  assert.deepEqual(pack.failingTests, ['only real failure']);
+  assert.match(pack.items[0].message, /real regression/);
+
+  // Also verify not ok with # SKIP directive is excluded, while an escaped \# TODO in a real failure name is kept.
+  const syntheticTap = [
+    'TAP version 13',
+    'not ok 1 - skipped check # SKIP not supported on this OS',
+    '  ---',
+    "  error: 'should be ignored'",
+    '  ...',
+    'not ok 2 - todo check # todo',
+    'not ok 3 - real test with \\# TODO in name',
+    '  ---',
+    "  location: 'tests/real.test.mjs:12:1'",
+    "  error: 'real failure'",
+    '  ...',
+  ].join('\n');
+  const synthPack = buildDiagnosticPack({ stdout: syntheticTap });
+  assert.equal(synthPack.items.length, 1);
+  assert.deepEqual(synthPack.failingTests, ['real test with \\# TODO in name']);
+  assert.match(synthPack.items[0].message, /real failure/);
+});
