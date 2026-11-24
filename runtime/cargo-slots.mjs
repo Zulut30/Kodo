@@ -7,13 +7,14 @@ import { noLinks } from './toolchains.mjs';
 
 // An OS-backed exclusive writer lock per slot. No TTL can expire mid-build;
 // process death closes the handle. Never hold the main Store writer lock.
-function trySlot(filename) {
-  const db = new DatabaseSync(filename, { timeout: 0 });
+export function tryCargoLock(filename, open = () => new DatabaseSync(filename, { timeout: 0 })) {
+  let db;
   try {
+    db = open();
     db.exec('BEGIN IMMEDIATE');
     return db;
   } catch (error) {
-    db.close();
+    db?.close();
     if ((error.errcode & 0xff) === 5) return null;
     throw error;
   }
@@ -21,7 +22,9 @@ function trySlot(filename) {
 
 async function sccachePath(env) {
   const variable = Object.keys(env).find(name => name.toUpperCase() === 'PATH');
-  for (const folder of (env[variable] ?? '').split(path.delimiter).filter(path.isAbsolute)) {
+  for (const entry of (env[variable] ?? '').split(path.delimiter)) {
+    const folder = process.platform === 'win32' ? entry.replace(/^"(.*)"$/, '$1') : entry;
+    if (!path.isAbsolute(folder)) continue;
     const file = path.join(folder, process.platform === 'win32' ? 'sccache.exe' : 'sccache');
     try {
       await access(file, constants.X_OK);
@@ -50,7 +53,7 @@ export async function withCargoSlot({ home, projectId, maxHeavyBuilds = 1, sccac
     for (let n = 1; n <= maxHeavyBuilds; n++) {
       const lock = path.join(pool, `slot-${n}.sqlite`);
       await noLinks(lock);
-      const db = trySlot(lock);
+      const db = tryCargoLock(lock);
       if (!db) continue;
       try {
         const target = path.join(pool, projectId, `slot-${n}`);
@@ -59,9 +62,16 @@ export async function withCargoSlot({ home, projectId, maxHeavyBuilds = 1, sccac
         const inherited = Object.fromEntries(
           Object.entries(env).filter(
             ([key]) =>
-              !['RUSTC_WRAPPER', 'CARGO_TARGET_DIR', 'CARGO_NET_OFFLINE', 'RUSTUP_AUTO_INSTALL'].includes(
-                key.toUpperCase(),
-              ),
+              ![
+                'RUSTC_WRAPPER',
+                'RUSTC_WORKSPACE_WRAPPER',
+                'CARGO_BUILD_RUSTC_WRAPPER',
+                'CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER',
+                'CARGO_BUILD_TARGET_DIR',
+                'CARGO_TARGET_DIR',
+                'CARGO_NET_OFFLINE',
+                'RUSTUP_AUTO_INSTALL',
+              ].includes(key.toUpperCase()),
           ),
         );
         /** @type {NodeJS.ProcessEnv} */

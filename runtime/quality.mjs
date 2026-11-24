@@ -585,7 +585,9 @@ function rustWorkspaceRoots(documents) {
   for (const [name, doc] of documents) {
     if (path.posix.basename(name) !== 'Cargo.toml' || !doc.workspace) continue;
     const root = dir(name);
-    for (const member of cargoMembers(documents, root).keys()) roots.set(member, root);
+    for (const member of cargoMembers(documents, root).keys()) {
+      if (!roots.has(member) || roots.get(member).length < root.length) roots.set(member, root);
+    }
   }
   return roots;
 }

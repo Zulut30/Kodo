@@ -911,7 +911,12 @@ export async function completeTask(ctx, input) {
       const defect =
         (await inspectSubmission(ctx.engine, run, task, head)) ??
         (await verifySubmission(ctx, run, task, head, signal));
-      if (defect) return { status: 'checks_failed', ...defect, revision: snapshot.revision };
+      if (defect)
+        return {
+          status: defect.code === 'cargo_fetch_failed' ? 'blocked' : 'checks_failed',
+          ...defect,
+          revision: snapshot.revision,
+        };
     }
     return integrateCompletion(ctx, C, { ...input, deferGate }, run);
   });

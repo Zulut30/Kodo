@@ -37,37 +37,41 @@ function relative(file) {
 }
 async function git(project, args, input) {
   const options = { cwd: project, input, env: workerEnvironment(), rawOutput: true, timeoutMs: 30000 };
-  if (args[0] === 'status') {
-    // Status itself can run clean/process filters when an equal-size tracked
-    // file needs rehashing. Inspect names only; suppress drivers for this child,
-    // without reading their commands, editing config or trusting their output.
-    const config = await execute(
-      'git',
-      ['config', '--null', '--name-only', '--get-regexp', '^filter\\..*\\.(clean|smudge|process|required)$'],
-      { ...options, allowFailure: true },
-    );
-    const keys = config.stdout.split('\0').filter(Boolean);
-    if (![0, 1].includes(config.code) || config.stdout.length > 65536 || keys.length > 256)
-      throw new Error('Unknown Git filter configuration');
-    const drivers = sorted(
-      keys.map(key => {
-        const match = /^(filter\.[^\x00-\x20=\x7f]+)\.(?:clean|smudge|process|required)$/i.exec(key);
-        if (!match) throw new Error('Unknown Git filter configuration');
-        return match[1];
-      }),
-    );
-    args = [
-      ...drivers.flatMap(driver =>
-        ['clean', 'smudge', 'process', 'required'].flatMap(key => [
-          '-c',
-          `${driver}.${key}=${key === 'required' ? 'false' : ''}`,
-        ]),
-      ),
-      ...args,
-    ];
-  }
+  if (args[0] === 'status') return gitWithoutFilters(project, args, options.timeoutMs);
   return (await execute('git', args, options)).stdout;
 }
+export async function gitWithoutFilters(project, args, timeoutMs = 120000) {
+  const options = { cwd: project, env: workerEnvironment(), rawOutput: true, timeoutMs };
+  // Status itself can run clean/process filters when an equal-size tracked
+  // file needs rehashing. Inspect names only; suppress drivers for this child,
+  // without reading their commands, editing config or trusting their output.
+  const config = await execute(
+    'git',
+    ['config', '--null', '--name-only', '--get-regexp', '^filter\\..*\\.(clean|smudge|process|required)$'],
+    { ...options, allowFailure: true },
+  );
+  const keys = config.stdout.split('\0').filter(Boolean);
+  if (![0, 1].includes(config.code) || config.stdout.length > 65536 || keys.length > 256)
+    throw new Error('Unknown Git filter configuration');
+  const drivers = sorted(
+    keys.map(key => {
+      const match = /^(filter\.[^\x00-\x20=\x7f]+)\.(?:clean|smudge|process|required)$/i.exec(key);
+      if (!match) throw new Error('Unknown Git filter configuration');
+      return match[1];
+    }),
+  );
+  args = [
+    ...drivers.flatMap(driver =>
+      ['clean', 'smudge', 'process', 'required'].flatMap(key => [
+        '-c',
+        `${driver}.${key}=${key === 'required' ? 'false' : ''}`,
+      ]),
+    ),
+    ...args,
+  ];
+  return (await execute('git', args, options)).stdout;
+}
+
 async function revision(project, value) {
   if (typeof value !== 'string' || !/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(value))
     throw new Error('Affected graph requires a full commit SHA');

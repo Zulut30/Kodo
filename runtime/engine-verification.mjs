@@ -646,7 +646,17 @@ export class EngineVerification extends EngineExecution {
       } catch (error) {
         if (signal?.aborted || this.store.getRun(run.id).cancelRequested)
           throw Object.assign(new Error('Запуск отменён'), { code: 'cancelled' });
-        if (['cancelled', 'quota', 'auth', 'lease_lost', 'evidence_integrity', 'behavior_blocked'].includes(error.code))
+        if (
+          [
+            'cancelled',
+            'quota',
+            'auth',
+            'lease_lost',
+            'evidence_integrity',
+            'behavior_blocked',
+            'cargo_fetch_failed',
+          ].includes(error.code)
+        )
           throw error;
         checkError = error;
       }

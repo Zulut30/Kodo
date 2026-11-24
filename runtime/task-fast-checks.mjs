@@ -16,13 +16,13 @@ import { isDeepStrictEqual } from 'node:util';
 import { performance } from 'node:perf_hooks';
 import { execute } from './command.mjs';
 import { git } from './workspace.mjs';
-import { validateCommandTimeouts } from './config.mjs';
+import { FAST_CHECK_TIMEOUT_MS, fastCheckTimeout, validateCommandTimeouts } from './config.mjs';
 import { stateHome, workerEnvironment } from './security.mjs';
 import { inspectCurrentSource, planAffected } from './ci-graph.mjs';
 import { cacheFingerprint, readCheckCache, writeCheckCache } from './ci-cache.mjs';
 
 export const TASK_FAST_PROFILE = 'task-fast';
-export const FAST_CHECK_TIMEOUT_MS = 120000;
+export { fastCheckTimeout, FAST_CHECK_TIMEOUT_MS };
 /**
  * The algorithm that counts passed `node --test` tests: the events of Kodo's own reporter
  * (`runtime/test-count-reporter.mjs`), never the text of the summary. Since 5 an npm script command
@@ -44,25 +44,6 @@ const fail = (message, code) => Object.assign(new Error(message), { code });
 const javascript = file => /\.[cm]?js$/.test(file);
 const lockFile = /(?:^|\/)(?:package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb?)$/;
 const executionReasons = ['cancelled', 'timeout', 'invalid_output', 'command_failed', 'ENOENT', 'EACCES', 'EPERM'];
-
-/**
- * The hard per-command timeout of the profile.
- * @param {{ fastChecks?: { timeoutMs?: number }, config?: any }} run
- * @param {number} defaultMs
- * @returns {number}
- */
-export function fastCheckTimeout(run, defaultMs = FAST_CHECK_TIMEOUT_MS) {
-  const settings = run.fastChecks === undefined ? run.config?.fastChecks : run.fastChecks;
-  const invalid = () =>
-    fail('Некорректный fastChecks.timeoutMs: требуется целое число от 1 до 2147483647 мс', 'configuration');
-  if (settings === undefined) return defaultMs;
-  if (!settings || typeof settings !== 'object' || Array.isArray(settings)) throw invalid();
-  if (Object.keys(settings).some(key => key !== 'timeoutMs')) throw invalid();
-  const value = settings.timeoutMs;
-  if (value === undefined) return defaultMs;
-  if (!Number.isSafeInteger(value) || value < 1 || value > 2147483647) throw invalid();
-  return value;
-}
 
 // Node options Kodo knows: 'flag' takes no value, 'value' takes the next argument unless written
 // as --name=value. Any other option makes the command line ambiguous: Kodo cannot tell whether
@@ -727,13 +708,18 @@ export async function executeCounted(launch, counting, options, roots) {
   return { ...execution, npm, recorded, observed: npm ? { ...recorded, count: npm.logged } : {} };
 }
 
+const cargoCommand = step => {
+  const name = path.basename(step.command);
+  return process.platform === 'win32' ? /^cargo(?:\.exe)?$/i.test(name) : name === 'cargo';
+};
+const plainCargo = step =>
+  cargoCommand(step) &&
+  step.args[0] === 'test' &&
+  (step.args.length === 1 || (step.args.length === 2 && step.args[1] === '--workspace'));
 async function rustFastPlan({ run, cwd, baseSha, headSha, configured }) {
-  if (!(await lstat(path.join(cwd, 'Cargo.toml')).catch(() => null))?.isFile()) return null;
+  const manifest = await lstat(path.join(cwd, 'Cargo.toml')).catch(() => null);
+  if (!manifest?.isFile() && !manifest?.isSymbolicLink()) return null;
   const timeoutMs = fastCheckTimeout(run, 600000);
-  const plainCargo = step =>
-    path.basename(step.command).replace(/\.exe$/i, '') === 'cargo' &&
-    step.args[0] === 'test' &&
-    (step.args.length === 1 || (step.args.length === 2 && step.args[1] === '--workspace'));
   const useDefault =
     !configured.length ||
     (configured.length === 1 &&
@@ -743,7 +729,7 @@ async function rustFastPlan({ run, cwd, baseSha, headSha, configured }) {
   const selected = useDefault
     ? [{ command: 'cargo', args: ['test'], timeoutMs: configured[0]?.timeoutMs }]
     : configured;
-  if (!selected.some(s => path.basename(s.command).replace(/\.exe$/i, '') === 'cargo')) return null;
+  if (!selected.some(cargoCommand)) return null;
   let graph;
   try {
     const { cargoPlanAt } = await import('./cargo-graph.mjs');
@@ -751,18 +737,10 @@ async function rustFastPlan({ run, cwd, baseSha, headSha, configured }) {
   } catch {
     graph = { changed: [], affectedCrates: [], fallback: true, reasons: ['cargo-graph-error'] };
   }
-  const selectors = graph.fallback ? [['--workspace']] : graph.affectedCrates.map(name => ['-p', name]);
-  const commands = selected.flatMap(step => {
-    if (!plainCargo(step)) return fullCommands([step], timeoutMs);
-    return ['check', 'test'].flatMap(kind =>
-      selectors.map(selector => ({
-        kind,
-        command: step.command,
-        args: [kind, ...selector, ...(kind === 'check' ? ['--tests'] : [])],
-        timeoutMs: Math.min(step.timeoutMs ?? timeoutMs, timeoutMs),
-      })),
-    );
-  });
+  const selector = graph.fallback ? ['--workspace'] : graph.packageSpecs.flatMap(spec => ['-p', spec]);
+  const commands = fullCommands(selected, timeoutMs).map(step =>
+    plainCargo(step) ? { ...step, args: ['test', ...selector] } : step,
+  );
   return {
     schemaVersion: 1,
     profile: TASK_FAST_PROFILE,
@@ -1049,13 +1027,22 @@ async function runStep({ engine, run, step, headSha, env, cache, counting, signa
   return { row };
 }
 
+export function fullFastFallback(run, plan) {
+  const timeoutMs = fastCheckTimeout(run, plan.rust ? 600000 : FAST_CHECK_TIMEOUT_MS);
+  const configured = run.config.commands.test || [];
+  const commands = fullCommands(configured, timeoutMs).map(step =>
+    plan.rust && plainCargo(step) ? { ...step, args: ['test', '--workspace'] } : step,
+  );
+  return { ...plan, affected: [], testFiles: [], fallback: true, reasons: ['no-tests-executed'], commands };
+}
+
 /**
  * Run the fast plan on the clean HEAD of `run.cwd` and record `run.checks`.
  * Throws `check_failed`, `fast_check_timeout` or `dirty_worktree` like the full checks do.
  * @param {{ engine: any, run: any, signal?: AbortSignal, maxHeavyBuilds?:number }} input
  */
 export async function runFastChecks({ engine, run, signal, maxHeavyBuilds = 1 }) {
-  const timeoutMs = fastCheckTimeout(run);
+  fastCheckTimeout(run);
   validateCommandTimeouts(run.config.commands);
   await engine.setup(run.cwd, run, signal);
   const headSha = await git(run.cwd, ['rev-parse', 'HEAD']);
@@ -1066,14 +1053,7 @@ export async function runFastChecks({ engine, run, signal, maxHeavyBuilds = 1 })
   if (outcome.noTests) {
     // The narrowed run executed no test: run the configured commands.test in full instead.
     engine.log(run, 'fast_checks_no_tests', { headSha, testFiles: plan.testFiles.length });
-    plan = {
-      ...plan,
-      affected: [],
-      testFiles: [],
-      fallback: true,
-      reasons: ['no-tests-executed'],
-      commands: fullCommands(run.config.commands.test || [], timeoutMs),
-    };
+    plan = fullFastFallback(run, plan);
     if (!plan.commands.length) throw new Error('Не настроена команда проверки результата');
     outcome = await executePlan({ engine, run, plan, headSha, signal, maxHeavyBuilds });
   }
@@ -1155,6 +1135,20 @@ async function executePlanSteps({ engine, run, plan, headSha, signal }, env) {
     results,
   };
   engine.save(run);
+  if (plan.rust) {
+    const { warmCargoDependencies } = await import('./cargo-fetch.mjs');
+    const step = plan.commands.find(cargoCommand);
+    await warmCargoDependencies({
+      home: engine.store.home,
+      cwd: run.cwd,
+      command: step.command,
+      env,
+      signal,
+      timeoutMs: step.timeoutMs,
+      secrets: engine.secrets,
+    });
+    await assertClean(run.cwd, headSha, 'После cargo fetch изменились проверяемые файлы или HEAD');
+  }
   const cache = plan.rust || plan.fallback ? null : await cacheContext(run, plan, headSha, env);
   const tests = plan.commands.filter(step => step.kind === 'test');
   // A simple npm script command is also counted by the plain `node --test` of the checked commit's package.json.
