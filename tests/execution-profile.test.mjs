@@ -55,3 +55,23 @@ test('A1 capacity counts each active pool, each machine and unassigned attempts'
   };
   assert.equal(freeWorkerSlots(smallerMachine, 0, busy), 4, 'shrinking the occupied machine leaves four slots on y');
 });
+
+const fourSlots = {
+  subscriptions: [{ id: 'sub', provider: 'codex', model: 'gpt', tier: 'fast', slots: 4 }],
+  machines: [{ id: 'pc', kind: 'local', maxWorkers: 4, maxHeavyBuilds: 1 }],
+};
+const placement = (sub, machine) => ({ subscription: { id: sub }, machine: { id: machine } });
+test('B2 replacement on just one axis charges each attempt once', async () => {
+  const { freeWorkerSlots } = await import('../runtime/execution-profile.mjs');
+  for (const row of [placement('old', 'pc'), placement('sub', 'old')]) {
+    assert.equal(freeWorkerSlots(fourSlots, 0, [row, row]), 2);
+  }
+});
+test('B4 unassigned and removed placements count against the host batch', async () => {
+  const { chargedBriefs } = await import('../runtime/execution-profile.mjs');
+  assert.equal(chargedBriefs(fourSlots, 0, [{}, placement('old', 'pc'), placement('sub', 'old')]), 3);
+});
+test('B5 direct worker assignment respects unknown occupancy', async () => {
+  const { assignWorker } = await import('../runtime/execution-profile.mjs');
+  assert.equal(assignWorker(fourSlots, 0, Array(4).fill(undefined), ['fast']), null);
+});

@@ -65,36 +65,34 @@ export function waveCapacity(profile, now) {
   return profile ? Math.min(total(active(profile, now), 'slots'), total(profile.machines, 'maxWorkers')) : 5;
 }
 
-function remaining(rows, key, kind, occupied) {
-  return rows.reduce(
+function remaining(resources, available, key, kind, occupied) {
+  const unknown = occupied.filter(p => !resources.some(row => row.id === p?.[kind]?.id)).length;
+  return available.reduce(
     (sum, row) => sum + Math.max(0, row[key] - occupied.filter(p => p?.[kind]?.id === row.id).length),
-    0,
+    -unknown,
   );
 }
 
 export function freeWorkerSlots(profile, now, occupied) {
-  const pools = active(profile, now);
-  const subscriptions = remaining(pools, 'slots', 'subscription', occupied);
-  const machines = remaining(profile.machines, 'maxWorkers', 'machine', occupied);
-  const unknown = occupied.filter(
-    p =>
-      !profile.subscriptions.some(s => s.id === p?.subscription?.id) ||
-      !profile.machines.some(m => m.id === p?.machine?.id),
-  ).length;
-  return Math.max(0, Math.min(subscriptions, machines) - unknown);
+  const subscriptions = remaining(profile.subscriptions, active(profile, now), 'slots', 'subscription', occupied);
+  const machines = remaining(profile.machines, profile.machines, 'maxWorkers', 'machine', occupied);
+  return Math.max(0, Math.min(subscriptions, machines));
 }
 
-// Charge this host's replayed briefs only against resources that can still serve
-// the batch. Shrinking a pool below occupancy must leave sibling pools usable.
+// Unassigned briefs consume the batch budget. Known placements charge their
+// active pool up to its current capacity, leaving room for sibling pools.
 export function chargedBriefs(profile, now, briefs) {
-  const pools = active(profile, now);
   const used = new Map(),
     hosts = new Map();
   let count = 0;
   for (const brief of briefs) {
-    const pool = pools.find(s => s.id === brief.subscription?.id);
+    const pool = profile.subscriptions.find(s => s.id === brief.subscription?.id);
     const host = profile.machines.find(m => m.id === brief.machine?.id);
-    if (!pool || !host) continue;
+    if (!pool || !host) {
+      count++;
+      continue;
+    }
+    if (Date.parse(pool.cooldownUntil) > now) continue;
     const p = used.get(pool.id) ?? 0,
       m = hosts.get(host.id) ?? 0;
     if (p >= pool.slots || m >= host.maxWorkers) continue;
@@ -108,7 +106,7 @@ export function chargedBriefs(profile, now, briefs) {
 // Existing attempts keep their original placement. Unassigned attempts (e.g. native runs)
 // still consume global capacity; a paused pool receives no new assignments.
 export function assignWorker(profile, now, occupied, tiers) {
-  if (!profile) return null;
+  if (!profile || !freeWorkerSlots(profile, now, occupied)) return null;
   const free = (rows, kind, key) =>
     rows.filter(row => occupied.filter(p => p?.[kind]?.id === row.id).length < row[key]);
   const pools = free(active(profile, now), 'subscription', 'slots');

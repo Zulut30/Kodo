@@ -1346,3 +1346,79 @@ test('A7 abandoned critical root is assigned heavy on retry', async t => {
   await f.complete('root', a.baseSha, { abandon: true, attemptId: a.attemptId });
   assert.equal((await f.wave({ limit: 1, retryFailed: true })).briefs[0].subscription.tier, 'heavy');
 });
+
+function fourSlotProfile(f) {
+  f.repo.setProfile(f.projectId, {
+    subscriptions: [{ id: 'p', provider: 'codex', model: 'gpt', slots: 4, tier: 'fast' }],
+    machines: [{ id: 'pc', kind: 'local', maxWorkers: 4, maxHeavyBuilds: 1 }],
+  });
+}
+test('B3b profile changes cannot interleave with a pull after its profile read', async t => {
+  const { projectCli } = await import('../runtime/project-cli.mjs');
+  const f = await fixture(t);
+  fourSlotProfile(f);
+  const pause = () =>
+    projectCli(['profile', 'pause-pool', f.projectId, '--subscription', 'p', '--until', '2099-01-01T00:00:00Z'], {
+      home: f.home,
+      secrets: {},
+    });
+  let read = false,
+    raced;
+  const repo = {
+    ...f.repo,
+    getProfile(id) {
+      read = true;
+      return f.repo.getProfile(id);
+    },
+    async snapshot(id) {
+      if (read && !raced) raced = await pause();
+      return f.repo.snapshot(id);
+    },
+  };
+  const wave = await nextWave({ ...f.ctx, repo }, { projectId: f.projectId, host: 't3', limit: 1 });
+  assert.equal(raced.report.result.code, 'project_busy');
+  assert.equal(wave.briefs.length, 1);
+  assert.equal((await pause()).exitCode, 0);
+  assert.equal((await f.wave()).code, 'waiting_limits');
+});
+test('B7 graph errors preserve installed briefs and block new reservations', async t => {
+  const f = await fixture(t);
+  fourSlotProfile(f);
+  const original = await f.wave({ limit: 1 });
+  assert.equal(original.briefs.length, 1);
+  for (const [deps, code] of [
+    [['task-c'], 'project_dependency_cycle'],
+    [['missing'], 'project_dependency_missing'],
+    [['task-a', 'task-a'], 'project_dependency_duplicate'],
+  ]) {
+    const repo = {
+      ...f.repo,
+      snapshot(id) {
+        const s = f.repo.snapshot(id);
+        s.tasks.find(t => t.id === 'task-c').dependsOn = deps;
+        return s;
+      },
+    };
+    const replay = await nextWave(
+      { ...f.ctx, repo },
+      { projectId: f.projectId, host: 't3', limit: 4, retryFailed: true },
+    );
+    assert.deepEqual(replay.briefs, original.briefs);
+    assert.ok(replay.blocked.some(row => row.code === code));
+    assert.equal(f.repo.snapshot(f.projectId).currentAttempts.length, 1);
+  }
+});
+
+test('B4 replay of two legacy briefs fills a two-brief profiled pull', async t => {
+  const f = await fixture(t, {
+    edit(spec) {
+      spec.tasks = Array.from({ length: 4 }, (_, i) => taskSpec('task-' + i));
+    },
+  });
+  const first = await f.wave({ limit: 2 });
+  assert.equal(first.briefs.length, 2);
+  fourSlotProfile(f);
+  const replay = await f.wave({ limit: 2 });
+  assert.deepEqual(replay.briefs, first.briefs);
+  assert.equal(f.repo.snapshot(f.projectId).currentAttempts.length, 2);
+});

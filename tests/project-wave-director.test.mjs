@@ -829,9 +829,7 @@ const reviewProfile = workers => ({
   subscriptions: [{ id: 'p', provider: 'codex', model: 'gpt', tier: 'standard', slots: workers }],
   machines: [{ id: 'pc', kind: 'local', maxWorkers: workers, maxHeavyBuilds: 1 }],
 });
-test('A3 recovering native reservations respects external occupancy, including zero vacancies', async t => {
-  const ids = ['e-one', 'e-two', 'e-three', 'n-one', 'n-two'];
-  const f = await fixture(t, { tasks: ids.map(id => task(id)) });
+async function reserveFixtureAttempts(f, ids) {
   for (const id of ids) {
     await f.repo.apply(
       f.command(f.repo.snapshot(f.id), { op: 'transition', kind: 'task', id, to: 'ready', evidence: [], mappings: [] }),
@@ -841,6 +839,11 @@ test('A3 recovering native reservations respects external occupancy, including z
       actor: id.startsWith('n-') ? 'project-director' : 'project-external:t3',
     });
   }
+}
+test('A3 recovering native reservations respects external occupancy, including zero vacancies', async t => {
+  const ids = ['e-one', 'e-two', 'e-three', 'n-one', 'n-two'];
+  const f = await fixture(t, { tasks: ids.map(id => task(id)) });
+  await reserveFixtureAttempts(f, ids);
   f.repo.setProfile(f.id, reviewProfile(3));
   const wait = await f.director.drain(f.id, { concurrency: 3, maxWaves: 1 });
   assert.deepEqual([wait.status, wait.waves, f.calls.worker.length], ['waiting_limits', 0, 0]);
@@ -868,4 +871,95 @@ test('A8 pause during a native wave takes effect on the next iteration; A5 resum
   assert.equal(paused.exitCode, 0, paused.output);
   assert.deepEqual([result.status, result.waves, f.calls.worker.length], ['waiting_limits', 1, 1]);
   assert.equal((await f.director.resume(f.id)).status, 'waiting_limits');
+});
+
+function placeExternalRuns(f, tasks, subscription) {
+  const ids = new Set(
+    f.repo
+      .snapshot(f.id)
+      .currentAttempts.filter(a => tasks.includes(a.taskId))
+      .map(a => a.runId),
+  );
+  const getRun = f.store.getRun.bind(f.store);
+  f.store.getRun = id =>
+    ids.has(id)
+      ? {
+          executor: { kind: 'external', host: 't3' },
+          workerPlacement: { subscription: { id: subscription }, machine: { id: 'pc' } },
+        }
+      : getRun(id);
+}
+
+for (const mode of ['legacy', 'profile-default', 'profile-resume']) {
+  test('B1 external attempts leave native capacity for ' + mode, async t => {
+    const ids = ['e-one', 'e-two', 'e-three', 'n-one', 'n-two'];
+    const f = await fixture(t, { tasks: ids.map(id => task(id)) });
+    await reserveFixtureAttempts(f, ids);
+    if (mode !== 'legacy') {
+      const profile = reviewProfile(8);
+      if (mode === 'profile-resume') {
+        profile.subscriptions[0].slots = 5;
+        profile.subscriptions.push({
+          ...profile.subscriptions[0],
+          id: 'paused',
+          slots: 3,
+          cooldownUntil: '2099-01-01T00:00:00Z',
+        });
+        placeExternalRuns(f, ids.slice(0, 3), 'paused');
+      }
+      f.repo.setProfile(f.id, profile);
+    }
+    const result =
+      mode === 'profile-resume'
+        ? await f.director.resume(f.id)
+        : await f.director.drain(f.id, mode === 'legacy' ? { concurrency: 3, maxWaves: 1 } : { maxWaves: 1 });
+    assert.equal(result.waves, 1, result.status);
+    assert.equal(f.calls.worker.length, mode === 'profile-resume' ? 1 : 2);
+  });
+}
+test('B3a a pause inside an epic gate applies before the next admission', async t => {
+  let paused;
+  const f = await fixture(t, {
+    tasks: [task('alpha', { epicId: 'first' }), task('beta', { epicId: 'second', dependsOn: ['alpha'] })],
+    hooks: {
+      onReview: async () => {
+        const { projectCli } = await import('../runtime/project-cli.mjs');
+        paused = await projectCli(
+          ['profile', 'pause-pool', f.id, '--subscription', 'p', '--until', '2099-01-01T00:00:00Z'],
+          { home: f.home, secrets: {} },
+        );
+      },
+    },
+  });
+  f.repo.setProfile(f.id, reviewProfile(1));
+  const result = await f.director.drain(f.id);
+  assert.equal(paused.exitCode, 0, paused.output);
+  assert.deepEqual(f.calls.worker, ['alpha']);
+  assert.equal(result.status, 'waiting_limits');
+  assert.equal(
+    f.repo.snapshot(f.id).currentAttempts.some(a => a.taskId === 'beta'),
+    false,
+  );
+});
+test('B6 drain blockers use the same horizon as a one-slot selection', async t => {
+  const busy = Array.from({ length: 14 }, (_, i) => 'e-' + i);
+  const tasks = [
+    ...busy.map(id => task(id)),
+    ...Array.from({ length: 29 }, (_, i) => task('waiting-' + i, { writePaths: [busy[0] + '.txt'] })),
+  ];
+  const f = await fixture(t, { tasks });
+  await reserveFixtureAttempts(f, busy);
+  const profile = reviewProfile(1);
+  profile.machines[0].maxWorkers = 15;
+  profile.subscriptions.push({
+    ...profile.subscriptions[0],
+    id: 'paused',
+    slots: 14,
+    cooldownUntil: '2099-01-01T00:00:00Z',
+  });
+  f.repo.setProfile(f.id, profile);
+  placeExternalRuns(f, busy, 'paused');
+  const result = await f.director.drain(f.id, { concurrency: 64 });
+  assert.equal(result.status, 'blocked');
+  assert.ok(!result.blockers.some(row => row.code === 'horizon_limit'), JSON.stringify(result.blockers));
 });

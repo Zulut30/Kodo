@@ -298,12 +298,12 @@ export async function waveAvailability(ctx, snapshot) {
   return rows;
 }
 
-const horizonOf = async (ctx, snapshot, options) =>
+const horizonOf = async (ctx, snapshot, options, slots, active) =>
   planProjectHorizon(
     {
       snapshot,
       profiledWave: options.profiledWave,
-      limit: options.profiledWave ? waveHorizon(options.windowSize) : 24,
+      limit: options.profiledWave ? waveHorizon(slots, active.external.length, options.windowSize) : 24,
       availability: await waveAvailability(ctx, snapshot),
       now: ctx.clock(),
     },
@@ -1210,8 +1210,7 @@ export async function attemptExecutor({ repo, store }, snapshot, attempt) {
 
 // Native attempts still open (crash or quota mid-wave) and tasks in flight elsewhere
 // (external chats, or a reservation of an unknown owner): never executed by the drain.
-async function activeAttempts(ctx, projectId) {
-  const snapshot = await snapshotOf(ctx, projectId);
+async function activeAttempts(ctx, snapshot) {
   const native = [],
     external = [],
     externalPlacements = [];
@@ -1232,10 +1231,9 @@ async function activeAttempts(ctx, projectId) {
 }
 
 function nativeSlots(options, active) {
-  const window = Math.max(0, options.requested - active.external.length);
   return options.profile
-    ? Math.min(window, freeWorkerSlots(options.profile, options.now, active.externalPlacements))
-    : window;
+    ? Math.min(options.concurrency, freeWorkerSlots(options.profile, options.now, active.externalPlacements))
+    : options.concurrency;
 }
 
 // `--retry-failed`: one new attempt per failed task, disjoint scopes, at most `concurrency`.
@@ -1243,12 +1241,13 @@ function nativeSlots(options, active) {
 // attempts; a task an external chat abandoned is retried by `next-wave --retry-failed`.
 async function reserveRetries(ctx, projectId, options, control, state) {
   let snapshot = await snapshotOf(ctx, projectId);
-  const horizon = await horizonOf(ctx, snapshot, options);
-  const active = await activeAttempts(ctx, projectId);
+  const active = await activeAttempts(ctx, snapshot);
+  const slots = nativeSlots(options, active);
+  const horizon = await horizonOf(ctx, snapshot, options, slots, active);
   const taken = [...active.native.map(row => row.taskId), ...active.external].map(
     id => taskOf(snapshot, id).writePaths,
   );
-  const available = nativeSlots(options, active) - active.native.length;
+  const available = options.profile ? slots - active.native.length : options.concurrency;
   let count = 0;
   for (const attempt of snapshot.currentAttempts.filter(row => retryStates.includes(row.status))) {
     const task = taskOf(snapshot, attempt.taskId);
@@ -1277,9 +1276,8 @@ async function reserveRetries(ctx, projectId, options, control, state) {
   }
 }
 
-async function noProgress(ctx, projectId, state, options) {
-  const snapshot = await snapshotOf(ctx, projectId);
-  const horizon = await horizonOf(ctx, snapshot, options);
+async function noProgress(ctx, snapshot, state, options, slots, active) {
+  const horizon = await horizonOf(ctx, snapshot, options, slots, active);
   const rows = horizon.blocked.filter(row => !reached(taskOf(snapshot, row.taskId).status, 'integrated'));
   for (const row of rows)
     state.blockers.push({ code: row.reasons[0], kind: 'task', id: row.taskId, reasons: row.reasons });
@@ -1337,27 +1335,29 @@ async function drainLoop(ctx, projectId, options, control, state) {
     retry = options.retryFailed;
   for (;;) {
     control.check();
-    let stop = controlState(await snapshotOf(ctx, projectId));
+    let snapshot = await snapshotOf(ctx, projectId);
+    let stop = controlState(snapshot);
     if (stop) return finish(ctx, projectId, state, stop);
     Object.assign(options, drainWindow(ctx, projectId, options.requested));
     if (!options.concurrency) return finish(ctx, projectId, state, pending || 'waiting_limits');
     if (retry) {
       retry = false;
       await reserveRetries(ctx, projectId, options, control, state);
+      snapshot = await snapshotOf(ctx, projectId);
     }
-    const active = await activeAttempts(ctx, projectId);
-    const slots = nativeSlots(options, active);
-    if (!pending && active.native.length) {
+    const recovering = await activeAttempts(ctx, snapshot);
+    if (!pending && recovering.native.length) {
+      const slots = nativeSlots(options, recovering);
       if (!slots) return finish(ctx, projectId, state, 'waiting_limits');
       if (state.waves >= options.maxWaves) return finish(ctx, projectId, state, 'max_waves');
-      pending = await executeWave(ctx, projectId, active.native.slice(0, slots), options, control, state);
+      pending = await executeWave(ctx, projectId, recovering.native.slice(0, slots), options, control, state);
       continue;
     }
     if (['cancelled', 'paused'].includes(pending)) return finish(ctx, projectId, state, pending);
     const gates = await runPendingGates(ctx, { projectId, signal: control.signal, retryFailed: options.retryFailed });
     state.gates.push(...gates.gates);
     state.blockers.push(...gates.blocked);
-    const snapshot = await snapshotOf(ctx, projectId);
+    snapshot = await snapshotOf(ctx, projectId);
     if (settled(snapshot.project.status)) return finish(ctx, projectId, state, 'accepted');
     stop = controlState(snapshot);
     if (stop || control.signal.aborted) return finish(ctx, projectId, state, stop || 'cancelled');
@@ -1370,6 +1370,10 @@ async function drainLoop(ctx, projectId, options, control, state) {
       );
     if (pending) return finish(ctx, projectId, state, pending);
     if (state.waves >= options.maxWaves) return finish(ctx, projectId, state, 'max_waves');
+    // A gate can run long enough for another connection to change the profile.
+    Object.assign(options, drainWindow(ctx, projectId, options.requested));
+    const active = await activeAttempts(ctx, snapshot);
+    const slots = nativeSlots(options, active);
     if (!slots) return finish(ctx, projectId, state, 'waiting_limits');
     const taskIds = selectWave(snapshot, {
       limit: slots,
@@ -1379,7 +1383,8 @@ async function drainLoop(ctx, projectId, options, control, state) {
       availability: await waveAvailability(ctx, snapshot),
       now: ctx.clock(),
     });
-    if (!taskIds.length) return finish(ctx, projectId, state, await noProgress(ctx, projectId, state, options));
+    if (!taskIds.length)
+      return finish(ctx, projectId, state, await noProgress(ctx, snapshot, state, options, slots, active));
     const attempts = [];
     for (const taskId of taskIds) attempts.push(await admitTask(ctx, projectId, taskId, options, control));
     pending = await executeWave(ctx, projectId, attempts, options, control, state);
