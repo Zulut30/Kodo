@@ -28,6 +28,7 @@ import { deliver, releasePackage, prepareReleaseVersion, reconcileDelivery } fro
 import { loadDefaultPolicy } from './skill-policy.mjs';
 import { buildTaskContext, validateTaskContract } from './task-context.mjs';
 import { compactPlanEvidence, measureContext } from './context-pack.mjs';
+import { packWaveContextBlocks } from './wave-context.mjs';
 import { isManagedRtkReady, rtkWorkerEnvironment } from './rtk.mjs';
 import { writeProgress, assertPrivateArtifactPath } from './progress.mjs';
 import { resolveTool, formatToolContext } from './tools.mjs';
@@ -859,6 +860,22 @@ try {
           const rendered = renderSessionPrompt(request, this.secrets);
           const knowledge = await this.nativeKnowledge(run, request.cwd, node, identity);
           const references = [...(request.contextMetrics?.references || []), ...knowledge.references];
+          const baseSections = [
+            { name: 'guidance', bytes: measureContext(guidance), mandatory: true },
+            ...promptSections(request, this.secrets),
+            ...(knowledge.text ? [{ name: 'knowledge', bytes: measureContext(knowledge.text), mandatory: false }] : []),
+          ];
+          const waveBlocks =
+            run.waveContext && (stage === 'plan' || node != null)
+              ? packWaveContextBlocks({
+                  apiCards: run.waveContext.apiCards,
+                  baseSha: run.waveContext.baseSha || run.baseSha || '',
+                  verifiedLessons: run.waveContext.verifiedLessons,
+                  diagnostics: run.waveContext.diagnostics,
+                  limitBytes: run.config.budgets?.contextBytes ?? null,
+                  baseUsedBytes: baseSections.reduce((sum, sec) => sum + sec.bytes, 0),
+                })
+              : null;
           // Sizes and hashes only: the manifest never holds prompt text.
           const manifest = buildContextManifest({
             runId: run.id,
@@ -866,16 +883,10 @@ try {
             node: node?.id ?? null,
             headSha: run.headSha || run.baseSha || null,
             limitBytes: run.config.budgets?.contextBytes ?? null,
-            sections: [
-              { name: 'guidance', bytes: measureContext(guidance), mandatory: true },
-              ...promptSections(request, this.secrets),
-              ...(knowledge.text
-                ? [{ name: 'knowledge', bytes: measureContext(knowledge.text), mandatory: false }]
-                : []),
-            ],
+            sections: [...baseSections, ...(waveBlocks?.sections ?? [])],
             references,
           });
-          request = { ...request, prompt: guidance + rendered + knowledge.text };
+          request = { ...request, prompt: guidance + rendered + knowledge.text + (waveBlocks?.text ?? '') };
           localBytes = {
             promptBytes: measureContext(request.prompt),
             contextOriginalBytes: request.contextMetrics?.originalBytes ?? null,

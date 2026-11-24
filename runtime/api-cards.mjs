@@ -983,6 +983,11 @@ function parseCatFileBatchOutput(buffer) {
   return contents;
 }
 
+/**
+ * @param {string} cwd
+ * @param {string[]} oids
+ * @param {{ signal?: AbortSignal, cache?: any }} [options]
+ */
 function readBlobsBatch(cwd, oids, { signal, cache } = {}) {
   if (signal?.aborted) return Promise.reject(cancelledError());
   const unique = [...new Set(oids.filter(Boolean))];

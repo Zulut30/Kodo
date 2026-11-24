@@ -1212,7 +1212,15 @@ test('next-wave and complete-task require a pull host, a bound limit and a wave 
 });
 
 test('Worker roles are short profiles; an unknown owner gets the developer profile', () => {
-  assert.deepEqual(WORKER_ROLES, ['architect', 'developer', 'integrator', 'ui-qa', 'performance', 'security', 'reviewer']);
+  assert.deepEqual(WORKER_ROLES, [
+    'architect',
+    'developer',
+    'integrator',
+    'ui-qa',
+    'performance',
+    'security',
+    'reviewer',
+  ]);
   for (const role of WORKER_ROLES) {
     const profile = workerRole(role);
     assert.equal(profile.role, role);

@@ -238,7 +238,8 @@ export function packWaveContextBlocks({
 
   const candidateDiagnostics = formatWaveDiagnostics(diagnostics);
   const diagnosticsFits =
-    Boolean(candidateDiagnostics) && (limitBytes === null || usedBytes + measureContext(candidateDiagnostics) <= limitBytes);
+    Boolean(candidateDiagnostics) &&
+    (limitBytes === null || usedBytes + measureContext(candidateDiagnostics) <= limitBytes);
   const diagnosticsBlock = diagnosticsFits ? candidateDiagnostics : '';
   const keptDiagnostics = diagnosticsFits ? diagnostics : null;
   if (diagnosticsBlock) usedBytes += measureContext(diagnosticsBlock);
