@@ -1210,6 +1210,7 @@ export function lintMilestone(milestone, snapshot, options = {}) {
   const raw = new Map(milestone.tasks.map(task => [task.id, task.dependsOn]));
   const fresh = normalized.tasks.map(task => ({ ...task, dependsOn: raw.get(task.id) }));
   const ancestors = taskAncestors(fresh);
+  const allAncestors = taskAncestors([...current.tasks, ...fresh]);
   const others = current.tasks.filter(task => ![...CLOSED, 'cancelled'].includes(task.status));
   const pairs = parallelOverlaps(normalized.tasks, { ancestors, others });
   const inputFindings = taskInputFindings({
@@ -1229,8 +1230,9 @@ export function lintMilestone(milestone, snapshot, options = {}) {
     ...overlapFindings(pairs, [...normalized.tasks, ...others]),
     ...moduleOwnerFindings(normalized, {
       parallelPairs: pairs,
-      existingTasks: current.tasks,
+      existingTasks: others,
       existingEpics: current.epics,
+      ancestors: allAncestors,
     }),
     ...inputFindings,
     ...taskScopeSizeFindings(normalized.tasks, alreadyOversized),

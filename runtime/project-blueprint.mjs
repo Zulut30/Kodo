@@ -617,11 +617,17 @@ function indexOwnersByModule(tasks, foundationEpics) {
   return byModule;
 }
 
+const CLOSED_OWNER_STATUSES = new Set(['accepted', 'released', 'cancelled']);
+
 /** Reject tasks without an unambiguous module/write owner: unbounded catch-all scopes
  * or multiple non-foundation epics claiming write ownership of the same module.
- * When `existingTasks`/`existingEpics` are supplied (`append-milestone`), only new
- * tasks in `spec.tasks` are linted against existing owners; accepted milestones are never re-linted. */
-export function moduleOwnerFindings(spec, { parallelPairs = [], existingTasks = [], existingEpics = [] } = {}) {
+ * When `existingTasks`/`existingEpics` are supplied (`append-milestone`), only non-closed
+ * existing tasks count as active module owners, and a new task that transitively depends
+ * on all existing owners of a module is a sequential extension, not a conflict. */
+export function moduleOwnerFindings(
+  spec,
+  { parallelPairs = [], existingTasks = [], existingEpics = [], ancestors = null } = {},
+) {
   const findings = [];
   const unbounded = spec.tasks.filter(task => (task.writePaths ?? []).some(isUnboundedWritePath)).map(task => task.id);
   if (unbounded.length) {
@@ -638,9 +644,11 @@ export function moduleOwnerFindings(spec, { parallelPairs = [], existingTasks = 
       .filter(epic => epic.id === FOUNDATION_ID || epic.milestoneId === FOUNDATION_ID)
       .map(epic => epic.id),
   );
+  const openExisting = (existingTasks ?? []).filter(task => !CLOSED_OWNER_STATUSES.has(task.status));
+  const ancestorMap = ancestors ?? taskAncestors([...openExisting, ...(spec.tasks ?? [])]);
   const parallelSet = new Set(parallelPairs.map(([a, b]) => (a < b ? `${a}\0${b}` : `${b}\0${a}`)));
   const freshByModule = indexOwnersByModule(spec.tasks, foundationEpics);
-  const existingByModule = indexOwnersByModule(existingTasks, foundationEpics);
+  const existingByModule = indexOwnersByModule(openExisting, foundationEpics);
 
   for (const [mod, freshOwners] of [...freshByModule.entries()].sort(([a], [b]) => compare(a, b))) {
     const existingOwners = existingByModule.get(mod) ?? [];
@@ -658,10 +666,12 @@ export function moduleOwnerFindings(spec, { parallelPairs = [], existingTasks = 
           crossEpicIds.add(right.id);
         }
       }
-      for (const existing of existingOwners) {
-        if (left.epicId !== existing.epicId && !parallelSet.has(pairKey(left.id, existing.id))) {
-          crossEpicIds.add(left.id);
-          crossEpicIds.add(existing.id);
+      if (existingOwners.length && !existingOwners.every(existing => ancestorMap.get(left.id)?.has(existing.id))) {
+        for (const existing of existingOwners) {
+          if (left.epicId !== existing.epicId && !parallelSet.has(pairKey(left.id, existing.id))) {
+            crossEpicIds.add(left.id);
+            crossEpicIds.add(existing.id);
+          }
         }
       }
     }

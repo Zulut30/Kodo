@@ -16,7 +16,12 @@ import { recordGateLesson, createGateRunDraft, runEpicGate } from '../runtime/wa
 import { ensureIntegration, mergeTask } from '../runtime/project-integration.mjs';
 import { integrationHome } from '../runtime/project-director-waves.mjs';
 import { confirmedCriteria } from './helpers/gate-review.mjs';
-import { MAX_TASK_MODULES, MAX_TASK_WRITE_PATHS, compileBlueprint } from '../runtime/project-blueprint.mjs';
+import {
+  MAX_TASK_MODULES,
+  MAX_TASK_WRITE_PATHS,
+  compileBlueprint,
+  moduleOwnerFindings,
+} from '../runtime/project-blueprint.mjs';
 import { lintMilestone } from '../runtime/project-bootstrap.mjs';
 import { buildContextManifest } from '../runtime/context-manifest.mjs';
 import { buildDiagnosticPack } from '../runtime/diagnostic-pack.mjs';
@@ -280,14 +285,38 @@ test('lintMilestone applies moduleOwnerFindings, taskScopeSizeFindings, and inte
     JSON.stringify(integRes.findings),
   );
 
-  // 3. New epic claiming existing module owner (`src/storage` owned by epic `storage`) -> blueprint_owner_ambiguous
-  const ownerConflict = lintMilestone(
-    ms([makeTask('search-steal', 'search', { dependsOn: ['storage-1'], writePaths: ['src/storage/hack.js'] })]),
+  // 3a. Sequential extension of an ACCEPTED module (`src/storage` owned by accepted `storage-1`) MUST pass.
+  const extendAccepted = lintMilestone(
+    ms([makeTask('search-extend', 'search', { dependsOn: ['storage-1'], writePaths: ['src/storage/oauth.js'] })]),
     snapshot,
   );
+  assert.equal(extendAccepted.ok, true, JSON.stringify(extendAccepted.findings));
+
+  // 3b. Direct unit check: open existing owner + new task transitively depending on all open owners -> NO conflict.
+  const openSnapshot = structuredClone(snapshot);
+  openSnapshot.tasks.find(t => t.id === 'storage-1').status = 'running';
+  openSnapshot.tasks.find(t => t.id === 'storage-1').writePaths = ['src/storage/core.js'];
+  const openOwners = openSnapshot.tasks.filter(t => !['accepted', 'released', 'cancelled'].includes(t.status));
+  const transitiveFindings = moduleOwnerFindings(
+    {
+      epics: [{ id: 'search', milestoneId: 'm2' }],
+      tasks: [
+        makeTask('search-prep', 'search', { dependsOn: ['storage-1'], writePaths: ['src/search/prep.js'] }),
+        makeTask('search-seq', 'search', { dependsOn: ['search-prep'], writePaths: ['src/storage/oauth.js'] }),
+      ],
+    },
+    { existingTasks: openOwners, existingEpics: openSnapshot.epics },
+  );
+  assert.deepEqual(transitiveFindings, []);
+
+  // 3c. Parallel capture of an OPEN module (not depending on open owner `storage-1`) -> blueprint_owner_ambiguous.
+  const parallelSteal = lintMilestone(
+    ms([makeTask('search-steal', 'search', { dependsOn: ['scaffold'], writePaths: ['src/storage/hack.js'] })]),
+    openSnapshot,
+  );
   assert.ok(
-    ownerConflict.findings.some(f => f.code === 'blueprint_owner_ambiguous' && f.taskIds?.includes('search-steal')),
-    JSON.stringify(ownerConflict.findings),
+    parallelSteal.findings.some(f => f.code === 'blueprint_owner_ambiguous' && f.taskIds?.includes('search-steal')),
+    JSON.stringify(parallelSteal.findings),
   );
 
   // 4. Oversized new task (>3 modules) -> split_required
