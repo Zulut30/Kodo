@@ -158,3 +158,89 @@ test('diagnostic-pack preserves review fix and does not treat a single generic c
   });
   assert.equal(hasStructuredDiagnostics(genericPack), false);
 });
+
+test('diagnostic-pack parses real Node 24 spec and TAP fixtures (✖ failing tests: and |- YAML block scalars)', async () => {
+  const realSpec = await readFile(path.join(fixturesDir, 'node24-spec.txt'), 'utf8');
+  const specPack = buildDiagnosticPack({ stdout: realSpec });
+  assert.equal(specPack.items.length, 2, `expected 2 spec items, got ${JSON.stringify(specPack.items)}`);
+  assert.deepEqual(specPack.failingTests, ['strict equality mismatch', 'explicit error message']);
+  assert.equal(specPack.items[0].file, 'sample.test.mjs');
+  assert.equal(specPack.items[0].line, 4);
+  assert.equal(specPack.items[0].column, 1);
+  assert.equal(specPack.items[0].code, 'ERR_ASSERTION');
+  assert.match(specPack.items[0].message, /Expected values to be strictly equal/);
+  assert.equal(specPack.items[1].file, 'sample.test.mjs');
+  assert.equal(specPack.items[1].line, 5);
+  assert.match(specPack.items[1].message, /boom failed/);
+
+  const realTap = await readFile(path.join(fixturesDir, 'node24-tap.txt'), 'utf8');
+  const tapPack = buildDiagnosticPack({ stdout: realTap });
+  assert.equal(tapPack.items.length, 2);
+  assert.deepEqual(tapPack.failingTests, ['strict equality mismatch', 'explicit error message']);
+  assert.notEqual(tapPack.items[0].message, '|-');
+  assert.match(tapPack.items[0].message, /Expected values to be strictly equal/);
+  assert.match(tapPack.items[0].message, /1 !== 2/);
+  assert.equal(tapPack.items[0].file, 'fixtures/sample.test.mjs');
+  assert.equal(tapPack.items[0].line, 4);
+  assert.match(tapPack.items[1].message, /boom failed/);
+});
+
+test('diagnostic-pack redacts secrets before 320-char truncation, reserves room for first item before test names, enforces maxBytes floor, and parses text rustc errors', () => {
+  // 1. Secret straddling 320-char boundary must not leak its prefix!
+  const secret = 'SUPER_SECRET_TOKEN_XYZ_9876543210';
+  const paddedMsg = `${'a'.repeat(312)}${secret} trailing`;
+  const redactedPack = buildDiagnosticPack({
+    gates: [
+      { status: 'failed', report: { findings: [{ ruleId: 'sec', file: 'src/a.mjs', line: 1, message: paddedMsg }] } },
+    ],
+    secrets: { token: secret },
+  });
+  assert.doesNotMatch(JSON.stringify(redactedPack), /SUPER_SECRET/);
+
+  // 2. 50 failing tests under tight maxBytes: must keep at least 1 diagnostic item before failingTests list!
+  const fiftyFailures = Array.from(
+    { length: 50 },
+    (_, i) =>
+      `not ok ${i + 1} - very long failing test name number ${String(i).padStart(3, '0')}\n  ---\n  location: 'tests/t${i}.test.mjs:${i + 1}:1'\n  error: 'Failure ${i}'\n  code: 'ERR_ASSERTION'\n  ...\n`,
+  ).join('');
+  const tightPack = buildDiagnosticPack({ stdout: fiftyFailures, maxBytes: 900 });
+  assert.ok(tightPack.bytes <= 900, `bytes ${tightPack.bytes} > 900`);
+  assert.ok(tightPack.items.length >= 1, 'must reserve room for at least the first diagnostic item');
+
+  // 3. Lower bound of maxBytes is enforced strictly.
+  assert.throws(
+    () => buildDiagnosticPack({ stdout: '', maxBytes: 128 }),
+    error => error.code === 'diagnostic_invalid',
+  );
+  const floorPack = buildDiagnosticPack({ stdout: fiftyFailures, maxBytes: 256 });
+  assert.ok(floorPack.bytes <= 256, `bytes ${floorPack.bytes} > 256`);
+
+  // 4. Plain text rustc output from ordinary `cargo test`.
+  const rustText = [
+    '   Compiling core-lib v0.1.0 (/repo/crates/core)',
+    'error[E0425]: cannot find value `missing_var` in this scope',
+    ' --> src/lib.rs:3:5',
+    '  |',
+    '3 |     missing_var',
+    '  |     ^^^^^^^^^^^ not found in this scope',
+    '',
+    'warning[unused_variables]: unused variable: `x`',
+    ' --> src/lib.rs:10:9',
+    '',
+    'error: could not compile `core-lib` (lib test) due to 1 previous error; 1 warning emitted',
+  ].join('\n');
+  const rustPack = buildDiagnosticPack({ stderr: rustText });
+  assert.equal(rustPack.items.length, 2);
+  assert.deepEqual(rustPack.items[0], {
+    file: 'src/lib.rs',
+    line: 3,
+    column: 5,
+    code: 'E0425',
+    level: 'error',
+    message: 'cannot find value `missing_var` in this scope (not found in this scope)',
+    failingTests: [],
+  });
+  assert.equal(rustPack.items[1].level, 'warning');
+  assert.equal(rustPack.items[1].file, 'src/lib.rs');
+  assert.equal(rustPack.items[1].line, 10);
+});

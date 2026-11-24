@@ -11,6 +11,7 @@ import { redact } from './security.mjs';
 
 export const DEFAULT_MAX_DIAGNOSTICS = 25;
 export const DEFAULT_MAX_DIAGNOSTIC_BYTES = 4096;
+export const MIN_DIAGNOSTIC_BYTES = 256;
 const MAX_MESSAGE_CHARS = 320;
 const MAX_FAILING_TESTS = 50;
 
@@ -78,7 +79,7 @@ function parseCargoJson(text) {
           column: safeInt(primary?.column_start),
           code: typeof msg.code?.code === 'string' && msg.code.code.trim() ? msg.code.code.trim() : null,
           level,
-          message: trimMessage(combined),
+          message: combined,
           failingTests: [],
           _summaryNoise: spans.length === 0 && RUST_SUMMARY_NOISE.test(baseMsg),
         });
@@ -112,11 +113,55 @@ function parseCargoJson(text) {
   return { items: filtered, failingTests };
 }
 
+function parseCargoText(text) {
+  const items = [];
+  const lines = text.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    const head = /^(error|warning)(?:\[([A-Za-z0-9_]+)\])?:\s*(.+)$/.exec(lines[i].trim());
+    if (!head) continue;
+    const level = normalizeLevel(head[1]);
+    const code = head[2] || null;
+    const baseMsg = head[3].trim();
+    let file = null,
+      line = null,
+      column = null,
+      label = '';
+    for (let j = i + 1; j <= Math.min(lines.length - 1, i + 6); j++) {
+      const next = lines[j];
+      if (!file) {
+        const arrow = /^\s*-->\s+(.+?):(\d+):(\d+)\s*$/.exec(next);
+        if (arrow) {
+          file = cleanPath(arrow[1]);
+          line = safeInt(Number(arrow[2]));
+          column = safeInt(Number(arrow[3]));
+          continue;
+        }
+      } else {
+        const caret = /^\s*\|\s*\^+\s+(.+)$/.exec(next);
+        if (caret) {
+          label = caret[1].trim();
+          break;
+        }
+        if (/^(?:error|warning)(?:\[|:)/.test(next.trim())) break;
+      }
+    }
+    const noise = !file && RUST_SUMMARY_NOISE.test(baseMsg);
+    if (!file && !code && !noise) continue;
+    const message = label && !baseMsg.includes(label) ? `${baseMsg} (${label})` : baseMsg;
+    items.push({ file, line, column, code, level, message, failingTests: [], _summaryNoise: noise });
+  }
+  const hasRealErrors = items.some(item => item.level === 'error' && !item._summaryNoise);
+  return items.filter(item => !(hasRealErrors && item._summaryNoise)).map(({ _summaryNoise: _drop, ...rest }) => rest);
+}
+
 // ---- node:test (spec & TAP) + Node syntax error parser ----------------------
 
 function parseLocation(raw) {
   if (typeof raw !== 'string') return { file: null, line: null, column: null };
-  const cleaned = raw.trim().replace(/^['"]|['"]$/g, '');
+  const cleaned = raw
+    .trim()
+    .replace(/^['"]|['"]$/g, '')
+    .replaceAll('\\\\', '\\');
   const match = /^(?:file:\/\/\/?)?(.+?):(\d+)(?::(\d+))?$/.exec(cleaned);
   if (!match) return { file: cleanPath(cleaned), line: null, column: null };
   return {
@@ -137,7 +182,7 @@ function parseNodeTestSpec(text) {
   const items = [];
   const failingTests = [];
   const lines = text.split(/\r?\n/);
-  const sectionIndex = lines.findIndex(line => /^\s*failing tests:\s*$/i.test(line));
+  const sectionIndex = lines.findIndex(line => /^\s*(?:[✖×x]\s+)?failing tests:\s*$/i.test(line));
   if (sectionIndex !== -1) {
     let i = sectionIndex + 1;
     while (i < lines.length) {
@@ -173,17 +218,36 @@ function parseNodeTestSpec(text) {
         column,
         code,
         level: 'error',
-        message: trimMessage(detailLines.slice(0, 2).join(' — ') || firstDetail),
+        message: detailLines.slice(0, 2).join(' — ') || firstDetail,
         failingTests: testName ? [testName] : [],
       });
     }
   } else {
     for (const raw of lines) {
+      if (/^\s*(?:[✖×x]\s+)?failing tests:\s*$/i.test(raw)) continue;
       const match = /^\s*[✖×]\s+(.+?)(?:\s+\([\d.]+m?s\))?\s*$/.exec(raw);
       if (match) failingTests.push(match[1].trim());
     }
   }
   return { items, failingTests };
+}
+
+function readYamlBlockScalar(lines, startIndex, baseIndent) {
+  const collected = [];
+  let k = startIndex;
+  while (k < lines.length) {
+    const rawLine = lines[k];
+    if (rawLine.trim() === '...') break;
+    if (!rawLine.trim()) {
+      k++;
+      continue;
+    }
+    const indent = rawLine.length - rawLine.trimStart().length;
+    if (indent <= baseIndent) break;
+    collected.push(rawLine.trim());
+    k++;
+  }
+  return { text: collected.join(' — '), nextIndex: k };
 }
 
 function parseNodeTestTap(text) {
@@ -204,11 +268,22 @@ function parseNodeTestTap(text) {
     if (lines[i + 1]?.trim() === '---') {
       let j = i + 2;
       while (j < lines.length && lines[j].trim() !== '...') {
-        const row = lines[j].trim();
+        const rawLine = lines[j];
+        const row = rawLine.trim();
         const loc = /^location:\s*(.+)$/.exec(row);
         if (loc) ({ file, line, column } = parseLocation(loc[1]));
         const err = /^error:\s*(.+)$/.exec(row);
-        if (err) errorMsg = err[1].trim().replace(/^['"]|['"]$/g, '');
+        if (err) {
+          const val = err[1].trim();
+          if (/^[|>][+-]?\d*$/.test(val)) {
+            const baseIndent = rawLine.length - rawLine.trimStart().length;
+            const block = readYamlBlockScalar(lines, j + 1, baseIndent);
+            errorMsg = block.text || null;
+            j = block.nextIndex;
+            continue;
+          }
+          errorMsg = val.replace(/^['"]|['"]$/g, '');
+        }
         const codeMatch = /^code:\s*(.+)$/.exec(row);
         if (codeMatch) code = codeMatch[1].trim().replace(/^['"]|['"]$/g, '');
         j++;
@@ -221,7 +296,7 @@ function parseNodeTestTap(text) {
       column,
       code: code || (errorMsg ? extractErrorCode(errorMsg) : null) || 'test_failed',
       level: 'error',
-      message: trimMessage(errorMsg || `Test failed: ${testName}`),
+      message: errorMsg || `Test failed: ${testName}`,
       failingTests: [testName],
     });
   }
@@ -251,7 +326,7 @@ function parseNodeSyntaxError(text) {
         column: null,
         code: errMatch[1],
         level: 'error',
-        message: trimMessage(`${errMatch[1]}: ${errMatch[2]}`),
+        message: `${errMatch[1]}: ${errMatch[2]}`,
         failingTests: [],
       });
     }
@@ -275,7 +350,7 @@ function normalizeFinding(f, fallbackCode) {
     column: safeInt(f.column),
     code,
     level: normalizeLevel(f.severity ?? f.level ?? 'error'),
-    message: trimMessage(f.message || f.problem || f.reason || fallbackCode),
+    message: f.message || f.problem || f.reason || fallbackCode,
     failingTests: [],
   };
 }
@@ -291,7 +366,7 @@ function parseBehaviorFailures(behavior) {
       column: null,
       code: typeof behavior.code === 'string' ? behavior.code : 'behavior_gate',
       level: 'error',
-      message: trimMessage(behavior.message || behavior.reason || 'Behaviour gate failed'),
+      message: behavior.message || behavior.reason || 'Behaviour gate failed',
       failingTests: [],
     },
   ];
@@ -320,7 +395,7 @@ function parseGateReceipts(gates) {
           column: null,
           code: `ui_case:${String(c.id ?? 'unknown')}`,
           level: 'error',
-          message: trimMessage(`UI case ${c.id ?? 'unknown'} (${c.tool ?? 'ui'}) ${c.status}`),
+          message: `UI case ${c.id ?? 'unknown'} (${c.tool ?? 'ui'}) ${c.status}`,
           failingTests: [],
         });
       }
@@ -439,7 +514,8 @@ function packDiagnostics({ items, failingTests, maxItems, maxBytes }) {
   };
 
   let doc = makeDoc(kept, keptTests, truncated);
-  while (doc.bytes > maxBytes && kept.length > 0) {
+  // Reserve room for at least the first diagnostic item before keeping the full failingTests list.
+  while (doc.bytes > maxBytes && kept.length > 1) {
     kept = kept.slice(0, kept.length - 1);
     truncated = true;
     doc = makeDoc(kept, keptTests, true);
@@ -449,6 +525,19 @@ function packDiagnostics({ items, failingTests, maxItems, maxBytes }) {
     tests = tests.slice(0, tests.length - 1);
     truncated = true;
     doc = makeDoc(kept, tests, true);
+  }
+  if (doc.bytes > maxBytes && kept.length === 1) {
+    const first = { ...kept[0], failingTests: [] };
+    doc = makeDoc([first], tests, true);
+    if (doc.bytes > maxBytes) {
+      first.message = trimMessage(first.message, 60);
+      if (first.fix) delete first.fix;
+      doc = makeDoc([first], tests, true);
+    }
+    if (doc.bytes > maxBytes) {
+      kept = [];
+      doc = makeDoc([], tests, true);
+    }
   }
   return doc;
 }
@@ -488,8 +577,10 @@ export function buildDiagnosticPack(input = {}) {
     throw Object.assign(new Error('Diagnostic pack maxItems must be a positive integer'), {
       code: 'diagnostic_invalid',
     });
-  if (!Number.isSafeInteger(maxBytes) || maxBytes < 128)
-    throw Object.assign(new Error('Diagnostic pack maxBytes must be >= 128'), { code: 'diagnostic_invalid' });
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < MIN_DIAGNOSTIC_BYTES)
+    throw Object.assign(new Error(`Diagnostic pack maxBytes must be >= ${MIN_DIAGNOSTIC_BYTES}`), {
+      code: 'diagnostic_invalid',
+    });
 
   const combinedText = [stdout, stderr].filter(part => typeof part === 'string' && part.length > 0).join('\n');
 
@@ -509,6 +600,9 @@ export function buildDiagnosticPack(input = {}) {
     const cargo = parseCargoJson(combinedText);
     rawItems.push(...cargo.items);
     rawFailingTests.push(...cargo.failingTests);
+    if (!cargo.items.length) {
+      rawItems.push(...parseCargoText(combinedText));
+    }
 
     const spec = parseNodeTestSpec(combinedText);
     rawItems.push(...spec.items);
