@@ -1002,8 +1002,10 @@ test('nextWave enforces budgets.contextBytes by truncating api-cards to fit rema
   );
   assert.equal(fitWave.briefs.length, 1);
   const fitBrief = fitWave.briefs[0];
+  const combinedWorkerBytes = Buffer.byteLength(`${fitBrief.roleInstructions}\n\n${fitBrief.prompt}`, 'utf8');
   assert.equal(fitBrief.contextManifest.limitBytes, 4096);
-  assert.ok(fitBrief.contextManifest.totalBytes <= 4096, `totalBytes ${fitBrief.contextManifest.totalBytes} > 4096`);
+  assert.equal(fitBrief.contextManifest.totalBytes, combinedWorkerBytes);
+  assert.ok(combinedWorkerBytes <= 4096, `combined worker bytes ${combinedWorkerBytes} > 4096`);
   assert.equal(fitBrief.apiCards.truncated, true);
   assert.match(fitBrief.apiCards.text, /\[truncated:/);
 
