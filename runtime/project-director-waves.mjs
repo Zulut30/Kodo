@@ -945,7 +945,9 @@ export function gateHolds(ctx, snapshot) {
     const run = storedRun(ctx.store, gate.runId);
     // A verified gate whose acceptance stopped mid-chain (for example after a crash between the
     // epic and its milestone): `kodo project gates` resumes the chain, so the host is told to run it.
-    if (run?.state === 'succeeded') {
+    // Only while that container is still integrated: after append-milestone the project is
+    // running again and an old finished chain is no longer resumable.
+    if (run?.state === 'succeeded' && reached(recordOf(snapshot, open.kind, open.id)?.status, 'integrated')) {
       for (const item of gate.containers) held.add(key(item));
       rows.push({ code: 'project_gate_pending', kind: open.kind, id: open.id, gateId: gate.id, runId: run.id });
       continue;

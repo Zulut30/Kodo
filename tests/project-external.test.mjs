@@ -1013,6 +1013,19 @@ test('The gate classification names a verified gate whose acceptance stopped mid
   assert.deepEqual(gateHolds({ store }, snapshot), [
     { code: 'project_gate_pending', kind: 'milestone', id: 'm', gateId: 'g1', runId: 'r1' },
   ]);
+  // Review finding (minor): after append-milestone the accepted chain is finished, the project is
+  // running again and the new milestone is proposed — the old gate is not resumable or pending.
+  const appended = {
+    ...snapshot,
+    project: { projectId: 'p', status: 'running' },
+    milestones: [
+      { id: 'm', status: 'accepted' },
+      { id: 'm2', status: 'proposed' },
+    ],
+    epics: [...snapshot.epics, { id: 'e2', milestoneId: 'm2', status: 'proposed' }],
+    tasks: [...snapshot.tasks, { id: 't2', epicId: 'e2', status: 'proposed', dependsOn: [] }],
+  };
+  assert.deepEqual(gateHolds({ store }, appended), []);
 });
 
 test('next-wave names a blocked epic whose tasks are all integrated and a cancelled predecessor', async t => {

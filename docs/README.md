@@ -70,7 +70,7 @@
 ```powershell
 npm ci
 npm run test:fast     # быстрые модульные тесты, меньше минуты
-npm run test:coverage # полная suite с покрытием (`-- --fast` для быстрого набора)
+npm run test:coverage # полная suite с покрытием, включая наборы фабрики волн (`-- --fast` для быстрого набора)
 npm run format        # Prettier для собственного JavaScript
 npm run lint          # oxlint, предупреждения запрещены, сложность ограничена
 npm run typecheck     # tsc --checkJs против baseline известных диагностик

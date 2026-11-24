@@ -203,7 +203,12 @@ export async function runTests({
 } = {}) {
   // Never accept Node's recursive-run warning as a successful empty suite.
   if (process.env.NODE_TEST_CONTEXT !== undefined) throw new Error('Unsupported recursive test runner invocation');
-  const files = paths.length ? explicitTests(cwd, paths) : discoverTests(cwd);
+  // A full coverage run keeps the separate wave suites; `--fast` and explicit paths select their own.
+  const files = paths.length
+    ? explicitTests(cwd, paths)
+    : coverage
+      ? orderTests([...discoverTests(cwd), ...separateSuites.map(file => path.join(cwd, file))], cwd)
+      : discoverTests(cwd);
   const aborted = () => {
     process.exitCode = 1;
   };

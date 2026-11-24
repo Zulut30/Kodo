@@ -173,7 +173,10 @@ test('The wave factory suites run in their own command and CI step, outside defa
   const scripts = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8')).scripts;
   assert.equal(scripts['test:waves'], `node scripts/run-tests.mjs ${separateSuites.join(' ')}`);
   const workflow = readFileSync(path.join(root, '.github/workflows/ci.yml'), 'utf8');
-  assert.match(workflow, /run: npm run test:waves/);
+  // The step belongs to the required check job of both platforms, not to the optional fast job.
+  const [fast, check] = workflow.split('\n  check:');
+  assert.doesNotMatch(fast, /npm run test:waves/);
+  assert.match(check, /\n {6}- name: Wave factory suites\n {8}run: npm run test:waves\n/);
 });
 test(
   'Scheduler starts heuristic heavy files before lexical files in real isolated children',
