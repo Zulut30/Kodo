@@ -668,3 +668,181 @@ test('nextWave degrades gracefully when api-cards fail and reuses cached cards o
   assert.equal(buildCount, 1, 'repeated nextWave must reuse cached apiCards for active attempt without rebuilding');
   assert.deepEqual(repeated.briefs[0].apiCards, firstValid.briefs[0].apiCards);
 });
+
+test('nextWave enforces budgets.contextBytes by truncating api-cards to fit remaining budget and throws context_budget only when mandatory contract overflows', async t => {
+  const dir = await realpath(await mkdtemp(path.join(os.tmpdir(), 'kodo-15d-budget-')));
+  const project = path.join(dir, 'repo');
+  const home = path.join(dir, 'home');
+  await mkdir(project, { recursive: true });
+  git(project, 'init', '-b', 'main');
+  git(project, 'config', 'user.name', 'Test');
+  git(project, 'config', 'user.email', 'test@example.invalid');
+  git(project, 'config', 'core.autocrlf', 'false');
+  const bigExports = Array.from(
+    { length: 90 },
+    (_, i) => `export function storageOperation_${String(i).padStart(3, '0')}(key, value, options) { return key; }`,
+  ).join('\n');
+  await commit(
+    project,
+    {
+      'kodo.config.json': JSON.stringify({
+        schemaVersion: 1,
+        repository: 'fixture/Kodo',
+        client: 'codex',
+        baseBranch: 'main',
+        concurrency: 2,
+        repairRounds: 1,
+        researchBudget: 0,
+        budgets: { contextBytes: 4096 },
+        commands: { test: [{ command: process.execPath, args: ['--test'] }], build: [], deploy: [], smoke: [] },
+        checks: [],
+        delivery: { enabled: false, release: false, firstVersion: '0.2.0' },
+      }),
+      'src/storage/index.mjs': `${bigExports}\n`,
+    },
+    'init',
+  );
+
+  const store = new Store(home);
+  const engine = new Engine({ store });
+  const repo = await openProjectStore({
+    store,
+    contracts,
+    authorizeTransition: createProjectTransitionAuthorizer({ store, engine, contracts }),
+  });
+  t.after(async () => {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const criterion = { id: 'ok', text: 'Works', evidenceKinds: ['checks'] };
+  const ctx = { repo, engine, store, contracts };
+
+  // Case 1: mandatory contract fits (<4096), huge API card (~7KB) is deterministically truncated under remaining budget.
+  const createdFit = await repo.apply({
+    schemaVersion: 1,
+    commandId: randomUUID(),
+    projectId: null,
+    expectedRevision: null,
+    actor: 'coordinator',
+    reason: 'Budget fit test',
+    action: {
+      op: 'create',
+      spec: {
+        schemaVersion: 1,
+        id: 'budget-fit',
+        root: project,
+        title: 'Budget fit',
+        definitionOfDone: [criterion],
+        constraints: ['Keep API stable'],
+        businessContext: 'Budget fixture',
+        architectureRefs: [],
+        milestones: [{ id: 'm1', title: 'M1', acceptance: [criterion], releaseRequired: false }],
+        epics: [
+          { id: 'storage', milestoneId: 'm1', title: 'Storage', acceptance: [criterion] },
+          { id: 'api', milestoneId: 'm1', title: 'API', acceptance: [criterion] },
+        ],
+        tasks: [
+          {
+            id: 'storage-1',
+            epicId: 'storage',
+            title: 'Storage 1',
+            description: 'Base storage',
+            owner: 'developer',
+            dependsOn: [],
+            writePaths: ['src/storage'],
+            acceptance: [criterion],
+            interfaceRefs: [],
+            priority: 40,
+            userValue: 3,
+            risk: 1,
+            estimatedEffort: 1,
+            riskApprovalRequired: false,
+          },
+          {
+            id: 'api-1',
+            epicId: 'api',
+            title: 'API 1',
+            description: 'Implement API endpoint',
+            owner: 'developer',
+            dependsOn: [],
+            writePaths: ['src/api'],
+            acceptance: [criterion],
+            interfaceRefs: [],
+            priority: 90,
+            userValue: 3,
+            risk: 1,
+            estimatedEffort: 1,
+            riskApprovalRequired: false,
+          },
+        ],
+        execution: { cadence: 'wave', integration: 'branch' },
+      },
+    },
+  });
+  // Pass custom builder that returns the large storage card using buildApiCards with paths:['src/storage']
+  const { buildApiCards: realBuild } = await import('../runtime/api-cards.mjs');
+  const fitWave = await nextWave(
+    {
+      ...ctx,
+      buildApiCards: args => realBuild({ ...args, paths: ['src/storage'] }),
+    },
+    { projectId: createdFit.projectId, host: 't3', limit: 1 },
+  );
+  assert.equal(fitWave.briefs.length, 1);
+  const fitBrief = fitWave.briefs[0];
+  assert.equal(fitBrief.contextManifest.limitBytes, 4096);
+  assert.ok(fitBrief.contextManifest.totalBytes <= 4096, `totalBytes ${fitBrief.contextManifest.totalBytes} > 4096`);
+  assert.equal(fitBrief.apiCards.truncated, true);
+  assert.match(fitBrief.apiCards.text, /\[truncated:/);
+
+  // Case 2: mandatory task contract itself exceeds budgets.contextBytes (4096) -> throws context_budget.
+  const createdOverflow = await repo.apply({
+    schemaVersion: 1,
+    commandId: randomUUID(),
+    projectId: null,
+    expectedRevision: null,
+    actor: 'coordinator',
+    reason: 'Budget overflow test',
+    action: {
+      op: 'create',
+      spec: {
+        schemaVersion: 1,
+        id: 'budget-overflow',
+        root: project,
+        title: 'Budget overflow',
+        definitionOfDone: [criterion],
+        constraints: ['Keep API stable'],
+        businessContext: 'Budget fixture',
+        architectureRefs: [],
+        milestones: [{ id: 'm1', title: 'M1', acceptance: [criterion], releaseRequired: false }],
+        epics: [{ id: 'api', milestoneId: 'm1', title: 'API', acceptance: [criterion] }],
+        tasks: [
+          {
+            id: 'api-big',
+            epicId: 'api',
+            title: 'API Big',
+            description: 'Mandatory requirement detail. '.repeat(170),
+            owner: 'developer',
+            dependsOn: [],
+            writePaths: ['src/api'],
+            acceptance: [criterion],
+            interfaceRefs: [],
+            priority: 90,
+            userValue: 3,
+            risk: 1,
+            estimatedEffort: 1,
+            riskApprovalRequired: false,
+          },
+        ],
+        execution: { cadence: 'wave', integration: 'branch' },
+      },
+    },
+  });
+  const overflowWave = await nextWave(ctx, { projectId: createdOverflow.projectId, host: 't3', limit: 1 });
+  assert.equal(overflowWave.briefs.length, 0);
+  assert.ok(
+    overflowWave.blocked.some(row => row.taskId === 'api-big' && row.code === 'context_budget'),
+    `expected context_budget in blocked, got ${JSON.stringify(overflowWave.blocked)}`,
+  );
+});

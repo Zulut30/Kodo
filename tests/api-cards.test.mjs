@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -425,4 +426,51 @@ export const make = (v: number): { x: number } => {
     'export const C: { count: number }',
     'export const make = (v: number): { x: number } =>',
   ]);
+});
+
+test('buildApiCards resolves module names from verified apply-spec interface evidence envelopes', async t => {
+  const { dir, baseSha } = await createRepo(t, {
+    'crates/world/src/lib.rs': 'pub struct World;\npub fn create_world() -> World { World }\n',
+  });
+  const home = await realpath(await mkdtemp(path.join(os.tmpdir(), 'kodo-api-ev-')));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const evidenceDir = path.join(home, 'project-interfaces', 'evidence');
+  await mkdir(evidenceDir, { recursive: true });
+
+  const envelopeText = JSON.stringify({
+    schemaVersion: 1,
+    kind: 'interface',
+    value: { schemaVersion: 1, module: 'world', source: 'interfaces/world.md', text: '# World API' },
+  });
+  const digest = createHash('sha256').update(envelopeText, 'utf8').digest('hex');
+  const evidencePath = path.join(evidenceDir, `interface-${digest}.json`);
+  await writeFile(evidencePath, envelopeText, 'utf8');
+
+  const task = {
+    id: 'render-1',
+    epicId: 'render',
+    dependsOn: [],
+    writePaths: ['crates/render'],
+    interfaceRefs: [{ kind: 'interface', runId: null, headSha: null, path: evidencePath, sha256: digest }],
+  };
+  const tasks = [{ id: 'world-1', epicId: 'world', writePaths: ['crates/world'] }, task];
+
+  const card = await buildApiCards({ cwd: dir, baseSha, task, tasks, home });
+  assert.deepEqual(
+    card.modules.map(m => [m.path, m.signatures]),
+    [['crates/world/src/lib.rs', ['pub struct World', 'pub fn create_world() -> World']]],
+  );
+
+  // Tampered sha256 must NOT be trusted.
+  const tampered = await buildApiCards({
+    cwd: dir,
+    baseSha,
+    task: {
+      ...task,
+      interfaceRefs: [{ kind: 'interface', runId: null, headSha: null, path: evidencePath, sha256: '0'.repeat(64) }],
+    },
+    tasks,
+    home,
+  });
+  assert.deepEqual(tampered.modules, []);
 });
