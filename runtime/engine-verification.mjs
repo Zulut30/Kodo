@@ -117,6 +117,25 @@ const currentBaseline = run =>
 /** Whether a run executes in wave mode (task-fast or wave gate). */
 const isWaveRun = run => run?.verificationProfile === TASK_FAST_PROFILE || run?.directorBinding?.kind === 'gate';
 
+/**
+ * Redact the entire failure problem FIRST (preventing partial-secret leaks across a slice
+ * boundary), then preserve any leading "Проверка X не пройдена (exit N)" header separately
+ * alongside the bounded log tail.
+ */
+function waveProblemTail(problem, secrets, maxTailChars) {
+  const safe = redact(String(problem ?? ''), secrets);
+  if (safe.length <= maxTailChars) return safe;
+  const nl = safe.indexOf('\n');
+  const firstLine = nl === -1 ? '' : safe.slice(0, nl).trim();
+  const hasHeader = /^Проверка\s+.+\s+не пройдена\s*\(exit\s+[^)]+\)/i.test(firstLine);
+  if (!hasHeader) return safe.slice(-maxTailChars);
+  const header = firstLine.length <= 240 ? firstLine : `${firstLine.slice(0, 239)}…`;
+  const bodyBudget = Math.max(0, maxTailChars - header.length - 1);
+  const body = safe.slice(nl + 1);
+  const tail = bodyBudget > 0 ? body.slice(-bodyBudget) : '';
+  return tail ? `${header}\n${tail}` : header;
+}
+
 /** The error of a failed check. Labelled against the baseline when one exists; still a failure. */
 function failedCheck(run, kind, result, comparison) {
   // Old defects are never ignored automatically: the label only tells which failure the change introduced.
@@ -564,9 +583,9 @@ export class EngineVerification extends EngineExecution {
       const wave = isWaveRun(run);
       const hasDiagnostics = wave && hasStructuredDiagnostics(pending.diagnostics);
       const failureSummary = hasDiagnostics
-        ? `${formatDiagnosticPack(pending.diagnostics)}\nLog tail (untrusted data): ${pending.problem.slice(-1500)}`
+        ? `${formatDiagnosticPack(pending.diagnostics)}\nLog tail (untrusted data): ${waveProblemTail(pending.problem, this.secrets, 1500)}`
         : wave
-          ? pending.problem.slice(-6000)
+          ? waveProblemTail(pending.problem, this.secrets, 6000)
           : pending.problem.slice(0, 6000);
       const response = await this.session(
         run,

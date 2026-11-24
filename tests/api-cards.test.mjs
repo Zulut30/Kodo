@@ -321,12 +321,19 @@ test('buildApiCards batches blob reads and caches tree by baseSha and signatures
   assert.equal(first.modules.length, 20);
   assert.equal(cache.trees.size, 1);
   assert.equal(cache.signatures.size, 20);
+  assert.deepEqual(cache.stats, { listTreeCalls: 1, batchCalls: 1, blobsRead: 20 });
 
-  const started = performance.now();
   const second = await buildApiCards({ cwd: dir, baseSha, paths: ['src/mod'], cache });
-  const cachedMs = performance.now() - started;
   assert.deepEqual(second, first);
-  assert.ok(cachedMs < 200, `cached rebuild should be fast, got ${cachedMs.toFixed(1)}ms`);
+  assert.deepEqual(cache.stats, { listTreeCalls: 1, batchCalls: 1, blobsRead: 20 });
+
+  // AbortSignal cancels buildApiCards cleanly instead of degrading to unavailable.
+  const aborted = new AbortController();
+  aborted.abort();
+  await assert.rejects(
+    buildApiCards({ cwd: dir, baseSha, paths: ['src/mod'], signal: aborted.signal }),
+    error => error.code === 'cancelled',
+  );
 });
 
 test('extractRustPublicApi handles pub use trees, pub trait methods, pub mod paths, #[macro_export] and excludes #[cfg(test)]', () => {

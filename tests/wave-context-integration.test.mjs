@@ -717,8 +717,11 @@ test('repairVerification preserves legacy 6000-char prompt outside waves and use
   assert.doesNotMatch(prompts[1], /Diagnostic pack/);
   assert.match(prompts[1], /assert 2 == 1/);
 
-  // 3. Wave gate run with structured review finding + long log: uses Diagnostic pack with fix + log TAIL (not head).
-  const longProblem = `HEAD_MARKER_SHOULD_DROP\n${'x'.repeat(2500)}\nTAIL_MARKER_MUST_SURVIVE\n`;
+  // 3. Wave gate run with structured review finding + long log: uses Diagnostic pack with fix + log TAIL (not head),
+  // redacts secrets BEFORE slicing, and preserves the "Проверка ... не пройдена (exit N)" header separately.
+  const boundarySecret = 'WAVE_REPAIR_SECRET_TOKEN_99887766';
+  engine.secrets = { token: boundarySecret };
+  const longProblem = `Проверка npm test не пройдена (exit 1)\nHEAD_MARKER_SHOULD_DROP\n${'x'.repeat(1200)}${boundarySecret}${'y'.repeat(1445)}TAIL_MARKER_MUST_SURVIVE\n`;
   const waveStructuredRun = makeRun('repair-wave-structured', {
     directorBinding: { kind: 'gate', projectId: 'p', gateId: 'g', headSha: head },
     verification: {
@@ -742,8 +745,10 @@ test('repairVerification preserves legacy 6000-char prompt outside waves and use
   await engine.repairVerification(waveStructuredRun);
   assert.match(prompts[2], /Diagnostic pack/);
   assert.match(prompts[2], /Add explicit null check/);
+  assert.match(prompts[2], /Проверка npm test не пройдена \(exit 1\)/);
   assert.match(prompts[2], /TAIL_MARKER_MUST_SURVIVE/);
   assert.doesNotMatch(prompts[2], /HEAD_MARKER_SHOULD_DROP/);
+  assert.doesNotMatch(prompts[2], /WAVE_REPAIR_SECRET|TOKEN_99887766/);
 });
 
 test('nextWave degrades gracefully when api-cards fail and reuses cached cards on repeated calls', async t => {
@@ -1419,4 +1424,140 @@ test('nextWave issues integrator brief with dedicated role and roleInstructions 
   assert.match(brief.roleInstructions, /shared integration files/i);
   assert.match(brief.roleInstructions, /minimal/i);
   assert.match(brief.roleInstructions, /do not implement or rewrite module business logic/i);
+});
+
+test('G10: retryDiagnosticsFor reads only the immediately preceding attempt and does not fall back to earlier attempts', async t => {
+  const temp = await realpath(await mkdtemp(path.join(os.tmpdir(), 'kodo-15d-g10-retry-')));
+  const project = path.join(temp, 'repo');
+  const home = path.join(temp, 'home');
+  await mkdir(project, { recursive: true });
+  git(project, 'init', '-b', 'main');
+  git(project, 'config', 'user.email', 'kodo@example.test');
+  git(project, 'config', 'user.name', 'Kodo Test');
+  await commit(
+    project,
+    {
+      'kodo.config.json': JSON.stringify({
+        schemaVersion: 1,
+        repository: 'fixture/Kodo',
+        client: 'codex',
+        baseBranch: 'main',
+        concurrency: 2,
+        repairRounds: 1,
+        researchBudget: 0,
+        commands: { test: [{ command: process.execPath, args: ['--test'] }], build: [], deploy: [], smoke: [] },
+        checks: [],
+        delivery: { enabled: false, release: false, firstVersion: '0.2.0' },
+      }),
+      'src/app/index.mjs': 'export const ok = true;\n',
+    },
+    'Init',
+  );
+  const store = new Store(home);
+  t.after(async () => {
+    store.close();
+    await rm(temp, { recursive: true, force: true });
+  });
+  const engine = new Engine({
+    store,
+    provider: {
+      discoverProviders: async () => [
+        { id: 'codex:gpt-6.1-sol', client: 'codex', model: 'gpt-6.1-sol', available: true },
+      ],
+    },
+  });
+  const repo = await openProjectStore({
+    store,
+    contracts,
+    authorizeTransition: createProjectTransitionAuthorizer({ store, engine, contracts }),
+  });
+  const crit = id => ({ id, text: `Criterion ${id}`, evidenceKinds: ['checks'] });
+  const created = await repo.apply({
+    schemaVersion: 1,
+    commandId: randomUUID(),
+    projectId: null,
+    expectedRevision: null,
+    actor: 'coordinator',
+    reason: 'Create retry diag test project',
+    action: {
+      op: 'create',
+      spec: {
+        schemaVersion: 1,
+        id: 'retry-diag',
+        root: project,
+        title: 'Retry diag test',
+        definitionOfDone: [crit('dod')],
+        constraints: ['Clean'],
+        businessContext: 'Test',
+        architectureRefs: [],
+        milestones: [{ id: 'm1', title: 'M1', acceptance: [crit('m1')], releaseRequired: false }],
+        epics: [{ id: 'e1', milestoneId: 'm1', title: 'E1', acceptance: [crit('e1')] }],
+        tasks: [
+          {
+            id: 't1',
+            epicId: 'e1',
+            title: 'Task 1',
+            description: 'Update src/app/index.mjs',
+            owner: 'developer',
+            dependsOn: [],
+            writePaths: ['src/app/index.mjs'],
+            acceptance: [crit('t1-ok')],
+            interfaceRefs: [],
+            priority: 60,
+            userValue: 3,
+            risk: 1,
+            estimatedEffort: 1,
+            riskApprovalRequired: false,
+          },
+        ],
+        execution: { cadence: 'wave', integration: 'branch' },
+      },
+    },
+  });
+  const projectId = created.projectId;
+  const ctx = { repo, engine, store, contracts };
+
+  // Attempt 1: gets issued, fails with structured diagnostics, then abandoned.
+  const w1 = await nextWave(ctx, { projectId, host: 't3', limit: 1 });
+  assert.equal(w1.briefs.length, 1);
+  const run1Id = w1.briefs[0].runId;
+  const diag1 = buildDiagnosticPack({
+    stdout: "TAP version 13\nnot ok 1 - stale attempt 1 failure\n  ---\n  error: 'old error from attempt 1'\n  ...\n",
+  });
+  store.updateRun(run1Id, { lastDiagnostics: diag1 });
+  await completeTask(ctx, {
+    projectId,
+    taskId: 't1',
+    head: w1.briefs[0].baseSha,
+    attemptId: w1.briefs[0].attemptId,
+    abandon: true,
+  });
+
+  // Attempt 2: receives attempt 1 diagnostics, then fails with EMPTY diagnostics and is abandoned.
+  const w2 = await nextWave(ctx, { projectId, host: 't3', limit: 1, retryFailed: true });
+  assert.equal(w2.briefs.length, 1);
+  assert.match(w2.briefs[0].prompt, /stale attempt 1 failure/);
+  const run2Id = w2.briefs[0].runId;
+  store.updateRun(run2Id, { lastDiagnostics: buildDiagnosticPack({ stdout: '' }) });
+  await completeTask(ctx, {
+    projectId,
+    taskId: 't1',
+    head: w2.briefs[0].baseSha,
+    attemptId: w2.briefs[0].attemptId,
+    abandon: true,
+  });
+
+  // Attempt 3: previous attempt (attempt 2) had an EMPTY diagnostic pack -> MUST NOT fall back to attempt 1!
+  const w3 = await nextWave(ctx, { projectId, host: 't3', limit: 1, retryFailed: true });
+  assert.equal(w3.briefs.length, 1);
+  assert.equal(w3.briefs[0].diagnostics, undefined);
+  assert.doesNotMatch(w3.briefs[0].prompt, /stale attempt 1 failure/);
+
+  // Also check AbortSignal propagation into nextWave -> buildApiCards.
+  const aborted = new AbortController();
+  aborted.abort();
+  await assert.rejects(
+    nextWave(ctx, { projectId, host: 't3', limit: 1, signal: aborted.signal }),
+    error => error.code === 'cancelled' || error.code === 'project_cancelled',
+  );
 });

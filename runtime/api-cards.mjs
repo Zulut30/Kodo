@@ -7,7 +7,7 @@ import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { readFile, realpath, stat } from 'node:fs/promises';
 import path from 'node:path';
-import { execute } from './command.mjs';
+import { execute, gitBoundary } from './command.mjs';
 import { ownsPath } from './contracts.mjs';
 import { redact, workerEnvironment } from './security.mjs';
 
@@ -879,6 +879,7 @@ export function createApiCardCache() {
     signatures: new Map(),
     invariants: new Map(),
     interfaceModules: new Map(),
+    stats: { listTreeCalls: 0, batchCalls: 0, blobsRead: 0 },
   };
 }
 
@@ -911,14 +912,29 @@ export function unavailableApiCard({
   };
 }
 
-async function listTreeBlobs(cwd, baseSha, cache) {
+function cancelledError() {
+  return Object.assign(new Error('API cards build cancelled'), { code: 'cancelled' });
+}
+
+function killGitChild(child) {
+  try {
+    child.kill();
+  } catch {
+    // Ignore kill error on already exited child.
+  }
+}
+
+async function listTreeBlobs(cwd, baseSha, cache, signal) {
+  if (signal?.aborted) throw cancelledError();
   const treeKey = `${cwd}\0${baseSha}`;
   if (cache?.trees?.has(treeKey)) return cache.trees.get(treeKey);
+  if (cache?.stats) cache.stats.listTreeCalls++;
   const result = await execute('git', ['ls-tree', '-r', '-l', '-z', '--full-tree', baseSha], {
     cwd,
     env: workerEnvironment(),
     rawOutput: true,
     timeoutMs: 15000,
+    signal,
   });
   const blobs = [];
   for (const row of result.stdout.split('\0')) {
@@ -967,13 +983,19 @@ function parseCatFileBatchOutput(buffer) {
   return contents;
 }
 
-function readBlobsBatch(cwd, oids) {
+function readBlobsBatch(cwd, oids, { signal, cache } = {}) {
+  if (signal?.aborted) return Promise.reject(cancelledError());
   const unique = [...new Set(oids.filter(Boolean))];
   if (!unique.length) return Promise.resolve(new Map());
+  if (cache?.stats) {
+    cache.stats.batchCalls++;
+    cache.stats.blobsRead += unique.length;
+  }
+  const guarded = gitBoundary(['cat-file', '--batch'], workerEnvironment());
   return new Promise((resolve, reject) => {
-    const child = spawn('git', ['cat-file', '--batch'], {
+    const child = spawn('git', guarded.args, {
       cwd,
-      env: workerEnvironment(),
+      env: guarded.env,
       windowsHide: true,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
@@ -981,33 +1003,34 @@ function readBlobsBatch(cwd, oids) {
     let totalBytes = 0;
     let stderr = '';
     let settled = false;
+    let stopError = null;
     const finish = (error, value) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
       if (error) reject(error);
       else resolve(value);
     };
+    const stopChild = error => {
+      if (stopError) return;
+      stopError = error;
+      killGitChild(child);
+    };
+    const onAbort = () => stopChild(cancelledError());
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted) onAbort();
     const timer = setTimeout(() => {
-      try {
-        child.kill('SIGKILL');
-      } catch {
-        // Ignore kill error on already exited child.
-      }
-      finish(Object.assign(new Error('git cat-file --batch timed out'), { code: 'api_cards_timeout' }));
+      stopChild(Object.assign(new Error('git cat-file --batch timed out'), { code: 'api_cards_timeout' }));
     }, 15000);
     child.on('error', error => {
-      finish(Object.assign(new Error(error.message), { code: 'api_cards_git_error' }));
+      finish(stopError ?? Object.assign(new Error(error.message), { code: 'api_cards_git_error' }));
     });
     child.stdout.on('data', chunk => {
+      if (stopError) return;
       totalBytes += chunk.length;
       if (totalBytes > MAX_BATCH_STDOUT_BYTES) {
-        try {
-          child.kill('SIGKILL');
-        } catch {
-          // Ignore kill error.
-        }
-        finish(Object.assign(new Error('git cat-file --batch output exceeded cap'), { code: 'api_cards_overflow' }));
+        stopChild(Object.assign(new Error('git cat-file --batch output exceeded cap'), { code: 'api_cards_overflow' }));
         return;
       }
       chunks.push(chunk);
@@ -1017,6 +1040,10 @@ function readBlobsBatch(cwd, oids) {
     });
     child.on('close', code => {
       if (settled) return;
+      if (stopError) {
+        finish(stopError);
+        return;
+      }
       if (code !== 0) {
         finish(
           Object.assign(new Error(`git cat-file --batch failed (${code}): ${stderr.trim()}`), {
@@ -1361,6 +1388,7 @@ function extractModuleCards({ sourceTargets, fetched, cache, secrets }) {
  *   secrets?: Record<string, any>,
  *   cache?: ReturnType<typeof createApiCardCache> | null,
  *   home?: string | null,
+ *   signal?: AbortSignal,
  * }} input
  */
 export async function buildApiCards({
@@ -1375,7 +1403,9 @@ export async function buildApiCards({
   secrets = {},
   cache = null,
   home = null,
+  signal = undefined,
 }) {
+  if (signal?.aborted) throw cancelledError();
   if (typeof cwd !== 'string' || !cwd) return unavailableApiCard({ baseSha, code: 'api_cards_invalid', maxBytes });
   if (typeof baseSha !== 'string' || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(baseSha))
     return unavailableApiCard({ baseSha, code: 'api_cards_invalid', maxBytes });
@@ -1383,7 +1413,7 @@ export async function buildApiCards({
     return unavailableApiCard({ baseSha, code: 'api_cards_invalid', maxBytes });
 
   try {
-    const blobs = await listTreeBlobs(cwd, baseSha, cache);
+    const blobs = await listTreeBlobs(cwd, baseSha, cache, signal);
     const blobByPath = new Map(blobs.map(b => [b.path, b]));
     const invTargets = selectInvariantTargets(blobByPath);
     const scopes = await resolveDependencyScopes({ task, tasks, paths, home, cache });
@@ -1406,12 +1436,13 @@ export async function buildApiCards({
         .map(e => e.blob.oid),
       ...sourceTargets.filter(b => !cache?.signatures?.has(`${detectLanguage(b.path)}\0${b.oid}`)).map(b => b.oid),
     ];
-    const fetched = await readBlobsBatch(cwd, oidsToRead);
+    const fetched = await readBlobsBatch(cwd, oidsToRead, { signal, cache });
     const collectedInvariants = collectInvariants({ invTargets, fetched, cache, invariants, constraints, secrets });
     const modules = extractModuleCards({ sourceTargets, fetched, cache, secrets });
     const packed = packApiCard({ baseSha, invariants: collectedInvariants, modules, maxBytes });
     return { schemaVersion: 1, kind: 'api-cards', baseSha, maxBytes, ...packed };
   } catch (error) {
+    if (signal?.aborted || error?.code === 'cancelled') throw error;
     return unavailableApiCard({ baseSha, code: error?.code || 'api_cards_failed', maxBytes });
   }
 }

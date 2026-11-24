@@ -147,6 +147,7 @@ async function operate(options, ports, safety) {
         ports: ports.wave,
         // The CLI entry passes its own command: the briefs call the same Kodo package.
         ...(ports.cli === undefined ? {} : { cli: ports.cli }),
+        ...(ports.signal ? { signal: ports.signal } : {}),
       });
       success = result.briefs.length > 0;
     } else if (options.action === 'gates') {
