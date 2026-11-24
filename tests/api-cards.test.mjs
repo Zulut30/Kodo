@@ -1,0 +1,284 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { performance } from 'node:perf_hooks';
+import {
+  DEFAULT_API_CARD_MAX_BYTES,
+  buildApiCards,
+  extractJsTsPublicApi,
+  extractRustPublicApi,
+} from '../runtime/api-cards.mjs';
+
+function git(cwd, ...args) {
+  const result = spawnSync('git', args, { cwd, encoding: 'utf8', windowsHide: true });
+  assert.equal(result.status, 0, `${args.join(' ')}\n${result.stderr}`);
+  return result.stdout.trim();
+}
+
+async function write(cwd, relativePath, content) {
+  const full = path.join(cwd, relativePath);
+  await mkdir(path.dirname(full), { recursive: true });
+  await writeFile(full, content, 'utf8');
+}
+
+async function createRepo(t, files) {
+  const dir = await realpath(await mkdtemp(path.join(os.tmpdir(), 'kodo-api-cards-')));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  git(dir, 'init', '-b', 'main');
+  git(dir, 'config', 'user.name', 'Kodo Test');
+  git(dir, 'config', 'user.email', 'kodo-test@example.invalid');
+  git(dir, 'config', 'core.autocrlf', 'false');
+  for (const [name, content] of Object.entries(files)) await write(dir, name, content);
+  git(dir, 'add', '-A');
+  git(dir, 'commit', '-m', 'Initial fixture');
+  const baseSha = git(dir, 'rev-parse', 'HEAD');
+  return { dir, baseSha };
+}
+
+test('extractRustPublicApi extracts pub items as single-line signatures without bodies and excludes non-pub/pub(crate)', () => {
+  const rust = `
+// pub fn commented_out() {}
+/* pub struct BlockCommented {
+   /* nested pub fn inner() {} */
+} */
+pub mod chunk;
+pub(crate) mod internal_mod;
+mod private_mod;
+
+pub const MAX_HEIGHT: usize = 256;
+pub(crate) const CRATE_LIMIT: usize = 16;
+const PRIVATE_CONST: u8 = 1;
+
+pub type BlockId = u16;
+pub(super) type LocalId = u8;
+
+pub struct Chunk<T>
+where
+    T: Copy,
+{
+    pub blocks: Vec<T>,
+    dirty: bool,
+}
+
+pub(crate) struct InternalGrid {
+    size: usize,
+}
+
+struct PrivateHelper;
+
+pub enum ChunkState {
+    Empty,
+    Ready { count: usize },
+}
+
+pub(in crate::world) enum RestrictedState {
+    Pending,
+}
+
+pub trait WorldStore: Send + Sync {
+    fn get_block(&self, x: i32, y: i32) -> BlockId;
+}
+
+pub async fn load_chunk(
+    x: i32,
+    z: i32,
+) -> Result<Chunk<u16>, String> {
+    let fake = "pub fn inside_string() {}";
+    let raw = r#"pub struct InsideRaw {}"#;
+    let _ = (fake, raw);
+    todo!()
+}
+
+pub(crate) fn internal_load() {}
+fn private_helper() {}
+
+impl<T: Copy> Chunk<T> {
+    pub fn len(&self) -> usize {
+        self.blocks.len()
+    }
+
+    pub(crate) fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    fn reset(&mut self) {}
+}
+`;
+  const signatures = extractRustPublicApi(rust);
+  assert.deepEqual(signatures, [
+    'pub mod chunk',
+    'pub const MAX_HEIGHT: usize = 256',
+    'pub type BlockId = u16',
+    'pub struct Chunk<T> where T: Copy',
+    'pub enum ChunkState',
+    'pub trait WorldStore: Send + Sync',
+    'pub async fn load_chunk( x: i32, z: i32, ) -> Result<Chunk<u16>, String>',
+    'impl<T: Copy> Chunk<T> :: pub fn len(&self) -> usize',
+  ]);
+  for (const sig of signatures) {
+    assert.ok(!sig.includes('\n'), `signature must be single-line: ${sig}`);
+    assert.doesNotMatch(
+      sig,
+      /pub\(|commented_out|BlockCommented|inside_string|InsideRaw|private_helper|InternalGrid|PrivateHelper|RestrictedState|mark_dirty|reset/,
+    );
+  }
+});
+
+test('extractJsTsPublicApi extracts exported functions, classes, constants and types without bodies and ignores non-exported items', () => {
+  const ts = `
+// export function commented() {}
+/* export class Hidden {} */
+const SECRET_LOCAL = 'ignore';
+function privateFn(a: number): number {
+  return a + 1;
+}
+
+export const VERSION = '1.0.0';
+export const compute = (x: number, y: number): number => {
+  const s = 'export const FAKE = 1;';
+  return x + y + s.length;
+};
+
+export async function fetchChunk(
+  id: string,
+  opts?: { force?: boolean },
+): Promise<Uint8Array> {
+  return new Uint8Array();
+}
+
+export class WorldEngine extends BaseEngine {
+  run() {
+    return 42;
+  }
+}
+
+export type ChunkKey = \`\${number}:\${number}\`;
+export interface StorageAdapter<T> {
+  read(key: ChunkKey): Promise<T>;
+}
+export enum BuildMode {
+  Fast,
+  Full,
+}
+export { VERSION as WORLD_VERSION };
+`;
+  const signatures = extractJsTsPublicApi(ts);
+  assert.deepEqual(signatures, [
+    "export const VERSION = '1.0.0'",
+    'export const compute = (x: number, y: number): number =>',
+    'export async function fetchChunk( id: string, opts?: { force?: boolean }, ): Promise<Uint8Array>',
+    'export class WorldEngine extends BaseEngine',
+    'export type ChunkKey = `${number}:${number}`',
+    'export interface StorageAdapter<T>',
+    'export enum BuildMode',
+    'export { VERSION as WORLD_VERSION }',
+  ]);
+  for (const sig of signatures) {
+    assert.ok(!sig.includes('\n'));
+    assert.doesNotMatch(sig, /SECRET_LOCAL|privateFn|commented|Hidden|FAKE/);
+  }
+});
+
+test('buildApiCards reads strictly from baseSha (working tree edits do not leak) and includes blueprint invariants', async t => {
+  const { dir, baseSha } = await createRepo(t, {
+    '.kodo/blueprint/PROJECT.md': [
+      '# Voxel Sandbox',
+      '## Цель',
+      'Оригинальная воксельная песочница.',
+      '## Инварианты',
+      '- Координаты чанков всегда в i32, без паники при переполнении.',
+      '- Рендер не читает диск напрямую.',
+    ].join('\n'),
+    'crates/world/src/lib.rs': [
+      'pub struct World { seed: u64 }',
+      'pub(crate) fn internal_seed() -> u64 { 0 }',
+      'pub fn new_world(seed: u64) -> World { World { seed } }',
+    ].join('\n'),
+    'src/storage/index.mjs': [
+      'function hidden() { return 0; }',
+      'export function saveNote(title, body) { return { title, body }; }',
+      'export const MAX_NOTES = 100;',
+    ].join('\n'),
+  });
+
+  // Mutate working tree after baseSha commit: must NOT affect the card built for baseSha!
+  await write(dir, 'crates/world/src/lib.rs', 'pub fn dirty_working_tree_fn() {}\npub struct DirtyStruct {}\n');
+  await write(dir, 'src/storage/index.mjs', 'export function dirtyJsFn() {}\n');
+  await write(dir, 'crates/world/src/untracked.rs', 'pub fn untracked_fn() {}\n');
+
+  const task = {
+    id: 'render-module',
+    dependsOn: ['world-module', 'storage-module'],
+    writePaths: ['crates/render'],
+    interfaceRefs: [],
+  };
+  const tasks = [
+    { id: 'world-module', epicId: 'world', writePaths: ['crates/world'] },
+    { id: 'storage-module', epicId: 'storage', writePaths: ['src/storage'] },
+    task,
+  ];
+
+  const started = performance.now();
+  const card = await buildApiCards({
+    cwd: dir,
+    baseSha,
+    task,
+    tasks,
+    constraints: ['Без паник в публичном API.'],
+  });
+  const elapsedMs = performance.now() - started;
+
+  assert.equal(card.kind, 'api-cards');
+  assert.equal(card.baseSha, baseSha);
+  assert.equal(card.truncated, false);
+  assert.ok(card.bytes <= DEFAULT_API_CARD_MAX_BYTES);
+  assert.equal(card.bytes, Buffer.byteLength(card.text, 'utf8'));
+  assert.ok(elapsedMs < 1000, `expected < 1000ms, got ${elapsedMs.toFixed(1)}ms`);
+
+  assert.deepEqual(
+    card.modules.map(m => [m.path, m.language, m.signatures]),
+    [
+      ['crates/world/src/lib.rs', 'rust', ['pub struct World', 'pub fn new_world(seed: u64) -> World']],
+      ['src/storage/index.mjs', 'js', ['export function saveNote(title, body)', 'export const MAX_NOTES = 100']],
+    ],
+  );
+  assert.ok(card.invariants.some(line => line.includes('Координаты чанков всегда в i32')));
+  assert.ok(card.invariants.some(line => line.includes('Без паник в публичном API.')));
+  assert.doesNotMatch(card.text, /dirty_working_tree_fn|DirtyStruct|dirtyJsFn|untracked_fn|internal_seed|hidden/);
+
+  // Deterministic across repeated calls.
+  const second = await buildApiCards({
+    cwd: dir,
+    baseSha,
+    task,
+    tasks,
+    constraints: ['Без паник в публичном API.'],
+  });
+  assert.deepEqual(second, card);
+});
+
+test('buildApiCards truncates deterministically within maxBytes and marks truncation clearly', async t => {
+  const manyFns = Array.from(
+    { length: 80 },
+    (_, i) => `pub fn compute_block_light_level_${String(i).padStart(3, '0')}(x: i32, y: i32, z: i32) -> u8 { 0 }`,
+  ).join('\n');
+  const { dir, baseSha } = await createRepo(t, {
+    'crates/world/src/a.rs': manyFns,
+    'crates/world/src/b.rs': manyFns,
+  });
+
+  const maxBytes = 600;
+  const first = await buildApiCards({ cwd: dir, baseSha, paths: ['crates/world'], maxBytes });
+  const second = await buildApiCards({ cwd: dir, baseSha, paths: ['crates/world'], maxBytes });
+
+  assert.deepEqual(second, first, 'truncation must be deterministic');
+  assert.equal(first.truncated, true);
+  assert.ok(first.bytes <= maxBytes, `bytes ${first.bytes} > ${maxBytes}`);
+  assert.equal(first.bytes, Buffer.byteLength(first.text, 'utf8'));
+  assert.ok(first.originalBytes > maxBytes);
+  assert.ok(first.omitted.files > 0 || first.omitted.signatures > 0);
+  assert.match(first.text, /\[truncated:/);
+});

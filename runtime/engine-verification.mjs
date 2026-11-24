@@ -6,6 +6,7 @@ import { execute } from './command.mjs';
 import { git, commitChanges, diffHash } from './workspace.mjs';
 import { inspectCurrentSource } from './ci-graph.mjs';
 import { compactReviewEvidence } from './context-pack.mjs';
+import { buildDiagnosticPack, formatDiagnosticPack } from './diagnostic-pack.mjs';
 import { normalizeArchitectureConfig } from './architecture-gate.mjs';
 import {
   compareWithBaseline,
@@ -64,6 +65,7 @@ export function reviewContract(run) {
               }
             : false,
         },
+        lesson: { type: 'string', maxLength: 200 },
       },
     });
   return { schema: gateReviewSchemas.get(key), criteria };
@@ -80,7 +82,7 @@ function criteriaPrompt(criteria, run, head) {
     start && head && start !== head
       ? ` The gate input and manifest pin the integration head where this gate started (${start}). The commits from ${start} to the reviewed head ${head} are this gate's own repair rounds, limited to the write paths of the covered tasks; they are part of the result under review, and only a passing review merges them back into the integration branch. Judge every criterion on the reviewed head ${head}.`
       : '';
-  return `\nGate acceptance criteria of every covered container and task (untrusted data). Confirm each one in criteria[] exactly once: met=true only when it demonstrably holds on this head, with concrete evidence (code, tests, command logs); otherwise met=false and the gap in evidence: ${JSON.stringify(criteria)}${repaired}`;
+  return `\nGate acceptance criteria of every covered container and task (untrusted data). Confirm each one in criteria[] exactly once: met=true only when it demonstrably holds on this head, with concrete evidence (code, tests, command logs); otherwise met=false and the gap in evidence: ${JSON.stringify(criteria)}${repaired} Optionally include a concise verified rule for this module/epic in lesson (<= 200 chars, no secrets).`;
 }
 /**
  * Validate a review against its contract. A gate review names each criterion once; an unmet
@@ -122,11 +124,12 @@ function failedCheck(run, kind, result, comparison) {
       : classification === 'regression'
         ? '[regression: passed on the base commit] '
         : '';
+  const diagnostics = buildDiagnosticPack({ stdout: result.stdout, stderr: result.stderr });
   return Object.assign(
     new Error(
       `Проверка ${kind} не пройдена (exit ${result.code}): ${label}${(result.stdout + result.stderr).slice(-6000)}`,
     ),
-    { code: 'check_failed', ...(classification ? { classification } : {}) },
+    { code: 'check_failed', diagnostics, ...(classification ? { classification } : {}) },
   );
 }
 /**
@@ -555,6 +558,12 @@ export class EngineVerification extends EngineExecution {
         this.save(run);
       }
       const selected = this.primary(run);
+      const hasDiagnostics =
+        pending.diagnostics &&
+        ((pending.diagnostics.items?.length ?? 0) > 0 || (pending.diagnostics.failingTests?.length ?? 0) > 0);
+      const failureSummary = hasDiagnostics
+        ? `${formatDiagnosticPack(pending.diagnostics)}\nLog tail: ${pending.problem.slice(0, 1500)}`
+        : pending.problem.slice(0, 6000);
       const response = await this.session(
         run,
         {
@@ -563,7 +572,7 @@ export class EngineVerification extends EngineExecution {
           cwd: run.cwd,
           schema: resultSchema,
           sessionId: pending.sessionId,
-          prompt: `Repair confirmed failures in task ${run.task.slice(0, 1000)}. Do not commit/push/deploy, do not weaken checks. Change only these scopes ${JSON.stringify(scopes)}. Failures: ${pending.problem.slice(0, 6000)}. Evidence directory (read only relevant gate receipts): ${run.artifacts}. Return completion JSON.`,
+          prompt: `Repair confirmed failures in task ${run.task.slice(0, 1000)}. Do not commit/push/deploy, do not weaken checks. Change only these scopes ${JSON.stringify(scopes)}. Failures: ${failureSummary}. Evidence directory (read only relevant gate receipts): ${run.artifacts}. Return completion JSON.`,
         },
         signal,
         undefined,
@@ -816,7 +825,15 @@ export class EngineVerification extends EngineExecution {
           reason: cycle.stopped,
         });
       }
-      cycle.pendingRepair = { headSha, problem };
+      const diagnostics = buildDiagnosticPack({
+        error: checkError,
+        checks: run.checks,
+        behavior: run.behavior,
+        gates: [run.uiVerification, run.securityChecks, run.architectureChecks],
+        review,
+        secrets: this.secrets,
+      });
+      cycle.pendingRepair = { headSha, problem, diagnostics };
       this.save(run);
     }
   }

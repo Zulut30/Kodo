@@ -11,6 +11,8 @@ import { inside } from './toolchains.mjs';
 
 export const BLUEPRINT_DIR = '.kodo/blueprint';
 export const MAX_TASK_INPUT_BYTES = 12000;
+export const MAX_TASK_WRITE_PATHS = 8;
+export const MAX_TASK_MODULES = 3;
 export const FOUNDATION_ID = 'foundation';
 export const FACTORY_ROLES = Object.freeze(['architect', 'developer', 'ui-qa', 'performance', 'security', 'reviewer']);
 export const DEFAULT_EXECUTION = Object.freeze({ cadence: 'wave', integration: 'branch' });
@@ -514,17 +516,142 @@ export function parallelOverlaps(tasks, { ancestors = taskAncestors(tasks), othe
   return pairs;
 }
 
-export function overlapFindings(pairs) {
+const SHARED_INTEGRATION_FILES = new Set([
+  'Cargo.toml',
+  'Cargo.lock',
+  'package.json',
+  'package-lock.json',
+  'pnpm-workspace.yaml',
+  'tsconfig.json',
+  'kodo.config.json',
+]);
+const SHARED_ENTRYPOINT = /^(?:src\/|cli\/)?(?:main|index|lib|app)\.(?:rs|[cm]?[jt]sx?)$/;
+const UNBOUNDED_SCOPE =
+  /^(?:\.|\.\.?\/\*+|\*+|\*\*\/\*+|(?:src|crates|packages|modules|libs)(?:\/\*+|\/\*\*|\/\*\*\/\*+)?)$/;
+const MODULE_SCOPE = /^((?:src|crates|packages|modules|libs|services|apps|runtime)\/[^/*?[{]+)/;
+
+const cleanScope = scope =>
+  String(scope ?? '')
+    .replaceAll('\\', '/')
+    .replace(/^\.\//, '')
+    .replace(/\/+$/, '');
+
+/** Whether a writePath targets a shared root manifest or entrypoint that parallel tasks must not co-edit. */
+export function isSharedIntegrationPath(scope) {
+  const normalized = cleanScope(scope);
+  return SHARED_INTEGRATION_FILES.has(normalized) || SHARED_ENTRYPOINT.test(normalized);
+}
+
+/** Whether a writePath is an unbounded root/container wildcard without a concrete module owner. */
+function isUnboundedWritePath(scope) {
+  return UNBOUNDED_SCOPE.test(cleanScope(scope));
+}
+
+function moduleOfWritePath(scope) {
+  const match = MODULE_SCOPE.exec(cleanScope(scope));
+  return match ? match[1] : null;
+}
+
+function pairSharesIntegrationFile(left, right) {
+  if (!left || !right) return false;
+  for (const a of left.writePaths ?? [])
+    for (const b of right.writePaths ?? [])
+      if ((isSharedIntegrationPath(a) || isSharedIntegrationPath(b)) && scopesOverlap([a], [b])) return true;
+  return false;
+}
+
+export function overlapFindings(pairs, tasks = []) {
+  const byId = new Map(tasks.map(task => [task.id, task]));
   const visible = pairs.slice(0, PAIR_CAP);
   return visible.map((pair, index) => {
     const rest = index === visible.length - 1 && pairs.length > visible.length;
+    const suffix = rest ? `; ещё пар: ${pairs.length - visible.length}` : '';
+    if (pairSharesIntegrationFile(byId.get(pair[0]), byId.get(pair[1]))) {
+      return finding(
+        'integrator_required',
+        `Задачи ${pair[0]} и ${pair[1]} в одной волне пересекаются по общим файлам (Cargo.toml, package.json или точка входа); вынесите правку общих файлов в отдельную задачу-интегратор${suffix}`,
+        pair,
+      );
+    }
     return finding(
       'blueprint_parallel_overlap',
-      `Задачи ${pair[0]} и ${pair[1]} могут идти параллельно, но их writePaths пересекаются` +
-        (rest ? `; ещё пар: ${pairs.length - visible.length}` : ''),
+      `Задачи ${pair[0]} и ${pair[1]} могут идти параллельно, но их writePaths пересекаются${suffix}`,
       pair,
     );
   });
+}
+
+/** Reject tasks without an unambiguous module/write owner: unbounded catch-all scopes
+ * or multiple non-foundation epics claiming write ownership of the same module. */
+export function moduleOwnerFindings(spec, { parallelPairs = [] } = {}) {
+  const findings = [];
+  const unbounded = spec.tasks.filter(task => (task.writePaths ?? []).some(isUnboundedWritePath)).map(task => task.id);
+  if (unbounded.length) {
+    findings.push(
+      finding(
+        'blueprint_owner_ambiguous',
+        'Задача должна задавать однозначный модуль/область записи, без корневых или контейнерных шаблонов (., **, src/**, crates/**)',
+        unbounded,
+      ),
+    );
+  }
+  const foundationEpics = new Set(
+    spec.epics.filter(epic => epic.id === FOUNDATION_ID || epic.milestoneId === FOUNDATION_ID).map(epic => epic.id),
+  );
+  const parallelSet = new Set(parallelPairs.map(([a, b]) => (a < b ? `${a}\0${b}` : `${b}\0${a}`)));
+  const ownersByModule = new Map();
+  for (const task of spec.tasks) {
+    if (foundationEpics.has(task.epicId)) continue;
+    const modules = new Set((task.writePaths ?? []).map(moduleOfWritePath).filter(Boolean));
+    for (const mod of modules) {
+      const list = ownersByModule.get(mod) ?? [];
+      list.push(task);
+      ownersByModule.set(mod, list);
+    }
+  }
+  for (const [mod, owners] of [...ownersByModule.entries()].sort(([a], [b]) => compare(a, b))) {
+    const epics = new Set(owners.map(task => task.epicId));
+    if (epics.size <= 1) continue;
+    const crossEpicPairs = [];
+    for (let i = 0; i < owners.length; i++)
+      for (let j = i + 1; j < owners.length; j++)
+        if (owners[i].epicId !== owners[j].epicId) {
+          const key =
+            owners[i].id < owners[j].id ? `${owners[i].id}\0${owners[j].id}` : `${owners[j].id}\0${owners[i].id}`;
+          if (!parallelSet.has(key)) crossEpicPairs.push([owners[i].id, owners[j].id]);
+        }
+    if (!crossEpicPairs.length) continue;
+    const taskIds = [...new Set(crossEpicPairs.flat())];
+    findings.push(
+      finding(
+        'blueprint_owner_ambiguous',
+        `Модуль ${mod} не имеет однозначного владельца: в него пишут задачи разных эпиков (${[...epics].sort(compare).join(', ')})`,
+        taskIds,
+      ),
+    );
+  }
+  return findings;
+}
+
+/** Reject tasks whose write scope exceeds MAX_TASK_WRITE_PATHS or MAX_TASK_MODULES. */
+export function taskScopeSizeFindings(tasks, alreadyOversized = new Set()) {
+  const oversized = tasks
+    .filter(task => {
+      if (alreadyOversized.has(task.id)) return false;
+      const paths = task.writePaths ?? [];
+      const modules = new Set(paths.map(moduleOfWritePath).filter(Boolean));
+      return paths.length > MAX_TASK_WRITE_PATHS || modules.size > MAX_TASK_MODULES;
+    })
+    .map(task => task.id);
+  return oversized.length
+    ? [
+        finding(
+          'split_required',
+          `Слишком крупная задача: больше ${MAX_TASK_WRITE_PATHS} путей записи или больше ${MAX_TASK_MODULES} модулей; разделите задачу в чертеже`,
+          oversized,
+        ),
+      ]
+    : [];
 }
 
 export function ownerFindings(tasks) {
@@ -740,13 +867,25 @@ function analyzeFactorySpec(spec, options = {}) {
   const findings = [...base.findings, ...sectionFindings(projectMarkdown)];
   if (!base.spec) return { spec: null, findings };
   const ancestors = taskAncestors(base.spec.tasks);
+  const pairs = parallelOverlaps(base.spec.tasks, { ancestors });
+  const inputFindings = taskInputFindings({
+    project: storedProject(base.spec),
+    tasks: base.spec.tasks,
+    contracts,
+    knownValues,
+  });
+  const alreadyOversized = new Set(
+    inputFindings.filter(item => item.code === 'split_required').flatMap(item => item.taskIds ?? []),
+  );
   findings.push(
     ...ownerFindings(base.spec.tasks),
     ...waveZeroFindings(base.spec, ancestors),
     ...containerFindings(base.spec),
     ...epicCycleFindings(base.spec.tasks),
-    ...overlapFindings(parallelOverlaps(base.spec.tasks, { ancestors })),
-    ...taskInputFindings({ project: storedProject(base.spec), tasks: base.spec.tasks, contracts, knownValues }),
+    ...overlapFindings(pairs, base.spec.tasks),
+    ...moduleOwnerFindings(base.spec, { parallelPairs: pairs }),
+    ...inputFindings,
+    ...taskScopeSizeFindings(base.spec.tasks, alreadyOversized),
     ...interfaceFindings(base.spec, interfaces),
   );
   return { spec: base.spec, findings };

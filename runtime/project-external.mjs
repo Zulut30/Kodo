@@ -41,6 +41,10 @@ import { workerRole } from './worker-roles.mjs';
 import { applyWavePolicy } from './wave-policy.mjs';
 import { DEFAULT_CLI, assertCliPrefix, quotePath } from './cli-command.mjs';
 import { planProjectHorizon } from './project-planner.mjs';
+import { buildApiCards } from './api-cards.mjs';
+import { buildContextManifest } from './context-manifest.mjs';
+import { measureContext, selectWaveVerifiedLessons } from './context-pack.mjs';
+import { formatDiagnosticPack } from './diagnostic-pack.mjs';
 
 /** The largest batch one `nextWave` call returns. */
 export const MAX_WAVE_LIMIT = 5;
@@ -126,7 +130,76 @@ function workerContract(run, writePaths, selfCheck) {
   ].join('\n');
 }
 
-function briefFor(state, attempt, task, run) {
+function retryDiagnosticsFor(state, attempt, task, run) {
+  const usable = pack =>
+    pack &&
+    typeof pack === 'object' &&
+    pack.kind === 'diagnostic-pack' &&
+    ((Array.isArray(pack.items) && pack.items.length > 0) ||
+      (Array.isArray(pack.failingTests) && pack.failingTests.length > 0));
+  if (usable(run.lastDiagnostics)) return run.lastDiagnostics;
+  if (!(attempt.number > 1)) return null;
+  const store = storeOf(state.ctx),
+    project = state.snapshot.project;
+  const previous = store
+    .listRuns(project.root)
+    .filter(
+      row =>
+        row.id !== run.id &&
+        row.directorBinding?.projectId === project.projectId &&
+        row.directorBinding.taskId === task.id &&
+        usable(row.lastDiagnostics),
+    );
+  return previous[0]?.lastDiagnostics ?? null;
+}
+
+async function waveBriefEnrichment(state, attempt, task, run, basePrompt) {
+  const project = state.snapshot.project;
+  if (project.execution?.cadence !== 'wave') return { prompt: basePrompt, extra: {} };
+  const store = storeOf(state.ctx);
+  const secrets = state.ctx.engine.secrets || {};
+  const apiCards = await buildApiCards({
+    cwd: run.project,
+    baseSha: run.baseSha,
+    task,
+    tasks: state.snapshot.tasks,
+    constraints: project.constraints,
+    secrets,
+  });
+  const verifiedLessons = selectWaveVerifiedLessons(store.lessons(project.root, 20), {
+    task,
+    projectId: project.projectId,
+  });
+  const diagnostics = retryDiagnosticsFor(state, attempt, task, run);
+  const apiCardBlock = `\n\n${apiCards.text}`;
+  const lessonsBlock = verifiedLessons.length
+    ? `\n\nVerified lessons (module/epic):\n${verifiedLessons.map(item => `- [${item.headSha.slice(0, 12)}] ${item.summary}`).join('\n')}`
+    : '';
+  const diagnosticsBlock = diagnostics ? `\n\nPrevious attempt failures:\n${formatDiagnosticPack(diagnostics)}` : '';
+  const sections = [
+    { name: 'instructions', bytes: measureContext(basePrompt), mandatory: true },
+    { name: 'api-cards', bytes: measureContext(apiCardBlock), mandatory: true },
+    ...(lessonsBlock ? [{ name: 'verified-lessons', bytes: measureContext(lessonsBlock), mandatory: false }] : []),
+    ...(diagnosticsBlock ? [{ name: 'diagnostics', bytes: measureContext(diagnosticsBlock), mandatory: false }] : []),
+  ];
+  const contextManifest = buildContextManifest({
+    runId: run.id,
+    stage: 'wave-brief',
+    node: task.id,
+    headSha: run.baseSha,
+    sections,
+    references: [],
+  });
+  const extra = {
+    apiCards,
+    contextManifest,
+    ...(verifiedLessons.length ? { verifiedLessons } : {}),
+    ...(diagnostics ? { diagnostics } : {}),
+  };
+  return { prompt: `${basePrompt}${apiCardBlock}${lessonsBlock}${diagnosticsBlock}`, extra };
+}
+
+async function briefFor(state, attempt, task, run) {
   const { C, options, cli } = state,
     project = state.snapshot.project;
   const input = C.buildDirectorTaskInput({ project, task }, options);
@@ -134,6 +207,8 @@ function briefFor(state, attempt, task, run) {
   const { role, instructions } = workerRole(task.owner);
   // The caller's CLI (`cli`): a chat runs the same Kodo package that issued the brief.
   const selfCheck = `${cli} ci feedback --base ${run.baseSha} --project ${quotePath(run.cwd)} --json`;
+  const basePrompt = `${input}\n\n${workerContract(run, task.writePaths, selfCheck)}`;
+  const { prompt, extra } = await waveBriefEnrichment(state, attempt, task, run, basePrompt);
   const brief = {
     projectId: project.projectId,
     taskId: task.id,
@@ -147,10 +222,11 @@ function briefFor(state, attempt, task, run) {
     branch: run.branch,
     baseSha: run.baseSha,
     interfaces: task.interfaceRefs.map(ref => ref.path),
-    prompt: `${input}\n\n${workerContract(run, task.writePaths, selfCheck)}`,
+    prompt,
     selfCheck,
     completeCommand: `${cli} project complete-task ${project.projectId} ${task.id} --head <SHA> --attempt ${attempt.id} --defer-gate`,
     abandonCommand: `${cli} project complete-task ${project.projectId} ${task.id} --head <SHA> --abandon --attempt ${attempt.id}`,
+    ...extra,
   };
   C.assertDirectorSafe(brief, options);
   return brief;
@@ -217,7 +293,7 @@ async function prepareAttempt(state, attempt) {
   await advanceToRunning(state, attempt.taskId);
   const current = currentOf(state.snapshot, attempt.taskId);
   state.briefs.push(
-    briefFor(
+    await briefFor(
       state,
       current,
       state.snapshot.tasks.find(row => row.id === task.id),
@@ -826,8 +902,17 @@ async function verifySubmission(ctx, run, task, head, signal) {
     return null;
   const verdict = await verifyTaskFastOnce({ engine: ctx.engine, run: run.id, signal });
   if (!verdict.passed || verdict.headSha !== head) {
-    store.updateRun(run.id, { state: 'executing' });
-    return verdict.passed ? problem('external_head_changed') : { code: verdict.code, message: verdict.message };
+    store.updateRun(run.id, {
+      state: 'executing',
+      ...(verdict.diagnostics ? { lastDiagnostics: verdict.diagnostics } : {}),
+    });
+    return verdict.passed
+      ? problem('external_head_changed')
+      : {
+          code: verdict.code,
+          message: verdict.message,
+          ...(verdict.diagnostics ? { diagnostics: verdict.diagnostics } : {}),
+        };
   }
   store.updateRun(run.id, { state: 'succeeded', error: null });
   return null;

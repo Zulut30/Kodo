@@ -1,3 +1,5 @@
+import { scopesOverlap } from './contracts.mjs';
+
 /** Actual UTF-8 text bytes. These are neither billed tokens nor quota usage. */
 export function measureContext(text) {
   if (typeof text !== 'string') throw new TypeError('Context measurement requires a string');
@@ -109,7 +111,7 @@ function addStrings(fields, owner, key, value, field) {
 
 // The caller supplies relevant project-scoped lessons in priority order. This
 // projects existing recorded evidence; it performs no new review or storage.
-function verifiedLessonSummaries(lessons) {
+export function verifiedLessonSummaries(lessons, maxLessons = 3) {
   const selected = [];
   if (!Array.isArray(lessons)) return selected;
   for (const lesson of lessons) {
@@ -138,9 +140,50 @@ function verifiedLessonSummaries(lessons) {
       headSha: lesson.headSha,
       summary: summary.length <= 200 ? summary.join('') : summary.slice(0, 199).join('') + '…',
     });
-    if (selected.length === 3) break;
+    if (selected.length === maxLessons) break;
   }
   return selected;
+}
+
+const MODULE_CONTAINER = /^(?:src|crates|packages|modules|libs|services|apps|runtime)\/([^/*?[{]+)/;
+
+/** Extract normalized module names from a list of writePaths. */
+export function modulesFromWritePaths(writePaths) {
+  const modules = new Set();
+  for (const raw of strings(writePaths)) {
+    const normalized = raw.replaceAll('\\', '/').replace(/^\.\//, '').replace(/\/+$/, '');
+    const match = MODULE_CONTAINER.exec(normalized);
+    if (!match) continue;
+    const name = match[1].replace(/\.[a-z0-9]+$/i, '').toLowerCase();
+    if (name) modules.add(name);
+  }
+  return [...modules];
+}
+
+/**
+ * Select up to `maxLessons` head-verified gate lessons matching a wave task's
+ * epic or module/writePaths. Never returns secrets or raw review text: output
+ * contains only `{ runId, headSha, summary }` (<= 200 Unicode chars).
+ * @param {any[]} lessons
+ * @param {{ task: { epicId?: string, writePaths?: string[] }, projectId?: string, maxLessons?: number }} options
+ */
+export function selectWaveVerifiedLessons(lessons, { task, projectId, maxLessons = 3 } = /** @type {any} */ ({})) {
+  if (!Array.isArray(lessons) || !record(task)) return [];
+  const taskModules = modulesFromWritePaths(task.writePaths);
+  const taskPaths = strings(task.writePaths);
+  const matched = lessons.filter(lesson => {
+    if (!record(lesson)) return false;
+    if (projectId && typeof lesson.projectId === 'string' && lesson.projectId !== projectId) return false;
+    const epicIds = strings(lesson.epicIds);
+    const modules = strings(lesson.modules).map(m => m.toLowerCase());
+    const writePaths = strings(lesson.writePaths);
+    if (!epicIds.length && !modules.length && !writePaths.length) return false;
+    if (typeof task.epicId === 'string' && epicIds.includes(task.epicId)) return true;
+    if (taskModules.some(mod => modules.includes(mod))) return true;
+    if (taskPaths.length && writePaths.length && scopesOverlap(writePaths, taskPaths)) return true;
+    return false;
+  });
+  return verifiedLessonSummaries(matched, maxLessons);
 }
 
 /** Bounded allowlisted analysis/discovery metadata; source bodies, cache,

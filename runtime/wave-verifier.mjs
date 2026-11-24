@@ -22,6 +22,8 @@ import { runFastChecks } from './task-fast-checks.mjs';
 import { buildGateInput, buildGateManifest, gateBindingFor, gateReviewCriteria } from './project-contracts.mjs';
 import { applyWavePolicy, assertWavePolicy } from './wave-policy.mjs';
 import { gateRange, gateRepairInScope, integrationHeadOf } from './project-integration.mjs';
+import { buildDiagnosticPack } from './diagnostic-pack.mjs';
+import { modulesFromWritePaths, verifiedLessonSummaries } from './context-pack.mjs';
 
 /** The watchdog of a wave gate when the project sets none. */
 export const GATE_WATCHDOG = Object.freeze({ stalledRounds: 2, rejectUnchanged: true });
@@ -258,7 +260,68 @@ async function gateDraft({ engine, project, gate, covered, containers, input }) 
   draft.gateManifest = await engine.persistEvidence(draft, 'gate-manifest', manifest, { headSha: gate.headSha });
   // The independent review confirms each of them (review.criteria).
   draft.gateCriteria = gateReviewCriteria(manifest);
+  const coveredWritePaths = covered.flatMap(({ task }) => task.writePaths || []);
+  const epicIds = [
+    ...new Set([
+      ...(gate.containers || []).filter(c => c.kind === 'epic').map(c => c.id),
+      ...covered.map(({ task }) => task.epicId).filter(nonEmpty),
+    ]),
+  ];
+  draft.gateScope = {
+    epicIds,
+    modules: modulesFromWritePaths(coveredWritePaths),
+    writePaths: [...new Set(coveredWritePaths)],
+  };
   return draft;
+}
+
+/**
+ * Record a head-verified gate lesson (<= 200 Unicode chars, bound to `run.headSha`,
+ * passing checks and passing review, redacted, without raw review findings) into
+ * the project's knowledge store so subsequent tasks of the same module/epic receive it.
+ * @param {any} engine
+ * @param {any} run
+ */
+export function recordGateLesson(engine, run) {
+  if (!engine?.store || !run || run.directorBinding?.kind !== 'gate') return null;
+  const rawLesson =
+    typeof run.review?.lesson === 'string' ? run.review.lesson : typeof run.lesson === 'string' ? run.lesson : '';
+  const trimmed = redact(rawLesson.trim(), engine.secrets || {});
+  if (!trimmed) return null;
+  if (!shaPattern.test(run.headSha) || run.review?.passed !== true || run.review.headSha !== run.headSha) return null;
+  const chars = Array.from(trimmed);
+  const summary = chars.length <= 200 ? trimmed : chars.slice(0, 199).join('') + '…';
+  const checkResults = Array.isArray(run.checks?.results)
+    ? run.checks.results.map(item => ({ command: item.command, exitCode: item.exitCode }))
+    : [];
+  const scope = run.gateScope ?? {
+    epicIds: [],
+    modules: modulesFromWritePaths((run.plan?.tasks || []).flatMap(task => task.writePaths || [])),
+    writePaths: [...new Set((run.plan?.tasks || []).flatMap(task => task.writePaths || []))],
+  };
+  const candidate = {
+    runId: run.id,
+    headSha: run.headSha,
+    summary,
+    lesson: summary,
+    kind: 'gate-lesson',
+    projectId: run.directorBinding.projectId,
+    gateId: run.directorBinding.gateId,
+    epicIds: [...new Set(scope.epicIds || [])],
+    modules: [...new Set(scope.modules || [])],
+    writePaths: [...new Set(scope.writePaths || [])],
+    checks: {
+      complete: run.checks?.complete === true,
+      headSha: run.checks?.headSha ?? run.headSha,
+      results: checkResults,
+    },
+    review: { passed: true, headSha: run.headSha },
+  };
+  // Verify using the exact same head-bound checks/review rules as ContextPack.
+  if (!verifiedLessonSummaries([candidate], 1).length) return null;
+  if (typeof engine.store.rememberLesson === 'function')
+    return engine.store.rememberLesson(run.project, run.id, candidate);
+  return null;
 }
 
 /** Hold `run:<id>` like Engine.run(): heartbeat, cancellation requests and the caller's signal. */
@@ -446,6 +509,8 @@ export async function runEpicGate({ engine, run: input, signal }) {
       run.state = 'succeeded';
       run.error = null;
       run.blocker = resolveBlocker(run.blocker, { at: new Date().toISOString(), outcome: 'succeeded' });
+      const recordedLesson = recordGateLesson(engine, run);
+      if (recordedLesson) run.gateLesson = { headSha: run.headSha, lesson: recordedLesson.lesson };
       engine.save(run);
       engine.log(run, 'gate_succeeded', { headSha: run.headSha, smoke: run.smoke.results.length });
       return run;
@@ -480,10 +545,19 @@ export async function verifyTaskFastOnce({ engine, run: input, signal }) {
       const error = leaseError() || caught;
       if (leased.aborted || ['cancelled', 'quota', 'auth', 'lease_lost', 'evidence_integrity'].includes(error.code))
         throw error;
+      const diagnostics = buildDiagnosticPack({
+        checks: run.checks,
+        behavior: run.behavior,
+        error,
+        secrets: engine.secrets,
+      });
+      run.lastDiagnostics = diagnostics;
+      engine.save(run);
       return {
         passed: false,
         code: error.code || 'error',
         message: redact(String(error.message), engine.secrets).slice(0, 6000),
+        diagnostics,
         headSha: run.checks?.headSha ?? null,
         checks: run.checks,
         behavior: run.behavior,

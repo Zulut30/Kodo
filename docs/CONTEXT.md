@@ -31,7 +31,7 @@
 
 Правила:
 
-- Обязательные секции (`guidance`, `instructions`, `task-context`, `gates`) манифест не сокращает и не позволяет записать сокращёнными. Внутри `task-context` обязательный блок контракта (описание, область записи, acceptance) передаётся полностью, а необязательный блок (цель запуска, зависимости, источники) ограничен и может быть урезан упаковщиком контекста задачи; манифест этого урезания не показывает.
+- Обязательные секции (`guidance`, `instructions`, `task-context`, `gates`, а в волновой фабрике также `api-cards`) манифест не сокращает и не позволяет записать сокращёнными. Внутри `task-context` обязательный блок контракта (описание, область записи, acceptance) передаётся полностью, а необязательный блок (цель запуска, зависимости, источники) ограничен и может быть урезан упаковщиком контекста задачи; манифест этого урезания не показывает. Аналогично `api-cards` имеет собственный детерминированный предел размера (по умолчанию 12 КБ) при сборке, после чего передаётся через манифест как обязательная секция.
 - Сессия с `task-context` обязана ссылаться на свой `node-contract`. Контракт содержит полные acceptance-критерии узла.
 - Сокращённая секция обязана перечислить, что она потеряла (`omitted`). Молчаливого сокращения нет.
 - Ссылка без корректного SHA-256 записывается как непроверяемая (`sha256: null`) и никогда не считается контрактом.
@@ -100,10 +100,40 @@
 
 Байты контекста — не токены. Usage берётся только из того, что отдал нативный клиент; отсутствующий usage остаётся `null`, а не нулём ([metrics](../runtime/metrics.mjs)). Экономия токенов, квоты, денег и времени этим этапом не измерялась и не заявляется.
 
+## Волновой контекст: карты публичного API, пакет ошибок и уроки гейтов
+
+Добавлено этапом 15D ([ADR-0017](decisions/0017-parallel-engine.md)). Всё выполняется локально и детерминированно — без вызовов моделей и сети; подключается к брифам волновой фабрики только при `project.execution.cadence === "wave"`.
+
+### Карта публичного API (`runtime/api-cards.mjs`)
+
+Перед выдачей брифа `nextWave` извлекает публичный API модулей, от которых зависит задача (`dependsOn` и `interfaceRefs`), строго из коммита `baseSha` (`git ls-tree` и `git show <baseSha>:<path>`), не читая рабочий каталог: локальные правки в рабочем дереве не влияют на карту.
+
+- **Rust** (`extractRustPublicApi`): публичные `pub struct`, `pub enum`, `pub trait`, `pub fn`, `pub type`, `pub const`, `pub static`, `pub mod`, `pub use` и `pub fn/const/type` внутри `impl`-блоков в одну строку без тел. Непубличные элементы и ограниченная видимость (`pub(crate)`, `pub(super)`, `pub(in …)`) исключаются; комментарии и строковые литералы (включая raw-строки) игнорируются.
+- **JS/TS** (`extractJsTsPublicApi`): `export` функций, классов, констант (стрелочные функции — до `=>`), типов, интерфейсов, enum и реэкспортов в одну строку без тел; локальные объявления исключаются.
+- **Инварианты проекта**: собираются из коммита `baseSha` (`.kodo/blueprint/invariants.md`, `INVARIANTS.md`, `docs/invariants.md`, раздел «Инварианты» / «Invariants» в `.kodo/blueprint/PROJECT.md`) и `project.constraints`.
+- **Предел и усечение**: по умолчанию `DEFAULT_API_CARD_MAX_BYTES = 12288` (12 КБ UTF-8). При превышении лишние подписи/файлы отбрасываются детерминированно с явной пометкой `[truncated: omitted …]` и счётчиками `omitted`.
+- **Встраивание через `ContextManifest`**: карта входит в бриф волновой задачи (`brief.apiCards`, `brief.prompt` и `brief.contextManifest`) как обязательная (`mandatory: true`) секция `api-cards`; существующие поля брифа не меняются.
+
+### Компактный пакет ошибок (`runtime/diagnostic-pack.mjs`)
+
+`buildDiagnosticPack` собирает нормализованный дедуплицированный список `{ file, line, column, code, level, message, failingTests[] }` и общий список `failingTests[]` из трёх источников:
+
+- `cargo build/check/test --message-format=json` (`reason: "compiler-message"`, primary span, код ошибки/предупреждения, фильтрация шумовых итоговых строк вроде `aborting due to N previous errors`, плюс имена упавших Rust-тестов);
+- вывод `node:test` (форматы `spec` с `failing tests:` / `test at file:line:col` и `TAP` с YAML-блоками), а также синтаксические ошибки `node --check`;
+- отказы гейтов Kodo (behaviour, architecture, security, UI и замечания ревью).
+
+Пределы по умолчанию: `DEFAULT_MAX_DIAGNOSTICS = 25` записей и `DEFAULT_MAX_DIAGNOSTIC_BYTES = 4096` байт UTF-8; секреты редактируются до сериализации. При провале `task-fast` (`runtime/task-fast-checks.mjs`, `runtime/wave-verifier.mjs`) пакет сохраняется в результат (`checks_failed.diagnostics` и `run.lastDiagnostics`) и передаётся в бриф повторной попытки (`brief.diagnostics` и `brief.prompt`) и в промпт ремонта (`runtime/engine-verification.mjs`), оставляя хвост лога коротким дополнением.
+
+### Проверенные уроки гейтов (`verifiedLessons`) в волнах
+
+В схеме ревью гейта эпика (`reviewContract` в `runtime/engine-verification.mjs`) доступно необязательное структурированное поле `lesson` (≤ 200 символов). При успешном завершении гейта (`runEpicGate` / `recordGateLesson` в `runtime/wave-verifier.mjs`) урок проходит редактирование секретов, привязку к `headSha` с пройденными проверками и ревью и сохраняется в таблице `knowledge` (`store.rememberLesson`) с областью `epicIds`/`modules`/`writePaths`, без сырого текста ревью и замечаний.
+
+При выдаче брифа следующей задачи `selectWaveVerifiedLessons` (`runtime/context-pack.mjs`) отбирает до трёх проверенных уроков (`{ runId, headSha, summary }`) того же модуля или эпика и включает их в `brief.verifiedLessons` и секцию `verified-lessons` манифеста; задачи чужих модулей и эпиков этот урок не получают.
+
 ## Проверка
 
 ```powershell
-node scripts/run-tests.mjs tests/fast-path.test.mjs tests/context-manifest.test.mjs tests/fast-path-engine.test.mjs
+node scripts/run-tests.mjs tests/fast-path.test.mjs tests/context-manifest.test.mjs tests/fast-path-engine.test.mjs tests/api-cards.test.mjs tests/diagnostic-pack.test.mjs tests/wave-context-integration.test.mjs
 ```
 
 Все проверки offline: fake providers, настоящие Git и SQLite. Модели и платные вызовы не используются.
