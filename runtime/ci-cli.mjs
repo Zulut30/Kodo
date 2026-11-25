@@ -5,7 +5,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
-import { access } from 'node:fs/promises';
+import { access, lstat } from 'node:fs/promises';
 import { execute } from './command.mjs';
 import { redact, workerEnvironment } from './security.mjs';
 
@@ -95,7 +95,17 @@ async function sourceState(project, headSha, dependencies) {
     return 'unknown';
   }
 }
-async function affected(options, dependencies) {
+async function hasCargoFeedbackWorkspace(project) {
+  const manifest = await lstat(path.join(project, 'Cargo.toml')).catch(() => null);
+  if (!manifest?.isFile()) return false;
+  const pkg = await lstat(path.join(project, 'package.json')).catch(() => null);
+  return !pkg;
+}
+async function affected(options, dependencies, { feedback = false } = {}) {
+  if (!dependencies.planAffected && feedback && (await hasCargoFeedbackWorkspace(options.project))) {
+    const { cargoFeedbackGraph } = await import('./cargo-graph.mjs');
+    return validateGraph(await cargoFeedbackGraph(options));
+  }
   const plan = dependencies.planAffected ?? (await import('./ci-graph.mjs')).planAffected;
   if (typeof plan !== 'function') throw fail('graph_contract');
   return validateGraph(await plan(options));
@@ -143,6 +153,7 @@ export async function planCi(options, dependencies = {}) {
         ...(options.feedback ? { changedPaths: await workingChanges(project, dependencies, options.signal) } : {}),
       },
       dependencies,
+      { feedback: Boolean(options.feedback) },
     );
     if (options.feedback) {
       report.requiresFullCheck = true;
@@ -178,6 +189,7 @@ export async function planCi(options, dependencies = {}) {
       capabilities,
       mode: broad ? 'standard' : 'quick',
       ...(broad ? {} : { changedPaths: scope.filter(name => names.has(name)) }),
+      ...(options.feedback ? { feedback: true } : {}),
     };
     report.quality = await registry.plan(project, qualityOptions);
     report.qualityOptions = qualityOptions;
@@ -452,10 +464,12 @@ export async function runCi(options, dependencies = {}) {
       : receipts.some(row => row.status === 'passed')
         ? 'passed'
         : 'not_applicable';
+  const warnings = [...new Set(receipts.flatMap(row => [...(row.warnings ?? []), ...(row.report?.warnings ?? [])]))];
   return {
     ...plan,
     status: options.feedback && status === 'passed' ? 'feedback_ready' : status,
     complete: !options.feedback && status === 'passed',
+    ...(warnings.length ? { warnings } : {}),
     ...(options.feedback
       ? {
           codeChecksObserved: receipts.some(
@@ -490,6 +504,7 @@ export async function ciCli(argv, dependencies = {}) {
       ? JSON.stringify(report)
       : [
           `CI ${report.tier}: ${report.status} (${report.platform})`,
+          ...(report.warnings?.length ? [`Warnings: ${report.warnings.join(', ')}`] : []),
           ...(report.receipts ?? report.commands).map(row => `${row.phase}: ${row.status ?? 'planned'}`),
           'Cross-platform and deployment evidence must be collected separately.',
         ].join('\n');

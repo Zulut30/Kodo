@@ -416,6 +416,15 @@ function toManifestMap(manifests) {
 
 function parseManifestEntry(raw) {
   if (raw === undefined) return { error: 'missing' };
+  if (isPlainObject(raw)) {
+    let manifestHash;
+    try {
+      manifestHash = hash(raw);
+    } catch {
+      manifestHash = digest(JSON.stringify(raw));
+    }
+    return { doc: raw, hash: manifestHash };
+  }
   const decoded = decodeUtf8(raw);
   if (!decoded) return { error: 'parse-error' };
   try {
@@ -793,7 +802,7 @@ function resolveWorkspaceAtRoot({ rootDir, rootEntry, manifestDirs, snapshotDirs
 
 /**
  * Resolve a Cargo workspace offline using Cargo's member/exclude/path-dependency rules.
- * @param {{ manifests: Map<string, Buffer | string> | Record<string, Buffer | string>, files?: Array<string | { path: string }>, startDir?: string }} input
+ * @param {{ manifests: Map<string, Buffer | string | Record<string, any>> | Record<string, Buffer | string | Record<string, any>>, files?: Array<string | { path: string }>, startDir?: string }} input
  */
 export function resolveCargoWorkspace({ manifests, files, startDir = '' }) {
   const rawMap = toManifestMap(manifests);

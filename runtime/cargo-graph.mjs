@@ -1,11 +1,15 @@
+import { createHash } from 'node:crypto';
+import { lstat, readFile, realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { parse } from 'smol-toml';
+import { resolveCargoWorkspace } from './cargo-workspace.mjs';
 import { execute } from './command.mjs';
 import { rustSourcePaths } from './rust-source-paths.mjs';
+import { workerEnvironment } from './security.mjs';
+import { noLinks } from './toolchains.mjs';
 
 const posix = path.posix;
 const folder = name => (posix.dirname(name) === '.' ? '' : posix.dirname(name));
-const manifestAt = dir => posix.join(dir, 'Cargo.toml');
 const normalized = dir =>
   posix
     .normalize(dir || '.')
@@ -42,37 +46,34 @@ function dependencies(doc, rootDoc, dir, root) {
   return paths;
 }
 
-// Include implicit workspace members reached through local path dependencies.
-export function cargoMembers(documents, root = '') {
-  root = normalized(root);
-  const rootDoc = documents.get(manifestAt(root)),
-    workspace = rootDoc?.workspace ?? {};
-  const members = new Map();
-  const add = dir => {
-    const doc = documents.get(manifestAt(dir));
-    if (doc?.package && !members.has(dir)) members.set(dir, doc);
-  };
-  add(root);
-  const relativeDir = dir => posix.relative(root || '.', dir || '.');
-  const eligible = dir => {
-    const rel = relativeDir(dir);
-    if (rel === '..' || rel.startsWith('../')) return false;
-    return !ancestors(rel).some(
-      parent =>
-        matches(parent, workspace.exclude) ||
-        (parent && documents.get(manifestAt(posix.join(root, parent)))?.workspace),
-    );
-  };
-  if (rootDoc?.workspace) {
-    for (const [name, doc] of documents) {
-      if (posix.basename(name) !== 'Cargo.toml' || !doc?.package) continue;
-      const dir = folder(name);
-      if (eligible(dir) && matches(relativeDir(dir), workspace.members)) add(dir);
-    }
-    for (const [dir, doc] of members)
-      for (const dep of dependencies(doc, rootDoc, dir, root)) if (eligible(dep)) add(dep);
+/**
+ * Resolve a Cargo workspace through the canonical resolver in cargo-workspace.mjs.
+ * @param {Map<string, any>} documents
+ * @param {string} [root]
+ * @param {{ files?: Array<string | { path: string }> }} [options]
+ */
+export function cargoWorkspace(documents, root = '', options = {}) {
+  const { files } = options;
+  const manifests = new Map();
+  for (const [name, doc] of documents) {
+    if (posix.basename(name) === 'Cargo.toml') manifests.set(name, doc);
   }
-  return members;
+  return resolveCargoWorkspace({
+    manifests,
+    ...(files === undefined ? {} : { files }),
+    startDir: normalized(root),
+  });
+}
+
+/**
+ * Include implicit workspace members reached through local path dependencies.
+ * @param {Map<string, any>} documents
+ * @param {string} [root]
+ * @param {{ files?: Array<string | { path: string }> }} [options]
+ */
+export function cargoMembers(documents, root = '', options = {}) {
+  const resolved = cargoWorkspace(documents, root, options);
+  return new Map(resolved.members.map(member => [member.root, member.doc]));
 }
 
 function targetPaths(doc) {
@@ -297,10 +298,20 @@ function packageSpec(doc, root) {
 }
 
 export function affectedCrates(documents, changed, snapshot = { entries: [], sources: new Map() }) {
-  const members = cargoMembers(documents),
-    root = documents.get('Cargo.toml');
+  const entries = snapshot.entries ?? [];
+  const linkPaths = entries.filter(entry => entry.mode === '120000').map(entry => entry.file);
+  const nonLinkEntries = entries.filter(entry => entry.mode !== '120000').map(entry => entry.file);
+  const files = [...nonLinkEntries, ...(snapshot.sources ? snapshot.sources.keys() : [])];
+  const workspace = cargoWorkspace(documents, '', { files: files.length ? files : undefined });
+  const members = new Map(workspace.members.map(member => [member.root, member.doc]));
+  const root = documents.get('Cargo.toml');
   const all = [...members.values()].map(doc => doc.package.name);
   const full = reason => ({ affectedCrates: all, fallback: true, reasons: [reason], packageSpecs: [] });
+  if (workspace.unsupported.length) {
+    if (linkPaths.some(link => cargoLink(link, members, [...members.keys()], root?.workspace)))
+      return full('cargo-linked-input');
+    return full('cargo-workspace-unsupported');
+  }
   if (
     !changed.length ||
     root?.patch ||
@@ -315,7 +326,6 @@ export function affectedCrates(documents, changed, snapshot = { entries: [], sou
     .filter(dir => dir || root?.package)
     .sort((a, b) => b.length - a.length);
   const selected = new Set();
-  const linkPaths = snapshot.entries.filter(entry => entry.mode === '120000').map(entry => entry.file);
   const links = new Set(linkPaths.map(pathKey));
   const unowned = [];
   for (const file of changed) {
@@ -364,6 +374,68 @@ export function affectedCrates(documents, changed, snapshot = { entries: [], sou
   return { affectedCrates: packages.map(doc => doc.package.name), packageSpecs, fallback: false, reasons };
 }
 
+const isCargoSourceFile = file =>
+  posix.basename(file) === 'Cargo.toml' ||
+  pathKey(file).endsWith('.rs') ||
+  file === 'Cargo.lock' ||
+  /(?:^|\/)\.cargo\/config[^/]*$/.test(file);
+
+const feedbackConfigFile = file => /^(?:\.gitignore|architecture\.policy\.json|kodo\.config\.json)$/.test(file);
+const sortedUnique = values => [...new Set(values)].sort();
+const digestJson = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+
+async function overlayWorkingChanges(project, snapshot, changedPaths) {
+  if (!changedPaths.length) return snapshot;
+  const entriesByFile = new Map(snapshot.entries.map(entry => [entry.file, entry]));
+  const sources = new Map(snapshot.sources);
+  for (const file of changedPaths) {
+    const absolute = path.join(project, ...file.split('/'));
+    let info;
+    try {
+      info = await lstat(absolute);
+    } catch (error) {
+      if (error.code === 'ENOENT' || error.code === 'ENOTDIR') {
+        entriesByFile.delete(file);
+        sources.delete(file);
+        continue;
+      }
+      throw error;
+    }
+    if (info.isSymbolicLink()) {
+      entriesByFile.set(file, { mode: '120000', type: 'blob', oid: '0'.repeat(40), file });
+      sources.delete(file);
+      continue;
+    }
+    if (!info.isFile() || info.size > 16 * 1024 * 1024) continue;
+    const bytes = await readFile(absolute);
+    entriesByFile.set(file, {
+      mode: '100644',
+      type: 'blob',
+      oid: createHash('sha256').update(bytes).digest('hex'),
+      file,
+    });
+    if (isCargoSourceFile(file)) sources.set(file, bytes.toString('utf8'));
+  }
+  const entries = [...entriesByFile.values()].sort((a, b) => (a.file < b.file ? -1 : a.file > b.file ? 1 : 0));
+  return { entries, sources };
+}
+
+async function readFeedbackBlob(project, headSha, changedSet, file, readSourceSnapshot) {
+  if (changedSet.has(file)) {
+    try {
+      const absolute = path.join(project, ...file.split('/'));
+      const info = await lstat(absolute);
+      if (info.isFile() && !info.isSymbolicLink() && info.size <= 16 * 1024 * 1024)
+        return await readFile(absolute, 'utf8');
+    } catch {
+      return undefined;
+    }
+    return undefined;
+  }
+  const extra = await readSourceSnapshot(project, headSha, name => name === file);
+  return extra.sources.get(file);
+}
+
 // Read manifest blobs at the submitted commit. A rename contributes both paths.
 export async function cargoPlanAt(cwd, baseSha, headSha) {
   if (![baseSha, headSha].every(sha => /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(sha)))
@@ -373,18 +445,11 @@ export async function cargoPlanAt(cwd, baseSha, headSha) {
     .split('\0')
     .filter(Boolean);
   const { readSourceSnapshot } = await import('./ci-graph.mjs');
-  const snapshot = await readSourceSnapshot(
-    cwd,
-    headSha,
-    file =>
-      posix.basename(file) === 'Cargo.toml' ||
-      pathKey(file).endsWith('.rs') ||
-      file === 'Cargo.lock' ||
-      /(?:^|\/)\.cargo\/config[^/]*$/.test(file),
-  );
+  const snapshot = await readSourceSnapshot(cwd, headSha, isCargoSourceFile);
   const docs = new Map();
   for (const [file, text] of snapshot.sources) if (posix.basename(file) === 'Cargo.toml') docs.set(file, parse(text));
-  const extra = extraTargetFiles(cargoMembers(docs));
+  const nonLinkFiles = snapshot.entries.filter(entry => entry.mode !== '120000').map(entry => entry.file);
+  const extra = extraTargetFiles(cargoMembers(docs, '', { files: nonLinkFiles }));
   if (extra.size) {
     const targets = await readSourceSnapshot(cwd, headSha, file => extra.has(file));
     for (const [file, text] of targets.sources) snapshot.sources.set(file, text);
@@ -414,4 +479,138 @@ export async function cargoPlanAt(cwd, baseSha, headSha) {
     ? []
     : snapshot.entries.filter(entry => entry.mode === '120000').map(entry => entry.file);
   return { changed, ...scope, unrelatedLinks };
+}
+
+async function collectFeedbackReferences(project, headSha, changedSet, snapshot, members, readSourceSnapshot) {
+  const extra = extraTargetFiles(members);
+  for (const file of extra) {
+    if (!snapshot.sources.has(file)) {
+      const text = await readFeedbackBlob(project, headSha, changedSet, file, readSourceSnapshot);
+      if (text !== undefined) snapshot.sources.set(file, text);
+    }
+  }
+  const references = new Map();
+  let pending = [...snapshot.sources.keys()].filter(file => pathKey(file).endsWith('.rs') || extra.has(file));
+  while (pending.length) {
+    const fragments = new Set();
+    for (const file of pending) {
+      const refs = rustSourcePaths(snapshot.sources.get(file));
+      references.set(file, refs);
+      for (const { kind, value } of refs)
+        if (kind === 'include' && value && !outside(normalized(posix.join(folder(file), value)))) {
+          const target = normalized(posix.join(folder(file), value));
+          if (!snapshot.sources.has(target)) fragments.add(target);
+        }
+    }
+    if (!fragments.size) break;
+    const nextPending = [];
+    for (const file of fragments) {
+      const text = await readFeedbackBlob(project, headSha, changedSet, file, readSourceSnapshot);
+      if (text !== undefined) {
+        snapshot.sources.set(file, text);
+        nextPending.push(file);
+      }
+    }
+    pending = nextPending;
+  }
+  return references;
+}
+
+/** Build a CI-graph-compatible Cargo affected plan for worker `kodo ci feedback` self-checks. */
+export async function cargoFeedbackGraph({ project, baseSha, headSha, changedPaths = [] }) {
+  project = path.resolve(project);
+  await noLinks(project);
+  project = await realpath(project);
+  const gitRead = async args =>
+    (await execute('git', args, { cwd: project, env: workerEnvironment(), rawOutput: true, timeoutMs: 30000 })).stdout;
+  if ((await realpath(path.resolve((await gitRead(['rev-parse', '--show-toplevel'])).trim()))) !== project)
+    throw new Error('Affected project must be the repository root');
+  if (![baseSha, headSha].every(sha => typeof sha === 'string' && /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(sha)))
+    throw new Error('Invalid cargo graph revisions');
+  const diffChanged = (await gitRead(['diff', '--no-renames', '--name-only', '-z', baseSha, headSha, '--']))
+    .split('\0')
+    .filter(Boolean);
+  const changedFiles = sortedUnique([...diffChanged, ...changedPaths]);
+  const changedSet = new Set(changedPaths);
+  const { readSourceSnapshot } = await import('./ci-graph.mjs');
+  const snapshot = await overlayWorkingChanges(
+    project,
+    await readSourceSnapshot(project, headSha, isCargoSourceFile),
+    changedPaths,
+  );
+  const allFiles = sortedUnique([...snapshot.entries.map(entry => entry.file), ...changedFiles]);
+  const hashes = {
+    sourceHash: digestJson(snapshot.entries.map(({ file, mode, oid }) => [file, mode, oid])),
+    dependencyHash: digestJson(
+      snapshot.entries
+        .filter(entry => posix.basename(entry.file) === 'Cargo.toml' || posix.basename(entry.file) === 'Cargo.lock')
+        .map(({ file, oid }) => [file, oid]),
+    ),
+  };
+  const result = (affectedFiles, affectedCratesList, fallback, reasons) => ({
+    schemaVersion: 1,
+    changedFiles,
+    affectedFiles,
+    affectedCrates: affectedCratesList,
+    testFiles: [],
+    fallback,
+    reasons: sortedUnique(reasons),
+    ...hashes,
+  });
+
+  const docs = new Map();
+  try {
+    for (const [file, text] of snapshot.sources) if (posix.basename(file) === 'Cargo.toml') docs.set(file, parse(text));
+  } catch {
+    return result(allFiles, [], true, ['cargo-workspace-unsupported']);
+  }
+
+  const nonLinkFiles = snapshot.entries.filter(entry => entry.mode !== '120000').map(entry => entry.file);
+  const workspace = cargoWorkspace(docs, '', { files: nonLinkFiles });
+  const members = new Map(workspace.members.map(member => [member.root, member.doc]));
+  const references = await collectFeedbackReferences(
+    project,
+    headSha,
+    changedSet,
+    snapshot,
+    members,
+    readSourceSnapshot,
+  );
+
+  if (workspace.unsupported.length) {
+    const linkPaths = snapshot.entries.filter(entry => entry.mode === '120000').map(entry => entry.file);
+    const reason = linkPaths.some(link =>
+      cargoLink(link, members, [...members.keys()], docs.get('Cargo.toml')?.workspace),
+    )
+      ? 'cargo-linked-input'
+      : 'cargo-workspace-unsupported';
+    return result(allFiles, workspace.members.map(member => member.name).sort(), true, [reason]);
+  }
+
+  const cargoChanged = changedFiles.filter(file => !feedbackConfigFile(file));
+  if (!cargoChanged.length) return result(changedFiles, [], false, []);
+
+  const scope = affectedCrates(docs, cargoChanged, { ...snapshot, references });
+  let { fallback, reasons } = scope;
+  let affectedCrateNames = sortedUnique(scope.affectedCrates);
+  if (fallback && reasons.length && reasons.every(reason => reason === 'cargo-workspace-input')) {
+    fallback = false;
+    reasons = [];
+    affectedCrateNames = workspace.members.map(member => member.name).sort();
+  }
+  if (fallback) return result(allFiles, affectedCrateNames, true, reasons);
+
+  const affectedNameSet = new Set(affectedCrateNames);
+  const affectedDirs = new Set(
+    workspace.members.filter(member => affectedNameSet.has(member.name)).map(member => member.root),
+  );
+  const sortedMemberDirs = [...members.keys()].sort((a, b) => b.length - a.length);
+  const ownedRustFiles = snapshot.entries
+    .filter(entry => entry.mode !== '120000' && pathKey(entry.file).endsWith('.rs'))
+    .map(entry => entry.file)
+    .filter(file => {
+      const owner = sortedMemberDirs.find(dir => inDirectory(dir, file));
+      return owner !== undefined && affectedDirs.has(owner);
+    });
+  return result(sortedUnique([...changedFiles, ...ownedRustFiles]), affectedCrateNames, false, reasons);
 }

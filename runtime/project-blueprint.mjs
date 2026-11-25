@@ -534,6 +534,7 @@ export function parallelOverlaps(tasks, { ancestors = taskAncestors(tasks), othe
 const SHARED_INTEGRATION_FILES = new Set([
   'Cargo.toml',
   'Cargo.lock',
+  'rust-toolchain.toml',
   'package.json',
   'package-lock.json',
   'pnpm-workspace.yaml',
@@ -1333,6 +1334,52 @@ export function rustContractCrateFindings(
   return findings;
 }
 
+function isRustToolchainBlueprint(spec, projectMarkdown, architecturePolicy, waveZeroTasks) {
+  if (architecturePolicy?.schemaVersion === 2 && architecturePolicy?.language === 'rust') return true;
+  if (typeof projectMarkdown === 'string' && /\b(?:rust|cargo)\b/i.test(projectMarkdown)) return true;
+  const meta = [spec.title, spec.businessContext, ...(spec.constraints ?? [])].filter(Boolean).join('\n');
+  if (/\b(?:rust|cargo)\b/i.test(meta)) return true;
+  return waveZeroTasks.some(task =>
+    (task.writePaths ?? []).some(scope => /(?:^|\/)Cargo\.toml$/i.test(normalizeRelScope(scope))),
+  );
+}
+
+/** Wave 0 for Rust blueprints must include `rust-toolchain.toml` (exact `channel = "1.x.y"`
+ * with `clippy` and `rustfmt` components) in its writePaths unless a valid file already exists. */
+export function rustToolchainFindings(
+  spec,
+  projectMarkdown = '',
+  architecturePolicy = null,
+  { hasRustToolchain = false } = {},
+) {
+  if (hasRustToolchain) return [];
+  const waveZeroEpics = new Set(
+    spec.epics.filter(epic => epic.id === FOUNDATION_ID || epic.milestoneId === FOUNDATION_ID).map(epic => epic.id),
+  );
+  const waveZeroTasks = spec.tasks.filter(task => waveZeroEpics.has(task.epicId));
+  if (!waveZeroTasks.length) return [];
+  if (!isRustToolchainBlueprint(spec, projectMarkdown, architecturePolicy, waveZeroTasks)) return [];
+  const coversToolchain = waveZeroTasks.some(task =>
+    (task.writePaths ?? []).some(rawScope => {
+      const scope = normalizeScopePath(rawScope);
+      return (
+        Boolean(scope) &&
+        (scope === 'rust-toolchain.toml' ||
+          scope.endsWith('/rust-toolchain.toml') ||
+          isExplicitContractScope(scope, '', 'rust-toolchain.toml'))
+      );
+    }),
+  );
+  if (coversToolchain) return [];
+  return [
+    finding(
+      'rust_toolchain_required',
+      'Для Rust-проекта Волна 0 (foundation) должна содержать задачу с rust-toolchain.toml ' +
+        '(точная версия channel = "1.x.y", компоненты clippy и rustfmt) в writePaths',
+    ),
+  ];
+}
+
 function analyzeFactorySpec(spec, options = {}) {
   const {
     contracts = projectContracts,
@@ -1341,6 +1388,7 @@ function analyzeFactorySpec(spec, options = {}) {
     projectMarkdown = '',
     architecturePolicy = null,
     packageNames = null,
+    hasRustToolchain = false,
   } = options;
   const base = normalizeFactory(spec, { contracts, knownValues });
   const findings = [...base.findings, ...sectionFindings(projectMarkdown)];
@@ -1359,6 +1407,7 @@ function analyzeFactorySpec(spec, options = {}) {
   findings.push(
     ...ownerFindings(base.spec.tasks),
     ...waveZeroFindings(base.spec, ancestors),
+    ...rustToolchainFindings(base.spec, projectMarkdown, architecturePolicy, { hasRustToolchain }),
     ...rustContractCrateFindings(base.spec, projectMarkdown, architecturePolicy, ancestors, packageNames),
     ...containerFindings(base.spec),
     ...epicCycleFindings(base.spec.tasks),
@@ -1467,6 +1516,20 @@ async function readOptionalArchitecturePolicy(root) {
   }
 }
 
+async function readOptionalRustToolchain(root) {
+  try {
+    const file = await readBoundedFile(path.join(root, 'rust-toolchain.toml'), BLUEPRINT_LIMITS.project);
+    const doc = parseToml(file.text);
+    const tc = /** @type {Record<string, any> | null} */ (isPlain(doc?.toolchain) ? doc.toolchain : null);
+    const channel = typeof tc?.channel === 'string' ? tc.channel.trim() : '';
+    const exactChannel = /^\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?$/.test(channel);
+    const components = Array.isArray(tc?.components) ? tc.components : [];
+    return exactChannel && components.includes('clippy') && components.includes('rustfmt');
+  } catch {
+    return false;
+  }
+}
+
 async function readOptionalCargoPackageNames(root, specValue, projectMarkdown) {
   const dirs = new Set(['']);
   if (isPlain(specValue) && Array.isArray(specValue.tasks)) {
@@ -1504,10 +1567,10 @@ async function readOptionalCargoPackageNames(root, specValue, projectMarkdown) {
  * (with execution) even when findings exist; ok is the only acceptance signal.
  * `specFile` optionally replaces .kodo/blueprint/spec.json. Nothing is written to disk.
  * @param {string} root
- * @param {{ contracts?: typeof projectContracts, knownValues?: string[], specFile?: string, architecturePolicy?: Record<string, any> | null, packageNames?: Map<string, string> | Record<string, string> | null }} [options] */
+ * @param {{ contracts?: typeof projectContracts, knownValues?: string[], specFile?: string, architecturePolicy?: Record<string, any> | null, packageNames?: Map<string, string> | Record<string, string> | null, hasRustToolchain?: boolean }} [options] */
 export async function compileBlueprint(
   root,
-  { contracts = projectContracts, knownValues = [], specFile, architecturePolicy, packageNames } = {},
+  { contracts = projectContracts, knownValues = [], specFile, architecturePolicy, packageNames, hasRustToolchain } = {},
 ) {
   let blueprint;
   try {
@@ -1524,6 +1587,8 @@ export async function compileBlueprint(
     packageNames === undefined
       ? await readOptionalCargoPackageNames(blueprint.root, source.value, blueprint.project.text)
       : packageNames;
+  const resolvedToolchain =
+    hasRustToolchain === undefined ? await readOptionalRustToolchain(blueprint.root) : Boolean(hasRustToolchain);
   const analysis = analyzeFactorySpec(source.value, {
     contracts,
     knownValues,
@@ -1531,6 +1596,7 @@ export async function compileBlueprint(
     projectMarkdown: blueprint.project.text,
     architecturePolicy: policy,
     packageNames: resolvedPackageNames,
+    hasRustToolchain: resolvedToolchain,
   });
   const findings = [...source.findings, ...analysis.findings];
   return { ok: findings.length === 0, spec: analysis.spec, interfaces: blueprint.interfaces, findings };

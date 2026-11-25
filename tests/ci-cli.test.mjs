@@ -1164,3 +1164,197 @@ test('CI workflow keeps required full platform contexts smoke lock cache and PR 
   assert.match(fast, /node scripts\/ci.mjs feedback --json/);
   assert.match(workflow, /node scripts\/ci.mjs run --tier L2/);
 });
+
+test('D1: ci feedback on Rust workspace uses Cargo crate graph, classifies Wave 0 config, and warns toolchain_unpinned only when unpinned', async t => {
+  const { runQuality } = await import('../runtime/quality-runner.mjs');
+  const { toolRunner } = await import('./fixtures/quality/helpers.mjs');
+  const makeRustRepo = async (t, extraFiles = {}) => {
+    const scratch = await mkdtemp(path.join(os.tmpdir(), 'kodo-ci-rust-'));
+    t.after(() => rm(scratch, { recursive: true, force: true }));
+    const project = path.join(scratch, 'project');
+    await mkdir(project);
+    const git = args => execute('git', args, { cwd: project, rawOutput: true });
+    await git(['init', '-q']);
+    await git(['config', 'user.name', 'CI Rust Fixture']);
+    await git(['config', 'user.email', 'ci-rust@example.invalid']);
+    await git(['config', 'core.autocrlf', 'false']);
+    await git(['config', 'commit.gpgSign', 'false']);
+    const putFile = async (rel, content) => {
+      const full = path.join(project, rel);
+      await mkdir(path.dirname(full), { recursive: true });
+      await writeFile(full, content, 'utf8');
+    };
+    const baseFiles = {
+      'Cargo.toml': '[workspace]\nresolver = "2"\nmembers = ["crates/*"]\n[workspace.package]\nedition = "2021"\n',
+      'Cargo.lock': [
+        'version = 4',
+        '[[package]]\nname = "core"\nversion = "0.1.0"',
+        '[[package]]\nname = "world"\nversion = "0.1.0"\ndependencies = ["core"]',
+        '[[package]]\nname = "render"\nversion = "0.1.0"',
+        '',
+      ].join('\n\n'),
+      'crates/core/Cargo.toml': '[package]\nname = "core"\nversion = "0.1.0"\nedition.workspace = true\n',
+      'crates/core/src/lib.rs': 'pub fn tick() -> u32 { 1 }\n',
+      'crates/world/Cargo.toml':
+        '[package]\nname = "world"\nversion = "0.1.0"\nedition.workspace = true\n[dependencies]\ncore = { path = "../core" }\n',
+      'crates/world/src/lib.rs': 'pub fn step() -> u32 { core::tick() }\n',
+      'crates/render/Cargo.toml': '[package]\nname = "render"\nversion = "0.1.0"\nedition.workspace = true\n',
+      'crates/render/src/lib.rs': 'pub fn draw() {}\n',
+      ...extraFiles,
+    };
+    for (const [rel, content] of Object.entries(baseFiles)) await putFile(rel, content);
+    await git(['add', '-A']);
+    await git(['commit', '-qm', 'base']);
+    const baseSha = (await git(['rev-parse', 'HEAD'])).stdout.trim();
+    const commit = async message => {
+      await git(['add', '-A']);
+      await git(['commit', '-qm', message]);
+      return (await git(['rev-parse', 'HEAD'])).stdout.trim();
+    };
+    const fake = toolRunner();
+    const runner = (command, args, options) =>
+      command === 'rustup' && args[0] === 'run' && args[1] === '1.85.0'
+        ? fake.runner(args[2], args.slice(3), options)
+        : fake.runner(command, args, options);
+    const qualityDeps = {
+      runQuality: options =>
+        runQuality({
+          ...options,
+          runner,
+          nativeResolve: async id => ({ command: id, args: [], env: {}, binaryHash: 'b'.repeat(64) }),
+        }),
+    };
+    return { project, baseSha, putFile, commit, qualityDeps };
+  };
+
+  await t.test(
+    'unpinned Rust workspace gives feedback_ready with toolchain_unpinned and Cargo crate scope',
+    async t => {
+      const repo = await makeRustRepo(t);
+      await repo.putFile('crates/core/src/lib.rs', 'pub fn tick() -> u32 { 2 }\n');
+      await repo.commit('edit core');
+      const res = await ciCli(
+        ['feedback', '--base', repo.baseSha, '--project', repo.project, '--json'],
+        repo.qualityDeps,
+      );
+      assert.equal(res.exitCode, 0, JSON.stringify(res.report));
+      assert.equal(res.report.status, 'feedback_ready');
+      assert.equal(res.report.complete, false);
+      assert.equal(res.report.graph.fallback, false);
+      assert.deepEqual(res.report.graph.affectedCrates, ['core', 'world']);
+      assert.ok(
+        !res.report.deferredChecks.some(row => row.reason === 'affected_graph_fallback'),
+        `must not defer with affected_graph_fallback: ${JSON.stringify(res.report.deferredChecks)}`,
+      );
+      assert.deepEqual(res.report.warnings, ['toolchain_unpinned']);
+      const receipts = res.report.receipts.find(r => r.phase === 'quality').report.receipts;
+      assert.equal(receipts.find(r => r.id === 'rust:crates/core:lint').status, 'passed');
+      assert.equal(receipts.find(r => r.id === 'rust:crates/world:typecheck').status, 'passed');
+      assert.equal(receipts.find(r => r.id === 'rust:crates/render:lint').status, 'skipped');
+      assert.deepEqual(receipts.find(r => r.id === 'rust:crates/core:lint').warnings, ['toolchain_unpinned']);
+    },
+  );
+
+  await t.test('pinned Rust workspace with rust-toolchain.toml gives feedback_ready without warning', async t => {
+    const repo = await makeRustRepo(t, {
+      'rust-toolchain.toml': '[toolchain]\nchannel = "1.85.0"\ncomponents = ["clippy", "rustfmt"]\n',
+    });
+    await repo.putFile('crates/core/src/lib.rs', 'pub fn tick() -> u32 { 3 }\n');
+    await repo.commit('edit core pinned');
+    const res = await ciCli(
+      ['feedback', '--base', repo.baseSha, '--project', repo.project, '--json'],
+      repo.qualityDeps,
+    );
+    assert.equal(res.exitCode, 0, JSON.stringify(res.report));
+    assert.equal(res.report.status, 'feedback_ready');
+    assert.equal(res.report.graph.fallback, false);
+    assert.deepEqual(res.report.graph.affectedCrates, ['core', 'world']);
+    assert.equal(res.report.warnings, undefined);
+    const receipts = res.report.receipts.find(r => r.phase === 'quality').report.receipts;
+    assert.ok(receipts.every(r => r.warnings === undefined));
+  });
+
+  await t.test('uncommitted working-tree edit on Rust crate resolves Cargo graph without fallback', async t => {
+    const repo = await makeRustRepo(t, {
+      'rust-toolchain.toml': '[toolchain]\nchannel = "1.85.0"\ncomponents = ["clippy", "rustfmt"]\n',
+    });
+    await repo.putFile('crates/core/src/lib.rs', 'pub fn tick() -> u32 { 99 }\n');
+    const res = await ciCli(
+      ['feedback', '--base', repo.baseSha, '--project', repo.project, '--json'],
+      repo.qualityDeps,
+    );
+    assert.equal(res.exitCode, 0, JSON.stringify(res.report));
+    assert.equal(res.report.status, 'feedback_ready');
+    assert.equal(res.report.graph.fallback, false);
+    assert.deepEqual(res.report.graph.affectedCrates, ['core', 'world']);
+    assert.equal(res.report.warnings, undefined);
+  });
+
+  await t.test(
+    'Wave 0 commit with .gitignore, architecture.policy.json, Cargo.lock and rust-toolchain.toml passes cleanly',
+    async t => {
+      const scratch = await mkdtemp(path.join(os.tmpdir(), 'kodo-ci-rust-w0-'));
+      t.after(() => rm(scratch, { recursive: true, force: true }));
+      const project = path.join(scratch, 'project');
+      await mkdir(project);
+      const git = args => execute('git', args, { cwd: project, rawOutput: true });
+      await git(['init', '-q']);
+      await git(['config', 'user.name', 'CI Rust W0']);
+      await git(['config', 'user.email', 'ci-rust@example.invalid']);
+      await git(['config', 'core.autocrlf', 'false']);
+      await git(['config', 'commit.gpgSign', 'false']);
+      const putFile = async (rel, content) => {
+        const full = path.join(project, rel);
+        await mkdir(path.dirname(full), { recursive: true });
+        await writeFile(full, content, 'utf8');
+      };
+      await putFile(
+        'kodo.config.json',
+        JSON.stringify({
+          schemaVersion: 1,
+          client: 'codex',
+          commands: { test: [{ command: 'cargo', args: ['test'] }] },
+        }),
+      );
+      await git(['add', '-A']);
+      await git(['commit', '-qm', 'initial config']);
+      const baseSha = (await git(['rev-parse', 'HEAD'])).stdout.trim();
+      await putFile('.gitignore', 'target/\n');
+      await putFile(
+        'architecture.policy.json',
+        JSON.stringify({ schemaVersion: 2, version: 1, language: 'rust', layers: [] }),
+      );
+      await putFile(
+        'Cargo.toml',
+        '[workspace]\nresolver = "2"\nmembers = ["crates/*"]\n[workspace.package]\nedition = "2021"\n',
+      );
+      await putFile('Cargo.lock', 'version = 4\n\n[[package]]\nname = "contracts"\nversion = "0.1.0"\n');
+      await putFile('rust-toolchain.toml', '[toolchain]\nchannel = "1.85.0"\ncomponents = ["clippy", "rustfmt"]\n');
+      await putFile(
+        'crates/contracts/Cargo.toml',
+        '[package]\nname = "contracts"\nversion = "0.1.0"\nedition.workspace = true\n',
+      );
+      await putFile('crates/contracts/src/lib.rs', 'pub struct Id(pub u64);\n');
+      await git(['add', '-A']);
+      await git(['commit', '-qm', 'wave 0']);
+      const fake = toolRunner();
+      const runner = (command, args, options) =>
+        command === 'rustup' && args[0] === 'run' && args[1] === '1.85.0'
+          ? fake.runner(args[2], args.slice(3), options)
+          : fake.runner(command, args, options);
+      const res = await ciCli(['feedback', '--base', baseSha, '--project', project, '--json'], {
+        runQuality: options =>
+          runQuality({
+            ...options,
+            runner,
+            nativeResolve: async id => ({ command: id, args: [], env: {}, binaryHash: 'b'.repeat(64) }),
+          }),
+      });
+      assert.equal(res.exitCode, 0, JSON.stringify(res.report));
+      assert.equal(res.report.status, 'feedback_ready');
+      assert.equal(res.report.graph.fallback, false);
+      assert.ok(!res.report.deferredChecks.some(row => row.reason === 'affected_graph_fallback'));
+      assert.equal(res.report.warnings, undefined);
+    },
+  );
+});

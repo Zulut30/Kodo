@@ -624,3 +624,106 @@ test('separate Cargo manifests can share a wave and two explicit Cargo.lock owne
     assert.deepEqual(codes(await compileBlueprint(root)), owners === 2 ? ['integrator_required'] : []);
   }
 });
+
+test('D1: Rust blueprint Wave 0 linter requires rust-toolchain.toml in writePaths or valid file on disk', async t => {
+  const dir = await realpath(await mkdtemp(path.join(os.tmpdir(), 'kodo-rust-toolchain-bp-')));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const criterion = id => ({ id, text: 'cargo test passes', evidenceKinds: ['checks'] });
+  const mkTask = (id, epicId, dependsOn, writePaths) => ({
+    id,
+    epicId,
+    title: `Task ${id}`,
+    description: `Implement ${id}`,
+    owner: 'developer',
+    dependsOn,
+    writePaths,
+    acceptance: [criterion(`${id}-done`)],
+    interfaceRefs: [],
+    priority: 50,
+    userValue: 3,
+    risk: 1,
+    estimatedEffort: 1,
+    riskApprovalRequired: false,
+  });
+  const md = [
+    '# Voxel',
+    '## Цель',
+    'Игра.',
+    '## Модули',
+    'core, world, render.',
+    '## Стек',
+    'Rust 2024, Cargo workspace.',
+    '## Критерии готовности',
+    '- cargo test проходит.',
+  ].join('\n');
+  const spec = {
+    schemaVersion: 1,
+    id: 'voxel',
+    root: dir,
+    title: 'Voxel',
+    definitionOfDone: [criterion('done')],
+    constraints: [],
+    businessContext: 'Rust game',
+    architectureRefs: [],
+    execution: { cadence: 'wave', integration: 'branch' },
+    milestones: [
+      { id: 'foundation', title: 'Wave 0', acceptance: [criterion('f-done')], releaseRequired: false },
+      { id: 'mvp', title: 'MVP', acceptance: [criterion('m-done')], releaseRequired: false },
+    ],
+    epics: [
+      { id: 'foundation', milestoneId: 'foundation', title: 'W0', acceptance: [criterion('fe-done')] },
+      { id: 'gameplay', milestoneId: 'mvp', title: 'Gameplay', acceptance: [criterion('ge-done')] },
+    ],
+    tasks: [
+      mkTask(
+        'w0',
+        'foundation',
+        [],
+        [
+          'Cargo.toml',
+          'architecture.policy.json',
+          'crates/voxel-contracts/Cargo.toml',
+          'crates/voxel-contracts/src/**',
+        ],
+      ),
+      mkTask('core', 'gameplay', ['w0'], ['crates/core/Cargo.toml', 'crates/core/src/**']),
+      mkTask('world', 'gameplay', ['core'], ['crates/world/Cargo.toml', 'crates/world/src/**']),
+    ],
+  };
+
+  // Without rust-toolchain.toml in Wave 0 writePaths -> rust_toolchain_required.
+  const missing = lintFactorySpec(spec, { interfaces: [], projectMarkdown: md });
+  assert.equal(missing.ok, false);
+  assert.ok(
+    missing.findings.some(f => f.code === 'rust_toolchain_required'),
+    `expected rust_toolchain_required, got ${JSON.stringify(missing.findings)}`,
+  );
+
+  // Also triggers for language: rust architecturePolicy even with minimal markdown.
+  const byPolicy = lintFactorySpec(spec, {
+    interfaces: [],
+    projectMarkdown: '# App\n## Цель\nApp.\n## Модули\ncore.\n## Стек\nSystems.\n## Критерии готовности\n- ok\n',
+    architecturePolicy: { schemaVersion: 2, language: 'rust', contractCrates: ['voxel-contracts'] },
+  });
+  assert.ok(byPolicy.findings.some(f => f.code === 'rust_toolchain_required'));
+
+  // Adding rust-toolchain.toml to Wave 0 writePaths clears the finding.
+  const withWritePath = structuredClone(spec);
+  withWritePath.tasks[0].writePaths.push('rust-toolchain.toml');
+  assert.deepEqual(lintFactorySpec(withWritePath, { interfaces: [], projectMarkdown: md }).findings, []);
+
+  // compileBlueprint: unpinned rust-toolchain.toml on disk still fails; exact channel + clippy + rustfmt passes.
+  await mkdir(path.join(dir, '.kodo', 'blueprint'), { recursive: true });
+  await writeFile(path.join(dir, '.kodo', 'blueprint', 'PROJECT.md'), md);
+  await writeFile(path.join(dir, '.kodo', 'blueprint', 'spec.json'), JSON.stringify(spec, null, 2));
+  await writeFile(path.join(dir, 'rust-toolchain.toml'), '[toolchain]\nchannel = "stable"\n');
+  const unpinnedDisk = await compileBlueprint(dir);
+  assert.ok(unpinnedDisk.findings.some(f => f.code === 'rust_toolchain_required'));
+
+  await writeFile(
+    path.join(dir, 'rust-toolchain.toml'),
+    '[toolchain]\nchannel = "1.85.0"\ncomponents = ["clippy", "rustfmt"]\n',
+  );
+  const pinnedDisk = await compileBlueprint(dir);
+  assert.deepEqual(pinnedDisk.findings, []);
+});

@@ -236,7 +236,7 @@ const graphDocs = () =>
       'Cargo.toml',
       {
         package: { name: 'game', version: '1.0.0' },
-        workspace: { members: ['.', 'crates/**'], exclude: ['crates/skip'] },
+        workspace: { members: ['.', 'crates/*'], exclude: ['crates/skip'] },
       },
     ],
     [
@@ -353,8 +353,12 @@ for (const [name, contents] of [
 test('Cargo membership stops at excludes and nested workspace roots', async () => {
   const { cargoMembers } = await import('../runtime/cargo-graph.mjs');
   const docs = graphDocs();
-  for (const dir of ['crates/skip/child', 'crates/inner', 'crates/inner/member'])
-    docs.set(dir + '/Cargo.toml', { package: { name: 'p' } });
+  for (const [dir, name] of [
+    ['crates/skip/child', 'skip-child'],
+    ['crates/inner', 'inner'],
+    ['crates/inner/member', 'inner-member'],
+  ])
+    docs.set(dir + '/Cargo.toml', { package: { name } });
   docs.get('crates/inner/Cargo.toml').workspace = { members: ['member'] };
   for (const root of ['', '.']) assert.deepEqual([...cargoMembers(docs, root).keys()].sort(), ['', 'crates/render']);
   assert.deepEqual([...cargoMembers(docs, 'crates/inner').keys()].sort(), ['crates/inner', 'crates/inner/member']);
@@ -534,4 +538,88 @@ test('clean Cargo homes on the same machine each get a warmup', async t => {
     });
   }
   assert.equal(await readFile(file, 'utf8'), 'fetched\nfetched\n');
+});
+
+test('D2: cargoMembers matches all live cargo metadata fixtures and unsupported triggers full fallback', async () => {
+  const { readdir, readFile } = await import('node:fs/promises');
+  const { default: path } = await import('node:path');
+  const { parse } = await import('smol-toml');
+  const { cargoMembers, cargoWorkspace, affectedCrates } = await import('../runtime/cargo-graph.mjs');
+  const fixturesDir = path.join(import.meta.dirname, 'fixtures', 'cargo-metadata');
+  const entries = (await readdir(fixturesDir)).filter(name => name.endsWith('.json')).sort();
+  assert.ok(entries.length >= 27, `expected at least 27 cargo-metadata fixtures, got ${entries.length}`);
+  for (const name of entries) {
+    const fx = JSON.parse(await readFile(path.join(fixturesDir, name), 'utf8'));
+    const docs = new Map(Object.entries(fx.manifests).map(([file, text]) => [file, parse(text)]));
+    const startDir = fx.startDir || '';
+    const resolved = cargoWorkspace(docs, startDir, { files: fx.files });
+    if (fx.ok === false) {
+      assert.ok(
+        resolved.unsupported.some(row => row.reason === fx.expectedReason),
+        `${name}: expected unsupported ${fx.expectedReason}, got ${JSON.stringify(resolved.unsupported)}`,
+      );
+      if (startDir === '') {
+        const snapshot = {
+          entries: (fx.files || Object.keys(fx.manifests)).map(file => ({ file, mode: '100644' })),
+          sources: new Map(),
+        };
+        const plan = affectedCrates(docs, ['crates/a/src/lib.rs'], snapshot);
+        assert.equal(plan.fallback, true, `${name}: unsupported workspace must fall back`);
+        assert.deepEqual(plan.reasons, ['cargo-workspace-unsupported'], `${name}: fallback reason`);
+        assert.deepEqual(plan.packageSpecs, [], `${name}: fallback clears packageSpecs`);
+      }
+      continue;
+    }
+    assert.deepEqual(
+      resolved.unsupported,
+      [],
+      `${name}: unexpected unsupported ${JSON.stringify(resolved.unsupported)}`,
+    );
+    const members = cargoMembers(docs, startDir, { files: fx.files });
+    const actual = [...members.entries()]
+      .map(([dir, doc]) => ({ name: doc.package.name, manifest: dir ? `${dir}/Cargo.toml` : 'Cargo.toml' }))
+      .sort((a, b) => (a.manifest < b.manifest ? -1 : a.manifest > b.manifest ? 1 : 0));
+    assert.deepEqual(actual, fx.workspace_members, `${name}: cargoMembers mismatch`);
+  }
+
+  // Malformed glob -> unsupported -> full fallback with cargo-workspace-unsupported.
+  const badGlobDocs = new Map([
+    ['Cargo.toml', parse('[workspace]\nmembers = ["crates/[unclosed"]\n')],
+    ['crates/a/Cargo.toml', parse('[package]\nname = "a"\nversion = "0.1.0"\nedition = "2021"\n')],
+  ]);
+  const badPlan = affectedCrates(badGlobDocs, ['crates/a/src/lib.rs']);
+  assert.equal(badPlan.fallback, true);
+  assert.deepEqual(badPlan.reasons, ['cargo-workspace-unsupported']);
+});
+
+test('D2: rustWorkspaceRoots uses canonical Cargo resolver for explicit package.workspace and excluded crates', async t => {
+  const fx = await fixture(t, {
+    'Cargo.toml':
+      '[workspace]\nresolver = "2"\nmembers = ["nested/sub", "peer"]\nexclude = ["crates/excluded"]\n[workspace.package]\nedition = "2024"\n',
+    'Cargo.lock': 'version = 4\n',
+    'rust-toolchain.toml': '[toolchain]\nchannel = "1.85.0"\ncomponents = ["clippy", "rustfmt"]\n',
+    'nested/Cargo.toml': '[workspace]\nresolver = "2"\nmembers = ["other"]\n[workspace.package]\nedition = "2018"\n',
+    'nested/Cargo.lock': 'version = 4\n',
+    'nested/other/Cargo.toml': '[package]\nname = "other"\nversion = "0.1.0"\nedition.workspace = true\n',
+    'nested/other/src/lib.rs': 'pub fn other() {}\n',
+    'nested/sub/Cargo.toml':
+      '[package]\nname = "sub"\nversion = "0.1.0"\nedition.workspace = true\nworkspace = "../.."\n',
+    'nested/sub/src/lib.rs': 'pub fn sub() {}\n',
+    'peer/Cargo.toml': '[package]\nname = "peer"\nversion = "0.1.0"\nedition.workspace = true\n',
+    'peer/src/lib.rs': 'pub fn peer() {}\n',
+    'crates/excluded/Cargo.toml': '[package]\nname = "excluded"\nversion = "0.1.0"\nedition.workspace = true\n',
+    'crates/excluded/src/lib.rs': 'pub fn excluded() {}\n',
+  });
+  const { checks } = await new QualityProfileRegistry().plan(fx.project, { capabilities: ['typecheck'] });
+  const byRoot = new Map(checks.map(c => [c.root, c]));
+  assert.equal(byRoot.get('nested/sub').status, 'applicable');
+  assert.equal(byRoot.get('nested/sub').edition, '2024');
+  assert.equal(byRoot.get('nested/other').status, 'applicable');
+  assert.equal(byRoot.get('nested/other').edition, '2018');
+  assert.equal(byRoot.get('peer').status, 'applicable');
+  assert.equal(byRoot.get('peer').edition, '2024');
+  // Excluded crate cannot inherit root workspace edition or Cargo.lock.
+  assert.equal(byRoot.get('crates/excluded').edition, null);
+  assert.equal(byRoot.get('crates/excluded').status, 'missing');
+  assert.equal(byRoot.get('crates/excluded').reason, 'cargo_lock_required');
 });

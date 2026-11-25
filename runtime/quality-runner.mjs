@@ -626,7 +626,15 @@ async function resolveCheckTool(ctx, check, receipt) {
 async function verifyRustCompiler(check, receipt, call, { tool, toolEnv, prefix }, nativeResolve) {
   const rustc = await nativeResolve('rustc');
   const compiler = await call(rustc.command, [...(rustc.args ?? []), '--version'], { stage: 'version' });
-  if (compiler.code !== 0 || compiler.stderr.trim() || !validVersion('rustc', compiler.stdout, check.rustcVersion))
+  const expectedRustc =
+    check.rustcVersion ??
+    (check.unpinnedToolchain ? /^rustc (\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?)/.exec(compiler.stdout)?.[1] : null);
+  if (
+    !expectedRustc ||
+    compiler.code !== 0 ||
+    compiler.stderr.trim() ||
+    !validVersion('rustc', compiler.stdout, expectedRustc)
+  )
     throw qualityError('version_mismatch', 'Rust compiler version mismatch');
   receipt.compilerIdentity = await toolIdentity(rustc);
   if (check.capability === 'lint') {
@@ -634,7 +642,7 @@ async function verifyRustCompiler(check, receipt, call, { tool, toolEnv, prefix 
       env: toolEnv,
       stage: 'version',
     });
-    const pin = check.clippyVersion ?? /^clippy (\d+\.\d+\.\d+)/.exec(clippy.stdout)?.[1];
+    const pin = check.clippyVersion ?? /^clippy (\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?)/.exec(clippy.stdout)?.[1];
     if (!pin || clippy.code !== 0 || clippy.stderr.trim() || !validVersion('clippy', clippy.stdout, pin))
       throw qualityError('version_mismatch', 'Clippy version mismatch');
   }
@@ -682,7 +690,10 @@ async function verifyCheckRuntime(ctx, check, receipt, call, { tool, toolEnv, pr
     actualVersion =
       check.toolchain && check.tool === 'rustfmt'
         ? /^rustfmt (\d+\.\d+\.\d+)/.exec(version.stdout)?.[1]
-        : check.version;
+        : (check.version ??
+          (check.unpinnedToolchain && check.tool === 'cargo'
+            ? /^cargo (\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?)/.exec(version.stdout)?.[1]
+            : null));
     if (
       !actualVersion ||
       version.code !== 0 ||
@@ -804,6 +815,7 @@ async function runQualityCheck(ctx, check) {
     version: check.version,
     status: check.status,
     reason: check.reason,
+    ...(check.warnings?.length ? { warnings: [...check.warnings] } : {}),
     files: check.files,
     scopeReason: check.scopeReason,
     headSha,
@@ -846,10 +858,12 @@ export async function runQuality(options = {}) {
         : plan.config.enabled
           ? 'skipped'
           : 'disabled';
+  const warnings = [...new Set(receipts.flatMap(r => r.warnings ?? []))];
   return clean({
     schemaVersion: 1,
     status,
     passed: status === 'passed' ? true : ['failed', 'blocked'].includes(status) ? false : null,
+    ...(warnings.length ? { warnings } : {}),
     durationMs: performance.now() - start,
     headSha,
     configHash: plan.configHash,
