@@ -1977,3 +1977,139 @@ test(
     assert.equal(run2.lastDiagnostics, null, 'successful native task-fast run must clear lastDiagnostics');
   },
 );
+
+test('V2: retryDiagnosticsFor selects strictly (projectId, taskId, number - 1) and returns null if attempt 2 had no Run', async t => {
+  const temp = await realpath(await mkdtemp(path.join(os.tmpdir(), 'kodo-15d-v2-attempt-')));
+  const project = path.join(temp, 'repo');
+  const home = path.join(temp, 'home');
+  await mkdir(project, { recursive: true });
+  git(project, 'init', '-b', 'main');
+  git(project, 'config', 'user.email', 'kodo@example.test');
+  git(project, 'config', 'user.name', 'Kodo Test');
+  await commit(
+    project,
+    {
+      'kodo.config.json': JSON.stringify({
+        schemaVersion: 1,
+        repository: 'fixture/Kodo',
+        client: 'codex',
+        baseBranch: 'main',
+        concurrency: 2,
+        repairRounds: 1,
+        researchBudget: 0,
+        commands: { test: [{ command: process.execPath, args: ['--test'] }], build: [], deploy: [], smoke: [] },
+        checks: [],
+        delivery: { enabled: false, release: false, firstVersion: '0.2.0' },
+      }),
+      'src/app/index.mjs': 'export const ok = true;\n',
+    },
+    'Init V2 repo',
+  );
+  const store = new Store(home);
+  t.after(async () => {
+    store.close();
+    await rm(temp, { recursive: true, force: true });
+  });
+  const engine = new Engine({
+    store,
+    provider: {
+      discoverProviders: async () => [
+        { id: 'codex:gpt-6.1-sol', client: 'codex', model: 'gpt-6.1-sol', available: true },
+      ],
+    },
+  });
+  const repo = await openProjectStore({
+    store,
+    contracts,
+    authorizeTransition: createProjectTransitionAuthorizer({ store, engine, contracts }),
+  });
+  const crit = id => ({ id, text: `Criterion ${id}`, evidenceKinds: ['checks'] });
+  const created = await repo.apply({
+    schemaVersion: 1,
+    commandId: randomUUID(),
+    projectId: null,
+    expectedRevision: null,
+    actor: 'coordinator',
+    reason: 'Create V2 project',
+    action: {
+      op: 'create',
+      spec: {
+        schemaVersion: 1,
+        id: 'v2-prev-attempt',
+        root: project,
+        title: 'V2 prev attempt',
+        definitionOfDone: [crit('dod')],
+        constraints: ['Clean'],
+        businessContext: 'Test',
+        architectureRefs: [],
+        milestones: [{ id: 'm1', title: 'M1', acceptance: [crit('m1')], releaseRequired: false }],
+        epics: [{ id: 'e1', milestoneId: 'm1', title: 'E1', acceptance: [crit('e1')] }],
+        tasks: [
+          {
+            id: 't1',
+            epicId: 'e1',
+            title: 'Task 1',
+            description: 'Update src/app/index.mjs',
+            owner: 'developer',
+            dependsOn: [],
+            writePaths: ['src/app/index.mjs'],
+            acceptance: [crit('t1-ok')],
+            interfaceRefs: [],
+            priority: 60,
+            userValue: 3,
+            risk: 1,
+            estimatedEffort: 1,
+            riskApprovalRequired: false,
+          },
+        ],
+        execution: { cadence: 'wave', integration: 'branch' },
+      },
+    },
+  });
+  const projectId = created.projectId;
+  const ctx = { repo, engine, store, contracts };
+
+  // Attempt 1: installed Run with stale-1 diagnostics, then abandoned.
+  const w1 = await nextWave(ctx, { projectId, host: 't3', limit: 1 });
+  assert.equal(w1.briefs.length, 1);
+  store.updateRun(w1.briefs[0].runId, {
+    lastDiagnostics: buildDiagnosticPack({
+      stdout: "TAP version 13\nnot ok 1 - stale-1\n  ---\n  error: 'stale-1 failure'\n  ...\n",
+    }),
+  });
+  await completeTask(ctx, {
+    projectId,
+    taskId: 't1',
+    head: w1.briefs[0].baseSha,
+    attemptId: w1.briefs[0].attemptId,
+    abandon: true,
+  });
+
+  // Attempt 2: reserved and cancelled BEFORE any Run is installed.
+  let snap = repo.snapshot(projectId);
+  const res2 = await repo.apply({
+    schemaVersion: 1,
+    commandId: randomUUID(),
+    projectId,
+    expectedRevision: snap.revision,
+    actor: 'project-external:t3',
+    reason: 'Reserve attempt 2',
+    action: { op: 'reserveAttempt', taskId: 't1', retryFailed: true },
+  });
+  snap = repo.snapshot(projectId);
+  await repo.apply({
+    schemaVersion: 1,
+    commandId: randomUUID(),
+    projectId,
+    expectedRevision: snap.revision,
+    actor: 'project-external:t3',
+    reason: 'Cancel attempt 2 before Run install',
+    action: { op: 'transition', kind: 'attempt', id: res2.attempt.id, to: 'cancelled', evidence: [], mappings: [] },
+  });
+
+  // Attempt 3: attempt 2 had no Run -> MUST receive NO diagnostics (must NOT fall back to attempt 1's stale-1!).
+  const w3 = await nextWave(ctx, { projectId, host: 't3', limit: 1, retryFailed: true });
+  assert.equal(w3.briefs.length, 1);
+  assert.equal(w3.briefs[0].diagnostics, undefined);
+  assert.doesNotMatch(w3.briefs[0].prompt, /stale-1/);
+});

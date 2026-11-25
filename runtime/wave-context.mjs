@@ -24,33 +24,31 @@ function usableDiagnostics(pack) {
   );
 }
 
-/** Find the single immediately preceding Run for `(projectId, taskId)` before `attempt.id`. */
-export async function latestPriorTaskRun({ repo, store, project, attempt, task, run }) {
-  const priorRuns = store
-    .listRuns(project.root)
-    .filter(
-      row =>
-        row.id !== run.id &&
-        row.directorBinding?.projectId === project.projectId &&
-        row.directorBinding.taskId === task.id,
-    );
-  if (!priorRuns.length) return null;
-  if (typeof repo?.history === 'function') {
-    const byAttempt = new Map(priorRuns.map(row => [row.directorBinding.attemptId, row]));
-    let after = 0,
-      previous = null;
-    for (let page = 0; page < 64; page++) {
-      const history = await repo.history(project.projectId, { after, limit: 1000 });
-      for (const event of history.events) {
-        if (event.type !== 'reserveAttempt' || event.entity.kind !== 'attempt') continue;
-        if (event.entity.id === attempt.id) return previous;
-        if (byAttempt.has(event.entity.id)) previous = byAttempt.get(event.entity.id);
-      }
-      if (history.complete || history.nextAfter <= after) break;
-      after = history.nextAfter;
-    }
+/**
+ * Find the Run of the exact immediately preceding attempt `(projectId, taskId, attempt.number - 1)`.
+ * Returns `null` when that attempt never installed a Run (e.g. cancelled before install), never falling
+ * back to an earlier attempt.
+ */
+export async function latestPriorTaskRun({ store, project, attempt, task, run }) {
+  if (!(Number.isSafeInteger(attempt?.number) && attempt.number > 1)) return null;
+  if (!store?.db) return null;
+  try {
+    const prevAttempt = store.db
+      .prepare('SELECT id, run_id, installed FROM kodo_project_attempts WHERE project_id=? AND task_id=? AND number=?')
+      .get(project.projectId, task.id, attempt.number - 1);
+    if (!prevAttempt || !prevAttempt.installed || !prevAttempt.run_id) return null;
+    const prevRun = typeof store.getRun === 'function' ? store.getRun(String(prevAttempt.run_id)) : null;
+    if (!prevRun || prevRun.id === run?.id) return null;
+    if (
+      prevRun.directorBinding?.projectId !== project.projectId ||
+      prevRun.directorBinding?.taskId !== task.id ||
+      prevRun.directorBinding?.attemptId !== prevAttempt.id
+    )
+      return null;
+    return prevRun;
+  } catch {
+    return null;
   }
-  return priorRuns[0];
 }
 
 /** Return usable diagnostics from the current run or ONLY the immediately preceding attempt (no fallback to older attempts). */
@@ -58,7 +56,6 @@ export async function retryDiagnosticsFor({ ctx, snapshot, attempt, task, run })
   if (run.lastDiagnostics !== undefined) return usableDiagnostics(run.lastDiagnostics) ? run.lastDiagnostics : null;
   if (!(attempt.number > 1)) return null;
   const previous = await latestPriorTaskRun({
-    repo: ctx.repo,
     store: storeOf(ctx),
     project: snapshot.project,
     attempt,
