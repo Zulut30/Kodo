@@ -184,14 +184,23 @@ const statusCounts = counts => {
   const rows = Object.entries(counts ?? {}).sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
   return rows.length ? rows.map(([status, count]) => `${status} ${count}`).join(', ') : 'none';
 };
-// Wave gates only: a legacy project report has no `gates`.
-const gateLines = gates =>
+// Wave gates only: a legacy project report has no `gates`. Arbitrations of the gate arbiter
+// (16B1) are listed when a gate recorded one.
+const arbitrationLine = totals =>
+  totals?.arbitrations?.total
+    ? [
+        `Arbitrations: ${totals.arbitrations.total} (confirm_pass ${totals.arbitrations.confirm_pass}, confirm_defect ${totals.arbitrations.confirm_defect}, split_needed ${totals.arbitrations.split_needed})`,
+      ]
+    : [];
+const gateLines = (gates, totals) =>
   Array.isArray(gates)
     ? [
         `Gates: ${gates.length || 'none'}`,
         ...gates.map(
-          row => `  ${row.id} ${row.status} ${row.containers.join(', ') || 'none'} run ${row.runId ?? 'none'}`,
+          row =>
+            `  ${row.id} ${row.status} ${row.containers.join(', ') || 'none'} run ${row.runId ?? 'none'}${row.arbitration ? ` arbiter ${row.arbitration}` : ''}`,
         ),
+        ...arbitrationLine(totals),
       ]
     : [];
 
@@ -213,7 +222,7 @@ export function humanProject(report) {
       row =>
         `  ${row.taskId} #${value(row.number)} ${value(row.state)}: queue ${wait(row.waits.queue)}, delivery queue ${wait(row.waits.deliveryQueue)}, CI ${wait(row.waits.ci)}; failures ${failureCodes(row.failures)}`,
     ),
-    ...gateLines(report.gates),
+    ...gateLines(report.gates, totals.gates),
     `Blockers: ${report.blockers.length ? report.blockers.map(item => `${item.code}@${item.taskId ?? item.scope}`).join(', ') : 'none'}`,
     observations(report.provenance),
     caveat,

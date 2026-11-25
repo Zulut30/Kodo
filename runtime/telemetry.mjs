@@ -711,6 +711,13 @@ function projectBlockers(snapshot, rows, current) {
   return blockers;
 }
 
+// Decisions of the gate arbiter (gate-arbiter.mjs); any other saved value is not reported.
+const arbiterDecisions = ['confirm_pass', 'confirm_defect', 'split_needed'];
+const arbitrationOf = run =>
+  record(run?.gateArbitration) && arbiterDecisions.includes(run.gateArbitration.decision)
+    ? run.gateArbitration.decision
+    : null;
+
 /**
  * Wave gates with the state of their gate Runs: a gate record has no status of its own. A gate
  * whose Run is not found keeps `unknown` (or a status the record itself carries).
@@ -730,6 +737,7 @@ function gateRows(snapshot, runsById, eventsByRun, options) {
       const containers = list(gate.containers)
         .filter(record)
         .map(item => `${code(item.kind, 'unknown')}:${slug(item.id)}`);
+      const arbitration = report ? arbitrationOf(run) : null;
       return {
         row: {
           id: slug(gate.id),
@@ -737,6 +745,8 @@ function gateRows(snapshot, runsById, eventsByRun, options) {
           runId: runId === null ? null : slug(runId),
           containers,
           sessions: report ? report.attempts.sessions : null,
+          // The decision of the gate arbiter (16B1), only when one was recorded.
+          ...(arbitration ? { arbitration } : {}),
         },
         number: integer(gate.number),
         key: containers[0] ?? null,
@@ -771,12 +781,17 @@ function gateBlockers(gates) {
 // whose Run is missing makes the session total unknown; `observedUsage` keeps what was found.
 function gateTotals(gates) {
   const found = gates.filter(gate => gate.report);
+  const decisions = found.map(gate => gate.row.arbitration).filter(Boolean);
   return {
     gates: gates.length,
     runs: found.length,
     complete: found.length === gates.length,
     sessions: gates.length ? total(gates.map(gate => gate.row.sessions)).value : 0,
     observedUsage: usageOf(found.flatMap(gate => list(gate.run.sessionAttempts))),
+    arbitrations: {
+      total: decisions.length,
+      ...Object.fromEntries(arbiterDecisions.map(name => [name, decisions.filter(item => item === name).length])),
+    },
   };
 }
 
