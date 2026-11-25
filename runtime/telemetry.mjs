@@ -891,6 +891,7 @@ export function buildProjectReport(
     runs: { known: found.length, total: attemptsTotal, complete: found.length === attemptsTotal },
   };
   const seenPlatforms = platforms(runs);
+  const snapshotComplete = !Object.entries(completeness).some(([key, value]) => key !== 'runs' && !value.complete);
   const kpis = buildProjectTelemetry({
     snapshot,
     attempts: all,
@@ -900,6 +901,7 @@ export function buildProjectReport(
     profile,
     waveGates,
     runsComplete: completeness.runs.complete,
+    snapshotComplete,
   });
   const notes = new Set();
   if (!completeness.runs.complete) notes.add('runs_missing');

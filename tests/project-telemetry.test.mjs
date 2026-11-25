@@ -1125,3 +1125,504 @@ test('C1 preserves backward compatibility of legacy project reports and counts a
   assert.deepEqual(report.utilization.subscriptions, []);
   assert.deepEqual(report.utilization.machines, []);
 });
+
+test('R1: lost lease, run_busy, or aborted task-fast writes no verdict event and never pollutes FPY or rejections', async t => {
+  const dir = await realpath(await mkdtemp(path.join(os.tmpdir(), 'kodo-c1-r1-')));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const root = path.join(dir, 'repo');
+  const home = path.join(dir, 'state');
+  await initRepo(root);
+
+  let clockSec = 0;
+  const clockMs = () => at(clockSec);
+  const clockIso = () => iso(clockSec);
+
+  const store = new Store(home, {}, { clock: clockMs });
+  try {
+    const engine = new Engine({ store, secrets: {} });
+    const repo = await openProjectStore({
+      store,
+      contracts,
+      authorizeTransition: async () => {},
+      clock: clockIso,
+    });
+    const spec = contracts.normalizeProjectSpec(
+      {
+        schemaVersion: 1,
+        id: 'c1-r1',
+        root,
+        title: 'R1 fenced verdict test',
+        execution: { cadence: 'wave', integration: 'branch' },
+        definitionOfDone: [criterion('p-proof')],
+        constraints: ['Scope only'],
+        businessContext: 'Test',
+        architectureRefs: [],
+        milestones: [{ id: 'm1', title: 'M1', acceptance: [criterion('m-proof')], releaseRequired: false }],
+        epics: [{ id: 'e1', milestoneId: 'm1', title: 'E1', acceptance: [criterion('e-proof')] }],
+        tasks: [taskSpec('a', 'e1', ['a.txt'])],
+      },
+      { knownValues: [] },
+    );
+    const { projectId } = await repo.apply({
+      schemaVersion: 1,
+      commandId: randomUUID(),
+      projectId: null,
+      expectedRevision: null,
+      actor: 'test',
+      reason: 'create',
+      action: { op: 'create', spec },
+    });
+    const ctx = { repo, engine, store, contracts, clock: clockIso };
+
+    clockSec = 10;
+    const wave = await nextWave(ctx, { projectId, host: 't3', limit: 1 });
+    const [brief] = wave.briefs;
+    await writeFile(path.join(brief.worktree, 'a.txt'), 'hello\n');
+    await git(brief.worktree, ['add', 'a.txt']);
+    await git(brief.worktree, ['commit', '-m', 'add a']);
+    const head = await git(brief.worktree, ['rev-parse', 'HEAD']);
+
+    // 1. run_busy during verifyTaskFast must NOT write task_fast_finished
+    clockSec = 20;
+    const busyRes = await completeTask(ctx, {
+      projectId,
+      taskId: 'a',
+      head,
+      attemptId: brief.attemptId,
+      deferGate: true,
+      ports: {
+        verifyTaskFast: async () => {
+          throw Object.assign(new Error('run busy'), { code: 'run_busy' });
+        },
+      },
+    });
+    assert.equal(busyRes.status, 'blocked');
+    assert.equal(busyRes.code, 'project_task_busy');
+    assert.equal(store.events(brief.runId).filter(ev => ev.type === 'task_fast_finished').length, 0);
+
+    // 2. Lease lost during verifyTaskFast (before verdict commit) must NOT write task_fast_finished
+    clockSec = 30;
+    const lostRes = await completeTask(ctx, {
+      projectId,
+      taskId: 'a',
+      head,
+      attemptId: brief.attemptId,
+      deferGate: true,
+      ports: {
+        verifyTaskFast: async () => {
+          // Simulate lease expiry/loss while verify was running
+          store.db.prepare('DELETE FROM leases WHERE name=?').run(`project-verify:${brief.runId}`);
+          return { passed: false, headSha: head, code: 'check_failed', message: 'stale failure' };
+        },
+      },
+    });
+    assert.equal(lostRes.status, 'blocked');
+    assert.equal(lostRes.code, 'project_lease_lost');
+    assert.equal(store.events(brief.runId).filter(ev => ev.type === 'task_fast_finished').length, 0);
+
+    // Report must NOT show FPY 0 / rejections 1 with complete:true
+    const snapshot = repo.snapshot(projectId);
+    const runs = { [brief.runId]: store.getRun(brief.runId) };
+    const events = { [brief.runId]: store.events(brief.runId) };
+    const rep = buildProjectReport(snapshot, runs, events, { now: at(40) });
+    assert.equal(rep.firstPassYield.taskFast.rate, null);
+    assert.equal(rep.firstPassYield.taskFast.complete, false);
+    assert.equal(rep.interventions.rejections, 0);
+
+    // 3. Even if aborted/non-verdict task_fast_finished events exist in a log, metrics ignore them
+    const syntheticEvents = {
+      [brief.runId]: [
+        { seq: 1, type: 'brief_issued', time: at(10), data: {} },
+        { seq: 2, type: 'task_submitted', time: at(20), data: { accepted: true } },
+        { seq: 3, type: 'task_fast_started', time: at(20), data: {} },
+        { seq: 4, type: 'task_fast_finished', time: at(25), data: { passed: false, outcome: 'aborted' } },
+        { seq: 5, type: 'task_fast_started', time: at(30), data: {} },
+        { seq: 6, type: 'task_fast_finished', time: at(35), data: { passed: false, code: 'run_busy' } },
+        { seq: 7, type: 'task_fast_started', time: at(40), data: {} },
+        { seq: 8, type: 'task_fast_finished', time: at(45), data: { passed: true, outcome: 'passed' } },
+      ],
+    };
+    const rep2 = buildProjectReport(snapshot, runs, syntheticEvents, { now: at(50) });
+    assert.deepEqual(rep2.firstPassYield.taskFast, {
+      passed: 1,
+      known: 1,
+      total: 1,
+      rate: 1,
+      complete: true,
+    });
+    assert.equal(rep2.interventions.rejections, 0);
+  } finally {
+    store.close();
+  }
+});
+
+test('R2: missing Run, missing observation, or incomplete snapshot stays in denominator and prevents complete:true', () => {
+  const mkSnap = (tasksComplete = true) => ({
+    schemaVersion: 1,
+    project: { projectId: 'p-r2', status: 'running', paused: false, revision: 4 },
+    revision: 4,
+    milestones: [{ id: 'm1', status: 'running' }],
+    epics: [{ id: 'e1', status: 'running' }],
+    tasks: [
+      { id: 't1', epicId: 'e1', status: 'accepted', updatedAt: iso(100) },
+      { id: 't2', epicId: 'e1', status: 'running', updatedAt: iso(50) },
+    ],
+    currentAttempts: [
+      {
+        id: 'att-1',
+        taskId: 't1',
+        number: 1,
+        runId: 'run-1',
+        status: 'accepted',
+        createdAt: iso(0),
+        updatedAt: iso(80),
+      },
+      {
+        id: 'att-2',
+        taskId: 't2',
+        number: 1,
+        runId: 'run-2',
+        status: 'running',
+        createdAt: iso(10),
+        updatedAt: iso(50),
+      },
+    ],
+    riskApprovals: [],
+    completeness: {
+      milestones: { total: 1, returned: 1, complete: true },
+      epics: { total: 1, returned: 1, complete: true },
+      tasks: { total: tasksComplete ? 2 : 3, returned: 2, complete: tasksComplete },
+      currentAttempts: { total: 2, returned: 2, complete: true },
+      riskApprovals: { total: 0, returned: 0, complete: true },
+    },
+    gates: [
+      {
+        id: 'g1',
+        number: 1,
+        runId: 'gate-1',
+        headSha: sha(1),
+        containers: [{ kind: 'epic', id: 'e1' }],
+        installed: true,
+      },
+    ],
+  });
+
+  const completeRun1 = {
+    id: 'run-1',
+    state: 'succeeded',
+    createdAt: iso(0),
+    executor: { kind: 'external', host: 't3' },
+    verificationProfile: 'task-fast',
+    checks: { profile: 'task-fast', complete: true, results: [] },
+    externalCompletion: { integratedAt: iso(80) },
+    sessionAttempts: [],
+    coordinatorOperations: [],
+  };
+  const completeGate1 = {
+    id: 'gate-1',
+    state: 'succeeded',
+    createdAt: iso(85),
+    headSha: sha(1),
+    sessionAttempts: [sessionRow('review', 5000)],
+    coordinatorOperations: [],
+  };
+  const events1 = [
+    { seq: 1, type: 'brief_issued', time: at(0), data: {} },
+    { seq: 2, type: 'task_submitted', time: at(30), data: { accepted: true } },
+    { seq: 3, type: 'task_fast_started', time: at(30), data: {} },
+    { seq: 4, type: 'task_fast_finished', time: at(40), data: { passed: true, outcome: 'passed' } },
+    { seq: 5, type: 'integration_enqueued', time: at(40), data: { seq: 1 } },
+    { seq: 6, type: 'integration_dequeued', time: at(60), data: { seq: 1 } },
+    { seq: 7, type: 'integration_finished', time: at(80), data: { seq: 1, status: 'integrated' } },
+  ];
+  const gateEvents1 = [
+    { seq: 1, type: 'gate_verify_started', time: at(85), data: { attempt: 0 } },
+    { seq: 2, type: 'gate_verify_finished', time: at(90), data: { attempt: 0, passed: true, outcome: 'passed' } },
+    { seq: 3, type: 'gate_succeeded', time: at(95), data: {} },
+    { seq: 4, type: 'gate_accepted', time: at(100), data: { gateId: 'g1', taskIds: ['t1'] } },
+  ];
+
+  // Case A: run-2 is MISSING -> t2 stays in denominator, NO metric may report complete:true
+  const repMissing = buildProjectReport(
+    mkSnap(true),
+    { 'run-1': completeRun1, 'gate-1': completeGate1 },
+    { 'run-1': events1, 'gate-1': gateEvents1 },
+    { now: at(120) },
+  );
+  assert.deepEqual(repMissing.firstPassYield.taskFast, {
+    passed: 1,
+    known: 1,
+    total: 2,
+    rate: null,
+    complete: false,
+  });
+  assert.equal(repMissing.throughput.integrated.complete, false);
+  assert.equal(repMissing.throughput.integrated.tasksPerHour, null);
+  assert.equal(repMissing.throughput.accepted.complete, false);
+  assert.equal(repMissing.throughput.accepted.tasksPerHour, null);
+  assert.equal(repMissing.taskDuration.complete, false);
+  assert.equal(repMissing.taskDuration.p50Ms, null);
+  assert.equal(repMissing.breakdown.agent.complete, false);
+  assert.equal(repMissing.breakdown.taskFast.complete, false);
+  assert.equal(repMissing.breakdown.integrationQueue.wait.complete, false);
+  assert.equal(repMissing.breakdown.integrationQueue.merge.complete, false);
+  assert.equal(repMissing.breakdown.quota.complete, false);
+  assert.equal(repMissing.breakdown.human.complete, false);
+  assert.equal(repMissing.arbitrations.complete, false);
+  assert.equal(repMissing.arbitrations.count, null);
+  assert.equal(repMissing.interventions.complete, false);
+  assert.equal(repMissing.interventions.total, null);
+  assert.equal(repMissing.utilization.overall.complete, false);
+
+  // Case B: run-2 exists, executing with only brief_issued (no task-fast observation yet) -> FPY total=2, known=1, rate=null, complete=false
+  const repUnobserved = buildProjectReport(
+    mkSnap(true),
+    {
+      'run-1': completeRun1,
+      'run-2': {
+        id: 'run-2',
+        state: 'executing',
+        createdAt: iso(10),
+        executor: { kind: 'external', host: 't3' },
+        verificationProfile: 'task-fast',
+        sessionAttempts: [],
+        coordinatorOperations: [],
+      },
+      'gate-1': completeGate1,
+    },
+    {
+      'run-1': events1,
+      'run-2': [{ seq: 1, type: 'brief_issued', time: at(10), data: {} }],
+      'gate-1': gateEvents1,
+    },
+    { now: at(120) },
+  );
+  assert.deepEqual(repUnobserved.firstPassYield.taskFast, {
+    passed: 1,
+    known: 1,
+    total: 2,
+    rate: null,
+    complete: false,
+  });
+
+  // Case C: truncated snapshot (completeness.tasks.complete === false) -> FPY & gate FPY & arbitrations & interventions cannot be complete:true
+  const repTruncated = buildProjectReport(
+    mkSnap(false),
+    {
+      'run-1': completeRun1,
+      'run-2': { ...completeRun1, id: 'run-2' },
+      'gate-1': completeGate1,
+    },
+    { 'run-1': events1, 'run-2': events1, 'gate-1': gateEvents1 },
+    { now: at(120) },
+  );
+  assert.equal(repTruncated.firstPassYield.taskFast.complete, false);
+  assert.equal(repTruncated.firstPassYield.taskFast.rate, null);
+  assert.equal(repTruncated.firstPassYield.gate.complete, false);
+  assert.equal(repTruncated.firstPassYield.gate.rate, null);
+  assert.equal(repTruncated.throughput.integrated.complete, false);
+  assert.equal(repTruncated.taskDuration.complete, false);
+  assert.equal(repTruncated.arbitrations.complete, false);
+  assert.equal(repTruncated.interventions.complete, false);
+  assert.equal(repTruncated.utilization.overall.complete, false);
+});
+
+test('R3: cancelling gate verification logs gate_verify_finished with outcome cancelled and never passed:true', async t => {
+  const dir = await realpath(await mkdtemp(path.join(os.tmpdir(), 'kodo-c1-r3-')));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const root = path.join(dir, 'repo');
+  const home = path.join(dir, 'state');
+  const baseSha = await initRepo(root);
+
+  const store = new Store(home, {});
+  try {
+    const engine = new Engine({ store, secrets: {} });
+    const run = store.createRun({
+      id: 'gate-r3-cancel',
+      project: root,
+      task: 'gate verify cancel',
+      client: 'codex',
+      state: 'verifying',
+      cwd: root,
+      baseSha,
+      headSha: baseSha,
+      config: { commands: { test: [], build: [], deploy: [], smoke: [] }, repairRounds: 1 },
+      directorBinding: { kind: 'gate', projectId: 'p-r3', gateId: 'g-r3', runId: 'gate-r3-cancel' },
+      sessionAttempts: [],
+      coordinatorOperations: [],
+    });
+
+    const ac = new AbortController();
+    engine.checks = async () => {
+      ac.abort();
+      throw Object.assign(new Error('aborted'), { code: 'cancelled' });
+    };
+
+    await assert.rejects(() => engine.verify(run, ac.signal), { code: 'cancelled' });
+
+    const verifyEvents = store.events(run.id).filter(ev => ev.type === 'gate_verify_finished');
+    assert.equal(verifyEvents.length, 1);
+    assert.equal(verifyEvents[0].data.passed, false);
+    assert.equal(verifyEvents[0].data.outcome, 'cancelled');
+  } finally {
+    store.close();
+  }
+});
+
+test('R4: breakdown.agent includes rework interval from failed submission or task-fast until --abandon', () => {
+  const snapshot = {
+    schemaVersion: 1,
+    project: { projectId: 'p-r4', status: 'running', paused: false, revision: 2 },
+    revision: 2,
+    milestones: [{ id: 'm1', status: 'running' }],
+    epics: [{ id: 'e1', status: 'running' }],
+    tasks: [
+      { id: 't1', epicId: 'e1', status: 'cancelled' },
+      { id: 't2', epicId: 'e1', status: 'cancelled' },
+    ],
+    currentAttempts: [
+      { id: 'a1', taskId: 't1', number: 1, runId: 'r1', status: 'blocked', createdAt: iso(0), updatedAt: iso(65) },
+      { id: 'a2', taskId: 't2', number: 1, runId: 'r2', status: 'blocked', createdAt: iso(0), updatedAt: iso(50) },
+    ],
+    riskApprovals: [],
+    completeness: {
+      milestones: { total: 1, returned: 1, complete: true },
+      epics: { total: 1, returned: 1, complete: true },
+      tasks: { total: 2, returned: 2, complete: true },
+      currentAttempts: { total: 2, returned: 2, complete: true },
+      riskApprovals: { total: 0, returned: 0, complete: true },
+    },
+  };
+  const runs = {
+    r1: {
+      id: 'r1',
+      state: 'cancelled',
+      createdAt: iso(0),
+      executor: { kind: 'external', host: 't3' },
+      verificationProfile: 'task-fast',
+      externalAbandon: { schemaVersion: 1, attemptId: 'a1', headSha: sha(1) },
+      sessionAttempts: [],
+      coordinatorOperations: [],
+    },
+    r2: {
+      id: 'r2',
+      state: 'cancelled',
+      createdAt: iso(0),
+      executor: { kind: 'external', host: 't3' },
+      verificationProfile: 'task-fast',
+      externalAbandon: { schemaVersion: 1, attemptId: 'a2', headSha: sha(2) },
+      sessionAttempts: [],
+      coordinatorOperations: [],
+    },
+  };
+  const events = {
+    // r1: brief 0s -> submit 30s (30s) -> task-fast fails at 40s -> agent reworks 40s..65s (25s) -> abandon at 65s => 55s
+    r1: [
+      { seq: 1, type: 'brief_issued', time: at(0), data: {} },
+      { seq: 2, type: 'task_submitted', time: at(30), data: { accepted: true } },
+      { seq: 3, type: 'task_fast_started', time: at(30), data: {} },
+      {
+        seq: 4,
+        type: 'task_fast_finished',
+        time: at(40),
+        data: { passed: false, outcome: 'failed', code: 'check_failed' },
+      },
+      { seq: 5, type: 'cancelled', time: at(65), data: { code: 'external_abandoned' } },
+    ],
+    // r2: brief 0s -> rejected submit 20s (20s) -> agent reworks 20s..50s (30s) -> abandon at 50s => 50s
+    r2: [
+      { seq: 1, type: 'brief_issued', time: at(0), data: {} },
+      { seq: 2, type: 'task_submitted', time: at(20), data: { accepted: false, code: 'external_scope' } },
+      { seq: 3, type: 'cancelled', time: at(50), data: { code: 'external_abandoned' } },
+    ],
+  };
+
+  const report = buildProjectReport(snapshot, runs, events, { now: at(100) });
+  // Total agent time = 55_000 + 50_000 = 105_000ms
+  assert.deepEqual(report.breakdown.agent, {
+    durationMs: 105_000,
+    measuredMs: 105_000,
+    known: 2,
+    total: 2,
+    complete: true,
+  });
+});
+
+test('R5: native Run breakdown.human closes blocked intervals using blocker.history[].endedAt', () => {
+  const snapshot = {
+    schemaVersion: 1,
+    project: { projectId: 'p-r5', status: 'accepted', paused: false, revision: 3 },
+    revision: 3,
+    milestones: [{ id: 'm1', status: 'accepted' }],
+    epics: [{ id: 'e1', status: 'accepted' }],
+    tasks: [{ id: 't1', epicId: 'e1', status: 'accepted', updatedAt: iso(120) }],
+    currentAttempts: [
+      {
+        id: 'a1',
+        taskId: 't1',
+        number: 1,
+        runId: 'r-native',
+        status: 'accepted',
+        createdAt: iso(0),
+        updatedAt: iso(120),
+      },
+    ],
+    riskApprovals: [],
+    completeness: {
+      milestones: { total: 1, returned: 1, complete: true },
+      epics: { total: 1, returned: 1, complete: true },
+      tasks: { total: 1, returned: 1, complete: true },
+      currentAttempts: { total: 1, returned: 1, complete: true },
+      riskApprovals: { total: 0, returned: 0, complete: true },
+    },
+  };
+  // Native Engine.run() resolves blocker into blocker.history with endedAt without logging a `resumed` event.
+  const runs = {
+    'r-native': {
+      id: 'r-native',
+      state: 'succeeded',
+      createdAt: iso(0),
+      sessionAttempts: [sessionRow('developer', 10_000)],
+      coordinatorOperations: [],
+      blocker: {
+        current: null,
+        history: [
+          {
+            code: 'check_failed',
+            scope: 'verification',
+            firstSeen: iso(10),
+            lastSeen: iso(10),
+            endedAt: iso(45),
+            outcome: 'resumed',
+          },
+          {
+            code: 'review_failed',
+            scope: 'verification',
+            firstSeen: iso(70),
+            lastSeen: iso(70),
+            endedAt: iso(90),
+            outcome: 'resumed',
+          },
+        ],
+      },
+    },
+  };
+  const events = {
+    'r-native': [
+      { seq: 1, type: 'created', time: at(0), data: {} },
+      { seq: 2, type: 'blocked', time: at(10), data: { code: 'check_failed' } },
+      { seq: 3, type: 'blocked', time: at(70), data: { code: 'review_failed' } },
+      { seq: 4, type: 'succeeded', time: at(120), data: {} },
+    ],
+  };
+
+  const report = buildProjectReport(snapshot, runs, events, { now: at(130) });
+  // (45s - 10s) + (90s - 70s) = 35s + 20s = 55_000ms
+  assert.deepEqual(report.breakdown.human, {
+    durationMs: 55_000,
+    measuredMs: 55_000,
+    known: 2,
+    total: 2,
+    complete: true,
+  });
+});

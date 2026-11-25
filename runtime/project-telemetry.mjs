@@ -66,8 +66,27 @@ const integratedStatuses = new Set(['integrated', 'accepted', 'released']);
 const acceptedStatuses = new Set(['accepted', 'released']);
 const stoppedAttemptStatuses = new Set(['blocked', 'failed', 'cancelled']);
 const closedTaskStatuses = new Set(['integrated', 'accepted', 'released', 'cancelled']);
+const untouchedTaskStatuses = new Set(['proposed', 'ready', 'cancelled']);
 const terminalQueueStatuses = new Set(['integrated', 'rejected', 'failed']);
 const terminalGateStates = new Set(['succeeded', 'blocked', 'failed', 'cancelled']);
+const nonVerdictTaskFastCodes = new Set([
+  'run_busy',
+  'project_lease_lost',
+  'project_task_busy',
+  'cancelled',
+  'aborted',
+]);
+const isAbortedTaskFast = ev =>
+  ev?.data?.skipped === true ||
+  ev?.data?.outcome === 'aborted' ||
+  ev?.data?.outcome === 'cancelled' ||
+  nonVerdictTaskFastCodes.has(ev?.data?.code);
+const isCompletedTaskFastVerdict = ev =>
+  ev?.type === 'task_fast_finished' &&
+  !isAbortedTaskFast(ev) &&
+  (ev?.data?.outcome === 'passed' ||
+    ev?.data?.outcome === 'failed' ||
+    (ev?.data?.outcome === undefined && typeof ev?.data?.passed === 'boolean'));
 
 const lookup = (source, id) =>
   source instanceof Map ? source.get(id) : record(source) && Object.hasOwn(source, id) ? source[id] : undefined;
@@ -129,7 +148,7 @@ function stoppedAtOf(attempt, run, events, queueRows) {
   return null;
 }
 
-function pairStartFinish(events, startType, finishType) {
+function pairStartFinish(events, startType, finishType, { ignoreFinish = null } = {}) {
   const samples = [];
   let open = null;
   for (const event of events) {
@@ -138,7 +157,9 @@ function pairStartFinish(events, startType, finishType) {
       open = millis(event.time);
       if (open === null) open = NaN;
     } else if (event.type === finishType && open !== null) {
-      samples.push(Number.isNaN(open) ? null : interval(open, millis(event.time)));
+      if (!ignoreFinish || !ignoreFinish(event)) {
+        samples.push(Number.isNaN(open) ? null : interval(open, millis(event.time)));
+      }
       open = null;
     }
   }
@@ -214,7 +235,7 @@ function agentSampleForAttempt(attempt, run, events) {
       }
       return null;
     }
-    const fastEnds = events.filter(event => event.type === 'task_fast_finished');
+    const fastEnds = events.filter(event => isCompletedTaskFastVerdict(event));
     let sum = 0;
     for (let i = 0; i < submissions.length; i++) {
       const subTime = millis(submissions[i].time);
@@ -240,18 +261,26 @@ function agentSampleForAttempt(attempt, run, events) {
       if (seg === null) return null;
       sum += seg;
     }
-    // If the last submission failed and the attempt is still executing (waiting for next fix), it's open.
     const lastSub = submissions.at(-1);
     const lastSubTime = millis(lastSub.time);
     const lastFastAfter = fastEnds.findLast(ev => {
       const t = millis(ev.time);
       return t !== null && lastSubTime !== null && t >= lastSubTime;
     });
-    const stillOpen =
-      run.state === 'executing' &&
-      !record(run.externalAbandon) &&
-      (lastSub.data?.accepted === false || (lastFastAfter && lastFastAfter.data?.passed !== true));
-    if (stillOpen) return null;
+    const returnedToAgentAt =
+      lastSub.data?.accepted === false
+        ? lastSubTime
+        : lastFastAfter && lastFastAfter.data?.passed !== true
+          ? millis(lastFastAfter.time)
+          : null;
+    if (returnedToAgentAt !== null) {
+      if (record(run.externalAbandon) || run.state === 'cancelled') {
+        const cancelEvent = events.findLast(event => event.type === 'cancelled');
+        const tail = interval(returnedToAgentAt, cancelEvent ? millis(cancelEvent.time) : null);
+        return tail === null ? null : sum + tail;
+      }
+      if (run.state === 'executing') return null;
+    }
     return sum;
   }
   // Native attempt: sum implementation sessions if history is complete.
@@ -265,7 +294,18 @@ function agentSampleForAttempt(attempt, run, events) {
 
 function taskFastSamplesForAttempt(run, events) {
   if (!record(run)) return [null];
-  const paired = pairStartFinish(events, 'task_fast_started', 'task_fast_finished');
+  const paired = pairStartFinish(events, 'task_fast_started', 'task_fast_finished', {
+    ignoreFinish: isAbortedTaskFast,
+  });
+  const lastAcceptedSub = events.findLast(ev => ev.type === 'task_submitted' && ev.data?.accepted !== false);
+  if (lastAcceptedSub && run.state === 'executing' && !record(run.externalAbandon)) {
+    const subTime = millis(lastAcceptedSub.time);
+    const hasVerdictAfter = events.some(
+      ev =>
+        isCompletedTaskFastVerdict(ev) && millis(ev.time) !== null && subTime !== null && millis(ev.time) >= subTime,
+    );
+    if (!hasVerdictAfter) paired.push(null);
+  }
   if (paired.length) return paired;
   if (run.verificationProfile === 'task-fast' && (run.checks?.profile === 'task-fast' || run.state === 'succeeded')) {
     const rows = list(run.checks?.results).filter(record);
@@ -282,6 +322,7 @@ function gateVerifySamples(run, events) {
   const verifyPairs = pairStartFinish(events, 'gate_verify_started', 'gate_verify_finished');
   const smokePairs = pairStartFinish(events, 'gate_smoke_started', 'gate_smoke_finished');
   if (verifyPairs.length || smokePairs.length) return [...verifyPairs, ...smokePairs];
+  if (!terminalGateStates.has(run.state)) return [null];
   const samples = [];
   const checkStarts = events.filter(event => event.type === 'check_started');
   const checkRows = list(run.checks?.results).filter(record);
@@ -296,8 +337,29 @@ function gateVerifySamples(run, events) {
 
 function gateSessionSamples(run, stage) {
   if (!record(run)) return [null];
+  if (!terminalGateStates.has(run.state)) return [null];
   if (run.metrics?.historyComplete === false || !Array.isArray(run.sessionAttempts)) return [null];
   return run.sessionAttempts.filter(item => item?.stage === stage).map(item => duration(item?.metrics?.durationMs));
+}
+
+function matchHistoryEntry(history, usedHistory, openTime, upperBound = null) {
+  if (openTime === null || Number.isNaN(openTime)) return null;
+  const idx = history.findIndex((item, index) => {
+    if (usedHistory.has(index)) return false;
+    const first = millis(item.firstSeen);
+    const ended = millis(item.endedAt);
+    if (first === null || ended === null || ended < openTime) return false;
+    if (upperBound !== null && ended > upperBound) return false;
+    const last = millis(item.lastSeen);
+    return (
+      Math.abs(first - openTime) <= 5000 ||
+      (last !== null && Math.abs(last - openTime) <= 5000) ||
+      (first <= openTime && openTime <= ended)
+    );
+  });
+  if (idx < 0) return null;
+  usedHistory.add(idx);
+  return millis(history[idx].endedAt);
 }
 
 function quotaSamplesForRun(run, events) {
@@ -308,7 +370,10 @@ function quotaSamplesForRun(run, events) {
   let openQuota = null;
   for (const event of events) {
     if (event.type === 'waiting_limits') {
-      if (openQuota !== null) samples.push(null);
+      if (openQuota !== null) {
+        const histEnd = matchHistoryEntry(history, usedHistory, openQuota, millis(event.time));
+        samples.push(histEnd === null ? null : interval(openQuota, histEnd));
+      }
       openQuota = millis(event.time);
       if (openQuota === null) openQuota = NaN;
     } else if ((event.type === 'resumed' || event.type === 'cancelled') && openQuota !== null) {
@@ -317,20 +382,11 @@ function quotaSamplesForRun(run, events) {
     }
   }
   if (openQuota !== null) {
-    const matchedIndex = history.findIndex(
-      (item, index) =>
-        !usedHistory.has(index) &&
-        !Number.isNaN(openQuota) &&
-        millis(item.firstSeen) !== null &&
-        millis(item.endedAt) !== null &&
-        Math.abs(millis(item.firstSeen) - openQuota) <= 5000,
-    );
-    if (matchedIndex >= 0 && run.state !== 'waiting_limits') {
-      usedHistory.add(matchedIndex);
-      samples.push(interval(millis(history[matchedIndex].firstSeen), millis(history[matchedIndex].endedAt)));
-    } else {
-      samples.push(null);
-    }
+    const histEnd =
+      run.state !== 'waiting_limits' && run.blocker?.current?.code !== 'quota'
+        ? matchHistoryEntry(history, usedHistory, openQuota)
+        : null;
+    samples.push(histEnd === null ? null : interval(openQuota, histEnd));
   } else if (!events.some(event => event.type === 'waiting_limits')) {
     for (const item of history) samples.push(interval(millis(item.firstSeen), millis(item.endedAt)));
     if (run.state === 'waiting_limits' || run.blocker?.current?.code === 'quota') samples.push(null);
@@ -342,10 +398,14 @@ function humanSamplesForRun(run, events, closedBySuccessorAt = null) {
   if (!record(run)) return [];
   const samples = [];
   const history = list(run.blocker?.history).filter(item => record(item) && item.code !== 'quota');
+  const usedHistory = new Set();
   let openBlocked = null;
   for (const event of events) {
     if (event.type === 'blocked') {
-      if (openBlocked !== null) samples.push(null);
+      if (openBlocked !== null) {
+        const histEnd = matchHistoryEntry(history, usedHistory, openBlocked, millis(event.time));
+        samples.push(histEnd === null ? null : interval(openBlocked, histEnd));
+      }
       openBlocked = millis(event.time);
       if (openBlocked === null) openBlocked = NaN;
     } else if ((event.type === 'resumed' || event.type === 'cancelled') && openBlocked !== null) {
@@ -356,6 +416,9 @@ function humanSamplesForRun(run, events, closedBySuccessorAt = null) {
   if (openBlocked !== null) {
     if (closedBySuccessorAt !== null && !Number.isNaN(openBlocked)) {
       samples.push(interval(openBlocked, closedBySuccessorAt));
+    } else if (run.state !== 'blocked' && !(record(run.blocker?.current) && run.blocker.current.code !== 'quota')) {
+      const histEnd = matchHistoryEntry(history, usedHistory, openBlocked);
+      samples.push(histEnd === null ? null : interval(openBlocked, histEnd));
     } else {
       samples.push(null);
     }
@@ -425,7 +488,15 @@ function weightedOccupancy(intervals, windowStart, windowEnd) {
   return { median, peak };
 }
 
-function buildContext({ snapshot, attempts, runsById, eventsByRun, integrationQueue, runsComplete }) {
+function buildContext({
+  snapshot,
+  attempts,
+  runsById,
+  eventsByRun,
+  integrationQueue,
+  runsComplete,
+  snapshotComplete = true,
+}) {
   const tasks = list(snapshot.tasks).filter(record);
   const currentByTask = new Map(
     list(snapshot.currentAttempts)
@@ -484,6 +555,10 @@ function buildContext({ snapshot, attempts, runsById, eventsByRun, integrationQu
     return count > own.length || own.some((item, index) => (integer(item.attempt.number) ?? 0) !== index + 1);
   });
   const gatesComplete = gateEntries.every(item => item.run !== null);
+  const snapshotCompletenessMissing =
+    record(snapshot.completeness) &&
+    Object.values(snapshot.completeness).some(entry => record(entry) && entry.complete !== true);
+  const snapshotIncomplete = !snapshotComplete || snapshotCompletenessMissing;
   const queueEntries = queueEntriesOf(attempts, eventsByRun, integrationQueue);
   return {
     snapshot,
@@ -495,13 +570,24 @@ function buildContext({ snapshot, attempts, runsById, eventsByRun, integrationQu
     queueEntries,
     hasAttemptGaps,
     gatesComplete,
+    snapshotIncomplete,
     missingTaskRuns: !runsComplete || hasAttemptGaps,
     missingAnyRuns: !runsComplete || hasAttemptGaps || !gatesComplete,
   };
 }
 
 function computeThroughputAndDuration(ctx) {
-  const { tasks, currentByTask, enrichedAttempts, enrichedByTask, gateEntries, hasAttemptGaps } = ctx;
+  const {
+    tasks,
+    currentByTask,
+    enrichedAttempts,
+    enrichedByTask,
+    gateEntries,
+    hasAttemptGaps,
+    missingTaskRuns,
+    missingAnyRuns,
+    snapshotIncomplete,
+  } = ctx;
   const acceptedAtByTask = new Map();
   for (const item of gateEntries) {
     for (const event of item.events) {
@@ -514,7 +600,11 @@ function computeThroughputAndDuration(ctx) {
     }
   }
   const allIssuedKnown =
-    enrichedAttempts.length > 0 && !hasAttemptGaps && enrichedAttempts.every(item => item.issuedMs !== null);
+    !snapshotIncomplete &&
+    !missingTaskRuns &&
+    enrichedAttempts.length > 0 &&
+    !hasAttemptGaps &&
+    enrichedAttempts.every(item => item.issuedMs !== null);
   const firstIssuedMs = allIssuedKnown ? Math.min(...enrichedAttempts.map(item => item.issuedMs)) : null;
 
   const integratedTasks = tasks.filter(task => integratedStatuses.has(task.status));
@@ -532,7 +622,7 @@ function computeThroughputAndDuration(ctx) {
     const taskComplete =
       own.length > 0 &&
       count === own.length &&
-      own.every((item, index) => (integer(item.attempt.number) ?? 0) === index + 1);
+      own.every((item, index) => item.run !== null && (integer(item.attempt.number) ?? 0) === index + 1);
     const endMs = [...own].reverse().find(item => item.integratedMs !== null)?.integratedMs ?? null;
     integratedTimes.push(endMs);
     taskDurationSamples.push(interval(taskComplete ? own[0].issuedMs : null, endMs));
@@ -541,9 +631,9 @@ function computeThroughputAndDuration(ctx) {
     if (acceptedAtByTask.has(task.id)) return acceptedAtByTask.get(task.id);
     return task.status === 'accepted' ? millis(task.updatedAt) : null;
   });
-  const buildRate = (count, endTimes) => {
+  const buildRate = (count, endTimes, extraMissing = false) => {
     const knownEnds = endTimes.filter(value => value !== null);
-    const endsComplete = count > 0 && knownEnds.length === count;
+    const endsComplete = !extraMissing && count > 0 && knownEnds.length === count;
     const windowEndMs = endsComplete ? Math.max(...knownEnds) : null;
     const windowMs = allIssuedKnown && endsComplete ? interval(firstIssuedMs, windowEndMs) : null;
     const complete = count > 0 && allIssuedKnown && endsComplete && windowMs !== null && windowMs > 0;
@@ -559,11 +649,15 @@ function computeThroughputAndDuration(ctx) {
     };
   };
   const knownDurations = taskDurationSamples.filter(value => value !== null);
-  const durationComplete = integratedTasks.length > 0 && knownDurations.length === integratedTasks.length;
+  const durationComplete =
+    !snapshotIncomplete &&
+    !missingTaskRuns &&
+    integratedTasks.length > 0 &&
+    knownDurations.length === integratedTasks.length;
   return {
     throughput: {
-      integrated: buildRate(integratedTasks.length, integratedTimes),
-      accepted: buildRate(acceptedTasks.length, acceptedTimes),
+      integrated: buildRate(integratedTasks.length, integratedTimes, snapshotIncomplete || missingTaskRuns),
+      accepted: buildRate(acceptedTasks.length, acceptedTimes, snapshotIncomplete || missingAnyRuns),
     },
     taskDuration: {
       p50Ms: durationComplete ? percentile(knownDurations, 0.5) : null,
@@ -616,7 +710,18 @@ function collectHumanSamples(ctx) {
 }
 
 function computeBreakdown(ctx) {
-  const { enrichedAttempts, gateEntries, queueEntries, gatesComplete, missingTaskRuns, missingAnyRuns } = ctx;
+  const {
+    enrichedAttempts,
+    gateEntries,
+    queueEntries,
+    gatesComplete,
+    missingTaskRuns,
+    missingAnyRuns,
+    snapshotIncomplete,
+  } = ctx;
+  const taskMissing = missingTaskRuns || snapshotIncomplete;
+  const gateMissing = !gatesComplete || snapshotIncomplete;
+  const anyMissing = missingAnyRuns || snapshotIncomplete;
   const agentSamples = enrichedAttempts.map(item => agentSampleForAttempt(item.attempt, item.run, item.events));
   const taskFastSamples = enrichedAttempts.flatMap(item => taskFastSamplesForAttempt(item.run, item.events));
   const queueRunIds = new Set(queueEntries.map(entry => entry.runId));
@@ -637,51 +742,50 @@ function computeBreakdown(ctx) {
     ...gateEntries.flatMap(item => quotaSamplesForRun(item.run, item.events)),
   ];
   return {
-    agent: summarizeBucket(agentSamples, { allowZero: false, missing: missingTaskRuns }),
-    taskFast: summarizeBucket(taskFastSamples, { allowZero: false, missing: missingTaskRuns }),
+    agent: summarizeBucket(agentSamples, { allowZero: false, missing: taskMissing }),
+    taskFast: summarizeBucket(taskFastSamples, { allowZero: false, missing: taskMissing }),
     integrationQueue: {
-      wait: summarizeBucket(waitSamples, { allowZero: false, missing: missingTaskRuns, withPercentiles: true }),
-      merge: summarizeBucket(mergeSamples, { allowZero: false, missing: missingTaskRuns, withPercentiles: true }),
+      wait: summarizeBucket(waitSamples, { allowZero: false, missing: taskMissing, withPercentiles: true }),
+      merge: summarizeBucket(mergeSamples, { allowZero: false, missing: taskMissing, withPercentiles: true }),
     },
     gates: {
       verify: summarizeBucket(
         gateEntries.flatMap(item => gateVerifySamples(item.run, item.events)),
-        { allowZero: false, missing: !gatesComplete },
+        { allowZero: false, missing: gateMissing },
       ),
       review: summarizeBucket(
         gateEntries.flatMap(item => gateSessionSamples(item.run, 'review')),
-        { allowZero: false, missing: !gatesComplete },
+        { allowZero: false, missing: gateMissing },
       ),
       repair: summarizeBucket(
         gateEntries.flatMap(item => gateSessionSamples(item.run, 'repair')),
-        { allowZero: gateEntries.length > 0, missing: !gatesComplete },
+        { allowZero: gateEntries.length > 0, missing: gateMissing },
       ),
     },
-    quota: summarizeBucket(quotaSamples, { allowZero: true, missing: missingAnyRuns }),
-    human: summarizeBucket(collectHumanSamples(ctx), { allowZero: true, missing: missingAnyRuns }),
+    quota: summarizeBucket(quotaSamples, { allowZero: true, missing: anyMissing }),
+    human: summarizeBucket(collectHumanSamples(ctx), { allowZero: true, missing: anyMissing }),
   };
 }
 
 function computeFirstPassYield(ctx) {
-  const { tasks, enrichedByTask, gateEntries } = ctx;
+  const { tasks, currentByTask, enrichedByTask, gateEntries, missingTaskRuns, snapshotIncomplete } = ctx;
   let taskPassed = 0,
     taskKnown = 0,
     taskTotal = 0;
   for (const task of tasks) {
     const own = enrichedByTask.get(task.id) ?? [];
-    const observed = own.some(
-      item =>
-        item.events.some(ev => ['task_submitted', 'task_fast_started', 'task_fast_finished'].includes(ev.type)) ||
-        item.run?.checks?.profile === 'task-fast' ||
-        item.run?.state === 'succeeded' ||
-        record(item.run?.externalAbandon),
+    const current = currentByTask.get(task.id);
+    const attemptCount = Math.max(
+      integer(current?.number) ?? 0,
+      ...own.map(item => integer(item.attempt.number) ?? 0),
+      own.length,
     );
-    if (!observed) continue;
+    if (attemptCount === 0 && untouchedTaskStatuses.has(task.status)) continue;
     taskTotal++;
     const first = own[0];
-    if ((integer(first.attempt.number) ?? 0) !== 1 || !first.run) continue;
+    if (!first || (integer(first.attempt.number) ?? 0) !== 1 || !first.run) continue;
     const subs = first.events.filter(ev => ev.type === 'task_submitted');
-    const fasts = first.events.filter(ev => ev.type === 'task_fast_finished' && ev.data?.skipped !== true);
+    const fasts = first.events.filter(ev => isCompletedTaskFastVerdict(ev));
     if (subs.length && subs[0].data?.accepted === false) {
       taskKnown++;
     } else if (fasts.length) {
@@ -691,7 +795,7 @@ function computeFirstPassYield(ctx) {
       taskKnown++;
     }
   }
-  const taskComplete = taskTotal > 0 && taskKnown === taskTotal;
+  const taskComplete = !snapshotIncomplete && !missingTaskRuns && taskTotal > 0 && taskKnown === taskTotal;
 
   let gatePassed = 0,
     gateKnown = 0;
@@ -712,7 +816,7 @@ function computeFirstPassYield(ctx) {
       item.run.headSha !== item.gate.headSha;
     if (repairRounds === 0 && repairSessions === 0 && !headMoved) gatePassed++;
   }
-  const gateComplete = gateTotal > 0 && gateKnown === gateTotal;
+  const gateComplete = !snapshotIncomplete && gateTotal > 0 && gateKnown === gateTotal;
   return {
     taskFast: {
       passed: taskPassed,
@@ -732,6 +836,7 @@ function computeFirstPassYield(ctx) {
 }
 
 function computeArbitrations(ctx) {
+  const complete = !ctx.missingAnyRuns && !ctx.snapshotIncomplete;
   const seenRuns = new Map();
   for (const item of ctx.enrichedAttempts) if (item.run) seenRuns.set(item.run.id, item.run);
   for (const item of ctx.gateEntries) if (item.run) seenRuns.set(item.run.id, item.run);
@@ -747,11 +852,12 @@ function computeArbitrations(ctx) {
       decisions[decision] = (decisions[decision] ?? 0) + 1;
     }
   }
-  return { count, decisions, complete: !ctx.missingAnyRuns };
+  return { count: complete ? count : null, decisions: complete ? decisions : {}, complete };
 }
 
 function computeInterventions(ctx) {
-  const { enrichedAttempts, gateEntries, queueEntries, hasAttemptGaps, missingAnyRuns } = ctx;
+  const { enrichedAttempts, gateEntries, queueEntries, hasAttemptGaps, missingAnyRuns, snapshotIncomplete } = ctx;
+  const incomplete = missingAnyRuns || snapshotIncomplete;
   let abandonCount = 0;
   let rejectionCount = 0;
   const rejectedQueueKeys = new Set();
@@ -771,9 +877,7 @@ function computeInterventions(ctx) {
       item.events.some(ev => ev.type === 'cancelled' && ev.data?.code === 'external_abandoned');
     if (abandoned) abandonCount++;
     const subRejects = item.events.filter(ev => ev.type === 'task_submitted' && ev.data?.accepted === false).length;
-    const fastRejects = item.events.filter(
-      ev => ev.type === 'task_fast_finished' && ev.data?.passed === false && ev.data?.skipped !== true,
-    ).length;
+    const fastRejects = item.events.filter(ev => isCompletedTaskFastVerdict(ev) && ev.data?.passed === false).length;
     const runQueueRejects = [...rejectedQueueKeys].filter(k => k.startsWith(`${item.run.id}:`)).length;
     rejectionCount += subRejects + fastRejects;
     if (
@@ -797,12 +901,12 @@ function computeInterventions(ctx) {
     if (seenGateContainers.has(item.key)) gateRetries++;
     else seenGateContainers.add(item.key);
   }
-  const retryFailedCount = hasAttemptGaps ? null : taskRetries + gateRetries;
-  const complete = !missingAnyRuns && retryFailedCount !== null;
+  const retryFailedCount = hasAttemptGaps || incomplete ? null : taskRetries + gateRetries;
+  const complete = !incomplete && retryFailedCount !== null;
   return {
-    abandon: missingAnyRuns ? null : abandonCount,
+    abandon: incomplete ? null : abandonCount,
     retryFailed: retryFailedCount,
-    rejections: missingAnyRuns ? null : rejectionCount,
+    rejections: incomplete ? null : rejectionCount,
     total: complete ? abandonCount + retryFailedCount + rejectionCount : null,
     complete,
   };
@@ -864,7 +968,7 @@ function resourceMetadata(profile, slotIntervals) {
 }
 
 function computeUtilization(ctx, profile) {
-  const { enrichedAttempts, missingTaskRuns } = ctx;
+  const { enrichedAttempts, missingTaskRuns, snapshotIncomplete } = ctx;
   const slotIntervals = enrichedAttempts.map(item => {
     const stopped =
       stoppedAttemptStatuses.has(item.attempt.status) ||
@@ -882,7 +986,8 @@ function computeUtilization(ctx, profile) {
     };
   });
   const knownSlots = slotIntervals.filter(item => item.valid);
-  const allSlotsKnown = !missingTaskRuns && slotIntervals.length > 0 && knownSlots.length === slotIntervals.length;
+  const allSlotsKnown =
+    !snapshotIncomplete && !missingTaskRuns && slotIntervals.length > 0 && knownSlots.length === slotIntervals.length;
   const utilStart = allSlotsKnown ? Math.min(...knownSlots.map(item => item.start)) : null;
   const utilEnd = allSlotsKnown ? Math.max(...knownSlots.map(item => item.end)) : null;
   const utilWindowMs = allSlotsKnown ? interval(utilStart, utilEnd) : null;
@@ -937,6 +1042,7 @@ function computeUtilization(ctx, profile) {
  *   profile?: any,
  *   waveGates?: any[] | null,
  *   runsComplete: boolean,
+ *   snapshotComplete?: boolean,
  * }} input
  */
 export function buildProjectTelemetry({
@@ -948,9 +1054,18 @@ export function buildProjectTelemetry({
   profile = null,
   waveGates = null,
   runsComplete,
+  snapshotComplete = true,
 }) {
   void waveGates;
-  const ctx = buildContext({ snapshot, attempts, runsById, eventsByRun, integrationQueue, runsComplete });
+  const ctx = buildContext({
+    snapshot,
+    attempts,
+    runsById,
+    eventsByRun,
+    integrationQueue,
+    runsComplete,
+    snapshotComplete,
+  });
   const { throughput, taskDuration } = computeThroughputAndDuration(ctx);
   return {
     throughput,

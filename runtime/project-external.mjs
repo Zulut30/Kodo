@@ -1079,7 +1079,7 @@ async function verifySubmission(ctx, C, step, input) {
         const now = await state();
         if (now !== 'go') return now === 'verified' ? null : stale;
         const checked = AbortSignal.any([dedupeLost, slotLost, ...(signal ? [signal] : [])]);
-        logEvent(store, run.id, 'task_fast_started', { attemptId: attempt.id, headSha: head }, clockMs(ctx));
+        const startedAt = clockMs(ctx);
         let verdict;
         try {
           verdict = await verify({
@@ -1090,18 +1090,6 @@ async function verifySubmission(ctx, C, step, input) {
             ...(machine?.maxHeavyBuilds ? { maxHeavyBuilds: machine.maxHeavyBuilds } : {}),
           });
         } catch (error) {
-          logEvent(
-            store,
-            run.id,
-            'task_fast_finished',
-            {
-              attemptId: attempt.id,
-              headSha: head,
-              passed: false,
-              code: typeof error?.code === 'string' ? error.code : 'error',
-            },
-            clockMs(ctx),
-          );
           // Another call verifies the same Run right now (its lease `run:<id>`).
           if (error?.code === 'run_busy') return { blocked: 'project_task_busy' };
           // A fenced write of the check found a lease of this submission gone.
@@ -1110,19 +1098,7 @@ async function verifySubmission(ctx, C, step, input) {
           if (cancelled(store.getRun(run.id))) return stale;
           throw error;
         }
-        logEvent(
-          store,
-          run.id,
-          'task_fast_finished',
-          {
-            attemptId: attempt.id,
-            headSha: head,
-            passed: Boolean(verdict.passed && verdict.headSha === head && !verdict.skipped),
-            ...(verdict.skipped ? { skipped: true, ...(verdict.code ? { code: verdict.code } : {}) } : {}),
-            ...(!verdict.skipped && !verdict.passed ? { code: verdict.code ?? 'check_failed' } : {}),
-          },
-          clockMs(ctx),
-        );
+        const finishedAt = clockMs(ctx);
         if (dedupeLost.aborted || slotLost.aborted || !leaseOwned(store, dedupe))
           return { blocked: 'project_lease_lost' };
         if (verdict.skipped)
@@ -1131,8 +1107,8 @@ async function verifySubmission(ctx, C, step, input) {
             : (await state()) === 'verified'
               ? null
               : stale;
-        // The verdict is written in a short project section, fenced by the leases of
-        // `project-verify`, the build slot and the section (one transaction, runtime/lease-fence.mjs).
+        // The verdict and its telemetry events are written together in a short project section,
+        // fenced by `project-verify`, the build slot and the section (one transaction).
         try {
           return await section(async () => {
             const current = await verificationState(ctx, C, input, attempt.id, run.id);
@@ -1147,6 +1123,22 @@ async function verifySubmission(ctx, C, step, input) {
                   { state: 'executing', ...(verdict.diagnostics ? { lastDiagnostics: verdict.diagnostics } : {}) },
                   { preserveCancellation: true },
                 );
+                if (!verdict.passed) {
+                  logEvent(store, run.id, 'task_fast_started', { attemptId: attempt.id, headSha: head }, startedAt);
+                  logEvent(
+                    store,
+                    run.id,
+                    'task_fast_finished',
+                    {
+                      attemptId: attempt.id,
+                      headSha: head,
+                      passed: false,
+                      outcome: 'failed',
+                      code: verdict.code ?? 'check_failed',
+                    },
+                    finishedAt,
+                  );
+                }
                 return verdict.passed
                   ? problem('external_head_changed')
                   : {
@@ -1163,7 +1155,15 @@ async function verifySubmission(ctx, C, step, input) {
                 { state: 'succeeded', error: null, lastDiagnostics: null },
                 { preserveCancellation: true },
               );
-              logEvent(store, run.id, 'succeeded', { attemptId: attempt.id, headSha: head }, clockMs(ctx));
+              logEvent(store, run.id, 'task_fast_started', { attemptId: attempt.id, headSha: head }, startedAt);
+              logEvent(
+                store,
+                run.id,
+                'task_fast_finished',
+                { attemptId: attempt.id, headSha: head, passed: true, outcome: 'passed' },
+                finishedAt,
+              );
+              logEvent(store, run.id, 'succeeded', { attemptId: attempt.id, headSha: head }, finishedAt);
               return null;
             });
           });
@@ -1255,14 +1255,14 @@ async function integrateQueued(ctx, C, W, waveCtx, entry, signal) {
     store.updateRun(run.id, {
       externalCompletion: { schemaVersion: 1, headSha, integration, gates, integratedAt },
     });
+    logEvent(
+      store,
+      run.id,
+      'integration_finished',
+      { seq: entry.seq, attemptId: entry.attemptId, headSha, status: 'integrated' },
+      Date.parse(integratedAt),
+    );
   });
-  logEvent(
-    store,
-    run.id,
-    'integration_finished',
-    { seq: entry.seq, attemptId: entry.attemptId, headSha, status: 'integrated' },
-    Date.parse(integratedAt),
-  );
   return { status: 'integrated', integration };
 }
 

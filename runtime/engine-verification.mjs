@@ -780,6 +780,7 @@ export class EngineVerification extends EngineExecution {
       if (cycle.pendingRepair) await this.repairVerification(run, signal);
       const attempt = cycle.attempt;
       let checkError;
+      let verifyOutcome = 'failed';
       logGateVerify(this, run, 'gate_verify_started', { attempt });
       try {
         run.uiVerification = null;
@@ -792,13 +793,20 @@ export class EngineVerification extends EngineExecution {
         else await this.checks(run, signal);
         await this.behaviorGate(run, signal);
         if (!fast) await this.verificationGates(run, signal);
+        verifyOutcome = 'passed';
       } catch (error) {
-        if (signal?.aborted || this.store.getRun(run.id).cancelRequested)
+        if (signal?.aborted || this.store.getRun(run.id).cancelRequested) {
+          verifyOutcome = 'cancelled';
           throw Object.assign(new Error('Запуск отменён'), { code: 'cancelled' });
+        }
         maybeRethrowVerificationError(this, run, error);
         checkError = error;
       } finally {
-        logGateVerify(this, run, 'gate_verify_finished', { attempt, passed: !checkError });
+        logGateVerify(this, run, 'gate_verify_finished', {
+          attempt,
+          passed: verifyOutcome === 'passed',
+          outcome: verifyOutcome,
+        });
       }
       const headSha = await git(run.cwd, ['rev-parse', 'HEAD']);
       if (!checkError && fast) {
