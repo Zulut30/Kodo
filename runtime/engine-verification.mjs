@@ -273,6 +273,8 @@ export class EngineVerification extends EngineExecution {
       secrets: this.secrets,
       persist: (kind, value) => this.persistEvidence(run, kind, value, { headSha }),
       isClean: async () => (await inspectCurrentSource({ project: run.cwd, headSha })) === 'clean',
+      // The test registry of a Rust project is compared on a full gate only, never per task-fast task.
+      registry: run.verificationProfile !== TASK_FAST_PROFILE,
     });
     this.save(run);
     if ((await inspectCurrentSource({ project: run.cwd, headSha })) !== 'clean')
