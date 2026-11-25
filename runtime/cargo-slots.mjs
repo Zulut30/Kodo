@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { constants } from 'node:fs';
-import { access, mkdir, stat } from 'node:fs/promises';
+import { access, mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { DatabaseSync } from 'node:sqlite';
 import { setTimeout as delay } from 'node:timers/promises';
 import { noLinks } from './toolchains.mjs';
@@ -36,8 +36,91 @@ async function sccachePath(env) {
   return null;
 }
 
-/** @param {{home:string, projectId:string, maxHeavyBuilds?:number, sccache?:boolean|'auto', env?:NodeJS.ProcessEnv, signal?:AbortSignal}} options */
-export async function withCargoSlot({ home, projectId, maxHeavyBuilds = 1, sccache = false, env = {}, signal }, work) {
+// Cargo names the artifacts of a workspace (path) package by a hash taken relative to its
+// workspace root and judges their freshness by file mtimes. Two worktrees of one repository that
+// share a target directory therefore share artifact names: a slot last built from another
+// checkout can hand a task that checkout's library when the task's sources are older than the
+// artifact (a false failure, or a false pass). The slot remembers the checkout it last built;
+// on a change the fingerprints of path packages (a `local` entry that checks dep-info) are
+// removed, so Cargo rebuilds the workspace crates and keeps the registry dependencies.
+const CHECKOUT_MARKER = '.kodo-checkout';
+
+async function entries(dir) {
+  try {
+    return await readdir(dir, { withFileTypes: true });
+  } catch (error) {
+    if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return [];
+    throw error;
+  }
+}
+
+// A unit fingerprint that checks dep-info is a path package; unreadable ones count as one.
+async function localUnit(dir) {
+  for (const entry of await entries(dir)) {
+    if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+    try {
+      const local = JSON.parse(await readFile(path.join(dir, entry.name), 'utf8'))?.local;
+      if (!Array.isArray(local)) return true;
+      if (local.some(item => item && typeof item === 'object' && 'CheckDepInfo' in item)) return true;
+    } catch {
+      return true;
+    }
+  }
+  return false;
+}
+
+// `<package>-<metadata hash>`: the package part of a unit directory.
+const unitPackage = name => name.replace(/-[0-9a-f]{16}$/, '');
+
+// `.fingerprint` of each profile (`debug`, `release`, `<triple>/<profile>`) under the slot.
+async function purgeLocalFingerprints(target) {
+  const profiles = [];
+  for (const first of await entries(target)) {
+    if (!first.isDirectory()) continue;
+    profiles.push(path.join(target, first.name));
+    for (const second of await entries(path.join(target, first.name)))
+      if (second.isDirectory() && second.name !== '.fingerprint')
+        profiles.push(path.join(target, first.name, second.name));
+  }
+  for (const profile of profiles) {
+    const fingerprints = path.join(profile, '.fingerprint');
+    const units = (await entries(fingerprints)).filter(unit => unit.isDirectory());
+    // Every unit of a path package goes, its build-script run (`RerunIfChanged`) included.
+    const local = new Set();
+    for (const unit of units)
+      if (await localUnit(path.join(fingerprints, unit.name))) local.add(unitPackage(unit.name));
+    for (const unit of units)
+      if (local.has(unitPackage(unit.name)))
+        await rm(path.join(fingerprints, unit.name), { recursive: true, force: true });
+  }
+}
+
+async function claimForCheckout(target, checkout) {
+  if (checkout === undefined) return;
+  const current = path.resolve(checkout);
+  const marker = path.join(target, CHECKOUT_MARKER);
+  await noLinks(marker);
+  let previous = null;
+  try {
+    previous = await readFile(marker, 'utf8');
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
+  if (previous === current) return;
+  await purgeLocalFingerprints(target);
+  await writeFile(marker, current, { mode: 0o600 });
+}
+
+/**
+ * `checkout`: the worktree the build runs in; a slot last built from another checkout first drops
+ * the fingerprints of its path packages (see CHECKOUT_MARKER).
+ * @param {{home:string, projectId:string, maxHeavyBuilds?:number, sccache?:boolean|'auto', env?:NodeJS.ProcessEnv,
+ *   signal?:AbortSignal, checkout?:string}} options
+ */
+export async function withCargoSlot(
+  { home, projectId, maxHeavyBuilds = 1, sccache = false, env = {}, signal, checkout },
+  work,
+) {
   if (
     typeof projectId !== 'string' ||
     !/^[a-zA-Z0-9_-]{1,128}$/.test(projectId) ||
@@ -59,6 +142,7 @@ export async function withCargoSlot({ home, projectId, maxHeavyBuilds = 1, sccac
         const target = path.join(pool, projectId, `slot-${n}`);
         await noLinks(target);
         await mkdir(target, { recursive: true, mode: 0o700 });
+        await claimForCheckout(target, checkout);
         const inherited = Object.fromEntries(
           Object.entries(env).filter(
             ([key]) =>

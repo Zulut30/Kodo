@@ -142,3 +142,84 @@ test('separate Node processes cannot share a slot and a killed holder releases i
     waiter?.kill();
   }
 });
+
+test('A slot built from another checkout drops only the fingerprints of path packages', async t => {
+  const { mkdir: makeDir, readdir: list } = await import('node:fs/promises');
+  const { base: home } = await fixture(t);
+  const target = path.join(home, 'cargo-target', 'game', 'slot-1');
+  const unit = async (dir, file, local) => {
+    await makeDir(path.join(target, dir), { recursive: true });
+    await writeFile(path.join(target, dir, file), JSON.stringify({ local }));
+  };
+  const seed = async () => {
+    await unit('debug/.fingerprint/voxa-mesh-0123456789abcdef', 'lib-voxa_mesh.json', [
+      { CheckDepInfo: { dep_info: 'lib-voxa_mesh' } },
+    ]);
+    // The build-script run of the same path package fingerprints RerunIfChanged, not dep-info.
+    await unit('debug/.fingerprint/voxa-mesh-fedcba9876543210', 'run-build-script-build-script-build.json', [
+      { RerunIfChanged: { output: 'x', paths: ['build.rs'] } },
+    ]);
+    await unit('debug/.fingerprint/serde-1111222233334444', 'lib-serde.json', [{ Precalculated: '1.0.0' }]);
+    await unit('x86_64-pc-windows-msvc/release/.fingerprint/voxa-io-aaaabbbbccccdddd', 'lib-voxa_io.json', [
+      { CheckDepInfo: {} },
+    ]);
+  };
+  const units = async () =>
+    [
+      ...(await list(path.join(target, 'debug/.fingerprint'))),
+      ...(await list(path.join(target, 'x86_64-pc-windows-msvc/release/.fingerprint'))),
+    ].sort();
+  const build = checkout => withCargoSlot({ home, projectId: 'game', checkout }, env => env.CARGO_TARGET_DIR);
+  await seed();
+  assert.equal(await build(path.join(home, 'a')), target);
+  assert.deepEqual(await units(), ['serde-1111222233334444'], 'a slot without a recorded checkout is cleaned');
+  await seed();
+  await build(path.join(home, 'a'));
+  assert.equal((await units()).length, 4, 'the same checkout keeps its incremental state');
+  await build(path.join(home, 'b'));
+  assert.deepEqual(await units(), ['serde-1111222233334444'], 'another checkout rebuilds the path packages');
+  await seed();
+  await build(undefined);
+  assert.equal((await units()).length, 4, 'a build without a checkout leaves the slot alone');
+});
+
+test('Two checkouts of one workspace never share a stale library through the slot', { timeout: 300000 }, async t => {
+  const { execFileSync, spawnSync } = await import('node:child_process');
+  const { mkdir: makeDir, utimes } = await import('node:fs/promises');
+  if (spawnSync('cargo', ['--version'], { windowsHide: true }).status !== 0) return t.skip('cargo is not installed');
+  const { base: home } = await fixture(t);
+  const checkout = async (name, lib, testBody) => {
+    const root = path.join(home, name);
+    await makeDir(path.join(root, 'crates', 'demo', 'src'), { recursive: true });
+    await makeDir(path.join(root, 'crates', 'demo', 'tests'), { recursive: true });
+    await writeFile(path.join(root, 'Cargo.toml'), '[workspace]\nresolver = "2"\nmembers = ["crates/*"]\n');
+    await writeFile(
+      path.join(root, 'crates', 'demo', 'Cargo.toml'),
+      '[package]\nname = "demo"\nversion = "0.1.0"\nedition = "2021"\n',
+    );
+    await writeFile(path.join(root, 'crates', 'demo', 'src', 'lib.rs'), lib);
+    await writeFile(path.join(root, 'crates', 'demo', 'tests', 'api.rs'), testBody);
+    return root;
+  };
+  const older = await checkout('a', 'pub fn a() -> u32 { 1 }\n', '#[test]\nfn a() { assert_eq!(demo::a(), 1); }\n');
+  const newer = await checkout(
+    'b',
+    'pub fn a() -> u32 { 1 }\npub fn b() -> u32 { 2 }\n',
+    '#[test]\nfn b() { assert_eq!(demo::b(), 2); }\n',
+  );
+  // The second task wrote its sources before the first one's library was built into the slot.
+  const past = new Date(Date.now() - 3600_000);
+  for (const file of ['Cargo.toml', 'crates/demo/Cargo.toml', 'crates/demo/src/lib.rs', 'crates/demo/tests/api.rs'])
+    await utimes(path.join(newer, file), past, past);
+  const cargoTest = (cwd, slotCheckout) =>
+    withCargoSlot({ home, projectId: 'game', checkout: slotCheckout, env: process.env }, env => {
+      const result = spawnSync('cargo', ['test', '--offline'], { cwd, env, encoding: 'utf8', windowsHide: true });
+      return { status: result.status, output: result.stdout + result.stderr };
+    });
+  execFileSync('cargo', ['generate-lockfile', '--offline'], { cwd: older, windowsHide: true });
+  execFileSync('cargo', ['generate-lockfile', '--offline'], { cwd: newer, windowsHide: true });
+  assert.equal((await cargoTest(older, older)).status, 0);
+  const verified = await cargoTest(newer, newer);
+  assert.equal(verified.status, 0, verified.output);
+  assert.match(verified.output, /test b \.\.\. ok/);
+});

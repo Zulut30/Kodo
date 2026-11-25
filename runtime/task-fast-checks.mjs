@@ -1135,6 +1135,8 @@ async function executePlan(input) {
       sccache: run.config.rust?.sccache,
       env,
       signal,
+      // A slot shared by the worktrees of several tasks rebuilds the workspace crates of a new one.
+      checkout: run.cwd,
     },
     buildEnv => executePlanSteps(input, buildEnv),
   );
