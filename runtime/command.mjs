@@ -100,7 +100,7 @@ function stoppedOutput(text, secrets) {
  * @property {number} [timeoutMs]
  * @property {boolean} [allowFailure] Resolve instead of reject on a non-zero exit code.
  * @property {Record<string, string>} [secrets] Values redacted from output and errors.
- * @property {number} [stdoutPrefixBytes] Retain a redacted UTF-8 prefix while draining remaining stdout.
+ * @property {(chunk: string) => void} [consumeStdout] Stream raw decoded stdout to a trusted local parser.
  * @property {boolean} [rawOutput] Resolve with unredacted stdout/stderr.
  */
 
@@ -132,7 +132,7 @@ export async function execute(
     allowFailure = false,
     secrets = {},
     rawOutput = false,
-    stdoutPrefixBytes,
+    consumeStdout,
   } = {},
 ) {
   if (/(?:^|[\\/])git(?:\.exe)?$/i.test(command)) ({ args, env } = gitBoundary(args, env));
@@ -169,21 +169,9 @@ export async function execute(
     const aborted = () => stop('cancelled');
     signal?.addEventListener('abort', aborted, { once: true });
     if (signal?.aborted) aborted();
-    let prefixBytes = 0,
-      prefixClipped = false;
     child.stdout.on('data', data => {
-      if (stdoutPrefixBytes !== undefined) {
-        if (prefixClipped) return;
-        const bytes = Buffer.from(data);
-        const remaining = stdoutPrefixBytes - prefixBytes;
-        if (bytes.length > remaining) {
-          stdout += bytes
-            .subarray(0, remaining)
-            .toString('utf8')
-            .replace(/\uFFFD$/, '');
-          prefixClipped = true;
-        } else stdout += data;
-        prefixBytes += bytes.length;
+      if (consumeStdout) {
+        consumeStdout(data);
         return;
       }
       const remaining = 16 * 1024 * 1024 - stdout.length;
@@ -224,7 +212,7 @@ export async function execute(
         return;
       }
       const clean = {
-        stdout: prefixClipped ? stoppedOutput(stdout, secrets) : redact(stdout, secrets),
+        stdout: redact(stdout, secrets),
         stderr: redact(stderr, secrets),
         code,
       };

@@ -879,19 +879,45 @@ test(
     const repaired = f.branchHead(id);
     assert.equal(git(f.root, 'show', `${repaired}:a.txt`), 'a fixed by the e1 gate');
 
-    // The worker chat of y edits a.txt from its older base and reports the commit.
-    await writeFile(path.join(brief.worktree, 'a.txt'), 'a extended by y\n');
-    git(brief.worktree, 'add', '-A');
-    git(brief.worktree, 'commit', '-m', 'Implement y');
-    const head = git(brief.worktree, 'rev-parse', 'HEAD');
-    const completed = await f.cli(['complete-task', id, 'y', '--head', head]);
-    assert.equal(completed.exitCode, 2, completed.output);
-    assert.deepEqual(
-      [completed.report.result.status, completed.report.result.code],
-      ['blocked', 'project_integration_conflict'],
-    );
-    assert.equal(f.branchHead(id), repaired, 'the conflicting merge was aborted: the branch head is unchanged');
     const worktree = f.integrationWorktree(id);
+    let current = brief;
+    let latest = repaired;
+    for (let round = 0; round < 3; round++) {
+      if (round) {
+        await writeFile(path.join(worktree, 'a.txt'), 'integration edit ' + round + '\n');
+        git(worktree, 'add', 'a.txt');
+        git(worktree, 'commit', '-m', 'Advance integration while worker is running');
+        latest = f.branchHead(id);
+      }
+      await writeFile(path.join(current.worktree, 'a.txt'), 'worker edit ' + round + '\n');
+      git(current.worktree, 'add', 'a.txt');
+      git(current.worktree, 'commit', '-m', 'Implement y');
+      const head = git(current.worktree, 'rev-parse', 'HEAD');
+      const completed = await f.cli(['complete-task', id, 'y', '--head', head, '--attempt', current.attemptId]);
+      assert.equal(f.branchHead(id), latest);
+      if (round === 2) {
+        assert.equal(completed.exitCode, 2, completed.output);
+        assert.deepEqual(
+          [completed.report.result.status, completed.report.result.code],
+          ['blocked', 'project_integration_conflict'],
+        );
+        assert.equal(completed.report.result.retry, undefined);
+      } else {
+        assert.equal(completed.exitCode, 0, completed.output);
+        assert.deepEqual(
+          [completed.report.result.status, completed.report.result.code, completed.report.result.retry],
+          ['abandoned', 'project_integration_conflict_retry', { scheduled: true, remaining: 1 - round }],
+        );
+        const pull = await f.cli(['next-wave', id, '--host', 't3', '--limit', '1']);
+        assert.equal(pull.exitCode, 0, pull.output);
+        const [fresh] = pull.report.result.briefs;
+        assert.equal(fresh.baseSha, latest);
+        assert.equal(fresh.previousAttempt.attemptId, current.attemptId);
+        assert.equal(fresh.previousAttempt.headSha, head);
+        assert.match(fresh.previousAttempt.diff, /worker edit/);
+        current = fresh;
+      }
+    }
     assert.equal(git(worktree, 'status', '--porcelain=v1', '--untracked-files=all'), '');
     assert.notEqual(
       spawnSync('git', ['rev-parse', '-q', '--verify', 'MERGE_HEAD'], { cwd: worktree, windowsHide: true }).status,
@@ -910,7 +936,7 @@ test(
     assert.equal(retried.exitCode, 0, retried.output);
     const [again] = retried.report.result.briefs;
     assert.equal(again.taskId, 'y');
-    assert.equal(again.baseSha, repaired);
+    assert.equal(again.baseSha, latest);
     await writeFile(path.join(again.worktree, 'a.txt'), 'a fixed by the e1 gate, extended by y\n');
     git(again.worktree, 'add', '-A');
     git(again.worktree, 'commit', '-m', 'Implement y again');

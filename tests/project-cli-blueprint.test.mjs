@@ -1040,7 +1040,7 @@ test('apply-spec and append-milestone support 400 tasks and bounded planning tim
       ...spec.tasks[2],
       id: 'unit-' + index + '-' + i,
       epicId: epic.id,
-      writePaths: ['docs/unit-' + index + '-' + i],
+      writePaths: Array.from({ length: 12 }, (_, j) => 'docs/shared/unit-' + index + '-' + i + '/file-' + j),
       interfaceRefs: [],
       dependsOn: [],
     }));
@@ -1054,6 +1054,10 @@ test('apply-spec and append-milestone support 400 tasks and bounded planning tim
       ...batch.tasks.slice(0, 320 - spec.tasks.length).map(task => ({ ...task, dependsOn: ['test-bench'] })),
     );
   }
+  for (const task of spec.tasks) {
+    while (task.writePaths.length < 12)
+      task.writePaths.push('docs/shared/' + task.id + '/file-' + task.writePaths.length);
+  }
   const last = chunk(5);
   const milestoneFile = path.join(f.dir, 'milestone.json');
   await writeFile(milestoneFile, JSON.stringify(last));
@@ -1065,14 +1069,21 @@ test('apply-spec and append-milestone support 400 tasks and bounded planning tim
   const { repo, store } = await f.direct();
   const priorId = prior.report.projectId;
   assert.equal(repo.snapshot(priorId).tasks.length, 320);
+  const { lintMilestone } = await import('../runtime/project-bootstrap.mjs');
+  const openHistory = repo.snapshot(priorId);
+  const lintStart = performance.now();
+  assert.deepEqual(lintMilestone(last, openHistory).findings, []);
+  assert.ok(performance.now() - lintStart < 10000, '80 fresh tasks against 320 open tasks within 10 seconds');
   // Stage the closed historical rows for this size benchmark. The separate lifecycle test
   // reaches acceptance through real transitions, while this test exercises the append itself.
   store.db
     .prepare("UPDATE kodo_project_records SET body=json_set(body, '$.status', 'accepted') WHERE project_id=?")
     .run(priorId);
+  const appendStart = performance.now();
   const appended = await f.run(['append-milestone', priorId, '--file', milestoneFile]);
   assert.equal(appended.exitCode, 0, JSON.stringify(appended.report.result));
   assert.equal(appended.report.result.tasks.length, 80);
+  assert.ok(performance.now() - appendStart < 10000, '80-task append within 10 seconds');
   assert.equal(repo.snapshot(priorId).tasks.length, 400);
   spec.milestones.push(last.milestone);
   spec.epics.push(...last.epics);

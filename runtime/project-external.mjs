@@ -21,6 +21,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { stat } from 'node:fs/promises';
 import { execute } from './command.mjs';
+import { retryDiff } from './project-retry-diff.mjs';
 import { git, makeWorktree, plannedWorktreeHome } from './workspace.mjs';
 import { ownsPath, scopesOverlap } from './contracts.mjs';
 import { redact } from './security.mjs';
@@ -158,7 +159,12 @@ async function briefFor(state, attempt, task, run) {
   const selfCheck = `${cli} ci feedback --base ${run.baseSha} --project ${quotePath(run.cwd)} --json`;
   const prior = await latestPriorTaskRun({ store: storeOf(state.ctx), project, task, run, attempt });
   const previousAttempt = prior?.externalConflict?.previousAttempt;
-  const carry = previousAttempt ? '\nPort the changes in previousAttempt.diff onto the fresh baseSha.' : '';
+  let carry = previousAttempt ? '\nPort the changes in previousAttempt.diff onto the fresh baseSha.' : '';
+  if (previousAttempt) {
+    carry +=
+      ' If truncated is true the diff is incomplete. Recover omittedFiles from previousAttempt.headSha in this repository.';
+    if (previousAttempt.truncated === undefined) state.pendingDiffs.set(attempt.id, prior.id);
+  }
   const basePrompt = `${input}\n\n${workerContract(run, task.writePaths, selfCheck)}${carry}`;
   const { prompt, extra } = await enrichExternalWaveBrief({
     state,
@@ -425,7 +431,7 @@ async function reserveRetries(state, manual) {
       currentOf(state.snapshot, candidate.id),
     );
     if (executor.kind !== 'external' || executor.host !== state.host) {
-      state.blocked.push({ taskId: candidate.id, code: 'project_retry_executor' });
+      if (manual) state.blocked.push({ taskId: candidate.id, code: 'project_retry_executor' });
       continue;
     }
     await reserve(
@@ -606,6 +612,7 @@ export async function nextWave(ctx, input) {
   if (typeof home === 'string') quotePath(await plannedWorktreeHome(home));
   const stallMinutes = input.stallMinutes ?? 30;
   need(Number.isSafeInteger(stallMinutes) && stallMinutes > 0, 'arguments');
+  const pendingDiffs = new Map();
   const result = await withWaveAdmissionLeases(store, projectId, async checkLease => {
     const now = Date.parse((ctx.clock ?? (() => new Date().toISOString()))());
     const profile = ctx.repo.getProfile(projectId);
@@ -618,6 +625,7 @@ export async function nextWave(ctx, input) {
       worktreeHome: await waves.integrationHome(store),
     });
     const state = {
+      pendingDiffs,
       ctx,
       C,
       host,
@@ -658,6 +666,10 @@ export async function nextWave(ctx, input) {
     };
     return result;
   });
+  for (const brief of result.briefs) {
+    const priorId = pendingDiffs.get(brief.attemptId);
+    if (priorId) brief.previousAttempt = await captureConflictDiff(ctx, priorId, brief.writePaths);
+  }
   const watch = await watchWorkers(ctx, result.briefs, stallMinutes, signal);
   const report = { ...result, watch };
   C.assertDirectorSafe(report, options);
@@ -843,37 +855,6 @@ async function abandonAttempt(ctx, snapshot, attempt, run, { head, commandId }) 
   };
 }
 
-async function retryDiff(ctx, run, task, head) {
-  const range = [run.baseSha, head];
-  const stats = await execute('git', ['diff', '--numstat', '--no-renames', '-z', ...range], {
-    cwd: run.project,
-    rawOutput: true,
-  });
-  const files = stats.stdout.split('\0').flatMap(row => {
-    const match = /^\d+\t\d+\t([\s\S]+)$/.exec(row);
-    return match && ownsPath(task.writePaths, match[1]) ? [match[1]] : [];
-  });
-  let diff = '';
-  for (const file of files) {
-    const remaining = 65536 - Buffer.byteLength(diff);
-    if (remaining < 4) break;
-    const part = await execute(
-      'git',
-      ['--literal-pathspecs', 'diff', '--no-color', '--no-renames', ...range, '--', file],
-      {
-        cwd: run.project,
-        secrets: ctx.engine.secrets,
-        stdoutPrefixBytes: remaining,
-      },
-    );
-    if (!/[\x00-\x08\x0b\x0c\x0e-\x1f]/.test(part.stdout)) diff += part.stdout;
-  }
-  return Buffer.from(diff)
-    .subarray(0, 65536)
-    .toString('utf8')
-    .replace(/\uFFFD$/, '');
-}
-
 // Runs inside the queue drain's fenced project and integration sections.
 async function scheduleConflictRetry(ctx, snapshot, task, attempt, run, headSha, integration) {
   const code = 'project_integration_conflict';
@@ -887,7 +868,6 @@ async function scheduleConflictRetry(ctx, snapshot, task, attempt, run, headSha,
     attemptId: attempt.id,
     headSha,
     reason: code,
-    diff: await retryDiff(ctx, run, task, headSha),
   };
   const retry = { scheduled: true, remaining: 1 - used };
   const current = currentOf(snapshot, task.id);
@@ -903,10 +883,41 @@ async function scheduleConflictRetry(ctx, snapshot, task, attempt, run, headSha,
     state: 'cancelled',
     cancelRequested: true,
     externalAbandon: { schemaVersion: 1, attemptId: attempt.id, headSha },
-    externalConflict: { previousAttempt, retry, number: attempt.number },
+    externalConflict: {
+      previousAttempt,
+      writePaths: task.writePaths,
+      retry,
+      integration,
+      reason: integration.reason ?? code,
+      number: attempt.number,
+    },
     error: { code: 'project_integration_conflict_retry', message: 'Integration conflict' },
   });
-  return { status: 'rejected', code: 'project_integration_conflict_retry', retry };
+  return {
+    status: 'rejected',
+    code: 'project_integration_conflict_retry',
+    retry,
+    integration,
+    reason: integration.reason ?? code,
+  };
+}
+
+// The drain persists the immutable inputs before settling the queue. A completion,
+// its replay or a concurrent next-wave can finish capture after releasing the leases.
+async function captureConflictDiff(ctx, runId, legacyScopes) {
+  const store = storeOf(ctx);
+  const run = store.getRun(runId);
+  const conflict = run.externalConflict;
+  if (conflict.previousAttempt.truncated !== undefined) return conflict.previousAttempt;
+  const captured = await retryDiff(
+    run,
+    conflict.writePaths ?? legacyScopes,
+    conflict.previousAttempt.headSha,
+    ctx.engine.secrets,
+  );
+  const previousAttempt = { ...conflict.previousAttempt, ...captured };
+  store.updateRun(runId, { externalConflict: { ...conflict, previousAttempt } });
+  return previousAttempt;
 }
 
 // The Runs of this task's attempts that an abandon already stopped with `head`.
@@ -1209,7 +1220,8 @@ async function verifySubmission(ctx, C, step, input) {
               const written = store.getRun(run.id);
               if (cancelled(written) || integrationStarted(written) || written.externalCompletion) return stale;
               if (!verdict.passed || verdict.headSha !== head) {
-                recordFailure(store, run, verdict);
+                if (verificationFailureStatus(verdict.code) === 'checks_failed')
+                  recordFailure(ctx, run, verdict.passed ? problem('external_head_changed') : verdict);
                 // A failed check keeps its diagnostic pack for the next attempt's brief (15D).
                 store.updateRun(
                   run.id,
@@ -1259,7 +1271,13 @@ async function integrateQueued(ctx, C, W, waveCtx, entry, signal) {
   const stale = { status: 'rejected', code: 'project_submission_stale' };
   if (attempt.id !== entry.attemptId || run.id !== entry.runId) return stale;
   if (run.externalConflict?.previousAttempt.headSha === headSha)
-    return { status: 'rejected', code: 'project_integration_conflict_retry', retry: run.externalConflict.retry };
+    return {
+      status: 'rejected',
+      code: 'project_integration_conflict_retry',
+      retry: run.externalConflict.retry,
+      integration: run.externalConflict.integration,
+      reason: run.externalConflict.reason,
+    };
   if (run.externalCompletion?.headSha === headSha)
     return (await mergeRecorded(projectId, run))
       ? { status: 'integrated', integration: run.externalCompletion.integration }
@@ -1457,7 +1475,10 @@ async function externalAttempt(ctx, C, projectId, taskId) {
 
 // The checks of a submission that need consistent project state, in one short project section:
 // a decided result, a replay of a recorded completion, or the attempt to verify and integrate.
-function recordFailure(store, run, defect) {
+const verificationFailureStatus = code => (code === 'cargo_fetch_failed' ? 'blocked' : 'checks_failed');
+
+function recordFailure(ctx, run, defect) {
+  const store = storeOf(ctx);
   const signature = createHash('sha256')
     .update(
       JSON.stringify([defect.code, defect.diagnostics?.items?.[0] ?? defect.diagnostics?.failingTests?.[0] ?? null]),
@@ -1466,7 +1487,11 @@ function recordFailure(store, run, defect) {
   const last = store.getRun(run.id).externalFailure;
   const repeated = last?.signature === signature;
   store.updateRun(run.id, {
-    externalFailure: { signature, repeated, since: repeated ? last.since : new Date().toISOString() },
+    externalFailure: {
+      signature,
+      repeated,
+      since: repeated ? last.since : (ctx.clock?.() ?? new Date().toISOString()),
+    },
   });
 }
 
@@ -1478,10 +1503,14 @@ async function admitSubmission(ctx, C, input) {
   const recorded = attemptId && attemptId !== attempt.id ? earlierAbandon(ctx, snapshot, attempt, attemptId) : run;
   if (recorded?.externalConflict?.previousAttempt.headSha === head)
     return {
+      conflictRunId: recorded.id,
+      task,
       result: {
         status: 'abandoned',
         code: 'project_integration_conflict_retry',
         retry: recorded.externalConflict.retry,
+        integration: recorded.externalConflict.integration ?? null,
+        reason: recorded.externalConflict.reason ?? recorded.externalConflict.previousAttempt.reason,
         revision: snapshot.revision,
       },
     };
@@ -1498,7 +1527,13 @@ async function admitSubmission(ctx, C, input) {
     return blocked('project_attempt_not_running');
   const defect = await inspectSubmission(ctx.engine, run, task, head);
   if (defect) {
-    recordFailure(storeOf(ctx), run, defect);
+    // After reassignment, a bare SHA off this branch (or its shared starting
+    // commit) does not identify the current worker. Its own commits still count.
+    const attributable =
+      attemptId !== undefined ||
+      attempt.number === 1 ||
+      (head !== run.baseSha && defect.code !== 'external_branch_mismatch');
+    if (attributable) recordFailure(ctx, run, defect);
     return { result: { status: 'checks_failed', ...defect, revision: snapshot.revision } };
   }
   return { ...current, verified: false };
@@ -1539,7 +1574,10 @@ export async function completeTask(ctx, input) {
       abandonTarget(ctx, await externalAttempt(ctx, C, projectId, taskId), { head, attemptId, commandId }),
     );
   const step = await section(() => admitSubmission(ctx, C, input));
-  if (step.result) return step.result;
+  if (step.result) {
+    if (step.conflictRunId) await captureConflictDiff(ctx, step.conflictRunId, step.task.writePaths);
+    return step.result;
+  }
   const completion = { ...input, deferGate };
   if (step.replay) return finishCompletion(ctx, C, completion, step.replay, true);
   const { snapshot, attempt, run } = step;
@@ -1550,7 +1588,7 @@ export async function completeTask(ctx, input) {
     // A dependency download failure is the environment, not the submission (15C): blocked.
     if (defect)
       return {
-        status: defect.code === 'cargo_fetch_failed' ? 'blocked' : 'checks_failed',
+        status: verificationFailureStatus(defect.code),
         ...defect,
         revision: snapshot.revision,
       };
@@ -1583,10 +1621,11 @@ export async function completeTask(ctx, input) {
   });
   const outcome = done.outcome;
   if (done.status === 'failed') throw Object.assign(new Error(`Project ${outcome.code}`), { code: outcome.code });
+  if (outcome.retry) await captureConflictDiff(ctx, run.id, step.task.writePaths);
   if (done.status === 'rejected')
     return {
       status: outcome.retry ? 'abandoned' : 'blocked',
-      ...(outcome.retry && { retry: outcome.retry }),
+      ...(outcome.retry && { retry: outcome.retry, reason: outcome.reason }),
       code: outcome.code,
       integration: outcome.integration ?? null,
       revision: outcome.integration?.revision ?? (await snapshotOf(ctx, projectId)).revision,

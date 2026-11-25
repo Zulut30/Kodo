@@ -519,16 +519,57 @@ export function taskAncestors(tasks) {
 /** Pairs of tasks without a dependency path between them whose writePaths overlap.
  * `others` are tasks that may run concurrently with every task in `tasks`. */
 export function parallelOverlaps(tasks, { ancestors = taskAncestors(tasks), others = [] } = {}) {
-  const pairs = [];
-  for (let i = 0; i < tasks.length; i++) {
-    const left = tasks[i];
-    for (const right of tasks.slice(i + 1)) {
-      if (ancestors.get(left.id)?.has(right.id) || ancestors.get(right.id)?.has(left.id)) continue;
-      if (scopesOverlap(left.writePaths, right.writePaths)) pairs.push([left.id, right.id]);
+  // Each node indexes tasks ending at this literal directory and tasks anywhere below it.
+  // A wildcard inside a component leaves the whole component to the canonical matcher.
+  const node = () => ({ children: new Map(), ends: new Set(), below: new Set() });
+  const root = node();
+  const all = [...tasks, ...others];
+  const indexed = all.map((task, index) =>
+    task.writePaths.map(scope => {
+      const parts = scope.replace(/^\.\//, '').split('/');
+      const segments = [];
+      if (!parts.includes('..')) {
+        for (const part of parts) {
+          if (!part || part === '.' || /[^a-zA-Z0-9_.-]/.test(part)) break;
+          segments.push(part.toLowerCase());
+        }
+      }
+      return { index, scope, segments };
+    }),
+  );
+  for (const paths of indexed) {
+    for (const entry of paths) {
+      let at = root;
+      at.below.add(entry);
+      for (const part of entry.segments) {
+        if (!at.children.has(part)) at.children.set(part, node());
+        at = at.children.get(part);
+        at.below.add(entry);
+      }
+      at.ends.add(entry);
     }
-    for (const other of others)
-      if (!ancestors.get(left.id)?.has(other.id) && scopesOverlap(left.writePaths, other.writePaths))
-        pairs.push([left.id, other.id]);
+  }
+  const pairs = [];
+  for (const [i, left] of tasks.entries()) {
+    const matches = new Set();
+    for (const entry of indexed[i]) {
+      const compareEntries = candidates => {
+        for (const { index, scope } of candidates) {
+          if (index <= i || matches.has(index)) continue;
+          const right = all[index];
+          if (ancestors.get(left.id)?.has(right.id) || (index < tasks.length && ancestors.get(right.id)?.has(left.id)))
+            continue;
+          if (scopesOverlap([entry.scope], [scope])) matches.add(index);
+        }
+      };
+      let at = root;
+      for (const part of entry.segments) {
+        compareEntries(at.ends);
+        at = at.children.get(part);
+      }
+      compareEntries(at.below);
+    }
+    for (const index of [...matches].sort((a, b) => a - b)) pairs.push([left.id, all[index].id]);
   }
   return pairs;
 }
