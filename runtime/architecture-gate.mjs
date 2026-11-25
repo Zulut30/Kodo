@@ -223,11 +223,45 @@ const normalizeTaskPaths = value => {
   return [...new Set(normalized)].sort();
 };
 
+const commitSha = value => typeof value === 'string' && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(value);
+
+const normalizeTaskScopes = value => {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) throw failure('configuration');
+  const rows = value.map(entry => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw failure('configuration');
+    const id = typeof entry.id === 'string' ? entry.id.trim() : '';
+    if (!id || !commitSha(entry.commit)) throw failure('configuration');
+    const writePaths = normalizeTaskPaths(entry.writePaths);
+    if (!writePaths) throw failure('configuration');
+    return { id, commit: entry.commit, writePaths };
+  });
+  return rows.sort((a, b) =>
+    a.id < b.id ? -1 : a.id > b.id ? 1 : a.commit < b.commit ? -1 : a.commit > b.commit ? 1 : 0,
+  );
+};
+
 /** Extract task writePaths from a Run for architecture gate execution and freshness checks. */
 export function architectureTaskPathsForRun(run) {
   return Array.isArray(run?.plan?.tasks)
     ? run.plan.tasks.flatMap(task => (Array.isArray(task.writePaths) ? task.writePaths : []))
     : [];
+}
+
+/** Extract per-task commit + writePaths scopes when a Run (e.g. an epic gate) binds each task to its merge commit. */
+export function architectureTaskScopesForRun(run) {
+  if (!Array.isArray(run?.plan?.tasks) || !run?.nodes || typeof run.nodes !== 'object') return undefined;
+  const scopes = [];
+  for (const task of run.plan.tasks) {
+    const commit = run.nodes?.[task?.id]?.headSha;
+    if (!commitSha(commit)) continue;
+    scopes.push({
+      id: String(task.id),
+      commit,
+      writePaths: Array.isArray(task.writePaths) ? [...task.writePaths] : [],
+    });
+  }
+  return scopes.length ? scopes : undefined;
 }
 
 /**
@@ -237,6 +271,7 @@ export function architectureTaskPathsForRun(run) {
  * @property {string} [baseSha] Merge base of the affected-module plan.
  * @property {Record<string, any>} [config] Raw `architecture` configuration; normalized here.
  * @property {string[]} [taskPaths] Explicit writePaths of the checked task(s) (used for Rust contract crate protection).
+ * @property {{ id: string, commit: string, writePaths: string[] }[]} [taskScopes] Per-task commit + writePaths scopes for epic gates.
  * @property {AbortSignal} [signal]
  */
 
@@ -249,6 +284,7 @@ export async function runArchitectureChecks({
   artifacts,
   secrets = {},
   taskPaths,
+  taskScopes,
   signal,
 } = {}) {
   config = normalizeArchitectureConfig(config);
@@ -264,6 +300,8 @@ export async function runArchitectureChecks({
   if (!config.enabled) return receipt;
   const boundTaskPaths = normalizeTaskPaths(taskPaths);
   if (boundTaskPaths !== undefined) receipt.taskPaths = boundTaskPaths;
+  const boundTaskScopes = normalizeTaskScopes(taskScopes);
+  if (boundTaskScopes?.length) receipt.taskScopes = boundTaskScopes;
   const directory = await privateDirectory(artifacts, cwd, signal);
   Object.assign(receipt, {
     status: 'blocked',
@@ -285,6 +323,7 @@ export async function runArchitectureChecks({
       signal,
       redactions: secrets,
       ...(boundTaskPaths !== undefined ? { taskPaths: boundTaskPaths } : {}),
+      ...(boundTaskScopes?.length ? { taskScopes: boundTaskScopes } : {}),
     });
     receipt.status =
       receipt.report.passed === true ? 'passed' : receipt.report.status === 'failed' ? 'failed' : 'blocked';
@@ -332,7 +371,7 @@ export async function runArchitectureChecks({
 // oxlint-disable-next-line complexity -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
 export async function isCurrentArchitectureReceipt(
   receipt,
-  { cwd, project, headSha, baseSha, config, taskPaths, signal, now } = {},
+  { cwd, project, headSha, baseSha, config, taskPaths, taskScopes, signal, now } = {},
 ) {
   try {
     config = normalizeArchitectureConfig(config);
@@ -343,6 +382,11 @@ export async function isCurrentArchitectureReceipt(
       // A receipt produced without taskPaths ran under the strictest contract-protection mode;
       // any path granted during the check must remain authorized by the caller's expectedTaskPaths.
       if (actualTaskPaths.some(item => !expectedTaskPaths.includes(item))) return false;
+    }
+    const expectedTaskScopes = normalizeTaskScopes(taskScopes);
+    if (expectedTaskScopes !== undefined) {
+      const actualTaskScopes = receipt?.taskScopes === undefined ? [] : normalizeTaskScopes(receipt.taskScopes);
+      if (hash(actualTaskScopes) !== hash(expectedTaskScopes)) return false;
     }
     if (
       receipt?.schemaVersion !== 1 ||
@@ -366,6 +410,7 @@ export async function isCurrentArchitectureReceipt(
       signal,
       ...(now ? { now } : {}),
       ...(receipt.taskPaths !== undefined ? { taskPaths: receipt.taskPaths } : {}),
+      ...(receipt.taskScopes !== undefined ? { taskScopes: receipt.taskScopes } : {}),
     });
     if (
       planned.report.status !== 'planned' ||

@@ -7,6 +7,7 @@ import {
   isCurrentArchitectureReceipt,
   architectureConfigHash,
   architectureTaskPathsForRun,
+  architectureTaskScopesForRun,
 } from './architecture-gate.mjs';
 import { sha256, fail, parse, wait } from './delivery-process.mjs';
 import { operationIntent, operationOutcome } from './delivery-operations.mjs';
@@ -132,6 +133,7 @@ async function verifyReview(ctx) {
       baseSha: ctx.run.baseSha,
       config: architectureConfig,
       taskPaths: architectureTaskPathsForRun(ctx.run),
+      ...(architectureTaskScopesForRun(ctx.run) ? { taskScopes: architectureTaskScopesForRun(ctx.run) } : {}),
       signal: ctx.signal,
     }))
   )

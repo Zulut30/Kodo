@@ -25,9 +25,68 @@ function literalScopePrefix(scope) {
   return literal.join('/');
 }
 
-export function scopeMatchesPath(rawScope, rawFile) {
+const MAX_SCOPE_BRACE_EXPANSIONS = 64;
+
+/**
+ * Expand brace alternation expressions `{a,b}` (including nested braces and
+ * alternatives containing `/`) into full normalized scope strings.
+ * Returns `null` if braces are unbalanced or expansion exceeds `maxBranches`.
+ * @param {string} rawScope
+ * @param {number} [maxBranches]
+ * @returns {string[] | null}
+ */
+export function expandScopeBraces(rawScope, maxBranches = MAX_SCOPE_BRACE_EXPANSIONS) {
   const scope = normalizeScopePath(rawScope);
-  const file = normalizeScopePath(rawFile);
+  if (!scope) return [];
+  const expandOne = pattern => {
+    let open = -1;
+    for (let i = 0; i < pattern.length; i++) {
+      if (pattern[i] === '}') return null;
+      if (pattern[i] === '{') {
+        open = i;
+        break;
+      }
+    }
+    if (open === -1) return [pattern];
+    let depth = 0;
+    let close = -1;
+    const parts = [];
+    let start = open + 1;
+    for (let i = open; i < pattern.length; i++) {
+      const ch = pattern[i];
+      if (ch === '{') depth++;
+      else if (ch === '}') {
+        depth--;
+        if (depth === 0) {
+          parts.push(pattern.slice(start, i));
+          close = i;
+          break;
+        }
+      } else if (ch === ',' && depth === 1) {
+        parts.push(pattern.slice(start, i));
+        start = i + 1;
+      }
+    }
+    if (close === -1) return null;
+    const prefix = pattern.slice(0, open);
+    const suffix = pattern.slice(close + 1);
+    const out = [];
+    for (const part of parts) {
+      const nested = expandOne(`${prefix}${part}${suffix}`);
+      if (nested === null) return null;
+      for (const item of nested) {
+        out.push(item);
+        if (out.length > maxBranches) return null;
+      }
+    }
+    return out;
+  };
+  const expanded = expandOne(scope);
+  if (expanded === null) return null;
+  return [...new Set(expanded.map(normalizeScopePath).filter(Boolean))];
+}
+
+function singleScopeMatchesPath(scope, file) {
   if (!scope || !file) return false;
   if (scope === '.' || scope === '**') return true;
   if (!SCOPE_GLOB_META.test(scope)) return file === scope || file.startsWith(`${scope}/`);
@@ -36,6 +95,15 @@ export function scopeMatchesPath(rawScope, rawFile) {
     if (base && !SCOPE_GLOB_META.test(base) && (file === base || file.startsWith(`${base}/`))) return true;
   }
   return path.posix.matchesGlob(file, scope);
+}
+
+export function scopeMatchesPath(rawScope, rawFile) {
+  const scope = normalizeScopePath(rawScope);
+  const file = normalizeScopePath(rawFile);
+  if (!scope || !file) return false;
+  const branches = expandScopeBraces(scope);
+  if (branches === null) return singleScopeMatchesPath(scope, file);
+  return branches.some(branch => singleScopeMatchesPath(branch, file));
 }
 
 /**
@@ -79,9 +147,20 @@ function segmentsIntersectSubtree(scopeSegs, rootSegs) {
   return walk(0, 0);
 }
 
+function branchIntersectsSubtree(branch, crateRoot) {
+  if (!branch) return false;
+  if (branch === '.' || branch === '**') return true;
+  if (crateRoot === '') return true;
+  if (!SCOPE_GLOB_META.test(branch)) {
+    return branch === crateRoot || crateRoot.startsWith(`${branch}/`) || branch.startsWith(`${crateRoot}/`);
+  }
+  return segmentsIntersectSubtree(branch.split('/'), crateRoot.split('/'));
+}
+
 /**
- * Returns true if `rawScope` can intersect any path inside `rawCrateRoot`'s subtree
- * WITHOUT explicitly naming `rawCrateRoot` via literal segments.
+ * Returns true if `rawScope` (or any brace-expanded alternative of it) can intersect
+ * any path inside `rawCrateRoot`'s subtree WITHOUT explicitly naming `rawCrateRoot`
+ * via leading literal segments.
  * @param {string} rawScope
  * @param {string} rawCrateRoot
  */
@@ -92,8 +171,12 @@ export function isBroadContractScope(rawScope, rawCrateRoot) {
   if (!scope) return false;
   if (scope === '.') return true;
   if (crateRoot === '') return literalScopePrefix(scope) === '';
-  if (!SCOPE_GLOB_META.test(scope)) return crateRoot === scope || crateRoot.startsWith(`${scope}/`);
-  return segmentsIntersectSubtree(scope.split('/'), crateRoot.split('/'));
+  const branches = expandScopeBraces(scope);
+  if (branches === null) {
+    const literal = literalScopePrefix(scope);
+    return !literal || crateRoot === literal || crateRoot.startsWith(`${literal}/`);
+  }
+  return branches.some(branch => branchIntersectsSubtree(branch, crateRoot));
 }
 
 export const isPlainObject = value =>

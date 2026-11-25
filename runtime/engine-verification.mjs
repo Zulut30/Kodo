@@ -6,7 +6,11 @@ import { execute } from './command.mjs';
 import { git, commitChanges, diffHash } from './workspace.mjs';
 import { inspectCurrentSource } from './ci-graph.mjs';
 import { compactReviewEvidence } from './context-pack.mjs';
-import { architectureTaskPathsForRun, normalizeArchitectureConfig } from './architecture-gate.mjs';
+import {
+  architectureTaskPathsForRun,
+  architectureTaskScopesForRun,
+  normalizeArchitectureConfig,
+} from './architecture-gate.mjs';
 import {
   compareWithBaseline,
   isCurrentBehaviorReceipt,
@@ -525,6 +529,7 @@ export class EngineVerification extends EngineExecution {
       run[field] = null;
       this.save(run);
       const taskPaths = field === 'architectureChecks' ? architectureTaskPathsForRun(run) : undefined;
+      const taskScopes = field === 'architectureChecks' ? architectureTaskScopesForRun(run) : undefined;
       try {
         run[field] = await executeGate({
           cwd: run.cwd,
@@ -535,6 +540,7 @@ export class EngineVerification extends EngineExecution {
           previous,
           secrets: this.secrets,
           ...(taskPaths ? { taskPaths } : {}),
+          ...(taskScopes ? { taskScopes } : {}),
           signal,
         });
       } catch (error) {
@@ -550,6 +556,7 @@ export class EngineVerification extends EngineExecution {
           baseSha: run.baseSha,
           config,
           ...(taskPaths ? { taskPaths } : {}),
+          ...(taskScopes ? { taskScopes } : {}),
           signal,
         }))
       ) {
@@ -815,6 +822,7 @@ export class EngineVerification extends EngineExecution {
               baseSha: run.baseSha,
               config: run.config.architecture,
               taskPaths: architectureTaskPathsForRun(run),
+              ...(architectureTaskScopesForRun(run) ? { taskScopes: architectureTaskScopesForRun(run) } : {}),
               signal,
             }))
           ) {

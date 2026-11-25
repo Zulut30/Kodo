@@ -18,7 +18,7 @@ import {
 import { integrationLeaseHeld } from './project-integration-lease.mjs';
 import { WAVE_POLICY_FIELDS, assertWavePolicy } from './wave-policy.mjs';
 import { isCurrentBehaviorReceipt } from './behavior-gate.mjs';
-import { architectureTaskPathsForRun } from './architecture-gate.mjs';
+import { architectureTaskPathsForRun, architectureTaskScopesForRun } from './architecture-gate.mjs';
 import {
   TEST_COUNT_VERSION,
   countingPlan,
@@ -203,6 +203,7 @@ async function assertFullReceipts(engine, run) {
     'review_stale',
   );
   const archTaskPaths = architectureTaskPathsForRun(run);
+  const archTaskScopes = architectureTaskScopesForRun(run);
   for (const [field, setting, method] of [
     ['uiVerification', 'uiVerification', 'isCurrentUIReceipt'],
     ['securityChecks', 'security', 'isCurrentSecurityReceipt'],
@@ -218,7 +219,9 @@ async function assertFullReceipts(engine, run) {
             headSha: run.headSha,
             baseSha: run.baseSha,
             config,
-            ...(field === 'architectureChecks' ? { taskPaths: archTaskPaths } : {}),
+            ...(field === 'architectureChecks'
+              ? { taskPaths: archTaskPaths, ...(archTaskScopes ? { taskScopes: archTaskScopes } : {}) }
+              : {}),
           })) === true,
         'gate_stale',
       );

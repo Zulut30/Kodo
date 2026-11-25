@@ -240,6 +240,46 @@ function validateLayout(files, policy) {
   }
 }
 
+async function readTaskDiffs(project, taskScopes, context) {
+  if (!Array.isArray(taskScopes) || !taskScopes.length) return undefined;
+  const diffs = [];
+  for (const entry of taskScopes) {
+    if (
+      !entry ||
+      typeof entry.id !== 'string' ||
+      !entry.id.trim() ||
+      !sha(entry.commit) ||
+      !Array.isArray(entry.writePaths)
+    )
+      throw fail('configuration');
+    const parentsLine = (await git(project, ['rev-list', '--parents', '-n', '1', entry.commit], context)).trim();
+    const parts = parentsLine.split(' ').filter(Boolean);
+    if (parts[0] !== entry.commit) throw fail('configuration');
+    const firstParent = parts[1];
+    const raw = firstParent
+      ? await git(
+          project,
+          [
+            'diff',
+            '--no-ext-diff',
+            '--no-textconv',
+            '--no-renames',
+            '--name-only',
+            '-z',
+            firstParent,
+            entry.commit,
+            '--',
+          ],
+          context,
+        )
+      : await git(project, ['diff-tree', '--no-commit-id', '--name-only', '-r', '-z', '--root', entry.commit], context);
+    const paths = [...new Set(raw.split('\0').filter(Boolean))].sort().map(safeFile);
+    if (paths.length > 20000) throw fail('scope_limit');
+    diffs.push({ id: entry.id, changedPaths: paths, writePaths: entry.writePaths });
+  }
+  return diffs;
+}
+
 function touchedRustContractCrate(changedPaths, pairs) {
   if (!changedPaths.length) return false;
   const roots = [];
@@ -553,12 +593,14 @@ async function compose(options, ports, plan) {
     basePolicy && baseGraph && (!isRust || baseIsRust)
       ? evaluateArchitecture({ policy: basePolicy, graph: baseGraph }).findings
       : [];
+  const taskDiffs = isRust ? await readTaskDiffs(project, options.taskScopes ?? ports.taskScopes, context) : undefined;
   const headFindings = isRust
     ? evaluateArchitecture({
         policy: headPolicy,
         graph: headGraph,
         changedPaths,
         taskPaths: options.taskPaths ?? ports.taskPaths ?? [],
+        ...(taskDiffs ? { taskDiffs } : {}),
         basePolicy: baseIsRust ? basePolicy : null,
         baseGraph,
       }).findings
@@ -756,6 +798,7 @@ export async function architectureCli(argv, ports = {}) {
         signal: ports.signal,
         redactions: ports.redactions,
         ...(ports.taskPaths !== undefined ? { taskPaths: ports.taskPaths } : {}),
+        ...(ports.taskScopes !== undefined ? { taskScopes: ports.taskScopes } : {}),
       },
       ports,
       action === 'plan',

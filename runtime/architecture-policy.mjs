@@ -488,8 +488,17 @@ function rustCycleFindings({ crates, adjacency, crossEdges, add }) {
   for (const name of sorted(crates.keys())) if (!indices.has(name)) connect(name);
 }
 
-function evaluateRustContractChanges({ normalized, basePolicy, crates, baseCrates, changedPaths, taskPaths, add }) {
-  if (!changedPaths.length) return;
+function evaluateRustContractChanges({
+  normalized,
+  basePolicy,
+  crates,
+  baseCrates,
+  changedPaths,
+  taskPaths,
+  taskDiffs,
+  add,
+}) {
+  if (!changedPaths.length && !taskDiffs.length) return;
   const protectedInstances = [];
   const collect = (policyObj, crateMap) => {
     if (!policyObj || policyObj.schemaVersion !== 2 || !crateMap) return;
@@ -501,21 +510,25 @@ function evaluateRustContractChanges({ normalized, basePolicy, crates, baseCrate
   collect(normalized, crates);
   collect(basePolicy, baseCrates);
   if (!protectedInstances.length) return;
-  for (const changedFile of changedPaths) {
-    for (const crate of protectedInstances) {
-      const insideCrate = crate.root ? within(changedFile, crate.root) : crate.files.includes(changedFile);
-      if (!insideCrate) continue;
-      const authorized = taskPaths.some(scope => isExplicitContractScope(scope, crate.root, changedFile));
-      if (!authorized) {
-        const related = changedFile !== crate.manifest ? [crate.manifest] : [];
-        add('contract_change_not_allowed', changedFile, null, crate.name, null, related, [crate.manifest]);
+  const checkBatch = (paths, scopes) => {
+    for (const changedFile of paths) {
+      for (const crate of protectedInstances) {
+        const insideCrate = crate.root ? within(changedFile, crate.root) : crate.files.includes(changedFile);
+        if (!insideCrate) continue;
+        const authorized = scopes.some(scope => isExplicitContractScope(scope, crate.root, changedFile));
+        if (!authorized) {
+          const related = changedFile !== crate.manifest ? [crate.manifest] : [];
+          add('contract_change_not_allowed', changedFile, null, crate.name, null, related, [crate.manifest]);
+        }
       }
     }
-  }
+  };
+  checkBatch(changedPaths, taskPaths);
+  for (const entry of taskDiffs) checkBatch(entry.changedPaths, entry.writePaths);
 }
 
 function evaluateRustArchitecture(input) {
-  shapeWithOptional(input, ['policy', 'graph'], ['changedPaths', 'taskPaths', 'basePolicy', 'baseGraph']);
+  shapeWithOptional(input, ['policy', 'graph'], ['changedPaths', 'taskPaths', 'taskDiffs', 'basePolicy', 'baseGraph']);
   const normalized = validateArchitecturePolicy(input.policy);
   const crates = inspectRustGraph(input.graph);
   if (
@@ -527,6 +540,17 @@ function evaluateRustArchitecture(input) {
   const baseCrates = input.baseGraph && basePolicy?.schemaVersion === 2 ? inspectRustGraph(input.baseGraph) : null;
   const changedPaths = input.changedPaths === undefined ? [] : array(input.changedPaths, limits.files).map(relative);
   const taskPaths = input.taskPaths === undefined ? [] : array(input.taskPaths, limits.files).map(safeScope);
+  const taskDiffs =
+    input.taskDiffs === undefined
+      ? []
+      : array(input.taskDiffs, limits.modules).map(entry => {
+          shape(entry, ['id', 'changedPaths', 'writePaths']);
+          return {
+            id: text(entry.id),
+            changedPaths: array(entry.changedPaths, limits.files).map(relative),
+            writePaths: array(entry.writePaths, limits.files).map(safeScope),
+          };
+        });
   const layerIndexByCrate = new Map();
   for (const [layerIdx, layer] of normalized.layers.entries()) {
     for (const name of layer.crates) layerIndexByCrate.set(name, layerIdx);
@@ -613,7 +637,7 @@ function evaluateRustArchitecture(input) {
     }
   }
   rustCycleFindings({ crates, adjacency, crossEdges, add });
-  evaluateRustContractChanges({ normalized, basePolicy, crates, baseCrates, changedPaths, taskPaths, add });
+  evaluateRustContractChanges({ normalized, basePolicy, crates, baseCrates, changedPaths, taskPaths, taskDiffs, add });
   return {
     schemaVersion: 1,
     findings: [...findings.values()].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)),

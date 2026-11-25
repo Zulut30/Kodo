@@ -2480,3 +2480,198 @@ test('X4: hidden files (.gitignore, .cargo/config.toml) inside contract crate ar
     ),
   );
 });
+
+test('X1: brace-expanded globs like {crates/game-contracts,crates/world}/src/** fail linter & gate; epic gate checks contract edits per task diff', async t => {
+  const fx = await rustFixture(t);
+  await fx.put('crates/game-contracts/src/lib.rs', 'pub struct Event { pub id: u128 }\n');
+  const headSha = fx.commit('edit contract crate for X1');
+
+  // 1) Gate: brace alternation before contract crate root must NOT authorize contract edits.
+  for (const badScope of [
+    '{crates/game-contracts,crates/world}/src/**',
+    '{crates/game-contracts*,crates/world}/**',
+    'crates/{game-contracts,world}/src/**',
+    '{crates/game-contracts}/src/**',
+  ]) {
+    const res = await checkArchitecture({
+      project: fx.project,
+      baseSha: fx.baseSha,
+      headSha,
+      evidenceDir: fx.artifacts,
+      taskPaths: [badScope],
+    });
+    assert.equal(res.status, 'failed', `badScope ${badScope} must fail gate`);
+    assert.ok(
+      res.findings.some(f => f.ruleId === 'contract_change_not_allowed'),
+      `badScope ${badScope} must trigger contract_change_not_allowed, got ${JSON.stringify(res.findings)}`,
+    );
+  }
+
+  // Brace alternation AFTER literal contract crate root IS explicit and authorizes matching files.
+  const goodBrace = await checkArchitecture({
+    project: fx.project,
+    baseSha: fx.baseSha,
+    headSha,
+    evidenceDir: fx.artifacts,
+    taskPaths: ['crates/game-contracts/{src,tests}/**'],
+  });
+  assert.equal(
+    goodBrace.status,
+    'passed',
+    `crates/game-contracts/{src,tests}/** must pass: ${JSON.stringify(goodBrace.findings)}`,
+  );
+
+  // 2) Blueprint linter: brace alternation intersecting contract crate -> contract_scope_too_broad.
+  const mkSpec = extraScope => ({
+    schemaVersion: 1,
+    id: 'x1-bp',
+    title: 'Rust X1',
+    root: '/tmp/x1',
+    businessContext: 'Cargo workspace',
+    execution: { cadence: 'wave', integration: 'branch' },
+    constraints: [],
+    milestones: [
+      { id: 'foundation', title: 'W0', acceptance: [] },
+      { id: 'mvp', title: 'MVP', acceptance: [] },
+    ],
+    epics: [
+      { id: 'foundation', milestoneId: 'foundation', title: 'W0', acceptance: [] },
+      { id: 'domain', milestoneId: 'mvp', title: 'Domain', acceptance: [] },
+    ],
+    tasks: [
+      {
+        id: 't0',
+        epicId: 'foundation',
+        title: 'Contracts',
+        owner: 'architect',
+        dependsOn: [],
+        writePaths: [
+          'Cargo.toml',
+          'crates/game-contracts/Cargo.toml',
+          'crates/game-contracts/src/**',
+          'architecture.policy.json',
+        ],
+      },
+      {
+        id: 't1',
+        epicId: 'domain',
+        title: 'World',
+        owner: 'developer',
+        dependsOn: ['t0'],
+        writePaths: [extraScope],
+      },
+      {
+        id: 't2',
+        epicId: 'domain',
+        title: 'Combat',
+        owner: 'developer',
+        dependsOn: ['t0'],
+        writePaths: ['crates/combat/Cargo.toml', 'crates/combat/src/**'],
+      },
+    ],
+  });
+  const md = '## Стек\nRust Cargo workspace\n';
+  for (const broad of [
+    '{crates/game-contracts,crates/world}/src/**',
+    '{crates/game-contracts*,crates/world}/**',
+    'crates/{game-contracts,world}/src/**',
+    '{crates/game-contracts}/src/**',
+  ]) {
+    const findings = rustContractCrateFindings(mkSpec(broad), md);
+    assert.ok(
+      findings.some(f => f.code === 'contract_scope_too_broad' && f.taskIds?.includes('t1')),
+      `expected contract_scope_too_broad for ${broad}, got ${JSON.stringify(findings)}`,
+    );
+  }
+  // Unrelated brace alternation must NOT falsely trigger contract_scope_too_broad.
+  assert.equal(
+    rustContractCrateFindings(mkSpec('{crates/world,crates/render}/src/**'), md).some(
+      f => f.code === 'contract_scope_too_broad',
+    ),
+    false,
+  );
+  // Explicit contract crate root with brace alternation inside is NOT broad.
+  assert.equal(
+    rustContractCrateFindings(mkSpec('crates/game-contracts/{src,tests}/**'), md).some(
+      f => f.code === 'contract_scope_too_broad',
+    ),
+    false,
+  );
+
+  // 3) Epic gate: sibling migration task's authorization must NOT hide an unauthorized contract edit in another task.
+  const epicFx = await rustFixture(t);
+  await epicFx.put('crates/game-contracts/src/types.rs', 'pub struct EventId(pub u64);\n');
+  const migrateCommit = epicFx.commit('task migrate-contracts');
+  await epicFx.put('crates/world/src/lib.rs', 'pub fn tick() -> u64 { 1 }\n');
+  await epicFx.put('crates/game-contracts/src/lib.rs', 'pub struct SneakyEdit;\n');
+  const sneakyWorldCommit = epicFx.commit('task world-feature sneaks contract edit');
+
+  const gateMod = await import('../runtime/architecture-gate.mjs');
+  const epicRunBad = {
+    plan: {
+      tasks: [
+        { id: 'migrate-contracts', writePaths: ['crates/game-contracts/**'] },
+        { id: 'world-feature', writePaths: ['crates/world/**'] },
+      ],
+    },
+    nodes: {
+      'migrate-contracts': { id: 'migrate-contracts', headSha: migrateCommit },
+      'world-feature': { id: 'world-feature', headSha: sneakyWorldCommit },
+    },
+  };
+  const badReceipt = await runArchitectureChecks({
+    cwd: epicFx.project,
+    baseSha: epicFx.baseSha,
+    headSha: sneakyWorldCommit,
+    config: { enabled: true },
+    artifacts: epicFx.artifacts,
+    taskPaths: gateMod.architectureTaskPathsForRun(epicRunBad),
+    taskScopes: gateMod.architectureTaskScopesForRun(epicRunBad),
+  });
+  assert.equal(badReceipt.status, 'failed');
+  assert.ok(
+    badReceipt.report.findings.some(
+      f => f.ruleId === 'contract_change_not_allowed' && f.file === 'crates/game-contracts/src/lib.rs',
+    ),
+    `sibling contract task must not hide unauthorized edit in world-feature: ${JSON.stringify(badReceipt.report.findings)}`,
+  );
+
+  // Clean epic: migrate-contracts edits contract, world-feature edits only world -> PASS + fresh receipt.
+  const cleanFx = await rustFixture(t);
+  await cleanFx.put('crates/game-contracts/src/lib.rs', 'pub struct CleanV2;\n');
+  const cleanMigrate = cleanFx.commit('task migrate-contracts clean');
+  await cleanFx.put('crates/world/src/lib.rs', 'pub fn tick() -> u64 { 2 }\n');
+  const cleanWorld = cleanFx.commit('task world-feature clean');
+  const epicRunClean = {
+    plan: {
+      tasks: [
+        { id: 'migrate-contracts', writePaths: ['crates/game-contracts/**'] },
+        { id: 'world-feature', writePaths: ['crates/world/**'] },
+      ],
+    },
+    nodes: {
+      'migrate-contracts': { id: 'migrate-contracts', headSha: cleanMigrate },
+      'world-feature': { id: 'world-feature', headSha: cleanWorld },
+    },
+  };
+  const cleanOpts = {
+    cwd: cleanFx.project,
+    baseSha: cleanFx.baseSha,
+    headSha: cleanWorld,
+    config: { enabled: true },
+    artifacts: cleanFx.artifacts,
+    taskPaths: gateMod.architectureTaskPathsForRun(epicRunClean),
+    taskScopes: gateMod.architectureTaskScopesForRun(epicRunClean),
+  };
+  const cleanReceipt = await runArchitectureChecks(cleanOpts);
+  assert.equal(cleanReceipt.status, 'passed', `clean epic must pass: ${JSON.stringify(cleanReceipt.report)}`);
+  assert.equal(await isCurrentArchitectureReceipt(cleanReceipt, cleanOpts), true);
+  // Changing expected taskScopes must invalidate freshness.
+  assert.equal(
+    await isCurrentArchitectureReceipt(cleanReceipt, {
+      ...cleanOpts,
+      taskScopes: [{ id: 'world-feature', commit: cleanWorld, writePaths: ['crates/world/**'] }],
+    }),
+    false,
+  );
+});
