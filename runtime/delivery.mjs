@@ -6,7 +6,6 @@ import { isCurrentSecurityReceipt, securityConfigHash } from './security-gates.m
 import {
   isCurrentArchitectureReceipt,
   architectureConfigHash,
-  architectureScopeBaseForRun,
   architectureTaskPathsForRun,
   architectureTaskScopesForRun,
 } from './architecture-gate.mjs';
@@ -133,7 +132,6 @@ async function verifyReview(ctx) {
         cwd: ctx.cwd,
         headSha: head,
         baseSha: ctx.run.baseSha,
-        scopeBaseSha: architectureScopeBaseForRun(ctx.run),
         config: architectureConfig,
         taskPaths: architectureTaskPathsForRun(ctx.run),
         ...(archTaskScopes ? { taskScopes: archTaskScopes } : {}),

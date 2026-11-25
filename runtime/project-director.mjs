@@ -18,11 +18,7 @@ import {
 import { integrationLeaseHeld } from './project-integration-lease.mjs';
 import { WAVE_POLICY_FIELDS, assertWavePolicy } from './wave-policy.mjs';
 import { isCurrentBehaviorReceipt } from './behavior-gate.mjs';
-import {
-  architectureScopeBaseForRun,
-  architectureTaskPathsForRun,
-  architectureTaskScopesForRun,
-} from './architecture-gate.mjs';
+import { architectureTaskPathsForRun, architectureTaskScopesForRun } from './architecture-gate.mjs';
 import {
   TEST_COUNT_VERSION,
   countingPlan,
@@ -224,11 +220,7 @@ async function assertFullReceipts(engine, run, gateContext = null) {
             baseSha: run.baseSha,
             config,
             ...(field === 'architectureChecks'
-              ? {
-                  scopeBaseSha: architectureScopeBaseForRun(run),
-                  taskPaths: archTaskPaths,
-                  ...(archTaskScopes ? { taskScopes: archTaskScopes } : {}),
-                }
+              ? { taskPaths: archTaskPaths, ...(archTaskScopes ? { taskScopes: archTaskScopes } : {}) }
               : {}),
           })) === true,
         'gate_stale',

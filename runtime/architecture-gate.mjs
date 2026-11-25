@@ -232,9 +232,6 @@ const NULL_HASH = hash(null);
 const isRustV2Report = report =>
   Boolean(report?.hashes && report.hashes.policy !== NULL_HASH && report.hashes.registry === NULL_HASH);
 const isEpicGateRun = run => run?.planSource === 'gate' || run?.directorBinding?.kind === 'gate';
-export const architectureScopeBaseForRun = run =>
-  run.directorBinding?.kind === 'gate' ? (run.directorBinding.headSha ?? '') : undefined;
-
 const commitSha = value => typeof value === 'string' && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(value);
 const hasIncompleteTaskScope = scopes => Array.isArray(scopes) && scopes.some(entry => entry.mode === 'incomplete');
 
@@ -366,7 +363,6 @@ export function architectureTaskScopesForRun(run, { gate, tasks } = {}) {
  * @typedef {object} ArchitectureGateOptions
  * @property {string} [cwd] Checked project checkout.
  * @property {string} [headSha] Exact head the receipt is bound to.
- * @property {string} [scopeBaseSha] Integration head before a wave gate starts repairs.
  * @property {string} [baseSha] Merge base of the affected-module plan.
  * @property {Record<string, any>} [config] Raw `architecture` configuration; normalized here.
  * @property {string[]} [taskPaths] Explicit writePaths of the checked task(s) (used for Rust contract crate protection).
@@ -379,7 +375,6 @@ export async function runArchitectureChecks({
   cwd = process.cwd(),
   headSha,
   baseSha,
-  scopeBaseSha,
   config,
   artifacts,
   secrets = {},
@@ -395,7 +390,6 @@ export async function runArchitectureChecks({
     passed: null,
     headSha,
     baseSha,
-    ...(scopeBaseSha !== undefined ? { scopeBaseSha } : {}),
     configHash: architectureConfigHash(config),
   };
   if (!config.enabled) return receipt;
@@ -417,7 +411,6 @@ export async function runArchitectureChecks({
     receipt.report = await checkArchitecture({
       project: cwd,
       baseSha,
-      scopeBaseSha,
       headSha,
       evidenceDir: directory,
       signal,
@@ -475,7 +468,7 @@ export async function runArchitectureChecks({
 // oxlint-disable-next-line complexity -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
 export async function isCurrentArchitectureReceipt(
   receipt,
-  { cwd, project, headSha, baseSha, scopeBaseSha, config, taskPaths, taskScopes, signal, now } = {},
+  { cwd, project, headSha, baseSha, config, taskPaths, taskScopes, signal, now } = {},
 ) {
   try {
     config = normalizeArchitectureConfig(config);
@@ -486,7 +479,6 @@ export async function isCurrentArchitectureReceipt(
       receipt.passed !== true ||
       receipt.headSha !== headSha ||
       receipt.baseSha !== baseSha ||
-      receipt.scopeBaseSha !== scopeBaseSha ||
       receipt.configHash !== architectureConfigHash(config) ||
       (!cwd && !project) ||
       receipt.cwd !== (await realpath(cwd ?? project)) ||
@@ -518,7 +510,6 @@ export async function isCurrentArchitectureReceipt(
     const { architectureCli } = await import('./architecture-cli.mjs');
     const planned = await architectureCli(['plan', '--project', receipt.cwd, '--base', baseSha, '--json'], {
       signal,
-      scopeBaseSha,
       ...(now ? { now } : {}),
       ...(isRust && receipt.taskPaths !== undefined ? { taskPaths: receipt.taskPaths } : {}),
       ...(isRust && receipt.taskScopes !== undefined ? { taskScopes: receipt.taskScopes } : {}),

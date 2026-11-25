@@ -240,17 +240,6 @@ function validateLayout(files, policy) {
   }
 }
 
-async function changedPathsBetween(project, from, to, context) {
-  const raw = await git(
-    project,
-    ['diff', '--no-ext-diff', '--no-textconv', '--no-renames', '--name-only', '-z', from, to, '--'],
-    context,
-  );
-  const paths = [...new Set(raw.split('\0').filter(Boolean))].sort().map(safeFile);
-  if (paths.length > 20000) throw fail('scope_limit');
-  return paths;
-}
-
 async function readTaskDiffs(project, taskScopes, context) {
   if (!Array.isArray(taskScopes) || !taskScopes.length) return undefined;
   const diffs = [];
@@ -557,19 +546,38 @@ async function compose(options, ports, plan) {
   const headSha = options.headSha ?? (await git(project, ['rev-parse', '--verify', 'HEAD'], context)).trim();
   if (!sha(headSha)) throw fail('configuration');
   await fence(project, headSha, context);
-  const scopeBaseSha = options.scopeBaseSha;
-  if (scopeBaseSha !== undefined) {
-    if (!sha(scopeBaseSha)) throw fail('configuration');
-    await git(project, ['merge-base', '--is-ancestor', options.baseSha, scopeBaseSha], context);
-    await git(project, ['merge-base', '--is-ancestor', scopeBaseSha, headSha], context);
-  }
   const baseFiles = await inventory(project, options.baseSha, context),
     headFiles = await inventory(project, headSha, context);
   const rawBase = await document(project, baseFiles, POLICY, context, true),
     rawHead = await document(project, headFiles, POLICY, context, true);
   const basePolicy = rawBase === null ? null : validateArchitecturePolicy(rawBase),
     headPolicy = rawHead === null ? null : validateArchitecturePolicy(rawHead);
-  const changedPaths = await changedPathsBetween(project, scopeBaseSha ?? options.baseSha, headSha, context);
+  const changedPaths = [
+    ...new Set(
+      (
+        await git(
+          project,
+          [
+            'diff',
+            '--no-ext-diff',
+            '--no-textconv',
+            '--no-renames',
+            '--name-only',
+            '-z',
+            options.baseSha,
+            headSha,
+            '--',
+          ],
+          context,
+        )
+      )
+        .split('\0')
+        .filter(Boolean),
+    ),
+  ]
+    .sort()
+    .map(safeFile);
+  if (changedPaths.length > 20000) throw fail('scope_limit');
   const protection = evaluateArchitectureProtection({ basePolicy, headPolicy, changedPaths });
   if (basePolicy && !headPolicy) throw fail('configuration');
   let report = {
@@ -638,11 +646,7 @@ async function compose(options, ports, plan) {
         head: headRegistry,
         baseGraph,
         headGraph,
-        // Contract test selection still covers the complete integration range.
-        changedPaths:
-          scopeBaseSha === undefined
-            ? changedPaths
-            : await changedPathsBetween(project, options.baseSha, headSha, context),
+        changedPaths,
       });
   const rustContractChanged =
     isRust &&
@@ -825,7 +829,6 @@ export async function architectureCli(argv, ports = {}) {
     const report = await compose(
       {
         ...options,
-        scopeBaseSha: ports.scopeBaseSha,
         signal: ports.signal,
         redactions: ports.redactions,
         ...(ports.taskPaths !== undefined ? { taskPaths: ports.taskPaths } : {}),
