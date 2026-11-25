@@ -39,6 +39,12 @@ const gateReviewSchemas = new Map();
 const logGateVerify = (engine, run, type, data) => {
   if (run.directorBinding?.kind === 'gate') engine.log(run, type, data);
 };
+// Whether this verification was cancelled (its signal or a cancel request on the stored Run).
+const verifyCancelled = (engine, run, signal) =>
+  Boolean(signal?.aborted || engine.store.getRun(run.id).cancelRequested);
+const throwIfVerifyCancelled = (engine, run, signal) => {
+  if (verifyCancelled(engine, run, signal)) throw Object.assign(new Error('Запуск отменён'), { code: 'cancelled' });
+};
 /**
  * The review contract of a run. A wave gate Run (`directorBinding.kind === 'gate'`) confirms
  * every criterion of its gate manifest (`run.gateCriteria`, ids from `gateReviewCriteria`)
@@ -793,9 +799,11 @@ export class EngineVerification extends EngineExecution {
         else await this.checks(run, signal);
         await this.behaviorGate(run, signal);
         if (!fast) await this.verificationGates(run, signal);
+        // A cancel that arrived during the last check is a cancel, never a pass (telemetry 16C).
+        throwIfVerifyCancelled(this, run, signal);
         verifyOutcome = 'passed';
       } catch (error) {
-        if (signal?.aborted || this.store.getRun(run.id).cancelRequested) {
+        if (verifyCancelled(this, run, signal)) {
           verifyOutcome = 'cancelled';
           throw Object.assign(new Error('Запуск отменён'), { code: 'cancelled' });
         }

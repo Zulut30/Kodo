@@ -1236,12 +1236,16 @@ async function integrateQueued(ctx, C, W, waveCtx, entry, signal) {
       after.integration?.status === 'merged' &&
       after.integration.mergedHead === headSha &&
       (await mergeRecorded(projectId, after));
-    logEvent(
-      store,
-      run.id,
-      'integration_finished',
-      { seq: entry.seq, attemptId: entry.attemptId, headSha, status: failedMerge ? 'failed' : 'rejected', code },
-      clockMs(ctx),
+    // Fenced like the integrated outcome: a drain that lost its lease records no outcome (the row
+    // stays `merging` for the next holder), so telemetry never counts an unfinished merge.
+    store.withFence([], () =>
+      logEvent(
+        store,
+        run.id,
+        'integration_finished',
+        { seq: entry.seq, attemptId: entry.attemptId, headSha, status: failedMerge ? 'failed' : 'rejected', code },
+        clockMs(ctx),
+      ),
     );
     if (failedMerge) return { status: 'failed', code, merged: true, integration: integration ?? null };
     return { status: 'rejected', code, integration: integration ?? null };

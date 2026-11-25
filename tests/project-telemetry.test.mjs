@@ -1469,6 +1469,45 @@ test('R3: cancelling gate verification logs gate_verify_finished with outcome ca
   }
 });
 
+test('R3b: a cancel requested during the last check that returns normally is logged as cancelled, never passed', async t => {
+  const dir = await realpath(await mkdtemp(path.join(os.tmpdir(), 'kodo-c1-r3b-')));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const root = path.join(dir, 'repo');
+  const home = path.join(dir, 'state');
+  const baseSha = await initRepo(root);
+  const store = new Store(home, {});
+  try {
+    const engine = new Engine({ store, secrets: {} });
+    const run = store.createRun({
+      id: 'gate-r3b-cancel',
+      project: root,
+      task: 'gate verify late cancel',
+      client: 'codex',
+      state: 'verifying',
+      cwd: root,
+      baseSha,
+      headSha: baseSha,
+      config: { commands: { test: [], build: [], deploy: [], smoke: [] }, repairRounds: 1 },
+      directorBinding: { kind: 'gate', projectId: 'p-r3b', gateId: 'g-r3b', runId: 'gate-r3b-cancel' },
+      sessionAttempts: [],
+      coordinatorOperations: [],
+    });
+    // Every check passes; the cancel arrives inside the last one, which still returns normally.
+    engine.checks = async () => {};
+    engine.behaviorGate = async () => {};
+    engine.verificationGates = async () => {
+      store.updateRun(run.id, { cancelRequested: true });
+    };
+    await assert.rejects(() => engine.verify(run), { code: 'cancelled' });
+    const verifyEvents = store.events(run.id).filter(ev => ev.type === 'gate_verify_finished');
+    assert.equal(verifyEvents.length, 1);
+    assert.equal(verifyEvents[0].data.passed, false);
+    assert.equal(verifyEvents[0].data.outcome, 'cancelled');
+  } finally {
+    store.close();
+  }
+});
+
 test('R4: breakdown.agent includes rework interval from failed submission or task-fast until --abandon', () => {
   const snapshot = {
     schemaVersion: 1,
