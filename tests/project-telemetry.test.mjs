@@ -906,6 +906,8 @@ test('C1 unknown or missing timestamps stay null with complete:false and arbitra
         current: { code: 'quota', scope: 'run', firstSeen: iso(10), lastSeen: iso(10), occurrences: 1 },
         history: [],
       },
+      // 16B1 records the start of an arbiter session before it; a started session is no arbitration.
+      gateArbitration: { status: 'started', headSha: 'a'.repeat(40), attempts: 1 },
     },
   };
   const events = {

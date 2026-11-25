@@ -845,7 +845,12 @@ function computeArbitrations(ctx) {
   const decisions = {};
   for (const run of seenRuns.values()) {
     const raw = run.gateArbitration;
-    const entries = Array.isArray(raw) ? raw.filter(record) : record(raw) ? [raw] : [];
+    // Only a decided arbitration counts (16B1 writes `status: 'started'` before the session).
+    const decided = entry =>
+      record(entry) &&
+      (entry.status === undefined || entry.status === 'decided') &&
+      ['confirm_pass', 'confirm_defect', 'split_needed'].includes(entry.decision ?? entry.verdict);
+    const entries = (Array.isArray(raw) ? raw : [raw]).filter(decided);
     for (const entry of entries) {
       count++;
       const decision = code(entry.decision ?? entry.verdict, 'unknown');
