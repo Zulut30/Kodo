@@ -8,6 +8,7 @@ import { inspectCurrentSource } from './ci-graph.mjs';
 import { compactReviewEvidence } from './context-pack.mjs';
 import { buildDiagnosticPack, formatDiagnosticPack, hasStructuredDiagnostics } from './diagnostic-pack.mjs';
 import {
+  architectureScopeBaseForRun,
   architectureTaskPathsForRun,
   architectureTaskScopesForRun,
   normalizeArchitectureConfig,
@@ -604,6 +605,7 @@ export class EngineVerification extends EngineExecution {
           artifacts: run.artifacts,
           previous,
           secrets: this.secrets,
+          ...(field === 'architectureChecks' ? { scopeBaseSha: architectureScopeBaseForRun(run) } : {}),
           ...(taskPaths ? { taskPaths } : {}),
           ...(taskScopes ? { taskScopes } : {}),
           signal,
@@ -620,6 +622,7 @@ export class EngineVerification extends EngineExecution {
           headSha,
           baseSha: run.baseSha,
           config,
+          ...(field === 'architectureChecks' ? { scopeBaseSha: architectureScopeBaseForRun(run) } : {}),
           ...(taskPaths ? { taskPaths } : {}),
           ...(taskScopes ? { taskScopes } : {}),
           signal,
@@ -893,6 +896,7 @@ export class EngineVerification extends EngineExecution {
               headSha,
               baseSha: run.baseSha,
               config: run.config.architecture,
+              scopeBaseSha: architectureScopeBaseForRun(run),
               taskPaths: architectureTaskPathsForRun(run),
               ...(architectureTaskScopesForRun(run) ? { taskScopes: architectureTaskScopesForRun(run) } : {}),
               signal,
