@@ -1240,3 +1240,65 @@ test('Quality TypeScript external ambient package scopes block before tool execu
     assert.equal(result.receipts[0].reason, 'typescript_external_types_unsupported');
   }
 });
+
+test('R2: isCurrentQualityReceipt rejects unpinned ci feedback receipt and accepts pinned receipt', async t => {
+  const { runQuality, isCurrentQualityReceipt } = await api();
+  const fx = await fixture(t, {
+    'Cargo.toml': '[package]\nname = "demo"\nversion = "0.1.0"\nedition = "2021"\n',
+    'Cargo.lock': 'version = 4\n',
+    'src/lib.rs': 'pub fn answer() -> i32 { 42 }\n',
+  });
+  const fake = toolRunner();
+  const runner = (command, args, options) =>
+    command === 'rustup' && args[0] === 'run' && args[1] === '1.85.0'
+      ? fake.runner(args[2], args.slice(3), options)
+      : fake.runner(command, args, options);
+  const nativeResolve = async id => ({ command: id, args: [], env: {}, binaryHash: 'b'.repeat(64) });
+
+  // Unpinned self-check (feedback: true) passes with toolchain_unpinned warning,
+  // but MUST NEVER satisfy isCurrentQualityReceipt for gates.
+  const unpinned = await runQuality({
+    ...fx,
+    capabilities: ['lint', 'typecheck'],
+    feedback: true,
+    runner,
+    nativeResolve,
+  });
+  assert.equal(unpinned.status, 'passed');
+  assert.equal(unpinned.passed, true);
+  assert.deepEqual(unpinned.warnings, ['toolchain_unpinned']);
+  assert.equal(
+    await isCurrentQualityReceipt(unpinned, { project: fx.project, runner, nativeResolve }),
+    false,
+    'unpinned ci feedback receipt must NEVER be current for gates',
+  );
+  // Stripping warnings/unpinnedToolchain from a cloned report must still fail validation.
+  const stripped = structuredClone(unpinned);
+  delete stripped.warnings;
+  for (const row of stripped.receipts) {
+    delete row.warnings;
+    delete row.unpinnedToolchain;
+  }
+  assert.equal(
+    await isCurrentQualityReceipt(stripped, { project: fx.project, runner, nativeResolve }),
+    false,
+    'stripped unpinned receipt must still fail isCurrentQualityReceipt',
+  );
+
+  // With exact rust-toolchain.toml committed, regular pinned quality receipt IS current.
+  await put(fx.project, 'rust-toolchain.toml', '[toolchain]\nchannel = "1.85.0"\ncomponents = ["clippy", "rustfmt"]\n');
+  const pinned = await runQuality({
+    ...fx,
+    capabilities: ['lint', 'typecheck'],
+    runner,
+    nativeResolve,
+  });
+  assert.equal(pinned.status, 'passed');
+  assert.equal(pinned.passed, true);
+  assert.equal(pinned.warnings, undefined);
+  assert.equal(
+    await isCurrentQualityReceipt(pinned, { project: fx.project, runner, nativeResolve }),
+    true,
+    'pinned quality receipt must be current',
+  );
+});

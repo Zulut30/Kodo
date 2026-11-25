@@ -33,6 +33,7 @@ const pinsHash = (check, plan) =>
       tool: check.tool,
       version: check.version,
       pin: toolCatalog.find(t => t.id === check.tool) ?? plan.config.tools[check.tool] ?? null,
+      ...(check.unpinnedToolchain ? { unpinnedToolchain: true } : {}),
     }),
   );
 async function toolIdentity(tool) {
@@ -815,6 +816,7 @@ async function runQualityCheck(ctx, check) {
     version: check.version,
     status: check.status,
     reason: check.reason,
+    ...(check.unpinnedToolchain ? { unpinnedToolchain: true } : {}),
     ...(check.warnings?.length ? { warnings: [...check.warnings] } : {}),
     files: check.files,
     scopeReason: check.scopeReason,
@@ -885,8 +887,10 @@ export async function isCurrentQualityReceipt(
       report?.schemaVersion !== 1 ||
       report.status !== 'passed' ||
       report.passed !== true ||
+      report.warnings?.includes('toolchain_unpinned') ||
       !Array.isArray(report.receipts) ||
-      !report.receipts.some(r => r.status === 'passed')
+      !report.receipts.some(r => r.status === 'passed') ||
+      report.receipts.some(r => r.unpinnedToolchain === true || r.warnings?.includes('toolchain_unpinned'))
     )
       return false;
     const plan = await new QualityProfileRegistry().plan(project ?? report.plan.project, {
@@ -912,6 +916,10 @@ export async function isCurrentQualityReceipt(
         row.id !== check.id ||
         row.tool !== check.tool ||
         row.version !== check.version ||
+        row.unpinnedToolchain === true ||
+        row.warnings?.includes('toolchain_unpinned') ||
+        check.unpinnedToolchain === true ||
+        (row.status === 'passed' && check.status !== 'applicable') ||
         row.pinsHash !== pinsHash(check, plan) ||
         JSON.stringify(row.files) !== JSON.stringify(check.files)
       )

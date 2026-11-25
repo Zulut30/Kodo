@@ -2,7 +2,7 @@
 import path from 'node:path';
 import { lstat, readFile, readdir, realpath } from 'node:fs/promises';
 import { parse as parseToml } from 'smol-toml';
-import { resolveCargoWorkspace } from './cargo-workspace.mjs';
+import { resolveCargoWorkspaceRoots } from './cargo-workspace.mjs';
 import { toolCatalog } from './tools.mjs';
 import { inside, noLinks, sha256 } from './toolchains.mjs';
 import { secretFile } from './security.mjs';
@@ -580,20 +580,13 @@ function metadataScope(report, scope, affected) {
     return { widened, blocked: unknown };
   return { widened, blocked: [] };
 }
-function rustWorkspaceRoots(documents, files) {
+export function rustWorkspaceRoots(documents, files) {
   const manifests = new Map();
   for (const [name, doc] of documents) {
     if (path.posix.basename(name) === 'Cargo.toml') manifests.set(name, doc);
   }
-  const roots = new Map();
-  for (const [name, doc] of manifests) {
-    if (!doc?.package) continue;
-    const member = dir(name);
-    const resolved = resolveCargoWorkspace({ manifests, files, startDir: member });
-    if (resolved.unsupported.length || !resolved.hasWorkspace) continue;
-    if (resolved.members.some(item => item.root === member)) roots.set(member, resolved.root);
-  }
-  return roots;
+  if (!manifests.size) return new Map();
+  return resolveCargoWorkspaceRoots({ manifests, files });
 }
 
 function inheritedDocument(root, filename, documents) {

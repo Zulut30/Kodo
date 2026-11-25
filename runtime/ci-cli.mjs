@@ -157,19 +157,30 @@ export async function planCi(options, dependencies = {}) {
     );
     if (options.feedback) {
       report.requiresFullCheck = true;
-      report.deferredChecks = [
-        ...(report.graph.fallback
+      const deferredTests = report.graph.fallback
+        ? [
+            {
+              phase: 'tests',
+              status: 'deferred',
+              reason: 'affected_graph_fallback',
+              tier: 'L2',
+              headSha,
+              ambiguityReasonCount: report.graph.reasons.length,
+            },
+          ]
+        : Array.isArray(report.graph.affectedCrates) && !report.graph.testFiles.length
           ? [
               {
                 phase: 'tests',
                 status: 'deferred',
-                reason: 'affected_graph_fallback',
-                tier: 'L2',
+                reason: 'cargo_tests_deferred_to_task_fast',
+                tier: 'task-fast',
                 headSha,
-                ambiguityReasonCount: report.graph.reasons.length,
               },
             ]
-          : []),
+          : [];
+      report.deferredChecks = [
+        ...deferredTests,
         { phase: 'fullcheck', status: 'required', tier: 'L2', headSha, platforms: ['linux', 'win32'] },
       ];
     }
@@ -506,6 +517,9 @@ export async function ciCli(argv, dependencies = {}) {
           `CI ${report.tier}: ${report.status} (${report.platform})`,
           ...(report.warnings?.length ? [`Warnings: ${report.warnings.join(', ')}`] : []),
           ...(report.receipts ?? report.commands).map(row => `${row.phase}: ${row.status ?? 'planned'}`),
+          ...(report.deferredChecks ?? [])
+            .filter(row => row.status === 'deferred')
+            .map(row => `${row.phase}: deferred (${row.reason})`),
           'Cross-platform and deployment evidence must be collected separately.',
         ].join('\n');
     return { report, exitCode, output };

@@ -611,6 +611,7 @@ test('separate Cargo manifests can share a wave and two explicit Cargo.lock owne
   for (const owners of [0, 1, 2]) {
     const { root } = await blueprint(t, {
       mutate(spec) {
+        task(spec, 'scaffold').writePaths.push('rust-toolchain.toml');
         for (const [index, id] of ['storage-module', 'api-module'].entries()) {
           const current = task(spec, id);
           current.writePaths = ['crates/' + id + '/Cargo.toml'];
@@ -712,11 +713,19 @@ test('D1: Rust blueprint Wave 0 linter requires rust-toolchain.toml in writePath
   withWritePath.tasks[0].writePaths.push('rust-toolchain.toml');
   assert.deepEqual(lintFactorySpec(withWritePath, { interfaces: [], projectMarkdown: md }).findings, []);
 
-  // compileBlueprint: unpinned rust-toolchain.toml on disk still fails; exact channel + clippy + rustfmt passes.
+  // compileBlueprint: unpinned committed rust-toolchain.toml fails; exact channel + clippy + rustfmt at HEAD passes.
+  const { execFileSync } = await import('node:child_process');
+  const git = (...args) => execFileSync('git', args, { cwd: dir, stdio: 'pipe' });
+  git('init', '-q');
+  git('config', 'user.name', 'Test');
+  git('config', 'user.email', 'test@example.invalid');
+  git('config', 'commit.gpgSign', 'false');
   await mkdir(path.join(dir, '.kodo', 'blueprint'), { recursive: true });
   await writeFile(path.join(dir, '.kodo', 'blueprint', 'PROJECT.md'), md);
   await writeFile(path.join(dir, '.kodo', 'blueprint', 'spec.json'), JSON.stringify(spec, null, 2));
   await writeFile(path.join(dir, 'rust-toolchain.toml'), '[toolchain]\nchannel = "stable"\n');
+  git('add', 'rust-toolchain.toml');
+  git('commit', '-qm', 'unpinned toolchain');
   const unpinnedDisk = await compileBlueprint(dir);
   assert.ok(unpinnedDisk.findings.some(f => f.code === 'rust_toolchain_required'));
 
@@ -724,6 +733,109 @@ test('D1: Rust blueprint Wave 0 linter requires rust-toolchain.toml in writePath
     path.join(dir, 'rust-toolchain.toml'),
     '[toolchain]\nchannel = "1.85.0"\ncomponents = ["clippy", "rustfmt"]\n',
   );
+  git('add', 'rust-toolchain.toml');
+  git('commit', '-qm', 'pinned toolchain');
   const pinnedDisk = await compileBlueprint(dir);
   assert.deepEqual(pinnedDisk.findings, []);
+});
+
+test('R1: isRustToolchainBlueprint uses structural signals only, not prose words like cargo/rust', async t => {
+  const { execFileSync } = await import('node:child_process');
+  const git = (cwd, ...args) => execFileSync('git', args, { cwd, stdio: 'pipe' });
+  const proseCases = [
+    ['Cargo tracking for a logistics company', 'Logistics cargo tracker', 'Track cargo containers'],
+    ['Учёт грузов (cargo)', 'Учёт грузов (cargo)', 'Система учёта грузов (cargo)'],
+    ['No Rust or WASM', 'Plain Node service', 'No Rust or WASM dependencies allowed'],
+  ];
+  for (const [mdPhrase, title, context] of proseCases) {
+    const { root, dir } = await blueprint(t, {
+      mutate(spec) {
+        spec.title = title;
+        spec.businessContext = context;
+        spec.constraints = [mdPhrase];
+      },
+    });
+    const projectMd = (await readFile(path.join(dir, 'PROJECT.md'), 'utf8')) + `\n${mdPhrase}\n`;
+    await writeFile(path.join(dir, 'PROJECT.md'), projectMd);
+    const compiled = await compileBlueprint(root);
+    assert.deepEqual(
+      codes(compiled),
+      [],
+      `JS blueprint with "${mdPhrase}" must pass, got ${JSON.stringify(compiled.findings)}`,
+    );
+    const linted = lintFactorySpec(compiled.spec, { interfaces: compiled.interfaces, projectMarkdown: projectMd });
+    assert.deepEqual(codes(linted), [], `lintFactorySpec with "${mdPhrase}" must pass`);
+  }
+
+  // Structural Rust signals without rust-toolchain.toml in Wave 0 MUST trigger rust_toolchain_required:
+  // (1) *.rs in a Wave 1 task writePaths
+  const rsTaskBp = await blueprint(t, {
+    mutate(spec) {
+      task(spec, 'storage-module').writePaths = ['crates/storage/src/lib.rs'];
+    },
+  });
+  assert.ok(codes(await compileBlueprint(rsTaskBp.root)).includes('rust_toolchain_required'));
+
+  // (2) Cargo.toml in a Wave 1 task writePaths
+  const cargoTaskBp = await blueprint(t, {
+    mutate(spec) {
+      task(spec, 'storage-module').writePaths = ['crates/storage/Cargo.toml'];
+    },
+  });
+  assert.ok(codes(await compileBlueprint(cargoTaskBp.root)).includes('rust_toolchain_required'));
+
+  // (3) Committed Cargo.toml at Git HEAD (even when tasks only mention directories)
+  const committedBp = await blueprint(t);
+  git(committedBp.root, 'init', '-q');
+  git(committedBp.root, 'config', 'user.name', 'Test');
+  git(committedBp.root, 'config', 'user.email', 'test@example.invalid');
+  git(committedBp.root, 'config', 'commit.gpgSign', 'false');
+  await writeFile(path.join(committedBp.root, 'Cargo.toml'), '[package]\nname = "demo"\nversion = "0.1.0"\n');
+  git(committedBp.root, 'add', 'Cargo.toml');
+  git(committedBp.root, 'commit', '-qm', 'add Cargo.toml');
+  assert.ok(codes(await compileBlueprint(committedBp.root)).includes('rust_toolchain_required'));
+});
+
+test('R5: readOptionalRustToolchain reads committed HEAD only and ignores uncommitted working-tree file', async t => {
+  const { execFileSync } = await import('node:child_process');
+  const git = (cwd, ...args) => execFileSync('git', args, { cwd, stdio: 'pipe' });
+  const { root } = await blueprint(t, {
+    mutate(spec) {
+      task(spec, 'scaffold').writePaths.push('Cargo.toml');
+    },
+  });
+  git(root, 'init', '-q');
+  git(root, 'config', 'user.name', 'Test');
+  git(root, 'config', 'user.email', 'test@example.invalid');
+  git(root, 'config', 'commit.gpgSign', 'false');
+  await writeFile(path.join(root, 'README.md'), 'init\n');
+  git(root, 'add', 'README.md');
+  git(root, 'commit', '-qm', 'init');
+
+  // Uncommitted valid rust-toolchain.toml in working tree MUST NOT suppress rust_toolchain_required.
+  await writeFile(
+    path.join(root, 'rust-toolchain.toml'),
+    '[toolchain]\nchannel = "1.85.0"\ncomponents = ["clippy", "rustfmt"]\n',
+  );
+  const uncommitted = await compileBlueprint(root);
+  assert.ok(
+    codes(uncommitted).includes('rust_toolchain_required'),
+    `uncommitted rust-toolchain.toml must not suppress finding, got ${JSON.stringify(uncommitted.findings)}`,
+  );
+
+  // Once committed at HEAD, compileBlueprint passes.
+  git(root, 'add', 'rust-toolchain.toml');
+  git(root, 'commit', '-qm', 'commit rust-toolchain.toml');
+  const committed = await compileBlueprint(root);
+  assert.deepEqual(codes(committed), []);
+
+  // Oversized committed rust-toolchain.toml (> 64 KiB) must not be accepted.
+  await writeFile(
+    path.join(root, 'rust-toolchain.toml'),
+    `[toolchain]\nchannel = "1.85.0"\ncomponents = ["clippy", "rustfmt"]\n# ${'x'.repeat(70 * 1024)}\n`,
+  );
+  git(root, 'add', 'rust-toolchain.toml');
+  git(root, 'commit', '-qm', 'oversized toolchain');
+  const oversized = await compileBlueprint(root);
+  assert.ok(codes(oversized).includes('rust_toolchain_required'));
 });

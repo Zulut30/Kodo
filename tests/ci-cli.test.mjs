@@ -1358,3 +1358,65 @@ test('D1: ci feedback on Rust workspace uses Cargo crate graph, classifies Wave 
     },
   );
 });
+
+test('R4: Rust ci feedback with fallback:false explicitly reports tests deferred to task-fast with reason', async t => {
+  const { runQuality } = await import('../runtime/quality-runner.mjs');
+  const { toolRunner } = await import('./fixtures/quality/helpers.mjs');
+  const scratch = await mkdtemp(path.join(os.tmpdir(), 'kodo-ci-rust-r4-'));
+  t.after(() => rm(scratch, { recursive: true, force: true }));
+  const project = path.join(scratch, 'project');
+  await mkdir(project);
+  const git = args => execute('git', args, { cwd: project, rawOutput: true });
+  await git(['init', '-q']);
+  await git(['config', 'user.name', 'CI Rust R4']);
+  await git(['config', 'user.email', 'ci-rust-r4@example.invalid']);
+  await git(['config', 'core.autocrlf', 'false']);
+  await git(['config', 'commit.gpgSign', 'false']);
+  const putFile = async (rel, content) => {
+    const full = path.join(project, rel);
+    await mkdir(path.dirname(full), { recursive: true });
+    await writeFile(full, content, 'utf8');
+  };
+  await putFile(
+    'Cargo.toml',
+    '[workspace]\nresolver = "2"\nmembers = ["crates/*"]\n[workspace.package]\nedition = "2021"\n',
+  );
+  await putFile('Cargo.lock', 'version = 4\n\n[[package]]\nname = "core"\nversion = "0.1.0"\n');
+  await putFile('rust-toolchain.toml', '[toolchain]\nchannel = "1.85.0"\ncomponents = ["clippy", "rustfmt"]\n');
+  await putFile('crates/core/Cargo.toml', '[package]\nname = "core"\nversion = "0.1.0"\nedition.workspace = true\n');
+  await putFile('crates/core/src/lib.rs', 'pub fn tick() -> u32 { 1 }\n');
+  await git(['add', '-A']);
+  await git(['commit', '-qm', 'base']);
+  const baseSha = (await git(['rev-parse', 'HEAD'])).stdout.trim();
+  await putFile('crates/core/src/lib.rs', 'pub fn tick() -> u32 { 2 }\n');
+  await git(['add', '-A']);
+  await git(['commit', '-qm', 'edit core']);
+
+  const fake = toolRunner();
+  const runner = (command, args, options) =>
+    command === 'rustup' && args[0] === 'run' && args[1] === '1.85.0'
+      ? fake.runner(args[2], args.slice(3), options)
+      : fake.runner(command, args, options);
+  const deps = {
+    runQuality: options =>
+      runQuality({
+        ...options,
+        runner,
+        nativeResolve: async id => ({ command: id, args: [], env: {}, binaryHash: 'b'.repeat(64) }),
+      }),
+  };
+
+  const jsonRes = await ciCli(['feedback', '--base', baseSha, '--project', project, '--json'], deps);
+  assert.equal(jsonRes.exitCode, 0, JSON.stringify(jsonRes.report));
+  assert.equal(jsonRes.report.status, 'feedback_ready');
+  assert.equal(jsonRes.report.graph.fallback, false);
+  const deferredTests = jsonRes.report.deferredChecks.find(row => row.phase === 'tests');
+  assert.ok(deferredTests, `expected deferred tests entry, got ${JSON.stringify(jsonRes.report.deferredChecks)}`);
+  assert.equal(deferredTests.status, 'deferred');
+  assert.equal(deferredTests.tier, 'task-fast');
+  assert.equal(deferredTests.reason, 'cargo_tests_deferred_to_task_fast');
+
+  const textRes = await ciCli(['feedback', '--base', baseSha, '--project', project], deps);
+  assert.equal(textRes.exitCode, 0);
+  assert.match(textRes.output, /tests: deferred \(cargo_tests_deferred_to_task_fast\)/);
+});

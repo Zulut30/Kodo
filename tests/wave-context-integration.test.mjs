@@ -155,6 +155,7 @@ test('blueprint linter rejects task without unambiguous owner, shared-file wave 
 
   // (d) Integrator role task is accepted and exempt from split_required on shared integration files
   const integratorBp = await blueprintCopy(t, spec => {
+    spec.tasks.find(item => item.id === 'scaffold').writePaths.push('rust-toolchain.toml');
     const wiring = {
       ...spec.tasks.find(item => item.id === 'web-module'),
       id: 'wire-all',

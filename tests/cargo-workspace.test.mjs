@@ -623,3 +623,108 @@ test('D2: rustWorkspaceRoots uses canonical Cargo resolver for explicit package.
   assert.equal(byRoot.get('crates/excluded').status, 'missing');
   assert.equal(byRoot.get('crates/excluded').reason, 'cargo_lock_required');
 });
+
+test('R3: rustWorkspaceRoots resolves 500 crates and 20k files within 1s budget', async () => {
+  const { performance } = await import('node:perf_hooks');
+  const { rustWorkspaceRoots } = await import('../runtime/quality.mjs');
+  const documents = new Map();
+  const files = ['Cargo.toml', 'Cargo.lock', 'nested/Cargo.toml', 'nested/Cargo.lock'];
+  documents.set('Cargo.toml', {
+    workspace: {
+      resolver: '2',
+      members: ['crates/*', 'nested/sub'],
+      exclude: ['crates/excluded'],
+      package: { edition: '2024' },
+    },
+  });
+  documents.set('nested/Cargo.toml', {
+    workspace: { resolver: '2', members: ['other'], package: { edition: '2021' } },
+  });
+  for (let i = 0; i < 500; i++) {
+    const dir = `crates/c${String(i).padStart(3, '0')}`;
+    documents.set(`${dir}/Cargo.toml`, { package: { name: `c${i}`, version: '0.1.0', edition: { workspace: true } } });
+    files.push(`${dir}/Cargo.toml`);
+    for (let f = 0; f < 39; f++) files.push(`${dir}/src/mod_${f}.rs`);
+  }
+  documents.set('crates/excluded/Cargo.toml', {
+    package: { name: 'excluded', version: '0.1.0', edition: '2021' },
+  });
+  documents.set('nested/sub/Cargo.toml', {
+    package: { name: 'sub', version: '0.1.0', edition: { workspace: true }, workspace: '../..' },
+  });
+  documents.set('nested/other/Cargo.toml', {
+    package: { name: 'other', version: '0.1.0', edition: { workspace: true } },
+  });
+  files.push('crates/excluded/Cargo.toml', 'nested/sub/Cargo.toml', 'nested/other/Cargo.toml');
+  assert.ok(files.length >= 20000, `expected >= 20000 files, got ${files.length}`);
+
+  const started = performance.now();
+  const roots = rustWorkspaceRoots(documents, files);
+  const elapsedMs = performance.now() - started;
+
+  assert.equal(roots.get('crates/c000'), '');
+  assert.equal(roots.get('crates/c499'), '');
+  assert.equal(roots.get('nested/sub'), '');
+  assert.equal(roots.get('nested/other'), 'nested');
+  assert.equal(roots.has('crates/excluded'), false);
+  assert.equal(roots.size, 502);
+  assert.ok(
+    elapsedMs < 1000,
+    `rustWorkspaceRoots(500 crates, ${files.length} files) took ${elapsedMs.toFixed(1)}ms (> 1000ms)`,
+  );
+});
+
+test('R6: cargoFeedbackGraph batches include! fragment reads instead of running ls-tree per file', async t => {
+  const { execFileSync } = await import('node:child_process');
+  const { cargoFeedbackGraph } = await import('../runtime/cargo-graph.mjs');
+  const { readSourceSnapshot } = await import('../runtime/ci-graph.mjs');
+  const fx = await fixture(t, {
+    'Cargo.toml': '[workspace]\nresolver = "2"\nmembers = ["crates/*"]\n',
+    'Cargo.lock': 'version = 4\n\n[[package]]\nname = "core"\nversion = "0.1.0"\n',
+    'crates/core/Cargo.toml': '[package]\nname = "core"\nversion = "0.1.0"\nedition = "2021"\n',
+    'crates/core/src/lib.rs': [
+      'include!("f1.inc");',
+      'include!("f2.inc");',
+      'include!("f3.inc");',
+      'include!("f4.inc");',
+      'pub fn v() -> i32 { A + B + C + D }',
+      '',
+    ].join('\n'),
+    'crates/core/src/f1.inc': 'const A: i32 = 1;\n',
+    'crates/core/src/f2.inc': 'const B: i32 = 2;\n',
+    'crates/core/src/f3.inc': 'const C: i32 = 3;\n',
+    'crates/core/src/f4.inc': 'const D: i32 = 4;\n',
+  });
+  const baseSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: fx.project, encoding: 'utf8' }).trim();
+  await put(
+    fx.project,
+    'crates/core/src/lib.rs',
+    [
+      'include!("f1.inc");',
+      'include!("f2.inc");',
+      'include!("f3.inc");',
+      'include!("f4.inc");',
+      'pub fn v() -> i32 { A + B + C + D + 1 }',
+      '',
+    ].join('\n'),
+  );
+  execFileSync('git', ['add', '-A'], { cwd: fx.project });
+  execFileSync('git', ['commit', '-qm', 'edit lib'], { cwd: fx.project });
+  const headSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: fx.project, encoding: 'utf8' }).trim();
+
+  let snapshotCalls = 0;
+  const countingSnapshot = async (...args) => {
+    snapshotCalls++;
+    return readSourceSnapshot(...args);
+  };
+  const plan = await cargoFeedbackGraph(
+    { project: fx.project, baseSha, headSha, changedPaths: [] },
+    { readSourceSnapshot: countingSnapshot },
+  );
+  assert.equal(plan.fallback, false, JSON.stringify(plan));
+  assert.deepEqual(plan.affectedCrates, ['core']);
+  assert.ok(
+    snapshotCalls >= 1 && snapshotCalls <= 2,
+    `expected 1..2 batched snapshot calls for 4 include! fragments, got ${snapshotCalls}`,
+  );
+});

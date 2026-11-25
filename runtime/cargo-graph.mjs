@@ -420,20 +420,28 @@ async function overlayWorkingChanges(project, snapshot, changedPaths) {
   return { entries, sources };
 }
 
-async function readFeedbackBlob(project, headSha, changedSet, file, readSourceSnapshot) {
-  if (changedSet.has(file)) {
-    try {
-      const absolute = path.join(project, ...file.split('/'));
-      const info = await lstat(absolute);
-      if (info.isFile() && !info.isSymbolicLink() && info.size <= 16 * 1024 * 1024)
-        return await readFile(absolute, 'utf8');
-    } catch {
-      return undefined;
+async function readFeedbackBlobs(project, headSha, changedSet, files, readSourceSnapshot) {
+  const results = new Map();
+  const committed = new Set();
+  for (const file of files) {
+    if (changedSet.has(file)) {
+      try {
+        const absolute = path.join(project, ...file.split('/'));
+        const info = await lstat(absolute);
+        if (info.isFile() && !info.isSymbolicLink() && info.size <= 16 * 1024 * 1024)
+          results.set(file, await readFile(absolute, 'utf8'));
+      } catch {
+        // Missing or unreadable working-tree file leaves entry absent.
+      }
+    } else {
+      committed.add(file);
     }
-    return undefined;
   }
-  const extra = await readSourceSnapshot(project, headSha, name => name === file);
-  return extra.sources.get(file);
+  if (committed.size) {
+    const extra = await readSourceSnapshot(project, headSha, name => committed.has(name));
+    for (const [file, text] of extra.sources) results.set(file, text);
+  }
+  return results;
 }
 
 // Read manifest blobs at the submitted commit. A rename contributes both paths.
@@ -483,11 +491,10 @@ export async function cargoPlanAt(cwd, baseSha, headSha) {
 
 async function collectFeedbackReferences(project, headSha, changedSet, snapshot, members, readSourceSnapshot) {
   const extra = extraTargetFiles(members);
-  for (const file of extra) {
-    if (!snapshot.sources.has(file)) {
-      const text = await readFeedbackBlob(project, headSha, changedSet, file, readSourceSnapshot);
-      if (text !== undefined) snapshot.sources.set(file, text);
-    }
+  const missingExtra = [...extra].filter(file => !snapshot.sources.has(file));
+  if (missingExtra.length) {
+    const loaded = await readFeedbackBlobs(project, headSha, changedSet, missingExtra, readSourceSnapshot);
+    for (const [file, text] of loaded) snapshot.sources.set(file, text);
   }
   const references = new Map();
   let pending = [...snapshot.sources.keys()].filter(file => pathKey(file).endsWith('.rs') || extra.has(file));
@@ -503,13 +510,11 @@ async function collectFeedbackReferences(project, headSha, changedSet, snapshot,
         }
     }
     if (!fragments.size) break;
+    const loaded = await readFeedbackBlobs(project, headSha, changedSet, fragments, readSourceSnapshot);
     const nextPending = [];
-    for (const file of fragments) {
-      const text = await readFeedbackBlob(project, headSha, changedSet, file, readSourceSnapshot);
-      if (text !== undefined) {
-        snapshot.sources.set(file, text);
-        nextPending.push(file);
-      }
+    for (const [file, text] of loaded) {
+      snapshot.sources.set(file, text);
+      nextPending.push(file);
     }
     pending = nextPending;
   }
@@ -517,7 +522,7 @@ async function collectFeedbackReferences(project, headSha, changedSet, snapshot,
 }
 
 /** Build a CI-graph-compatible Cargo affected plan for worker `kodo ci feedback` self-checks. */
-export async function cargoFeedbackGraph({ project, baseSha, headSha, changedPaths = [] }) {
+export async function cargoFeedbackGraph({ project, baseSha, headSha, changedPaths = [] }, dependencies = {}) {
   project = path.resolve(project);
   await noLinks(project);
   project = await realpath(project);
@@ -532,7 +537,7 @@ export async function cargoFeedbackGraph({ project, baseSha, headSha, changedPat
     .filter(Boolean);
   const changedFiles = sortedUnique([...diffChanged, ...changedPaths]);
   const changedSet = new Set(changedPaths);
-  const { readSourceSnapshot } = await import('./ci-graph.mjs');
+  const readSourceSnapshot = dependencies.readSourceSnapshot ?? (await import('./ci-graph.mjs')).readSourceSnapshot;
   const snapshot = await overlayWorkingChanges(
     project,
     await readSourceSnapshot(project, headSha, isCargoSourceFile),
