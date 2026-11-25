@@ -8,6 +8,7 @@ import { redact, workerEnvironment } from './security.mjs';
 import { execute } from './command.mjs';
 import { assertPrivateArtifactPath } from './progress.mjs';
 import { gateRange } from './project-integration.mjs';
+import { assertFence } from './lease-fence.mjs';
 
 const fail = code => {
   throw Object.assign(new Error('Project ' + code), { code: 'project_' + code });
@@ -1043,6 +1044,8 @@ async function apply(ctx, input) {
     requireValue(decision === undefined, 'authorization_denied');
   }
   return transaction(ctx.db, 'BEGIN IMMEDIATE', () => {
+    // A lease holder's command is fenced: its leases must still be live (runtime/lease-fence.mjs).
+    assertFence(ctx.db);
     const repeated = replay(ctx, namespace, command.commandId, payloadHash);
     if (repeated) return repeated;
     const now = new Date().toISOString();
@@ -1121,6 +1124,7 @@ async function apply(ctx, input) {
 }
 
 async function installRun(ctx, input) {
+  // Installs are fenced like commands: a holder whose lease passed on installs nothing.
   safe(ctx, input);
   requireValue(
     input && Object.keys(input).length === 2 && Object.hasOwn(input, 'binding') && Object.hasOwn(input, 'runDraft'),
@@ -1129,6 +1133,7 @@ async function installRun(ctx, input) {
   const binding = normalize(ctx, 'installBinding', input.binding),
     runDraft = structuredClone(input.runDraft);
   return transaction(ctx.db, 'BEGIN IMMEDIATE', () => {
+    assertFence(ctx.db);
     const s = readSnapshot(ctx, binding.projectId);
     complete(ctx, s);
     const task = s.tasks.find(item => item.id === binding.taskId);
@@ -1304,6 +1309,7 @@ async function installGateRun(ctx, input) {
   const bound = value =>
     bytes(ctx, 'gateBinding', normalize(ctx, 'gateBinding', value)).equals(bytes(ctx, 'gateBinding', binding));
   return transaction(ctx.db, 'BEGIN IMMEDIATE', () => {
+    assertFence(ctx.db);
     const s = readSnapshot(ctx, binding.projectId);
     complete(ctx, s);
     requireValue(isWave(ctx, s.project), 'gate_unsupported');

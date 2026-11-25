@@ -157,7 +157,10 @@ test('Task merges record before and task head as parents and form the wave front
     writePaths: ['src/first.txt'],
     savePending: recorder.savePending,
   });
-  assert.deepEqual(recorder.calls, [{ before: integration.head, headAtSave: integration.head }]);
+  // Stage 15B: the merge commit is built first and saved with `before`, then published.
+  assert.deepEqual(recorder.calls, [
+    { before: integration.head, mergeCommit: one.mergeCommit, headAtSave: integration.head },
+  ]);
   assert.deepEqual(one, {
     branch: integration.branch,
     before: integration.head,
@@ -249,7 +252,8 @@ test('Files outside the task write paths roll the merge back with a scope code',
     }),
     'project_integration_scope',
   );
-  assert.equal(recorder.calls.length, 1);
+  // Stage 15B: the scope check runs on the built merge commit before anything is saved or published.
+  assert.equal(recorder.calls.length, 0);
   assert.equal(await git(integration.worktree, ['rev-parse', 'HEAD']), integration.head);
   assert.equal(await git(integration.worktree, ['status', '--porcelain=v1', '--untracked-files=all']), '');
   // A crash between Git's merge and the scope check leaves an unverified merge;

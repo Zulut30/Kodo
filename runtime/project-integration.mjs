@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { lstat, realpath } from 'node:fs/promises';
 import { execute, gitBoundary } from './command.mjs';
 import { git, makeWorktree, withWorktreeLock } from './workspace.mjs';
@@ -177,6 +177,30 @@ async function assertCommit(worktree, commit) {
  * The head of the project's integration branch `kodo/project/<projectId>` (null when absent).
  * @param {{ cwd: string, projectId: string }} options
  */
+/**
+ * Whether `head` is on the project's integration branch: true, false (confirmed, also when the
+ * branch does not exist) or null when Git could not answer (an unreadable object, a locked file).
+ * Callers must not treat null as absence: a merge that was published may only be unreadable now.
+ * @param {{ cwd: string, projectId: string, head: string }} input
+ * @returns {Promise<boolean | null>}
+ */
+export async function headOnIntegrationBranch({ cwd, projectId, head }) {
+  const branch = await execute(
+    'git',
+    ['rev-parse', '--verify', '--quiet', `refs/heads/${integrationBranch(projectId)}^{commit}`],
+    { cwd, allowFailure: true },
+  );
+  // `--verify --quiet` exits 1 without output for a missing ref; anything else is not an answer.
+  if (branch.code === 1 && !branch.stdout.trim()) return false;
+  if (branch.code !== 0) return null;
+  const ancestor = await execute('git', ['merge-base', '--is-ancestor', head, branch.stdout.trim()], {
+    cwd,
+    allowFailure: true,
+  });
+  if (ancestor.code === 0) return true;
+  return ancestor.code === 1 ? false : null;
+}
+
 export async function integrationHeadOf({ cwd, projectId }) {
   const found = await execute(
     'git',
@@ -301,6 +325,147 @@ async function existingMerge(worktree, taskHead) {
     if (mergedHead === taskHead && !extra.length) return { before, mergeCommit };
   }
   return fail('integration_invalid');
+}
+
+const coded = code => Object.assign(new Error(`Project ${code}`), { code });
+
+// A ref's current value, synchronously: the SHA, null when it does not exist, undefined when Git
+// could not answer (did not run, timed out, failed otherwise).
+function refValue(cwd, ref, timeoutMs) {
+  const { args, env } = gitBoundary(['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], process.env);
+  const found = spawnSync('git', args, { cwd, env, encoding: 'utf8', timeout: timeoutMs, windowsHide: true });
+  if (found.error || found.status === null) return undefined;
+  if (found.status === 0) return found.stdout.trim();
+  return found.status === 1 && !found.stdout.trim() ? null : undefined;
+}
+
+/**
+ * Change refs in one atomic, synchronous `git update-ref --stdin` transaction (hooks off):
+ * `verify` rows must still hold their SHA and each `update` moves a ref from `expected` to `next`.
+ * Synchronous on purpose: the caller may run it inside an open SQLite write transaction that
+ * fences its lease tokens (`publishRefs` in runtime/project-publish.mjs), so no other process can
+ * take the lease between the token check and the ref change. A `verify` row that no longer holds
+ * is `project_submission_stale` (the worker moved its branch); any other refusal is
+ * `project_lease_lost` (another holder moved the branch).
+ * @param {string} cwd
+ * @param {{ verify?: { ref: string, sha: string }[], update: { ref: string, next: string, expected: string }[] }} commands
+ * @param {{ timeoutMs?: number }} [options]
+ */
+export function updateRefsAtomically(cwd, { verify = [], update }, { timeoutMs = 5000 } = {}) {
+  const valid = row => typeof row?.ref === 'string' && row.ref.startsWith('refs/heads/') && !/\s/.test(row.ref);
+  if (
+    !Array.isArray(verify) ||
+    !Array.isArray(update) ||
+    !update.length ||
+    !verify.every(row => valid(row) && sha(row.sha)) ||
+    !update.every(row => valid(row) && sha(row.next) && sha(row.expected))
+  )
+    fail('integration_invalid');
+  const input = [
+    'start',
+    ...verify.map(row => `verify ${row.ref} ${row.sha}`),
+    ...update.map(row => `update ${row.ref} ${row.next} ${row.expected}`),
+    'commit',
+    '',
+  ].join('\n');
+  const { args, env } = gitBoundary(['update-ref', '--stdin'], process.env);
+  const result = spawnSync('git', args, { cwd, env, input, encoding: 'utf8', timeout: timeoutMs, windowsHide: true });
+  if (result.status === 0) return;
+  // A Git that did not run or timed out changed nothing that can be trusted: a lost publish at
+  // once. A refused transaction is classified by `refusedPublish` after the caller's SQLite
+  // transaction ended (no second Git call while the write lock is held).
+  if (result.error || result.status === null) throw coded('project_lease_lost');
+  throw Object.assign(coded('project_lease_lost'), { refused: true });
+}
+
+/**
+ * The code of a refused ref transaction (outside any SQLite transaction): `project_submission_stale`
+ * when a `verify` row (the worker's branch) moved, otherwise the error itself.
+ * @param {any} error
+ * @param {string} cwd
+ * @param {{ ref: string, sha: string }[]} [verify]
+ */
+export function refusedPublish(error, cwd, verify = []) {
+  if (error?.refused !== true) return error;
+  // Only a worker ref read back with another value (or gone) is stale; an unanswered read keeps
+  // the original lost-publish error rather than guessing that the worker moved.
+  const values = verify.map(row => refValue(cwd, row.ref, 5000));
+  if (values.includes(undefined)) return error;
+  return values.some((value, index) => value !== verify[index].sha) ? coded('project_submission_stale') : error;
+}
+
+/** The default ref publisher: the atomic update without a lease fence (callers without a Store). */
+export const atomicPublisher = async ({ cwd, verify, update }) => {
+  try {
+    updateRefsAtomically(cwd, { verify, update });
+  } catch (error) {
+    throw refusedPublish(error, cwd, verify);
+  }
+};
+
+// The worktree that has the integration branch checked out follows the branch's current head
+// (never moves the branch itself), under the repository's worktree lock.
+async function syncWorktree(worktree) {
+  await withWorktreeLock(worktree, () => git(worktree, ['reset', '--quiet', '--hard', 'HEAD']));
+}
+
+// The integration branch moves only through `publish` (an atomic ref transaction; in production
+// fenced by the holder's lease tokens): a holder whose branch another holder moved, or whose lease
+// passed on, changes nothing. `verify` rows (the worker's branch on its verified head) are checked
+// in the same ref transaction.
+/**
+ * @param {string} worktree
+ * @param {string} branch
+ * @param {string} next
+ * @param {string} expected
+ * @param {(commands: { cwd: string, verify: any[], update: any[] }) => Promise<unknown>} [publish]
+ * @param {{ ref: string, sha: string }[]} [verify]
+ */
+async function advanceBranch(worktree, branch, next, expected, publish = atomicPublisher, verify = []) {
+  await publish({ cwd: worktree, verify, update: [{ ref: `refs/heads/${branch}`, next, expected }] });
+  await syncWorktree(worktree);
+}
+
+// A crash between publishing a merge and syncing the worktree leaves the branch on the merge
+// commit while the index and files still are the saved `before`. Exactly that state (no unfinished
+// operation, no untracked file, index tree = tree of `before`, files = index) is synced to the
+// branch head; any other state is left for assertIntegrationWorktree to refuse.
+async function resumePublishedMerge(worktree, pending) {
+  if (!sha(pending?.mergeCommit)) return;
+  await integrationWorktree(worktree);
+  if ((await headOf(worktree)) !== pending.mergeCommit) return;
+  if ((await unfinishedOperations(worktree)).length) return;
+  if (await git(worktree, ['ls-files', '--others', '--exclude-standard'])) return;
+  const index = await execute('git', ['write-tree'], { cwd: worktree, allowFailure: true });
+  if (index.code !== 0 || index.stdout.trim() !== (await git(worktree, ['rev-parse', `${pending.before}^{tree}`])))
+    return;
+  if ((await execute('git', ['diff', '--quiet'], { cwd: worktree, allowFailure: true })).code !== 0) return;
+  await syncWorktree(worktree);
+}
+
+// `merge.verifySignatures` keeps its meaning for Kodo's merges: the task head must carry a valid
+// signature (`project_integration_unverified_signature` otherwise).
+async function assertSignature(worktree, taskHead) {
+  const setting = await execute('git', ['config', '--type=bool', '--get', 'merge.verifySignatures'], {
+    cwd: worktree,
+    allowFailure: true,
+  });
+  if (setting.code !== 0 || setting.stdout.trim() !== 'true') return;
+  const verified = await execute('git', ['verify-commit', taskHead], { cwd: worktree, allowFailure: true });
+  if (verified.code !== 0) fail('integration_unverified_signature');
+}
+
+// The merge commit of `head` into `before` (first parent `before`), built without touching any
+// worktree or branch (`merge-tree --write-tree`, the same ort merge as `git merge`).
+async function mergeCommitOf(worktree, before, head, message) {
+  const tree = await execute('git', ['merge-tree', '--write-tree', '--no-messages', before, head], {
+    cwd: worktree,
+    allowFailure: true,
+  });
+  if (tree.code === 1) fail('integration_conflict');
+  if (tree.code !== 0) fail('integration_invalid');
+  const treeSha = tree.stdout.trim().split(/\r?\n/)[0];
+  return git(worktree, ['commit-tree', treeSha, '-p', before, '-p', head, '-m', message]);
 }
 
 async function abortMerge(worktree, before) {
@@ -459,12 +624,16 @@ async function mergeDefect(worktree, before, taskHead, writePaths, secrets, comm
  * Besides the merged result, every commit the merge brings in is inspected (`inspectHistory`,
  * with `secrets`): a defect rolls the merge back as `project_integration_history`
  * (`project_integration_history_unverifiable` for contents it could not compare).
+ * The merge commit is built and checked first; `savePending({ before, mergeCommit })` records it, and
+ * only then `publish` moves the branch (with `verify`: the worker's branch still on its head).
  * @param {{
  *   worktree: string, taskId: string, taskHead: string, writePaths: string[],
- *   savePending: (pending: { before: string }) => unknown,
- *   pending?: { before: string } | null,
+ *   savePending: (pending: { before: string, mergeCommit: string }) => unknown,
+ *   pending?: { before: string, mergeCommit?: string } | null,
  *   withLease?: <T>(work: () => Promise<T>) => Promise<T>,
  *   secrets?: Record<string, unknown>,
+ *   publish?: (commands: { cwd: string, verify: any[], update: any[] }) => Promise<unknown>,
+ *   verify?: { ref: string, sha: string }[],
  * }} options
  */
 export async function mergeTask({
@@ -476,8 +645,12 @@ export async function mergeTask({
   pending = null,
   withLease,
   secrets = {},
+  publish = atomicPublisher,
+  verify = [],
 }) {
   if (
+    typeof publish !== 'function' ||
+    !Array.isArray(verify) ||
     !slug(taskId) ||
     !sha(taskHead) ||
     !Array.isArray(writePaths) ||
@@ -489,6 +662,7 @@ export async function mergeTask({
   )
     fail('integration_invalid');
   const merge = async () => {
+    await resumePublishedMerge(worktree, pending);
     await abandonInterruptedMerge(worktree, pending, taskHead);
     const branch = await assertIntegrationWorktree(worktree);
     await assertCommit(worktree, taskHead);
@@ -505,28 +679,21 @@ export async function mergeTask({
         recovered.mergeCommit,
       );
       if (defect) {
-        if (recovered.mergeCommit === head) await git(worktree, ['reset', '--hard', recovered.before]);
+        if (recovered.mergeCommit === head) await advanceBranch(worktree, branch, recovered.before, head, publish);
         fail(defect);
       }
       return { branch, ...recovered, mergedHead: taskHead, status: 'merged' };
     }
     const before = head;
-    await savePending({ before });
-    const merged = await execute(
-      'git',
-      ['merge', '--no-ff', '--no-edit', '-m', `Kodo: integrate ${taskId}`, taskHead],
-      { cwd: worktree, allowFailure: true },
-    );
-    if (merged.code !== 0) {
-      await abortMerge(worktree, before);
-      fail('integration_conflict');
-    }
-    const defect = await mergeDefect(worktree, before, taskHead, writePaths, secrets);
-    if (defect) {
-      await git(worktree, ['reset', '--hard', before]);
-      fail(defect);
-    }
-    return { branch, before, mergeCommit: await headOf(worktree), mergedHead: taskHead, status: 'merged' };
+    await assertSignature(worktree, taskHead);
+    // The merge commit is built and checked before the branch moves: a conflict or a defect leaves
+    // the branch and its worktree untouched, and only the publish moves the branch.
+    const mergeCommit = await mergeCommitOf(worktree, before, taskHead, `Kodo: integrate ${taskId}`);
+    const defect = await mergeDefect(worktree, before, taskHead, writePaths, secrets, mergeCommit);
+    if (defect) fail(defect);
+    await savePending({ before, mergeCommit });
+    await advanceBranch(worktree, branch, mergeCommit, before, publish, verify);
+    return { branch, before, mergeCommit, mergedHead: taskHead, status: 'merged' };
   };
   return withLease ? withLease(merge) : merge();
 }
@@ -561,11 +728,32 @@ export async function gateRepairInScope({ worktree, from, to, writePaths }) {
  * belongs to the verified gate head; project acceptance additionally requires a
  * gate whose verified head equals the branch head at acceptance time.
  * The caller holds lease `project-integration:<projectId>`.
- * @param {{ worktree: string, expectedHead: string, gateHead: string }} options
+ * `savePending({ before, target })` records the return before it is published; `pending` (that record)
+ * lets a repeat sync a worktree that a crash left between the publish and the sync.
+ * @param {{ worktree: string, expectedHead: string, gateHead: string,
+ *   publish?: (commands: { cwd: string, verify: any[], update: any[] }) => Promise<unknown>,
+ *   pending?: { before: string, target: string } | null,
+ *   savePending?: (pending: { before: string, target: string }) => unknown }} options
  */
-export async function mergeBackGate({ worktree, expectedHead, gateHead }) {
-  if (!sha(gateHead) || !sha(expectedHead)) fail('integration_invalid');
-  await assertIntegrationWorktree(worktree);
+export async function mergeBackGate({
+  worktree,
+  expectedHead,
+  gateHead,
+  publish = atomicPublisher,
+  pending = null,
+  savePending = () => {},
+}) {
+  if (
+    !sha(gateHead) ||
+    !sha(expectedHead) ||
+    typeof publish !== 'function' ||
+    typeof savePending !== 'function' ||
+    (pending !== null && (!sha(pending?.before) || !sha(pending?.target)))
+  )
+    fail('integration_invalid');
+  // A crash between the publish of this return and the worktree sync: the same recovery as a task.
+  if (pending) await resumePublishedMerge(worktree, { before: pending.before, mergeCommit: pending.target });
+  const branch = await assertIntegrationWorktree(worktree);
   await assertCommit(worktree, gateHead);
   await assertCommit(worktree, expectedHead);
   if (!(await ancestor(worktree, expectedHead, gateHead))) fail('integration_invalid');
@@ -573,13 +761,14 @@ export async function mergeBackGate({ worktree, expectedHead, gateHead }) {
   if (await ancestor(worktree, gateHead, before)) return before;
   // The branch is never rewritten: it must still contain the gate head.
   if (!(await ancestor(worktree, expectedHead, before))) fail('integration_invalid');
-  const args =
+  // `merge.verifySignatures` holds for the gate head in both forms of the return.
+  await assertSignature(worktree, gateHead);
+  // Fast-forward to the verified head, or merge the repairs; either way by compare-and-swap.
+  const next =
     before === expectedHead
-      ? ['merge', '--ff-only', gateHead]
-      : ['merge', '--no-ff', '--no-edit', '-m', 'Kodo: integrate gate repairs', gateHead];
-  if ((await execute('git', args, { cwd: worktree, allowFailure: true })).code !== 0) {
-    await abortMerge(worktree, before);
-    fail('integration_conflict');
-  }
-  return headOf(worktree);
+      ? gateHead
+      : await mergeCommitOf(worktree, before, gateHead, 'Kodo: integrate gate repairs');
+  await savePending({ before, target: next });
+  await advanceBranch(worktree, branch, next, before, publish);
+  return next;
 }

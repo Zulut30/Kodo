@@ -14,7 +14,13 @@ const defaultPattern = `**/{test,test/**/*,test-*,*[._-]test}.{${extensions}}`;
 // >=1008474.9099 ms in Windows run 44577524507) run in their own step, `npm run test:waves`, like
 // `npm run test:final`: with them, one L2 command reached its fixed deadline on Windows CI
 // (runs 45410439061 and 45418257242, ~2400 s). Default discovery skips them; explicit paths run them.
-export const separateSuites = ['tests/project-wave-director.test.mjs', 'tests/project-wave-e2e.test.mjs'];
+// The parallel engine suite (stage 15B: real task-fast, merges and concurrent completions, 45-100 s
+// per case in one local Windows run, not a receipt) joins them for the same reason.
+export const separateSuites = [
+  'tests/project-wave-director.test.mjs',
+  'tests/project-wave-e2e.test.mjs',
+  'tests/project-parallel-engine.test.mjs',
+];
 
 const priority = [
   // Source821 Windows/Node24.22.1 receipt c9b54c3c: all completed files >=90000 ms

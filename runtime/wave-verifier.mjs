@@ -563,13 +563,24 @@ export async function runEpicGate({ engine, run: input, signal }) {
 /**
  * One pass of the task-fast checks and the behaviour gate on the Run's current head, without
  * repair: the verdict for a task an external chat implemented. A pass records `run.headSha`.
- * @param {{ engine: any, run: any, signal?: AbortSignal, maxHeavyBuilds?: number }} input
+ * A Run whose integration started (or recorded a completion) keeps its proof: the verdict is
+ * `{ passed: false, skipped: true, code: 'run_integrated' }` without touching the Run. With
+ * `expectedHeadSha`, a worktree that moved to another head is `{ skipped: true, code: 'head_changed' }`
+ * and its proof is kept as well.
+ * @param {{ engine: any, run: any, signal?: AbortSignal, maxHeavyBuilds?: number, expectedHeadSha?: string }} input
  */
-export async function verifyTaskFastOnce({ engine, run: input, signal, maxHeavyBuilds = 1 }) {
+export async function verifyTaskFastOnce({ engine, run: input, signal, maxHeavyBuilds = 1, expectedHeadSha }) {
   const id = typeof input === 'string' ? input : input?.id;
   engine.store.getRun(id);
   return withRunLease(engine, id, signal, async (leased, leaseError) => {
     const run = engine.store.getRun(id);
+    if (['merged', 'pending'].includes(run.integration?.status) || run.externalCompletion)
+      return { passed: false, skipped: true, code: 'run_integrated', headSha: run.headSha ?? null };
+    if (expectedHeadSha !== undefined) {
+      const current = await execute('git', ['rev-parse', 'HEAD'], { cwd: run.cwd, allowFailure: true });
+      if (current.code !== 0 || current.stdout.trim() !== expectedHeadSha)
+        return { passed: false, skipped: true, code: 'head_changed', headSha: current.stdout.trim() || null };
+    }
     run.checks = null;
     run.behavior = null;
     engine.save(run);
@@ -584,7 +595,10 @@ export async function verifyTaskFastOnce({ engine, run: input, signal, maxHeavyB
       return { passed: true, headSha: run.headSha, checks: run.checks, behavior: run.behavior };
     } catch (caught) {
       const error = leaseError() || caught;
-      if (leased.aborted || ['cancelled', 'quota', 'auth', 'lease_lost', 'evidence_integrity'].includes(error.code))
+      if (
+        leased.aborted ||
+        ['cancelled', 'quota', 'auth', 'lease_lost', 'project_lease_lost', 'evidence_integrity'].includes(error.code)
+      )
         throw error;
       const diagnostics = buildDiagnosticPack({
         checks: run.checks,
