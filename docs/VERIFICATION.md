@@ -509,6 +509,42 @@
 
 Полные проверки gate Run считают тесты Node так же, как полный fallback `task-fast` — по событиям репортёра Kodo (см. «Подсчёт тестов `node --test`»): для каждой команды `commands.test` вида `node --test` нужен известный ненулевой счёт (`nodeTestOutcome`); npm-скрипт решается своим кодом выхода, а подтверждённый ноль его счётного прогона — тоже `gate_check_no_tests` (см. «npm-скрипт `node --test`»). Ноль пройденных тестов — `gate_check_no_tests`, счёт неизвестен (опция отбора, неизвестная опция, журнал событий отсутствует, битый или неполный) — `gate_check_summary_unknown`; оба — провал проверки и раунд ремонта, exit 0 раннера их не отменяет. Строка квитанции хранит настроенную команду (`command`), исполненную (`executed`), версию алгоритма (`countVersion`) и число (`tests`); журнал evidence строки — `executed`, `countVersion` и файл событий (`testEvents`). Повторное использование квитанции требует `tests > 0` и `countVersion` текущего алгоритма, а доверенный валидатор приёмки пересчитывает `tests` по `testEvents` журнала этой строки, а не по stdout, и сверяет `executed` с нормализованной командой (`project_gate_tests_uncounted`). Проверки gate Run запускаются без унаследованного `NODE_TEST_CONTEXT`/`NODE_TEST_WORKER_ID` (`fastEnvironment`). Legacy Run — без изменений: его команды исполняются как записаны, без репортёров Kodo и подсчёта.
 
+#### Арбитр гейта
+
+Ремонт гейта ограничен. Если после него ревью всё ещё отказывает, решает арбитр — одна сессия на другой подписке профиля проекта (`runtime/gate-arbiter.mjs`). Без арбитра гейт блокируется, и решает человек.
+
+Арбитр вызывается при всех условиях сразу:
+
+- проект волновой, у него есть профиль исполнения ([RUNTIME.md](RUNTIME.md)) хотя бы с двумя подписками разных провайдеров;
+- цикл проверки gate Run остановился после ремонта (`repair_budget_exhausted`, `no_progress` или `no_verified_progress`), причина — отказ ревью на текущем чистом head;
+- на этом head зелёные все детерминированные проверки: полные проверки, behaviour gate, UI/security/architecture, область ремонта, политика волны и `commands.smoke`;
+- у этого gate Run ещё нет решения арбитра.
+
+Без профиля, с одной подпиской или при красной детерминированной проверке гейт блокируется, как раньше. Арбитр оценивает только findings ревью и не отменяет упавшие тесты, гейты, smoke или `validateWaveGate`.
+
+Подписку выбирает `selectArbiter`. Её `provider` сопоставляется с клиентом Kodo: `codex`, `openai`, `chatgpt` → `codex`, `claude-code`, `claude`, `anthropic` → `claude-code`. Подписка с неизвестным провайдером не подходит. Клиент арбитра должен отличаться от клиента ревьюера. Подписки на паузе (`cooldownUntil`) пропускаются. Порядок выбора — тир `heavy`, затем `standard`, затем `fast`, внутри тира — порядок профиля. Модель берётся из подписки. Она должна входить в allowlist `models` конфигурации и быть доступна по подписке (`discoverProviders`). У Run с фиксированной моделью (`--model`) арбитра нет. Сессия идёт через `engine.session` подписочного клиента в режиме read-only, API не используется.
+
+Вход арбитра заморожен и сохраняется как evidence `gate-arbitration-input`. В нём критерии гейта, отчёт ревью (findings, criteria), ограниченный diff `baseSha...head` (до 60 000 символов, при `budgets.contextBytes` — не больше четверти бюджета) и квитанции checks, behaviour, гейтов и smoke. Ответ проверяется схемой:
+
+- `decision`: `confirm_pass`, `confirm_defect` или `split_needed`;
+- `rationale`: до 4000 символов;
+- `evidence`: `criteria` — по одной строке `{id, met, evidence}` на каждый критерий гейта, `findings` — по одной строке `{index, confirmed, reason}` на каждый finding ревью;
+- `splitWork`: работа `{title, description, writePaths}` для `split_needed`, иначе `null`.
+
+`confirm_pass` требует выполнения всех критериев и ни одного подтверждённого finding. Невалидный ответ или изменение worktree арбитром записываются как `confirm_defect` с полем `invalid`.
+
+Решение записывается в Run: `gateArbitration: {schemaVersion, decision, rationale, evidence, splitWork?, invalid?, client, model, subscriptionId, reviewerClient, reviewModel, headSha, reviewSessionId, reviewHash, input, sessionId, decidedAt, receipt}`. `receipt` — неизменяемое evidence `gate-arbitration` с той же записью. Повторный запуск того же Run берёт записанное решение и сессию не открывает. Квота, отмена и потеря lease прерывают Run без решения.
+
+- `confirm_pass` — Run `succeeded`, `run.headSha` = проверенный head. Ревью остаётся квитанцией с `passed: false`.
+- `confirm_defect` — Run блокируется прежним кодом отказа ревью. В сообщении — вывод арбитра.
+- `split_needed` — Run блокируется кодом `gate_split_needed`. Блокер `drain` несёт `splitWork` для `kodo project extend` или `append-milestone`.
+
+Блокеры гейта с арбитражем несут поле `arbitration: {decision, client, model, rationale}`.
+
+Отказ ревью принимается только по `confirm_pass`. Проверка свежести (`gateRunCurrent`) и `validateWaveGate` требуют, чтобы `gateArbitration.headSha` совпадал с `run.headSha` и с head ревью. Запись должна быть привязана к квитанции ревью: `reviewSessionId` и `reviewHash` — SHA-256 сохранённого `run.review`. Клиент арбитра должен отличаться от клиента ревьюера, каждый критерий — подтверждён. Обе evidence-записи арбитража должны быть целы и совпадать с записью в Run, иначе отказ `review_stale` или `arbitration_invalid`. Критерии гейта (`assertGateCriteria`) тогда подтверждает `gateArbitration.evidence.criteria`.
+
+`kodo report --project` показывает решение в строке гейта (`arbitration`) и итог `totals.gates.arbitrations: {total, confirm_pass, confirm_defect, split_needed}`, в тексте — строка `Arbitrations: …`.
+
 ### Политика проверок волнового Run
 
 `kodo.config.json` коммита читается сырым (`git show` с `rawOutput`, без редактирования): разбирается и хэшируется ровно та политика, которая будет исполнена. Run хранится в Store отредактированным, поэтому политика, в строке которой есть известный секрет или значение, которое `redact` заменил бы (ключ формата провайдера, `Bearer …`, `?token=`/`?key=`/`&api_key=`), отвергается до записи и исполнения: `project_wave_policy_unsafe` (`wavePolicyAt(cwd, commit, {secrets})`); задача с такой головой не сливается (`wave_policy_unsafe`), gate Run — `blocked` с `wave_policy_unsafe`. Шаблонные ссылки `${NAME}` допустимы.

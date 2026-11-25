@@ -24,6 +24,7 @@ import { applyWavePolicy, assertWavePolicy } from './wave-policy.mjs';
 import { gateRange, gateRepairInScope, integrationHeadOf } from './project-integration.mjs';
 import { buildDiagnosticPack } from './diagnostic-pack.mjs';
 import { modulesFromWritePaths, verifiedLessonSummaries } from './context-pack.mjs';
+import { arbitrableRefusal, arbitrateGate, arbitrationAccepts, arbitrationStop } from './gate-arbiter.mjs';
 
 /** The watchdog of a wave gate when the project sets none. */
 export const GATE_WATCHDOG = Object.freeze({ stalledRounds: 2, rejectUnchanged: true });
@@ -502,9 +503,12 @@ function stopRun(engine, run, error, signal) {
  * Verify an installed gate Run once, fully: checks, behaviour gate, UI/security/architecture
  * gates and one independent review, with bounded repair inside the covered write paths,
  * then `commands.smoke`. Ends `succeeded`, or `blocked`/`waiting_limits`/`cancelled` with a blocker.
- * @param {{ engine: any, run: any, signal?: AbortSignal }} input
+ * With `arbitration` (the project's execution profile and the current time), a review refusal
+ * after the exhausted repair cycle, with every deterministic check green including smoke, goes to
+ * the gate arbiter on another subscription once per Run (`gate-arbiter.mjs`).
+ * @param {{ engine: any, run: any, signal?: AbortSignal, arbitration?: { profile?: any, now?: number } | null }} input
  */
-export async function runEpicGate({ engine, run: input, signal }) {
+export async function runEpicGate({ engine, run: input, signal, arbitration = null }) {
   const id = typeof input === 'string' ? input : input?.id;
   const stored = engine.store.getRun(id);
   if (stored.directorBinding?.kind !== 'gate' || stored.directorBinding.runId !== stored.id)
@@ -519,7 +523,15 @@ export async function runEpicGate({ engine, run: input, signal }) {
       await gateWorktree(run, leased);
       engine.checkCancelled(run, leased);
       await engine.selectModels(run);
-      await engine.verify(run, leased);
+      let refusal = null;
+      try {
+        await engine.verify(run, leased);
+      } catch (error) {
+        refusal = arbitration ? await arbitrableRefusal({ engine, run, error, ...arbitration }) : null;
+        if (!refusal) throw error;
+      }
+      // A refused review leaves run.headSha on the last accepted head: the reviewed head is checked.
+      const verifiedHead = refusal?.headSha ?? run.headSha;
       // Repairs may move the verified head past the gate head, but only by
       // descendants that change the covered tasks' write paths.
       const writePaths = run.plan.tasks.flatMap(task => task.writePaths);
@@ -527,7 +539,7 @@ export async function runEpicGate({ engine, run: input, signal }) {
         !(await gateRepairInScope({
           worktree: run.cwd,
           from: run.directorBinding.headSha,
-          to: run.headSha,
+          to: verifiedHead,
           writePaths,
         }))
       )
@@ -536,7 +548,7 @@ export async function runEpicGate({ engine, run: input, signal }) {
       await assertWavePolicy({
         run,
         policyCommit: run.directorBinding.headSha,
-        headSha: run.headSha,
+        headSha: verifiedHead,
         secrets: engine.secrets,
       }).catch(error => {
         if (error?.code === 'project_wave_policy_unsafe')
@@ -546,13 +558,28 @@ export async function runEpicGate({ engine, run: input, signal }) {
       });
       await runSmoke(engine, run, leased);
       engine.checkCancelled(run, leased);
+      if (refusal) {
+        // Smoke passed on the reviewed head too: only the review's findings are in dispute.
+        const record = await arbitrateGate({ engine, run, refusal, signal: leased });
+        engine.checkCancelled(run, leased);
+        const accepted = run.headSha;
+        run.headSha = verifiedHead;
+        if (!arbitrationAccepts(run)) {
+          run.headSha = accepted;
+          throw arbitrationStop(refusal.error, record);
+        }
+      }
       run.state = 'succeeded';
       run.error = null;
       run.blocker = resolveBlocker(run.blocker, { at: new Date().toISOString(), outcome: 'succeeded' });
       const recordedLesson = recordGateLesson(engine, run);
       if (recordedLesson) run.gateLesson = { headSha: run.headSha, lesson: recordedLesson.lesson };
       engine.save(run);
-      engine.log(run, 'gate_succeeded', { headSha: run.headSha, smoke: run.smoke.results.length });
+      engine.log(run, 'gate_succeeded', {
+        headSha: run.headSha,
+        smoke: run.smoke.results.length,
+        ...(refusal ? { arbitration: run.gateArbitration.decision } : {}),
+      });
       return run;
     } catch (error) {
       return stopRun(engine, run, leaseError() || error, leased);

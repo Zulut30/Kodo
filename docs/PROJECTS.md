@@ -146,7 +146,7 @@ Snapshot wave-проекта содержит `gates` (все гейты по `n
 
 **Гейт проекта.** Если все milestone приняты, а проект нет — ветка ушла дальше проверенной головы гейта, покрывшего проект (например, сдвиг во время гейта эпика или во время проверки приёмки), — `runPendingGates` резервирует гейт `[project]` на текущей голове ветки: merges всех задач, база — первый родитель самого раннего слияния, то есть ревью всего проекта. После успеха он принимает проект. Если ветка снова ушла во время этого гейта, в том же проходе резервируется ещё один (Store разрешает новый гейт проекта при `succeeded` прежнем с другой головой); после второго подряд — блокер `wave_project_head_mismatch`.
 
-Результат: `{status, waves, integrated, gates: [{gateId, runId, state}], blockers: [{code, kind, id}], revision, code?}`. Блокер гейта дополнительно называет его `gateId` и `runId` (и `state` остановленного gate Run).
+Результат: `{status, waves, integrated, gates: [{gateId, runId, state}], blockers: [{code, kind, id}], revision, code?}`. Блокер гейта дополнительно называет его `gateId` и `runId` (и `state` остановленного gate Run). Если gate Run рассмотрел арбитр, блокер несёт `arbitration`, а при `gate_split_needed` — ещё `splitWork` для `extend` или `append-milestone` ([VERIFICATION.md](VERIFICATION.md), «Арбитр гейта»).
 
 | `status` | Когда |
 | --- | --- |

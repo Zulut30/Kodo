@@ -1,6 +1,7 @@
 import { isDeepStrictEqual } from 'node:util';
 import { isCurrentBehaviorReceipt } from './behavior-gate.mjs';
 import { integrationBranch } from './project-integration.mjs';
+import { arbitrationAccepts } from './gate-arbiter.mjs';
 import {
   lifecycle,
   settled,
@@ -265,7 +266,8 @@ function gateRunCurrent(run) {
     run.checks != null &&
     !Object.hasOwn(run.checks, 'profile') &&
     integrated(run) &&
-    run.review?.passed === true &&
+    // A refused review counts only with a `confirm_pass` arbitration bound to it and this head (16B1).
+    (run.review?.passed === true || arbitrationAccepts(run)) &&
     run.review.headSha === run.headSha &&
     typeof run.review.diffHash === 'string' &&
     run.review.diffHash !== EMPTY_DIFF &&
