@@ -2608,6 +2608,7 @@ test('X1: brace-expanded globs like {crates/game-contracts,crates/world}/src/** 
 
   const gateMod = await import('../runtime/architecture-gate.mjs');
   const epicRunBad = {
+    planSource: 'gate',
     plan: {
       tasks: [
         { id: 'migrate-contracts', writePaths: ['crates/game-contracts/**'] },
@@ -2643,6 +2644,7 @@ test('X1: brace-expanded globs like {crates/game-contracts,crates/world}/src/** 
   await cleanFx.put('crates/world/src/lib.rs', 'pub fn tick() -> u64 { 2 }\n');
   const cleanWorld = cleanFx.commit('task world-feature clean');
   const epicRunClean = {
+    planSource: 'gate',
     plan: {
       tasks: [
         { id: 'migrate-contracts', writePaths: ['crates/game-contracts/**'] },
@@ -3061,6 +3063,11 @@ test('X6: Wave 0 Rust docs/skill/bootstrap cover crate stubs, Cargo.lock, .gitig
       /интегратор/i,
       `${label}: must describe dedicated integrator task for new external dependencies`,
     );
+    assert.match(
+      text,
+      /крейта-потребителя|потребителя[^\n]*Cargo\.toml/i,
+      `${label}: must note that integrator writePaths includes the consumer crate Cargo.toml`,
+    );
   }
 
   // invalid-package-edition must emit a dedicated hint from UNSUPPORTED_ARCHITECTURE_HINTS.
@@ -3119,4 +3126,413 @@ test('X6: Wave 0 Rust docs/skill/bootstrap cover crate stubs, Cargo.lock, .gitig
     assert.match(finding.hint || '', /edition/i, `expected edition-specific hint, got ${JSON.stringify(finding)}`);
     return true;
   });
+});
+
+test('Y1: Rust v2 epic gate blocks fail-closed when any gate task lacks valid headSha or mismatches merge manifest (run + revalidation)', async t => {
+  const fx = await rustFixture(t);
+  await fx.put('crates/game-contracts/src/types.rs', 'pub struct V1;\n');
+  const migrateCommit = fx.commit('migrate-contracts commit');
+  await fx.put('crates/world/src/lib.rs', 'pub fn tick() -> u64 { 10 }\n');
+  await fx.put('crates/game-contracts/src/lib.rs', 'pub struct UnauthorizedEdit;\n');
+  const sneakyCommit = fx.commit('world-task sneaky contract edit');
+
+  const gateMod = await import('../runtime/architecture-gate.mjs');
+  const missingShaGateRun = {
+    planSource: 'gate',
+    directorBinding: { kind: 'gate' },
+    plan: {
+      tasks: [
+        { id: 'migrate-contracts', writePaths: ['crates/game-contracts/**'] },
+        { id: 'world-task', writePaths: ['crates/world/**'] },
+      ],
+    },
+    nodes: {
+      'migrate-contracts': { id: 'migrate-contracts', headSha: migrateCommit },
+      // world-task intentionally missing headSha!
+      'world-task': { id: 'world-task' },
+    },
+  };
+  const missingScopes = gateMod.architectureTaskScopesForRun(missingShaGateRun);
+  const blockedReceipt = await runArchitectureChecks({
+    cwd: fx.project,
+    baseSha: fx.baseSha,
+    headSha: sneakyCommit,
+    config: { enabled: true },
+    artifacts: fx.artifacts,
+    taskPaths: gateMod.architectureTaskPathsForRun(missingShaGateRun),
+    taskScopes: missingScopes,
+  });
+  assert.equal(
+    blockedReceipt.status,
+    'blocked',
+    `missing headSha on epic gate must block, got ${JSON.stringify(blockedReceipt)}`,
+  );
+  assert.equal(blockedReceipt.passed, false);
+  assert.equal(blockedReceipt.reason, 'configuration');
+
+  // Non-existent commit SHA on epic gate task must also block, never pass.
+  const bogusShaGateRun = {
+    ...missingShaGateRun,
+    nodes: {
+      'migrate-contracts': { id: 'migrate-contracts', headSha: migrateCommit },
+      'world-task': { id: 'world-task', headSha: 'f'.repeat(40) },
+    },
+  };
+  const bogusReceipt = await runArchitectureChecks({
+    cwd: fx.project,
+    baseSha: fx.baseSha,
+    headSha: sneakyCommit,
+    config: { enabled: true },
+    artifacts: fx.artifacts,
+    taskPaths: gateMod.architectureTaskPathsForRun(bogusShaGateRun),
+    taskScopes: gateMod.architectureTaskScopesForRun(bogusShaGateRun),
+  });
+  assert.equal(bogusReceipt.status, 'blocked');
+  assert.equal(bogusReceipt.passed, false);
+  assert.equal(bogusReceipt.reason, 'configuration');
+
+  // Revalidation: a valid clean epic gate receipt MUST fail freshness when revalidated with missing headSha or mismatched gate manifest.
+  const cleanFx = await rustFixture(t);
+  await cleanFx.put('crates/game-contracts/src/lib.rs', 'pub struct CleanV3;\n');
+  const cleanMigrate = cleanFx.commit('clean migrate');
+  await cleanFx.put('crates/world/src/lib.rs', 'pub fn tick() -> u64 { 11 }\n');
+  const cleanWorld = cleanFx.commit('clean world');
+  const cleanGateRun = {
+    planSource: 'gate',
+    directorBinding: { kind: 'gate' },
+    plan: {
+      tasks: [
+        { id: 'migrate-contracts', writePaths: ['crates/game-contracts/**'] },
+        { id: 'world-task', writePaths: ['crates/world/**'] },
+      ],
+    },
+    nodes: {
+      'migrate-contracts': { id: 'migrate-contracts', headSha: cleanMigrate },
+      'world-task': { id: 'world-task', headSha: cleanWorld },
+    },
+  };
+  const cleanOpts = {
+    cwd: cleanFx.project,
+    baseSha: cleanFx.baseSha,
+    headSha: cleanWorld,
+    config: { enabled: true },
+    artifacts: cleanFx.artifacts,
+    taskPaths: gateMod.architectureTaskPathsForRun(cleanGateRun),
+    taskScopes: gateMod.architectureTaskScopesForRun(cleanGateRun),
+  };
+  const cleanReceipt = await runArchitectureChecks(cleanOpts);
+  assert.equal(cleanReceipt.status, 'passed');
+  assert.equal(await isCurrentArchitectureReceipt(cleanReceipt, cleanOpts), true);
+  // Missing headSha in revalidation -> false.
+  const incompleteRevalRun = {
+    ...cleanGateRun,
+    nodes: {
+      'migrate-contracts': { id: 'migrate-contracts', headSha: cleanMigrate },
+      'world-task': { id: 'world-task' },
+    },
+  };
+  assert.equal(
+    await isCurrentArchitectureReceipt(cleanReceipt, {
+      ...cleanOpts,
+      taskScopes: gateMod.architectureTaskScopesForRun(incompleteRevalRun),
+    }),
+    false,
+  );
+  // Gate manifest mismatch (mergeCommit differs from node.headSha) -> false.
+  const mismatchScopes = gateMod.architectureTaskScopesForRun(cleanGateRun, {
+    gate: {
+      merges: [
+        { taskId: 'migrate-contracts', mergeCommit: cleanMigrate },
+        { taskId: 'world-task', mergeCommit: cleanMigrate },
+      ],
+    },
+    tasks: cleanGateRun.plan.tasks,
+  });
+  assert.equal(await isCurrentArchitectureReceipt(cleanReceipt, { ...cleanOpts, taskScopes: mismatchScopes }), false);
+});
+
+test('Y2: ordinary Engine node uses baseSha..headSha (no-op node does not falsely inherit base commit contract edits)', async t => {
+  const fx = await rustFixture(t);
+  // Task 1 legitimately edits Cargo.toml and contract crate on commit 1.
+  await fx.put('crates/game-contracts/src/lib.rs', 'pub struct ContractV2;\n');
+  const afterT1 = fx.commit('t1 contract update');
+
+  const gateMod = await import('../runtime/architecture-gate.mjs');
+  // Ordinary (non-epic) Engine run: t2 committed nothing so node.baseSha === node.headSha === afterT1.
+  const ordinaryRun = {
+    planSource: 'cli',
+    baseSha: fx.baseSha,
+    plan: {
+      tasks: [
+        { id: 't1', writePaths: ['Cargo.toml', 'crates/game-contracts/**'] },
+        { id: 't2', writePaths: ['crates/world/**'] },
+      ],
+    },
+    nodes: {
+      t1: { id: 't1', baseSha: fx.baseSha, headSha: afterT1 },
+      t2: { id: 't2', baseSha: afterT1, headSha: afterT1 },
+    },
+  };
+  const taskPaths = gateMod.architectureTaskPathsForRun(ordinaryRun);
+  const taskScopes = gateMod.architectureTaskScopesForRun(ordinaryRun);
+  const receipt = await runArchitectureChecks({
+    cwd: fx.project,
+    baseSha: fx.baseSha,
+    headSha: afterT1,
+    config: { enabled: true },
+    artifacts: fx.artifacts,
+    taskPaths,
+    taskScopes,
+  });
+  assert.equal(
+    receipt.status,
+    'passed',
+    `no-op ordinary Engine node must have empty diff (baseSha..headSha), got ${JSON.stringify(receipt.report)}`,
+  );
+  assert.equal(
+    await isCurrentArchitectureReceipt(receipt, {
+      cwd: fx.project,
+      baseSha: fx.baseSha,
+      headSha: afterT1,
+      config: { enabled: true },
+      taskPaths,
+      taskScopes,
+    }),
+    true,
+  );
+
+  // When t2 actually commits an unauthorized contract edit between t2.baseSha..t2.headSha -> must FAIL.
+  await fx.put('crates/game-contracts/src/lib.rs', 'pub struct SneakyFromT2;\n');
+  const afterT2Bad = fx.commit('t2 sneaky contract edit');
+  const ordinaryRunBad = {
+    ...ordinaryRun,
+    nodes: {
+      t1: { id: 't1', baseSha: fx.baseSha, headSha: afterT1 },
+      t2: { id: 't2', baseSha: afterT1, headSha: afterT2Bad },
+    },
+  };
+  const badReceipt = await runArchitectureChecks({
+    cwd: fx.project,
+    baseSha: fx.baseSha,
+    headSha: afterT2Bad,
+    config: { enabled: true },
+    artifacts: fx.artifacts,
+    taskPaths: gateMod.architectureTaskPathsForRun(ordinaryRunBad),
+    taskScopes: gateMod.architectureTaskScopesForRun(ordinaryRunBad),
+  });
+  assert.equal(badReceipt.status, 'failed');
+  assert.ok(
+    badReceipt.report.findings.some(
+      f => f.ruleId === 'contract_change_not_allowed' && f.file === 'crates/game-contracts/src/lib.rs',
+    ),
+  );
+});
+
+test('Y3: scopeMatchesPath and isExplicitContractScope match ownsPath exactly for brace patterns (expansion stays linter-only)', async t => {
+  const { scopeMatchesPath, isExplicitContractScope, isBroadContractScope } =
+    await import('../runtime/cargo-workspace.mjs');
+  const { ownsPath } = await import('../runtime/contracts.mjs');
+
+  const pairs = [
+    ['crates/game-contracts/{src,tests}', 'crates/game-contracts/src/v2.rs', false],
+    ['crates/game-contracts/{src,tests}/**', 'crates/game-contracts/src/v2.rs', true],
+    ['crates/game-contracts/src/v{1..3}.rs', 'crates/game-contracts/src/v2.rs', true],
+    ['crates/game-contracts/src/v{1..3}.rs', 'crates/game-contracts/src/v4.rs', false],
+    ['crates/game-contracts/**', 'crates/game-contracts/.gitignore', true],
+    ['crates/game-contracts', 'crates/game-contracts/src/lib.rs', true],
+  ];
+  for (const [scope, file, expected] of pairs) {
+    assert.equal(ownsPath([scope], file), expected, `sanity ownsPath(${scope}, ${file})`);
+    assert.equal(scopeMatchesPath(scope, file), expected, `scopeMatchesPath(${scope}, ${file}) must match ownsPath`);
+    assert.equal(
+      isExplicitContractScope(scope, 'crates/game-contracts', file),
+      expected,
+      `isExplicitContractScope(${scope}, game-contracts, ${file}) must match ownsPath`,
+    );
+  }
+  // Brace expansion remains active in isBroadContractScope for linter detection.
+  assert.equal(isBroadContractScope('{crates/game-contracts,crates/world}/src/**', 'crates/game-contracts'), true);
+
+  // End-to-end checkArchitecture verification of both Y3 cases.
+  const fx = await rustFixture(t);
+  await fx.put('crates/game-contracts/src/v2.rs', 'pub struct V2;\n');
+  fx.commit('add v2.rs');
+
+  const deniedBraceDir = await checkArchitecture({
+    project: fx.project,
+    baseSha: fx.baseSha,
+    taskPaths: ['crates/game-contracts/{src,tests}'],
+  });
+  assert.equal(deniedBraceDir.status, 'failed');
+  assert.ok(
+    deniedBraceDir.findings.some(
+      f => f.ruleId === 'contract_change_not_allowed' && f.file === 'crates/game-contracts/src/v2.rs',
+    ),
+  );
+
+  const allowedBraceRange = await checkArchitecture({
+    project: fx.project,
+    baseSha: fx.baseSha,
+    taskPaths: ['crates/game-contracts/src/v{1..3}.rs'],
+  });
+  assert.equal(
+    allowedBraceRange.status,
+    'passed',
+    `crates/game-contracts/src/v{1..3}.rs must allow src/v2.rs like ownsPath, got ${JSON.stringify(allowedBraceRange)}`,
+  );
+});
+
+test('Y4: JS v1 architecture receipt remains fresh after run.nodes is populated (taskScopes applies only to Rust v2)', async t => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'kodo-arch-js-y4-'));
+  const artifacts = await mkdtemp(path.join(os.tmpdir(), 'kodo-arch-js-y4-art-'));
+  t.after(async () => {
+    await rm(dir, { recursive: true, force: true });
+    await rm(artifacts, { recursive: true, force: true });
+  });
+  const gitIn = (...args) =>
+    execFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  const put = async (rel, content) => {
+    const full = path.join(dir, rel);
+    await mkdir(path.dirname(full), { recursive: true });
+    await writeFile(full, typeof content === 'string' ? content : JSON.stringify(content, null, 2), 'utf8');
+  };
+  gitIn('init');
+  gitIn('config', 'user.email', 'test@example.com');
+  gitIn('config', 'user.name', 'Test');
+  await put('src/core/index.mjs', 'export const answer = () => 42;\n');
+  await put('src/app/index.mjs', 'export const run = () => 1;\n');
+  await put('architecture.contracts.json', { schemaVersion: 1, contracts: [], migrations: [] });
+  await put('architecture.policy.json', {
+    schemaVersion: 1,
+    version: 1,
+    productRoots: ['src'],
+    modules: [
+      { id: 'core', roots: ['src/core'], layer: 'core', public: [], allow: [] },
+      { id: 'app', roots: ['src/app'], layer: 'app', public: [], allow: ['core'] },
+    ],
+    layers: { app: ['core'], core: [] },
+    forbiddenImports: [],
+    cycles: 'forbid',
+    contracts: 'architecture.contracts.json',
+    baseline: [],
+    exceptions: [],
+    protectedPaths: ['architecture.policy.json'],
+  });
+  gitIn('add', '-A');
+  gitIn('commit', '-m', 'base js v1');
+  const baseSha = gitIn('rev-parse', 'HEAD');
+  await put('src/app/index.mjs', 'export const run = () => 2;\n');
+  gitIn('add', '-A');
+  gitIn('commit', '-m', 'update js v1');
+  const headSha = gitIn('rev-parse', 'HEAD');
+
+  // Receipt issued without taskScopes (like legacy/pre-node JS v1 run).
+  const receipt = await runArchitectureChecks({
+    cwd: dir,
+    baseSha,
+    headSha,
+    config: { enabled: true },
+    artifacts,
+  });
+  assert.equal(receipt.status, 'passed');
+  assert.equal(receipt.taskScopes, undefined);
+
+  // After run.nodes is populated (and even for a gate run with incomplete nodes), JS v1 receipt stays fresh!
+  const gateMod = await import('../runtime/architecture-gate.mjs');
+  const runWithNodes = {
+    baseSha,
+    headSha,
+    plan: { tasks: [{ id: 't1', writePaths: ['src/core/**'] }] },
+    nodes: { t1: { id: 't1', baseSha, headSha } },
+  };
+  assert.equal(
+    await isCurrentArchitectureReceipt(receipt, {
+      cwd: dir,
+      baseSha,
+      headSha,
+      config: { enabled: true },
+      taskPaths: gateMod.architectureTaskPathsForRun(runWithNodes),
+      taskScopes: gateMod.architectureTaskScopesForRun(runWithNodes),
+    }),
+    true,
+  );
+});
+
+test('Y5: package.workspace mismatch on member or conflict with exclude blocks as unsupported', async t => {
+  const { resolveCargoWorkspace } = await import('../runtime/cargo-workspace.mjs');
+
+  // 1) Member points package.workspace to sibling workspace -> wrong-workspace-root.
+  const wrongWs = resolveCargoWorkspace({
+    manifests: {
+      'Cargo.toml': '[workspace]\nresolver = "2"\nmembers = ["crates/a"]\n',
+      'crates/a/Cargo.toml':
+        '[package]\nname = "a"\nversion = "0.1.0"\nedition = "2021"\nworkspace = "../../other-ws"\n',
+      'other-ws/Cargo.toml': '[workspace]\nresolver = "2"\nmembers = []\n',
+    },
+    files: ['Cargo.toml', 'crates/a/Cargo.toml', 'crates/a/src/lib.rs', 'other-ws/Cargo.toml'],
+  });
+  assert.ok(
+    wrongWs.unsupported.some(u => u.reason === 'wrong-workspace-root' && u.file === 'crates/a/Cargo.toml'),
+    `expected wrong-workspace-root, got ${JSON.stringify(wrongWs.unsupported)}`,
+  );
+
+  // 2) Excluded package explicitly declaring package.workspace pointing to excluding workspace -> unlisted-workspace-member (not standalone).
+  const excludedExplicit = resolveCargoWorkspace({
+    startDir: 'crates/excluded',
+    manifests: {
+      'Cargo.toml': '[workspace]\nresolver = "2"\nmembers = ["crates/a"]\nexclude = ["crates/excluded"]\n',
+      'crates/a/Cargo.toml': '[package]\nname = "a"\nversion = "0.1.0"\nedition = "2021"\n',
+      'crates/excluded/Cargo.toml':
+        '[package]\nname = "excluded"\nversion = "0.1.0"\nedition = "2021"\nworkspace = "../.."\n',
+    },
+    files: [
+      'Cargo.toml',
+      'crates/a/Cargo.toml',
+      'crates/a/src/lib.rs',
+      'crates/excluded/Cargo.toml',
+      'crates/excluded/src/lib.rs',
+    ],
+  });
+  assert.ok(
+    excludedExplicit.unsupported.some(
+      u => u.reason === 'unlisted-workspace-member' && u.file === 'crates/excluded/Cargo.toml',
+    ),
+    `expected unlisted-workspace-member for excluded package with explicit package.workspace, got ${JSON.stringify(excludedExplicit)}`,
+  );
+
+  // 3) Manifest with both [workspace] and package.workspace -> invalid-workspace-config.
+  const bothWs = resolveCargoWorkspace({
+    manifests: {
+      'Cargo.toml':
+        '[workspace]\nresolver = "2"\nmembers = []\n[package]\nname = "root"\nversion = "0.1.0"\nedition = "2021"\nworkspace = "."\n',
+    },
+    files: ['Cargo.toml', 'src/lib.rs'],
+  });
+  assert.ok(
+    bothWs.unsupported.some(u => u.reason === 'invalid-workspace-config' && u.file === 'Cargo.toml'),
+    `expected invalid-workspace-config when both [workspace] and package.workspace set, got ${JSON.stringify(bothWs.unsupported)}`,
+  );
+
+  // 4) Member pointing package.workspace to SAME workspace root -> clean PASS.
+  const sameWs = resolveCargoWorkspace({
+    manifests: {
+      'Cargo.toml': '[workspace]\nresolver = "2"\nmembers = ["crates/a"]\n',
+      'crates/a/Cargo.toml': '[package]\nname = "a"\nversion = "0.1.0"\nedition = "2021"\nworkspace = "../.."\n',
+    },
+    files: ['Cargo.toml', 'crates/a/Cargo.toml', 'crates/a/src/lib.rs'],
+  });
+  assert.deepEqual(sameWs.unsupported, []);
+  assert.equal(sameWs.members.length, 1);
+
+  // 5) End-to-end checkArchitecture blocks when a member has wrong package.workspace.
+  const fx = await rustFixture(t);
+  await fx.put('other-ws/Cargo.toml', '[workspace]\nresolver = "2"\nmembers = []\n');
+  await fx.put(
+    'crates/world/Cargo.toml',
+    '[package]\nname = "world"\nversion = "0.1.0"\nedition = "2021"\nworkspace = "../../other-ws"\n[dependencies]\ngame-contracts = { path = "../game-contracts" }\n',
+  );
+  fx.commit('wrong package.workspace');
+  const blocked = await checkArchitecture({ project: fx.project, baseSha: fx.baseSha });
+  assert.equal(blocked.status, 'blocked');
+  assert.ok(blocked.unsupported.some(u => u.reason === 'wrong-workspace-root'));
 });

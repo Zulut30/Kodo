@@ -125,19 +125,21 @@ async function verifyReview(ctx) {
     !isCurrentSecurityReceipt(ctx.run.securityChecks, { headSha: head, config: securityConfig })
   )
     throw fail('stale_security_checks', 'Current security evidence is required for delivery');
-  if (
-    architectureConfig?.enabled &&
-    !(await isCurrentArchitectureReceipt(ctx.run.architectureChecks, {
-      cwd: ctx.cwd,
-      headSha: head,
-      baseSha: ctx.run.baseSha,
-      config: architectureConfig,
-      taskPaths: architectureTaskPathsForRun(ctx.run),
-      ...(architectureTaskScopesForRun(ctx.run) ? { taskScopes: architectureTaskScopesForRun(ctx.run) } : {}),
-      signal: ctx.signal,
-    }))
-  )
-    throw fail('stale_architecture_checks', 'Current architecture evidence is required for delivery');
+  if (architectureConfig?.enabled) {
+    const archTaskScopes = architectureTaskScopesForRun(ctx.run);
+    if (
+      !(await isCurrentArchitectureReceipt(ctx.run.architectureChecks, {
+        cwd: ctx.cwd,
+        headSha: head,
+        baseSha: ctx.run.baseSha,
+        config: architectureConfig,
+        taskPaths: architectureTaskPathsForRun(ctx.run),
+        ...(archTaskScopes ? { taskScopes: archTaskScopes } : {}),
+        signal: ctx.signal,
+      }))
+    )
+      throw fail('stale_architecture_checks', 'Current architecture evidence is required for delivery');
+  }
   return { head, diffHash };
 }
 

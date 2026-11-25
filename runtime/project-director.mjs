@@ -155,7 +155,7 @@ async function assertRunSource(snapshot, run, wave = false) {
   requireValue((await inspectCurrentSource({ project: run.cwd, headSha: run.headSha })) === 'clean', 'head_changed');
 }
 // Full checks with their logs, the independent review and every enabled gate on the verified head.
-async function assertFullReceipts(engine, run) {
+async function assertFullReceipts(engine, run, gateContext = null) {
   validateCommandTimeouts(run.config.commands);
   const expected = ['test', 'build'].flatMap(kind => run.config.commands[kind].map(command => ({ kind, command })));
   const fingerprint = hash({
@@ -203,7 +203,7 @@ async function assertFullReceipts(engine, run) {
     'review_stale',
   );
   const archTaskPaths = architectureTaskPathsForRun(run);
-  const archTaskScopes = architectureTaskScopesForRun(run);
+  const archTaskScopes = architectureTaskScopesForRun(run, gateContext ?? undefined);
   for (const [field, setting, method] of [
     ['uiVerification', 'uiVerification', 'isCurrentUIReceipt'],
     ['securityChecks', 'security', 'isCurrentSecurityReceipt'],
@@ -486,7 +486,7 @@ async function validateWaveGate({ store, engine, contracts, snapshot, run, gate,
   );
   await assertRunSource(snapshot, run, true);
   await assertWavePolicy({ run, policyCommit: gate.headSha, headSha: run.headSha, secrets: engine.secrets });
-  await assertFullReceipts(engine, run);
+  await assertFullReceipts(engine, run, { gate, tasks });
   await assertTestCounts(run, { step: row => row.command, positive: true, code: 'gate_tests_uncounted' });
   requireValue(
     isCurrentBehaviorReceipt(run.behavior, { headSha: run.headSha, baseSha: run.baseSha, config: run.config }),

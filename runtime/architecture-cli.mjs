@@ -244,20 +244,23 @@ async function readTaskDiffs(project, taskScopes, context) {
   if (!Array.isArray(taskScopes) || !taskScopes.length) return undefined;
   const diffs = [];
   for (const entry of taskScopes) {
-    if (
-      !entry ||
-      typeof entry.id !== 'string' ||
-      !entry.id.trim() ||
-      !sha(entry.commit) ||
-      !Array.isArray(entry.writePaths)
-    )
+    if (!entry || typeof entry.id !== 'string' || !entry.id.trim() || !Array.isArray(entry.writePaths))
       throw fail('configuration');
-    const parentsLine = (await git(project, ['rev-list', '--parents', '-n', '1', entry.commit], context)).trim();
-    const parts = parentsLine.split(' ').filter(Boolean);
-    if (parts[0] !== entry.commit) throw fail('configuration');
-    const firstParent = parts[1];
-    const raw = firstParent
-      ? await git(
+    const mode = entry.mode ?? (entry.baseCommit !== undefined ? 'range' : 'merge');
+    if (mode === 'incomplete') throw fail('configuration');
+    let paths;
+    if (mode === 'range') {
+      if (!sha(entry.baseCommit) || !sha(entry.commit)) throw fail('configuration');
+      if (
+        (await git(project, ['rev-parse', '--verify', `${entry.baseCommit}^{commit}`], context)).trim() !==
+          entry.baseCommit ||
+        (await git(project, ['rev-parse', '--verify', `${entry.commit}^{commit}`], context)).trim() !== entry.commit
+      )
+        throw fail('configuration');
+      if (entry.baseCommit === entry.commit) {
+        paths = [];
+      } else {
+        const raw = await git(
           project,
           [
             'diff',
@@ -266,14 +269,45 @@ async function readTaskDiffs(project, taskScopes, context) {
             '--no-renames',
             '--name-only',
             '-z',
-            firstParent,
+            entry.baseCommit,
             entry.commit,
             '--',
           ],
           context,
-        )
-      : await git(project, ['diff-tree', '--no-commit-id', '--name-only', '-r', '-z', '--root', entry.commit], context);
-    const paths = [...new Set(raw.split('\0').filter(Boolean))].sort().map(safeFile);
+        );
+        paths = [...new Set(raw.split('\0').filter(Boolean))].sort().map(safeFile);
+      }
+    } else if (mode === 'merge') {
+      if (!sha(entry.commit)) throw fail('configuration');
+      const parentsLine = (await git(project, ['rev-list', '--parents', '-n', '1', entry.commit], context)).trim();
+      const parts = parentsLine.split(' ').filter(Boolean);
+      if (parts[0] !== entry.commit) throw fail('configuration');
+      const firstParent = parts[1];
+      const raw = firstParent
+        ? await git(
+            project,
+            [
+              'diff',
+              '--no-ext-diff',
+              '--no-textconv',
+              '--no-renames',
+              '--name-only',
+              '-z',
+              firstParent,
+              entry.commit,
+              '--',
+            ],
+            context,
+          )
+        : await git(
+            project,
+            ['diff-tree', '--no-commit-id', '--name-only', '-r', '-z', '--root', entry.commit],
+            context,
+          );
+      paths = [...new Set(raw.split('\0').filter(Boolean))].sort().map(safeFile);
+    } else {
+      throw fail('configuration');
+    }
     if (paths.length > 20000) throw fail('scope_limit');
     diffs.push({ id: entry.id, changedPaths: paths, writePaths: entry.writePaths });
   }

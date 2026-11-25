@@ -210,6 +210,7 @@ const UNSUPPORTED_ARCHITECTURE_HINTS = {
   'unsupported-member-glob': 'Fix invalid glob syntax in [workspace] members',
   'nested-workspace-root': 'Exclude the nested [workspace] directory or remove the nested [workspace] table',
   'unlisted-workspace-member': 'Add the package to parent [workspace] members or exclude it explicitly',
+  'wrong-workspace-root': 'Update or remove package.workspace so the member points to its actual workspace root',
   'unsupported-underscore-dependencies':
     'Use hyphenated dev-dependencies / build-dependencies (underscore tables are rejected in edition 2024+)',
   'unresolved-workspace-edition': 'Declare edition in root [workspace.package] or set edition explicitly on the crate',

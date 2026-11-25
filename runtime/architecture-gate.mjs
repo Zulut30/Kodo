@@ -55,6 +55,7 @@ async function pins() {
     'architecture-debt.mjs',
     'architecture-rust.mjs',
     'cargo-workspace.mjs',
+    'scope-paths.mjs',
     'contract-registry.mjs',
     'javascript-dependencies.mjs',
     'ci-graph.mjs',
@@ -223,7 +224,12 @@ const normalizeTaskPaths = value => {
   return [...new Set(normalized)].sort();
 };
 
+const NULL_HASH = hash(null);
+const isRustV2Report = report =>
+  Boolean(report?.hashes && report.hashes.policy !== NULL_HASH && report.hashes.registry === NULL_HASH);
+const isEpicGateRun = run => run?.planSource === 'gate' || run?.directorBinding?.kind === 'gate';
 const commitSha = value => typeof value === 'string' && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(value);
+const hasIncompleteTaskScope = scopes => Array.isArray(scopes) && scopes.some(entry => entry.mode === 'incomplete');
 
 const normalizeTaskScopes = value => {
   if (value === undefined) return undefined;
@@ -231,13 +237,39 @@ const normalizeTaskScopes = value => {
   const rows = value.map(entry => {
     if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw failure('configuration');
     const id = typeof entry.id === 'string' ? entry.id.trim() : '';
-    if (!id || !commitSha(entry.commit)) throw failure('configuration');
+    if (!id) throw failure('configuration');
     const writePaths = normalizeTaskPaths(entry.writePaths);
     if (!writePaths) throw failure('configuration');
-    return { id, commit: entry.commit, writePaths };
+    const mode = entry.mode ?? (entry.baseCommit !== undefined ? 'range' : 'merge');
+    if (mode === 'incomplete') return { id, mode: 'incomplete', commit: null, writePaths };
+    if (mode === 'range') {
+      if (!commitSha(entry.baseCommit) || !commitSha(entry.commit)) throw failure('configuration');
+      return { id, mode: 'range', baseCommit: entry.baseCommit, commit: entry.commit, writePaths };
+    }
+    if (mode === 'merge') {
+      if (!commitSha(entry.commit)) throw failure('configuration');
+      return { id, mode: 'merge', commit: entry.commit, writePaths };
+    }
+    throw failure('configuration');
   });
   return rows.sort((a, b) =>
-    a.id < b.id ? -1 : a.id > b.id ? 1 : a.commit < b.commit ? -1 : a.commit > b.commit ? 1 : 0,
+    a.id < b.id
+      ? -1
+      : a.id > b.id
+        ? 1
+        : a.mode < b.mode
+          ? -1
+          : a.mode > b.mode
+            ? 1
+            : (a.commit ?? '') < (b.commit ?? '')
+              ? -1
+              : (a.commit ?? '') > (b.commit ?? '')
+                ? 1
+                : (a.baseCommit ?? '') < (b.baseCommit ?? '')
+                  ? -1
+                  : (a.baseCommit ?? '') > (b.baseCommit ?? '')
+                    ? 1
+                    : 0,
   );
 };
 
@@ -248,16 +280,75 @@ export function architectureTaskPathsForRun(run) {
     : [];
 }
 
-/** Extract per-task commit + writePaths scopes when a Run (e.g. an epic gate) binds each task to its merge commit. */
-export function architectureTaskScopesForRun(run) {
-  if (!Array.isArray(run?.plan?.tasks) || !run?.nodes || typeof run.nodes !== 'object') return undefined;
+/**
+ * Extract per-task commit + writePaths scopes for Rust v2 contract-crate enforcement.
+ * - Epic gates (`planSource === 'gate'` / `directorBinding.kind === 'gate'` or explicit `gate` manifest)
+ *   require complete 1-to-1 task-to-mergeCommit correspondence; any missing/mismatched SHA produces an
+ *   `incomplete` entry so Rust v2 fails closed (`configuration`) instead of dropping the task.
+ * - Ordinary Engine runs use `node.baseSha..node.headSha` (`mode: 'range'`) so no-op nodes
+ *   (`baseSha === headSha`) produce an empty diff rather than inheriting base-commit edits.
+ * @param {any} run
+ * @param {{ gate?: any, tasks?: any[] }} [context]
+ */
+// oxlint-disable-next-line complexity -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
+export function architectureTaskScopesForRun(run, { gate, tasks } = {}) {
+  const planTasks = Array.isArray(run?.plan?.tasks) ? run.plan.tasks : [];
+  const nodes = run?.nodes && typeof run.nodes === 'object' ? run.nodes : null;
+  if (isEpicGateRun(run) || gate) {
+    if (!planTasks.length) return [{ id: '__incomplete__', mode: 'incomplete', commit: null, writePaths: [] }];
+    const planById = new Map();
+    for (const task of planTasks) {
+      const id = typeof task?.id === 'string' ? task.id.trim() : '';
+      if (id) planById.set(id, task);
+    }
+    if (gate) {
+      const merges = Array.isArray(gate.merges) ? gate.merges : [];
+      const gateTasks = Array.isArray(tasks) ? tasks : planTasks;
+      const taskById = new Map(gateTasks.map(task => [task?.id, task]));
+      if (!merges.length || merges.length !== planTasks.length || planById.size !== planTasks.length) {
+        return [{ id: '__incomplete__', mode: 'incomplete', commit: null, writePaths: [] }];
+      }
+      const scopes = [];
+      for (const merge of merges) {
+        const id = typeof merge?.taskId === 'string' ? merge.taskId.trim() : '';
+        const planTask = planById.get(id);
+        const gateTask = taskById.get(id);
+        const nodeCommit = nodes?.[id]?.headSha;
+        const planPaths = Array.isArray(planTask?.writePaths) ? [...planTask.writePaths] : null;
+        const gatePaths = Array.isArray(gateTask?.writePaths) ? [...gateTask.writePaths] : null;
+        const pathsMatch =
+          planPaths !== null &&
+          gatePaths !== null &&
+          hash(planPaths.map(normalizeTaskPath).sort()) === hash(gatePaths.map(normalizeTaskPath).sort());
+        if (!id || !planTask || !commitSha(merge.mergeCommit) || nodeCommit !== merge.mergeCommit || !pathsMatch) {
+          scopes.push({ id: id || '__incomplete__', mode: 'incomplete', commit: null, writePaths: [] });
+        } else {
+          scopes.push({ id, mode: 'merge', commit: merge.mergeCommit, writePaths: planPaths });
+        }
+      }
+      return scopes;
+    }
+    return planTasks.map(task => {
+      const id = typeof task?.id === 'string' ? task.id.trim() : '';
+      const commit = nodes?.[task?.id]?.headSha;
+      const writePaths = Array.isArray(task?.writePaths) ? [...task.writePaths] : [];
+      if (!id || !commitSha(commit)) {
+        return { id: id || '__incomplete__', mode: 'incomplete', commit: null, writePaths };
+      }
+      return { id, mode: 'merge', commit, writePaths };
+    });
+  }
+  if (!planTasks.length || !nodes) return undefined;
   const scopes = [];
-  for (const task of run.plan.tasks) {
-    const commit = run.nodes?.[task?.id]?.headSha;
-    if (!commitSha(commit)) continue;
+  for (const task of planTasks) {
+    const id = typeof task?.id === 'string' ? task.id.trim() : '';
+    const node = nodes?.[task?.id];
+    if (!id || !commitSha(node?.baseSha) || !commitSha(node?.headSha)) continue;
     scopes.push({
-      id: String(task.id),
-      commit,
+      id,
+      mode: 'range',
+      baseCommit: node.baseSha,
+      commit: node.headSha,
       writePaths: Array.isArray(task.writePaths) ? [...task.writePaths] : [],
     });
   }
@@ -271,7 +362,7 @@ export function architectureTaskScopesForRun(run) {
  * @property {string} [baseSha] Merge base of the affected-module plan.
  * @property {Record<string, any>} [config] Raw `architecture` configuration; normalized here.
  * @property {string[]} [taskPaths] Explicit writePaths of the checked task(s) (used for Rust contract crate protection).
- * @property {{ id: string, commit: string, writePaths: string[] }[]} [taskScopes] Per-task commit + writePaths scopes for epic gates.
+ * @property {{ id: string, mode?: 'merge' | 'range' | 'incomplete', commit: string | null, baseCommit?: string, writePaths: string[] }[]} [taskScopes] Per-task commit + writePaths scopes for Rust v2 runs and epic gates.
  * @property {AbortSignal} [signal]
  */
 
@@ -299,9 +390,7 @@ export async function runArchitectureChecks({
   };
   if (!config.enabled) return receipt;
   const boundTaskPaths = normalizeTaskPaths(taskPaths);
-  if (boundTaskPaths !== undefined) receipt.taskPaths = boundTaskPaths;
   const boundTaskScopes = normalizeTaskScopes(taskScopes);
-  if (boundTaskScopes?.length) receipt.taskScopes = boundTaskScopes;
   const directory = await privateDirectory(artifacts, cwd, signal);
   Object.assign(receipt, {
     status: 'blocked',
@@ -325,6 +414,10 @@ export async function runArchitectureChecks({
       ...(boundTaskPaths !== undefined ? { taskPaths: boundTaskPaths } : {}),
       ...(boundTaskScopes?.length ? { taskScopes: boundTaskScopes } : {}),
     });
+    if (isRustV2Report(receipt.report)) {
+      if (boundTaskPaths !== undefined) receipt.taskPaths = boundTaskPaths;
+      if (boundTaskScopes?.length) receipt.taskScopes = boundTaskScopes;
+    }
     receipt.status =
       receipt.report.passed === true ? 'passed' : receipt.report.status === 'failed' ? 'failed' : 'blocked';
     receipt.passed = receipt.status === 'passed';
@@ -376,18 +469,6 @@ export async function isCurrentArchitectureReceipt(
   try {
     config = normalizeArchitectureConfig(config);
     if (!config.enabled) return true; // Neutral, never an enabled PASS.
-    const expectedTaskPaths = normalizeTaskPaths(taskPaths);
-    if (expectedTaskPaths !== undefined) {
-      const actualTaskPaths = receipt?.taskPaths === undefined ? [] : normalizeTaskPaths(receipt.taskPaths);
-      // A receipt produced without taskPaths ran under the strictest contract-protection mode;
-      // any path granted during the check must remain authorized by the caller's expectedTaskPaths.
-      if (actualTaskPaths.some(item => !expectedTaskPaths.includes(item))) return false;
-    }
-    const expectedTaskScopes = normalizeTaskScopes(taskScopes);
-    if (expectedTaskScopes !== undefined) {
-      const actualTaskScopes = receipt?.taskScopes === undefined ? [] : normalizeTaskScopes(receipt.taskScopes);
-      if (hash(actualTaskScopes) !== hash(expectedTaskScopes)) return false;
-    }
     if (
       receipt?.schemaVersion !== 1 ||
       receipt.status !== 'passed' ||
@@ -405,12 +486,29 @@ export async function isCurrentArchitectureReceipt(
       return false;
     const stored = await readEvidence(receipt.evidence[0], receipt.evidenceRoot);
     if (hash(stored) !== hash(snapshot(receipt))) return false;
+    const isRust = isRustV2Report(receipt.report);
+    if (isRust) {
+      const expectedTaskPaths = normalizeTaskPaths(taskPaths);
+      if (expectedTaskPaths !== undefined) {
+        const actualTaskPaths = receipt?.taskPaths === undefined ? [] : normalizeTaskPaths(receipt.taskPaths);
+        // A receipt produced without taskPaths ran under the strictest contract-protection mode;
+        // any path granted during the check must remain authorized by the caller's expectedTaskPaths.
+        if (actualTaskPaths.some(item => !expectedTaskPaths.includes(item))) return false;
+      }
+      const actualTaskScopes = receipt?.taskScopes === undefined ? [] : normalizeTaskScopes(receipt.taskScopes);
+      if (hasIncompleteTaskScope(actualTaskScopes)) return false;
+      const expectedTaskScopes = normalizeTaskScopes(taskScopes);
+      if (expectedTaskScopes !== undefined) {
+        if (hasIncompleteTaskScope(expectedTaskScopes)) return false;
+        if (hash(actualTaskScopes) !== hash(expectedTaskScopes)) return false;
+      }
+    }
     const { architectureCli } = await import('./architecture-cli.mjs');
     const planned = await architectureCli(['plan', '--project', receipt.cwd, '--base', baseSha, '--json'], {
       signal,
       ...(now ? { now } : {}),
-      ...(receipt.taskPaths !== undefined ? { taskPaths: receipt.taskPaths } : {}),
-      ...(receipt.taskScopes !== undefined ? { taskScopes: receipt.taskScopes } : {}),
+      ...(isRust && receipt.taskPaths !== undefined ? { taskPaths: receipt.taskPaths } : {}),
+      ...(isRust && receipt.taskScopes !== undefined ? { taskScopes: receipt.taskScopes } : {}),
     });
     if (
       planned.report.status !== 'planned' ||

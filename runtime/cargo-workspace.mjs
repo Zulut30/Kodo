@@ -2,6 +2,7 @@
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { parse as parseToml } from 'smol-toml';
+import { ownsPath } from './scope-paths.mjs';
 
 const compare = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
@@ -86,24 +87,12 @@ export function expandScopeBraces(rawScope, maxBranches = MAX_SCOPE_BRACE_EXPANS
   return [...new Set(expanded.map(normalizeScopePath).filter(Boolean))];
 }
 
-function singleScopeMatchesPath(scope, file) {
-  if (!scope || !file) return false;
-  if (scope === '.' || scope === '**') return true;
-  if (!SCOPE_GLOB_META.test(scope)) return file === scope || file.startsWith(`${scope}/`);
-  if (scope.endsWith('/**')) {
-    const base = scope.slice(0, -3);
-    if (base && !SCOPE_GLOB_META.test(base) && (file === base || file.startsWith(`${base}/`))) return true;
-  }
-  return path.posix.matchesGlob(file, scope);
-}
-
 export function scopeMatchesPath(rawScope, rawFile) {
   const scope = normalizeScopePath(rawScope);
   const file = normalizeScopePath(rawFile);
   if (!scope || !file) return false;
-  const branches = expandScopeBraces(scope);
-  if (branches === null) return singleScopeMatchesPath(scope, file);
-  return branches.some(branch => singleScopeMatchesPath(branch, file));
+  if (scope === '.') return true;
+  return ownsPath([scope], file);
 }
 
 /**
@@ -452,41 +441,47 @@ function findCandidateRoots(startDir, manifestDirs, parsedCache) {
     }
     if (isPlainObject(entry.doc.package) && packageCandidate === null) {
       packageCandidate = { rootDir: dir, entry };
-      if (workspaceCandidate === null && entry.doc.package.workspace !== undefined) {
+      if (entry.doc.package.workspace !== undefined) {
         const pkgManifest = dir ? `${dir}/Cargo.toml` : 'Cargo.toml';
-        if (typeof entry.doc.package.workspace !== 'string') {
+        if (isPlainObject(entry.doc.workspace) || typeof entry.doc.package.workspace !== 'string') {
           return {
             workspaceCandidate: null,
             packageCandidate,
+            explicitWorkspace: false,
             explicitError: { scope: 'manifest', file: pkgManifest, reason: 'invalid-workspace-config' },
           };
         }
-        const explicitDir = resolveRelativeDir(dir, entry.doc.package.workspace);
-        if (explicitDir === null) {
+        if (workspaceCandidate === null) {
+          const explicitDir = resolveRelativeDir(dir, entry.doc.package.workspace);
+          if (explicitDir === null) {
+            return {
+              workspaceCandidate: null,
+              packageCandidate,
+              explicitWorkspace: false,
+              explicitError: { scope: 'manifest', file: pkgManifest, reason: 'unsafe-path' },
+            };
+          }
+          const wsEntry = manifestDirs.has(explicitDir) ? parsedCache(explicitDir) : { error: 'missing' };
+          if (!wsEntry.error && !isPlainObject(wsEntry.doc.workspace)) {
+            const wsManifest = explicitDir ? `${explicitDir}/Cargo.toml` : 'Cargo.toml';
+            return {
+              workspaceCandidate: null,
+              packageCandidate,
+              explicitWorkspace: false,
+              explicitError: { scope: 'workspace', file: wsManifest, reason: 'missing-cargo-workspace' },
+            };
+          }
           return {
-            workspaceCandidate: null,
+            workspaceCandidate: { rootDir: explicitDir, entry: wsEntry },
             packageCandidate,
-            explicitError: { scope: 'manifest', file: pkgManifest, reason: 'unsafe-path' },
+            explicitWorkspace: true,
           };
         }
-        const wsEntry = manifestDirs.has(explicitDir) ? parsedCache(explicitDir) : { error: 'missing' };
-        if (!wsEntry.error && !isPlainObject(wsEntry.doc.workspace)) {
-          const wsManifest = explicitDir ? `${explicitDir}/Cargo.toml` : 'Cargo.toml';
-          return {
-            workspaceCandidate: null,
-            packageCandidate,
-            explicitError: { scope: 'workspace', file: wsManifest, reason: 'missing-cargo-workspace' },
-          };
-        }
-        return {
-          workspaceCandidate: { rootDir: explicitDir, entry: wsEntry },
-          packageCandidate,
-        };
       }
     }
     if (workspaceCandidate !== null) break;
   }
-  return { workspaceCandidate, packageCandidate };
+  return { workspaceCandidate, packageCandidate, explicitWorkspace: false };
 }
 
 function isNestedWorkspaceRoot(rootDir, candidateDir, manifestDirs, parsedCache) {
@@ -634,7 +629,7 @@ function expandPathMembers({
   }
 }
 
-function loadMemberPackages(selected, parsedCache, workspacePackage, unknown) {
+function loadMemberPackages(selected, rootDir, parsedCache, workspacePackage, unknown) {
   const members = [];
   const seenNames = new Set();
   for (const dir of [...selected].sort(compare)) {
@@ -643,6 +638,15 @@ function loadMemberPackages(selected, parsedCache, workspacePackage, unknown) {
     if (parsed.error) {
       unknown('manifest', manifest, 'parse-error', 0);
       continue;
+    }
+    if (parsed.doc.package?.workspace !== undefined) {
+      if (isPlainObject(parsed.doc.workspace) || typeof parsed.doc.package.workspace !== 'string') {
+        unknown('manifest', manifest, 'invalid-workspace-config');
+      } else {
+        const declaredWs = resolveRelativeDir(dir, parsed.doc.package.workspace);
+        if (declaredWs === null) unknown('manifest', manifest, 'unsafe-path');
+        else if (declaredWs !== rootDir) unknown('workspace', manifest, 'wrong-workspace-root');
+      }
     }
     const name = typeof parsed.doc.package?.name === 'string' ? parsed.doc.package.name.trim() : '';
     if (!name) {
@@ -768,7 +772,7 @@ function resolveWorkspaceAtRoot({ rootDir, rootEntry, manifestDirs, snapshotDirs
     });
   }
 
-  const members = loadMemberPackages(selected, parsedCache, workspacePackage, unknown);
+  const members = loadMemberPackages(selected, rootDir, parsedCache, workspacePackage, unknown);
   return {
     selected,
     isExcluded,
@@ -812,7 +816,7 @@ export function resolveCargoWorkspace({ manifests, files, startDir = '' }) {
   };
 
   const cleanStart = normalizeWorkspacePath(startDir === '' ? '.' : startDir) ?? '';
-  const { workspaceCandidate, packageCandidate, explicitError } = findCandidateRoots(
+  const { workspaceCandidate, packageCandidate, explicitError, explicitWorkspace } = findCandidateRoots(
     cleanStart,
     manifestDirs,
     parsedCache,
@@ -850,7 +854,7 @@ export function resolveCargoWorkspace({ manifests, files, startDir = '' }) {
   ) {
     return wsResolved.result;
   }
-  if (wsResolved.isExcluded(packageCandidate.rootDir)) {
+  if (wsResolved.isExcluded(packageCandidate.rootDir) && !explicitWorkspace) {
     return resolveFrom(packageCandidate).result;
   }
   const pkgManifest = packageCandidate.rootDir ? `${packageCandidate.rootDir}/Cargo.toml` : 'Cargo.toml';
