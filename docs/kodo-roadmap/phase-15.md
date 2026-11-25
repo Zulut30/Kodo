@@ -97,6 +97,10 @@ Git-транспорт `refs/kodo/<projectId>/base|work/<runId>`, брифы б�
 
 `kodo report --project`: задач в час, p50/p95 задачи, разбивка времени (агент, сборка, очередь, гейт, квота, человек), First-Pass Yield, арбитражи, вмешательства, загрузка подписок и машин. Навык `kodo-project-director` и [T3-HOST](../T3-HOST.md): старт с `profile set`, цикл скользящего окна, передача подписки и машины в `delegate_task`, архив чата сразу после интеграции.
 
+### 16D. Бэклог живого пилота (`kodo/16d-pilot-backlog`)
+
+Самопроверка `kodo ci feedback` на Rust-проектах: правило Волны 0 `rust_toolchain_required` для `rust-toolchain.toml` (`channel = "1.x.y"`, `clippy`, `rustfmt`), предупреждение `toolchain_unpinned` вместо `blocked` только в самопроверке воркера (гейты и `task-fast` без ослабления), выбор затронутых крейтов по графу Cargo без `affected_graph_fallback`, классификация конфиг-файлов Волны 0 (`.gitignore`, `architecture.policy.json`, `Cargo.lock`, `rust-toolchain.toml`). Перевод `cargoMembers` (`runtime/cargo-graph.mjs`) и `rustWorkspaceRoots` (`runtime/quality.mjs`) на канонический `resolveCargoWorkspace` (`runtime/cargo-workspace.mjs`) с консервативным `cargo-workspace-unsupported` при `unsupported` и дифференциальным тестом по фикстурам `cargo metadata`.
+
 ### Интеграция 1.2.0 и контрольная точка 2
 
 Слияние 16A–16C, полные проверки, CI, ревью, PR, `v1.2.0`, глобальный `kodo`. Большой прогон: многовеховая оригинальная воксельная игра на Rust, 50–80 задач, 10–20 параллельных воркеров; веха 2 через `kodo project extend`; итог по KPI.

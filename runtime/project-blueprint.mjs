@@ -14,6 +14,8 @@ import {
   scopeMatchesPath,
 } from './cargo-workspace.mjs';
 import { scopesOverlap } from './contracts.mjs';
+import { execute } from './command.mjs';
+import { workerEnvironment } from './security.mjs';
 import { inside } from './toolchains.mjs';
 
 export const BLUEPRINT_DIR = '.kodo/blueprint';
@@ -534,6 +536,7 @@ export function parallelOverlaps(tasks, { ancestors = taskAncestors(tasks), othe
 const SHARED_INTEGRATION_FILES = new Set([
   'Cargo.toml',
   'Cargo.lock',
+  'rust-toolchain.toml',
   'package.json',
   'package-lock.json',
   'pnpm-workspace.yaml',
@@ -1333,6 +1336,54 @@ export function rustContractCrateFindings(
   return findings;
 }
 
+function isRustWriteScope(rawScope) {
+  const scope = normalizeRelScope(rawScope);
+  if (!scope) return false;
+  return /(?:^|[/{,])(?:Cargo\.toml|[^/{},]+\.rs)(?:[},]|$)/i.test(scope);
+}
+
+function isRustToolchainBlueprint(spec, architecturePolicy, { hasCommittedCargoManifest = false } = {}) {
+  if (architecturePolicy?.schemaVersion === 2 && architecturePolicy?.language === 'rust') return true;
+  if (hasCommittedCargoManifest) return true;
+  return spec.tasks.some(task => (task.writePaths ?? []).some(isRustWriteScope));
+}
+
+/** Wave 0 for Rust blueprints must include `rust-toolchain.toml` (exact `channel = "1.x.y"`
+ * with `clippy` and `rustfmt` components) in its writePaths unless a valid committed file already exists. */
+export function rustToolchainFindings(
+  spec,
+  _projectMarkdown = '',
+  architecturePolicy = null,
+  { hasRustToolchain = false, hasCommittedCargoManifest = false } = {},
+) {
+  if (hasRustToolchain) return [];
+  const waveZeroEpics = new Set(
+    spec.epics.filter(epic => epic.id === FOUNDATION_ID || epic.milestoneId === FOUNDATION_ID).map(epic => epic.id),
+  );
+  const waveZeroTasks = spec.tasks.filter(task => waveZeroEpics.has(task.epicId));
+  if (!waveZeroTasks.length) return [];
+  if (!isRustToolchainBlueprint(spec, architecturePolicy, { hasCommittedCargoManifest })) return [];
+  const coversToolchain = waveZeroTasks.some(task =>
+    (task.writePaths ?? []).some(rawScope => {
+      const scope = normalizeScopePath(rawScope);
+      return (
+        Boolean(scope) &&
+        (scope === 'rust-toolchain.toml' ||
+          scope.endsWith('/rust-toolchain.toml') ||
+          isExplicitContractScope(scope, '', 'rust-toolchain.toml'))
+      );
+    }),
+  );
+  if (coversToolchain) return [];
+  return [
+    finding(
+      'rust_toolchain_required',
+      'Для Rust-проекта Волна 0 (foundation) должна содержать задачу с rust-toolchain.toml ' +
+        '(точная версия channel = "1.x.y", компоненты clippy и rustfmt) в writePaths',
+    ),
+  ];
+}
+
 function analyzeFactorySpec(spec, options = {}) {
   const {
     contracts = projectContracts,
@@ -1341,6 +1392,8 @@ function analyzeFactorySpec(spec, options = {}) {
     projectMarkdown = '',
     architecturePolicy = null,
     packageNames = null,
+    hasRustToolchain = false,
+    hasCommittedCargoManifest = false,
   } = options;
   const base = normalizeFactory(spec, { contracts, knownValues });
   const findings = [...base.findings, ...sectionFindings(projectMarkdown)];
@@ -1359,6 +1412,10 @@ function analyzeFactorySpec(spec, options = {}) {
   findings.push(
     ...ownerFindings(base.spec.tasks),
     ...waveZeroFindings(base.spec, ancestors),
+    ...rustToolchainFindings(base.spec, projectMarkdown, architecturePolicy, {
+      hasRustToolchain,
+      hasCommittedCargoManifest,
+    }),
     ...rustContractCrateFindings(base.spec, projectMarkdown, architecturePolicy, ancestors, packageNames),
     ...containerFindings(base.spec),
     ...epicCycleFindings(base.spec.tasks),
@@ -1467,6 +1524,72 @@ async function readOptionalArchitecturePolicy(root) {
   }
 }
 
+async function readCommittedRootEntry(root, file) {
+  try {
+    const top = await execute('git', ['rev-parse', '--show-toplevel'], {
+      cwd: root,
+      env: workerEnvironment(),
+      rawOutput: true,
+      allowFailure: true,
+      timeoutMs: 10000,
+    });
+    if (top.code !== 0 || typeof top.stdout !== 'string' || !(await sameDirectory(top.stdout.trim(), root)))
+      return null;
+    const ls = await execute('git', ['ls-tree', '-z', 'HEAD', '--', file], {
+      cwd: root,
+      env: workerEnvironment(),
+      rawOutput: true,
+      allowFailure: true,
+      timeoutMs: 10000,
+    });
+    if (ls.code !== 0 || typeof ls.stdout !== 'string') return null;
+    const rows = ls.stdout.split('\0').filter(Boolean);
+    if (rows.length !== 1) return null;
+    const match = /^(100644|100755) blob ([a-f0-9]{40,64})\t([\s\S]+)$/.exec(rows[0]);
+    if (!match || match[3] !== file) return null;
+    return { oid: match[2] };
+  } catch {
+    return null;
+  }
+}
+
+async function hasCommittedCargoManifest(root) {
+  return Boolean(await readCommittedRootEntry(root, 'Cargo.toml'));
+}
+
+async function readOptionalRustToolchain(root) {
+  const entry = await readCommittedRootEntry(root, 'rust-toolchain.toml');
+  if (!entry) return false;
+  try {
+    const sizeOut = await execute('git', ['cat-file', '-s', entry.oid], {
+      cwd: root,
+      env: workerEnvironment(),
+      rawOutput: true,
+      allowFailure: true,
+      timeoutMs: 10000,
+    });
+    const size = Number(sizeOut.stdout?.trim());
+    if (sizeOut.code !== 0 || !Number.isSafeInteger(size) || size < 0 || size > BLUEPRINT_LIMITS.project) return false;
+    const blob = await execute('git', ['cat-file', 'blob', entry.oid], {
+      cwd: root,
+      env: workerEnvironment(),
+      rawOutput: true,
+      allowFailure: true,
+      timeoutMs: 10000,
+    });
+    if (blob.code !== 0 || typeof blob.stdout !== 'string' || Buffer.byteLength(blob.stdout) > BLUEPRINT_LIMITS.project)
+      return false;
+    const doc = parseToml(blob.stdout);
+    const tc = /** @type {Record<string, any> | null} */ (isPlain(doc?.toolchain) ? doc.toolchain : null);
+    const channel = typeof tc?.channel === 'string' ? tc.channel.trim() : '';
+    const exactChannel = /^\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?$/.test(channel);
+    const components = Array.isArray(tc?.components) ? tc.components : [];
+    return exactChannel && components.includes('clippy') && components.includes('rustfmt');
+  } catch {
+    return false;
+  }
+}
+
 async function readOptionalCargoPackageNames(root, specValue, projectMarkdown) {
   const dirs = new Set(['']);
   if (isPlain(specValue) && Array.isArray(specValue.tasks)) {
@@ -1504,10 +1627,18 @@ async function readOptionalCargoPackageNames(root, specValue, projectMarkdown) {
  * (with execution) even when findings exist; ok is the only acceptance signal.
  * `specFile` optionally replaces .kodo/blueprint/spec.json. Nothing is written to disk.
  * @param {string} root
- * @param {{ contracts?: typeof projectContracts, knownValues?: string[], specFile?: string, architecturePolicy?: Record<string, any> | null, packageNames?: Map<string, string> | Record<string, string> | null }} [options] */
+ * @param {{ contracts?: typeof projectContracts, knownValues?: string[], specFile?: string, architecturePolicy?: Record<string, any> | null, packageNames?: Map<string, string> | Record<string, string> | null, hasRustToolchain?: boolean, hasCommittedCargoManifest?: boolean }} [options] */
 export async function compileBlueprint(
   root,
-  { contracts = projectContracts, knownValues = [], specFile, architecturePolicy, packageNames } = {},
+  {
+    contracts = projectContracts,
+    knownValues = [],
+    specFile,
+    architecturePolicy,
+    packageNames,
+    hasRustToolchain,
+    hasCommittedCargoManifest: committedCargo,
+  } = {},
 ) {
   let blueprint;
   try {
@@ -1524,6 +1655,10 @@ export async function compileBlueprint(
     packageNames === undefined
       ? await readOptionalCargoPackageNames(blueprint.root, source.value, blueprint.project.text)
       : packageNames;
+  const resolvedToolchain =
+    hasRustToolchain === undefined ? await readOptionalRustToolchain(blueprint.root) : Boolean(hasRustToolchain);
+  const resolvedCommittedCargo =
+    committedCargo === undefined ? await hasCommittedCargoManifest(blueprint.root) : Boolean(committedCargo);
   const analysis = analyzeFactorySpec(source.value, {
     contracts,
     knownValues,
@@ -1531,6 +1666,8 @@ export async function compileBlueprint(
     projectMarkdown: blueprint.project.text,
     architecturePolicy: policy,
     packageNames: resolvedPackageNames,
+    hasRustToolchain: resolvedToolchain,
+    hasCommittedCargoManifest: resolvedCommittedCargo,
   });
   const findings = [...source.findings, ...analysis.findings];
   return { ok: findings.length === 0, spec: analysis.spec, interfaces: blueprint.interfaces, findings };
