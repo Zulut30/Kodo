@@ -183,15 +183,9 @@ test('A slot built from another checkout drops only the fingerprints of path pac
   assert.equal((await units()).length, 4, 'a build without a checkout leaves the slot alone');
 });
 
-test('Two checkouts of one workspace never share a stale library through the slot', { timeout: 300000 }, async t => {
-  try {
-    await staleLibraryScenario(t);
-  } catch (error) {
-    // CI keeps only the tail of stderr: an unexpected failure prints its stack there.
-    console.error(`cargo-slots stale-library failure: ${error?.stack ?? error}`);
-    throw error;
-  }
-});
+test('Two checkouts of one workspace never share a stale library through the slot', { timeout: 300000 }, t =>
+  staleLibraryScenario(t),
+);
 
 async function staleLibraryScenario(t) {
   const { spawnSync } = await import('node:child_process');
@@ -236,8 +230,7 @@ async function staleLibraryScenario(t) {
   const baseline = await cargoTest(older, older);
   if (baseline.status !== 0) return t.skip(`cargo cannot build here: ${baseline.output.slice(-400)}`);
   const verified = await cargoTest(newer, newer);
-  // CI keeps only the tail of stderr: the Cargo output of a failure goes there.
-  if (verified.status !== 0) console.error(`cargo-slots stale-library output:\n${verified.output.slice(-1500)}`);
-  assert.equal(verified.status, 0, verified.output);
-  assert.match(verified.output, /test b \.\.\. ok/);
+  // The runner's stderr failure line keeps 200 characters of this message: Cargo's last words.
+  assert.equal(verified.status, 0, `cargo: ${verified.output.replace(/\s+/g, ' ').slice(-180)}`);
+  assert.match(verified.output, /test b \.\.\. ok/, `cargo: ${verified.output.replace(/\s+/g, ' ').slice(-180)}`);
 }

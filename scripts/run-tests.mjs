@@ -242,6 +242,11 @@ export async function runTests({
           kind: 'kodo-test-failure',
           name: (path.isAbsolute(name) ? path.basename(name) : name).slice(0, 240),
           failureType: String(data?.details?.error?.failureType || 'unknown').slice(0, 80),
+          // The first line of the cause (an assertion's own message) tells a CI reader what failed.
+          message: String(data?.details?.error?.cause?.message ?? data?.details?.error?.message ?? '')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .slice(0, 200),
         }),
       );
     });
