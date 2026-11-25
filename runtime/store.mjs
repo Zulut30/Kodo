@@ -429,9 +429,25 @@ export class Store {
   gateLessons(project, limit = 200) {
     return this.db
       .prepare(
-        "SELECT body FROM knowledge WHERE project=? AND json_extract(body, '$.kind') = 'gate-lesson' ORDER BY time DESC LIMIT ?",
+        "SELECT body FROM knowledge WHERE project=? AND json_extract(body, '$.kind') = 'gate-lesson' ORDER BY time DESC, rowid DESC LIMIT ?",
       )
       .all(projectKey(project), limit)
+      .map(row => JSON.parse(String(row.body)));
+  }
+  gateLessonsPage(project, { projectId = null, limit = 50, offset = 0 } = {}) {
+    if (projectId) {
+      return this.db
+        .prepare(
+          "SELECT body FROM knowledge WHERE project=? AND json_extract(body, '$.kind') = 'gate-lesson' AND (json_extract(body, '$.projectId') IS NULL OR json_extract(body, '$.projectId') = ?) ORDER BY time DESC, rowid DESC LIMIT ? OFFSET ?",
+        )
+        .all(projectKey(project), projectId, limit, offset)
+        .map(row => JSON.parse(String(row.body)));
+    }
+    return this.db
+      .prepare(
+        "SELECT body FROM knowledge WHERE project=? AND json_extract(body, '$.kind') = 'gate-lesson' ORDER BY time DESC, rowid DESC LIMIT ? OFFSET ?",
+      )
+      .all(projectKey(project), limit, offset)
       .map(row => JSON.parse(String(row.body)));
   }
   findKnowledgeCapture(project, captureId) {

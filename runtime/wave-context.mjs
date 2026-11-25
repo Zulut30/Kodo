@@ -277,6 +277,37 @@ export function packWaveContextBlocks({
 }
 
 /**
+ * Paginate `gate-lesson` rows in SQL (filtered by project + projectId) until `maxLessons`
+ * distinct verified matching lessons are collected or the table ends, so unrelated modules
+ * cannot evict matching lessons.
+ */
+export function selectStoreWaveVerifiedLessons(store, projectRoot, { task, projectId, maxLessons = 3, pageSize = 50 }) {
+  if (typeof store?.gateLessonsPage !== 'function') {
+    const all =
+      typeof store?.gateLessons === 'function'
+        ? store.gateLessons(projectRoot)
+        : (store?.lessons?.(projectRoot, 200) ?? []);
+    return selectWaveVerifiedLessons(all, { task, projectId, maxLessons });
+  }
+  const selected = [];
+  const seenText = new Set();
+  for (let offset = 0; selected.length < maxLessons; offset += pageSize) {
+    const page = store.gateLessonsPage(projectRoot, { projectId, limit: pageSize, offset });
+    if (!page.length) break;
+    const matches = selectWaveVerifiedLessons(page, { task, projectId, maxLessons });
+    for (const item of matches) {
+      const norm = item.summary.trim().replace(/\s+/g, ' ').toLowerCase();
+      if (seenText.has(norm)) continue;
+      seenText.add(norm);
+      selected.push(item);
+      if (selected.length === maxLessons) break;
+    }
+    if (page.length < pageSize) break;
+  }
+  return selected;
+}
+
+/**
  * Prepare shared wave context (API cards, scoped gate lessons, prior-attempt diagnostics)
  * for either an external (`next-wave`) or native (`drain`) wave task Run.
  */
@@ -306,9 +337,7 @@ export async function prepareWaveTaskContext({
           buildApiCardsImpl,
           signal,
         });
-  const allGateLessons =
-    typeof store.gateLessons === 'function' ? store.gateLessons(project.root) : store.lessons(project.root, 200);
-  const verifiedLessons = selectWaveVerifiedLessons(allGateLessons, {
+  const verifiedLessons = selectStoreWaveVerifiedLessons(store, project.root, {
     task,
     projectId: project.projectId,
   });

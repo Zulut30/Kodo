@@ -4,6 +4,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { Store } from '../runtime/store.mjs';
+import { prepareWaveTaskContext } from '../runtime/wave-context.mjs';
 import {
   compactPlanEvidence,
   compactReviewEvidence,
@@ -497,4 +498,79 @@ test('G7: dotted module directory names stay distinct, gate-lesson requires own 
     seenSql.filter(sql => /json_extract\(body,\s*'\$\.kind'\)/.test(sql) && /LIMIT\s*\?/i.test(sql)).length,
     2,
   );
+});
+
+test('V3: 200+ newer unrelated module gate-lessons do not evict a matching module lesson in real Store', async t => {
+  const home = await mkdtemp(path.join(os.tmpdir(), 'kodo-v3-store-'));
+  const store = new Store(home);
+  t.after(async () => {
+    store.close();
+    await rm(home, { recursive: true, force: true });
+  });
+  const project = path.join(home, 'repo');
+  const sha = 'd'.repeat(40);
+  const makeLesson = (id, summary, mod, epicId) => ({
+    runId: id,
+    headSha: sha,
+    summary,
+    lesson: summary,
+    kind: 'gate-lesson',
+    projectId: 'p1',
+    epicIds: [epicId],
+    modules: [mod],
+    writePaths: [mod],
+    criterionIds: [`epic:${epicId}:ok`],
+    checks: { complete: true, headSha: sha, results: [{ command, exitCode: 0, status: 'passed' }] },
+    review: { passed: true, headSha: sha },
+  });
+
+  // Insert 1 older lesson for packages/core.api, then 205 newer lessons for packages/core.ui.
+  store.rememberLesson(
+    project,
+    'api-lesson-0',
+    makeLesson('api-lesson-0', 'Keep core.api responses deterministic', 'packages/core.api', 'api'),
+  );
+  const projectKeyVal = store.db.prepare('SELECT project FROM knowledge WHERE run_id=?').get('api-lesson-0').project;
+  store.db.prepare('UPDATE knowledge SET time=? WHERE run_id=?').run(1000, 'api-lesson-0');
+  const insert = store.db.prepare('INSERT OR REPLACE INTO knowledge VALUES(?,?,?,?)');
+  for (let i = 1; i <= 205; i++) {
+    const rec = makeLesson(`ui-lesson-${i}`, `UI rule #${i}`, 'packages/core.ui', 'ui');
+    insert.run(`ui-lesson-${i}`, projectKeyVal, JSON.stringify(rec), 2000 + i);
+  }
+
+  const ctx = { store, engine: { store, secrets: {} } };
+  const snapshot = {
+    project: { projectId: 'p1', root: project, constraints: [], execution: { cadence: 'wave', integration: 'branch' } },
+    tasks: [],
+  };
+  const task = {
+    id: 'api-2',
+    epicId: 'api-next',
+    writePaths: ['packages/core.api/src/routes.ts'],
+    dependsOn: [],
+    interfaceRefs: [],
+  };
+  const run = store.createRun({ id: 'run-api-2', project, baseSha: sha });
+  const prepared = await prepareWaveTaskContext({
+    ctx,
+    snapshot,
+    attempt: { id: 'att-1', number: 1 },
+    task,
+    run,
+    buildApiCardsImpl: async () => ({
+      schemaVersion: 1,
+      kind: 'api-cards',
+      baseSha: sha,
+      maxBytes: 4096,
+      text: 'API card',
+      bytes: 8,
+      originalBytes: 8,
+      truncated: false,
+      omitted: { files: 0, signatures: 0, invariants: 0 },
+      invariants: [],
+      modules: [],
+    }),
+  });
+  assert.equal(prepared.verifiedLessons.length, 1);
+  assert.equal(prepared.verifiedLessons[0].summary, 'Keep core.api responses deterministic');
 });
