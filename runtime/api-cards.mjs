@@ -379,6 +379,82 @@ export function extractRustPublicApi(source) {
 
 // ---- JS/TS public API extractor ---------------------------------------------
 
+const REGEX_PREFIX_CHARS = new Set([
+  '(',
+  '[',
+  '{',
+  ',',
+  ';',
+  ':',
+  '=',
+  '!',
+  '&',
+  '|',
+  '?',
+  '~',
+  '^',
+  '+',
+  '-',
+  '*',
+  '%',
+  '<',
+  '>',
+]);
+const REGEX_PREFIX_WORDS = new Set([
+  'return',
+  'throw',
+  'case',
+  'in',
+  'of',
+  'typeof',
+  'void',
+  'delete',
+  'new',
+  'yield',
+  'await',
+  'else',
+  'do',
+  'export',
+  'default',
+]);
+
+function canStartJsRegex(code, i) {
+  let prev = i - 1;
+  while (prev >= 0 && /\s/.test(code[prev])) prev--;
+  if (prev < 0) return true;
+  if (REGEX_PREFIX_CHARS.has(code[prev])) return true;
+  if (isIdentChar(code[prev])) {
+    let start = prev;
+    while (start > 0 && isIdentChar(code[start - 1])) start--;
+    const word = code.slice(start, prev + 1).join('');
+    return REGEX_PREFIX_WORDS.has(word);
+  }
+  return false;
+}
+
+function scanJsRegex(source, start) {
+  let j = start + 1;
+  let inClass = false;
+  while (j < source.length) {
+    const ch = source[j];
+    if (ch === '\\') {
+      if (j + 1 >= source.length || source[j + 1] === '\n' || source[j + 1] === '\r') return -1;
+      j += 2;
+      continue;
+    }
+    if (ch === '\n' || ch === '\r') return -1;
+    if (ch === '[') inClass = true;
+    else if (ch === ']' && inClass) inClass = false;
+    else if (ch === '/' && !inClass) {
+      j++;
+      while (j < source.length && /[a-zA-Z]/.test(source[j])) j++;
+      return j;
+    }
+    j++;
+  }
+  return -1;
+}
+
 function maskJsTs(source) {
   const code = Array.from(source);
   const noComments = Array.from(source);
@@ -405,6 +481,16 @@ function maskJsTs(source) {
       blank(noComments, i, j);
       i = j;
       continue;
+    }
+    if (ch === '/' && canStartJsRegex(code, i)) {
+      const end = scanJsRegex(source, i);
+      if (end !== -1) {
+        blank(code, i, end);
+        code[i] = 'r';
+        code[end - 1] = 'r';
+        i = end;
+        continue;
+      }
     }
     if (ch === "'" || ch === '"') {
       let j = i + 1;
@@ -730,11 +816,13 @@ function finalizeConstExport(noComments, eqPos, end) {
   return eqPos !== -1 && !keepValue ? eqPos : end;
 }
 
-function isConstAsiEnd(code, noComments, nlIndex) {
-  const prevIdx = lastNonSpaceBefore(noComments, nlIndex);
-  if (prevIdx >= 0 && EXPR_CONT.has(noComments[prevIdx])) return false;
+function isConstAsiEnd(code, _noComments, nlIndex) {
   const nextIdx = nextNonSpaceOnSameOrLaterLine(code, nlIndex + 1);
   if (nextIdx >= code.length) return true;
+  // A top-level `export` on the next line never continues an expression from the previous line.
+  if (/^export\b/.test(code.slice(nextIdx))) return true;
+  const prevIdx = lastNonSpaceBefore(code, nlIndex);
+  if (prevIdx >= 0 && EXPR_CONT.has(code[prevIdx])) return false;
   return code[nextIdx] === '}' || STMT_START.test(code.slice(nextIdx));
 }
 

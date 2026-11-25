@@ -556,3 +556,23 @@ export const next = (v: number): "ok" | "err" => (v > 0 ? "ok" : "err");
     'export const next = (v: number): "ok" | "err" =>',
   ]);
 });
+
+test('V4: extractJsTsPublicApi masks regex literals and preserves following top-level exports without semicolons', () => {
+  const src = `
+export const pattern = () => /[a-z]+/
+export const VERSION = 2;
+export const complexRe = () => /a{1,3};"\\/'[\\]/]+/gi
+export function afterRegex(): number { return 1; }
+export const directRe = /^foo\\/bar$/
+export const NEXT = 'ok'
+`;
+  const sigs = extractJsTsPublicApi(src);
+  assert.deepEqual(sigs, [
+    'export const pattern = () =>',
+    'export const VERSION = 2',
+    'export const complexRe = () =>',
+    'export function afterRegex(): number',
+    'export const directRe = /^foo\\/bar$/',
+    "export const NEXT = 'ok'",
+  ]);
+});
