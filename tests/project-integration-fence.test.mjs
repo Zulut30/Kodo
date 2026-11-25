@@ -9,8 +9,17 @@ import { mkdtemp, mkdir, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { Store } from '../runtime/store.mjs';
-import { ensureIntegration, mergeTask } from '../runtime/project-integration.mjs';
+import { lstat } from 'node:fs/promises';
+import { setTimeout as delay } from 'node:timers/promises';
+import {
+  atomicPublisher,
+  ensureIntegration,
+  headOnIntegrationBranch,
+  mergeBackGate,
+  mergeTask,
+} from '../runtime/project-integration.mjs';
 import { integrationLeaseName, withIntegrationLease } from '../runtime/project-integration-lease.mjs';
+import { fencedPublisher } from '../runtime/project-publish.mjs';
 import { withGateController } from '../runtime/project-controller-lease.mjs';
 import { fencedBy } from '../runtime/lease-fence.mjs';
 
@@ -46,8 +55,17 @@ async function fixture(t) {
     git(worktree, 'commit', '-q', '-m', `Task ${name}`);
     return git(worktree, 'rev-parse', 'HEAD');
   };
-  const merge = (taskId, taskHead, savePending = () => {}) =>
-    mergeTask({ worktree: integration.worktree, taskId, taskHead, writePaths: [`${taskId}.txt`], savePending });
+  // Production publishes fenced by the holder's leases (runtime/project-publish.mjs).
+  const merge = (taskId, taskHead, savePending = () => {}, options = {}) =>
+    mergeTask({
+      worktree: integration.worktree,
+      taskId,
+      taskHead,
+      writePaths: [`${taskId}.txt`],
+      savePending,
+      publish: fencedPublisher(store),
+      ...options,
+    });
   const branchHead = () => git(root, 'rev-parse', `refs/heads/${integration.branch}`);
   const merges = () =>
     git(root, 'log', '--merges', '--format=%s', `refs/heads/${integration.branch}`).split('\n').filter(Boolean);
@@ -88,7 +106,7 @@ test('A stale integration holder whose branch another holder moved cannot merge 
   assert.equal(f.store.getRun(run.id).integration.status, 'pending', 'the stale holder recorded no merge');
 });
 
-test('A stale holder whose branch did not move publishes the merge but cannot record it', async t => {
+test('A stale holder whose branch did not move yet cannot publish its merge', async t => {
   const f = await fixture(t);
   const alpha = await f.task('alpha');
   const run = f.store.createRun({ project: f.root, task: 'alpha' });
@@ -102,13 +120,155 @@ test('A stale holder whose branch did not move publishes the merge but cannot re
   f.store.db.prepare('DELETE FROM leases WHERE name=?').run(name);
   const other = f.store.acquireLease(name, 'other', { ttlMs: 60000 });
   pause.resume();
+  // The new holder has not moved the branch: a compare-and-swap alone would let the stale holder
+  // win. The fenced publish checks the tokens in the same SQLite write transaction first.
   await assert.rejects(stale, { code: 'project_lease_lost' });
-  assert.equal(f.store.getRun(run.id).integration, undefined, 'the fenced record failed');
-  // The current holder recovers the merge from the branch history: never a second merge.
+  assert.deepEqual(f.merges(), [], 'nothing was published');
+  assert.equal(f.store.getRun(run.id).integration, undefined, 'and nothing recorded');
   f.store.releaseLease(other);
-  const recovered = await withIntegrationLease(f.store, f.projectId, () => f.merge('alpha', alpha));
-  assert.equal(recovered.mergeCommit, f.branchHead());
+  const merged = await withIntegrationLease(f.store, f.projectId, () => f.merge('alpha', alpha));
+  assert.equal(merged.mergeCommit, f.branchHead());
   assert.deepEqual(f.merges(), ['Kodo: integrate alpha']);
+});
+
+test('A worker branch that left its verified head is refused in the same ref transaction', async t => {
+  const f = await fixture(t);
+  const alpha = await f.task('alpha');
+  const before = f.branchHead();
+  // The worker commits again after its head was verified.
+  const worker = path.join(f.temp, 'tasks', 'alpha');
+  await writeFile(path.join(worker, 'alpha.txt'), 'alpha again\n');
+  git(worker, 'commit', '-q', '-am', 'Again');
+  await assert.rejects(
+    withIntegrationLease(f.store, f.projectId, () =>
+      f.merge('alpha', alpha, () => {}, { verify: [{ ref: 'refs/heads/kodo/alpha', sha: alpha }] }),
+    ),
+    { code: 'project_submission_stale' },
+  );
+  assert.equal(f.branchHead(), before, 'the integration branch did not move');
+  assert.equal(git(f.integration.worktree, 'status', '--porcelain'), '');
+});
+
+test('Returning a gate head is fenced: a lost lease or a moved branch publishes nothing', async t => {
+  const f = await fixture(t);
+  const gateHead = await (async () => {
+    // A gate repair commit on top of the integration head (a fast-forward candidate).
+    const worktree = path.join(f.temp, 'tasks', 'gate');
+    git(f.root, 'worktree', 'add', '-q', '-b', 'kodo/gate', worktree, f.branchHead());
+    await writeFile(path.join(worktree, 'gate.txt'), 'gate\n');
+    git(worktree, 'add', '-A');
+    git(worktree, 'commit', '-q', '-m', 'Gate repair');
+    return git(worktree, 'rev-parse', 'HEAD');
+  })();
+  const expectedHead = f.branchHead();
+  const name = integrationLeaseName(f.projectId);
+  const back = () =>
+    mergeBackGate({ worktree: f.integration.worktree, expectedHead, gateHead, publish: fencedPublisher(f.store) });
+  // The lease expired (its row is still there) before the gate head was returned.
+  await assert.rejects(
+    withIntegrationLease(f.store, f.projectId, async () => {
+      f.store.db.prepare('UPDATE leases SET expires=? WHERE name=?').run(Date.now() - 1, name);
+      return back();
+    }),
+    { code: 'project_lease_lost' },
+  );
+  assert.equal(f.branchHead(), expectedHead);
+  f.store.db.prepare('DELETE FROM leases WHERE name=?').run(name);
+  // Another holder moved the branch between the check and the publish: the swap fails.
+  const beta = await f.task('beta');
+  const moved = await withIntegrationLease(f.store, f.projectId, async () => {
+    const publish = async commands => {
+      await f.merge('beta', beta, () => {}, { publish: atomicPublisher });
+      return fencedPublisher(f.store)(commands);
+    };
+    return mergeBackGate({ worktree: f.integration.worktree, expectedHead, gateHead, publish }).catch(
+      error => error.code,
+    );
+  });
+  assert.equal(moved, 'project_lease_lost');
+  assert.deepEqual(f.merges(), ['Kodo: integrate beta']);
+});
+
+test('A crash between publishing a merge and syncing the worktree is recovered on retry', async t => {
+  const f = await fixture(t);
+  const alpha = await f.task('alpha');
+  const before = f.branchHead();
+  let pending = null;
+  // The process dies right after the ref transaction, before the worktree follows.
+  const crash = async commands => {
+    await atomicPublisher(commands);
+    throw Object.assign(new Error('Injected crash after update-ref'), { code: 'injected_crash' });
+  };
+  await assert.rejects(
+    f.merge('alpha', alpha, value => (pending = value), { publish: crash }),
+    { code: 'injected_crash' },
+  );
+  assert.equal(pending.before, before);
+  assert.equal(f.branchHead(), pending.mergeCommit, 'the merge is published');
+  assert.notEqual(git(f.integration.worktree, 'status', '--porcelain'), '', 'the worktree still shows before');
+  // A held index.lock stops the sync: the retry fails and changes nothing.
+  const lock = path.join(git(f.integration.worktree, 'rev-parse', '--absolute-git-dir'), 'index.lock');
+  await writeFile(lock, '');
+  await assert.rejects(f.merge('alpha', alpha, () => {}, { pending }));
+  assert.equal(f.branchHead(), pending.mergeCommit);
+  await rm(lock);
+  // The retry syncs exactly that state and recovers the published merge: never a second merge.
+  const recovered = await f.merge('alpha', alpha, () => assert.fail('no new merge'), { pending });
+  assert.equal(recovered.mergeCommit, pending.mergeCommit);
+  assert.equal(git(f.integration.worktree, 'status', '--porcelain'), '');
+  assert.deepEqual(f.merges(), ['Kodo: integrate alpha']);
+  // Any other dirty state is refused, never synced away.
+  const beta = await f.task('beta');
+  let betaPending = null;
+  await assert.rejects(f.merge('beta', beta, value => (betaPending = value), { publish: crash }));
+  await writeFile(path.join(f.integration.worktree, 'shared.txt'), 'edited by hand\n');
+  await assert.rejects(
+    f.merge('beta', beta, () => {}, { pending: betaPending }),
+    {
+      code: 'project_integration_worktree_invalid',
+    },
+  );
+  assert.equal(await lstat(lock).catch(() => null), null);
+});
+
+test('An expired lease is never renewed, and a nested integration lease after a loss stops at once', async t => {
+  const f = await fixture(t);
+  const token = f.store.acquireLease('renew:test', 'holder', { ttlMs: 60000 });
+  assert.equal(f.store.renewLease(token), true);
+  f.store.db.prepare('UPDATE leases SET expires=? WHERE token=?').run(Date.now() - 1, token);
+  assert.equal(f.store.renewLease(token), false, 'an expired row is not revived');
+  const name = integrationLeaseName(f.projectId);
+  const started = Date.now();
+  const nested = await withIntegrationLease(f.store, f.projectId, async () => {
+    f.store.db.prepare('DELETE FROM leases WHERE name=?').run(name);
+    f.store.acquireLease(name, 'other', { ttlMs: 60000 });
+    return withIntegrationLease(f.store, f.projectId, async () => 'ran').catch(error => error.code);
+  });
+  assert.equal(nested, 'project_lease_lost');
+  assert.ok(Date.now() - started < 30000, 'no wait for the lease');
+});
+
+test('A failed fenced write reports its own error, never a ROLLBACK failure', async t => {
+  const f = await fixture(t);
+  assert.throws(
+    () =>
+      f.store.withFence([], () => {
+        f.store.db.exec('ROLLBACK');
+        throw new Error('the original failure');
+      }),
+    /the original failure/,
+  );
+  assert.equal(f.store.db.isTransaction, false);
+});
+
+test('A missing integration branch is not on any head, never a Git error', async t => {
+  const f = await fixture(t);
+  const alpha = await f.task('alpha');
+  assert.equal(await headOnIntegrationBranch({ cwd: f.root, projectId: f.projectId, head: f.branchHead() }), true);
+  assert.equal(await headOnIntegrationBranch({ cwd: f.root, projectId: f.projectId, head: alpha }), false);
+  git(f.root, 'update-ref', '-d', `refs/heads/${f.integration.branch}`);
+  assert.equal(await headOnIntegrationBranch({ cwd: f.root, projectId: f.projectId, head: alpha }), false);
+  await delay(0);
 });
 
 test('Fenced writes check the live lease tokens in their own transaction', async t => {

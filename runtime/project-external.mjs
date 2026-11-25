@@ -29,6 +29,7 @@ import {
   ensureIntegration,
   inspectHistory,
   integrationHeadOf,
+  headOnIntegrationBranch,
   mergeOnBranch,
   waveFrontier,
 } from './project-integration.mjs';
@@ -46,6 +47,7 @@ import {
 import { withMachineBuild } from './machine-build-lease.mjs';
 import { awaitIntegration, drainIntegrationQueue, openIntegrationQueue } from './project-integration-queue.mjs';
 import { verifyTaskFastOnce } from './wave-verifier.mjs';
+import { fencedBy } from './lease-fence.mjs';
 import { workerRole } from './worker-roles.mjs';
 import { applyWavePolicy } from './wave-policy.mjs';
 import { DEFAULT_CLI, assertCliPrefix, quotePath } from './cli-command.mjs';
@@ -475,7 +477,7 @@ async function explainWave(state, snapshot) {
  * @param {{ projectId: string, host: string, limit?: number, retryFailed?: boolean, ports?: any, cli?: string }} input
  */
 export async function nextWave(ctx, input) {
-  const { projectId, host, limit = 3, retryFailed = false, ports, cli = DEFAULT_CLI } = input;
+  const { projectId, host, limit = 3, cli = DEFAULT_CLI } = input;
   need(isPullHost(host), 'host_unsupported');
   need(Number.isSafeInteger(limit) && limit >= 1 && limit <= MAX_WAVE_LIMIT, 'limit_invalid');
   assertCliPrefix(cli);
@@ -506,7 +508,17 @@ export async function nextWave(ctx, input) {
   if (typeof home === 'string') quotePath(await plannedWorktreeHome(home));
   const token = store.acquireLease(`project:${projectId}`, randomUUID(), { ttlMs: 60000, limit: 1 });
   need(token, 'busy');
+  // Every reservation and Run install of this call is fenced by its lease (runtime/lease-fence.mjs).
   try {
+    return await fencedBy([token], () => reserveWave(ctx, input, { C, store, cli, options, snapshot, token }));
+  } finally {
+    store.releaseLease(token);
+  }
+}
+
+async function reserveWave(ctx, input, { C, store, cli, options, snapshot, token }) {
+  const { projectId, host, limit = 3, retryFailed = false, ports } = input;
+  {
     const integration = await ensureIntegration({
       root: snapshot.project.root,
       projectId,
@@ -534,8 +546,6 @@ export async function nextWave(ctx, input) {
     const result = { projectId, revision, cli, briefs: state.briefs, blocked: state.blocked };
     C.assertDirectorSafe(result, options);
     return result;
-  } finally {
-    store.releaseLease(token);
   }
 }
 
@@ -854,10 +864,10 @@ async function replayedMerge(ctx, input, run) {
   };
 }
 
-// Whether `headSha` is on the project's integration branch (Git decides, not a record).
-async function headOnBranch(projectId, run, headSha) {
-  return ancestor(run.project, headSha, await integrationHeadOf({ cwd: run.project, projectId }));
-}
+// Whether `headSha` is on the project's integration branch (Git decides, not a record; false when
+// the branch does not exist).
+const headOnBranch = (projectId, run, headSha) =>
+  headOnIntegrationBranch({ cwd: run.project, projectId, head: headSha });
 
 const integrationStarted = run => ['merged', 'pending'].includes(run.integration?.status);
 const cancelled = run => Boolean(run.externalAbandon) || run.cancelRequested === true || run.state === 'cancelled';
@@ -982,7 +992,14 @@ async function integrateQueued(ctx, C, W, waveCtx, entry, signal) {
     if (cancelled(run) || !['running', 'verifying'].includes(attempt.status)) return stale;
     if (await workerStateDefect(run, headSha)) return stale;
   }
-  const integration = await W.integrateAndAdvance(waveCtx, { projectId, taskId, run: store.getRun(run.id), signal });
+  let integration;
+  try {
+    integration = await W.integrateAndAdvance(waveCtx, { projectId, taskId, run: store.getRun(run.id), signal });
+  } catch (error) {
+    // The ref transaction found the worker's branch off its verified head: nothing was published.
+    if (error?.code === 'project_submission_stale') return stale;
+    throw error;
+  }
   if (integration?.status !== 'integrated') {
     const code = integration?.code ?? 'project_integration_blocked';
     const after = store.getRun(run.id);

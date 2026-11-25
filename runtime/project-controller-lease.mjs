@@ -71,7 +71,7 @@ export async function withHeldLease(store, token, work, heartbeatMs = 10000) {
     } catch {
       return; // A transient Store failure must not throw from the timer; the next beat retries.
     }
-    if (renewed === false) lost.abort();
+    if (renewed === false) lost.abort(Object.assign(new Error('Project lease lost'), { code: 'project_lease_lost' }));
   }, heartbeatMs);
   timer.unref();
   try {
@@ -156,7 +156,7 @@ async function withControllerLease(store, name, work, options = {}) {
     } catch {
       return; // A transient Store failure must not throw from the timer; the next beat retries.
     }
-    if (renewed === false) lost.abort();
+    if (renewed === false) lost.abort(Object.assign(new Error('Project lease lost'), { code: 'project_lease_lost' }));
   }, heartbeatMs);
   timer.unref();
   // Only the standalone gate uses this callback, around the private Run. Rejoin

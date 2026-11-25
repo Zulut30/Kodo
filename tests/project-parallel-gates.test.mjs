@@ -279,3 +279,12 @@ test('A pass that a pause stopped reports why, even when the pause is lifted aft
   project.snapshot.project.paused = false;
   assert.equal(out.stopped, 'project_control_blocked');
 });
+
+test('A pass whose signal carries a lost lease reports the loss, never a cancel', async () => {
+  const { ctx } = memoryProject({ milestones: ['m1'], epics: [{ id: 'e1', milestoneId: 'm1' }] });
+  const controller = new AbortController();
+  controller.abort(Object.assign(new Error('Project lease lost'), { code: 'project_lease_lost' }));
+  ctx.runGate = async () => assert.fail('no gate runs without its lease');
+  const out = await runPendingGates(ctx, { projectId, signal: controller.signal });
+  assert.equal(out.stopped, 'project_lease_lost');
+});

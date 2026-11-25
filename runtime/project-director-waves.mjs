@@ -41,6 +41,7 @@ import {
 import { withGateController } from './project-controller-lease.mjs';
 import { withIntegrationLease as withLease } from './project-integration-lease.mjs';
 import { fencedBy } from './lease-fence.mjs';
+import { fencedPublisher } from './project-publish.mjs';
 import { GATE_WATCHDOG, createGateRunDraft, runEpicGate } from './wave-verifier.mjs';
 import { normalizeWatchdogConfig, recordBlocker } from './watchdog.mjs';
 import { applyWavePolicy, assertWavePolicy } from './wave-policy.mjs';
@@ -137,6 +138,8 @@ function childrenOf(snapshot, kind, id) {
 // (`project_control_blocked`) or a cancelled signal (`project_cancelled`); null to go on. The pass
 // reports it itself, so a caller never infers it from a later snapshot.
 function stopReason(snapshot, signal) {
+  // A lost lease is never reported as a cancel or a pause (its signal carries the reason).
+  if (signal?.aborted && signal.reason?.code === 'project_lease_lost') return 'project_lease_lost';
   if (controlState(snapshot)) return 'project_control_blocked';
   return signal?.aborted ? 'project_cancelled' : null;
 }
@@ -233,7 +236,8 @@ async function withProjectControl(ctx, projectId, signal, work) {
     },
   };
   try {
-    return await work(control);
+    // Writes of the foreground director are fenced by its lease (runtime/lease-fence.mjs).
+    return await fencedBy([token], () => work(control));
   } finally {
     clearInterval(timer);
     clearInterval(polling);
@@ -369,9 +373,23 @@ async function mergeRun(ctx, snapshot, task, run) {
       writePaths: task.writePaths,
       // Every commit of the task enters the branch: each one is inspected, not only the result.
       secrets: ctx.engine.secrets,
-      savePending: ({ before }) => ctx.store.updateRun(run.id, { integration: { branch, before, status: 'pending' } }),
-      // A crash after savePending may have left this merge unfinished (MERGE_HEAD).
-      pending: run.integration?.status === 'pending' ? { before: run.integration.before } : null,
+      savePending: ({ before, mergeCommit }) =>
+        ctx.store.updateRun(run.id, { integration: { branch, before, mergeCommit, status: 'pending' } }),
+      // A crash after savePending may have published the merge without syncing the worktree.
+      pending:
+        run.integration?.status === 'pending'
+          ? {
+              before: run.integration.before,
+              ...(run.integration.mergeCommit ? { mergeCommit: run.integration.mergeCommit } : {}),
+            }
+          : null,
+      // Published under the holder's lease fence; an external worker's branch must still be on
+      // its verified head in the same ref transaction.
+      publish: fencedPublisher(ctx.store),
+      verify:
+        run.executor?.kind === 'external' && typeof run.branch === 'string'
+          ? [{ ref: `refs/heads/${run.branch}`, sha: run.headSha }]
+          : [],
     });
     const integration = {
       branch: merged.branch,
@@ -713,7 +731,12 @@ async function acceptGate(ctx, projectId, gate, run, out, signal) {
       out.stopped ??= stopped;
       return;
     }
-    await mergeBackGate({ worktree, expectedHead: gate.headSha, gateHead: run.headSha });
+    await mergeBackGate({
+      worktree,
+      expectedHead: gate.headSha,
+      gateHead: run.headSha,
+      publish: fencedPublisher(ctx.store),
+    });
     const refs = await persistRefs(ctx, run, gateKinds);
     for (const merge of gate.merges)
       for (const kind of ['attempt', 'task']) {
@@ -970,7 +993,7 @@ async function withGateLeases(ctx, names, work) {
       } catch {
         continue; // A transient Store failure must not throw from the timer; the next beat retries.
       }
-      if (renewed === false) lost.abort();
+      if (renewed === false) lost.abort(Object.assign(new Error('Project lease lost'), { code: 'project_lease_lost' }));
     }
   }, ctx.engine.leaseHeartbeatMs || 10000);
   timer.unref();

@@ -307,7 +307,12 @@ export async function drainIntegrationQueue(input) {
     if (!rows.length) break;
     for (const [index, entry] of rows.entries()) {
       if (index > 0 && stop()) {
-        for (const rest of rows.slice(index)) if (claimed.includes(rest)) queue.release(rest.seq, claim);
+        try {
+          for (const rest of rows.slice(index)) if (claimed.includes(rest)) queue.release(rest.seq, claim);
+        } catch (error) {
+          // A drain whose lease passed on leaves its claimed rows to the current holder (adopt).
+          if (error?.code !== 'project_lease_lost') throw error;
+        }
         return finished;
       }
       let outcome;

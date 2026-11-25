@@ -1072,6 +1072,7 @@ async function apply(ctx, input) {
 }
 
 async function installRun(ctx, input) {
+  // Installs are fenced like commands: a holder whose lease passed on installs nothing.
   safe(ctx, input);
   requireValue(
     input && Object.keys(input).length === 2 && Object.hasOwn(input, 'binding') && Object.hasOwn(input, 'runDraft'),
@@ -1080,6 +1081,7 @@ async function installRun(ctx, input) {
   const binding = normalize(ctx, 'installBinding', input.binding),
     runDraft = structuredClone(input.runDraft);
   return transaction(ctx.db, 'BEGIN IMMEDIATE', () => {
+    assertFence(ctx.db);
     const s = readSnapshot(ctx, binding.projectId);
     complete(ctx, s);
     const task = s.tasks.find(item => item.id === binding.taskId);
@@ -1255,6 +1257,7 @@ async function installGateRun(ctx, input) {
   const bound = value =>
     bytes(ctx, 'gateBinding', normalize(ctx, 'gateBinding', value)).equals(bytes(ctx, 'gateBinding', binding));
   return transaction(ctx.db, 'BEGIN IMMEDIATE', () => {
+    assertFence(ctx.db);
     const s = readSnapshot(ctx, binding.projectId);
     complete(ctx, s);
     requireValue(isWave(ctx, s.project), 'gate_unsupported');

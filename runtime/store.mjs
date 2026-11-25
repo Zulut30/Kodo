@@ -5,6 +5,15 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { stateHome, redact } from './security.mjs';
 import { assertFence } from './lease-fence.mjs';
+
+// Roll back only an open transaction and never mask the error that caused it.
+function rollback(db) {
+  try {
+    if (db.isTransaction) db.exec('ROLLBACK');
+  } catch {
+    /* The initiating failure is the one reported. */
+  }
+}
 const projectKey = value => {
   const resolved = path.resolve(value);
   return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
@@ -374,7 +383,7 @@ export class Store {
       if (own) this.db.exec('COMMIT');
       return run;
     } catch (error) {
-      if (own) this.db.exec('ROLLBACK');
+      if (own) rollback(this.db);
       throw error;
     }
   }
@@ -395,7 +404,7 @@ export class Store {
       this.db.exec('COMMIT');
       return result;
     } catch (error) {
-      this.db.exec('ROLLBACK');
+      rollback(this.db);
       throw error;
     }
   }
@@ -555,8 +564,14 @@ export class Store {
       throw error;
     }
   }
+  // An expired lease is never renewed (another holder may already have taken it): one `now` for
+  // the check and the new expiry; no row changed means the lease is lost.
   renewLease(token, ttlMs = 60000) {
-    return this.db.prepare('UPDATE leases SET expires=? WHERE token=?').run(Date.now() + ttlMs, token).changes > 0;
+    const now = Date.now();
+    return (
+      this.db.prepare('UPDATE leases SET expires=? WHERE token=? AND expires>?').run(now + ttlMs, token, now).changes >
+      0
+    );
   }
   releaseLease(token) {
     this.db.prepare('DELETE FROM leases WHERE token=?').run(token);

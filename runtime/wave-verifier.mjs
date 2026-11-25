@@ -489,7 +489,10 @@ export async function verifyTaskFastOnce({ engine, run: input, signal, expectedH
       return { passed: true, headSha: run.headSha, checks: run.checks, behavior: run.behavior };
     } catch (caught) {
       const error = leaseError() || caught;
-      if (leased.aborted || ['cancelled', 'quota', 'auth', 'lease_lost', 'evidence_integrity'].includes(error.code))
+      if (
+        leased.aborted ||
+        ['cancelled', 'quota', 'auth', 'lease_lost', 'project_lease_lost', 'evidence_integrity'].includes(error.code)
+      )
         throw error;
       return {
         passed: false,

@@ -31,6 +31,9 @@ export async function withIntegrationLease(store, projectId, work, options = {})
   const name = integrationLeaseName(projectId),
     outer = held.getStore();
   if (integrationLeaseHeld(store, projectId)) return work();
+  // A nested call whose outer holder lost the lease stops at once: it never waits to take the
+  // lease again inside work that the outer holder no longer owns.
+  if (outer?.has(name)) fail('lease_lost');
   const deadline = Date.now() + waitMs;
   let token;
   while (!(token = store.acquireLease(name, randomUUID(), { ttlMs: 60000, limit: 1 }))) {

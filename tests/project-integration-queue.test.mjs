@@ -461,3 +461,63 @@ test('A lost lease aborts its holder, and a nested project section refuses to go
   );
   assert.equal(slot, true);
 });
+
+test('A lease lost between drain rows ends the drain quietly, the rest stays for the next holder', async t => {
+  const store = (await home(t)).open();
+  const queue = openIntegrationQueue(store);
+  for (const taskId of ['a', 'b', 'd']) queue.enqueue(row(taskId));
+  const token = store.acquireLease(`project-integration:${projectId}`, 'drain', { ttlMs: 60000 });
+  const expire = () => store.db.prepare('UPDATE leases SET expires=? WHERE token=?').run(Date.now() - 1, token);
+  // The lease expires while b integrates: a is finished, b's outcome is never recorded.
+  const finished = await fencedBy([token], () =>
+    drainIntegrationQueue({
+      queue,
+      projectId,
+      scopeOf,
+      integrate: async entry => {
+        if (entry.taskId === 'b') expire();
+        return { status: 'integrated' };
+      },
+    }),
+  );
+  assert.deepEqual(
+    finished.map(entry => entry.taskId),
+    ['a'],
+  );
+  assert.deepEqual(
+    queue.list(projectId).map(entry => [entry.taskId, entry.status]),
+    [
+      ['a', 'integrated'],
+      ['b', 'merging'],
+      ['d', 'merging'],
+    ],
+  );
+  // A stop between rows whose release finds the lease gone does not throw either.
+  const second = store.acquireLease(`project-integration:${projectId}`, 'drain-2', { ttlMs: 60000 });
+  queue.enqueue(row('e'));
+  queue.enqueue(row('f'));
+  store.db.prepare("UPDATE kodo_integration_queue SET status='integrated' WHERE task_id IN ('b','d')").run();
+  let rows = 0;
+  const stopped = await fencedBy([second], () =>
+    drainIntegrationQueue({
+      queue,
+      projectId,
+      // The lease expires right when the drain stops: releasing the unstarted row is fenced too.
+      stop: () => {
+        if (rows === 0) return false;
+        store.db.prepare('UPDATE leases SET expires=? WHERE token=?').run(Date.now() - 1, second);
+        return true;
+      },
+      integrate: async () => {
+        rows++;
+        return { status: 'integrated' };
+      },
+    }),
+  );
+  assert.equal(stopped.length, 1);
+  assert.equal(queue.list(projectId).find(entry => entry.taskId === 'f').status, 'merging', 'left for adopt');
+  const expiredRelease = await fencedBy([second], () =>
+    drainIntegrationQueue({ queue, projectId, integrate: async () => ({ status: 'integrated' }) }),
+  );
+  assert.deepEqual(expiredRelease, [], 'a drain without its lease ends quietly');
+});

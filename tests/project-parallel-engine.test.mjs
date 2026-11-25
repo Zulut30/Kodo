@@ -268,6 +268,14 @@ test('A verified completion waits for a busy integration lease beyond the old 12
   assert.equal(f.merges().length, 1);
 });
 
+// A "dead" process: its promise settles only when the test ends (with an error that its caller
+// swallows), never while the test runs; no promise is left pending forever.
+function frozen(t) {
+  return new Promise((resolve, reject) =>
+    t.after(() => reject(Object.assign(new Error('The process died'), { code: 'injected_crash' }))),
+  );
+}
+
 // Wait for `condition` (polled every 20 ms) with a deadline of its own: a broken build fails here.
 async function until(condition, label, ms = 120000) {
   const deadline = Date.now() + ms;
@@ -591,7 +599,7 @@ test('A pending merge that never reached the branch is checked again: a moved wo
       integration: { branch: `kodo/project/${f.projectId}`, before: f.integrationHead(), status: 'pending' },
     });
     died();
-    await new Promise(() => {});
+    await frozen(t);
   };
   const background = new AbortController();
   void f.complete(brief, head, { signal: background.signal }).catch(() => {});
@@ -663,7 +671,7 @@ test('A drain that dies after a merge never merges that task twice', async t => 
     const result = await waves.integrateAndAdvance(waveCtx, input);
     if (input.taskId === 't1' && f.calls.integrate.filter(id => id === 't1').length === 1) {
       died();
-      await new Promise(() => {});
+      await frozen(t);
     }
     return result;
   };
@@ -704,4 +712,59 @@ test('A drain that dies after a merge never merges that task twice', async t => 
   assert.deepEqual(f.calls.integrate, ['t0', 't1', 't1', 't2'], 't1 is resumed once, never merged again');
   assert.equal(f.merges().length, 3, 'one merge commit per task');
   assert.ok(queue.list(f.projectId).every(row => row.status === 'integrated'));
+});
+
+test('next-wave reserves and installs nothing once its project lease passed on', async t => {
+  const f = await fixture(t, { count: 2 });
+  const name = `project:${f.projectId}`;
+  // The TTL of next-wave's lease expired and another controller took project:<id>.
+  const handOff = () => {
+    f.store.db.prepare('DELETE FROM leases WHERE name=?').run(name);
+    f.store.acquireLease(name, 'other', { ttlMs: 60000 });
+  };
+  const wave = repo => nextWave({ ...f.ctx, repo }, { projectId: f.projectId, host: 't3', ports: f.ports, limit: 2 });
+  const beforeReserve = Object.create(f.repo, {
+    apply: {
+      value: async command => {
+        if (command.action.op === 'reserveAttempt') handOff();
+        return f.repo.apply(command);
+      },
+    },
+  });
+  const reserved = await wave(beforeReserve);
+  assert.deepEqual(reserved.briefs, []);
+  assert.ok(reserved.blocked.length > 0);
+  assert.ok(
+    reserved.blocked.every(row => row.code === 'project_lease_lost'),
+    JSON.stringify(reserved.blocked),
+  );
+  assert.deepEqual((await f.snapshot()).currentAttempts, [], 'no attempt was reserved');
+  f.store.db.prepare('DELETE FROM leases WHERE name=?').run(name);
+  // Before the Run install of a reserved attempt.
+  const beforeInstall = Object.create(f.repo, {
+    installRun: {
+      value: async value => {
+        handOff();
+        return f.repo.installRun(value);
+      },
+    },
+  });
+  const installed = await wave(beforeInstall);
+  assert.deepEqual(installed.briefs, []);
+  assert.ok(
+    installed.blocked.some(row => row.code === 'project_lease_lost'),
+    JSON.stringify(installed.blocked),
+  );
+  for (const attempt of (await f.snapshot()).currentAttempts)
+    assert.throws(() => f.store.getRun(attempt.runId), 'no Run was installed');
+});
+
+test('A lost lease inside task-fast is reported as such, never as a failed check', async t => {
+  const f = await fixture(t, { count: 1 });
+  const [brief] = (await f.briefs()).values();
+  await f.change(brief);
+  t.mock.method(f.engine, 'behaviorGate', async () => {
+    throw Object.assign(new Error('Project lease lost'), { code: 'project_lease_lost' });
+  });
+  await assert.rejects(verifyTaskFastOnce({ engine: f.engine, run: brief.runId }), { code: 'project_lease_lost' });
 });

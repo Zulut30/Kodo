@@ -85,6 +85,7 @@ async function pins() {
     'project-controller-lease.mjs',
     'machine-build-lease.mjs',
     'lease-fence.mjs',
+    'project-publish.mjs',
     'project-wave-evidence.mjs',
     'project-director-waves.mjs',
     'project-cli-wave.mjs',
