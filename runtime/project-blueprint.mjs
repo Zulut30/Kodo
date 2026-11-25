@@ -1295,7 +1295,8 @@ async function readOptionalCargoPackageNames(root, specValue, projectMarkdown) {
     try {
       const file = await readBoundedFile(target, BLUEPRINT_LIMITS.project);
       const doc = parseToml(file.text);
-      const pkgName = typeof doc?.package?.name === 'string' ? doc.package.name.trim() : '';
+      const pkg = /** @type {Record<string, any> | null} */ (isPlain(doc?.package) ? doc.package : null);
+      const pkgName = typeof pkg?.name === 'string' ? pkg.name.trim() : '';
       if (pkgName) names.set(dir, pkgName);
     } catch {
       /* Missing or unreadable manifest: fall back to directory name. */
