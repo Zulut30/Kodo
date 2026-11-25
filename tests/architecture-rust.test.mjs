@@ -2378,3 +2378,52 @@ test('W9: architectureTaskPathsForRun is shared, gate error surfaces snapshot (b
     `expected snapshot="base" on base unsupported, got ${JSON.stringify(baseRes.unsupported)}`,
   );
 });
+
+test('X5: members = ["*"] excludes workspace root itself while root [package] is added separately; explicit package.workspace resolves before ancestor search', async () => {
+  const mod = await import('../runtime/cargo-workspace.mjs');
+  const virtualStar = mod.resolveCargoWorkspace({
+    manifests: {
+      'Cargo.toml': '[workspace]\nresolver = "2"\nmembers = ["*"]\n',
+      'a/Cargo.toml': '[package]\nname = "a"\nversion = "0.1.0"\nedition = "2021"\n',
+      'b/Cargo.toml': '[package]\nname = "b"\nversion = "0.1.0"\nedition = "2021"\n',
+    },
+    files: ['Cargo.toml', 'a/Cargo.toml', 'a/src/lib.rs', 'b/Cargo.toml', 'b/src/lib.rs'],
+  });
+  assert.deepEqual(virtualStar.unsupported, []);
+  assert.deepEqual(
+    virtualStar.members.map(m => m.name),
+    ['a', 'b'],
+  );
+
+  const rootPkgStar = mod.resolveCargoWorkspace({
+    manifests: {
+      'Cargo.toml':
+        '[package]\nname = "root-pkg"\nversion = "0.1.0"\nedition = "2021"\n[workspace]\nresolver = "2"\nmembers = ["*"]\nexclude = ["src"]\n',
+      'a/Cargo.toml': '[package]\nname = "a"\nversion = "0.1.0"\nedition = "2021"\n',
+    },
+    files: ['Cargo.toml', 'src/lib.rs', 'a/Cargo.toml', 'a/src/lib.rs'],
+  });
+  assert.deepEqual(rootPkgStar.unsupported, []);
+  assert.deepEqual(
+    rootPkgStar.members.map(m => m.name),
+    ['root-pkg', 'a'],
+  );
+
+  // Explicit package.workspace = "../.." bypasses intermediate nested [workspace].
+  const explicitWs = mod.resolveCargoWorkspace({
+    manifests: {
+      'Cargo.toml': '[workspace]\nresolver = "2"\nmembers = ["nested/sub", "peer"]\n',
+      'peer/Cargo.toml': '[package]\nname = "peer"\nversion = "0.1.0"\nedition = "2021"\n',
+      'nested/Cargo.toml': '[workspace]\nresolver = "2"\nmembers = ["other"]\n',
+      'nested/other/Cargo.toml': '[package]\nname = "other"\nversion = "0.1.0"\nedition = "2021"\n',
+      'nested/sub/Cargo.toml': '[package]\nname = "sub"\nversion = "0.1.0"\nedition = "2021"\nworkspace = "../.."\n',
+    },
+    startDir: 'nested/sub',
+  });
+  assert.deepEqual(explicitWs.unsupported, []);
+  assert.equal(explicitWs.root, '');
+  assert.deepEqual(
+    explicitWs.members.map(m => m.name),
+    ['sub', 'peer'],
+  );
+});
