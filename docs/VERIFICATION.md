@@ -522,6 +522,16 @@
 
 Без профиля, с одной подпиской или при красной детерминированной проверке гейт блокируется, как раньше. Арбитр оценивает только findings ревью и не отменяет упавшие тесты, гейты, smoke или `validateWaveGate`.
 
+Сохранённым квитанциям Run арбитр не доверяет. Перед сессией их проверяет та же проверка, что у Director при приёмке (`assertArbitrableReceipts` в `project-director.mjs`):
+
+- логи полных проверок по `outputPath` и `outputHash`, их содержимое и отпечаток команд;
+- ненулевой счёт тестов (`gate_tests_uncounted`);
+- свежесть behaviour, UI, security и architecture;
+- привязка ревью к текущему diff гейта (`review.diffHash`);
+- после smoke — его квитанция с логами.
+
+При любом несоответствии арбитр не вызывается. Run блокируется кодом квитанции, например `evidence_integrity`, `project_proof_invalid`, `project_checks_stale` или `project_review_stale`.
+
 Подписку выбирает `selectArbiter`. Её `provider` сопоставляется с клиентом Kodo: `codex`, `openai`, `chatgpt` → `codex`, `claude-code`, `claude`, `anthropic` → `claude-code`. Подписка с неизвестным провайдером не подходит. Клиент арбитра должен отличаться от клиента ревьюера. Подписки на паузе (`cooldownUntil`) пропускаются. Порядок выбора — тир `heavy`, затем `standard`, затем `fast`, внутри тира — порядок профиля. Модель берётся из подписки. Она должна входить в allowlist `models` конфигурации и быть доступна по подписке (`discoverProviders`). У Run с фиксированной моделью (`--model`) арбитра нет. Сессия идёт через `engine.session` подписочного клиента в режиме read-only, API не используется.
 
 Вход арбитра заморожен и сохраняется как evidence `gate-arbitration-input`. В нём критерии гейта, отчёт ревью (findings, criteria), ограниченный diff `baseSha...head` (до 60 000 символов, при `budgets.contextBytes` — не больше четверти бюджета) и квитанции checks, behaviour, гейтов и smoke. Ответ проверяется схемой:
@@ -533,7 +543,9 @@
 
 `confirm_pass` требует выполнения всех критериев и ни одного подтверждённого finding. Невалидный ответ или изменение worktree арбитром записываются как `confirm_defect` с полем `invalid`.
 
-Решение записывается в Run: `gateArbitration: {schemaVersion, decision, rationale, evidence, splitWork?, invalid?, client, model, subscriptionId, reviewerClient, reviewModel, headSha, reviewSessionId, reviewHash, input, sessionId, decidedAt, receipt}`. `receipt` — неизменяемое evidence `gate-arbitration` с той же записью. Повторный запуск того же Run берёт записанное решение и сессию не открывает. Квота, отмена и потеря lease прерывают Run без решения.
+Решение записывается в Run: `gateArbitration: {schemaVersion, status: 'decided', decision, rationale, evidence, splitWork?, invalid?, client, model, subscriptionId, reviewerClient, reviewModel, headSha, reviewSessionId, reviewHash, input, sessionId, attempts, decidedAt, receipt}`. `receipt` — неизменяемое evidence `gate-arbitration` с той же записью. Повторный запуск того же Run берёт записанное решение и сессию не открывает.
+
+Старт сессии записывается до неё: `gateArbitration: {status: 'started', headSha, reviewHash, attempts, startedAt, …}`. Квота, отмена или потеря lease прерывают Run без решения, и запись `started` остаётся. Повтор допустим один раз (`ARBITER_MAX_ATTEMPTS = 2`), только при том же проверенном head и той же квитанции ревью (`arbiterRetryAllowed`). Дальше, или при другой привязке, решение — `confirm_defect` с `invalid: 'arbiter_retry_exhausted'`, без сессии. Гейт принимается только по записи `status: 'decided'`.
 
 - `confirm_pass` — Run `succeeded`, `run.headSha` = проверенный head. Ревью остаётся квитанцией с `passed: false`.
 - `confirm_defect` — Run блокируется прежним кодом отказа ревью. В сообщении — вывод арбитра.

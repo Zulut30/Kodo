@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, writeFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -13,7 +13,9 @@ import { createProjectDirector, createProjectTransitionAuthorizer } from '../run
 import { runEpicGate } from '../runtime/wave-verifier.mjs';
 import { reportCli } from '../runtime/report-cli.mjs';
 import {
+  ARBITER_MAX_ATTEMPTS,
   arbiterContract,
+  arbiterRetryAllowed,
   arbitrationAccepts,
   arbitrationOf,
   reviewReceiptHash,
@@ -136,6 +138,7 @@ test('arbitrationAccepts binds confirm_pass to the verified head, the review rec
     review,
     gateArbitration: {
       schemaVersion: 1,
+      status: 'decided',
       decision: 'confirm_pass',
       client: 'claude-code',
       reviewerClient: 'codex',
@@ -151,6 +154,11 @@ test('arbitrationAccepts binds confirm_pass to the verified head, the review rec
     },
   };
   assert.equal(arbitrationAccepts(run), true);
+  assert.equal(
+    arbitrationAccepts({ ...run, gateArbitration: { ...run.gateArbitration, status: 'started' } }),
+    false,
+    'a started session decided nothing',
+  );
   const changed = mutate => {
     const copy = structuredClone(run);
     mutate(copy);
@@ -634,3 +642,141 @@ test('A substituted arbitration headSha is never accepted', { timeout: 300000 },
   );
   assert.equal(f.gateRun().state, 'blocked');
 });
+
+// --- round 2 -------------------------------------------------------------------------------------
+
+test('R2 an interrupted arbiter session repeats once, only on the same head and review receipt', () => {
+  const review = { passed: false, headSha: sha('b'), sessionId: 'review-2', findings: [] };
+  const started = { status: 'started', headSha: sha('b'), reviewHash: reviewReceiptHash(review), attempts: 1 };
+  assert.equal(ARBITER_MAX_ATTEMPTS, 2);
+  assert.equal(arbiterRetryAllowed(started, sha('b'), review), true);
+  assert.equal(arbiterRetryAllowed({ ...started, attempts: 2 }, sha('b'), review), false, 'one repeat only');
+  assert.equal(arbiterRetryAllowed(started, sha('d'), review), false, 'another reviewed head');
+  assert.equal(arbiterRetryAllowed(started, sha('b'), { ...review, sessionId: 'review-3' }), false, 'another review');
+  assert.equal(arbiterRetryAllowed({ ...started, status: 'decided' }, sha('b'), review), false, 'decided');
+  assert.equal(arbiterRetryAllowed(undefined, sha('b'), review), false);
+});
+
+const quota = () => Object.assign(new Error('Subscription limit reached'), { code: 'quota' });
+
+test(
+  'R1 saved receipts are checked like the Director before the arbiter: a deleted or substituted log or a stale diffHash blocks with the receipt code',
+  { timeout: 600000 },
+  async t => {
+    const f = await fixture(t, { profile: null });
+    const first = await f.director.drain(f.id);
+    assert.equal(first.status, 'blocked', JSON.stringify(first));
+    assert.equal(f.calls.arbiter.length, 0);
+    const original = f.gateRun();
+    const arbitration = { profile: twoProviders(), now: Date.now() };
+    const resume = () => runEpicGate({ engine: f.engine, run: original.id, arbitration });
+    const row = original.checks.results[0];
+    const text = await readFile(row.outputPath, 'utf8');
+
+    // 1. The log of a passed check is gone.
+    await rm(row.outputPath, { force: true });
+    let run = await resume();
+    assert.equal(run.state, 'blocked');
+    assert.equal(run.error.code, 'evidence_integrity');
+    assert.equal(run.blocker.current.code, 'evidence_integrity');
+    assert.equal(f.calls.arbiter.length, 0, 'no arbiter on a missing log');
+    assert.equal(run.gateArbitration, undefined);
+    await writeFile(row.outputPath, text, { mode: 0o600 });
+
+    // 2. Another intact log stands in for the passed one.
+    const log = JSON.parse(text);
+    const forged = await f.engine.persistEvidence(
+      f.store.getRun(original.id),
+      'check',
+      { ...log.value, exitCode: 1 },
+      { headSha: original.checks.headSha },
+    );
+    const results = original.checks.results.map((item, index) =>
+      index ? item : { ...item, outputPath: forged.path, outputHash: forged.sha256 },
+    );
+    f.store.updateRun(original.id, { checks: { ...original.checks, results } });
+    run = await resume();
+    assert.equal(run.state, 'blocked');
+    assert.equal(run.error.code, 'project_proof_invalid');
+    assert.equal(f.calls.arbiter.length, 0, 'no arbiter on a substituted log');
+    f.store.updateRun(original.id, { checks: original.checks });
+
+    // 3. The review receipt names another diff than the gate's current one.
+    f.store.updateRun(original.id, { review: { ...original.review, diffHash: 'e'.repeat(64) } });
+    run = await resume();
+    assert.equal(run.state, 'blocked');
+    assert.equal(run.error.code, 'project_review_stale');
+    assert.equal(f.calls.arbiter.length, 0, 'no arbiter on a stale diffHash');
+    f.store.updateRun(original.id, { review: original.review });
+
+    // With the receipts intact again the same Run is arbitrated, and the Director accepts it.
+    run = await resume();
+    assert.equal(run.state, 'succeeded', JSON.stringify(run.error));
+    assert.equal(f.calls.arbiter.length, 1);
+    assert.equal(run.gateArbitration.status, 'decided');
+    const accepted = await f.director.drain(f.id);
+    assert.equal(accepted.status, 'accepted', JSON.stringify(accepted));
+  },
+);
+
+test(
+  'R2 the start of an arbitration is recorded first; an interrupted session repeats once and then the drain accepts',
+  { timeout: 300000 },
+  async t => {
+    let call = 0;
+    const f = await fixture(t, {
+      arbiter: schema => {
+        if (++call === 1) throw quota();
+        return arbiterAnswer(schema);
+      },
+    });
+    const first = await f.director.drain(f.id);
+    assert.notEqual(first.status, 'accepted', JSON.stringify(first));
+    const interrupted = f.gateRun();
+    assert.equal(interrupted.state, 'waiting_limits');
+    assert.equal(interrupted.gateArbitration.status, 'started');
+    assert.equal(interrupted.gateArbitration.attempts, 1);
+    assert.equal(interrupted.gateArbitration.headSha, interrupted.review.headSha);
+    assert.equal(interrupted.gateArbitration.reviewHash, reviewReceiptHash(interrupted.review));
+    assert.equal(interrupted.gateArbitration.decision, undefined);
+    const second = await f.director.drain(f.id);
+    assert.equal(second.status, 'accepted', JSON.stringify(second));
+    assert.equal(f.calls.arbiter.length, 2, 'one repeat after the interruption');
+    const gate = f.gateRun();
+    assert.equal(gate.gateArbitration.status, 'decided');
+    assert.equal(gate.gateArbitration.decision, 'confirm_pass');
+    assert.equal(gate.gateArbitration.attempts, 2);
+  },
+);
+
+test(
+  'R2 a second interruption ends the arbitration: confirm_defect with arbiter_retry_exhausted and no third session',
+  { timeout: 300000 },
+  async t => {
+    const f = await fixture(t, {
+      arbiter: () => {
+        throw quota();
+      },
+    });
+    await f.director.drain(f.id);
+    const runId = f.gateRun().id;
+    assert.equal(f.gateRun().state, 'waiting_limits');
+    const arbitration = { profile: twoProviders(), now: Date.now() };
+    let run = await runEpicGate({ engine: f.engine, run: runId, arbitration });
+    assert.equal(run.state, 'waiting_limits');
+    assert.equal(run.gateArbitration.status, 'started');
+    assert.equal(run.gateArbitration.attempts, 2);
+    assert.equal(f.calls.arbiter.length, 2);
+    run = await runEpicGate({ engine: f.engine, run: runId, arbitration });
+    assert.equal(run.state, 'blocked');
+    assert.equal(f.calls.arbiter.length, 2, 'no third session');
+    assert.equal(run.gateArbitration.status, 'decided');
+    assert.equal(run.gateArbitration.decision, 'confirm_defect');
+    assert.equal(run.gateArbitration.invalid, 'arbiter_retry_exhausted');
+    assert.match(run.error.message, /arbiter_retry_exhausted/);
+    const blocked = await f.director.drain(f.id);
+    assert.equal(blocked.status, 'blocked');
+    assert.equal(blocked.blockers.find(row => row.gateId).arbitration.invalid, 'arbiter_retry_exhausted');
+    assert.equal(f.calls.arbiter.length, 2);
+  },
+);

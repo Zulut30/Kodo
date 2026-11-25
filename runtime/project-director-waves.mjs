@@ -851,7 +851,14 @@ async function epicGate(ctx, snapshot, epic, retryFailed, out) {
   if (gate && run && retryStates.includes(run.state)) {
     if (retryFailed) return reserveGate(ctx, snapshot, containers, true);
     out.gates.push({ gateId: gate.id, runId: run.id, state: run.state });
-    out.blocked.push({ code: blockerOf(run), kind: 'epic', id: epic.id, gateId: gate.id, runId: run.id });
+    out.blocked.push({
+      code: blockerOf(run),
+      kind: 'epic',
+      id: epic.id,
+      gateId: gate.id,
+      runId: run.id,
+      ...arbitrationBlockerFields(run),
+    });
     return null;
   }
   if (!gate) return reserveGate(ctx, snapshot, containers, false);
@@ -955,7 +962,14 @@ async function projectGateRun(ctx, snapshot, { retryFailed, stale }, out) {
   if (!retryStates.includes(run.state)) return { gate, run };
   if (retryFailed) return reserveGate(ctx, snapshot, containers, true);
   out.gates.push({ gateId: gate.id, runId: run.id, state: run.state });
-  out.blocked.push({ code: blockerOf(run), kind: 'project', id: projectId, gateId: gate.id, runId: run.id });
+  out.blocked.push({
+    code: blockerOf(run),
+    kind: 'project',
+    id: projectId,
+    gateId: gate.id,
+    runId: run.id,
+    ...arbitrationBlockerFields(run),
+  });
   return null;
 }
 

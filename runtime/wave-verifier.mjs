@@ -25,6 +25,7 @@ import { gateRange, gateRepairInScope, integrationHeadOf } from './project-integ
 import { buildDiagnosticPack } from './diagnostic-pack.mjs';
 import { modulesFromWritePaths, verifiedLessonSummaries } from './context-pack.mjs';
 import { arbitrableRefusal, arbitrateGate, arbitrationAccepts, arbitrationStop } from './gate-arbiter.mjs';
+import { assertArbitrableReceipts } from './project-director.mjs';
 
 /** The watchdog of a wave gate when the project sets none. */
 export const GATE_WATCHDOG = Object.freeze({ stalledRounds: 2, rejectUnchanged: true });
@@ -477,6 +478,23 @@ async function runSmoke(engine, run, signal) {
   engine.save(run);
 }
 
+/**
+ * The Director's full receipt check of a refused gate review before its arbiter (16B1): saved
+ * receipts whose logs, counts, diff or freshness do not hold stop the Run with the receipt's code.
+ */
+const arbiterReceipts = (engine, run) => async (headSha, options) => {
+  try {
+    await assertArbitrableReceipts(engine, run, headSha, options);
+  } catch (error) {
+    const code = error?.code;
+    if (typeof code !== 'string' || !(/^project_[a-z0-9_]+$/.test(code) || code === 'evidence_integrity')) throw error;
+    throw Object.assign(fail(`Квитанции гейта не подтверждены перед арбитражем (${code})`, code), {
+      scope: 'verification',
+      reason: code,
+    });
+  }
+};
+
 /** The stop of a gate Run, recorded like Engine.run() records it. */
 function stopRun(engine, run, error, signal) {
   run.state = engine.store.getRun(run.id).cancelRequested
@@ -527,7 +545,15 @@ export async function runEpicGate({ engine, run: input, signal, arbitration = nu
       try {
         await engine.verify(run, leased);
       } catch (error) {
-        refusal = arbitration ? await arbitrableRefusal({ engine, run, error, ...arbitration }) : null;
+        refusal = arbitration
+          ? await arbitrableRefusal({
+              engine,
+              run,
+              error,
+              ...arbitration,
+              assertReceipts: arbiterReceipts(engine, run),
+            })
+          : null;
         if (!refusal) throw error;
       }
       // A refused review leaves run.headSha on the last accepted head: the reviewed head is checked.
@@ -560,6 +586,7 @@ export async function runEpicGate({ engine, run: input, signal, arbitration = nu
       engine.checkCancelled(run, leased);
       if (refusal) {
         // Smoke passed on the reviewed head too: only the review's findings are in dispute.
+        await arbiterReceipts(engine, run)(verifiedHead, { smoke: true });
         const record = await arbitrateGate({ engine, run, refusal, signal: leased });
         engine.checkCancelled(run, leased);
         const accepted = run.headSha;
