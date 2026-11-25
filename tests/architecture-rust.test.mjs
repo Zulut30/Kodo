@@ -3033,3 +3033,90 @@ test('X3: existing Cargo.toml [package].name maps crate directory (crates/protoc
     `mismatched [package].name must still fail contract_crate_required, got ${JSON.stringify(compiledMismatch.findings)}`,
   );
 });
+
+test('X6: Wave 0 Rust docs/skill/bootstrap cover crate stubs, Cargo.lock, .gitignore target/, external allowlists & integrator task; invalid-package-edition has explicit hint', async t => {
+  const skill = await readFile(
+    path.join(import.meta.dirname, '..', 'skills', 'kodo-project-director', 'SKILL.md'),
+    'utf8',
+  );
+  const blueprintDoc = await readFile(path.join(import.meta.dirname, '..', 'docs', 'BLUEPRINT.md'), 'utf8');
+  const bootstrapSrc = await readFile(path.join(import.meta.dirname, '..', 'runtime', 'project-bootstrap.mjs'), 'utf8');
+  for (const [label, text] of [
+    ['SKILL.md', skill],
+    ['docs/BLUEPRINT.md', blueprintDoc],
+    ['runtime/project-bootstrap.mjs', bootstrapSrc],
+  ]) {
+    assert.match(text, /заготовк/i, `${label}: must instruct Wave 0 to create stubs for all module crates`);
+    assert.match(text, /src\/lib\.rs/, `${label}: must mention src/lib.rs stubs in Wave 0`);
+    assert.match(text, /Cargo\.lock/, `${label}: must instruct Wave 0 to commit Cargo.lock`);
+    assert.match(text, /\.gitignore[^\n]*target\//, `${label}: must instruct Wave 0 to commit .gitignore with target/`);
+    assert.match(
+      text,
+      /allowedExternalCrates[^\n]*allowedDevExternalCrates/,
+      `${label}: must instruct Wave 0 to pre-declare allowedExternalCrates/allowedDevExternalCrates`,
+    );
+    assert.match(text, /\[workspace\.dependencies\]/, `${label}: must mention [workspace.dependencies] in Wave 0`);
+    assert.match(
+      text,
+      /интегратор/i,
+      `${label}: must describe dedicated integrator task for new external dependencies`,
+    );
+  }
+
+  // invalid-package-edition must emit a dedicated hint from UNSUPPORTED_ARCHITECTURE_HINTS.
+  const efx = await engineFixture(t, {
+    config: { architecture: { enabled: true }, repairRounds: 1, researchBudget: 0, concurrency: 1 },
+    testScript: 'process.exit(0);\n',
+  });
+  const engine = new Engine({ store: efx.openStore(), ...fakeServices() });
+  const run = await engine.create('X6 invalid-package-edition hint', {
+    project: efx.project,
+    mode: 'quick',
+    model: 'gpt-6.1-sol',
+  });
+  await engine.prepare(run);
+  run.models = await engine.provider.discoverProviders();
+  run.plan = {
+    summary: 'Bad edition',
+    tasks: [planNode('x6', 'developer', ['Cargo.toml', 'crates/game-contracts/**', 'architecture.policy.json'])],
+  };
+  const put = async (rel, content) => {
+    const full = path.join(run.cwd, rel);
+    await mkdir(path.dirname(full), { recursive: true });
+    await writeFile(full, typeof content === 'string' ? content : JSON.stringify(content, null, 2), 'utf8');
+  };
+  await put('Cargo.toml', '[workspace]\nresolver = "2"\nmembers = ["crates/*"]\n');
+  await put(
+    'crates/game-contracts/Cargo.toml',
+    '[package]\nname = "game-contracts"\nversion = "0.1.0"\nedition = "bad"\n',
+  );
+  await put('crates/game-contracts/src/lib.rs', 'pub struct Id(pub u64);\n');
+  await put('architecture.policy.json', {
+    schemaVersion: 2,
+    version: 1,
+    language: 'rust',
+    productRoots: ['crates'],
+    layers: [{ id: 'contracts', crates: ['game-contracts'] }],
+    cycles: 'forbid',
+    allowedExternalCrates: [],
+    allowedDevExternalCrates: [],
+    contractCrates: ['game-contracts'],
+    baseline: [],
+    exceptions: [],
+    protectedPaths: ['architecture.policy.json'],
+  });
+  fixtureGit(run.cwd, 'add', '-A');
+  fixtureGit(run.cwd, 'commit', '-m', 'invalid edition manifest');
+
+  await engine.checks(run);
+  await assert.rejects(engine.verificationGates(run), err => {
+    assert.equal(err.code, 'verification_failed');
+    const failures = JSON.parse(err.message.slice(err.message.indexOf('[')));
+    const finding = failures
+      .flatMap(entry => entry.findings || [])
+      .find(row => row.ruleId === 'unsupported.invalid-package-edition');
+    assert.ok(finding, `expected unsupported.invalid-package-edition in ${err.message}`);
+    assert.match(finding.hint || '', /edition/i, `expected edition-specific hint, got ${JSON.stringify(finding)}`);
+    return true;
+  });
+});

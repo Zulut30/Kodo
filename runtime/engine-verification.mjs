@@ -213,6 +213,8 @@ const UNSUPPORTED_ARCHITECTURE_HINTS = {
   'unsupported-underscore-dependencies':
     'Use hyphenated dev-dependencies / build-dependencies (underscore tables are rejected in edition 2024+)',
   'unresolved-workspace-edition': 'Declare edition in root [workspace.package] or set edition explicitly on the crate',
+  'invalid-package-edition':
+    'Set a valid 4-digit edition string (e.g. "2021" or "2024") or { workspace = true } in [package]',
   'conflicting-workspace-package': 'Remove the package field when workspace = true is set on a dependency',
   'unsupported-cargo-patch': 'Remove [patch] from Cargo.toml / .cargo/config(.toml) (unsupported by static gate)',
   'unsupported-cargo-replace': 'Remove [replace] from Cargo.toml / .cargo/config(.toml) (unsupported by static gate)',
