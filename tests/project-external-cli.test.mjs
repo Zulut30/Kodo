@@ -181,6 +181,12 @@ test('Project CLI delegates next-wave and complete-task to the pull protocol', a
   const profileCli = (action, ...flags) => projectCli(['profile', action, waveId, ...flags, '--json'], base);
   assert.deepEqual((await profileCli('set', '--file', file)).report.result.profile, profile);
   assert.deepEqual((await profileCli('show')).report.result.profile, profile);
+  for (const [action, down] of [
+    ['machine-down', true],
+    ['machine-up', false],
+  ]) {
+    assert.equal((await profileCli(action, '--machine', 'local')).report.result.profile.machines[0].down, down);
+  }
   const until = '2099-01-01T00:00:00Z';
   assert.equal(
     (await profileCli('pause-pool', '--subscription', 'pool', '--until', until)).report.result.profile.subscriptions[0]

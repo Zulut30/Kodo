@@ -1,3 +1,4 @@
+import { verifyRemoteProof } from './remote-task-receipt.mjs';
 import path from 'node:path';
 import { realpath, readFile } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
@@ -409,6 +410,11 @@ async function validateWaveTask({ engine, contracts, snapshot, run, options }) {
     secrets: engine.secrets,
   });
   if (!succeeded) return;
+  if (run.checks?.source === 'remote') {
+    requireValue(await verifyRemoteProof(run), 'checks_stale');
+    await assertTaskMerge(snapshot, run);
+    return;
+  }
   requireValue(run.checks?.profile === 'task-fast' && Array.isArray(run.checks.results), 'checks_stale');
   await assertLogs(engine, run, run.checks.results, 'fast-check');
   await assertTestCounts(run, { step: row => row, positive: false, code: 'fast_tests_uncounted' });

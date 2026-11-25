@@ -1,3 +1,4 @@
+import { remoteProof } from './remote-task-receipt.mjs';
 import { isDeepStrictEqual } from 'node:util';
 import { isCurrentBehaviorReceipt } from './behavior-gate.mjs';
 import { integrationBranch } from './project-integration.mjs';
@@ -94,16 +95,17 @@ function fastProof(run) {
   return (
     run.state === 'succeeded' &&
     run.verificationProfile === 'task-fast' &&
-    checks?.schemaVersion === 2 &&
-    checks.profile === 'task-fast' &&
-    checks.complete === true &&
-    checks.headSha === run.headSha &&
-    Boolean(checks.fingerprint) &&
-    checks.plan != null &&
-    Array.isArray(checks.results) &&
-    checks.results.length > 0 &&
-    (!Array.isArray(checks.plan) || checks.plan.length === checks.results.length) &&
-    checks.results.every(row => row?.exitCode === 0) &&
+    (remoteProof(run) ||
+      (checks?.schemaVersion === 2 &&
+        checks.profile === 'task-fast' &&
+        checks.complete === true &&
+        checks.headSha === run.headSha &&
+        Boolean(checks.fingerprint) &&
+        checks.plan != null &&
+        Array.isArray(checks.results) &&
+        checks.results.length > 0 &&
+        (!Array.isArray(checks.plan) || checks.plan.length === checks.results.length) &&
+        checks.results.every(row => row?.exitCode === 0))) &&
     isCurrentBehaviorReceipt(run.behavior, { headSha: run.headSha, baseSha: run.baseSha, config: run.config })
   );
 }

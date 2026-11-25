@@ -18,8 +18,10 @@
  * `project-director-waves.mjs`. Kodo never starts or archives the host's chats.
  */
 import { createHash, randomUUID } from 'node:crypto';
+import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { stat } from 'node:fs/promises';
+import { matchesReceiptFile, receiptBinding } from './remote-task-receipt.mjs';
 import { execute } from './command.mjs';
 import { git, makeWorktree, plannedWorktreeHome } from './workspace.mjs';
 import { scopesOverlap } from './contracts.mjs';
@@ -148,6 +150,32 @@ function workerContract(run, writePaths, selfCheck) {
   ].join('\n');
 }
 
+function remoteRefs(projectId, run) {
+  if (!['ssh', 't3-env'].includes(run.workerPlacement?.machine?.kind)) return null;
+  const prefix = 'refs/kodo/' + projectId;
+  return {
+    repository: run.transportRemote ?? 'origin',
+    baseRef: prefix + '/base/' + run.id,
+    workRef: prefix + '/work/' + run.id,
+  };
+}
+
+async function transport(cwd, args, signal) {
+  try {
+    const result = await execute('git', args, { cwd, signal, timeoutMs: 120000, allowFailure: true });
+    if (result.code === 0) return result.stdout.trim();
+  } catch (error) {
+    if (signal?.aborted) throw error;
+  }
+  fail('transport_failed');
+}
+
+async function pushBase(run, remote, signal) {
+  const names = await transport(run.project, ['remote'], signal);
+  need(names.split(/\r?\n/).includes(remote.repository), 'transport_failed');
+  await transport(run.project, ['push', remote.repository, run.baseSha + ':' + remote.baseRef], signal);
+}
+
 async function briefFor(state, attempt, task, run) {
   const { C, options, cli } = state,
     project = state.snapshot.project;
@@ -155,8 +183,41 @@ async function briefFor(state, attempt, task, run) {
   need(run.task === input, 'binding_invalid');
   const { role, instructions } = workerRole(task.owner);
   // The caller's CLI (`cli`): a chat runs the same Kodo package that issued the brief.
-  const selfCheck = `${cli} ci feedback --base ${run.baseSha} --project ${quotePath(run.cwd)} --json`;
-  const basePrompt = `${input}\n\n${workerContract(run, task.writePaths, selfCheck)}`;
+  const remote = remoteRefs(project.projectId, run);
+  if (remote) await pushBase(run, remote, state.signal);
+  const dispatcher = remote ? 'kodo' : cli;
+  const selfCheck = remote
+    ? 'kodo ci feedback --base ' + run.baseSha + ' --json'
+    : `${cli} ci feedback --base ${run.baseSha} --project ${quotePath(run.cwd)} --json`;
+  const interfaces = task.interfaceRefs.map(ref => {
+    if (!remote || !path.isAbsolute(ref.path)) return ref.path;
+    const relative = path.relative(project.root, ref.path);
+    return relative.startsWith('..') || path.isAbsolute(relative)
+      ? 'sha256:' + ref.sha256
+      : relative.split(path.sep).join('/');
+  });
+  let workerInput = input;
+  if (remote) {
+    workerInput = input.replaceAll(JSON.stringify(project.root), JSON.stringify('.'));
+    task.interfaceRefs.forEach((ref, index) => {
+      workerInput = workerInput.replaceAll(JSON.stringify(ref.path), JSON.stringify(interfaces[index]));
+    });
+  }
+  const basePrompt = remote
+    ? [
+        workerInput,
+        'In your clone, run:',
+        'git fetch ' + remote.repository + ' ' + remote.baseRef,
+        'git worktree add -b ' + run.branch + ' ' + run.id + ' ' + run.baseSha,
+        'cd ' + run.id,
+        'Implement only the assigned write paths. Preserve existing tests and add tests for new behaviour.',
+        'Stage the assigned changes with git add.',
+        'git commit -m "Implement assigned task"',
+        selfCheck,
+        'git push ' + remote.repository + ' HEAD:' + remote.workRef,
+        'Report the full commit SHA.',
+      ].join('\n')
+    : `${input}\n\n${workerContract(run, task.writePaths, selfCheck)}`;
   const { prompt, extra } = await enrichExternalWaveBrief({
     state,
     attempt,
@@ -175,14 +236,14 @@ async function briefFor(state, attempt, task, run) {
     role,
     roleInstructions: instructions,
     writePaths: [...task.writePaths],
-    worktree: run.cwd,
+    ...(remote ?? { worktree: run.cwd }),
     branch: run.branch,
     baseSha: run.baseSha,
-    interfaces: task.interfaceRefs.map(ref => ref.path),
+    interfaces,
     prompt,
     selfCheck,
-    completeCommand: `${cli} project complete-task ${project.projectId} ${task.id} --head <SHA> --attempt ${attempt.id} --defer-gate`,
-    abandonCommand: `${cli} project complete-task ${project.projectId} ${task.id} --head <SHA> --abandon --attempt ${attempt.id}`,
+    completeCommand: `${dispatcher} project complete-task ${project.projectId} ${task.id} --head <SHA> --attempt ${attempt.id} --defer-gate`,
+    abandonCommand: `${dispatcher} project complete-task ${project.projectId} ${task.id} --head <SHA> --abandon --attempt ${attempt.id}`,
     ...extra,
   };
   C.assertDirectorSafe(brief, options);
@@ -208,6 +269,9 @@ async function installExternalRun(state, attempt, task) {
           const placement = placementFor(state, task, attempt.id);
           need(placement, 'pool_unavailable');
           value.runDraft.workerPlacement = placement;
+          if (placement.machine.kind !== 'local')
+            value.runDraft.transportRemote =
+              state.profile.machines.find(m => m.id === placement.machine.id)?.gitRemote ?? 'origin';
         }
         value.runDraft.executor = { kind: 'external', host };
         value.runDraft.verificationProfile = 'task-fast';
@@ -314,6 +378,15 @@ async function resumeInFlight(state, replayOnly) {
     if (executor.kind !== 'external' || executor.host !== state.host) continue;
     const run = storedRun(store, attempt.runId);
     if ((replayOnly && !run) || run?.integration?.status === 'merged') continue;
+    if (state.profile?.machines.some(m => m.down && m.id === run?.workerPlacement?.machine?.id)) {
+      state.blocked.push({
+        taskId: attempt.taskId,
+        attemptId: attempt.id,
+        code: 'project_machine_down',
+        hint: 'Abandon the attempt and use next-wave --retry-failed.',
+      });
+      continue;
+    }
     await guarded(state, attempt.taskId, () => prepareAttempt(state, currentOf(state.snapshot, attempt.taskId)));
   }
 }
@@ -1055,6 +1128,7 @@ async function verifySubmission(ctx, C, step, input) {
             run: run.id,
             signal: checked,
             expectedHeadSha: head,
+            remoteChecks: step.remoteChecks,
             ...(machine?.maxHeavyBuilds ? { maxHeavyBuilds: machine.maxHeavyBuilds } : {}),
           });
         } catch (error) {
@@ -1341,9 +1415,39 @@ async function admitSubmission(ctx, C, input) {
   if (interrupted) return { ...current, verified: true };
   if (!['running', 'verifying'].includes(attempt.status) || run.integration?.status === 'merged')
     return blocked('project_attempt_not_running');
+  const remote = remoteRefs(projectId, run);
+  if (remote) {
+    const names = await transport(run.project, ['remote'], input.signal);
+    if (!names.split(/\r?\n/).includes(remote.repository)) fail('transport_failed');
+    const tracking = 'refs/kodo/fetched/' + run.id;
+    await transport(
+      run.project,
+      ['fetch', '--no-tags', '--no-write-fetch-head', remote.repository, '+' + remote.workRef + ':' + tracking],
+      input.signal,
+    );
+    if ((await git(run.project, ['rev-parse', tracking])) !== head) return blocked('project_transport_head_mismatch');
+    if (!(await ancestor(run.project, run.baseSha, head)))
+      return {
+        result: { status: 'checks_failed', ...problem('external_not_descendant'), revision: snapshot.revision },
+      };
+    const unsafe = await historyDefect(ctx.engine, run, task, head);
+    if (unsafe) return { result: { status: 'checks_failed', ...unsafe, revision: snapshot.revision } };
+    if ((await specialEntries(run.project, run.baseSha, head)).length) return blocked('project_external_symlink');
+    await transport(run.cwd, ['merge', '--ff-only', head], input.signal);
+  }
   const defect = await inspectSubmission(ctx.engine, run, task, head);
   if (defect) return { result: { status: 'checks_failed', ...defect, revision: snapshot.revision } };
-  return { ...current, verified: false };
+  let remoteChecks;
+  if (
+    remote &&
+    input.receipt &&
+    ctx.repo.getProfile(projectId)?.machines.some(m => m.id === run.workerPlacement.machine.id && m.trustedBuilds)
+  ) {
+    const binding = await receiptBinding(run, head);
+    if (!(await matchesReceiptFile(input.receipt, binding))) return blocked('project_receipt_mismatch');
+    remoteChecks = { ...binding, source: 'remote' };
+  }
+  return { ...current, verified: false, remoteChecks };
 }
 
 /**
@@ -1364,7 +1468,7 @@ async function admitSubmission(ctx, C, input) {
  * row stays queued for a repeat).
  * @param {{ repo: any, engine: any, store?: any, contracts?: any, clock?: () => string, buildApiCards?: any }} ctx
  * @param {{ projectId: string, taskId: string, head: string, deferGate?: boolean, abandon?: boolean,
- *   commandId?: string, attemptId?: string, ports?: any, signal?: AbortSignal, priority?: number,
+ *   commandId?: string, attemptId?: string, receipt?: string, ports?: any, signal?: AbortSignal, priority?: number,
  *   machine?: { id?: string, maxHeavyBuilds?: number }, integrationWaitMs?: number }} input
  */
 export async function completeTask(ctx, input) {

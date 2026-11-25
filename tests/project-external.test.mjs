@@ -1266,6 +1266,9 @@ test('Profile fills eight slots across hosts and refills a completed slot before
       spec.tasks[8].dependsOn = ['task-0'];
     },
   });
+  const bare = path.join(path.dirname(f.root), 'transport.git');
+  git(f.root, 'init', '--bare', bare);
+  git(f.root, 'remote', 'add', 'origin', bare);
   const sub = (id, slots, tier) => ({ id, slots, tier, provider: 'codex', model: 'gpt' });
   f.repo.setProfile(f.projectId, {
     subscriptions: [
@@ -1287,7 +1290,14 @@ test('Profile fills eight slots across hosts and refills a completed slot before
   assert.equal(root.machine.environmentId, 'lab');
   assert.ok(first.briefs.every(b => b.subscription.id === 'quick'));
   assert.deepEqual((await pull('orca')).briefs, initial.briefs);
-  const head = await commit(root.worktree, { 'src/0.mjs': 'export const value = 1;\n' });
+  const worker = path.join(path.dirname(f.root), 'worker');
+  git(f.root, 'clone', bare, worker);
+  git(worker, 'config', 'user.name', 'Worker');
+  git(worker, 'config', 'user.email', 'worker@example.invalid');
+  git(worker, 'fetch', 'origin', root.baseRef);
+  git(worker, 'checkout', '-b', root.branch, 'FETCH_HEAD');
+  const head = await commit(worker, { 'src/0.mjs': 'export const value = 1;\n' });
+  git(worker, 'push', 'origin', 'HEAD:' + root.workRef);
   assert.equal((await f.complete(root.taskId, head, { deferGate: true })).status, 'integrated');
   const next = await pull('orca');
   assert.deepEqual(
