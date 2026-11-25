@@ -627,9 +627,19 @@ export function rustCases(file, source, { nestedCrate = false } = {}) {
       let open = index + 2;
       const name = isIdentifier(tokens[open]) ? tokens[open++] : '';
       const close = OPENING.has(tokens[open]) ? groupEnd(tokens, open) : open - 1;
-      const tests = close > open ? templateTests(tokens.slice(open + 1, close)) : [];
-      if (name && tests.length)
-        templates.push({ name, tests, exported: attributes.some(item => attributePath(item).path === 'macro_export') });
+      const body = close > open ? tokens.slice(open + 1, close) : [];
+      // Every template is kept with the macros its body calls: a wrapper reaches the templates it expands.
+      if (name) {
+        const inner = new Set();
+        collectCalls(body, inner);
+        inner.delete(name);
+        templates.push({
+          name,
+          tests: templateTests(body),
+          calls: inner,
+          exported: attributes.some(item => attributePath(item).path === 'macro_export'),
+        });
+      }
       index = close + 1;
       reset();
     } else if (token === '{') {
@@ -702,6 +712,15 @@ export const rustTestCases = (file, source, options = {}) =>
 /** The macros a Rust source calls, read as tokens: a call in a comment or a string is no call. */
 export const rustMacroCalls = source => rustCases('src/lib.rs', source).calls;
 
+/**
+ * How a Rust source uses macros, read as tokens: the macros it calls outside templates, and its
+ * `macro_rules!` templates with the macros each one calls.
+ */
+export function rustMacroUse(source) {
+  const { calls, templates } = rustCases('src/lib.rs', source);
+  return { calls, templates };
+}
+
 /** The package name in a Cargo package id: `path+file:///…/game#0.1.0`, `…#engine@0.1.0`, `game 0.1.0 (…)`. */
 export function packageName(id) {
   const hash = id.lastIndexOf('#');
@@ -718,13 +737,20 @@ export function packageName(id) {
  * `\\?\` resolved. For `path.relative` and the directories the receipt shows.
  */
 function canonicalPath(value) {
-  let resolved;
-  try {
-    resolved = realpathSync.native(value);
-  } catch {
-    resolved = path.resolve(value);
+  // A path that does not exist yet is resolved through its nearest existing ancestor.
+  let existing = path.resolve(value),
+    rest = '';
+  for (;;) {
+    try {
+      const resolved = realpathSync.native(existing);
+      return (rest ? path.join(resolved, rest) : resolved).replace(/^\\\\\?\\(?!UNC\\)/, '');
+    } catch {
+      const parent = path.dirname(existing);
+      if (parent === existing) return path.resolve(value).replace(/^\\\\\?\\(?!UNC\\)/, '');
+      rest = rest ? path.join(path.basename(existing), rest) : path.basename(existing);
+      existing = parent;
+    }
   }
-  return resolved.replace(/^\\\\\?\\(?!UNC\\)/, '');
 }
 /** A key to compare paths with: case-insensitive on Windows, where the file system is. */
 const pathKey = value => (process.platform === 'win32' ? value.toLowerCase() : value);
@@ -810,7 +836,9 @@ async function listRegistry({ checkout, targetDir, runner, signal, secrets, env 
   const root = canonicalPath(checkout),
     relative = value => path.relative(root, canonicalPath(value)).split(path.sep).join('/'),
     manifests = new Map(),
-    entries = [];
+    entries = [],
+    // Every test target with its root file, also one that lists no test: its files belong to it.
+    targets = [];
   for (const [executable, message] of executables) {
     const manifest = message.manifest_path ?? path.join(checkout, 'Cargo.toml'),
       where = path.dirname(manifest),
@@ -825,6 +853,7 @@ async function listRegistry({ checkout, targetDir, runner, signal, secrets, env 
       dir: relative(where),
       src: message.target?.src_path ? relative(message.target.src_path) : '',
     };
+    targets.push(entry);
     if (!manifests.has(manifest)) {
       let text = '';
       try {
@@ -856,11 +885,45 @@ async function listRegistry({ checkout, targetDir, runner, signal, secrets, env 
       entries.push({ ...entry, name, ignored: left > 0 });
     }
   }
-  return { entries };
+  return { entries, targets };
 }
 
-/** A checkout of its own: its `.git` exists and Git names it as the top of its work tree. */
-async function healthyCheckout(checkout) {
+/**
+ * Whether `checkout` lies strictly inside `home`, both canonical: a link that leads elsewhere, or
+ * another drive (`path.relative` gives an absolute path there), is outside.
+ */
+export function strictlyInside(home, checkout) {
+  const relative = path.relative(canonicalPath(home), canonicalPath(checkout));
+  return (
+    relative !== '' &&
+    !path.isAbsolute(relative) &&
+    relative !== '..' &&
+    !relative.startsWith(`..${path.sep}`) &&
+    !relative.startsWith('../')
+  );
+}
+
+/** Whether the repository at `cwd` has `checkout` registered as one of its worktrees. */
+async function registeredIn(cwd, checkout) {
+  const listed = await execute('git', ['worktree', 'list', '--porcelain'], {
+    cwd,
+    allowFailure: true,
+    timeoutMs: 60000,
+  });
+  return (
+    listed.code === 0 &&
+    listed.stdout
+      .split(/\r?\n/)
+      .filter(line => line.startsWith('worktree '))
+      .some(line => canonicalKey(line.slice(9)) === canonicalKey(checkout))
+  );
+}
+
+/**
+ * A checkout of this repository's own: its `.git` exists, Git names it as the top of its work
+ * tree, and the repository at `cwd` has it registered.
+ */
+async function healthyCheckout(cwd, checkout) {
   if (!existsSync(path.join(checkout, '.git'))) return false;
   try {
     const top = await execute('git', ['rev-parse', '--show-toplevel'], {
@@ -868,7 +931,11 @@ async function healthyCheckout(checkout) {
       allowFailure: true,
       timeoutMs: 60000,
     });
-    return top.code === 0 && canonicalKey(top.stdout.trim()) === canonicalKey(checkout);
+    return (
+      top.code === 0 &&
+      canonicalKey(top.stdout.trim()) === canonicalKey(checkout) &&
+      (await registeredIn(cwd, checkout))
+    );
   } catch {
     return false;
   }
@@ -880,16 +947,14 @@ async function healthyCheckout(checkout) {
  * survives is deleted only when it lies inside the registry home; then `worktree prune` and `add`.
  */
 async function rebuildCheckout(cwd, home, checkout, baseSha) {
-  const inside = !path.relative(canonicalPath(home), canonicalPath(checkout)).startsWith('..');
   await withWorktreeLock(
     cwd,
     async () => {
+      // Checked again under the lock, just before Git and the file system act on it.
+      if (!strictlyInside(home, checkout)) throw new Error(`base checkout ${checkout} is outside the registry home`);
       const options = { cwd, allowFailure: true, timeoutMs: 60000 };
       await execute('git', ['worktree', 'remove', '--force', '--force', checkout], options);
-      if (existsSync(checkout)) {
-        if (!inside) throw new Error(`base checkout ${checkout} is outside the registry home`);
-        rmSync(checkout, { recursive: true, force: true });
-      }
+      if (existsSync(checkout)) rmSync(checkout, { recursive: true, force: true });
       await execute('git', ['worktree', 'prune'], options);
       await execute('git', ['worktree', 'add', '--detach', '--quiet', checkout, baseSha], { cwd, timeoutMs: 600000 });
     },
@@ -904,7 +969,9 @@ async function rebuildCheckout(cwd, home, checkout, baseSha) {
  * inside it only when its own `.git` is there: otherwise Git would climb to an outer repository.
  */
 async function prepareCheckout(cwd, home, checkout, baseSha, signal) {
-  if (await healthyCheckout(checkout)) {
+  // Before any Git command or deletion: the checkout, as the file system resolves it, is in the home.
+  if (!strictlyInside(home, checkout)) throw new Error(`base checkout ${checkout} is outside the registry home`);
+  if (await healthyCheckout(cwd, checkout)) {
     try {
       const options = { cwd: checkout, allowFailure: true, signal };
       const moved = await execute('git', ['checkout', '--detach', '--force', '--quiet', baseSha], options);
@@ -916,7 +983,7 @@ async function prepareCheckout(cwd, home, checkout, baseSha, signal) {
     }
   }
   await rebuildCheckout(cwd, home, checkout, baseSha);
-  if (!(await healthyCheckout(checkout))) throw new Error('base checkout could not be prepared');
+  if (!(await healthyCheckout(cwd, checkout))) throw new Error('base checkout could not be prepared');
 }
 
 /**
@@ -996,7 +1063,7 @@ function targetsOf(targets) {
         owner === null
           ? null
           : { tests: 'test', benches: 'bench', examples: 'example' }[key.slice(prefix(owner).length).split('/')[0]];
-      if (kind) found = targets.filter(target => target.dir === owner && target.kind === kind);
+      if (kind) found = targets.filter(target => pathKey(target.dir) === pathKey(owner) && target.kind === kind);
     }
     const result = new Set(found.map(target => target.key));
     memo.set(key, result);
@@ -1013,18 +1080,30 @@ function targetsOf(targets) {
  *   finding; it may stand for any target its file can belong to.
  * - `skips`: an `#[ignore]` the reading reported; only for a test ignored now.
  * - `moved`: a test the reading saw move to another file of the same target; it explains the
- *   loss only when the registry of the head shows the test gained in that file's target.
+ *   loss only when the registry of the head shows the test gained in that file's target, and
+ *   with the same activity: an active test that arrives ignored is `test_skipped`.
  * - `permitted`: a removal this run may make (`testRemovalAllowed`, also a whole permitted file
  *   that is gone: an empty name). It covers a loss only in a target confirmed for its file: the
- *   file's one target, or the one target of the file that had that test on the base.
- * A `harness = false` target is one entry with an empty name.
- * @param {{ base: any[], head: any[], reported?: any[], cfg?: any[], skips?: any[], moved?: any[], permitted?: any[] }} input
+ *   file's one target, or the one target of the file that had that test on the base; a gone
+ *   file covers only the target whose root it was.
+ * A `harness = false` target is one entry with an empty name. `targets` are every test target
+ * Cargo built, with its root file, also those that list no test: a file is matched against them.
+ * @param {{ base: any[], head: any[], targets?: any[], reported?: any[], cfg?: any[], skips?: any[], moved?: any[], permitted?: any[] }} input
  */
-export function compareRegistry({ base, head, reported = [], cfg = [], skips = [], moved = [], permitted = [] }) {
+export function compareRegistry({
+  base,
+  head,
+  targets: built = [],
+  reported = [],
+  cfg = [],
+  skips = [],
+  moved = [],
+  permitted = [],
+}) {
   const targetKey = entry => `${entry.package}\u0000${entry.kind}\u0000${entry.target}`;
   const key = entry => `${targetKey(entry)}\u0000${entry.name}`;
   const targets = new Map();
-  for (const entry of [...base, ...head])
+  for (const entry of [...built, ...base, ...head])
     if (!targets.has(targetKey(entry)))
       targets.set(targetKey(entry), {
         key: targetKey(entry),
@@ -1033,6 +1112,12 @@ export function compareRegistry({ base, head, reported = [], cfg = [], skips = [
         kind: kindOf(entry.kind),
       });
   const candidates = targetsOf([...targets.values()]);
+  const roots = file =>
+    new Set(
+      [...targets.values()]
+        .filter(target => target.src && pathKey(target.src) === pathKey(file))
+        .map(target => target.key),
+    );
   const tally = list => {
     const map = new Map();
     for (const entry of list) {
@@ -1045,10 +1130,13 @@ export function compareRegistry({ base, head, reported = [], cfg = [], skips = [
   };
   const before = tally(base),
     after = tally(head);
+  // What the head gained per test, as active and as ignored entries: a move must keep its activity.
   const gains = new Map();
   for (const [slot, counts] of after) {
-    const more = counts.total - (before.get(slot)?.total ?? 0);
-    if (more > 0) gains.set(slot, more);
+    const old = before.get(slot) ?? { total: 0, active: 0 };
+    const more = Math.max(0, counts.total - old.total),
+      active = Math.min(more, Math.max(0, counts.active - old.active));
+    if (more > 0) gains.set(slot, { active, ignored: more - active });
   }
   const byName = list => {
     const map = new Map();
@@ -1070,9 +1158,16 @@ export function compareRegistry({ base, head, reported = [], cfg = [], skips = [
     return at < 0 ? null : list.splice(at, 1)[0];
   };
   const any = () => true;
-  const gainedIn = item =>
-    [...candidates(item.to)].find(target => (gains.get(`${target}\u0000${item.name}`) ?? 0) > 0) ?? null;
+  /** The target of the file a test moved to that gained it as `kind` (`active` or `ignored`), or null. */
+  const gainedIn = (item, kind) =>
+    [...candidates(item.to)].find(target => (gains.get(`${target}\u0000${item.name}`)?.[kind] ?? 0) > 0) ?? null;
+  const consume = (item, kind) => {
+    const gain = gains.get(`${gainedIn(item, kind)}\u0000${item.name}`);
+    if (gain) gain[kind]--;
+  };
   const confirmed = entry => item => {
+    // A gone file covers only the target whose root it was.
+    if (item.name === '') return roots(item.file).has(targetKey(entry));
     const own = [...candidates(item.file)];
     return own.length === 1 || own.filter(target => before.has(`${target}\u0000${entry.name}`)).length === 1;
   };
@@ -1083,12 +1178,21 @@ export function compareRegistry({ base, head, reported = [], cfg = [], skips = [
     const now = after.get(slot) ?? { total: 0, active: 0 };
     const removed = Math.max(0, counts.total - now.total);
     const switched = Math.max(0, Math.max(0, counts.active - removed) - now.active);
-    for (let left = removed; left > 0; left--) {
+    // The entries gone from here that ran on the base come first.
+    const removedActive = Math.min(removed, Math.max(0, counts.active - now.active));
+    for (let index = 0; index < removed; index++) {
       if (take(pools.reported, counts.entry, any)) continue;
-      const move = take(pools.moved, counts.entry, item => gainedIn(item) !== null);
+      const active = index < removedActive,
+        same = active ? 'active' : 'ignored',
+        other = active ? 'ignored' : 'active';
+      const move =
+        take(pools.moved, counts.entry, item => gainedIn(item, same) !== null) ??
+        take(pools.moved, counts.entry, item => gainedIn(item, other) !== null);
       if (move) {
-        const target = /** @type {string} */ (gainedIn(move));
-        gains.set(`${target}\u0000${move.name}`, /** @type {number} */ (gains.get(`${target}\u0000${move.name}`)) - 1);
+        const kept = gainedIn(move, same) !== null;
+        consume(move, kept ? same : other);
+        // A test that ran on the base and arrives ignored is switched off.
+        if (!kept && active) off.push(counts.entry);
         continue;
       }
       const item = take(pools.permitted, counts.entry, confirmed(counts.entry));
@@ -1171,7 +1275,7 @@ async function cacheKey({ checkout, baseSha, env, runner, signal, secrets }) {
   return createHash('sha256')
     .update(
       JSON.stringify([
-        2,
+        3, // the format of a cached registry: 3 keeps every target with its root file
         baseSha,
         fileHash(path.join(checkout, 'Cargo.lock')),
         variables,
@@ -1187,17 +1291,17 @@ async function cacheKey({ checkout, baseSha, env, runner, signal, secrets }) {
 function readCache(file) {
   try {
     const value = JSON.parse(readFileSync(file, 'utf8'));
-    return Array.isArray(value?.entries) ? value : null;
+    return Array.isArray(value?.entries) && Array.isArray(value?.targets) ? value : null;
   } catch {
     return null;
   }
 }
 
-function writeCache(file, entries) {
+function writeCache(file, { entries, targets }) {
   try {
     mkdirSync(path.dirname(file), { recursive: true });
     const temporary = `${file}.${process.pid}.tmp`;
-    writeFileSync(temporary, JSON.stringify({ entries }));
+    writeFileSync(temporary, JSON.stringify({ entries, targets }));
     renameSync(temporary, file);
   } catch {
     // A cache that cannot be written only costs the next gate a build.
@@ -1234,7 +1338,7 @@ async function baseRegistry({ cwd, home, baseSha, runner, signal, secrets, env }
         secrets,
         env,
       });
-      if (!('reason' in listed)) writeCache(cache, listed.entries);
+      if (!('reason' in listed)) writeCache(cache, listed);
       return listed;
     },
     signal,
@@ -1284,7 +1388,12 @@ export async function rustRegistryCheck({
     }
     if ('reason' in before) return { registry: { status: 'incomplete', reason: `base_${before.reason}` } };
   }
-  const compared = compareRegistry({ base: before.entries, head: after.entries, ...pools });
+  const compared = compareRegistry({
+    base: before.entries,
+    head: after.entries,
+    targets: [...(before.targets ?? []), ...(after.targets ?? [])],
+    ...pools,
+  });
   return {
     registry: {
       status: 'compared',

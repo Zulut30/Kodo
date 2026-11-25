@@ -23,7 +23,7 @@ import {
   testWeakening,
   verificationConfigHash,
 } from '../runtime/behavior-gate.mjs';
-import { withBaseLock } from '../runtime/behavior-rust.mjs';
+import { strictlyInside, withBaseLock } from '../runtime/behavior-rust.mjs';
 
 /** A Git repository with one commit; `change` edits the tree and commits the head. */
 function repository(t, files = {}) {
@@ -1332,6 +1332,152 @@ test('The base build lock holds across processes and is released when its holder
   holder.kill('SIGKILL');
   await new Promise(resolve => holder.on('exit', resolve));
   assert.equal(await withBaseLock(home, async () => 'second', undefined, 10000), 'second');
+});
+
+test('Round 5: empty targets, moves into ignore, nested templates, checkout bounds', async t => {
+  const homes = s => {
+    const home = mkdtempSync(path.join(os.tmpdir(), 'kodo-registry-home-'));
+    s.after(() => rmSync(home, { recursive: true, force: true }));
+    return home;
+  };
+  const gate = async (s, head, options = {}) =>
+    runBehaviorGate({ ...head, config: {}, registry: true, registryHome: homes(s), runner: fakeCargo([]), ...options });
+  const unit = (name, attribute = '#[test]') =>
+    `#[cfg(test)]\nmod tests {\n    ${attribute}\n    fn ${name}() {\n        assert!(crate::one());\n    }\n}\n`;
+  const libAndBin = (lib, bin, ignored = []) =>
+    registry(
+      { package: 'game', kind: 'lib', target: 'game', tests: lib, ignored },
+      { package: 'game', kind: 'bin', target: 'game', tests: bin },
+    );
+  const one = 'pub fn one() -> bool { true }\n';
+  const main = 'fn main() {}\nfn one() -> bool { true }\n';
+  await t.test(
+    'Z1: a library that lists no test is still a target: its permission does not reach the binary',
+    async s => {
+      const repo = repository(s, {
+        'Cargo.toml': cargoToml,
+        'src/lib.rs': `${one}${unit('same', '#[cfg(feature = "slow")]\n    #[test]')}`,
+        'src/main.rs': `${main}${unit('same')}`,
+        'registry.json': libAndBin([], ['tests::same']),
+      });
+      const head = repo.change({
+        'src/lib.rs': one,
+        'src/main.rs': `${main}${unit('same', '#[cfg(feature = "slow")]\n    #[test]')}`,
+        'registry.json': libAndBin([], []),
+      });
+      const receipt = await gate(s, head, { config: { verification: { testRemovalAllowed: ['src/lib.rs'] } } });
+      assert.deepEqual(
+        [rules(receipt.findings), rules(receipt.allowed)],
+        [['test_deleted:null'], ['tests_removed:src/lib.rs']],
+      );
+      assert.match(receipt.findings[0].detail, /"game bin game: tests::same"/);
+    },
+  );
+  await t.test('Z2: an active test moved to where it is ignored is test_skipped', async s => {
+    const repo = repository(s, {
+      'Cargo.toml': cargoToml,
+      'src/lib.rs': one,
+      'src/main.rs': `${main}${unit('same')}`,
+      'registry.json': libAndBin([], ['tests::same']),
+    });
+    const ignored = repo.change({
+      'src/main.rs': main,
+      'src/lib.rs': `${one}${unit('same', '#[test]\n    #[cfg_attr(feature = "slow", ignore)]')}`,
+      'registry.json': libAndBin(['tests::same'], [], ['tests::same']),
+    });
+    assert.deepEqual(await weakened(ignored), [], 'the reading sees a move');
+    const receipt = await gate(s, ignored);
+    assert.deepEqual(rules(receipt.findings), ['test_skipped:null']);
+    assert.match(receipt.findings[0].detail, /ignored now: "game bin game: tests::same"/);
+    const active = repository(s, {
+      'Cargo.toml': cargoToml,
+      'src/lib.rs': one,
+      'src/main.rs': `${main}${unit('same')}`,
+      'registry.json': libAndBin([], ['tests::same']),
+    });
+    const kept = active.change({
+      'src/main.rs': main,
+      'src/lib.rs': `${one}${unit('same')}`,
+      'registry.json': libAndBin(['tests::same'], []),
+    });
+    assert.deepEqual((await gate(s, kept)).findings, [], 'an active move stays a move');
+  });
+  await t.test('Z3: a template expanded by a called wrapper is checked; an unreached one is not', async s => {
+    const make = body =>
+      `macro_rules! make_case {\n    ($n:ident) => {\n        #[test]\n        fn $n() {${body}}\n    };\n}\n`;
+    const files = {
+      'src/lib.rs': '#[macro_use]\nmod gen;\n#[macro_use]\nmod wrap;\nmod use_it;\n',
+      'src/gen.rs': make(' assert_eq!(1 + 1, 2); '),
+      'src/wrap.rs': 'macro_rules! cases {\n    () => {\n        make_case!(adds);\n    };\n}\n',
+    };
+    const called = repository(s, { ...files, 'src/use_it.rs': 'cases!();\n' });
+    assert.deepEqual(await weakened(called.change({ 'src/gen.rs': make(' ') })), ['weak_or_empty_test:src/gen.rs']);
+    const unused = repository(s, { ...files, 'src/use_it.rs': '// cases!();\nconst NOTE: &str = "cases!()";\n' });
+    assert.deepEqual(await weakened(unused.change({ 'src/gen.rs': make(' ') })), []);
+    // Two templates that only call each other reach nothing, and the search ends.
+    const cycle = repository(s, {
+      ...files,
+      'src/wrap.rs':
+        'macro_rules! cases {\n    () => {\n        make_case!(adds);\n        again!();\n    };\n}\nmacro_rules! again {\n    () => {\n        cases!();\n    };\n}\n',
+      'src/use_it.rs': '// nothing calls them\n',
+    });
+    assert.deepEqual(await weakened(cycle.change({ 'src/gen.rs': make(' ') })), []);
+  });
+  await t.test(
+    'Z4: the base checkout must lie strictly inside the registry home, as the file system resolves it',
+    async s => {
+      const home = homes(s);
+      assert.equal(strictlyInside(home, path.join(home, 'base-checkout')), true);
+      assert.equal(strictlyInside(home, home), false);
+      assert.equal(strictlyInside(home, path.join(home, '..', 'elsewhere')), false);
+      assert.equal(strictlyInside(home, path.join(home, '..', `${path.basename(home)}-sibling`, 'x')), false);
+      if (process.platform === 'win32') {
+        const drive = home.slice(0, 1).toUpperCase() === 'Z' ? 'Y' : 'Z';
+        assert.equal(strictlyInside(home, `${drive}:\\outer\\base-checkout`), false, 'another drive');
+      }
+      // A link in place of the checkout that leads outside: no Git command, no deletion there.
+      const outside = homes(s);
+      writeFileSync(path.join(outside, 'precious.txt'), 'kept\n');
+      symlinkSync(outside, path.join(home, 'base-checkout'), 'junction');
+      const repo = repository(s, {
+        'Cargo.toml': cargoToml,
+        'src/lib.rs': lib,
+        'registry.json': registry(libTarget(['tests::adds'])),
+      });
+      const head = repo.change({ 'README.md': '# again\n' });
+      const receipt = await runBehaviorGate({
+        ...head,
+        config: {},
+        registry: true,
+        registryHome: home,
+        runner: fakeCargo([]),
+      });
+      assert.equal(receipt.status, 'incomplete');
+      assert.match(receipt.testRegistry.reason, /outside the registry home/);
+      assert.equal(readFileSync(path.join(outside, 'precious.txt'), 'utf8'), 'kept\n');
+    },
+  );
+  await t.test('Z4: a checkout another repository registered is rebuilt for this one, the other untouched', async s => {
+    const home = homes(s);
+    const other = repository(s, { 'README.md': '# other\n' });
+    other.git('worktree', 'add', '--detach', '--quiet', path.join(home, 'base-checkout'), other.baseSha);
+    const repo = repository(s, {
+      'Cargo.toml': cargoToml,
+      'src/lib.rs': lib,
+      'registry.json': registry(libTarget(['tests::adds'])),
+    });
+    const head = repo.change({ 'README.md': '# again\n' });
+    const receipt = await runBehaviorGate({
+      ...head,
+      config: {},
+      registry: true,
+      registryHome: home,
+      runner: fakeCargo([]),
+    });
+    assert.equal(receipt.testRegistry.status, 'compared');
+    assert.equal(repo.git('-C', path.join(home, 'base-checkout'), 'rev-parse', 'HEAD'), repo.baseSha);
+    assert.equal(other.git('rev-parse', 'HEAD'), other.baseSha, 'the other repository was not moved');
+  });
 });
 
 test('The hash of a default verification block is unchanged; a disabled registry changes it', () => {

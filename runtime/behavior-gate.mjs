@@ -24,7 +24,7 @@ import {
   rustCases,
   rustCrateDir,
   rustCrateRootProbe,
-  rustMacroCalls,
+  rustMacroUse,
   rustRegistryCheck,
   rustTargetGroup,
   selectionNarrowed,
@@ -1002,8 +1002,10 @@ const MAX_CALL_FILES = 200;
 /**
  * `weak_or_empty_test` for a `macro_rules!` template: a test it defines that is new or changed
  * and cannot fail, in a macro that is called (`name!(`, `name! {`, `name! [`) — in its package,
- * or anywhere in the repository for `#[macro_export]`. Calls are read as Rust tokens: a call in a
- * comment or a string is none. An unused template defines no test.
+ * or anywhere in the repository for `#[macro_export]`. A call from inside another template counts
+ * when that template is itself reached from a real call, transitively (`cases!()` expanding
+ * `make_case!`), cycles cut. Calls are read as Rust tokens: a call in a comment or a string is
+ * none. An unreached template defines no test.
  */
 async function templateFindings(cwd, headSha, base, head) {
   const before = new Map();
@@ -1014,30 +1016,57 @@ async function templateFindings(cwd, headSha, base, head) {
         if (!before.has(slot)) before.set(slot, new Set());
         before.get(slot).add(test.body);
       }
-  const called = async (template, file) => {
-    const crate = rustCrateDir(file),
-      inScope = other => template.exported || rustCrateDir(other) === crate;
-    if (head.some(entry => entry.calls?.has(template.name) && inScope(entry.file))) return true;
-    // A text search finds the files that may call it; their tokens decide.
-    const pattern = `(^|[^A-Za-z0-9_])${template.name}[[:space:]]*![[:space:]]*[[({]`;
-    const pathspec = template.exported || !crate ? '*.rs' : `${crate}/*.rs`;
-    const listed = await execute('git', ['grep', '-l', '-E', pattern, headSha, '--', pathspec], {
-      cwd,
-      allowFailure: true,
-    });
-    const files = listed.stdout
+  /** How the files that may name a macro use macros, read once per file. */
+  const uses = new Map(
+    head.map(entry => [entry.file, { calls: entry.calls ?? new Set(), templates: entry.templates ?? [] }]),
+  );
+  const read = async file => {
+    if (uses.has(file)) return uses.get(file);
+    let use = { calls: new Set(), templates: [] };
+    const size = await execute('git', ['cat-file', '-s', `${headSha}:${file}`], { cwd, allowFailure: true });
+    if (size.code === 0 && Number(size.stdout.trim()) <= MAX_RUST_BYTES) {
+      const text = await execute('git', ['show', `${headSha}:${file}`], { cwd, allowFailure: true, rawOutput: true });
+      if (text.code === 0) use = rustMacroUse(text.stdout);
+    }
+    uses.set(file, use);
+    return use;
+  };
+  /** The files in scope that may call `name`: the changed ones and a text search; their tokens decide. */
+  const candidates = async (name, inScope, wide, crate) => {
+    const pattern = `(^|[^A-Za-z0-9_])${name}[[:space:]]*![[:space:]]*[[({]`;
+    const listed = await execute(
+      'git',
+      ['grep', '-l', '-E', pattern, headSha, '--', wide || !crate ? '*.rs' : `${crate}/*.rs`],
+      { cwd, allowFailure: true },
+    );
+    const found = listed.stdout
       .split(/\r?\n/)
       .filter(Boolean)
-      .map(line => line.slice(headSha.length + 1))
-      .filter(other => inScope(other) && !head.some(entry => entry.file === other));
+      .map(line => line.slice(headSha.length + 1));
+    return [...new Set([...head.map(entry => entry.file), ...found])].filter(inScope);
+  };
+  const reached = async (template, file, seen = new Set()) => {
+    const slot = `${file}\u0000${template.name}`;
+    if (seen.has(slot) || seen.size > 32) return false;
+    seen.add(slot);
+    const crate = rustCrateDir(file),
+      inScope = other => template.exported || rustCrateDir(other) === crate;
+    const files = await candidates(template.name, inScope, template.exported, crate);
     if (files.length > MAX_CALL_FILES) return true;
     for (const other of files) {
-      const text = await execute('git', ['show', `${headSha}:${other}`], { cwd, allowFailure: true, rawOutput: true });
-      if (text.code === 0 && text.stdout.length <= MAX_RUST_BYTES && rustMacroCalls(text.stdout).has(template.name))
-        return true;
+      const use = await read(other);
+      if (use.calls.has(template.name)) return true;
+      for (const wrapper of use.templates)
+        if (
+          wrapper.name !== template.name &&
+          wrapper.calls?.has(template.name) &&
+          (await reached(wrapper, other, seen))
+        )
+          return true;
     }
     return false;
   };
+  const called = (template, file) => reached(template, file);
   const found = [];
   for (const entry of head) {
     const fake = [];
