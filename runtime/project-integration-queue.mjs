@@ -321,7 +321,9 @@ export async function drainIntegrationQueue(input) {
         need(terminal.has(outcome?.status), 'integration_queue_invalid');
       } catch (error) {
         // A lost lease ends the drain: the row stays merging for the holder that has the leases now.
-        if (error?.code === 'project_lease_lost') return finished;
+        // An unreadable integration branch is not an answer either: the row stays merging and a
+        // later drain adopts it, instead of failing a merge that may already be published.
+        if (['project_lease_lost', 'project_integration_unreadable'].includes(error?.code)) return finished;
         outcome = { status: 'failed', code: errorCode(error) };
       }
       let done;

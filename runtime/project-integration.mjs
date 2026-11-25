@@ -178,8 +178,11 @@ async function assertCommit(worktree, commit) {
  * @param {{ cwd: string, projectId: string }} options
  */
 /**
- * Whether `head` is on the project's integration branch; false when the branch does not exist.
+ * Whether `head` is on the project's integration branch: true, false (confirmed, also when the
+ * branch does not exist) or null when Git could not answer (an unreadable object, a locked file).
+ * Callers must not treat null as absence: a merge that was published may only be unreadable now.
  * @param {{ cwd: string, projectId: string, head: string }} input
+ * @returns {Promise<boolean | null>}
  */
 export async function headOnIntegrationBranch({ cwd, projectId, head }) {
   const branch = await execute(
@@ -187,11 +190,15 @@ export async function headOnIntegrationBranch({ cwd, projectId, head }) {
     ['rev-parse', '--verify', '--quiet', `refs/heads/${integrationBranch(projectId)}^{commit}`],
     { cwd, allowFailure: true },
   );
-  if (branch.code !== 0) return false;
-  return (
-    (await execute('git', ['merge-base', '--is-ancestor', head, branch.stdout.trim()], { cwd, allowFailure: true }))
-      .code === 0
-  );
+  // `--verify --quiet` exits 1 without output for a missing ref; anything else is not an answer.
+  if (branch.code === 1 && !branch.stdout.trim()) return false;
+  if (branch.code !== 0) return null;
+  const ancestor = await execute('git', ['merge-base', '--is-ancestor', head, branch.stdout.trim()], {
+    cwd,
+    allowFailure: true,
+  });
+  if (ancestor.code === 0) return true;
+  return ancestor.code === 1 ? false : null;
 }
 
 export async function integrationHeadOf({ cwd, projectId }) {
@@ -322,11 +329,14 @@ async function existingMerge(worktree, taskHead) {
 
 const coded = code => Object.assign(new Error(`Project ${code}`), { code });
 
-// A ref's current value, synchronously (null when it does not exist).
+// A ref's current value, synchronously: the SHA, null when it does not exist, undefined when Git
+// could not answer (did not run, timed out, failed otherwise).
 function refValue(cwd, ref, timeoutMs) {
   const { args, env } = gitBoundary(['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], process.env);
   const found = spawnSync('git', args, { cwd, env, encoding: 'utf8', timeout: timeoutMs, windowsHide: true });
-  return found.status === 0 ? found.stdout.trim() : null;
+  if (found.error || found.status === null) return undefined;
+  if (found.status === 0) return found.stdout.trim();
+  return found.status === 1 && !found.stdout.trim() ? null : undefined;
 }
 
 /**
@@ -377,7 +387,11 @@ export function updateRefsAtomically(cwd, { verify = [], update }, { timeoutMs =
  */
 export function refusedPublish(error, cwd, verify = []) {
   if (error?.refused !== true) return error;
-  return verify.some(row => refValue(cwd, row.ref, 5000) !== row.sha) ? coded('project_submission_stale') : error;
+  // Only a worker ref read back with another value (or gone) is stale; an unanswered read keeps
+  // the original lost-publish error rather than guessing that the worker moved.
+  const values = verify.map(row => refValue(cwd, row.ref, 5000));
+  if (values.includes(undefined)) return error;
+  return values.some((value, index) => value !== verify[index].sha) ? coded('project_submission_stale') : error;
 }
 
 /** The default ref publisher: the atomic update without a lease fence (callers without a Store). */

@@ -869,6 +869,16 @@ async function replayedMerge(ctx, input, run) {
 const headOnBranch = (projectId, run, headSha) =>
   headOnIntegrationBranch({ cwd: run.project, projectId, head: headSha });
 
+// The same answer where only a confirmed one may act: when Git could not read the branch (a locked
+// or unreadable object), a published merge must not be taken for an absent one — its `pending`
+// record and queue row stay for a later drain instead of being released.
+async function headOnBranchKnown(projectId, run, headSha) {
+  const on = await headOnBranch(projectId, run, headSha);
+  if (on === null)
+    throw Object.assign(new Error('Integration branch unreadable'), { code: 'project_integration_unreadable' });
+  return on;
+}
+
 const integrationStarted = run => ['merged', 'pending'].includes(run.integration?.status);
 const cancelled = run => Boolean(run.externalAbandon) || run.cancelRequested === true || run.state === 'cancelled';
 
@@ -986,7 +996,7 @@ async function integrateQueued(ctx, C, W, waveCtx, entry, signal) {
   // Git first, then the Run's record: a recorded merge that left the branch is missing.
   if (run.integration?.status === 'merged' && run.integration.mergedHead === headSha) {
     if (!(await mergeRecorded(projectId, run))) return { status: 'rejected', code: 'project_integration_missing' };
-  } else if (!(await headOnBranch(projectId, run, headSha))) {
+  } else if (!(await headOnBranchKnown(projectId, run, headSha))) {
     // A new merge — also after a `pending` record whose merge never reached the branch: the full
     // check of the normal path (attempt, no abandon, the worker's branch and worktree on this head).
     const refused =

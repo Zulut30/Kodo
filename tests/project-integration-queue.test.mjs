@@ -79,6 +79,26 @@ test('The queue is a versioned migration of its own and survives a reopened stat
   assert.throws(() => reopened.enqueue({ ...row('x'), priority: 1.5 }), { code: 'project_integration_queue_invalid' });
 });
 
+test('An unreadable integration branch keeps the row merging for a later drain, never failed', async t => {
+  const queue = openIntegrationQueue((await home(t)).open());
+  queue.enqueue(row('a'));
+  const unreadable = Object.assign(new Error('unreadable'), { code: 'project_integration_unreadable' });
+  const first = await drainIntegrationQueue({
+    queue,
+    projectId,
+    integrate: async () => {
+      throw unreadable;
+    },
+  });
+  assert.deepEqual(first, []);
+  assert.equal(queue.list(projectId)[0].status, 'merging', 'not failed: the merge may already be published');
+  const later = await drainIntegrationQueue({ queue, projectId, integrate: async () => ({ status: 'integrated' }) });
+  assert.deepEqual(
+    later.map(entry => [entry.taskId, entry.status]),
+    [['a', 'integrated']],
+  );
+});
+
 test('A drain keeps priority and FIFO order: a claim ends at the first overlapping row', async t => {
   const queue = openIntegrationQueue((await home(t)).open());
   for (const [taskId, priority] of [

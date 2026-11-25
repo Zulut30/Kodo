@@ -36,10 +36,16 @@ export async function withIntegrationLease(store, projectId, work, options = {})
   if (outer?.has(name)) fail('lease_lost');
   const deadline = Date.now() + waitMs;
   let token;
-  while (!(token = store.acquireLease(name, randomUUID(), { ttlMs: 60000, limit: 1 }))) {
+  const stopped = () => {
     if (signal?.aborted) fail(signal.reason?.code === 'project_lease_lost' ? 'lease_lost' : 'control_blocked');
+  };
+  // A busy lease is waited for; the signal is checked before and after every pause, so a lease
+  // lost during the pause never lets the work start on a freshly taken integration lease.
+  while (!(token = store.acquireLease(name, randomUUID(), { ttlMs: 60000, limit: 1 }))) {
+    stopped();
     if (Date.now() >= deadline) fail('integration_busy');
     await delay(50);
+    stopped();
   }
   const timer = setInterval(() => {
     try {

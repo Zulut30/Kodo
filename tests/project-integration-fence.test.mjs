@@ -13,6 +13,7 @@ import { lstat } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 import {
   atomicPublisher,
+  refusedPublish,
   ensureIntegration,
   headOnIntegrationBranch,
   mergeBackGate,
@@ -267,9 +268,41 @@ test('A missing integration branch is not on any head, never a Git error', async
   const alpha = await f.task('alpha');
   assert.equal(await headOnIntegrationBranch({ cwd: f.root, projectId: f.projectId, head: f.branchHead() }), true);
   assert.equal(await headOnIntegrationBranch({ cwd: f.root, projectId: f.projectId, head: alpha }), false);
+  // Git that cannot answer (an object it cannot read) is not "absent": null, never false.
+  assert.equal(
+    await headOnIntegrationBranch({ cwd: f.root, projectId: f.projectId, head: 'a'.repeat(40) }),
+    null,
+    'an unreadable head is unknown',
+  );
   git(f.root, 'update-ref', '-d', `refs/heads/${f.integration.branch}`);
   assert.equal(await headOnIntegrationBranch({ cwd: f.root, projectId: f.projectId, head: alpha }), false);
-  await delay(0);
+  // A refused publish whose worker ref cannot be read back keeps its lost-publish error.
+  const notRepo = await mkdtemp(path.join(os.tmpdir(), 'kodo-not-repo-'));
+  t.after(() => rm(notRepo, { recursive: true, force: true }));
+  const refused = Object.assign(new Error('refused'), { code: 'project_lease_lost', refused: true });
+  assert.equal(refusedPublish(refused, notRepo, [{ ref: 'refs/heads/kodo/x', sha: alpha }]).code, 'project_lease_lost');
+});
+
+test('A lease lost during the wait for the integration lease never starts the work', async t => {
+  const f = await fixture(t);
+  const name = integrationLeaseName(f.projectId);
+  const other = f.store.acquireLease(name, 'other', { ttlMs: 60000, limit: 1 });
+  const controller = new AbortController();
+  let ran = false;
+  const waiting = withIntegrationLease(
+    f.store,
+    f.projectId,
+    async () => {
+      ran = true;
+    },
+    { signal: controller.signal },
+  );
+  await delay(20);
+  // Both at once: the lease is lost and the integration lease becomes free.
+  controller.abort(Object.assign(new Error('Project lease lost'), { code: 'project_lease_lost' }));
+  f.store.releaseLease(other);
+  await assert.rejects(waiting, { code: 'project_lease_lost' });
+  assert.equal(ran, false);
 });
 
 test('Fenced writes check the live lease tokens in their own transaction', async t => {
