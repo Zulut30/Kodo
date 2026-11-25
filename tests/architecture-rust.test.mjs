@@ -2427,3 +2427,56 @@ test('X5: members = ["*"] excludes workspace root itself while root [package] is
     ['sub', 'peer'],
   );
 });
+
+test('X4: hidden files (.gitignore, .cargo/config.toml) inside contract crate are allowed by crates/<contract>/** matching ownsPath semantics', async t => {
+  const fx = await rustFixture(t);
+  await fx.put('crates/game-contracts/.gitignore', 'target/\n');
+  await fx.put('crates/game-contracts/.cargo/config.toml', '[build]\njobs = 2\n');
+  const headSha = fx.commit('add dotfiles inside contract crate');
+
+  // Explicit contract directory glob dir/** must authorize dotfiles inside the contract crate.
+  const allowed = await checkArchitecture({
+    project: fx.project,
+    baseSha: fx.baseSha,
+    headSha,
+    evidenceDir: fx.artifacts,
+    taskPaths: ['crates/game-contracts/**'],
+  });
+  assert.equal(allowed.status, 'passed', `dotfiles must be allowed by dir/**: ${JSON.stringify(allowed.findings)}`);
+  assert.equal(allowed.requiresReview, true);
+
+  // Unrelated taskPaths must still block both dotfiles.
+  const deniedOther = await checkArchitecture({
+    project: fx.project,
+    baseSha: fx.baseSha,
+    headSha,
+    evidenceDir: fx.artifacts,
+    taskPaths: ['crates/world/**'],
+  });
+  assert.equal(deniedOther.status, 'failed');
+  assert.ok(
+    deniedOther.findings.some(
+      f => f.ruleId === 'contract_change_not_allowed' && f.file === 'crates/game-contracts/.gitignore',
+    ),
+  );
+  assert.ok(
+    deniedOther.findings.some(
+      f => f.ruleId === 'contract_change_not_allowed' && f.file === 'crates/game-contracts/.cargo/config.toml',
+    ),
+  );
+
+  // Narrower subtree crates/game-contracts/src/** must NOT authorize root dotfiles.
+  const deniedNarrow = await checkArchitecture({
+    project: fx.project,
+    baseSha: fx.baseSha,
+    headSha,
+    evidenceDir: fx.artifacts,
+    taskPaths: ['crates/game-contracts/src/**'],
+  });
+  assert.equal(deniedNarrow.status, 'failed');
+  assert.ok(
+    deniedNarrow.findings.some(
+      f => f.ruleId === 'contract_change_not_allowed' && f.file === 'crates/game-contracts/.gitignore',
+    ),
+  );
+});

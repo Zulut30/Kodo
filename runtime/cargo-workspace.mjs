@@ -29,8 +29,12 @@ export function scopeMatchesPath(rawScope, rawFile) {
   const scope = normalizeScopePath(rawScope);
   const file = normalizeScopePath(rawFile);
   if (!scope || !file) return false;
-  if (scope === '.') return true;
+  if (scope === '.' || scope === '**') return true;
   if (!SCOPE_GLOB_META.test(scope)) return file === scope || file.startsWith(`${scope}/`);
+  if (scope.endsWith('/**')) {
+    const base = scope.slice(0, -3);
+    if (base && !SCOPE_GLOB_META.test(base) && (file === base || file.startsWith(`${base}/`))) return true;
+  }
   return path.posix.matchesGlob(file, scope);
 }
 
