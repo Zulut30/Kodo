@@ -90,18 +90,9 @@ const projectTables = ['records', 'attempts', 'current', 'approvals', 'commands'
   name => `kodo_project_${name}`,
 );
 
-/**
- * The Project repository validates each record exactly as `kodo project status`
- * does, but opening it runs its migrator. The migrator only reads when a version
- * row exists (it then verifies the digest and the tables); it writes (backup
- * directory, backup file, DDL) only when the row is missing. A report therefore
- * requires the row first, and its database port reports no file location, so
- * the migrator's write branch stops at its location check before any write.
- */
+// A report validates the installed project schema on its private read-only snapshot.
 async function projectRepository(state) {
   if (!['kodo_project_migrations', ...projectTables].every(name => state.tables.has(name))) fail('report_not_found');
-  const version = state.db.prepare('SELECT version FROM kodo_project_migrations ORDER BY version DESC LIMIT 1').get();
-  if (version?.version !== 1) fail('report_unavailable');
   const { db } = state;
   const port = {
     prepare: sql => db.prepare(sql),
@@ -116,6 +107,7 @@ async function projectRepository(state) {
   return openProjectStore({
     // Structural validation only: keys mask printed values after the build, so a key
     // equal to a record field name never makes a valid snapshot unreadable.
+    skipMigration: true,
     store: { db: port, secrets: {}, createRun: () => fail('report_unavailable') },
     contracts,
   });

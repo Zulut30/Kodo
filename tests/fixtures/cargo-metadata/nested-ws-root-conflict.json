@@ -1,0 +1,19 @@
+{
+  "cargoVersion": "cargo 1.96.0 (30a34c682 2026-05-25)",
+  "startDir": "",
+  "ok": false,
+  "expectedReason": "nested-workspace-root",
+  "cargoError": "error: multiple workspace roots found in the same workspace:\n  <ROOT>/nested\n  <ROOT>",
+  "files": [
+    "Cargo.toml",
+    "crates/a/Cargo.toml",
+    "crates/a/src/lib.rs",
+    "nested/Cargo.toml",
+    "nested/src/lib.rs"
+  ],
+  "manifests": {
+    "Cargo.toml": "[workspace]\nresolver = \"2\"\nmembers = [\"crates/a\"]\n",
+    "crates/a/Cargo.toml": "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nnested = { path = \"../../nested\" }\n",
+    "nested/Cargo.toml": "[package]\nname = \"nested\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[workspace]\n"
+  }
+}

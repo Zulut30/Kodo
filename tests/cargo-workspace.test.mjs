@@ -1,0 +1,537 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { fixture, toolRunner, put } from './fixtures/quality/helpers.mjs';
+import { runQuality } from '../runtime/quality-runner.mjs';
+import { QualityProfileRegistry } from '../runtime/quality.mjs';
+import { planFastChecks } from '../runtime/task-fast-checks.mjs';
+import { git } from '../runtime/workspace.mjs';
+
+const workspace = {
+  'Cargo.toml':
+    '[workspace]\nmembers=["crates/*"]\n[workspace.package]\nedition="2021"\n[workspace.dependencies]\nengine={package="core",path="crates/core"}',
+  'Cargo.lock': `version = 4
+
+[[package]]
+name = "app"
+version = "0.1.0"
+dependencies = ["world"]
+
+[[package]]
+name = "core"
+version = "0.1.0"
+
+[[package]]
+name = "world"
+version = "0.1.0"
+dependencies = ["core"]
+`,
+  'rust-toolchain.toml': '[toolchain]\nchannel="1.85.0"\ncomponents=["rustfmt","clippy"]',
+};
+for (const [name, deps] of [
+  ['core', ''],
+  ['world', '[dependencies]\nengine.workspace=true'],
+  ['app', '[build-dependencies]\nworld={path="../world"}'],
+]) {
+  workspace[`crates/${name}/Cargo.toml`] =
+    `[package]\nname="${name}"\nversion="0.1.0"\nedition.workspace=true\n${deps}`;
+  workspace[`crates/${name}/src/lib.rs`] = 'pub fn value() {}\n';
+}
+
+test('workspace members inherit edition, lock and toolchain components', async t => {
+  const fx = await fixture(t, workspace);
+  const plan = await new QualityProfileRegistry().plan(fx.project, { capabilities: ['format', 'lint', 'typecheck'] });
+  assert.equal(plan.checks.length, 9);
+  for (const check of plan.checks) {
+    assert.equal(check.edition, '2021', check.id);
+    assert.equal(check.status, 'applicable', check.reason);
+    if (check.tool === 'cargo') assert.equal(check.rustcVersion, '1.85.0');
+  }
+  const fake = toolRunner();
+  const runner = (command, args, options) =>
+    command === 'rustup' && args[0] === 'run' && args[1] === '1.85.0'
+      ? fake.runner(args[2], args.slice(3), options)
+      : fake.runner(command, args, options);
+  const result = await runQuality({ ...fx, runner, capabilities: ['format', 'lint', 'typecheck'] });
+  assert.equal(result.status, 'passed', JSON.stringify(result.receipts.map(c => c.reason)));
+});
+
+test('task-fast plans transitive consumers, workspace inputs and Rust timeouts', async t => {
+  const { project: cwd } = await fixture(t, workspace);
+  const run = {
+    cwd,
+    config: { commands: { test: [{ command: process.platform === 'win32' ? 'CARGO.EXE' : 'cargo', args: ['test'] }] } },
+  };
+  for (const [file, expected] of [
+    ['crates/core/src/lib.rs', ['core', 'world', 'app']],
+    ['crates/app/src/lib.rs', ['app']],
+    ['Cargo.toml', null],
+  ]) {
+    const baseSha = await git(cwd, ['rev-parse', 'HEAD']);
+    await put(cwd, file, workspace[file] + '\n');
+    await git(cwd, [
+      '-c',
+      'user.name=test',
+      '-c',
+      'user.email=test@example.org',
+      '-c',
+      'commit.gpgSign=false',
+      'commit',
+      '-qam',
+      'change',
+    ]);
+    const headSha = await git(cwd, ['rev-parse', 'HEAD']);
+    for (const timeout of [undefined, 55555]) {
+      const plan = await planFastChecks({
+        run: { ...run, config: { ...run.config, fastChecks: { timeoutMs: timeout } } },
+        baseSha,
+        headSha,
+      });
+      const specs = expected?.map(n => n + '@0.1.0');
+      assert.equal(plan.commands.length, 1);
+      const [kind, ...args] = plan.commands[0].args;
+      assert.equal(kind, 'test');
+      assert.equal(args.pop(), '--locked');
+      if (specs) {
+        assert.deepEqual(
+          args.filter((_, i) => i % 2 === 0),
+          specs.map(() => '-p'),
+        );
+        assert.deepEqual(args.filter((_, i) => i % 2 === 1).sort(), specs.sort());
+      } else assert.deepEqual(args, ['--workspace']);
+      assert.ok(plan.commands.every(c => c.timeoutMs === (timeout ?? 600000)));
+    }
+  }
+});
+
+test('root lock and toolchain apply with a literal member edition', async t => {
+  const fx = await fixture(t, {
+    ...workspace,
+    ...Object.fromEntries(
+      Object.entries(workspace)
+        .filter(([k]) => k.startsWith('crates/') && k.endsWith('Cargo.toml'))
+        .map(([k, v]) => [k, v.replace('edition.workspace=true', 'edition="2021"')]),
+    ),
+  });
+  const { checks } = await new QualityProfileRegistry().plan(fx.project, {
+    capabilities: ['typecheck', 'format', 'lint'],
+  });
+  assert.deepEqual(
+    checks.filter(c => c.status !== 'applicable').map(c => [c.root, c.reason, c.version, c.rustcVersion]),
+    [],
+  );
+});
+
+test('task-fast executes the crate plan with a warm target through a fake cargo executable', async t => {
+  const { copyFile, link } = await import('node:fs/promises');
+  const { default: path } = await import('node:path');
+  const { runFastChecks } = await import('../runtime/task-fast-checks.mjs');
+  // A copy of the Node launcher named cargo executes the tracked scripts "fetch" and "test".
+  const shim = `
+    console.log(JSON.stringify({
+      args: process.argv.slice(2),
+      target: process.env.CARGO_TARGET_DIR,
+      offline: process.env.CARGO_NET_OFFLINE
+    }));
+  `;
+  const fetch = `
+    const fs = require('node:fs');
+    const file = process.env.CARGO_TARGET_DIR + '/fetch-log';
+    fs.appendFileSync(file, JSON.stringify([process.argv.slice(2), process.env.CARGO_NET_OFFLINE]) + '\\n');
+    if (!fs.existsSync(file + '.allow')) process.exit(42);
+  `;
+  const { project: cwd, base: home } = await fixture(t, { ...workspace, fetch, test: shim });
+  const cargo = path.join(home, process.platform === 'win32' ? 'cargo.exe' : 'cargo');
+  await link(process.execPath, cargo).catch(() => copyFile(process.execPath, cargo));
+  const baseSha = await git(cwd, ['rev-parse', 'HEAD']);
+  await put(cwd, 'crates/app/src/lib.rs', 'pub fn new_value() {}\n');
+  await git(cwd, [
+    '-c',
+    'user.name=test',
+    '-c',
+    'user.email=test@example.org',
+    '-c',
+    'commit.gpgSign=false',
+    'commit',
+    '-qam',
+    'only app',
+  ]);
+  const run = {
+    project: cwd,
+    cwd,
+    baseSha,
+    directorBinding: { projectId: 'game' },
+    config: { commands: { test: [{ command: cargo, args: ['test'] }] } },
+  };
+  const logs = [];
+  const engine = {
+    store: { home },
+    setup: async () => {},
+    checkCancelled() {},
+    save() {},
+    log() {},
+    persistEvidence: async (_run, _kind, data) => {
+      logs.push(data);
+      return { path: path.join(home, 'fake-receipt'), sha256: '0'.repeat(64), bytes: 1 };
+    },
+  };
+  const { writeFile, readFile } = await import('node:fs/promises');
+  const target = path.join(home, 'cargo-target', 'game', 'slot-1');
+  await assert.rejects(runFastChecks({ engine, run }), { code: 'cargo_fetch_failed' });
+  await writeFile(path.join(target, 'fetch-log.allow'), '');
+  for (let i = 0; i < 2; i++) {
+    logs.length = 0;
+    const checks = await runFastChecks({ engine, run });
+    assert.ok(checks.complete);
+    assert.deepEqual(checks.plan.affectedCrates, ['app']);
+    assert.deepEqual(
+      logs.map(row => JSON.parse(row.stdout)),
+      [{ args: ['-p', 'app@0.1.0', '--locked'], target, offline: 'true' }],
+    );
+  }
+  assert.deepEqual(
+    (await readFile(path.join(target, 'fetch-log'), 'utf8'))
+      .trim()
+      .split(/\r?\n/)
+      .map(line => JSON.parse(line)),
+    [
+      [['--locked'], 'false'],
+      [['--locked'], 'false'],
+    ],
+  );
+  await put(cwd, 'Cargo.lock', workspace['Cargo.lock'] + '# new graph\n');
+  await git(cwd, [
+    '-c',
+    'user.name=test',
+    '-c',
+    'user.email=test@example.org',
+    '-c',
+    'commit.gpgSign=false',
+    'commit',
+    '-qam',
+    'lock',
+  ]);
+  await runFastChecks({ engine, run });
+  assert.equal((await readFile(path.join(target, 'fetch-log'), 'utf8')).trim().split(/\r?\n/).length, 3);
+});
+
+test('Cargo shared inputs widen the plan even in a workspace with a root package', async () => {
+  const { parse } = await import('smol-toml');
+  const { affectedCrates } = await import('../runtime/cargo-graph.mjs');
+  const docs = new Map(
+    Object.entries(workspace)
+      .filter(([name]) => name.endsWith('Cargo.toml'))
+      .map(([name, source]) => [name, parse(source)]),
+  );
+  docs.get('Cargo.toml').package = { name: 'root-package' };
+  for (const file of ['Cargo.lock', 'rust-toolchain.toml', '.cargo/config', '.cargo/config.toml']) {
+    const plan = affectedCrates(docs, [file]);
+    assert.equal(plan.fallback, true, file);
+    assert.deepEqual(plan.affectedCrates.sort(), ['app', 'core', 'root-package', 'world']);
+  }
+});
+
+const graphDocs = () =>
+  new Map([
+    [
+      'Cargo.toml',
+      {
+        package: { name: 'game', version: '1.0.0' },
+        workspace: { members: ['.', 'crates/**'], exclude: ['crates/skip'] },
+      },
+    ],
+    [
+      'crates/render/Cargo.toml',
+      {
+        package: { name: 'config', version: '2.0.0' },
+        dependencies: { other: { package: 'config', version: '1.0.0' } },
+      },
+    ],
+  ]);
+for (const file of [
+  'assets/a.json',
+  'crates/render/fixtures/a.txt',
+  'crates/render/.cargo/config.toml',
+  'crates/render/src/rust-toolchain.toml',
+  'crates/render/src/a.json',
+]) {
+  test('unknown Cargo input widens ' + file, async () => {
+    const { affectedCrates } = await import('../runtime/cargo-graph.mjs');
+    assert.equal(affectedCrates(graphDocs(), [file]).fallback, true);
+  });
+}
+for (const [key, value] of [
+  ['lib', { path: '../shared.rs' }],
+  ['bin', [{ path: '../shared.rs' }]],
+  ['test', [{ path: '../shared.rs' }]],
+  ['bench', [{ path: '../shared.rs' }]],
+  ['example', [{ path: '../shared.rs' }]],
+  ['build', '../build.rs'],
+]) {
+  test('external target forces workspace ' + key, async () => {
+    const { affectedCrates } = await import('../runtime/cargo-graph.mjs');
+    const docs = graphDocs(),
+      doc = docs.get('crates/render/Cargo.toml');
+    if (key === 'build') doc.package.build = value;
+    else doc[key] = value;
+    assert.equal(affectedCrates(docs, ['src/main.rs']).fallback, true);
+    if (key === 'build') doc.package.build = 'custom.rs';
+    else doc[key] = key === 'lib' ? { path: 'custom.rs' } : [{ path: 'custom.rs' }];
+    assert.deepEqual(affectedCrates(docs, ['crates/render/custom.rs']).affectedCrates, ['config']);
+  });
+}
+for (const [name, contents] of [
+  ['include_str', 'include_str!("../../../src/main.rs")'],
+  ['include_bytes', 'include_bytes! ( "../../../src/main.rs" )'],
+  ['include', 'include!(concat!(env!("OUT_DIR"),"/file"))'],
+  ['path', '#[path = "../../../src/main.rs"] mod m;'],
+  ['patch', '[patch.crates-io]\nx={path="foo"}'],
+  ['source', '[source.crates-io]\nreplace-with="vendor"'],
+  ['build-script', 'fn main() {}'],
+  ['manifest-link', ''],
+]) {
+  test('hidden Cargo edge ' + name, async t => {
+    const { cargoPlanAt } = await import('../runtime/cargo-graph.mjs');
+    const file =
+      name === 'build-script'
+        ? 'crates/app/build.rs'
+        : ['patch', 'source'].includes(name)
+          ? '.cargo/config'
+          : 'crates/app/src/hidden.rs';
+    const { project } = await fixture(t, { ...workspace, [file]: contents });
+    const base = await git(project, ['rev-parse', 'HEAD']);
+    if (name === 'manifest-link') {
+      const oid = await git(project, ['rev-parse', 'HEAD:Cargo.toml']);
+      await git(project, ['update-index', '--add', '--cacheinfo', '120000,' + oid + ',crates/shadow/Cargo.toml']);
+    }
+    await put(project, 'crates/world/src/lib.rs', 'pub fn changed() {}');
+    await git(project, ['add', 'crates/world/src/lib.rs']);
+    await git(project, [
+      '-c',
+      'user.name=test',
+      '-c',
+      'user.email=test@example.org',
+      '-c',
+      'commit.gpgSign=false',
+      'commit',
+      '-qm',
+      'change',
+    ]);
+    // For the link case compare a later source-only change so the manifest diff itself cannot widen.
+    let from = base;
+    if (name === 'manifest-link') {
+      from = await git(project, ['rev-parse', 'HEAD']);
+      await put(project, 'crates/world/src/lib.rs', 'pub fn another() {}');
+      await git(project, ['add', 'crates/world/src/lib.rs']);
+      await git(project, [
+        '-c',
+        'user.name=test',
+        '-c',
+        'user.email=test@example.org',
+        '-c',
+        'commit.gpgSign=false',
+        'commit',
+        '-qm',
+        'source',
+      ]);
+    }
+    const plan = await cargoPlanAt(project, from, await git(project, ['rev-parse', 'HEAD']));
+    if (name === 'build-script') {
+      assert.equal(plan.fallback, false);
+      assert.deepEqual(plan.affectedCrates.sort(), ['app', 'world']);
+      assert.deepEqual(plan.reasons, ['cargo-build-script-input']);
+    } else {
+      const expected = {
+        patch: 'cargo-config-dependencies',
+        source: 'cargo-config-dependencies',
+        'manifest-link': 'cargo-linked-input',
+      };
+      assert.equal(plan.fallback, true);
+      assert.deepEqual(plan.reasons, [expected[name] ?? 'cargo-source-path']);
+    }
+  });
+}
+test('Cargo membership stops at excludes and nested workspace roots', async () => {
+  const { cargoMembers } = await import('../runtime/cargo-graph.mjs');
+  const docs = graphDocs();
+  for (const dir of ['crates/skip/child', 'crates/inner', 'crates/inner/member'])
+    docs.set(dir + '/Cargo.toml', { package: { name: 'p' } });
+  docs.get('crates/inner/Cargo.toml').workspace = { members: ['member'] };
+  for (const root of ['', '.']) assert.deepEqual([...cargoMembers(docs, root).keys()].sort(), ['', 'crates/render']);
+  assert.deepEqual([...cargoMembers(docs, 'crates/inner').keys()].sort(), ['crates/inner', 'crates/inner/member']);
+});
+test('nested CRLF virtual workspace selects the nearest edition and toolchain without package.json', async t => {
+  const fx = await fixture(t, {
+    ...workspace,
+    'Cargo.toml': '[workspace]\nmembers=["**"]\n[workspace.package]\nedition="2018"',
+    'crates/Cargo.toml':
+      '[workspace]\r\nmembers=["*"]\r\n[workspace.package]\r\nedition="2024"\r\n[workspace.dependencies]\r\nengine={package="core",path="core"}',
+    'crates/Cargo.lock': workspace['Cargo.lock'],
+    'crates/rust-toolchain.toml': '[toolchain]\r\nchannel="1.88.0"\r\n',
+  });
+  const { checks } = await new QualityProfileRegistry().plan(fx.project, { capabilities: ['typecheck'] });
+  assert.ok(
+    checks.length &&
+      checks.every(c => c.status === 'applicable' && c.edition === '2024' && c.rustcVersion === '1.88.0'),
+  );
+});
+test('Rust selectors distinguish a registry dependency with the same name', async t => {
+  const { project: cwd } = await fixture(t, {
+    'Cargo.toml': '[package]\nname="config"\nversion="2.0.0"\n[dependencies]\nother={package="config",version="1.0.0"}',
+    'src/lib.rs': '',
+    'Cargo.lock': 'version=4',
+  });
+  const baseSha = await git(cwd, ['rev-parse', 'HEAD']);
+  await put(cwd, 'src/lib.rs', 'pub fn x() {}');
+  await git(cwd, [
+    '-c',
+    'user.name=test',
+    '-c',
+    'user.email=test@example.org',
+    '-c',
+    'commit.gpgSign=false',
+    'commit',
+    '-qam',
+    'change',
+  ]);
+  const { normalizeConfig } = await import('../runtime/config.mjs');
+  const plan = await planFastChecks({
+    run: { cwd, config: normalizeConfig({}) },
+    baseSha,
+    headSha: await git(cwd, ['rev-parse', 'HEAD']),
+  });
+  assert.deepEqual(
+    plan.commands.map(c => c.args),
+    [['test', '-p', 'config@2.0.0', '--locked']],
+  );
+});
+test('optional Rust settings validate without adding absent policy keys', async () => {
+  const { normalizeConfig } = await import('../runtime/config.mjs');
+  for (const input of [
+    { rust: null },
+    { rust: { sccache: 1 } },
+    { rust: { extra: true } },
+    { fastChecks: [] },
+    { fastChecks: { timeoutMs: 0 } },
+    { fastChecks: { extra: true } },
+  ])
+    assert.throws(() => normalizeConfig(input));
+  const config = normalizeConfig({});
+  assert.ok(!Object.hasOwn(config, 'rust') && !Object.hasOwn(config, 'fastChecks'));
+});
+
+test('Rust noTests fallback keeps the Rust default and explicit limit', async () => {
+  const { fullFastFallback } = await import('../runtime/task-fast-checks.mjs');
+  for (const timeout of [undefined, 9876]) {
+    const run = {
+      config: { commands: { test: [{ command: 'cargo', args: ['test'] }] }, fastChecks: { timeoutMs: timeout } },
+    };
+    const plan = fullFastFallback(run, { rust: true });
+    assert.deepEqual(
+      plan.commands.map(c => [c.args, c.timeoutMs]),
+      [[['test', '--workspace', '--locked'], timeout ?? 600000]],
+    );
+  }
+});
+
+test('a root package cannot claim a nested manifest or read another member as private source', async () => {
+  const { affectedCrates } = await import('../runtime/cargo-graph.mjs');
+  const docs = graphDocs();
+  docs.set('src/vendor/Cargo.toml', { package: { name: 'vendored', version: '1.0.0' } });
+  assert.equal(affectedCrates(docs, ['src/vendor/src/lib.rs']).fallback, true);
+  for (const source of [
+    'include!("../crates/render/src/lib.rs")',
+    '#[path="../crates/render/src/lib.rs"] mod render;',
+  ]) {
+    const snapshot = { entries: [], sources: new Map([['src/lib.rs', source]]) };
+    assert.equal(affectedCrates(docs, ['crates/render/src/lib.rs'], snapshot).fallback, true);
+  }
+  docs.get('Cargo.toml').lib = { path: 'crates/render/shared.rs' };
+  assert.equal(affectedCrates(docs, ['crates/render/src/lib.rs']).fallback, true);
+});
+test('same registry version also widens package selection', async () => {
+  const { affectedCrates } = await import('../runtime/cargo-graph.mjs');
+  const sources = new Map([
+    ['Cargo.lock', '[[package]]\nname="config"\nversion="2.0.0"\nsource="registry+https://example.invalid"'],
+  ]);
+  assert.deepEqual(affectedCrates(graphDocs(), ['crates/render/src/lib.rs'], { entries: [], sources }).reasons, [
+    'cargo-ambiguous-package',
+  ]);
+});
+
+test('two Cargo slots share a single successful fetch for one lock and Cargo home', { timeout: 30000 }, async t => {
+  const { warmCargoDependencies } = await import('../runtime/cargo-fetch.mjs');
+  const { withCargoSlot } = await import('../runtime/cargo-slots.mjs');
+  const { readFile } = await import('node:fs/promises');
+  const { default: path } = await import('node:path');
+  const source =
+    "const fs=require('node:fs');fs.appendFileSync(process.env.FETCH_LOG,'fetched\\n');setTimeout(()=>{},200)";
+  const { base: home, project: cwd } = await fixture(t, { 'Cargo.lock': 'version=4', fetch: source });
+  const file = path.join(home, 'fetch-log');
+  const both = Promise.withResolvers();
+  t.signal.addEventListener('abort', () => both.reject(t.signal.reason), { once: true });
+  let waiting = 0;
+  const results = await Promise.all(
+    ['game', 'engine'].map(projectId =>
+      withCargoSlot(
+        { home, projectId, maxHeavyBuilds: 2, signal: t.signal, env: { ...process.env, FETCH_LOG: file } },
+        async env => {
+          if (++waiting === 2) both.resolve();
+          await both.promise;
+          await warmCargoDependencies({ home, cwd, command: process.execPath, env, timeoutMs: 10000 });
+          return path.basename(env.CARGO_TARGET_DIR);
+        },
+      ),
+    ),
+  );
+  assert.deepEqual(results.sort(), ['slot-1', 'slot-2']);
+  assert.equal(await readFile(file, 'utf8'), 'fetched\n');
+});
+
+test('Cargo scans an explicit Rust target with a nonstandard extension at HEAD', async t => {
+  const { cargoPlanAt } = await import('../runtime/cargo-graph.mjs');
+  const filename = 'crates/app/entry.inc';
+  const { project } = await fixture(t, {
+    ...workspace,
+    'crates/app/Cargo.toml': workspace['crates/app/Cargo.toml'] + '\n[lib]\npath="entry.inc"\n',
+    [filename]: 'include_str!("../core/src/lib.rs");',
+  });
+  const base = await git(project, ['rev-parse', 'HEAD']);
+  await put(project, 'crates/core/src/lib.rs', 'pub fn changed() {}');
+  await git(project, [
+    '-c',
+    'user.name=test',
+    '-c',
+    'user.email=test@example.org',
+    '-c',
+    'commit.gpgSign=false',
+    'commit',
+    '-qam',
+    'edit',
+  ]);
+  assert.deepEqual((await cargoPlanAt(project, base, await git(project, ['rev-parse', 'HEAD']))).reasons, [
+    'cargo-source-path',
+  ]);
+});
+
+test('clean Cargo homes on the same machine each get a warmup', async t => {
+  const { warmCargoDependencies } = await import('../runtime/cargo-fetch.mjs');
+  const { readFile } = await import('node:fs/promises');
+  const { default: path } = await import('node:path');
+  const { base: home, project: cwd } = await fixture(t, {
+    'Cargo.lock': 'version=4',
+    fetch: "require('node:fs').appendFileSync(process.env.FETCH_LOG,'fetched\\n');",
+  });
+  const file = path.join(home, 'fetch-log');
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => key.toUpperCase() !== 'CARGO_HOME'));
+  const name = process.platform === 'win32' ? 'Cargo_Home' : 'CARGO_HOME';
+  for (const directory of ['first', 'second']) {
+    await warmCargoDependencies({
+      home,
+      cwd,
+      command: process.execPath,
+      env: { ...env, FETCH_LOG: file, [name]: path.join(home, directory) },
+      timeoutMs: 10000,
+    });
+  }
+  assert.equal(await readFile(file, 'utf8'), 'fetched\nfetched\n');
+});

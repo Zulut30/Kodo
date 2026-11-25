@@ -1,5 +1,8 @@
 import Ajv from 'ajv';
 import path from 'node:path';
+import { ownsPath } from './scope-paths.mjs';
+
+export { ownsPath };
 
 const ajv = new Ajv({ allErrors: true, strict: true });
 export const planSchema = {
@@ -123,15 +126,13 @@ export function validatePlan(plan) {
   }
   return plan;
 }
-export function ownsPath(scopes, name) {
-  return scopes.some(
-    scope =>
-      path.posix.matchesGlob(name, scope) || name === scope || name.startsWith(scope.replace(/\/\*\*$/, '') + '/'),
-  );
-}
+// `./x` names the same path as `x`, as in ownsPath (validatePlan accepts both spellings).
+const withoutDot = scope => scope.replace(/^\.\//, '');
 export function scopesOverlap(left, right) {
-  return left.some(a =>
-    right.some(b => {
+  return left.some(rawA =>
+    right.some(rawB => {
+      const a = withoutDot(rawA),
+        b = withoutDot(rawB);
       const ap = a.split(/[*?[{]/)[0].replace(/\/$/, ''),
         bp = b.split(/[*?[{]/)[0].replace(/\/$/, '');
       return (

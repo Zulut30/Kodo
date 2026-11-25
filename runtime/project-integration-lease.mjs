@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
+import { fencedBy } from './lease-fence.mjs';
 
 // Lease `project-integration:<projectId>` serializes every change of a wave project's
 // integration branch and every transition whose proof reads that branch. The holder's
@@ -30,12 +31,21 @@ export async function withIntegrationLease(store, projectId, work, options = {})
   const name = integrationLeaseName(projectId),
     outer = held.getStore();
   if (integrationLeaseHeld(store, projectId)) return work();
+  // A nested call whose outer holder lost the lease stops at once: it never waits to take the
+  // lease again inside work that the outer holder no longer owns.
+  if (outer?.has(name)) fail('lease_lost');
   const deadline = Date.now() + waitMs;
   let token;
+  const stopped = () => {
+    if (signal?.aborted) fail(signal.reason?.code === 'project_lease_lost' ? 'lease_lost' : 'control_blocked');
+  };
+  // A busy lease is waited for; the signal is checked before and after every pause, so a lease
+  // lost during the pause never lets the work start on a freshly taken integration lease.
   while (!(token = store.acquireLease(name, randomUUID(), { ttlMs: 60000, limit: 1 }))) {
-    if (signal?.aborted) fail('control_blocked');
+    stopped();
     if (Date.now() >= deadline) fail('integration_busy');
     await delay(50);
+    stopped();
   }
   const timer = setInterval(() => {
     try {
@@ -46,7 +56,9 @@ export async function withIntegrationLease(store, projectId, work, options = {})
   }, heartbeatMs);
   timer.unref();
   try {
-    return await held.run(new Map([...(outer ?? []), [name, token]]), work);
+    // Writes inside are fenced by the token (runtime/lease-fence.mjs): a holder whose lease expired
+    // and passed to another holder cannot record a merge or a transition.
+    return await held.run(new Map([...(outer ?? []), [name, token]]), () => fencedBy([token], work));
   } finally {
     clearInterval(timer);
     store.releaseLease(token);

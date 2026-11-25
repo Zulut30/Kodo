@@ -1,30 +1,179 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
+import { fencedBy } from './lease-fence.mjs';
 
 const busy = () => Object.assign(new Error('Project busy'), { code: 'project_busy' });
+const coded = code => Object.assign(new Error(`Project ${code}`), { code });
+
+/**
+ * Acquire lease `name` (at most `limit` holders), polling every `pollMs` until `waitMs` passed
+ * (`busyCode`) or `signal` aborted (`project_cancelled`). `waitMs: 0` tries exactly once.
+ * The lease row carries a TTL and the holder's pid: a crashed holder never blocks for long.
+ * @param {any} store
+ * @param {string} name
+ * @param {{ limit?: number, ttlMs?: number, waitMs?: number, pollMs?: number, signal?: AbortSignal,
+ *   busyCode?: string, now?: () => number }} [options]
+ * @returns {Promise<string>} the lease token
+ */
+export async function acquireLeaseWaiting(store, name, options = {}) {
+  const {
+    limit = 1,
+    ttlMs = 60000,
+    waitMs = 120000,
+    pollMs = 25,
+    signal,
+    busyCode = 'project_busy',
+    now = () => Date.now(),
+  } = options;
+  const owner = randomUUID(),
+    deadline = now() + waitMs;
+  // A signal aborted by a lost lease keeps that reason, never a cancel.
+  const stopped = () =>
+    coded(signal?.reason?.code === 'project_lease_lost' ? 'project_lease_lost' : 'project_cancelled');
+  for (;;) {
+    if (signal?.aborted) throw stopped();
+    const token = store.acquireLease(name, owner, { ttlMs, limit });
+    if (token) return token;
+    if (now() >= deadline) throw coded(busyCode);
+    try {
+      await delay(pollMs, undefined, signal ? { signal } : undefined);
+    } catch (error) {
+      if (signal?.aborted) throw stopped();
+      throw error;
+    }
+  }
+}
+
+/** Whether `token` still names a live lease row (checking renews it). @param {any} store @param {string} token */
+export function leaseOwned(store, token) {
+  try {
+    return store.renewLease(token) === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Run `work(lost)` holding the lease `token`, renewed every `heartbeatMs`; release it afterwards.
+ * A renewal that finds no lease row (it expired and another holder may have it) aborts `lost`:
+ * the work stops at its next check and confirms `leaseOwned` before it publishes anything.
+ * @template T
+ * @param {any} store
+ * @param {string} token
+ * @param {(lost: AbortSignal) => Promise<T>} work
+ * @param {number} [heartbeatMs]
+ * @returns {Promise<T>}
+ */
+export async function withHeldLease(store, token, work, heartbeatMs = 10000) {
+  const lost = new AbortController();
+  const timer = setInterval(() => {
+    let renewed;
+    try {
+      renewed = store.renewLease(token);
+    } catch {
+      return; // A transient Store failure must not throw from the timer; the next beat retries.
+    }
+    if (renewed === false) lost.abort(Object.assign(new Error('Project lease lost'), { code: 'project_lease_lost' }));
+  }, heartbeatMs);
+  timer.unref();
+  try {
+    return await fencedBy([token], () => work(lost.signal));
+  } finally {
+    clearInterval(timer);
+    store.releaseLease(token);
+  }
+}
+
+// Short critical sections under `project:<id>`, reentrant within one async context: name → token, lost signal.
+const sections = new AsyncLocalStorage();
+
+const sectionName = projectId => `project:${projectId}`;
+
+/**
+ * Whether the current async context holds a live `project:<id>` section (checking renews it).
+ * @param {any} store
+ * @param {string} projectId
+ */
+export function projectSectionHeld(store, projectId) {
+  const held = sections.getStore()?.get(sectionName(projectId));
+  return Boolean(held) && leaseOwned(store, held.token);
+}
+
+/**
+ * Run `work` in a short critical section under lease `project:<id>`: waits for the lease (unlike
+ * the pull controllers, which refuse at once) up to `waitMs`, then `project_busy`; a cancelled
+ * `signal` stops the wait with `project_cancelled`. Nested sections of one holder reuse the lease.
+ * Used for the parts of complete-task, the integration queue drain and external gate passes
+ * that change project state; long work (task-fast, gate Runs) stays outside. A nested section
+ * confirms that the outer one still owns its lease (`project_lease_lost` otherwise); `work`
+ * receives the signal that aborts when a renewal finds the lease gone.
+ * @template T
+ * @param {any} store
+ * @param {string} projectId
+ * @param {(lost: AbortSignal) => Promise<T>} work
+ * @param {{ signal?: AbortSignal, waitMs?: number, pollMs?: number, heartbeatMs?: number }} [options]
+ * @returns {Promise<T>}
+ */
+export async function withProjectSection(store, projectId, work, options = {}) {
+  const name = sectionName(projectId),
+    outer = sections.getStore();
+  const held = outer?.get(name);
+  if (held) {
+    if (!leaseOwned(store, held.token)) throw coded('project_lease_lost');
+    return work(held.lost);
+  }
+  const token = await acquireLeaseWaiting(store, name, options);
+  return withHeldLease(
+    store,
+    token,
+    lost => sections.run(new Map([...(outer ?? []), [name, { token, lost }]]), () => work(lost)),
+    options.heartbeatMs,
+  );
+}
 
 // Gate-producing controllers exclude each other even while a standalone gate releases
 // the project lease for tests, independent review and repair in its private worktree.
-export const withGateController = (store, projectId, work) =>
-  withControllerLease(store, `project-gates:${projectId}`, work);
+// `work(outsideLease, lost)`: `lost` aborts when a renewal finds the lease gone (TTL expired);
+// writes inside the controller are fenced by its token (runtime/lease-fence.mjs).
+export const withGateController = (store, projectId, work, options = {}) =>
+  withControllerLease(store, `project-gates:${projectId}`, work, options);
 
 export function withPullLease(store, projectId, runsGates, work) {
   const run = () => withControllerLease(store, `project:${projectId}`, work);
   return runsGates ? withGateController(store, projectId, run) : run();
 }
 
-async function withControllerLease(store, name, work) {
+// A pull holds the profile only while issuing its batch. Profile writers take just
+// the inner lease, so they can run while a native drain is executing a gate.
+export function withWaveAdmissionLeases(store, projectId, work) {
+  return withControllerLease(store, `project:${projectId}`, (_, _lostProject, checkProject) =>
+    withControllerLease(store, `project-profile:${projectId}`, (_, _lostProfile, checkProfile) =>
+      work(() => {
+        checkProject();
+        checkProfile();
+      }),
+    ),
+  );
+}
+
+async function withControllerLease(store, name, work, options = {}) {
+  const heartbeatMs = options.heartbeatMs || 10000;
   const owner = randomUUID();
   const acquire = () => store.acquireLease(name, owner, { ttlMs: 60000, limit: 1 });
   let token = acquire();
   if (!token) throw busy();
+  const lost = new AbortController();
   const timer = setInterval(() => {
+    if (!token) return;
+    let renewed;
     try {
-      if (token) store.renewLease(token);
+      renewed = store.renewLease(token);
     } catch {
-      // A transient Store failure must not throw from the timer.
+      return; // A transient Store failure must not throw from the timer; the next beat retries.
     }
-  }, 10000);
+    if (renewed === false) lost.abort(Object.assign(new Error('Project lease lost'), { code: 'project_lease_lost' }));
+  }, heartbeatMs);
   timer.unref();
   // Only the standalone gate uses this callback, around the private Run. Rejoin
   // the serialized protocol before inspecting state, merging or accepting anything.
@@ -48,7 +197,14 @@ async function withControllerLease(store, name, work) {
     throw cancelled();
   };
   try {
-    return await work(outsideLease);
+    // work(outsideLease, lost, check): `lost` aborts once a renewal fails; `check` renews now and
+    // throws project_lease_lost when the lease row is gone, project_busy while it is released
+    // (the pull admission checks before each write and stops the whole batch).
+    const check = () => {
+      if (!token) throw busy();
+      if (!store.renewLease(token)) throw coded('project_lease_lost');
+    };
+    return await fencedBy([() => token], () => work(outsideLease, lost.signal, check));
   } finally {
     clearInterval(timer);
     if (token) store.releaseLease(token);

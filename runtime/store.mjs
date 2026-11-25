@@ -4,6 +4,16 @@ import { mkdirSync, realpathSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { stateHome, redact } from './security.mjs';
+import { assertFence } from './lease-fence.mjs';
+
+// Roll back only an open transaction and never mask the error that caused it.
+function rollback(db) {
+  try {
+    if (db.isTransaction) db.exec('ROLLBACK');
+  } catch {
+    /* The initiating failure is the one reported. */
+  }
+}
 const projectKey = value => {
   const resolved = path.resolve(value);
   return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
@@ -350,9 +360,14 @@ export class Store {
     if (!row) throw new Error(`Запуск не найден: ${id}`);
     return JSON.parse(row.body);
   }
+  // Inside a lease holder's async context (runtime/lease-fence.mjs) the write is fenced: it checks
+  // in its own transaction that the holder's leases are still live (`project_lease_lost` otherwise).
+  // Nested in `withFence`, it joins that transaction.
   updateRun(id, patch, { preserveCancellation = false } = {}) {
-    this.db.exec('BEGIN IMMEDIATE');
+    const own = !this.db.isTransaction;
+    if (own) this.db.exec('BEGIN IMMEDIATE');
     try {
+      assertFence(this.db);
       const current = this.getRun(id);
       const run = { ...current, ...patch, updatedAt: new Date().toISOString() };
       if (preserveCancellation) {
@@ -365,10 +380,31 @@ export class Store {
       this.db
         .prepare('UPDATE runs SET body=?,updated=? WHERE id=?')
         .run(JSON.stringify(redact(run, this.secrets)), Date.now(), id);
-      this.db.exec('COMMIT');
+      if (own) this.db.exec('COMMIT');
       return run;
     } catch (error) {
-      this.db.exec('ROLLBACK');
+      if (own) rollback(this.db);
+      throw error;
+    }
+  }
+  /**
+   * Run `operation` (synchronous; it may call updateRun) in one BEGIN IMMEDIATE transaction that
+   * first checks that every lease token in `tokens` and in the async context's fence still names a
+   * live row (`project_lease_lost` otherwise, nothing written).
+   * @template T
+   * @param {string[]} tokens
+   * @param {() => T} operation
+   * @returns {T}
+   */
+  withFence(tokens, operation) {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      assertFence(this.db, tokens);
+      const result = operation();
+      this.db.exec('COMMIT');
+      return result;
+    } catch (error) {
+      rollback(this.db);
       throw error;
     }
   }
@@ -411,11 +447,44 @@ export class Store {
       .run(run.id, projectKey(run.project), JSON.stringify(lesson), Date.now());
     return lesson;
   }
+  rememberLesson(project, id, record) {
+    const lesson = redact(record, this.secrets);
+    this.db
+      .prepare('INSERT OR REPLACE INTO knowledge VALUES(?,?,?,?)')
+      .run(id, projectKey(project), JSON.stringify(lesson), Date.now());
+    return lesson;
+  }
   lessons(project, limit = 5) {
     return this.db
-      .prepare('SELECT body FROM knowledge WHERE project=? ORDER BY time DESC LIMIT ?')
+      .prepare(
+        "SELECT body FROM knowledge WHERE project=? AND (json_extract(body, '$.kind') IS NULL OR json_extract(body, '$.kind') != 'gate-lesson') ORDER BY time DESC LIMIT ?",
+      )
       .all(projectKey(project), limit)
       .map(row => JSON.parse(row.body));
+  }
+  gateLessons(project, limit = 200) {
+    return this.db
+      .prepare(
+        "SELECT body FROM knowledge WHERE project=? AND json_extract(body, '$.kind') = 'gate-lesson' ORDER BY time DESC, rowid DESC LIMIT ?",
+      )
+      .all(projectKey(project), limit)
+      .map(row => JSON.parse(String(row.body)));
+  }
+  gateLessonsPage(project, { projectId = null, limit = 50, offset = 0 } = {}) {
+    if (projectId) {
+      return this.db
+        .prepare(
+          "SELECT body FROM knowledge WHERE project=? AND json_extract(body, '$.kind') = 'gate-lesson' AND (json_extract(body, '$.projectId') IS NULL OR json_extract(body, '$.projectId') = ?) ORDER BY time DESC, rowid DESC LIMIT ? OFFSET ?",
+        )
+        .all(projectKey(project), projectId, limit, offset)
+        .map(row => JSON.parse(String(row.body)));
+    }
+    return this.db
+      .prepare(
+        "SELECT body FROM knowledge WHERE project=? AND json_extract(body, '$.kind') = 'gate-lesson' ORDER BY time DESC, rowid DESC LIMIT ? OFFSET ?",
+      )
+      .all(projectKey(project), limit, offset)
+      .map(row => JSON.parse(String(row.body)));
   }
   findKnowledgeCapture(project, captureId) {
     return readKnowledgeCapture(this.db, knowledgeProjectKey(project), captureId);
@@ -528,8 +597,24 @@ export class Store {
       throw error;
     }
   }
+  // An expired lease is never renewed (another holder may already have taken it): one `now` for
+  // the check and the new expiry; no row changed means the lease is lost.
+  // `now` is read after the write lock was taken (BEGIN IMMEDIATE): a renewal that waited for
+  // another writer past the TTL fails instead of reviving the lease.
   renewLease(token, ttlMs = 60000) {
-    return this.db.prepare('UPDATE leases SET expires=? WHERE token=?').run(Date.now() + ttlMs, token).changes > 0;
+    const own = !this.db.isTransaction;
+    if (own) this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const now = Date.now();
+      const renewed =
+        this.db.prepare('UPDATE leases SET expires=? WHERE token=? AND expires>?').run(now + ttlMs, token, now)
+          .changes > 0;
+      if (own) this.db.exec('COMMIT');
+      return renewed;
+    } catch (error) {
+      if (own) rollback(this.db);
+      throw error;
+    }
   }
   releaseLease(token) {
     this.db.prepare('DELETE FROM leases WHERE token=?').run(token);

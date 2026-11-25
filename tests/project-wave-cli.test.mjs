@@ -55,7 +55,7 @@ test('Project drain strict grammar rejects invalid arguments before credentials,
     ['drain', id, '--max-waves', '1.5'],
     ['drain', id, '--max-waves', '-1'],
     ['drain', id, '--concurrency', '0'],
-    ['drain', id, '--concurrency', '6'],
+    ['drain', id, '--concurrency', '65'],
     ['drain', id, '--concurrency'],
     ['drain', id, '--max-waves', '--json'],
     ['drain', id, '--retry-failed', '--retry-failed'],
@@ -120,6 +120,32 @@ test('Project drain reports a blocked wave project and refuses a legacy one with
   assert.equal(blocked.report.result.code, 'risk_approval_required');
   assert.equal(blocked.report.result.waves, 0);
   assert.equal(blocked.report.revision, 1);
+  const drainEight = () => projectCli(['drain', waveId, '--concurrency', '8', '--json'], ports);
+  assert.equal((await drainEight()).exitCode, 1);
+  const file = path.join(directory, 'pools.json');
+  await writeFile(
+    file,
+    JSON.stringify({
+      subscriptions: [{ id: 'a', model: 'gpt', provider: 'codex', tier: 'fast', slots: 8 }],
+      machines: [{ id: 'pc', kind: 'local', maxWorkers: 8, maxHeavyBuilds: 1 }],
+    }),
+  );
+  assert.equal((await projectCli(['profile', 'set', waveId, '--file', file], ports)).exitCode, 0);
+  assert.equal(
+    (await projectCli(['drain', waveId, '--concurrency', '64', '--json'], ports)).report.result.code,
+    'risk_approval_required',
+  );
+  assert.equal(
+    (
+      await projectCli(
+        ['profile', 'pause-pool', waveId, '--subscription', 'a', '--until', '2099-01-01T00:00:00Z'],
+        ports,
+      )
+    ).exitCode,
+    0,
+  );
+  assert.equal((await drainEight()).report.result.status, 'waiting_limits');
+  assert.equal((await projectCli(['resume', waveId, '--json'], ports)).report.result.status, 'waiting_limits');
   const legacyId = await create('legacy');
   const legacy = await projectCli(['drain', legacyId, '--json'], ports);
   assert.equal(legacy.exitCode, 2);
@@ -132,6 +158,6 @@ test('CLI help lists project drain', () => {
   assert.equal(result.status, 0);
   assert.match(
     result.stdout,
-    /kodo project drain PROJECT_ID \[--max-waves 1\.\.100\] \[--concurrency 1\.\.5\] \[--retry-failed\] \[--command-id UUID\] \[--json\]/,
+    /kodo project drain PROJECT_ID \[--max-waves 1\.\.100\] \[--concurrency N\] \[--retry-failed\] \[--command-id UUID\] \[--json\]/,
   );
 });

@@ -405,6 +405,7 @@ test('The verification block is optional, strict about keys and safe about oracl
     testProtection: true,
     testRemovalAllowed: [],
     strictGates: false,
+    testRegistry: true,
     oracles: [],
   });
   const oracle = { id: 'git', command: 'node', protect: ['oracle/git.mjs'] };

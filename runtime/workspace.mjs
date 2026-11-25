@@ -151,7 +151,7 @@ export async function withWorktreeLock(project, action, signal = undefined, wait
   }
 }
 
-/** @param {{signal?: AbortSignal, waitMs?: number}} [options] */
+/** @param {{signal?: AbortSignal, waitMs?: number, onCreated?: () => Promise<void>}} [options] */
 export async function makeWorktree(project, directory, branch, base, options = {}) {
   const { signal } = options;
   return withWorktreeLock(
@@ -177,6 +177,7 @@ export async function makeWorktree(project, directory, branch, base, options = {
         branchExists ? ['worktree', 'add', directory, branch] : ['worktree', 'add', '-b', branch, directory, base],
         { signal },
       );
+      await options.onCreated?.();
       return directory;
     },
     signal,

@@ -116,3 +116,16 @@ test('Engine.run refuses external and gate Runs before taking the Run lease', as
   }
   assert.equal(services.calls.worker.length + services.calls.review.length + services.calls.planner, 0);
 });
+
+test('cargo_fetch_failed stops verification before the repair cycle', async () => {
+  const run = { id: 'run', verificationProfile: 'task-fast', config: { repairRounds: 2 } };
+  const engine = {
+    store: { getRun: () => run },
+    save() {},
+    fastChecks() {
+      throw Object.assign(new Error('fetch'), { code: 'cargo_fetch_failed' });
+    },
+  };
+  await assert.rejects(Engine.prototype.verify.call(engine, run), { code: 'cargo_fetch_failed' });
+  assert.equal(run.verification.attempt, 0);
+});

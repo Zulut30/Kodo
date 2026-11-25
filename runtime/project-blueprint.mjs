@@ -5,14 +5,31 @@
 import { createHash } from 'node:crypto';
 import { lstat, open, readdir, realpath, stat } from 'node:fs/promises';
 import path from 'node:path';
+import { parse as parseToml } from 'smol-toml';
 import * as projectContracts from './project-contracts.mjs';
+import {
+  isBroadContractScope,
+  isExplicitContractScope,
+  normalizeScopePath,
+  scopeMatchesPath,
+} from './cargo-workspace.mjs';
 import { scopesOverlap } from './contracts.mjs';
 import { inside } from './toolchains.mjs';
 
 export const BLUEPRINT_DIR = '.kodo/blueprint';
 export const MAX_TASK_INPUT_BYTES = 12000;
+export const MAX_TASK_WRITE_PATHS = 24;
+export const MAX_TASK_MODULES = 3;
 export const FOUNDATION_ID = 'foundation';
-export const FACTORY_ROLES = Object.freeze(['architect', 'developer', 'ui-qa', 'performance', 'security', 'reviewer']);
+export const FACTORY_ROLES = Object.freeze([
+  'architect',
+  'developer',
+  'integrator',
+  'ui-qa',
+  'performance',
+  'security',
+  'reviewer',
+]);
 export const DEFAULT_EXECUTION = Object.freeze({ cadence: 'wave', integration: 'branch' });
 export const REQUIRED_SECTIONS = Object.freeze([
   { title: 'Цель', aliases: ['цель', 'цели', 'goal', 'goals'] },
@@ -514,17 +531,190 @@ export function parallelOverlaps(tasks, { ancestors = taskAncestors(tasks), othe
   return pairs;
 }
 
-export function overlapFindings(pairs) {
+const SHARED_INTEGRATION_FILES = new Set([
+  'Cargo.toml',
+  'Cargo.lock',
+  'package.json',
+  'package-lock.json',
+  'pnpm-workspace.yaml',
+  'tsconfig.json',
+  'kodo.config.json',
+]);
+const SHARED_ENTRYPOINT = /^(?:src\/|cli\/)?(?:main|index|lib|app)\.(?:rs|[cm]?[jt]sx?)$/;
+const WORKSPACE_SHARED_FILE =
+  /^(?:crates|packages|modules|libs|services|apps)\/[^/*?[{]+\/(?:Cargo\.toml|package\.json|src\/(?:lib|main|index)\.(?:rs|[cm]?[jt]sx?))$/;
+const UNBOUNDED_SCOPE =
+  /^(?:\.|\.\.?\/\*+|\*+|\*\*\/\*+|(?:src|crates|packages|modules|libs)(?:\/\*+|\/\*\*|\/\*\*\/\*+)?)$/;
+const MODULE_SCOPE = /^((?:src|crates|packages|modules|libs|services|apps|runtime)\/[^/*?[{]+)/;
+
+const cleanScope = scope =>
+  String(scope ?? '')
+    .replaceAll('\\', '/')
+    .replace(/^\.\//, '')
+    .replace(/\/+$/, '');
+
+/** Whether a writePath targets a shared root manifest or entrypoint that parallel tasks must not co-edit. */
+export function isSharedIntegrationPath(scope) {
+  const normalized = cleanScope(scope);
+  return SHARED_INTEGRATION_FILES.has(normalized) || SHARED_ENTRYPOINT.test(normalized);
+}
+
+/** Whether a writePath is a shared manifest/entrypoint that an `integrator` task may touch without split_required. */
+function isIntegratorExemptPath(scope) {
+  return isSharedIntegrationPath(scope) || WORKSPACE_SHARED_FILE.test(cleanScope(scope));
+}
+
+/** Whether a writePath is an unbounded root/container wildcard without a concrete module owner. */
+function isUnboundedWritePath(scope) {
+  return UNBOUNDED_SCOPE.test(cleanScope(scope));
+}
+
+function moduleOfWritePath(scope) {
+  const match = MODULE_SCOPE.exec(cleanScope(scope));
+  return match ? match[1] : null;
+}
+
+function pairSharesIntegrationFile(left, right) {
+  if (!left || !right) return false;
+  for (const a of left.writePaths ?? [])
+    for (const b of right.writePaths ?? [])
+      if ((isSharedIntegrationPath(a) || isSharedIntegrationPath(b)) && scopesOverlap([a], [b])) return true;
+  return false;
+}
+
+export function overlapFindings(pairs, tasks = []) {
+  const byId = new Map(tasks.map(task => [task.id, task]));
   const visible = pairs.slice(0, PAIR_CAP);
   return visible.map((pair, index) => {
     const rest = index === visible.length - 1 && pairs.length > visible.length;
+    const suffix = rest ? `; ещё пар: ${pairs.length - visible.length}` : '';
+    if (pairSharesIntegrationFile(byId.get(pair[0]), byId.get(pair[1]))) {
+      return finding(
+        'integrator_required',
+        `Задачи ${pair[0]} и ${pair[1]} в одной волне пересекаются по общим файлам (Cargo.toml, package.json или точка входа); вынесите правку общих файлов в отдельную задачу-интегратор${suffix}`,
+        pair,
+      );
+    }
     return finding(
       'blueprint_parallel_overlap',
-      `Задачи ${pair[0]} и ${pair[1]} могут идти параллельно, но их writePaths пересекаются` +
-        (rest ? `; ещё пар: ${pairs.length - visible.length}` : ''),
+      `Задачи ${pair[0]} и ${pair[1]} могут идти параллельно, но их writePaths пересекаются${suffix}`,
       pair,
     );
   });
+}
+
+function ownedModulesOf(task) {
+  const paths =
+    task.owner === 'integrator'
+      ? (task.writePaths ?? []).filter(p => !isIntegratorExemptPath(p))
+      : (task.writePaths ?? []);
+  return new Set(paths.map(moduleOfWritePath).filter(Boolean));
+}
+
+function indexOwnersByModule(tasks, foundationEpics) {
+  const byModule = new Map();
+  for (const task of tasks) {
+    if (foundationEpics.has(task.epicId) || task.status === 'cancelled') continue;
+    for (const mod of ownedModulesOf(task)) {
+      const list = byModule.get(mod) ?? [];
+      list.push(task);
+      byModule.set(mod, list);
+    }
+  }
+  return byModule;
+}
+
+const CLOSED_OWNER_STATUSES = new Set(['accepted', 'released', 'cancelled']);
+
+/** Reject tasks without an unambiguous module/write owner: unbounded catch-all scopes
+ * or multiple non-foundation epics claiming write ownership of the same module.
+ * When `existingTasks`/`existingEpics` are supplied (`append-milestone`), only non-closed
+ * existing tasks count as active module owners, and a new task that transitively depends
+ * on all existing owners of a module is a sequential extension, not a conflict. */
+export function moduleOwnerFindings(
+  spec,
+  { parallelPairs = [], existingTasks = [], existingEpics = [], ancestors = null } = {},
+) {
+  const findings = [];
+  const unbounded = spec.tasks.filter(task => (task.writePaths ?? []).some(isUnboundedWritePath)).map(task => task.id);
+  if (unbounded.length) {
+    findings.push(
+      finding(
+        'blueprint_owner_ambiguous',
+        'Задача должна задавать однозначный модуль/область записи, без корневых или контейнерных шаблонов (., **, src/**, crates/**)',
+        unbounded,
+      ),
+    );
+  }
+  const foundationEpics = new Set(
+    [...(spec.epics ?? []), ...(existingEpics ?? [])]
+      .filter(epic => epic.id === FOUNDATION_ID || epic.milestoneId === FOUNDATION_ID)
+      .map(epic => epic.id),
+  );
+  const openExisting = (existingTasks ?? []).filter(task => !CLOSED_OWNER_STATUSES.has(task.status));
+  const ancestorMap = ancestors ?? taskAncestors([...openExisting, ...(spec.tasks ?? [])]);
+  const parallelSet = new Set(parallelPairs.map(([a, b]) => (a < b ? `${a}\0${b}` : `${b}\0${a}`)));
+  const freshByModule = indexOwnersByModule(spec.tasks, foundationEpics);
+  const existingByModule = indexOwnersByModule(openExisting, foundationEpics);
+
+  for (const [mod, freshOwners] of [...freshByModule.entries()].sort(([a], [b]) => compare(a, b))) {
+    const existingOwners = existingByModule.get(mod) ?? [];
+    const allOwners = [...freshOwners, ...existingOwners];
+    const epics = new Set(allOwners.map(task => task.epicId));
+    if (epics.size <= 1) continue;
+    const crossEpicIds = new Set();
+    const pairKey = (a, b) => (a < b ? `${a}\0${b}` : `${b}\0${a}`);
+    for (let i = 0; i < freshOwners.length; i++) {
+      const left = freshOwners[i];
+      for (let j = i + 1; j < freshOwners.length; j++) {
+        const right = freshOwners[j];
+        if (left.epicId !== right.epicId && !parallelSet.has(pairKey(left.id, right.id))) {
+          crossEpicIds.add(left.id);
+          crossEpicIds.add(right.id);
+        }
+      }
+      if (existingOwners.length && !existingOwners.every(existing => ancestorMap.get(left.id)?.has(existing.id))) {
+        for (const existing of existingOwners) {
+          if (left.epicId !== existing.epicId && !parallelSet.has(pairKey(left.id, existing.id))) {
+            crossEpicIds.add(left.id);
+            crossEpicIds.add(existing.id);
+          }
+        }
+      }
+    }
+    if (!crossEpicIds.size) continue;
+    findings.push(
+      finding(
+        'blueprint_owner_ambiguous',
+        `Модуль ${mod} не имеет однозначного владельца: в него пишут задачи разных эпиков (${[...epics].sort(compare).join(', ')})`,
+        [...crossEpicIds],
+      ),
+    );
+  }
+  return findings;
+}
+
+/** Reject tasks whose write scope exceeds MAX_TASK_WRITE_PATHS or MAX_TASK_MODULES.
+ * Integrator tasks (`owner === 'integrator'`) are exempt on shared integration files. */
+export function taskScopeSizeFindings(tasks, alreadyOversized = new Set()) {
+  const oversized = tasks
+    .filter(task => {
+      if (alreadyOversized.has(task.id)) return false;
+      const rawPaths = task.writePaths ?? [];
+      const paths = task.owner === 'integrator' ? rawPaths.filter(p => !isIntegratorExemptPath(p)) : rawPaths;
+      const modules = new Set(paths.map(moduleOfWritePath).filter(Boolean));
+      return paths.length > MAX_TASK_WRITE_PATHS || modules.size > MAX_TASK_MODULES;
+    })
+    .map(task => task.id);
+  return oversized.length
+    ? [
+        finding(
+          'split_required',
+          `Слишком крупная задача: больше ${MAX_TASK_WRITE_PATHS} путей записи или больше ${MAX_TASK_MODULES} модулей; разделите задачу в чертеже`,
+          oversized,
+        ),
+      ]
+    : [];
 }
 
 export function ownerFindings(tasks) {
@@ -734,19 +924,448 @@ function interfaceFindings(spec, interfaces) {
   return findings;
 }
 
+const RUST_CONTRACT_CRATE_MIN = 3;
+const CONTRACT_CRATE_NAME = /(?:^|[-_])contracts$/i;
+
+function normalizeRelScope(raw) {
+  if (typeof raw !== 'string') return '';
+  return raw
+    .replaceAll('\\', '/')
+    .replace(/^(?:\.\/)+/, '')
+    .replace(/\/+$/, '');
+}
+
+function crateFromWritePath(raw) {
+  const cleaned = normalizeRelScope(raw);
+  if (!cleaned) return null;
+  const cratesMatch = /^((?:[^/*?[{]+\/)*crates\/([A-Za-z0-9][A-Za-z0-9_-]*))(?:\/|$)/.exec(cleaned);
+  if (cratesMatch) return { name: cratesMatch[2], root: cratesMatch[1] };
+  const cargoMatch = /^([^/*?[{]+(?:\/[^/*?[{]+)*)\/Cargo\.toml$/.exec(cleaned);
+  if (cargoMatch) {
+    const root = cargoMatch[1];
+    return { name: root.split('/').at(-1), root };
+  }
+  return null;
+}
+
+function isRustBlueprint(spec, projectMarkdown, architecturePolicy) {
+  if (architecturePolicy?.schemaVersion === 2 && architecturePolicy?.language === 'rust') return true;
+  if (typeof projectMarkdown === 'string' && /\b(?:rust|cargo)\b/i.test(projectMarkdown)) return true;
+  if (
+    spec.tasks.some(task =>
+      (task.writePaths ?? []).some(scope => /(?:^|\/)Cargo\.toml$|\.rs$/i.test(String(scope).replaceAll('\\', '/'))),
+    )
+  )
+    return true;
+  const meta = [spec.title, spec.businessContext, ...(spec.constraints ?? [])].filter(Boolean).join('\n');
+  return /\b(?:rust|cargo)\b/i.test(meta);
+}
+
+function linesOutsideCodeFences(text) {
+  if (typeof text !== 'string' || !text) return [];
+  const lines = text.replace(/\r\n?/g, '\n').split('\n');
+  const out = [];
+  let fence = null;
+  for (const line of lines) {
+    const opener = /^ {0,3}(`{3,}|~{3,})/.exec(line);
+    if (fence) {
+      if (
+        opener &&
+        opener[1][0] === fence[0] &&
+        opener[1].length >= fence.length &&
+        !/\S/.test(line.slice(opener[0].length))
+      )
+        fence = null;
+      continue;
+    }
+    if (opener) {
+      fence = opener[1];
+      continue;
+    }
+    out.push(line);
+  }
+  return out;
+}
+
+const strictDeclRe = (key, valueClass) =>
+  new RegExp(
+    `^ {0,3}(?:[-*]\\s+)?${key}\\s*:\\s*(?:\`(${valueClass})\`|"(${valueClass})"|'(${valueClass})'|(${valueClass}))\\s*$`,
+  );
+const CONTRACT_DECL_RE = strictDeclRe('contractCrate', '[A-Za-z0-9][A-Za-z0-9_./-]*');
+const WORKSPACE_DECL_RE = strictDeclRe('workspaceRoot', '\\.|[A-Za-z0-9][A-Za-z0-9_./-]*');
+const ROOT_PACKAGE_DECL_RE = strictDeclRe('rootPackage', '\\.|[A-Za-z0-9][A-Za-z0-9_./-]*');
+
+function cleanDeclaredPath(raw) {
+  const cleaned = raw
+    .trim()
+    .replaceAll('\\', '/')
+    .replace(/^(?:\.\/)+/, '')
+    .replace(/\/+$/, '');
+  if (!cleaned || /^(?:none|no|false)$/i.test(cleaned)) return null;
+  if (cleaned !== '.' && cleaned.split('/').some(part => !part || part === '.' || part === '..')) return null;
+  return cleaned;
+}
+
+function collectStrictDeclarations(sources, pattern) {
+  const tokens = new Set();
+  for (const source of sources) {
+    for (const line of linesOutsideCodeFences(source)) {
+      const match = pattern.exec(line);
+      if (!match) continue;
+      const raw = match[1] ?? match[2] ?? match[3] ?? match[4];
+      const cleaned = cleanDeclaredPath(raw);
+      if (cleaned) tokens.add(cleaned);
+    }
+  }
+  return tokens;
+}
+
+function declaredContractTokens(spec, projectMarkdown) {
+  return collectStrictDeclarations([projectMarkdown, ...(spec.constraints ?? [])], CONTRACT_DECL_RE);
+}
+
+function declaredRootPackages(spec, projectMarkdown) {
+  const roots = new Set();
+  for (const token of collectStrictDeclarations([projectMarkdown, ...(spec.constraints ?? [])], ROOT_PACKAGE_DECL_RE)) {
+    roots.add(token === '.' || token === 'Cargo.toml' ? '' : token.replace(/\/Cargo\.toml$/, ''));
+  }
+  return roots;
+}
+
+function declaredWorkspaceRoots(spec, projectMarkdown, architecturePolicy, allCrates) {
+  const roots = new Set();
+  if (architecturePolicy?.schemaVersion === 2 && architecturePolicy?.language === 'rust') roots.add('');
+  for (const token of collectStrictDeclarations([projectMarkdown, ...(spec.constraints ?? [])], WORKSPACE_DECL_RE)) {
+    roots.add(token === '.' || token === 'Cargo.toml' ? '' : token.replace(/\/Cargo\.toml$/, ''));
+  }
+  for (const task of spec.tasks) {
+    for (const raw of task.writePaths ?? []) {
+      const cleaned = normalizeRelScope(raw);
+      if (cleaned === 'Cargo.toml') roots.add('');
+      else if (cleaned.endsWith('/Cargo.toml')) {
+        const dir = cleaned.slice(0, -'/Cargo.toml'.length);
+        if ([...allCrates.keys()].some(crateRoot => crateRoot !== dir && crateRoot.startsWith(`${dir}/`)))
+          roots.add(dir);
+      }
+    }
+  }
+  return roots;
+}
+
+function taskCreatesCompilableContractCrate(task, contractRoot) {
+  let coversManifest = false;
+  let coversSource = false;
+  const manifestPath = contractRoot ? `${contractRoot}/Cargo.toml` : 'Cargo.toml';
+  const libPath = contractRoot ? `${contractRoot}/src/lib.rs` : 'src/lib.rs';
+  const srcPrefix = contractRoot ? `${contractRoot}/src/` : 'src/';
+  for (const rawScope of task.writePaths ?? []) {
+    if (!isExplicitContractScope(rawScope, contractRoot)) continue;
+    const scope = normalizeScopePath(rawScope);
+    if (scopeMatchesPath(scope, manifestPath)) coversManifest = true;
+    if (scopeMatchesPath(scope, libPath) || (scope.startsWith(srcPrefix) && /\.rs$/i.test(scope))) coversSource = true;
+  }
+  return coversManifest && coversSource;
+}
+
+function broadContractScopeFindings(spec, contractRoots) {
+  if (!contractRoots.size) return [];
+  const offending = new Set();
+  for (const task of spec.tasks) {
+    for (const scope of task.writePaths ?? []) {
+      for (const contractRoot of contractRoots) {
+        if (isBroadContractScope(scope, contractRoot)) offending.add(task.id);
+      }
+    }
+  }
+  if (!offending.size) return [];
+  return [
+    finding(
+      'contract_scope_too_broad',
+      'Путь записи задачи накрывает защищённый контрактный крейт слишком широкой маской; ' +
+        'укажите конкретный каталог модуля или явно назовите каталог контрактного крейта в задаче контракта',
+      [...offending].sort(compare),
+    ),
+  ];
+}
+
+function ownerWorkspaceOf(crateRoot, sortedWorkspaceRoots) {
+  return sortedWorkspaceRoots.find(wsRoot =>
+    wsRoot === '' ? true : crateRoot === wsRoot || crateRoot.startsWith(`${wsRoot}/`),
+  );
+}
+
+function normalizePackageNames(raw) {
+  const map = new Map();
+  const entries = raw instanceof Map ? [...raw.entries()] : isPlain(raw) ? Object.entries(raw) : [];
+  for (const [dir, name] of entries) {
+    if (typeof dir !== 'string' || typeof name !== 'string' || !name.trim()) continue;
+    const cleaned = dir === '' || dir === '.' ? '' : normalizeRelScope(dir);
+    map.set(cleaned, name.trim());
+  }
+  return map;
+}
+
+function selectContractRootsForWorkspace({
+  wsRoot,
+  wsCrates,
+  workspaceRoots,
+  explicitTokens,
+  architecturePolicy,
+  actualNames,
+}) {
+  const roots = new Set();
+  const isRustV2Policy =
+    wsRoot === '' && architecturePolicy?.schemaVersion === 2 && architecturePolicy?.language === 'rust';
+  if (isRustV2Policy) {
+    const policyNames = new Set(
+      Array.isArray(architecturePolicy.contractCrates)
+        ? architecturePolicy.contractCrates.filter(n => typeof n === 'string' && n.trim()).map(n => n.trim())
+        : [],
+    );
+    for (const [root, name] of wsCrates.entries()) {
+      if (policyNames.has(name)) roots.add(root);
+    }
+    for (const token of explicitTokens) {
+      const dir = token === '.' ? '' : token;
+      const pkgName = actualNames?.get(dir);
+      if (pkgName && policyNames.has(pkgName) && ownerWorkspaceOf(dir, workspaceRoots) === wsRoot) roots.add(dir);
+    }
+    return roots;
+  }
+  for (const [root, name] of wsCrates.entries()) {
+    if (explicitTokens.has(root) || explicitTokens.has(name) || CONTRACT_CRATE_NAME.test(name)) roots.add(root);
+  }
+  for (const token of explicitTokens) {
+    if (token.includes('/') && ownerWorkspaceOf(token, workspaceRoots) === wsRoot) roots.add(token);
+  }
+  return roots;
+}
+
+function taskCoversManifest(task, wsRoot) {
+  const manifestPath = wsRoot ? `${wsRoot}/Cargo.toml` : 'Cargo.toml';
+  return (task.writePaths ?? []).some(rawScope => {
+    const scope = normalizeScopePath(rawScope);
+    return Boolean(scope) && (scope === manifestPath || isExplicitContractScope(scope, wsRoot, manifestPath));
+  });
+}
+
+function hasRootPackageMember(spec, wsRoot, explicitRootPackages = new Set(), explicitTokens = new Set()) {
+  if (explicitRootPackages.has(wsRoot)) return true;
+  if (explicitTokens.has(wsRoot === '' ? '.' : wsRoot)) return true;
+  const srcDir = wsRoot ? `${wsRoot}/src` : 'src';
+  const libPath = `${srcDir}/lib.rs`;
+  const mainPath = `${srcDir}/main.rs`;
+  let hasManifest = false;
+  let hasRustSrc = false;
+  for (const task of spec.tasks) {
+    if (taskCoversManifest(task, wsRoot)) hasManifest = true;
+    for (const rawScope of task.writePaths ?? []) {
+      const scope = normalizeScopePath(rawScope);
+      if (!scope) continue;
+      if (scope === libPath || scope === mainPath || (scope.startsWith(`${srcDir}/`) && /\.rs$/i.test(scope))) {
+        hasRustSrc = true;
+      }
+    }
+  }
+  return hasManifest && hasRustSrc;
+}
+
+function waveZeroPolicyFindings({ waveZeroTasks, ancestors, architecturePolicy, requiredWorkspaces }) {
+  if (architecturePolicy?.schemaVersion === 2 && architecturePolicy?.language === 'rust') return [];
+  const policyTasks = waveZeroTasks.filter(task =>
+    (task.writePaths ?? []).some(scope => isExplicitContractScope(scope, '', 'architecture.policy.json')),
+  );
+  if (!policyTasks.length) {
+    return [
+      finding(
+        'architecture_policy_required',
+        'Для Rust workspace с ≥ 3 крейтами Волна 0 (foundation) должна содержать задачу, ' +
+          'создающую architecture.policy.json (в её writePaths), иначе гейты при architecture.enabled будут заблокированы',
+      ),
+    ];
+  }
+  const policyIds = new Set(policyTasks.map(task => task.id));
+  const unordered = new Set(
+    waveZeroTasks
+      .filter(
+        task =>
+          !policyIds.has(task.id) &&
+          !policyTasks.some(
+            pt =>
+              ancestors.get(task.id)?.has(pt.id) || (pt.epicId === task.epicId && ancestors.get(pt.id)?.has(task.id)),
+          ),
+      )
+      .map(task => task.id),
+  );
+  // At the first epic gate carrying architecture.policy.json, the workspace manifest and
+  // compilable contract crate must already exist (same task, same epic, or an ancestor task).
+  for (const pt of policyTasks) {
+    const ptAncestors = ancestors.get(pt.id) ?? new Set();
+    const available = waveZeroTasks.filter(
+      task => task.id === pt.id || task.epicId === pt.epicId || ptAncestors.has(task.id),
+    );
+    for (const { wsRoot, wsContracts } of requiredWorkspaces) {
+      const hasManifest = available.some(task => taskCoversManifest(task, wsRoot));
+      const hasContract = available.some(task =>
+        [...wsContracts].some(contractRoot => taskCreatesCompilableContractCrate(task, contractRoot)),
+      );
+      if (!hasManifest || !hasContract) unordered.add(pt.id);
+    }
+  }
+  if (!unordered.size) return [];
+  return [
+    finding(
+      'architecture_policy_order',
+      'Остальные задачи Волны 0 (foundation) должны зависеть от задачи, создающей architecture.policy.json, ' +
+        'или совпадать с ней, а к гейту эпика с политикой уже должны существовать Cargo.toml и контрактный крейт',
+      [...unordered].sort(compare),
+    ),
+  ];
+}
+
+/** Multi-crate Rust workspaces (>= 3 crates sharing a workspace root) must create a compilable
+ * contract crate (`Cargo.toml` + `src/**`) and `architecture.policy.json` in Wave 0. */
+export function rustContractCrateFindings(
+  spec,
+  projectMarkdown = '',
+  architecturePolicy = null,
+  ancestors = null,
+  packageNames = null,
+) {
+  if (!isRustBlueprint(spec, projectMarkdown, architecturePolicy)) return [];
+  const actualNames = normalizePackageNames(packageNames);
+  const allCrates = new Map();
+  for (const task of spec.tasks) {
+    for (const scope of task.writePaths ?? []) {
+      const crate = crateFromWritePath(scope);
+      if (crate) allCrates.set(crate.root, actualNames.get(crate.root) ?? crate.name);
+    }
+  }
+  const explicitTokens = declaredContractTokens(spec, projectMarkdown);
+  const explicitRootPackages = declaredRootPackages(spec, projectMarkdown);
+  const workspaceRoots = [...declaredWorkspaceRoots(spec, projectMarkdown, architecturePolicy, allCrates)].sort(
+    (a, b) => b.length - a.length || compare(a, b),
+  );
+  const byWorkspace = new Map(workspaceRoots.map(wsRoot => [wsRoot, new Map()]));
+  for (const [crateRoot, crateName] of allCrates.entries()) {
+    const ownerWs = ownerWorkspaceOf(crateRoot, workspaceRoots);
+    if (ownerWs !== undefined && crateRoot !== ownerWs) byWorkspace.get(ownerWs).set(crateRoot, crateName);
+  }
+  for (const [wsRoot, wsCrates] of byWorkspace.entries()) {
+    if (
+      !wsCrates.has(wsRoot) &&
+      (actualNames.has(wsRoot) || hasRootPackageMember(spec, wsRoot, explicitRootPackages, explicitTokens))
+    ) {
+      wsCrates.set(wsRoot, actualNames.get(wsRoot) ?? (wsRoot ? wsRoot.split('/').at(-1) : spec.id || 'root'));
+    }
+  }
+
+  const allContractRoots = new Set();
+  if (workspaceRoots.length) {
+    for (const [wsRoot, wsCrates] of byWorkspace.entries()) {
+      for (const root of selectContractRootsForWorkspace({
+        wsRoot,
+        wsCrates,
+        workspaceRoots,
+        explicitTokens,
+        architecturePolicy,
+        actualNames,
+      }))
+        allContractRoots.add(root);
+    }
+  } else {
+    for (const [root, name] of allCrates.entries()) {
+      if (explicitTokens.has(root) || explicitTokens.has(name) || CONTRACT_CRATE_NAME.test(name))
+        allContractRoots.add(root);
+    }
+    for (const token of explicitTokens) {
+      if (token.includes('/')) allContractRoots.add(token);
+    }
+  }
+  const findings = [...broadContractScopeFindings(spec, allContractRoots)];
+  if (!workspaceRoots.length) return findings;
+
+  const waveZeroEpics = new Set(
+    spec.epics.filter(epic => epic.id === FOUNDATION_ID || epic.milestoneId === FOUNDATION_ID).map(epic => epic.id),
+  );
+  const waveZeroTasks = spec.tasks.filter(task => waveZeroEpics.has(task.epicId));
+  if (!waveZeroTasks.length) return findings;
+
+  const requiredWorkspaces = [];
+  let missingContract = false;
+  for (const [wsRoot, wsCrates] of byWorkspace.entries()) {
+    if (wsCrates.size < RUST_CONTRACT_CRATE_MIN) continue;
+    const wsContracts = selectContractRootsForWorkspace({
+      wsRoot,
+      wsCrates,
+      workspaceRoots,
+      explicitTokens,
+      architecturePolicy,
+      actualNames,
+    });
+    requiredWorkspaces.push({ wsRoot, wsContracts });
+    const satisfied = waveZeroTasks.some(task =>
+      [...wsContracts].some(contractRoot => taskCreatesCompilableContractCrate(task, contractRoot)),
+    );
+    if (!satisfied) missingContract = true;
+  }
+  if (missingContract) {
+    findings.push(
+      finding(
+        'contract_crate_required',
+        'Для Rust workspace с ≥ 3 крейтами Волна 0 (foundation) должна содержать задачу, ' +
+          'создающую компилируемый контрактный крейт (Cargo.toml и src/** в crates/<name>-contracts ' +
+          'или явно объявленном контрактном крейте), защищённый через contractCrates в architecture.policy.json',
+      ),
+    );
+  }
+  if (requiredWorkspaces.length) {
+    const resolvedAncestors = ancestors ?? taskAncestors(spec.tasks);
+    findings.push(
+      ...waveZeroPolicyFindings({
+        waveZeroTasks,
+        ancestors: resolvedAncestors,
+        architecturePolicy,
+        requiredWorkspaces,
+      }),
+    );
+  }
+  return findings;
+}
+
 function analyzeFactorySpec(spec, options = {}) {
-  const { contracts = projectContracts, knownValues = [], interfaces = [], projectMarkdown = '' } = options;
+  const {
+    contracts = projectContracts,
+    knownValues = [],
+    interfaces = [],
+    projectMarkdown = '',
+    architecturePolicy = null,
+    packageNames = null,
+  } = options;
   const base = normalizeFactory(spec, { contracts, knownValues });
   const findings = [...base.findings, ...sectionFindings(projectMarkdown)];
   if (!base.spec) return { spec: null, findings };
   const ancestors = taskAncestors(base.spec.tasks);
+  const pairs = parallelOverlaps(base.spec.tasks, { ancestors });
+  const inputFindings = taskInputFindings({
+    project: storedProject(base.spec),
+    tasks: base.spec.tasks,
+    contracts,
+    knownValues,
+  });
+  const alreadyOversized = new Set(
+    inputFindings.filter(item => item.code === 'split_required').flatMap(item => item.taskIds ?? []),
+  );
   findings.push(
     ...ownerFindings(base.spec.tasks),
     ...waveZeroFindings(base.spec, ancestors),
+    ...rustContractCrateFindings(base.spec, projectMarkdown, architecturePolicy, ancestors, packageNames),
     ...containerFindings(base.spec),
     ...epicCycleFindings(base.spec.tasks),
-    ...overlapFindings(parallelOverlaps(base.spec.tasks, { ancestors })),
-    ...taskInputFindings({ project: storedProject(base.spec), tasks: base.spec.tasks, contracts, knownValues }),
+    ...overlapFindings(pairs, base.spec.tasks),
+    ...moduleOwnerFindings(base.spec, { parallelPairs: pairs }),
+    ...inputFindings,
+    ...taskScopeSizeFindings(base.spec.tasks, alreadyOversized),
     ...interfaceFindings(base.spec, interfaces),
   );
   return { spec: base.spec, findings };
@@ -838,12 +1457,58 @@ async function resolveSource({ root, spec, interfaces }) {
   return { value, findings };
 }
 
+async function readOptionalArchitecturePolicy(root) {
+  try {
+    const file = await readBoundedFile(path.join(root, 'architecture.policy.json'), BLUEPRINT_LIMITS.spec);
+    const parsed = JSON.parse(file.text);
+    return isPlain(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+async function readOptionalCargoPackageNames(root, specValue, projectMarkdown) {
+  const dirs = new Set(['']);
+  if (isPlain(specValue) && Array.isArray(specValue.tasks)) {
+    for (const task of specValue.tasks) {
+      if (!isPlain(task) || !Array.isArray(task.writePaths)) continue;
+      for (const scope of task.writePaths) {
+        if (typeof scope !== 'string') continue;
+        const crate = crateFromWritePath(scope);
+        if (crate) dirs.add(crate.root);
+      }
+    }
+    for (const token of declaredContractTokens(specValue, projectMarkdown)) {
+      if (token.includes('/')) dirs.add(token);
+    }
+  }
+  const names = new Map();
+  for (const dir of dirs) {
+    if (dir && dir.split('/').some(part => !part || part === '.' || part === '..' || /[*?[{]/.test(part))) continue;
+    const target = dir ? path.join(root, ...dir.split('/'), 'Cargo.toml') : path.join(root, 'Cargo.toml');
+    if (!inside(root, target)) continue;
+    try {
+      const file = await readBoundedFile(target, BLUEPRINT_LIMITS.project);
+      const doc = parseToml(file.text);
+      const pkg = /** @type {Record<string, any> | null} */ (isPlain(doc?.package) ? doc.package : null);
+      const pkgName = typeof pkg?.name === 'string' ? pkg.name.trim() : '';
+      if (pkgName) names.set(dir, pkgName);
+    } catch {
+      /* Missing or unreadable manifest: fall back to directory name. */
+    }
+  }
+  return names;
+}
+
 /** Read, resolve and lint the blueprint. Returns the compiled ProjectSpec
  * (with execution) even when findings exist; ok is the only acceptance signal.
  * `specFile` optionally replaces .kodo/blueprint/spec.json. Nothing is written to disk.
  * @param {string} root
- * @param {{ contracts?: typeof projectContracts, knownValues?: string[], specFile?: string }} [options] */
-export async function compileBlueprint(root, { contracts = projectContracts, knownValues = [], specFile } = {}) {
+ * @param {{ contracts?: typeof projectContracts, knownValues?: string[], specFile?: string, architecturePolicy?: Record<string, any> | null, packageNames?: Map<string, string> | Record<string, string> | null }} [options] */
+export async function compileBlueprint(
+  root,
+  { contracts = projectContracts, knownValues = [], specFile, architecturePolicy, packageNames } = {},
+) {
   let blueprint;
   try {
     blueprint = await readBlueprint(root, { specFile });
@@ -853,11 +1518,19 @@ export async function compileBlueprint(root, { contracts = projectContracts, kno
     throw error;
   }
   const source = await resolveSource(blueprint);
+  const policy =
+    architecturePolicy === undefined ? await readOptionalArchitecturePolicy(blueprint.root) : architecturePolicy;
+  const resolvedPackageNames =
+    packageNames === undefined
+      ? await readOptionalCargoPackageNames(blueprint.root, source.value, blueprint.project.text)
+      : packageNames;
   const analysis = analyzeFactorySpec(source.value, {
     contracts,
     knownValues,
     interfaces: blueprint.interfaces,
     projectMarkdown: blueprint.project.text,
+    architecturePolicy: policy,
+    packageNames: resolvedPackageNames,
   });
   const findings = [...source.findings, ...analysis.findings];
   return { ok: findings.length === 0, spec: analysis.spec, interfaces: blueprint.interfaces, findings };

@@ -19,12 +19,14 @@ import {
   containerFindings,
   epicCycleFindings,
   finding,
+  moduleOwnerFindings,
   overlapFindings,
   ownerFindings,
   parallelOverlaps,
   readBoundedFile,
   taskAncestors,
   taskInputFindings,
+  taskScopeSizeFindings,
 } from './project-blueprint.mjs';
 
 export const BOOTSTRAP_CLIENTS = Object.freeze(['codex', 'claude-code']);
@@ -131,7 +133,7 @@ const FRAMEWORKS = [
   'mocha',
   '@playwright/test',
 ];
-const SESSION_SCHEMA = {
+export const SESSION_SCHEMA = {
   type: 'object',
   additionalProperties: false,
   required: ['status', 'summary'],
@@ -418,6 +420,7 @@ const RULES = `# Правила чертежа Kodo
 6. \`root\` — абсолютный путь каталога проекта; id — slug; остальные поля строго по ProjectSpec v1.
 7. **Эпики без циклов.** Если задача эпика X зависит от задачи эпика Y, никакая задача Y не должна зависеть (через задачи любых эпиков) от задач X: гейты эпиков закрываются по порядку.
 8. **Минимальный тест в Волне 0.** Первая задача Волны 0 создаёт минимальный проходящий тест, его путь — в её \`writePaths\`: без тестов проверка задачи ничего не доказывает, а прогон \`node --test\` без единого теста — отказ (\`fast_check_no_tests\`).
+9. **Контрактный крейт Волны 0 (единый Rust workspace с ≥ 3 крейтами).** Волна 0 (\`${FOUNDATION_ID}\`) должна содержать задачу, чьи \`writePaths\` покрывают \`Cargo.toml\` и \`src/**\` компилируемого контрактного крейта (\`crates/<name>-contracts\` или крейта, явно объявленного строкой \`contractCrate: crates/<name>\` в \`PROJECT.md\`), и \`architecture.policy.json\` (\`schemaVersion: 2, language: "rust"\`): в корневом \`Cargo.toml\` задайте \`members = ["crates/*"]\` и \`[workspace.dependencies]\`, создайте заготовки всех крейтов карты модулей (\`Cargo.toml\` и \`src/lib.rs\` с заглушкой), закоммитьте \`Cargo.lock\` и \`.gitignore\` с \`target/\`, а в политике заранее перечислите все крейты карты модулей в \`layers\` (включая будущие крейты Волны 1+, иначе они получат \`ownership.unowned\`) и нужные внешние крейты в \`allowedExternalCrates\`/\`allowedDevExternalCrates\`. Задачи Волн 1+ наполняют \`src/\` своих крейтов; новая внешняя зависимость добавляется отдельной задачей-интегратором, у которой в \`writePaths\` есть корневой \`Cargo.toml\`, \`Cargo.toml\` крейта-потребителя (для добавления \`dep.workspace = true\`), \`Cargo.lock\` и \`architecture.policy.json\`. Обычным задачам нельзя накрывать контрактный крейт широкой маской (\`crates/**\` → \`contract_scope_too_broad\`). Отсутствие такой задачи Волны 0 — finding \`contract_crate_required\`.
 
 ## kodo.config.json — до apply-spec
 
@@ -427,7 +430,8 @@ const RULES = `# Правила чертежа Kodo
 
 - \`client\` — подписочный клиент, который исполняет гейты: \`codex\` или \`claude-code\` (есть только подписка Claude Code — \`claude-code\`).
 - \`commands.test\` — команда тестов стека из «Стек»: \`{ "command": "<программа>", "args": [...] }\`. Шаблон: пустой каталог — \`npm test\` (новый Node-проект); один стек с манифестом в корне — его команда (Node — \`npm test\`, только если в package.json есть \`scripts.test\`; Python — \`python -m pytest\`, Rust — \`cargo test\`, Go — \`go test ./...\`, .NET — \`dotnet test\`, Maven — \`mvn test\`, Gradle — \`gradle test\`, Deno — \`deno test\`). Манифест только во вложенном каталоге, несколько стеков, package.json без \`scripts.test\`, стек без известной команды, нераспознанный стек или неполный обход каталога — в шаблоне \`commands.test: []\`: задайте команду сами. Пустой \`commands.test\` гейт не принимает.
-- \`kodo.config.json\` уже есть — проверьте в нём \`client\` и \`commands.test\` и не перезаписывайте остальное.
+- \`architecture.enabled\` — для многомодульных проектов с \`architecture.policy.json\` (включая Rust workspace) включите \`"architecture": {"enabled": true}\` в исходном коммите, иначе архитектурный гейт остаётся \`disabled\` и защита контрактов молча не работает.
+- \`kodo.config.json\` уже есть — проверьте в нём \`client\`, \`commands.test\` и \`architecture.enabled\` и не перезаписывайте остальное.
 
 ## Коды проверки
 
@@ -440,6 +444,9 @@ const RULES = `# Правила чертежа Kodo
 | \`blueprint_section_missing\`, \`blueprint_section_empty\` | Разделы PROJECT.md |
 | \`blueprint_owner_unknown\` | owner — одна из ролей |
 | \`blueprint_wave0_missing\`, \`blueprint_wave0_bypassed\`, \`blueprint_wave0_order\` | Волна 0 |
+| \`contract_crate_required\` | Единый Rust workspace с ≥ 3 крейтами: добавить в Волну 0 задачу с \`Cargo.toml\` + \`src/**\` контрактного крейта (\`crates/<name>-contracts\` или \`contractCrate: …\` в \`PROJECT.md\`) и \`architecture.policy.json\` в её \`writePaths\` |
+| \`architecture_policy_required\`, \`architecture_policy_order\` | Добавить \`architecture.policy.json\` в \`writePaths\` задачи Волны 0 и поставить остальные задачи Волны 0 в зависимость от неё |
+| \`contract_scope_too_broad\` | Сузить \`writePaths\` обычной задачи, чтобы не накрывать контрактный крейт широкой маской |
 | \`blueprint_container_empty\` | Пустой майлстоун или эпик: добавить в него эпик/задачу или удалить его |
 | \`blueprint_epic_cycle\` | Цикл зависимостей между эпиками: перенести задачи или объединить эпики |
 | \`blueprint_parallel_overlap\` | Пересечение writePaths параллельных задач |
@@ -895,7 +902,7 @@ const MILESTONE_RULES = `# Правила нового майлстоуна
 8. В майлстоуне есть хотя бы один эпик, в каждом новом эпике — хотя бы одна задача.
 9. \`interfaceRefs: []\` или полные Ref, скопированные без изменений из раздела «Привязанные интерфейсы» context.md (они уже есть у задач проекта): так воркер получит контракт в brief.interfaces. Новые ссылки к замороженным интерфейсам привязывает только apply-spec: короткая форма \`interfaces/<module>.md\`, изменённый или неизвестный Ref и Ref, чьё evidence не проходит проверку, отклоняются (\`milestone_interface_unbound\`).
 
-Коды: \`milestone_shape\`, \`milestone_task_count\`, \`milestone_id_conflict\`, \`milestone_foreign_parent\`, \`milestone_dependency_unknown\`, \`milestone_dependency_not_accepted\`, \`milestone_interface_unbound\`, \`milestone_snapshot_invalid\`, \`milestone_snapshot_incomplete\`, \`milestone_spec_invalid\`, \`blueprint_owner_unknown\`, \`blueprint_container_empty\`, \`blueprint_epic_cycle\`, \`blueprint_parallel_overlap\`, \`split_required\`.
+Коды: \`milestone_shape\`, \`milestone_task_count\`, \`milestone_id_conflict\`, \`milestone_foreign_parent\`, \`milestone_dependency_unknown\`, \`milestone_dependency_not_accepted\`, \`milestone_interface_unbound\`, \`milestone_snapshot_invalid\`, \`milestone_snapshot_incomplete\`, \`milestone_spec_invalid\`, \`blueprint_owner_unknown\`, \`blueprint_owner_ambiguous\`, \`blueprint_container_empty\`, \`blueprint_epic_cycle\`, \`blueprint_parallel_overlap\`, \`integrator_required\`, \`split_required\`.
 `;
 
 function milestoneTemplate(snapshot) {
@@ -972,7 +979,7 @@ export async function prepareExtend(options = {}) {
   };
 }
 
-const MILESTONE_SESSION_SCHEMA = {
+export const MILESTONE_SESSION_SCHEMA = {
   type: 'object',
   additionalProperties: false,
   required: ['status', 'summary', 'milestone'],
@@ -1208,14 +1215,32 @@ export function lintMilestone(milestone, snapshot, options = {}) {
   const raw = new Map(milestone.tasks.map(task => [task.id, task.dependsOn]));
   const fresh = normalized.tasks.map(task => ({ ...task, dependsOn: raw.get(task.id) }));
   const ancestors = taskAncestors(fresh);
+  const allAncestors = taskAncestors([...current.tasks, ...fresh]);
   const others = current.tasks.filter(task => ![...CLOSED, 'cancelled'].includes(task.status));
+  const pairs = parallelOverlaps(normalized.tasks, { ancestors, others });
+  const inputFindings = taskInputFindings({
+    project: current.project,
+    tasks: normalized.tasks,
+    contracts,
+    knownValues,
+  });
+  const alreadyOversized = new Set(
+    inputFindings.filter(item => item.code === 'split_required').flatMap(item => item.taskIds ?? []),
+  );
   findings.push(
     ...ownerFindings(normalized.tasks),
     // Raw task parents: normalization re-homes a foreign epicId (milestone_foreign_parent reports it).
     ...containerFindings({ ...normalized, tasks: milestone.tasks.filter(isPlain) }),
     ...epicCycleFindings([...current.tasks, ...fresh], { fresh: new Set(normalized.epics.map(epic => epic.id)) }),
-    ...overlapFindings(parallelOverlaps(normalized.tasks, { ancestors, others })),
-    ...taskInputFindings({ project: current.project, tasks: normalized.tasks, contracts, knownValues }),
+    ...overlapFindings(pairs, [...normalized.tasks, ...others]),
+    ...moduleOwnerFindings(normalized, {
+      parallelPairs: pairs,
+      existingTasks: others,
+      existingEpics: current.epics,
+      ancestors: allAncestors,
+    }),
+    ...inputFindings,
+    ...taskScopeSizeFindings(normalized.tasks, alreadyOversized),
   );
   return done(findings);
 }

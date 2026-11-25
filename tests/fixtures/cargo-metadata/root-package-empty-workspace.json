@@ -1,0 +1,20 @@
+{
+  "cargoVersion": "cargo 1.96.0 (30a34c682 2026-05-25)",
+  "startDir": "",
+  "workspace_root": "",
+  "workspace_members": [
+    {
+      "name": "root-pkg",
+      "manifest": "Cargo.toml"
+    },
+    {
+      "name": "helper",
+      "manifest": "crates/helper/Cargo.toml"
+    }
+  ],
+  "manifests": {
+    "Cargo.toml": "[package]\nname = \"root-pkg\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nhelper = { path = \"crates/helper\" }\n[workspace]\n",
+    "crates/helper/Cargo.toml": "[package]\nname = \"helper\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    "crates/orphan/Cargo.toml": "[package]\nname = \"orphan\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+  }
+}

@@ -996,3 +996,42 @@ test('Warm validation cache never lets raw secrets or accessors reach canonical 
   assert.equal(reads, 0);
   assert.equal(repo.snapshot(id).revision, result.revision);
 });
+
+test('Opening a v1 database applies only the profile migration and preserves existing project state', async t => {
+  const f = await fixture(t);
+  const { repo, store } = await f.open();
+  const { result } = await create(repo, f.project);
+  const before = repo.snapshot(result.projectId);
+  store.db.exec('DROP TABLE kodo_project_profiles; DELETE FROM kodo_project_migrations WHERE version=2');
+  const { repo: upgraded, store: current } = await f.open();
+  assert.deepEqual(upgraded.snapshot(result.projectId), before);
+  assert.equal(upgraded.getProfile(result.projectId), null);
+  assert.deepEqual(
+    current.db
+      .prepare('SELECT version FROM kodo_project_migrations ORDER BY version')
+      .all()
+      .map(r => r.version),
+    [1, 2],
+  );
+  assert.ok(
+    readdirSync(path.join(f.home, 'project-backups'), { recursive: true }).some(p =>
+      String(p).endsWith('before-v2.sqlite'),
+    ),
+  );
+});
+
+test('A9 corrupt stored profile is distinguished from unsafe data', async t => {
+  const f = await fixture(t, { secrets: { fixture: 'hiddenfixturevalue' } });
+  const { repo, store } = await f.open();
+  const {
+    result: { projectId },
+  } = await create(repo, f.project);
+  for (const [body, code] of [
+    ['{', 'project_database_corrupt'],
+    ['{}', 'project_database_corrupt'],
+    ['{"id":"hiddenfixturevalue"}', 'project_unsafe'],
+  ]) {
+    store.db.prepare('INSERT OR REPLACE INTO kodo_project_profiles VALUES(?,?)').run(projectId, body);
+    assert.throws(() => repo.getProfile(projectId), { code });
+  }
+});

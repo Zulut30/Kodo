@@ -1,6 +1,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { compactPlanEvidence, compactReviewEvidence, measureContext } from '../runtime/context-pack.mjs';
+import { mkdtemp, rm } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { Store } from '../runtime/store.mjs';
+import { prepareWaveTaskContext } from '../runtime/wave-context.mjs';
+import {
+  compactPlanEvidence,
+  compactReviewEvidence,
+  measureContext,
+  modulesFromWritePaths,
+  selectWaveVerifiedLessons,
+} from '../runtime/context-pack.mjs';
 
 const privatePaths = {
   plan: 'C:/private evidence/план-🧭.json',
@@ -312,4 +323,254 @@ test('Impossible or invalid byte budgets fail explicitly without truncating requ
     assert.throws(() => compactPlanEvidence({}, { maxBytes }), /budget/i);
   }
   assert.throws(() => measureContext({}), /string/i);
+});
+
+test('Wave gate lessons use full module paths, require criterion binding, deduplicate before max 3 and stay out of ordinary plan evidence', () => {
+  assert.deepEqual(modulesFromWritePaths(['crates/core/src/lib.rs']), ['crates/core']);
+  assert.deepEqual(modulesFromWritePaths(['packages/core/index.ts']), ['packages/core']);
+
+  const sha = 'a'.repeat(40);
+  const makeGateLesson = (id, summary, extra = {}) => ({
+    runId: id,
+    headSha: sha,
+    summary,
+    lesson: summary,
+    kind: 'gate-lesson',
+    projectId: 'p1',
+    epicIds: ['core-rs'],
+    modules: ['crates/core'],
+    writePaths: ['crates/core'],
+    criterionIds: ['epic:core-rs:ok'],
+    checks: { complete: true, headSha: sha, results: [{ command, exitCode: 0, status: 'passed' }] },
+    review: { passed: true, headSha: sha },
+    ...extra,
+  });
+
+  // Ordinary compactPlanEvidence MUST NOT read gate-lesson records at all!
+  const planDoc = parse(
+    compactPlanEvidence({ analysis: { summary: 'ok', priorLessons: [makeGateLesson('g1', 'Gate note')] } }),
+  );
+  assert.deepEqual(planDoc.analysis.verifiedLessons, []);
+
+  // packages/core MUST NOT receive crates/core's lesson!
+  const pkgTask = { epicId: 'core-js', writePaths: ['packages/core/index.ts'] };
+  assert.deepEqual(
+    selectWaveVerifiedLessons([makeGateLesson('g1', 'Rust core note')], { task: pkgTask, projectId: 'p1' }),
+    [],
+  );
+
+  // Unbound lesson (no criterionIds) is ignored.
+  const rsTask = { epicId: 'core-rs', writePaths: ['crates/core/src/mod.rs'] };
+  assert.deepEqual(
+    selectWaveVerifiedLessons([makeGateLesson('g-no-crit', 'No criterion', { criterionIds: [] })], {
+      task: rsTask,
+      projectId: 'p1',
+    }),
+    [],
+  );
+
+  // Deduplication of normalized text + filter by scope BEFORE maxLessons = 3.
+  const manyOther = Array.from({ length: 10 }, (_, i) =>
+    makeGateLesson(`other-${i}`, `Other note ${i}`, {
+      epicIds: ['other'],
+      modules: ['crates/other'],
+      writePaths: ['crates/other'],
+    }),
+  );
+  const matching = [
+    makeGateLesson('g1', 'Keep   errors   typed'),
+    makeGateLesson('g2', 'keep errors typed'),
+    makeGateLesson('g3', 'Use i32 coordinates'),
+    makeGateLesson('g4', 'Avoid unwrap in public API'),
+    makeGateLesson('g5', 'Fourth distinct note'),
+  ];
+  const selected = selectWaveVerifiedLessons([...manyOther, ...matching], {
+    task: rsTask,
+    projectId: 'p1',
+    maxLessons: 3,
+  });
+  assert.equal(selected.length, 3);
+  assert.deepEqual(
+    selected.map(row => row.summary),
+    ['Keep   errors   typed', 'Use i32 coordinates', 'Avoid unwrap in public API'],
+  );
+  assert.deepEqual(selected[0].criterionIds, ['epic:core-rs:ok']);
+});
+
+test('G7: dotted module directory names stay distinct, gate-lesson requires own check receipt object, and store filters kind in SQL', async t => {
+  assert.deepEqual(modulesFromWritePaths(['packages/core.api/src/index.ts']), ['packages/core.api']);
+  assert.deepEqual(modulesFromWritePaths(['packages/core.ui/src/index.ts']), ['packages/core.ui']);
+  assert.deepEqual(modulesFromWritePaths(['packages/core.api', 'packages/core.ui']), [
+    'packages/core.api',
+    'packages/core.ui',
+  ]);
+
+  const sha = 'b'.repeat(40);
+  const apiLesson = {
+    runId: 'gate-api',
+    headSha: sha,
+    summary: 'API package invariant',
+    kind: 'gate-lesson',
+    projectId: 'p1',
+    epicIds: ['api'],
+    modules: ['packages/core.api'],
+    writePaths: ['packages/core.api'],
+    criterionIds: ['epic:api:ok'],
+    checks: { complete: true, headSha: sha, results: [{ command, exitCode: 0, status: 'passed' }] },
+    review: { passed: true, headSha: sha },
+  };
+  assert.equal(
+    selectWaveVerifiedLessons([apiLesson], {
+      task: { epicId: 'ui', writePaths: ['packages/core.ui/src/app.ts'] },
+      projectId: 'p1',
+    }).length,
+    0,
+  );
+  assert.equal(
+    selectWaveVerifiedLessons([apiLesson], {
+      task: { epicId: 'api-next', writePaths: ['packages/core.api/src/routes.ts'] },
+      projectId: 'p1',
+    }).length,
+    1,
+  );
+
+  // gate-lesson MUST reject bare array checks (no selector synthesis of complete/headSha),
+  // as well as receipt missing complete:true or headSha; legacy array stays valid for ordinary lessons.
+  const bareArrayGate = { ...apiLesson, runId: 'gate-arr', checks: [{ command, exitCode: 0 }] };
+  const missingCompleteGate = {
+    ...apiLesson,
+    runId: 'gate-inc',
+    checks: { headSha: sha, results: [{ command, exitCode: 0, status: 'passed' }] },
+  };
+  const wrongHeadGate = {
+    ...apiLesson,
+    runId: 'gate-head',
+    checks: { complete: true, headSha: 'c'.repeat(40), results: [{ command, exitCode: 0, status: 'passed' }] },
+  };
+  assert.deepEqual(
+    selectWaveVerifiedLessons([bareArrayGate, missingCompleteGate, wrongHeadGate], {
+      task: { epicId: 'api', writePaths: ['packages/core.api/src/routes.ts'] },
+      projectId: 'p1',
+    }),
+    [],
+  );
+  const ordinaryLegacy = {
+    runId: 'ord-1',
+    headSha: sha,
+    summary: 'Ordinary legacy array check lesson',
+    checks: [{ command, exitCode: 0 }],
+    review: { passed: true, headSha: sha },
+  };
+  const ordinaryPlan = parse(compactPlanEvidence({ analysis: { summary: 'ok', priorLessons: [ordinaryLegacy] } }));
+  assert.equal(ordinaryPlan.analysis.verifiedLessons.length, 1);
+
+  // Store filters kind in SQL BEFORE ORDER BY ... LIMIT.
+  const home = await mkdtemp(path.join(os.tmpdir(), 'kodo-g7-store-'));
+  const store = new Store(home);
+  t.after(async () => {
+    store.close();
+    await rm(home, { recursive: true, force: true });
+  });
+  const project = path.join(home, 'repo');
+  for (let i = 0; i < 4; i++) {
+    store.rememberLesson(project, `ord-${i}`, { runId: `ord-${i}`, summary: `Ordinary ${i}` });
+  }
+  for (let i = 0; i < 15; i++) {
+    store.rememberLesson(project, `gate-${i}`, { runId: `gate-${i}`, kind: 'gate-lesson', summary: `Gate ${i}` });
+  }
+  const origPrepare = store.db.prepare.bind(store.db);
+  const seenSql = [];
+  store.db.prepare = sql => {
+    seenSql.push(sql);
+    return origPrepare(sql);
+  };
+  const ord = store.lessons(project, 3);
+  const gates = store.gateLessons(project, 4);
+  assert.equal(ord.length, 3);
+  assert.ok(ord.every(row => row.kind !== 'gate-lesson'));
+  assert.equal(gates.length, 4);
+  assert.ok(gates.every(row => row.kind === 'gate-lesson'));
+  assert.ok(
+    seenSql.some(sql => /json_extract\(body,\s*'\$\.kind'\)/.test(sql) && /LIMIT\s*\?/i.test(sql)),
+    `Expected SQL json_extract + LIMIT in store queries, got: ${JSON.stringify(seenSql)}`,
+  );
+  assert.equal(
+    seenSql.filter(sql => /json_extract\(body,\s*'\$\.kind'\)/.test(sql) && /LIMIT\s*\?/i.test(sql)).length,
+    2,
+  );
+});
+
+test('V3: 200+ newer unrelated module gate-lessons do not evict a matching module lesson in real Store', async t => {
+  const home = await mkdtemp(path.join(os.tmpdir(), 'kodo-v3-store-'));
+  const store = new Store(home);
+  t.after(async () => {
+    store.close();
+    await rm(home, { recursive: true, force: true });
+  });
+  const project = path.join(home, 'repo');
+  const sha = 'd'.repeat(40);
+  const makeLesson = (id, summary, mod, epicId) => ({
+    runId: id,
+    headSha: sha,
+    summary,
+    lesson: summary,
+    kind: 'gate-lesson',
+    projectId: 'p1',
+    epicIds: [epicId],
+    modules: [mod],
+    writePaths: [mod],
+    criterionIds: [`epic:${epicId}:ok`],
+    checks: { complete: true, headSha: sha, results: [{ command, exitCode: 0, status: 'passed' }] },
+    review: { passed: true, headSha: sha },
+  });
+
+  // Insert 1 older lesson for packages/core.api, then 205 newer lessons for packages/core.ui.
+  store.rememberLesson(
+    project,
+    'api-lesson-0',
+    makeLesson('api-lesson-0', 'Keep core.api responses deterministic', 'packages/core.api', 'api'),
+  );
+  const projectKeyVal = store.db.prepare('SELECT project FROM knowledge WHERE run_id=?').get('api-lesson-0').project;
+  store.db.prepare('UPDATE knowledge SET time=? WHERE run_id=?').run(1000, 'api-lesson-0');
+  const insert = store.db.prepare('INSERT OR REPLACE INTO knowledge VALUES(?,?,?,?)');
+  for (let i = 1; i <= 205; i++) {
+    const rec = makeLesson(`ui-lesson-${i}`, `UI rule #${i}`, 'packages/core.ui', 'ui');
+    insert.run(`ui-lesson-${i}`, projectKeyVal, JSON.stringify(rec), 2000 + i);
+  }
+
+  const ctx = { store, engine: { store, secrets: {} } };
+  const snapshot = {
+    project: { projectId: 'p1', root: project, constraints: [], execution: { cadence: 'wave', integration: 'branch' } },
+    tasks: [],
+  };
+  const task = {
+    id: 'api-2',
+    epicId: 'api-next',
+    writePaths: ['packages/core.api/src/routes.ts'],
+    dependsOn: [],
+    interfaceRefs: [],
+  };
+  const run = store.createRun({ id: 'run-api-2', project, baseSha: sha });
+  const prepared = await prepareWaveTaskContext({
+    ctx,
+    snapshot,
+    attempt: { id: 'att-1', number: 1 },
+    task,
+    run,
+    buildApiCardsImpl: async () => ({
+      schemaVersion: 1,
+      kind: 'api-cards',
+      baseSha: sha,
+      maxBytes: 4096,
+      text: 'API card',
+      bytes: 8,
+      originalBytes: 8,
+      truncated: false,
+      omitted: { files: 0, signatures: 0, invariants: 0 },
+      invariants: [],
+      modules: [],
+    }),
+  });
+  assert.equal(prepared.verifiedLessons.length, 1);
+  assert.equal(prepared.verifiedLessons[0].summary, 'Keep core.api responses deterministic');
 });

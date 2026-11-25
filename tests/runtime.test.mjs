@@ -221,6 +221,12 @@ test('Plan contracts reject malformed graphs and forbidden scopes while overlap 
   assert.equal(scopesOverlap(['src/**'], ['src/lib/**']), true);
   assert.equal(scopesOverlap(['src/**'], ['docs/**']), false);
   assert.equal(scopesOverlap(['**/*.mjs'], ['src/lib.mjs']), true);
+  // `./x` and `x` name the same path for ownership and for overlap alike (15F).
+  assert.equal(ownsPath(['./Cargo.lock'], 'Cargo.lock'), true);
+  assert.equal(scopesOverlap(['./Cargo.lock'], ['Cargo.lock']), true);
+  assert.equal(scopesOverlap(['./sub/**'], ['sub/Cargo.lock']), true);
+  assert.equal(scopesOverlap(['./sub'], ['sub']), true);
+  assert.equal(scopesOverlap(['./docs/**'], ['src/**']), false);
   for (const scopes of [
     ['../escape'],
     ['/outside'],

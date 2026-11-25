@@ -1,0 +1,53 @@
+{
+  "cargoVersion": "cargo 1.96.0 (30a34c682 2026-05-25)",
+  "startDir": "",
+  "ok": true,
+  "workspace_root": "",
+  "workspace_members": [
+    {
+      "name": "a",
+      "manifest": "crates/a/Cargo.toml"
+    },
+    {
+      "name": "b",
+      "manifest": "crates/b/Cargo.toml"
+    },
+    {
+      "name": "c",
+      "manifest": "crates/c/Cargo.toml"
+    }
+  ],
+  "member_dependencies": {
+    "a": [
+      {
+        "name": "b",
+        "kind": "build-dependency"
+      },
+      {
+        "name": "b",
+        "kind": "dev-dependency"
+      },
+      {
+        "name": "b",
+        "kind": "dev-dependency"
+      }
+    ],
+    "b": [],
+    "c": []
+  },
+  "files": [
+    "Cargo.toml",
+    "crates/a/Cargo.toml",
+    "crates/a/src/lib.rs",
+    "crates/b/Cargo.toml",
+    "crates/b/src/lib.rs",
+    "crates/c/Cargo.toml",
+    "crates/c/src/lib.rs"
+  ],
+  "manifests": {
+    "Cargo.toml": "[workspace]\nresolver = \"2\"\nmembers = [\"crates/*\"]\n",
+    "crates/a/Cargo.toml": "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dev-dependencies]\nb = { path = \"../b\" }\n[dev_dependencies]\nc = { path = \"../c\" }\n[build-dependencies]\nb = { path = \"../b\" }\n[build_dependencies]\nc = { path = \"../c\" }\n[target.'cfg(unix)'.dev-dependencies]\nb = { path = \"../b\" }\n[target.'cfg(unix)'.dev_dependencies]\nc = { path = \"../c\" }\n",
+    "crates/b/Cargo.toml": "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    "crates/c/Cargo.toml": "[package]\nname = \"c\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+  }
+}

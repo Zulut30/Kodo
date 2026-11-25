@@ -47,6 +47,28 @@ export const defaults = {
   checks: ['check (ubuntu-latest, 24)', 'check (windows-latest, 24)'],
   delivery: { enabled: false, release: false, firstVersion: '0.2.0' },
 };
+export const FAST_CHECK_TIMEOUT_MS = 120000;
+/**
+ * The hard per-command timeout of the profile.
+ * @param {{ fastChecks?: { timeoutMs?: number }, config?: any }} run
+ * @param {number} defaultMs
+ * @returns {number}
+ */
+export function fastCheckTimeout(run, defaultMs = FAST_CHECK_TIMEOUT_MS) {
+  const settings = run.fastChecks === undefined ? run.config?.fastChecks : run.fastChecks;
+  const invalid = () =>
+    Object.assign(new Error('Некорректный fastChecks.timeoutMs: требуется целое число от 1 до 2147483647 мс'), {
+      code: 'configuration',
+    });
+  if (settings === undefined) return defaultMs;
+  if (!settings || typeof settings !== 'object' || Array.isArray(settings)) throw invalid();
+  if (Object.keys(settings).some(key => key !== 'timeoutMs')) throw invalid();
+  const value = settings.timeoutMs;
+  if (value === undefined) return defaultMs;
+  if (!Number.isSafeInteger(value) || value < 1 || value > 2147483647) throw invalid();
+  return value;
+}
+
 export function validateCommandTimeouts(commands) {
   for (const kind of ['test', 'build', 'deploy', 'smoke'])
     for (const [index, command] of (commands[kind] || []).entries()) {
@@ -99,6 +121,20 @@ export function normalizeConfig(file, overrides = {}) {
     !Object.hasOwn(overrides, 'primaryModel')
   )
     config.primaryModel = file.primaryModels?.[overrides.client] || null;
+  fastCheckTimeout({ config });
+  const rust = config.rust;
+  if (
+    rust !== undefined &&
+    (!rust ||
+      typeof rust !== 'object' ||
+      Array.isArray(rust) ||
+      Object.keys(rust).some(k => k !== 'sccache') ||
+      ('sccache' in rust && ![true, false, 'auto'].includes(rust.sccache)))
+  )
+    throw Object.assign(
+      new Error('Некорректная настройка rust: допустим только sccache со значением true, false или "auto"'),
+      { code: 'configuration' },
+    );
   normalizeConcurrency(config.concurrency);
   Object.defineProperty(config, configuredConcurrency, {
     value: Object.hasOwn(overrides, 'concurrency') || Object.hasOwn(file, 'concurrency') ? config.concurrency : null,

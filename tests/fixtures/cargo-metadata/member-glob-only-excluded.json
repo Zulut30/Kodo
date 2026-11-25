@@ -1,0 +1,16 @@
+{
+  "cargoVersion": "cargo 1.96.0 (30a34c682 2026-05-25)",
+  "startDir": "",
+  "ok": true,
+  "workspace_root": "",
+  "workspace_members": [],
+  "files": [
+    "Cargo.toml",
+    "crates/only/Cargo.toml",
+    "crates/only/src/lib.rs"
+  ],
+  "manifests": {
+    "Cargo.toml": "[workspace]\nresolver = \"2\"\nmembers = [\"crates/*\"]\nexclude = [\"crates/only\"]\n",
+    "crates/only/Cargo.toml": "[package]\nname = \"only\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+  }
+}

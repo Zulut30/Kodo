@@ -483,6 +483,8 @@ test('Installed-layout gate works without package lock and rejects changed actua
   await cp(new URL('../package.json', import.meta.url), path.join(installed, 'package.json'));
   const parserSource = fileURLToPath(new URL('../', import.meta.resolve('acorn')));
   await cp(parserSource, path.join(installed, 'node_modules/acorn'), { recursive: true });
+  const tomlSource = fileURLToPath(new URL('../', import.meta.resolve('smol-toml')));
+  await cp(tomlSource, path.join(installed, 'node_modules/smol-toml'), { recursive: true });
   const gatePath = path.join(installed, 'runtime/architecture-gate.mjs');
   const gate = await import(pathToFileURL(gatePath));
   const receipt = await gate.runArchitectureChecks(fx.options());
@@ -490,9 +492,13 @@ test('Installed-layout gate works without package lock and rejects changed actua
   assert.equal(await gate.isCurrentArchitectureReceipt(receipt, fx.options()), true);
   for (const filename of [
     gatePath,
+    path.join(installed, 'runtime/architecture-rust.mjs'),
+    path.join(installed, 'runtime/cargo-workspace.mjs'),
     path.join(installed, 'runtime/project-controller-lease.mjs'),
     path.join(installed, 'runtime/project-integration-lease.mjs'),
     path.join(installed, 'node_modules/acorn/dist/acorn.mjs'),
+    path.join(installed, 'node_modules/smol-toml/dist/index.js'),
+    path.join(installed, 'node_modules/smol-toml/dist/parse.js'),
   ]) {
     const original = await readFile(filename);
     await writeFile(filename, Buffer.concat([original, Buffer.from('\n// changed pin\n')]));

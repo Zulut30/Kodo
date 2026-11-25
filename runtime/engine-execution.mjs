@@ -1,3 +1,4 @@
+import { isLock, implicitLock } from './cargo-lock.mjs';
 import path from 'node:path';
 import { readFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
@@ -81,9 +82,19 @@ export class EngineExecution extends EnginePlanning {
       .split('\0')
       .filter(Boolean);
     const files = [...new Set([...tracked, ...untracked])];
-    const outside = files.filter(
-      name => !ownsPath(scopes, name) || (frozen && !ownsPath(frozen, name)) || secretFile(name),
-    );
+    const outside = [];
+    const boundaries = frozen && frozen !== scopes ? [scopes, frozen] : [scopes];
+    for (const name of files) {
+      for (const allowed of boundaries) {
+        if (isLock(name) && frozen && !ownsPath(allowed, name)) {
+          const reason = await implicitLock(cwd, baseSha, null, name, files, allowed);
+          if (!reason) continue;
+          outside.push(reason === 'scope' ? name : name + ' (' + reason + ')');
+        } else if (!ownsPath(allowed, name) || secretFile(name)) outside.push(name);
+        else continue;
+        break;
+      }
+    }
     if (outside.length)
       throw Object.assign(new Error(`Изменены файлы вне области задачи: ${outside.join(', ')}`), {
         code: 'scope_conflict',
