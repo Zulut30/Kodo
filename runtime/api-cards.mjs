@@ -428,10 +428,18 @@ function canStartJsRegex(code, i) {
   if (isIdentChar(code[prev])) {
     let start = prev;
     while (start > 0 && isIdentChar(code[start - 1])) start--;
+    // A name after `.` or `?.` is a property (`config.default / 2`), never a keyword before a regex.
+    if (afterPropertyDot(code, start)) return false;
     const word = code.slice(start, prev + 1).join('');
     return REGEX_PREFIX_WORDS.has(word);
   }
   return false;
+}
+
+function afterPropertyDot(code, start) {
+  let before = start - 1;
+  while (before >= 0 && /\s/.test(code[before])) before--;
+  return before >= 0 && code[before] === '.' && code[before - 1] !== '.';
 }
 
 function scanJsRegex(source, start) {
@@ -822,9 +830,11 @@ function finalizeConstExport(noComments, eqPos, end) {
 function isConstAsiEnd(code, _noComments, nlIndex) {
   const nextIdx = nextNonSpaceOnSameOrLaterLine(code, nlIndex + 1);
   if (nextIdx >= code.length) return true;
+  const prevIdx = lastNonSpaceBefore(code, nlIndex);
+  // `writer.\n  export()` is a property access across the line break, not a new statement.
+  if (prevIdx >= 0 && code[prevIdx] === '.') return false;
   // A top-level `export` on the next line never continues an expression from the previous line.
   if (/^export\b/.test(code.slice(nextIdx))) return true;
-  const prevIdx = lastNonSpaceBefore(code, nlIndex);
   if (prevIdx >= 0 && EXPR_CONT.has(code[prevIdx])) return false;
   return code[nextIdx] === '}' || STMT_START.test(code.slice(nextIdx));
 }
@@ -946,6 +956,7 @@ export function extractJsTsPublicApi(source) {
       code.startsWith('export', i) &&
       !isIdentChar(code[i - 1]) &&
       code[i - 1] !== '.' &&
+      !afterPropertyDot(code, i) &&
       !/[A-Za-z0-9_$]/.test(code[i + 6] ?? '')
     ) {
       const { sigEnd, skipTo } = findExportHeaderEnd(code, noComments, i);

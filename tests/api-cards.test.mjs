@@ -577,6 +577,26 @@ export const NEXT = 'ok'
   ]);
 });
 
+test('A property named like a keyword is not a regex start, and `.` before a line break continues the expression', () => {
+  const division = `
+const config = { default: 60 };
+const half = config.default / 2; // user's preferred interval
+export function interval() { return half; }
+`;
+  assert.deepEqual(extractJsTsPublicApi(division), ['export function interval()']);
+  const method = `
+const writer = { export() { return 'ok'; } };
+export const result = writer.
+  export();
+export function next() {}
+`;
+  const sigs = extractJsTsPublicApi(method);
+  assert.equal(sigs.length, 2, JSON.stringify(sigs));
+  assert.match(sigs[0], /^export const result\b/);
+  assert.ok(!sigs.some(sig => /^export\(\)/.test(sig)), 'no phantom export() entry');
+  assert.equal(sigs[1], 'export function next()');
+});
+
 test('V5: non-BMP characters (emoji/surrogate pairs) do not desynchronize JS/TS or Rust mask indices', () => {
   const ts = `
 // 🚀 launch module
