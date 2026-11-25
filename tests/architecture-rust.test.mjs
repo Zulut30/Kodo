@@ -2675,3 +2675,246 @@ test('X1: brace-expanded globs like {crates/game-contracts,crates/world}/src/** 
     false,
   );
 });
+
+test('X2: nested virtual workspace root is not a package, non-Rust src/** is not a root [package], indented code blocks & unpaired quotes are ignored, and Wave 0 policy epic requires manifest + contract', () => {
+  const mkSpec = (epics, tasks) => ({
+    schemaVersion: 1,
+    id: 'x2-bp',
+    title: 'Rust X2',
+    root: '/tmp/x2',
+    businessContext: 'Rust project',
+    execution: { cadence: 'wave', integration: 'branch' },
+    constraints: [],
+    milestones: [
+      { id: 'foundation', title: 'W0', acceptance: [] },
+      { id: 'mvp', title: 'MVP', acceptance: [] },
+    ],
+    epics,
+    tasks,
+  });
+  const stdEpics = [
+    { id: 'foundation', milestoneId: 'foundation', title: 'W0', acceptance: [] },
+    { id: 'domain', milestoneId: 'mvp', title: 'Domain', acceptance: [] },
+  ];
+  const md = '## Стек\nRust Cargo workspace\n';
+
+  // 1) Nested virtual workspace backend/Cargo.toml + 2 crates = 2 packages -> NO contract_crate_required / architecture_policy_required.
+  const nestedVirtual = mkSpec(stdEpics, [
+    {
+      id: 'w0',
+      epicId: 'foundation',
+      title: 'Workspace',
+      owner: 'architect',
+      dependsOn: [],
+      writePaths: ['backend/Cargo.toml'],
+    },
+    {
+      id: 't1',
+      epicId: 'domain',
+      title: 'A',
+      owner: 'developer',
+      dependsOn: ['w0'],
+      writePaths: ['backend/crates/a/Cargo.toml', 'backend/crates/a/src/**'],
+    },
+    {
+      id: 't2',
+      epicId: 'domain',
+      title: 'B',
+      owner: 'developer',
+      dependsOn: ['w0'],
+      writePaths: ['backend/crates/b/Cargo.toml', 'backend/crates/b/src/**'],
+    },
+  ]);
+  assert.deepEqual(
+    rustContractCrateFindings(nestedVirtual, md),
+    [],
+    `nested virtual workspace with 2 crates must not trigger: ${JSON.stringify(rustContractCrateFindings(nestedVirtual, md))}`,
+  );
+
+  // Nested root WITH backend/src/main.rs + 2 crates = 3 packages -> DOES trigger.
+  const nestedRootPkg = structuredClone(nestedVirtual);
+  nestedRootPkg.tasks[0].writePaths = ['backend/Cargo.toml', 'backend/src/main.rs'];
+  const nestedRootFindings = rustContractCrateFindings(nestedRootPkg, md);
+  assert.ok(nestedRootFindings.some(f => f.code === 'contract_crate_required'));
+  assert.ok(nestedRootFindings.some(f => f.code === 'architecture_policy_required'));
+
+  // 2) Polyglot frontend (package.json + src/**) with root Cargo.toml + 2 Rust crates = 2 Rust packages -> NO trigger.
+  const polyglotFrontend = mkSpec(stdEpics, [
+    {
+      id: 'w0',
+      epicId: 'foundation',
+      title: 'Frontend + Workspace',
+      owner: 'architect',
+      dependsOn: [],
+      writePaths: ['package.json', 'src/**', 'Cargo.toml'],
+    },
+    {
+      id: 't1',
+      epicId: 'domain',
+      title: 'A',
+      owner: 'developer',
+      dependsOn: ['w0'],
+      writePaths: ['crates/a/Cargo.toml', 'crates/a/src/**'],
+    },
+    {
+      id: 't2',
+      epicId: 'domain',
+      title: 'B',
+      owner: 'developer',
+      dependsOn: ['w0'],
+      writePaths: ['crates/b/Cargo.toml', 'crates/b/src/**'],
+    },
+  ]);
+  assert.deepEqual(
+    rustContractCrateFindings(polyglotFrontend, md),
+    [],
+    `frontend src/** must not count as Rust root [package]: ${JSON.stringify(rustContractCrateFindings(polyglotFrontend, md))}`,
+  );
+
+  // Explicit src/**/*.rs or rootPackage: . DOES count as Rust root [package] (3 total -> triggers).
+  const rootRsGlob = structuredClone(polyglotFrontend);
+  rootRsGlob.tasks[0].writePaths = ['Cargo.toml', 'src/**/*.rs'];
+  assert.ok(rustContractCrateFindings(rootRsGlob, md).some(f => f.code === 'contract_crate_required'));
+  assert.ok(
+    rustContractCrateFindings(polyglotFrontend, `${md}rootPackage: .\n`).some(
+      f => f.code === 'contract_crate_required',
+    ),
+  );
+
+  // 3) Indented code block (4 spaces) and unpaired quotes/backticks must be ignored.
+  const protoSpec = mkSpec(stdEpics, [
+    {
+      id: 'w0',
+      epicId: 'foundation',
+      title: 'Protocol',
+      owner: 'architect',
+      dependsOn: [],
+      writePaths: ['Cargo.toml', 'architecture.policy.json', 'crates/protocol/Cargo.toml', 'crates/protocol/src/**'],
+    },
+    {
+      id: 't1',
+      epicId: 'domain',
+      title: 'A',
+      owner: 'developer',
+      dependsOn: ['w0'],
+      writePaths: ['crates/a/Cargo.toml', 'crates/a/src/**'],
+    },
+    {
+      id: 't2',
+      epicId: 'domain',
+      title: 'B',
+      owner: 'developer',
+      dependsOn: ['w0'],
+      writePaths: ['crates/b/Cargo.toml', 'crates/b/src/**'],
+    },
+  ]);
+  for (const badDecl of [
+    '    contractCrate: crates/protocol\n',
+    '\tcontractCrate: crates/protocol\n',
+    'contractCrate: `crates/protocol\n',
+    'contractCrate: crates/protocol`\n',
+    'contractCrate: "crates/protocol\'\n',
+  ]) {
+    assert.ok(
+      rustContractCrateFindings(protoSpec, `${md}${badDecl}`).some(f => f.code === 'contract_crate_required'),
+      `invalid/indented declaration ${JSON.stringify(badDecl)} must be ignored`,
+    );
+  }
+  for (const goodDecl of [
+    'contractCrate: `crates/protocol`\n',
+    'contractCrate: "crates/protocol"\n',
+    "contractCrate: 'crates/protocol'\n",
+    '  - contractCrate: crates/protocol\n',
+  ]) {
+    assert.deepEqual(
+      rustContractCrateFindings(protoSpec, `${md}${goodDecl}`),
+      [],
+      `valid declaration ${JSON.stringify(goodDecl)} must pass`,
+    );
+  }
+
+  // 4) Policy and contract in DIFFERENT Wave 0 epics: policy epic running before contract epic -> architecture_policy_order.
+  const splitWave0 = mkSpec(
+    [
+      { id: 'foundation-policy', milestoneId: 'foundation', title: 'W0 Policy', acceptance: [] },
+      { id: 'foundation-contracts', milestoneId: 'foundation', title: 'W0 Contracts', acceptance: [] },
+      { id: 'domain', milestoneId: 'mvp', title: 'Domain', acceptance: [] },
+    ],
+    [
+      {
+        id: 'w0-policy',
+        epicId: 'foundation-policy',
+        title: 'Policy only',
+        owner: 'architect',
+        dependsOn: [],
+        writePaths: ['architecture.policy.json'],
+      },
+      {
+        id: 'w0-contracts',
+        epicId: 'foundation-contracts',
+        title: 'Contracts after policy epic',
+        owner: 'architect',
+        dependsOn: ['w0-policy'],
+        writePaths: ['Cargo.toml', 'crates/game-contracts/Cargo.toml', 'crates/game-contracts/src/**'],
+      },
+      {
+        id: 't1',
+        epicId: 'domain',
+        title: 'A',
+        owner: 'developer',
+        dependsOn: ['w0-contracts'],
+        writePaths: ['crates/a/Cargo.toml', 'crates/a/src/**'],
+      },
+      {
+        id: 't2',
+        epicId: 'domain',
+        title: 'B',
+        owner: 'developer',
+        dependsOn: ['w0-contracts'],
+        writePaths: ['crates/b/Cargo.toml', 'crates/b/src/**'],
+      },
+    ],
+  );
+  const splitFindings = rustContractCrateFindings(splitWave0, md);
+  assert.ok(
+    splitFindings.some(f => f.code === 'architecture_policy_order' && f.taskIds?.includes('w0-policy')),
+    `policy epic without manifest/contract ready must trigger architecture_policy_order, got ${JSON.stringify(splitFindings)}`,
+  );
+
+  // Same epic (contracts then policy in one Wave 0 epic) -> PASS because both exist at that epic's gate.
+  const sameEpicWave0 = mkSpec(stdEpics, [
+    {
+      id: 'w0-contracts',
+      epicId: 'foundation',
+      title: 'Contracts',
+      owner: 'architect',
+      dependsOn: [],
+      writePaths: ['Cargo.toml', 'crates/game-contracts/Cargo.toml', 'crates/game-contracts/src/**'],
+    },
+    {
+      id: 'w0-policy',
+      epicId: 'foundation',
+      title: 'Policy',
+      owner: 'architect',
+      dependsOn: ['w0-contracts'],
+      writePaths: ['architecture.policy.json'],
+    },
+    {
+      id: 't1',
+      epicId: 'domain',
+      title: 'A',
+      owner: 'developer',
+      dependsOn: ['w0-policy'],
+      writePaths: ['crates/a/Cargo.toml', 'crates/a/src/**'],
+    },
+    {
+      id: 't2',
+      epicId: 'domain',
+      title: 'B',
+      owner: 'developer',
+      dependsOn: ['w0-policy'],
+      writePaths: ['crates/b/Cargo.toml', 'crates/b/src/**'],
+    },
+  ]);
+  assert.deepEqual(rustContractCrateFindings(sameEpicWave0, md), []);
+});

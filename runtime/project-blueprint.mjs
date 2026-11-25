@@ -803,8 +803,13 @@ function linesOutsideCodeFences(text) {
   return out;
 }
 
-const CONTRACT_DECL_RE = /^\s*(?:[-*]\s*)?contractCrate\s*:\s*`?([A-Za-z0-9][A-Za-z0-9_./-]*)`?\s*$/;
-const WORKSPACE_DECL_RE = /^\s*(?:[-*]\s*)?workspaceRoot\s*:\s*`?(\.|[A-Za-z0-9][A-Za-z0-9_./-]*)`?\s*$/;
+const strictDeclRe = (key, valueClass) =>
+  new RegExp(
+    `^ {0,3}(?:[-*]\\s+)?${key}\\s*:\\s*(?:\`(${valueClass})\`|"(${valueClass})"|'(${valueClass})'|(${valueClass}))\\s*$`,
+  );
+const CONTRACT_DECL_RE = strictDeclRe('contractCrate', '[A-Za-z0-9][A-Za-z0-9_./-]*');
+const WORKSPACE_DECL_RE = strictDeclRe('workspaceRoot', '\\.|[A-Za-z0-9][A-Za-z0-9_./-]*');
+const ROOT_PACKAGE_DECL_RE = strictDeclRe('rootPackage', '\\.|[A-Za-z0-9][A-Za-z0-9_./-]*');
 
 function cleanDeclaredPath(raw) {
   const cleaned = raw
@@ -823,7 +828,8 @@ function collectStrictDeclarations(sources, pattern) {
     for (const line of linesOutsideCodeFences(source)) {
       const match = pattern.exec(line);
       if (!match) continue;
-      const cleaned = cleanDeclaredPath(match[1]);
+      const raw = match[1] ?? match[2] ?? match[3] ?? match[4];
+      const cleaned = cleanDeclaredPath(raw);
       if (cleaned) tokens.add(cleaned);
     }
   }
@@ -832,6 +838,14 @@ function collectStrictDeclarations(sources, pattern) {
 
 function declaredContractTokens(spec, projectMarkdown) {
   return collectStrictDeclarations([projectMarkdown, ...(spec.constraints ?? [])], CONTRACT_DECL_RE);
+}
+
+function declaredRootPackages(spec, projectMarkdown) {
+  const roots = new Set();
+  for (const token of collectStrictDeclarations([projectMarkdown, ...(spec.constraints ?? [])], ROOT_PACKAGE_DECL_RE)) {
+    roots.add(token === '.' || token === 'Cargo.toml' ? '' : token.replace(/\/Cargo\.toml$/, ''));
+  }
+  return roots;
 }
 
 function declaredWorkspaceRoots(spec, projectMarkdown, architecturePolicy, allCrates) {
@@ -920,23 +934,36 @@ function selectContractRootsForWorkspace({ wsRoot, wsCrates, workspaceRoots, exp
   return roots;
 }
 
-function hasRootPackageMember(spec, wsRoot) {
+function taskCoversManifest(task, wsRoot) {
   const manifestPath = wsRoot ? `${wsRoot}/Cargo.toml` : 'Cargo.toml';
+  return (task.writePaths ?? []).some(rawScope => {
+    const scope = normalizeScopePath(rawScope);
+    return Boolean(scope) && (scope === manifestPath || isExplicitContractScope(scope, wsRoot, manifestPath));
+  });
+}
+
+function hasRootPackageMember(spec, wsRoot, explicitRootPackages = new Set(), explicitTokens = new Set()) {
+  if (explicitRootPackages.has(wsRoot)) return true;
+  if (explicitTokens.has(wsRoot === '' ? '.' : wsRoot)) return true;
   const srcDir = wsRoot ? `${wsRoot}/src` : 'src';
+  const libPath = `${srcDir}/lib.rs`;
+  const mainPath = `${srcDir}/main.rs`;
   let hasManifest = false;
-  let hasSrc = false;
+  let hasRustSrc = false;
   for (const task of spec.tasks) {
+    if (taskCoversManifest(task, wsRoot)) hasManifest = true;
     for (const rawScope of task.writePaths ?? []) {
       const scope = normalizeScopePath(rawScope);
       if (!scope) continue;
-      if (scope === manifestPath || isExplicitContractScope(scope, wsRoot, manifestPath)) hasManifest = true;
-      if (scope === srcDir || scope.startsWith(`${srcDir}/`)) hasSrc = true;
+      if (scope === libPath || scope === mainPath || (scope.startsWith(`${srcDir}/`) && /\.rs$/i.test(scope))) {
+        hasRustSrc = true;
+      }
     }
   }
-  return hasManifest && hasSrc;
+  return hasManifest && hasRustSrc;
 }
 
-function waveZeroPolicyFindings({ waveZeroTasks, ancestors, architecturePolicy }) {
+function waveZeroPolicyFindings({ waveZeroTasks, ancestors, architecturePolicy, requiredWorkspaces }) {
   if (architecturePolicy?.schemaVersion === 2 && architecturePolicy?.language === 'rust') return [];
   const policyTasks = waveZeroTasks.filter(task =>
     (task.writePaths ?? []).some(scope => isExplicitContractScope(scope, '', 'architecture.policy.json')),
@@ -951,17 +978,40 @@ function waveZeroPolicyFindings({ waveZeroTasks, ancestors, architecturePolicy }
     ];
   }
   const policyIds = new Set(policyTasks.map(task => task.id));
-  const unordered = waveZeroTasks
-    .filter(task => !policyIds.has(task.id) && !policyTasks.some(pt => ancestors.get(task.id)?.has(pt.id)))
-    .map(task => task.id)
-    .sort(compare);
-  if (!unordered.length) return [];
+  const unordered = new Set(
+    waveZeroTasks
+      .filter(
+        task =>
+          !policyIds.has(task.id) &&
+          !policyTasks.some(
+            pt =>
+              ancestors.get(task.id)?.has(pt.id) || (pt.epicId === task.epicId && ancestors.get(pt.id)?.has(task.id)),
+          ),
+      )
+      .map(task => task.id),
+  );
+  // At the first epic gate carrying architecture.policy.json, the workspace manifest and
+  // compilable contract crate must already exist (same task, same epic, or an ancestor task).
+  for (const pt of policyTasks) {
+    const ptAncestors = ancestors.get(pt.id) ?? new Set();
+    const available = waveZeroTasks.filter(
+      task => task.id === pt.id || task.epicId === pt.epicId || ptAncestors.has(task.id),
+    );
+    for (const { wsRoot, wsContracts } of requiredWorkspaces) {
+      const hasManifest = available.some(task => taskCoversManifest(task, wsRoot));
+      const hasContract = available.some(task =>
+        [...wsContracts].some(contractRoot => taskCreatesCompilableContractCrate(task, contractRoot)),
+      );
+      if (!hasManifest || !hasContract) unordered.add(pt.id);
+    }
+  }
+  if (!unordered.size) return [];
   return [
     finding(
       'architecture_policy_order',
       'Остальные задачи Волны 0 (foundation) должны зависеть от задачи, создающей architecture.policy.json, ' +
-        'или совпадать с ней, иначе гейт другого эпика Волны 0 при architecture.enabled получит blocked',
-      unordered,
+        'или совпадать с ней, а к гейту эпика с политикой уже должны существовать Cargo.toml и контрактный крейт',
+      [...unordered].sort(compare),
     ),
   ];
 }
@@ -978,16 +1028,17 @@ export function rustContractCrateFindings(spec, projectMarkdown = '', architectu
     }
   }
   const explicitTokens = declaredContractTokens(spec, projectMarkdown);
+  const explicitRootPackages = declaredRootPackages(spec, projectMarkdown);
   const workspaceRoots = [...declaredWorkspaceRoots(spec, projectMarkdown, architecturePolicy, allCrates)].sort(
     (a, b) => b.length - a.length || compare(a, b),
   );
   const byWorkspace = new Map(workspaceRoots.map(wsRoot => [wsRoot, new Map()]));
   for (const [crateRoot, crateName] of allCrates.entries()) {
     const ownerWs = ownerWorkspaceOf(crateRoot, workspaceRoots);
-    if (ownerWs !== undefined) byWorkspace.get(ownerWs).set(crateRoot, crateName);
+    if (ownerWs !== undefined && crateRoot !== ownerWs) byWorkspace.get(ownerWs).set(crateRoot, crateName);
   }
   for (const [wsRoot, wsCrates] of byWorkspace.entries()) {
-    if (!wsCrates.has(wsRoot) && hasRootPackageMember(spec, wsRoot)) {
+    if (!wsCrates.has(wsRoot) && hasRootPackageMember(spec, wsRoot, explicitRootPackages, explicitTokens)) {
       wsCrates.set(wsRoot, wsRoot ? wsRoot.split('/').at(-1) : spec.id || 'root');
     }
   }
@@ -1022,11 +1073,10 @@ export function rustContractCrateFindings(spec, projectMarkdown = '', architectu
   const waveZeroTasks = spec.tasks.filter(task => waveZeroEpics.has(task.epicId));
   if (!waveZeroTasks.length) return findings;
 
-  let requiresPolicy = false;
+  const requiredWorkspaces = [];
   let missingContract = false;
   for (const [wsRoot, wsCrates] of byWorkspace.entries()) {
     if (wsCrates.size < RUST_CONTRACT_CRATE_MIN) continue;
-    requiresPolicy = true;
     const wsContracts = selectContractRootsForWorkspace({
       wsRoot,
       wsCrates,
@@ -1034,6 +1084,7 @@ export function rustContractCrateFindings(spec, projectMarkdown = '', architectu
       explicitTokens,
       architecturePolicy,
     });
+    requiredWorkspaces.push({ wsRoot, wsContracts });
     const satisfied = waveZeroTasks.some(task =>
       [...wsContracts].some(contractRoot => taskCreatesCompilableContractCrate(task, contractRoot)),
     );
@@ -1049,9 +1100,16 @@ export function rustContractCrateFindings(spec, projectMarkdown = '', architectu
       ),
     );
   }
-  if (requiresPolicy) {
+  if (requiredWorkspaces.length) {
     const resolvedAncestors = ancestors ?? taskAncestors(spec.tasks);
-    findings.push(...waveZeroPolicyFindings({ waveZeroTasks, ancestors: resolvedAncestors, architecturePolicy }));
+    findings.push(
+      ...waveZeroPolicyFindings({
+        waveZeroTasks,
+        ancestors: resolvedAncestors,
+        architecturePolicy,
+        requiredWorkspaces,
+      }),
+    );
   }
   return findings;
 }
