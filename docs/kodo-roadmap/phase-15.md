@@ -107,3 +107,4 @@ Git-транспорт `refs/kodo/<projectId>/base|work/<runId>`, брифы б�
 | --- | --- |
 | 2026-11-24 | PR #27 влит (`33ef769`). Пользователь утвердил план и модели. ADR-0017 и этот документ. Старт стримов 15A–15E. |
 | 2026-11-25 | Стримы 15A–15E и 15F прошли перекрёстные ревью (Codex astra, Gemini 4 Neon, Claude) и влиты в `kodo/15-engine`. Остаток каждого последнего раунда записан в «Известные ограничения 1.1.0». |
+| 2026-11-25 | Стрим 16C (`kodo/16c-telemetry`): телеметрия `kodo report --project` (`throughput`, `taskDuration`, `breakdown`, `firstPassYield`, `arbitrations`, `interventions`, `utilization`), запись недостающих отметок времени жизненного цикла внешних задач/очереди/гейтов, обновлены навык `kodo-project-director`, `docs/T3-HOST.md` и `docs/OBSERVABILITY.md`. |

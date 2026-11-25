@@ -415,67 +415,72 @@ async function runSmoke(engine, run, signal) {
   run.smoke = { schemaVersion: 1, headSha, configured: commands.length > 0, complete: false, results };
   run.state = 'verifying';
   engine.save(run);
-  for (const { command, args = [], timeoutMs } of commands) {
-    engine.checkCancelled(run, signal);
-    const started = performance.now();
-    let result, error;
-    try {
-      result = await execute(command, args, {
-        cwd: run.cwd,
-        signal,
-        env: workerEnvironment(),
-        secrets: engine.secrets,
-        timeoutMs,
-        allowFailure: true,
+  if (commands.length > 0) engine.log(run, 'gate_smoke_started', { headSha, commands: commands.length });
+  try {
+    for (const { command, args = [], timeoutMs } of commands) {
+      engine.checkCancelled(run, signal);
+      const started = performance.now();
+      let result, error;
+      try {
+        result = await execute(command, args, {
+          cwd: run.cwd,
+          signal,
+          env: workerEnvironment(),
+          secrets: engine.secrets,
+          timeoutMs,
+          allowFailure: true,
+        });
+      } catch (caught) {
+        error = caught;
+      }
+      const output = result ?? error?.result ?? {},
+        exitCode = result ? result.code : null,
+        reason = error ? error.code || 'execution_failed' : undefined;
+      const value = {
+        command,
+        args,
+        exitCode,
+        ...(reason ? { reason } : {}),
+        durationMs: Math.round(performance.now() - started),
+        stdout: typeof output.stdout === 'string' ? output.stdout : '',
+        stderr: typeof output.stderr === 'string' ? output.stderr : '',
+      };
+      const evidence = await engine.persistEvidence(run, 'smoke', value, { headSha }).catch(persistError => {
+        if (!error) throw persistError;
+        return null;
       });
-    } catch (caught) {
-      error = caught;
+      results.push({
+        command,
+        args: [...args],
+        exitCode,
+        durationMs: value.durationMs,
+        ...(reason ? { reason } : {}),
+        ...(evidence
+          ? {
+              evidence: { path: evidence.path, sha256: evidence.sha256, bytes: evidence.bytes, headSha },
+              outputPath: evidence.path,
+              outputHash: evidence.sha256,
+            }
+          : {}),
+      });
+      engine.save(run);
+      if (error) {
+        if (signal?.aborted || error.code === 'cancelled') throw error;
+        throw fail(`Smoke-проверка не завершилась (${reason})`, 'smoke_failed');
+      }
+      if ((await inspectCurrentSource({ project: run.cwd, headSha })) !== 'clean')
+        throw fail('Smoke-проверка изменила проверяемый commit или файлы', 'dirty_worktree');
+      if (exitCode !== 0)
+        throw fail(
+          `Smoke-проверка не пройдена (exit ${exitCode}): ${(value.stdout + value.stderr).slice(-6000)}`,
+          'smoke_failed',
+        );
     }
-    const output = result ?? error?.result ?? {},
-      exitCode = result ? result.code : null,
-      reason = error ? error.code || 'execution_failed' : undefined;
-    const value = {
-      command,
-      args,
-      exitCode,
-      ...(reason ? { reason } : {}),
-      durationMs: Math.round(performance.now() - started),
-      stdout: typeof output.stdout === 'string' ? output.stdout : '',
-      stderr: typeof output.stderr === 'string' ? output.stderr : '',
-    };
-    const evidence = await engine.persistEvidence(run, 'smoke', value, { headSha }).catch(persistError => {
-      if (!error) throw persistError;
-      return null;
-    });
-    results.push({
-      command,
-      args: [...args],
-      exitCode,
-      durationMs: value.durationMs,
-      ...(reason ? { reason } : {}),
-      ...(evidence
-        ? {
-            evidence: { path: evidence.path, sha256: evidence.sha256, bytes: evidence.bytes, headSha },
-            outputPath: evidence.path,
-            outputHash: evidence.sha256,
-          }
-        : {}),
-    });
+    run.smoke.complete = true;
     engine.save(run);
-    if (error) {
-      if (signal?.aborted || error.code === 'cancelled') throw error;
-      throw fail(`Smoke-проверка не завершилась (${reason})`, 'smoke_failed');
-    }
-    if ((await inspectCurrentSource({ project: run.cwd, headSha })) !== 'clean')
-      throw fail('Smoke-проверка изменила проверяемый commit или файлы', 'dirty_worktree');
-    if (exitCode !== 0)
-      throw fail(
-        `Smoke-проверка не пройдена (exit ${exitCode}): ${(value.stdout + value.stderr).slice(-6000)}`,
-        'smoke_failed',
-      );
+  } finally {
+    if (commands.length > 0) engine.log(run, 'gate_smoke_finished', { headSha, passed: run.smoke?.complete === true });
   }
-  run.smoke.complete = true;
-  engine.save(run);
 }
 
 /**
@@ -535,7 +540,15 @@ export async function runEpicGate({ engine, run: input, signal, arbitration = nu
   return withRunLease(engine, id, signal, async (leased, leaseError) => {
     const run = engine.store.getRun(id);
     if (run.state === 'succeeded') return run;
-    run.blocker = resolveBlocker(run.blocker, { at: new Date().toISOString(), outcome: 'resumed' });
+    const previousState = run.state;
+    const resumedAt = new Date(
+      typeof engine.store.clock === 'function' ? engine.store.clock() : Date.now(),
+    ).toISOString();
+    run.blocker = resolveBlocker(run.blocker, { at: resumedAt, outcome: 'resumed' });
+    if (['waiting_limits', 'blocked'].includes(previousState)) {
+      engine.save(run);
+      engine.log(run, 'resumed', { previousState });
+    }
     try {
       validateCommandTimeouts(run.config.commands);
       await gateWorktree(run, leased);

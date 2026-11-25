@@ -79,6 +79,14 @@ const need = (value, code) => {
 };
 const storeOf = ctx => ctx.store ?? ctx.engine.store;
 const currentOf = (snapshot, taskId) => snapshot.currentAttempts.find(row => row.taskId === taskId);
+const clockIso = ctx => (typeof ctx?.clock === 'function' ? ctx.clock() : new Date().toISOString());
+const clockMs = ctx => {
+  const parsed = typeof ctx?.clock === 'function' ? Date.parse(ctx.clock()) : Date.now();
+  return Number.isFinite(parsed) ? parsed : Date.now();
+};
+const logEvent = (store, runId, type, data, time) => {
+  if (typeof store?.event === 'function') store.event(runId, type, data, time);
+};
 
 async function contractsOf(ctx) {
   return ctx.contracts || (await import('./project-contracts.mjs'));
@@ -258,6 +266,22 @@ async function prepareAttempt(state, attempt) {
     need((await git(run.cwd, ['rev-parse', 'HEAD'])) === run.baseSha, 'worktree_mismatch');
     state.checkLease();
     run = store.updateRun(run.id, { state: 'executing', headSha: run.baseSha });
+    logEvent(
+      store,
+      run.id,
+      'brief_issued',
+      {
+        attemptId: attempt.id,
+        host,
+        ...(run.workerPlacement
+          ? {
+              subscriptionId: run.workerPlacement.subscription?.id ?? null,
+              machineId: run.workerPlacement.machine?.id ?? null,
+            }
+          : {}),
+      },
+      clockMs(ctx),
+    );
   }
   await advanceToRunning(state, attempt.taskId);
   const current = currentOf(state.snapshot, attempt.taskId);
@@ -777,6 +801,13 @@ async function abandonAttempt(ctx, snapshot, attempt, run, { head, commandId }) 
     error: { code: 'external_abandoned', message: 'External worker abandoned the task' },
     externalAbandon: abandoned,
   });
+  logEvent(
+    store,
+    run.id,
+    'cancelled',
+    { attemptId: attempt.id, headSha: head, code: 'external_abandoned' },
+    clockMs(ctx),
+  );
   return {
     status: 'abandoned',
     attemptId: attempt.id,
@@ -1048,6 +1079,7 @@ async function verifySubmission(ctx, C, step, input) {
         const now = await state();
         if (now !== 'go') return now === 'verified' ? null : stale;
         const checked = AbortSignal.any([dedupeLost, slotLost, ...(signal ? [signal] : [])]);
+        const startedAt = clockMs(ctx);
         let verdict;
         try {
           verdict = await verify({
@@ -1066,6 +1098,7 @@ async function verifySubmission(ctx, C, step, input) {
           if (cancelled(store.getRun(run.id))) return stale;
           throw error;
         }
+        const finishedAt = clockMs(ctx);
         if (dedupeLost.aborted || slotLost.aborted || !leaseOwned(store, dedupe))
           return { blocked: 'project_lease_lost' };
         if (verdict.skipped)
@@ -1074,8 +1107,8 @@ async function verifySubmission(ctx, C, step, input) {
             : (await state()) === 'verified'
               ? null
               : stale;
-        // The verdict is written in a short project section, fenced by the leases of
-        // `project-verify`, the build slot and the section (one transaction, runtime/lease-fence.mjs).
+        // The verdict and its telemetry events are written together in a short project section,
+        // fenced by `project-verify`, the build slot and the section (one transaction).
         try {
           return await section(async () => {
             const current = await verificationState(ctx, C, input, attempt.id, run.id);
@@ -1090,6 +1123,22 @@ async function verifySubmission(ctx, C, step, input) {
                   { state: 'executing', ...(verdict.diagnostics ? { lastDiagnostics: verdict.diagnostics } : {}) },
                   { preserveCancellation: true },
                 );
+                if (!verdict.passed) {
+                  logEvent(store, run.id, 'task_fast_started', { attemptId: attempt.id, headSha: head }, startedAt);
+                  logEvent(
+                    store,
+                    run.id,
+                    'task_fast_finished',
+                    {
+                      attemptId: attempt.id,
+                      headSha: head,
+                      passed: false,
+                      outcome: 'failed',
+                      code: verdict.code ?? 'check_failed',
+                    },
+                    finishedAt,
+                  );
+                }
                 return verdict.passed
                   ? problem('external_head_changed')
                   : {
@@ -1106,6 +1155,15 @@ async function verifySubmission(ctx, C, step, input) {
                 { state: 'succeeded', error: null, lastDiagnostics: null },
                 { preserveCancellation: true },
               );
+              logEvent(store, run.id, 'task_fast_started', { attemptId: attempt.id, headSha: head }, startedAt);
+              logEvent(
+                store,
+                run.id,
+                'task_fast_finished',
+                { attemptId: attempt.id, headSha: head, passed: true, outcome: 'passed' },
+                finishedAt,
+              );
+              logEvent(store, run.id, 'succeeded', { attemptId: attempt.id, headSha: head }, finishedAt);
               return null;
             });
           });
@@ -1153,6 +1211,13 @@ async function integrateQueued(ctx, C, W, waveCtx, entry, signal) {
       return stale;
     }
   }
+  logEvent(
+    store,
+    run.id,
+    'integration_dequeued',
+    { seq: entry.seq, attemptId: entry.attemptId, headSha },
+    clockMs(ctx),
+  );
   let integration;
   try {
     integration = await W.integrateAndAdvance(waveCtx, { projectId, taskId, run: store.getRun(run.id), signal });
@@ -1166,21 +1231,41 @@ async function integrateQueued(ctx, C, W, waveCtx, entry, signal) {
     const after = store.getRun(run.id);
     // A merge that is on the branch but whose transitions were refused is `failed`: a repeated
     // submission continues it. Without a merge on the branch the head is refused.
-    if (
+    const failedMerge =
       code !== 'project_integration_missing' &&
       after.integration?.status === 'merged' &&
       after.integration.mergedHead === headSha &&
-      (await mergeRecorded(projectId, after))
-    )
-      return { status: 'failed', code, merged: true, integration: integration ?? null };
+      (await mergeRecorded(projectId, after));
+    // Fenced like the integrated outcome: a drain that lost its lease records no outcome (the row
+    // stays `merging` for the next holder), so telemetry never counts an unfinished merge.
+    store.withFence([], () =>
+      logEvent(
+        store,
+        run.id,
+        'integration_finished',
+        { seq: entry.seq, attemptId: entry.attemptId, headSha, status: failedMerge ? 'failed' : 'rejected', code },
+        clockMs(ctx),
+      ),
+    );
+    if (failedMerge) return { status: 'failed', code, merged: true, integration: integration ?? null };
     return { status: 'rejected', code, integration: integration ?? null };
   }
   // Fenced (runtime/lease-fence.mjs) in one transaction: a stale drain writes nothing, and a
   // completion already recorded for this head keeps its gates.
+  const integratedAt = clockIso(ctx);
   store.withFence([], () => {
     const recorded = store.getRun(run.id).externalCompletion;
     const gates = recorded?.headSha === headSha ? (recorded.gates ?? null) : null;
-    store.updateRun(run.id, { externalCompletion: { schemaVersion: 1, headSha, integration, gates } });
+    store.updateRun(run.id, {
+      externalCompletion: { schemaVersion: 1, headSha, integration, gates, integratedAt },
+    });
+    logEvent(
+      store,
+      run.id,
+      'integration_finished',
+      { seq: entry.seq, attemptId: entry.attemptId, headSha, status: 'integrated' },
+      Date.parse(integratedAt),
+    );
   });
   return { status: 'integrated', integration };
 }
@@ -1210,7 +1295,7 @@ async function tryDrain(ctx, C, W, input, expired) {
             const snapshot = await snapshotOf(ctx, projectId);
             const scopeOf = entry => snapshot.tasks.find(row => row.id === entry.taskId)?.writePaths ?? null;
             await drainIntegrationQueue({
-              queue: openIntegrationQueue(store),
+              queue: openIntegrationQueue(store, { clock: ctx.clock }),
               projectId,
               scopeOf,
               stop: () => signal?.aborted === true || expired() || !owned(),
@@ -1342,6 +1427,13 @@ async function admitSubmission(ctx, C, input) {
   if (!['running', 'verifying'].includes(attempt.status) || run.integration?.status === 'merged')
     return blocked('project_attempt_not_running');
   const defect = await inspectSubmission(ctx.engine, run, task, head);
+  logEvent(
+    storeOf(ctx),
+    run.id,
+    'task_submitted',
+    { attemptId: attempt.id, headSha: head, accepted: !defect, ...(defect ? { code: defect.code } : {}) },
+    clockMs(ctx),
+  );
   if (defect) return { result: { status: 'checks_failed', ...defect, revision: snapshot.revision } };
   return { ...current, verified: false };
 }
@@ -1406,7 +1498,7 @@ export async function completeTask(ctx, input) {
     if (replay) return replay;
   }
   const W = wavePorts(input.ports, ['createWaveContext', 'integrateAndAdvance', 'runPendingGates']);
-  const queue = openIntegrationQueue(store);
+  const queue = openIntegrationQueue(store, { clock: ctx.clock });
   const entry = queue.enqueue({
     projectId,
     taskId,
@@ -1416,6 +1508,20 @@ export async function completeTask(ctx, input) {
     headSha: head,
     priority: input.priority ?? 0,
   });
+  if (entry.status === 'queued') {
+    const existing =
+      typeof store.events === 'function' &&
+      store.events(run.id).some(event => event.type === 'integration_enqueued' && event.data?.seq === entry.seq);
+    if (!existing) {
+      logEvent(
+        store,
+        run.id,
+        'integration_enqueued',
+        { seq: entry.seq, attemptId: attempt.id, headSha: head },
+        Date.parse(entry.enqueuedAt),
+      );
+    }
+  }
   const done = await awaitIntegration({
     queue,
     seq: entry.seq,

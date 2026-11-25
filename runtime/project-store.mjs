@@ -164,6 +164,7 @@ const gitGateRange = async ({ root, baseSha, headSha, mergeCommits }) =>
  * `gateRange({ root, baseSha, headSha, mergeCommits })` (default: Git in the project root)
  * checks the commit range of a wave gate reservation before its transaction.
  * @param {{ store?: any, contracts?: any, authorizeTransition?: any, skipMigration?: boolean,
+ *   clock?: () => string,
  *   gateRange?: (input: { root: string, baseSha: string, headSha: string, mergeCommits: string[] }) => Promise<boolean | Map<string, string[]> | null> }} [options]
  */
 export async function openProjectStore({
@@ -171,6 +172,7 @@ export async function openProjectStore({
   contracts,
   authorizeTransition,
   skipMigration = false,
+  clock = () => new Date().toISOString(),
   gateRange: range = gitGateRange,
 } = {}) {
   requireValue(store?.db && typeof store.createRun === 'function', 'store_invalid');
@@ -210,6 +212,7 @@ export async function openProjectStore({
     store,
     contracts,
     authorizeTransition,
+    clock: typeof clock === 'function' ? clock : () => new Date().toISOString(),
     gateRange: range,
     options,
     db,
@@ -1091,7 +1094,7 @@ async function apply(ctx, input) {
     assertFence(ctx.db);
     const repeated = replay(ctx, namespace, command.commandId, payloadHash);
     if (repeated) return repeated;
-    const now = new Date().toISOString();
+    const now = ctx.clock();
     let project,
       record,
       previous = null,
@@ -1225,7 +1228,7 @@ async function installRun(ctx, input) {
     const saved = ctx.store.createRun(runDraft);
     requireValue(saved && typeof saved.then !== 'function' && isDeepStrictEqual(saved, runDraft), 'run_draft_invalid');
     ctx.db.prepare('UPDATE kodo_project_attempts SET installed=1 WHERE id=?').run(attempt.id);
-    put(ctx, 'project', { ...s.project, revision: s.revision + 1, updatedAt: new Date().toISOString() });
+    put(ctx, 'project', { ...s.project, revision: s.revision + 1, updatedAt: ctx.clock() });
     return saved;
   });
 }
@@ -1392,7 +1395,7 @@ async function installGateRun(ctx, input) {
     safe(ctx, runDraft);
     const saved = ctx.store.createRun(runDraft);
     requireValue(saved && typeof saved.then !== 'function' && isDeepStrictEqual(saved, runDraft), 'run_draft_invalid');
-    const now = new Date().toISOString();
+    const now = ctx.clock();
     put(ctx, 'gate', { ...gate, installed: true, updatedAt: now });
     put(ctx, 'project', { ...s.project, revision: s.revision + 1, updatedAt: now });
     return saved;
