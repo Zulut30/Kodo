@@ -192,6 +192,10 @@ async function briefFor(state, attempt, task, run) {
       state.signal,
     );
     if (!prior.retryRefPublished) storeOf(state.ctx).updateRun(prior.id, { retryRefPublished: true });
+  } else if (previousAttempt && !remote && !prior.retryRefPublished) {
+    // A local retry reads the earlier head from this repository: the earlier run's transport
+    // refs are no longer needed, and GC may remove them (the flag releases them).
+    storeOf(state.ctx).updateRun(prior.id, { retryRefPublished: true });
   }
   const portablePrevious = value =>
     remote
@@ -1715,14 +1719,15 @@ function recordFailure(ctx, run, defect) {
 }
 
 // A submission's inspection outcome for telemetry (16C): accepted or the defect code.
-const logSubmission = (ctx, run, attempt, head, defect) =>
-  logEvent(
-    storeOf(ctx),
-    run.id,
-    'task_submitted',
-    { attemptId: attempt.id, headSha: head, accepted: !defect, ...(defect ? { code: defect.code } : {}) },
-    clockMs(ctx),
-  );
+const logSubmission = (ctx, run, attempt, head, defect) => {
+  const store = storeOf(ctx);
+  const data = { attemptId: attempt.id, headSha: head, accepted: !defect, ...(defect ? { code: defect.code } : {}) };
+  // The same head submitted again with the same verdict is one submission for telemetry; the
+  // watchdog still counts the repeated failure (recordFailure).
+  const last = store.events(run.id).findLast(event => event.type === 'task_submitted');
+  if (last && isDeepStrictEqual(last.data, data)) return;
+  logEvent(store, run.id, 'task_submitted', data, clockMs(ctx));
+};
 
 async function admitSubmission(ctx, C, input) {
   const { projectId, taskId, head, attemptId } = input;

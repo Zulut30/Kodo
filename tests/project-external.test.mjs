@@ -1636,6 +1636,29 @@ for (const scenario of ['captured', 'pending', 'fetch']) {
   });
 }
 
+test('a local retry releases the transport refs of the earlier remote attempt', async t => {
+  const { f, a, bare, push } = await remoteRetryFixture(t);
+  f.ports.integrateAndAdvance = async () => ({ status: 'blocked', code: 'project_integration_conflict' });
+  const head = await push({ 'src/a.mjs': 'export const a = 42;\n' });
+  assert.ok((await f.complete(a.taskId, head, { attemptId: a.attemptId })).retry?.scheduled);
+  // The retry runs on this PC: it reads the earlier head locally and needs no remote ref.
+  f.repo.setProfile(f.projectId, {
+    subscriptions: [{ id: 'pool', slots: 1, tier: 'fast', provider: 'codex', model: 'gpt' }],
+    machines: [{ id: 'pc', kind: 'local', maxWorkers: 1, maxHeavyBuilds: 1 }],
+  });
+  const fresh = brief(await f.wave({ limit: 1 }), a.taskId);
+  assert.equal(fresh.previousAttempt.headSha, head);
+  assert.equal(fresh.previousAttempt.ref, undefined);
+  const prior = f.store.getRun(a.runId);
+  assert.equal(prior.retryRefPublished, true);
+  const { cleanupRemoteRefs } = await import('../runtime/project-remote-transport.mjs');
+  await cleanupRemoteRefs(prior);
+  const left = git(f.root, 'ls-remote', bare)
+    .split('\n')
+    .filter(line => line.includes(a.runId));
+  assert.deepEqual(left, [], 'the earlier attempt left no transport refs');
+});
+
 test('remote watch ignores coordinator checkout after push', async t => {
   const { f, wave, push } = await remoteRetryFixture(t);
   await push({ 'src/a.mjs': '// progress\n' });
@@ -1652,14 +1675,12 @@ test('remote scope submissions count rejected and accepted heads', async t => {
       .events(a.runId)
       .filter(e => e.type === 'task_submitted')
       .map(e => [e.data.accepted, e.data.code]);
-  assert.deepEqual(submissions(), [
-    [false, 'external_scope'],
-    [false, 'external_scope'],
-  ]);
+  // The same head with the same verdict counts once for telemetry; the watchdog still sees the repeat.
+  assert.deepEqual(submissions(), [[false, 'external_scope']]);
   assert.ok((await wave()).watch.some(entry => entry.code === 'worker_repeated_failure'));
   git(worker, 'checkout', '--detach', a.baseSha);
   const fixed = await push({ 'src/a.mjs': 'export const a = 42; // corrected\n' });
   assert.equal((await f.complete(a.taskId, fixed, { deferGate: true })).status, 'integrated');
   assert.deepEqual(submissions().at(-1), [true, undefined]);
-  assert.equal(submissions().length, 3);
+  assert.equal(submissions().length, 2);
 });

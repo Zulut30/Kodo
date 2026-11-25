@@ -709,7 +709,12 @@ test('R6: cargoFeedbackGraph batches include! fragment reads instead of running 
     ].join('\n'),
   );
   execFileSync('git', ['add', '-A'], { cwd: fx.project });
-  execFileSync('git', ['commit', '-qm', 'edit lib'], { cwd: fx.project });
+  // CI has no global Git identity: the commit names its own author.
+  execFileSync(
+    'git',
+    ['-c', 'user.name=Kodo Test', '-c', 'user.email=kodo-test@example.invalid', 'commit', '-qm', 'edit lib'],
+    { cwd: fx.project },
+  );
   const headSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: fx.project, encoding: 'utf8' }).trim();
 
   let snapshotCalls = 0;
