@@ -85,16 +85,27 @@ async function fileAt(cwd, rev, file) {
 async function memberChanged(cwd, rev, file, changed) {
   const root = path.posix.dirname(file);
   const rootManifest = path.posix.join(root, 'Cargo.toml');
-  const args = rev
-    ? ['ls-tree', '-r', '--name-only', '-z', rev]
-    : ['ls-files', '-z', '--cached', '--others', '--exclude-standard'];
-  const names = (await execute('git', args, { cwd, ...raw })).stdout
-    .split('\0')
-    .filter(name => path.posix.basename(name) === 'Cargo.toml');
+  // Ancestors can delimit nested workspaces. Sibling manifests cannot grant ownership.
+  const names = new Set([rootManifest]);
+  for (const file of changed) {
+    let dir = path.posix.dirname(file);
+    if (root !== '.' && dir !== root && !dir.startsWith(root + '/')) continue;
+    while (true) {
+      names.add(path.posix.join(dir, 'Cargo.toml'));
+      if (dir === '.') break;
+      dir = path.posix.dirname(dir);
+    }
+  }
   const docs = new Map();
   for (const name of names) {
+    let source;
     try {
-      docs.set(name, parse(await fileAt(cwd, rev, name)));
+      source = await fileAt(cwd, rev, name);
+    } catch {
+      continue;
+    }
+    try {
+      docs.set(name, parse(source));
     } catch {
       return false;
     }
@@ -131,6 +142,13 @@ export async function implicitLock(cwd, before, after, file, changed, scopes) {
   return 'scope';
 }
 
+function metadataEnvironment() {
+  const env = workerEnvironment();
+  for (const key of Object.keys(env))
+    if (/^(?:CARGO_BUILD_RUSTC.*|RUSTC(?:_WRAPPER|_WORKSPACE_WRAPPER)?)$/i.test(key)) delete env[key];
+  return { ...env, RUSTC: process.env.RUSTC || 'rustc', RUSTC_WRAPPER: '', RUSTC_WORKSPACE_WRAPPER: '' };
+}
+
 export async function regenerate(cwd, tree, before, head, files, signal) {
   const temp = await mkdtemp(path.join(os.tmpdir(), 'kodo-cargo-'));
   try {
@@ -153,9 +171,14 @@ export async function regenerate(cwd, tree, before, head, files, signal) {
     await run(['checkout-index', '--all']);
     for (const file of files) {
       const dir = path.dirname(path.join(work, file));
-      const options = { cwd: dir, env: workerEnvironment(), timeoutMs: 120000, signal };
-      for (const flags of [[], ['--locked', '--no-deps']])
-        await execute('cargo', ['metadata', '--offline', '--format-version', '1', ...flags], options);
+      if (!(await lstat(path.join(dir, 'Cargo.toml'))).isFile()) throw Error('missing workspace manifest');
+      const options = { cwd: dir, env: metadataEnvironment(), timeoutMs: 120000, signal, rawOutput: true };
+      for (const flags of [[], ['--locked', '--no-deps']]) {
+        const metadata = await execute('cargo', ['metadata', '--offline', '--format-version', '1', ...flags], options);
+        const root = JSON.parse(metadata.stdout).workspace_root;
+        if (!path.isAbsolute(root) || path.relative(await realpath(dir), await realpath(root)) !== '')
+          throw Error('foreign workspace lock');
+      }
       const contents = await readFile(path.join(work, file), 'utf8');
       for (const parent of [before, head]) if (lockChange(await fileAt(cwd, parent, file), contents)) throw Error();
       const blob = await git(cwd, ['hash-object', '-w', '--stdin'], { input: contents });
@@ -163,7 +186,10 @@ export async function regenerate(cwd, tree, before, head, files, signal) {
     }
     return await run(['write-tree']);
   } catch (error) {
-    if (error.code === 'cancelled') throw error;
+    if (error.code === 'cancelled') {
+      if (signal?.reason?.code === 'project_lease_lost') throw signal.reason;
+      throw error;
+    }
     throw Object.assign(Error('Project integration_conflict: cargo_lock_unresolved'), {
       code: 'project_integration_conflict',
       reason: 'cargo_lock_unresolved',

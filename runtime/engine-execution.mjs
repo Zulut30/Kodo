@@ -86,7 +86,7 @@ export class EngineExecution extends EnginePlanning {
     const boundaries = frozen && frozen !== scopes ? [scopes, frozen] : [scopes];
     for (const name of files) {
       for (const allowed of boundaries) {
-        if (isLock(name) && frozen && !allowed.includes(name)) {
+        if (isLock(name) && frozen && !ownsPath(allowed, name)) {
           const reason = await implicitLock(cwd, baseSha, null, name, files, allowed);
           if (!reason) continue;
           outside.push(reason === 'scope' ? name : name + ' (' + reason + ')');

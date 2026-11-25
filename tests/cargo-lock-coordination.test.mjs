@@ -18,3 +18,9 @@ test('implicit lock preserves package identities and accepts dependency addition
   assert.equal(lockChange(old, old.replace('version = 3', 'version = 2')), 'scope');
   assert.equal(lockChange(old, old + '[unknown]\n'), 'scope');
 });
+test('adding a second version preserves the existing package identity', () => {
+  const parallel = old + pkg('one', '2');
+  assert.equal(lockChange(old, parallel), null);
+  assert.equal(lockChange(parallel, old), null);
+  assert.equal(lockChange(parallel, old + pkg('one', '3')), 'cargo_lock_version_change');
+});

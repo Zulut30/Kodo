@@ -1,4 +1,4 @@
-import { implicitLock, isLock, lockChange, regenerate } from './cargo-lock.mjs';
+import { implicitLock, isLock, regenerate } from './cargo-lock.mjs';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { lstat, realpath } from 'node:fs/promises';
@@ -494,7 +494,8 @@ async function mergeCommitOf(worktree, before, head, message, options = null) {
     oid = await regenerate(worktree, oid, before, head, files, options.signal);
     message += '\n\n' + files.map(file => 'Kodo-Lock-Regenerated: ' + file).join('\n');
   }
-  return git(worktree, ['commit-tree', oid, '-p', before, '-p', head, '-m', message]);
+  const commit = await git(worktree, ['commit-tree', oid, '-p', before, '-p', head, '-m', message]);
+  return { commit, oid, files };
 }
 
 async function abortMerge(worktree, before) {
@@ -503,7 +504,7 @@ async function abortMerge(worktree, before) {
     await git(worktree, ['reset', '--hard', before]);
 }
 
-async function verifiedMerge(worktree, before, taskHead, writePaths, commit = 'HEAD') {
+async function verifiedMerge(worktree, before, taskHead, writePaths, commit, signal, built = null) {
   const [first, second, third] = (await git(worktree, ['rev-list', '--parents', '-n', '1', commit]))
     .split(' ')
     .slice(1);
@@ -512,30 +513,28 @@ async function verifiedMerge(worktree, before, taskHead, writePaths, commit = 'H
     .filter(Boolean);
   if (first !== before || second !== taskHead || third !== undefined) return false;
   for (const file of changed) {
-    if (ownsPath(writePaths, file) && (!isLock(file) || writePaths.includes(file))) continue;
+    if (ownsPath(writePaths, file)) continue;
     if (!isLock(file)) return false;
-    const reason = await implicitLock(worktree, before, commit, file, changed, writePaths);
-    if (reason === 'cargo_lock_version_change') return reason;
-    if (reason) return false;
+    for (const parent of [before, taskHead]) {
+      const reason = await implicitLock(worktree, parent, commit, file, changed, writePaths);
+      if (reason === 'cargo_lock_version_change') return reason;
+      if (reason) return false;
+    }
   }
-  const { oid, files } = await mergeTree(worktree, before, taskHead);
-  const trailers = await git(
-    worktree,
-    ['show', '-s', '--format=%(trailers:key=Kodo-Lock-Regenerated,valueonly)', commit],
-    { rawOutput: true },
-  );
-  if (trailers !== files.join('\n')) return false;
-  const delta = (await rawGit(worktree, ['diff', '--no-renames', '--name-only', '-z', oid, commit]))
-    .split('\0')
-    .filter(Boolean);
-  if (delta.some(file => !files.includes(file))) return false;
-  for (const file of files) {
-    if (!(await rawGit(worktree, ['ls-tree', commit, '--', file])).startsWith('100644 blob ')) return false;
-    const read = rev => rawGit(worktree, ['show', rev + ':' + file]);
-    const result = await read(commit);
-    for (const rev of [before, taskHead]) if (lockChange(await read(rev), result)) return false;
+  try {
+    const { oid, files } = built ?? (await mergeTree(worktree, before, taskHead));
+    const trailers = await git(
+      worktree,
+      ['show', '-s', '--format=%(trailers:key=Kodo-Lock-Regenerated,valueonly)', commit],
+      { rawOutput: true },
+    );
+    if (trailers !== files.join('\n')) return false;
+    const expected = !built && files.length ? await regenerate(worktree, oid, before, taskHead, files, signal) : oid;
+    return expected === (await git(worktree, ['rev-parse', commit + '^{tree}']));
+  } catch (error) {
+    if (['project_integration_conflict', 'project_integration_invalid'].includes(error.code)) return false;
+    throw error;
   }
-  return true;
 }
 
 // A crash after savePending but before the merge commit leaves MERGE_HEAD. Only
@@ -654,7 +653,7 @@ export async function inspectHistory({ cwd, base, head, writePaths, secrets = {}
       const defect = (kind, file = entry.path) => ({ kind, commit, file });
       if (secretFile(entry.path)) return defect('secret_path');
       if (specialMode(entry.from) || specialMode(entry.to)) return defect('special');
-      if (!ownsPath(writePaths, entry.path) || (isLock(entry.path) && !writePaths.includes(entry.path))) {
+      if (!ownsPath(writePaths, entry.path)) {
         if (!isLock(entry.path)) return defect('scope');
         taskChanges ??= (await rawGit(cwd, ['diff', '--name-only', '--no-renames', '-z', base + '...' + head]))
           .split('\0')
@@ -677,14 +676,21 @@ export async function inspectHistory({ cwd, base, head, writePaths, secrets = {}
       if (verdict !== 'clean') return defect(verdict);
     }
   }
+  if (taskChanges) {
+    const fork = await git(cwd, ['merge-base', base, head]);
+    for (const file of taskChanges.filter(name => isLock(name) && !ownsPath(writePaths, name))) {
+      const reason = await implicitLock(cwd, fork, head, file, taskChanges, writePaths);
+      if (reason) return { kind: reason, commit: head, file };
+    }
+  }
   return null;
 }
 
 // The merge `commit` of `taskHead` onto `before`: its result must stay inside the write paths
 // (`integration_scope`) and so must every commit it brings in (`integration_history`); a history
 // whose contents cannot be compared within the budget is `integration_history_unverifiable`.
-async function mergeDefect(worktree, before, taskHead, writePaths, secrets, commit = 'HEAD') {
-  const verdict = await verifiedMerge(worktree, before, taskHead, writePaths, commit);
+async function mergeDefect(worktree, before, taskHead, writePaths, secrets, commit, signal, built = null) {
+  const verdict = await verifiedMerge(worktree, before, taskHead, writePaths, commit, signal, built);
   if (verdict !== true) return { code: 'integration_scope', reason: verdict || undefined };
   const found = await inspectHistory({ cwd: worktree, base: before, head: taskHead, writePaths, secrets });
   if (found)
@@ -755,6 +761,7 @@ export async function mergeTask({
         writePaths,
         secrets,
         recovered.mergeCommit,
+        signal,
       );
       if (defect) {
         if (recovered.mergeCommit === head) await advanceBranch(worktree, branch, recovered.before, head, publish);
@@ -766,12 +773,13 @@ export async function mergeTask({
     await assertSignature(worktree, taskHead);
     // The merge commit is built and checked before the branch moves: a conflict or a defect leaves
     // the branch and its worktree untouched, and only the publish moves the branch.
-    const mergeCommit = await mergeCommitOf(worktree, before, taskHead, `Kodo: integrate ${taskId}`, {
+    const built = await mergeCommitOf(worktree, before, taskHead, `Kodo: integrate ${taskId}`, {
       signal,
       writePaths,
       secrets,
     });
-    const defect = await mergeDefect(worktree, before, taskHead, writePaths, secrets, mergeCommit);
+    const mergeCommit = built.commit;
+    const defect = await mergeDefect(worktree, before, taskHead, writePaths, secrets, mergeCommit, signal, built);
     if (defect) fail(defect.code, defect.reason);
     await savePending({ before, mergeCommit });
     await advanceBranch(worktree, branch, mergeCommit, before, publish, verify);
@@ -849,7 +857,7 @@ export async function mergeBackGate({
   const next =
     before === expectedHead
       ? gateHead
-      : await mergeCommitOf(worktree, before, gateHead, 'Kodo: integrate gate repairs');
+      : (await mergeCommitOf(worktree, before, gateHead, 'Kodo: integrate gate repairs')).commit;
   await savePending({ before, target: next });
   await advanceBranch(worktree, branch, next, before, publish);
   return next;

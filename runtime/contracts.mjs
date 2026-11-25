@@ -124,10 +124,10 @@ export function validatePlan(plan) {
   return plan;
 }
 export function ownsPath(scopes, name) {
-  return scopes.some(
-    scope =>
-      path.posix.matchesGlob(name, scope) || name === scope || name.startsWith(scope.replace(/\/\*\*$/, '') + '/'),
-  );
+  return scopes.some(value => {
+    const scope = value.replace(/^\.\//, '');
+    return path.posix.matchesGlob(name, scope) || name === scope || name.startsWith(scope.replace(/\/\*\*$/, '') + '/');
+  });
 }
 export function scopesOverlap(left, right) {
   return left.some(a =>
