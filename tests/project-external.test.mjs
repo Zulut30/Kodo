@@ -1570,3 +1570,96 @@ test('one scoped git diff captures whole text patches and classifies every omiss
   assert.equal(clean.truncated, false);
   assert.deepEqual(clean.omittedFiles, []);
 });
+
+async function remoteRetryFixture(t) {
+  const f = await fixture(t);
+  const bare = path.join(f.temp, 'remote.git');
+  git(f.root, 'init', '--bare', bare);
+  git(f.root, 'remote', 'add', 'origin', bare);
+  f.repo.setProfile(f.projectId, {
+    subscriptions: [{ id: 'pool', slots: 1, tier: 'fast', provider: 'codex', model: 'gpt' }],
+    machines: [{ id: 'worker', kind: 't3-env', environmentId: 'lab', maxWorkers: 1, maxHeavyBuilds: 1 }],
+  });
+  const wave = () => f.wave({ limit: 1 });
+  const a = brief(await wave(), 'task-a');
+  const worker = path.join(f.temp, 'clone');
+  git(f.root, 'clone', '--no-local', bare, worker);
+  git(worker, 'config', 'user.name', 'Worker');
+  git(worker, 'config', 'user.email', 'worker@example.invalid');
+  git(worker, 'fetch', 'origin', a.baseRef);
+  git(worker, 'checkout', '--detach', 'FETCH_HEAD');
+  const push = async files => {
+    const head = await commit(worker, files);
+    git(worker, 'push', '--force', 'origin', 'HEAD:' + a.workRef);
+    return head;
+  };
+  return { f, a, worker, wave, bare, push };
+}
+
+for (const scenario of ['captured', 'pending', 'fetch']) {
+  test('remote conflict retry ' + scenario, async t => {
+    const { f, a, wave, bare, push } = await remoteRetryFixture(t);
+    const integrate = f.ports.integrateAndAdvance;
+    f.ports.integrateAndAdvance = async () => ({ status: 'blocked', code: 'project_integration_conflict' });
+    const head = await push({
+      'src/a.mjs': 'export const a = 42;\n// ' + (scenario === 'fetch' ? 'x'.repeat(70000) : f.root) + '\n',
+    });
+    const done = await f.complete(a.taskId, head, { attemptId: a.attemptId });
+    assert.ok(done.retry?.scheduled, JSON.stringify(done));
+    if (scenario === 'pending') {
+      const conflict = f.store.getRun(a.runId).externalConflict;
+      const { headSha, reason, attemptId } = conflict.previousAttempt;
+      f.store.updateRun(a.runId, {
+        externalConflict: { ...conflict, previousAttempt: { headSha, reason, attemptId } },
+      });
+    }
+    const fresh = brief(await wave(), a.taskId);
+    if (scenario !== 'fetch') {
+      assert.ok(fresh.previousAttempt.diff.includes('<local-path>'));
+      assert.ok(!fresh.previousAttempt.diff.includes(f.root));
+      return;
+    }
+    assert.deepEqual(fresh.previousAttempt.omittedFiles, ['src/a.mjs']);
+    const clone = path.join(f.temp, 'fresh');
+    git(f.root, 'clone', '--no-local', bare, clone);
+    const ref = fresh.previousAttempt.ref;
+    assert.ok(ref && fresh.prompt.includes('git fetch origin ' + ref));
+    git(clone, 'fetch', 'origin', ref);
+    git(clone, 'cat-file', '-e', head);
+    git(clone, 'push', 'origin', head + ':' + fresh.workRef);
+    f.ports.integrateAndAdvance = integrate;
+    assert.equal(
+      (await f.complete(a.taskId, head, { attemptId: fresh.attemptId, deferGate: true })).status,
+      'integrated',
+    );
+    assert.equal(git(clone, 'ls-remote', 'origin', ref), '');
+  });
+}
+
+test('remote watch ignores coordinator checkout after push', async t => {
+  const { f, wave, push } = await remoteRetryFixture(t);
+  await push({ 'src/a.mjs': '// progress\n' });
+  f.ctx.clock = () => new Date(Date.now() + 3600000).toISOString();
+  assert.ok(!(await wave()).watch.some(entry => entry.code === 'worker_no_progress'));
+});
+
+test('remote scope submissions count rejected and accepted heads', async t => {
+  const { f, a, worker, wave, push } = await remoteRetryFixture(t);
+  const head = await push({ outside: 'unexpected' });
+  for (let i = 0; i < 2; i++) assert.equal((await f.complete(a.taskId, head)).code, 'external_scope');
+  const submissions = () =>
+    f.store
+      .events(a.runId)
+      .filter(e => e.type === 'task_submitted')
+      .map(e => [e.data.accepted, e.data.code]);
+  assert.deepEqual(submissions(), [
+    [false, 'external_scope'],
+    [false, 'external_scope'],
+  ]);
+  assert.ok((await wave()).watch.some(entry => entry.code === 'worker_repeated_failure'));
+  git(worker, 'checkout', '--detach', a.baseSha);
+  const fixed = await push({ 'src/a.mjs': 'export const a = 42; // corrected\n' });
+  assert.equal((await f.complete(a.taskId, fixed, { deferGate: true })).status, 'integrated');
+  assert.deepEqual(submissions().at(-1), [true, undefined]);
+  assert.equal(submissions().length, 3);
+});
