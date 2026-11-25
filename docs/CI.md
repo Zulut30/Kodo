@@ -44,7 +44,42 @@ Format/lint/typecheck используют действующий `QualityProfil
 
 В Actions новый необязательный `fast` включается только job-level условием `${{ vars.KODO_FAST_CI_ENABLED == 'true' }}`. Пока source/vendor ownership не подготовлен и не проверен, переменная отсутствует: job skipped/neutral, не PASS. После подготовки области координатор может установить repository variable `KODO_FAST_CI_ENABLED=true`; worker не меняет variables или branch protection. Причина opt-in — воспроизведённый blocked broad feedback, а не silent exclusion исходников. Локальный CLI feedback остаётся доступен для подготовленной области; его 4.29s observation не является Actions benchmark.
 
-`fast` и required `check` независимы: `check` не имеет этого условия и сохраняет matrix `{os:[ubuntu-latest,windows-latest],node:[24]}`, без `needs: fast`, `continue-on-error` и исключения обязательных проверок. Fast использует частичный `feedback`; matrix L2 сохраняет `run L2`, вызывает `npm run check` внутри CLI ровно один раз, затем mandatory security. Сквозные наборы фабрики волн (`npm run test:waves`: `tests/project-wave-director.test.mjs`, `tests/project-wave-e2e.test.mjs` и набор параллельного движка этапа 15B `tests/project-parallel-engine.test.mjs` — реальные `task-fast`, слияния и одновременные сдачи, 45–100 с на кейс) и финальные сценарии (`npm run test:final`) идут отдельными обязательными шагами той же matrix вне фиксированного предела одной команды L2 (`CI_COMMAND_TIMEOUT_MS`); обычное обнаружение тестов `npm run check` их не включает. Существующий installed CLI package smoke остаётся отдельным обязательным шагом каждого matrix job. Названия требуемых contexts остаются `check (ubuntu-latest, 24)` и `check (windows-latest, 24)`; изменения branch protection выполняет только координатор.
+`fast` и required `check` независимы: `check` не имеет этого условия и сохраняет matrix `{os:[ubuntu-latest,windows-latest],node:[24]}`, без `needs: fast`, `continue-on-error` и исключения обязательных проверок. Fast использует частичный `feedback`; matrix L2 сохраняет `run L2`, вызывает `npm run check` внутри CLI ровно один раз, затем mandatory security. Сквозные наборы фабрики волн (`npm run test:waves`: `tests/project-wave-director.test.mjs`, `tests/project-wave-e2e.test.mjs` и набор параллельного движка этапа 15B `tests/project-parallel-engine.test.mjs` — реальные `task-fast`, слияния и одновременные сдачи, 45–100 с на кейс), тяжёлые наборы (`npm run test:heavy`, см. ниже) и финальные сценарии (`npm run test:final`) идут отдельными обязательными шагами той же matrix вне фиксированного предела одной команды L2 (`CI_COMMAND_TIMEOUT_MS`); обычное обнаружение тестов `npm run check` их не включает. Полное локальное покрытие — `npm run check`, `npm run test:heavy`, `npm run test:waves` и `npm run test:final`. Существующий installed CLI package smoke остаётся отдельным обязательным шагом каждого matrix job. Названия требуемых contexts остаются `check (ubuntu-latest, 24)` и `check (windows-latest, 24)`; изменения branch protection выполняет только координатор.
+
+### Тяжёлые наборы — `npm run test:heavy` (16E)
+
+После этапа 15 команда L2 `npm run check` на Windows CI шла 1 479 745–2 325 940 мс (медиана семи прогонов — 2 032 659 мс) и на медленном раннере упёрлась в фиксированный предел 2 400 000 мс (`status: blocked`, `reason: timeout`). Предел закреплён `tests/windows-speed-oracle.test.mjs` и не меняется. Поэтому 19 самых долгих файлов (список `heavySuites` в `scripts/run-tests.mjs`) идут отдельным обязательным шагом `Heavy integration suites` обеих ОС сразу после L2. Стандартное обнаружение их пропускает, `--coverage` включает. `tests/test-schedule.test.mjs` проверяет, что каждый файл стандартного шаблона Node идёт ровно в одном шаге: L2, `test:heavy` или `test:waves`.
+
+Замер: этот Windows-ПК, Node 24.19.0. Каждый файл шёл отдельно и последовательно через `node scripts/run-tests.mjs <файл>` — это `node --test` с Git-окружением `npm test`. Параллельно на ПК шли чужие прогоны, поэтому числа — наблюдение, а не квитанция.
+
+| Вынесено в `test:heavy` | мс |
+| --- | ---: |
+| `tests/delivery.test.mjs` | 445 075 |
+| `tests/architecture-rust.test.mjs` | 319 540 |
+| `tests/project-director.test.mjs` | 274 403 |
+| `tests/wave-context-integration.test.mjs` | 270 006 |
+| `tests/task-fast-checks.test.mjs` | 250 077 |
+| `tests/behavior-rust.test.mjs` | 234 389 |
+| `tests/architecture-gate-integration.test.mjs` | 207 942 |
+| `tests/project-integration.test.mjs` | 171 110 |
+| `tests/engine-2.test.mjs` | 138 395 |
+| `tests/engine-4.test.mjs` | 133 341 |
+| `tests/engine-3.test.mjs` | 123 189 |
+| `tests/benchmark.test.mjs` | 119 250 |
+| `tests/engine.test.mjs` | 117 653 |
+| `tests/architecture-cli.test.mjs` | 112 324 |
+| `tests/ci-graph.test.mjs` | 109 399 |
+| `tests/knowledge-refresh.test.mjs` | 99 970 |
+| `tests/knowledge-cli.test.mjs` | 82 864 |
+| `tests/cargo-fetch-recovery.test.mjs` | 60 640 |
+| `tests/project-integration-fence.test.mjs` | 52 467 |
+| **Сумма** | **3 322 034** |
+
+Остались в L2 как короткие: `cargo-workspace` — 25 053 мс, `project-worktree-gc` — 21 074, `cargo-slots` — 6 414, `api-cards` — 4 650, `cargo-fast-scope` — 3 713, `project-integration-queue` — 1 564, `project-parallel-gates` — 350, `cargo-lock-coordination` — 254, `diagnostic-pack` — 205, `execution-profile` — 163.
+
+Оценка опирается на мерило `tests/project-parallel-engine.test.mjs`. Локально этот файл шёл 730 399 мс. В шаге `test:waves` на Windows CI сумма его кейсов составила 363 114–518 214 мс, то есть CI ≈ 0,50–0,71 × локального времени. При concurrency 4 L2 короче примерно на 0,50–0,71 × 3 322 034 / 4 мс, то есть на 413–589 с. По семи прогонам (45645526524, 45630500497, 45652087454, 45630658446, 45605431480, 45592552608, 45615441102) медиана L2 снижается с ≈ 33,9 до ≈ 25,0 мин. Самый долгий прошедший прогон даёт ≈ 29 мин вместо 38,8. Сам `test:heavy` — это ≈ 413–589 с работы на четырёх потоках плюс хвост упаковки. Самый долгий файл, `delivery`, стартует первым по списку `priority`, поэтому до 2 400 000 мс остаётся большой запас. Это оценка, а не квитанция: подтверждением служат длительности шагов на CI.
+
+Предел отдельных кейсов волновых наборов задаётся в самих тестах. Ни файл, ни runner, ни `run()` в `scripts/run-tests.mjs` своего предела не ставят. Раньше в `tests/project-wave-director.test.mjs` каждый кейс имел `{ timeout: 300000 }`, а в `tests/project-wave-e2e.test.mjs` — `{ timeout: 600000 }`. На медленных раннерах предел 300 с остановил «Three disjoint tasks run in parallel…» (runs 45605431480, 45652087454), «Tasks with overlapping write paths never share a wave» (45630500497, 45652087454), «appendMilestone reopens…» (45605431480, 45630500497) и «drain replaces a gate reservation…» (45652087454). На прошедших прогонах они шли 130–278 с. В e2e «drain accepts two epics…» занял 497 с из 600 (45605431480). Теперь у всех кейсов обоих файлов общий предел 900 000 мс, а пояснение вынесено в комментарий в начале файла. Шаг `test:waves` не подчиняется `CI_COMMAND_TIMEOUT_MS`: это обычный шаг без `timeout-minutes`. Его длительность (1 420 044–2 605 425 мс) задаёт самый долгий из параллельных файлов. На медленном раннере каждый из двух волновых файлов в одиночку занимает ~2 300–2 500 с: director — 1 283–2 419 с, e2e — 1 289–2 492 с суммы кейсов. Поэтому разбиение шага на два ни один из них не укоротит, а последовательные шаги только удлинят job. Сократить шаг можно, разделив сами волновые файлы. Это отдельное решение.
 
 Concurrency отменяет только устаревшие PR runs; main/release события используют уникальный `run_id` и `cancel-in-progress:false`. `setup-node cache:npm` хранит npm tarballs с ключом package-lock; `npm ci --ignore-scripts` снова проверяет lock/integrity. Кэш успешных checks, UI/security receipts, node_modules и чужие приватные данные в Actions не восстанавливаются. Публичный tarball cache не становится доказательством PASS. Частные command-cache policies реализует отдельный `ci-cache`, этот CLI не обходит их и не переиспользует receipts.
 
