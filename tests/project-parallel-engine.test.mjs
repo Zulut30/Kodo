@@ -208,6 +208,32 @@ test('Two completions verify task-fast at the same time with two build slots', a
   assert.equal(f.merges().length, 2);
 });
 
+test('A submission takes the build slot of the machine its profile placement named', async t => {
+  const f = await fixture(t, { count: 1 });
+  f.repo.setProfile(f.projectId, {
+    subscriptions: [{ id: 'a', slots: 2, provider: 'codex', model: 'gpt', tier: 'fast' }],
+    machines: [{ id: 'pc', kind: 'local', maxWorkers: 2, maxHeavyBuilds: 2 }],
+  });
+  const [brief] = (await f.briefs()).values();
+  assert.equal(brief.machine?.id, 'pc');
+  const requested = [];
+  const acquire = f.store.acquireLease.bind(f.store);
+  f.store.acquireLease = (name, owner, options) => {
+    if (name.startsWith('machine-build:')) requested.push([name, options?.limit]);
+    return acquire(name, owner, options);
+  };
+  const seen = [];
+  f.ports.verifyTaskFast = async input => {
+    seen.push(input.maxHeavyBuilds);
+    return verifyTaskFastOnce(input);
+  };
+  // No library `machine` override: the CLI never passes one.
+  const result = await f.complete(brief, await f.change(brief));
+  assert.equal(result.status, 'integrated', JSON.stringify(result));
+  assert.deepEqual(requested, [['machine-build:pc', 2]]);
+  assert.deepEqual(seen, [2]);
+});
+
 test('One build slot serializes task-fast across concurrent completions', async t => {
   const f = await fixture(t, { count: 2 });
   const briefs = await f.briefs();

@@ -1001,6 +1001,17 @@ async function verificationState(ctx, C, input, attemptId, runId) {
   return ['running', 'verifying'].includes(attempt.status) ? 'go' : 'stale';
 }
 
+// The build slot of a submission: an explicit `input.machine` (library callers), else the machine
+// the profile placed the attempt on (15A `workerPlacement`) with that machine's current
+// `maxHeavyBuilds` (1 when the profile no longer lists it), else this machine's default slot.
+function submissionMachine(ctx, projectId, run, input) {
+  if (input.machine) return input.machine;
+  const id = run.workerPlacement?.machine?.id;
+  if (typeof id !== 'string') return undefined;
+  const host = ctx.repo.getProfile?.(projectId)?.machines?.find(row => row.id === id);
+  return { id, maxHeavyBuilds: host?.maxHeavyBuilds ?? 1 };
+}
+
 // Verify the submitted head once. One verification per Run at a time (`project-verify:<runId>`,
 // taken before the machine slot): a duplicate submission waits for the first and then finds the
 // head verified. In one build slot of the machine (`machine-build:<id>`) the state is read again,
@@ -1015,6 +1026,7 @@ async function verifySubmission(ctx, C, step, input) {
   const section = work => withProjectSection(store, projectId, work, { signal });
   const state = () => section(() => verificationState(ctx, C, input, attempt.id, run.id));
   const stale = { blocked: 'project_submission_stale' };
+  const machine = submissionMachine(ctx, projectId, run, input);
   const dedupe = await acquireLeaseWaiting(store, `project-verify:${run.id}`, { signal, waitMs: 2 * 3600000 });
   return withHeldLease(store, dedupe, async dedupeLost => {
     const before = await state();
@@ -1032,7 +1044,7 @@ async function verifySubmission(ctx, C, step, input) {
             run: run.id,
             signal: checked,
             expectedHeadSha: head,
-            ...(input.machine?.maxHeavyBuilds ? { maxHeavyBuilds: input.machine.maxHeavyBuilds } : {}),
+            ...(machine?.maxHeavyBuilds ? { maxHeavyBuilds: machine.maxHeavyBuilds } : {}),
           });
         } catch (error) {
           // Another call verifies the same Run right now (its lease `run:<id>`).
@@ -1091,7 +1103,7 @@ async function verifySubmission(ctx, C, step, input) {
           throw error;
         }
       },
-      { machine: input.machine, signal },
+      { machine, signal },
     );
   });
 }
