@@ -543,7 +543,7 @@ function evaluateRustArchitecture(input) {
   const taskDiffs =
     input.taskDiffs === undefined
       ? []
-      : array(input.taskDiffs, limits.modules).map(entry => {
+      : array(input.taskDiffs, limits.files).map(entry => {
           shape(entry, ['id', 'changedPaths', 'writePaths']);
           return {
             id: text(entry.id),

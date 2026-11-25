@@ -240,7 +240,73 @@ function validateLayout(files, policy) {
   }
 }
 
-async function readTaskDiffs(project, taskScopes, context) {
+async function firstParentRange(project, base, head, context) {
+  if (!sha(base) || !sha(head)) throw fail('configuration');
+  const rows = (
+    await git(project, ['rev-list', '--reverse', '--first-parent', '--parents', head, '^' + base], context)
+  ).trim();
+  const parents = new Map();
+  let previous = base;
+  for (const line of rows.split(/\r?\n/).filter(Boolean)) {
+    const [commit, first, ...rest] = line.split(' ');
+    if (first !== previous) throw fail('configuration');
+    parents.set(commit, [first, ...rest]);
+    previous = commit;
+  }
+  if (previous !== head) throw fail('configuration');
+  return parents;
+}
+
+async function scopedDiff(project, base, head, context) {
+  if (base === head) return [];
+  const raw = await git(
+    project,
+    ['diff', '--no-ext-diff', '--no-textconv', '--no-renames', '--name-only', '-z', base, head, '--'],
+    context,
+  );
+  const paths = [...new Set(raw.split('\0').filter(Boolean))].sort().map(safeFile);
+  if (paths.length > 20000) throw fail('scope_limit');
+  return paths;
+}
+
+async function rustDiffInputs(project, options, ports, head, changedPaths, context) {
+  const scopes = options.taskScopes ?? ports.taskScopes ?? [];
+  const taskPaths = options.taskPaths ?? ports.taskPaths ?? [];
+  const origin = options.gateOrigin ?? ports.gateOrigin;
+  const hasMerge = scopes.some(s => (s.mode ?? (s.baseCommit ? 'range' : 'merge')) === 'merge');
+  const parents =
+    origin || hasMerge
+      ? await firstParentRange(project, options.baseSha, origin ? origin.headSha : head, context)
+      : null;
+  const own = await readTaskDiffs(project, scopes, context, parents);
+  if (!origin) return { changedPaths, taskPaths, taskDiffs: own ?? [] };
+  if (!Array.isArray(origin.provenance) || scopes.some(entry => entry.mode && entry.mode !== 'merge'))
+    throw fail('configuration');
+  const recorded = new Map(origin.provenance.map(entry => [entry.commit, entry]));
+  if (
+    recorded.size !== origin.provenance.length ||
+    origin.provenance.some(
+      entry =>
+        !parents.has(entry.commit) ||
+        !['gate', 'task'].includes(entry.kind) ||
+        !Array.isArray(entry.writePaths) ||
+        !entry.ref,
+    )
+  )
+    throw fail('configuration');
+  const covered = new Set(scopes.map(s => s.commit));
+  const taskDiffs = own ?? [];
+  for (const [commit, [first]] of parents) {
+    if (covered.has(commit)) continue;
+    const paths = await scopedDiff(project, first, commit, context);
+    taskDiffs.push({ id: commit, changedPaths: paths, writePaths: recorded.get(commit)?.writePaths ?? taskPaths });
+  }
+  await firstParentRange(project, origin.headSha, head, context);
+  const repairPaths = await scopedDiff(project, origin.headSha, head, context);
+  return { changedPaths: repairPaths, taskPaths, taskDiffs };
+}
+
+async function readTaskDiffs(project, taskScopes, context, parents) {
   if (!Array.isArray(taskScopes) || !taskScopes.length) return undefined;
   const diffs = [];
   for (const entry of taskScopes) {
@@ -257,58 +323,15 @@ async function readTaskDiffs(project, taskScopes, context) {
         (await git(project, ['rev-parse', '--verify', `${entry.commit}^{commit}`], context)).trim() !== entry.commit
       )
         throw fail('configuration');
-      if (entry.baseCommit === entry.commit) {
-        paths = [];
-      } else {
-        const raw = await git(
-          project,
-          [
-            'diff',
-            '--no-ext-diff',
-            '--no-textconv',
-            '--no-renames',
-            '--name-only',
-            '-z',
-            entry.baseCommit,
-            entry.commit,
-            '--',
-          ],
-          context,
-        );
-        paths = [...new Set(raw.split('\0').filter(Boolean))].sort().map(safeFile);
-      }
+      paths = await scopedDiff(project, entry.baseCommit, entry.commit, context);
     } else if (mode === 'merge') {
       if (!sha(entry.commit)) throw fail('configuration');
-      const parentsLine = (await git(project, ['rev-list', '--parents', '-n', '1', entry.commit], context)).trim();
-      const parts = parentsLine.split(' ').filter(Boolean);
-      if (parts[0] !== entry.commit) throw fail('configuration');
-      const firstParent = parts[1];
-      const raw = firstParent
-        ? await git(
-            project,
-            [
-              'diff',
-              '--no-ext-diff',
-              '--no-textconv',
-              '--no-renames',
-              '--name-only',
-              '-z',
-              firstParent,
-              entry.commit,
-              '--',
-            ],
-            context,
-          )
-        : await git(
-            project,
-            ['diff-tree', '--no-commit-id', '--name-only', '-r', '-z', '--root', entry.commit],
-            context,
-          );
-      paths = [...new Set(raw.split('\0').filter(Boolean))].sort().map(safeFile);
+      const pair = parents?.get(entry.commit);
+      if (pair?.length !== 2) throw fail('configuration');
+      paths = await scopedDiff(project, pair[0], entry.commit, context);
     } else {
       throw fail('configuration');
     }
-    if (paths.length > 20000) throw fail('scope_limit');
     diffs.push({ id: entry.id, changedPaths: paths, writePaths: entry.writePaths });
   }
   return diffs;
@@ -627,14 +650,12 @@ async function compose(options, ports, plan) {
     basePolicy && baseGraph && (!isRust || baseIsRust)
       ? evaluateArchitecture({ policy: basePolicy, graph: baseGraph }).findings
       : [];
-  const taskDiffs = isRust ? await readTaskDiffs(project, options.taskScopes ?? ports.taskScopes, context) : undefined;
+  const diffInputs = isRust ? await rustDiffInputs(project, options, ports, headSha, changedPaths, context) : {};
   const headFindings = isRust
     ? evaluateArchitecture({
         policy: headPolicy,
         graph: headGraph,
-        changedPaths,
-        taskPaths: options.taskPaths ?? ports.taskPaths ?? [],
-        ...(taskDiffs ? { taskDiffs } : {}),
+        ...diffInputs,
         basePolicy: baseIsRust ? basePolicy : null,
         baseGraph,
       }).findings

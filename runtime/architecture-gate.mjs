@@ -277,6 +277,13 @@ const normalizeTaskScopes = value => {
   );
 };
 
+export function architectureOriginForRun(run) {
+  const binding = run?.directorBinding;
+  return binding?.kind === 'gate'
+    ? { gateOrigin: { headSha: binding.headSha, provenance: binding.provenance ?? [] } }
+    : {};
+}
+
 /** Extract task writePaths from a Run for architecture gate execution and freshness checks. */
 export function architectureTaskPathsForRun(run) {
   return Array.isArray(run?.plan?.tasks)
@@ -365,6 +372,7 @@ export function architectureTaskScopesForRun(run, { gate, tasks } = {}) {
  * @property {string} [headSha] Exact head the receipt is bound to.
  * @property {string} [baseSha] Merge base of the affected-module plan.
  * @property {Record<string, any>} [config] Raw `architecture` configuration; normalized here.
+ * @property {{headSha:string, provenance:any[]}} [gateOrigin]
  * @property {string[]} [taskPaths] Explicit writePaths of the checked task(s) (used for Rust contract crate protection).
  * @property {{ id: string, mode?: 'merge' | 'range' | 'incomplete', commit: string | null, baseCommit?: string, writePaths: string[] }[]} [taskScopes] Per-task commit + writePaths scopes for Rust v2 runs and epic gates.
  * @property {AbortSignal} [signal]
@@ -380,6 +388,7 @@ export async function runArchitectureChecks({
   secrets = {},
   taskPaths,
   taskScopes,
+  gateOrigin,
   signal,
 } = {}) {
   config = normalizeArchitectureConfig(config);
@@ -416,9 +425,11 @@ export async function runArchitectureChecks({
       signal,
       redactions: secrets,
       ...(boundTaskPaths !== undefined ? { taskPaths: boundTaskPaths } : {}),
+      ...(gateOrigin ? { gateOrigin } : {}),
       ...(boundTaskScopes?.length ? { taskScopes: boundTaskScopes } : {}),
     });
     if (isRustV2Report(receipt.report)) {
+      if (gateOrigin) Object.assign(receipt, { gateOrigin, provenanceHash: hash(gateOrigin) });
       if (boundTaskPaths !== undefined) receipt.taskPaths = boundTaskPaths;
       if (boundTaskScopes?.length) receipt.taskScopes = boundTaskScopes;
     }
@@ -468,7 +479,7 @@ export async function runArchitectureChecks({
 // oxlint-disable-next-line complexity -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
 export async function isCurrentArchitectureReceipt(
   receipt,
-  { cwd, project, headSha, baseSha, config, taskPaths, taskScopes, signal, now } = {},
+  { cwd, project, headSha, baseSha, config, taskPaths, taskScopes, gateOrigin, signal, now } = {},
 ) {
   try {
     config = normalizeArchitectureConfig(config);
@@ -499,6 +510,15 @@ export async function isCurrentArchitectureReceipt(
         // any path granted during the check must remain authorized by the caller's expectedTaskPaths.
         if (actualTaskPaths.some(item => !expectedTaskPaths.includes(item))) return false;
       }
+      if (gateOrigin || receipt.gateOrigin) {
+        if (
+          !gateOrigin ||
+          !receipt.gateOrigin ||
+          hash(gateOrigin) !== receipt.provenanceHash ||
+          hash(receipt.gateOrigin) !== receipt.provenanceHash
+        )
+          return false;
+      }
       const actualTaskScopes = receipt?.taskScopes === undefined ? [] : normalizeTaskScopes(receipt.taskScopes);
       if (hasIncompleteTaskScope(actualTaskScopes)) return false;
       const expectedTaskScopes = normalizeTaskScopes(taskScopes);
@@ -512,6 +532,7 @@ export async function isCurrentArchitectureReceipt(
       signal,
       ...(now ? { now } : {}),
       ...(isRust && receipt.taskPaths !== undefined ? { taskPaths: receipt.taskPaths } : {}),
+      ...(isRust && gateOrigin ? { gateOrigin } : {}),
       ...(isRust && receipt.taskScopes !== undefined ? { taskScopes: receipt.taskScopes } : {}),
     });
     if (
