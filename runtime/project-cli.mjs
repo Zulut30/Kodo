@@ -13,6 +13,7 @@ function validateFlags(action, flags, positional) {
   if (flags['--command-id'] !== undefined && !uuid.test(flags['--command-id'])) invalid();
   if (
     (['create', 'set'].includes(action) && !flags['--file']) ||
+    (['machine-down', 'machine-up'].includes(action) && !flags['--machine']) ||
     (action === 'pause-pool' && (!flags['--subscription'] || !flags['--until'])) ||
     (action === 'approve-risk' && !flags['--reason'])
   )
@@ -32,7 +33,7 @@ function argumentsFor(argv) {
   let [action, ...args] = argv;
   const profile = action === 'profile';
   if (profile) [action, ...args] = args;
-  if (profile && !['set', 'show', 'pause-pool'].includes(action)) invalid();
+  if (profile && !['set', 'show', 'pause-pool', 'machine-down', 'machine-up'].includes(action)) invalid();
   const writes = ['create', 'resume', 'cancel', 'pause', 'reprioritize', 'approve-risk'];
   if (!profile && ![...writes, 'status', 'plan', 'gc-worktrees'].includes(action)) invalid();
   const allowed = new Set([
@@ -41,6 +42,8 @@ function argumentsFor(argv) {
     ...({
       create: ['--file'],
       set: ['--file'],
+      'machine-down': ['--machine'],
+      'machine-up': ['--machine'],
       'pause-pool': ['--subscription', '--until'],
       plan: ['--limit', '--dry-run'],
       resume: ['--retry-failed'],
@@ -151,6 +154,13 @@ async function profileOperation(store, repo, { action, projectId, flags }, input
     await new Promise(resolve => setTimeout(resolve, 50));
   }
   try {
+    if (action === 'machine-down' || action === 'machine-up') {
+      const profile = repo.getProfile(projectId);
+      const machine = profile?.machines.find(row => row.id === flags['--machine']);
+      if (!machine) throw Object.assign(new Error('Unknown machine'), { code: 'project_profile_invalid' });
+      machine.down = action === 'machine-down';
+      return repo.setProfile(projectId, profile);
+    }
     return action === 'set'
       ? repo.setProfile(projectId, input)
       : repo.pausePool(projectId, flags['--subscription'], flags['--until']);
@@ -160,7 +170,7 @@ async function profileOperation(store, repo, { action, projectId, flags }, input
 }
 
 function projectFailure(error, phase, action) {
-  const profile = ['set', 'show', 'pause-pool'].includes(action);
+  const profile = ['set', 'show', 'pause-pool', 'machine-down', 'machine-up'].includes(action);
   const argumentError = phase === 'arguments';
   const dataError = [
     ...(profile ? ['project_profile_invalid', 'project_wave_required'] : []),
@@ -266,7 +276,7 @@ export async function projectCli(argv, ports = {}) {
         action: { op: 'create', spec: input },
       });
       projectId = result.projectId;
-    } else if (['set', 'show', 'pause-pool'].includes(options.action)) {
+    } else if (['set', 'show', 'pause-pool', 'machine-down', 'machine-up'].includes(options.action)) {
       result = { profile: await profileOperation(store, repo, options, input, ports.profileWaitMs) };
     } else if (options.action === 'gc-worktrees') {
       const snapshot = await repo.snapshot(projectId);

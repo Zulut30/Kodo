@@ -75,3 +75,16 @@ test('B5 direct worker assignment respects unknown occupancy', async () => {
   const { assignWorker } = await import('../runtime/execution-profile.mjs');
   assert.equal(assignWorker(fourSlots, 0, Array(4).fill(undefined), ['fast']), null);
 });
+
+test('16A validates transport settings and excludes unavailable machines', async () => {
+  const { assignWorker } = await import('../runtime/execution-profile.mjs');
+  const profile = structuredClone(fourSlots);
+  Object.assign(profile.machines[0], { kind: 'ssh', gitRemote: 'team/workers.eu', trustedBuilds: false, down: true });
+  assert.deepEqual(validateExecutionProfile(profile).machines, profile.machines);
+  assert.equal(assignWorker(profile, 0, [], ['fast']), null);
+  for (const patch of [{ trustedBuilds: 1 }, { down: 'yes' }, { gitRemote: '--upload-pack' }, { gitRemote: 'a:b' }]) {
+    assert.throws(() => validateExecutionProfile({ ...profile, machines: [{ ...profile.machines[0], ...patch }] }), {
+      code: 'project_profile_invalid',
+    });
+  }
+});

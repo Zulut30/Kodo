@@ -40,7 +40,16 @@ export function validateExecutionProfile(profile, options = { knownValues: [] })
     check(sub.cooldownUntil == null || instant(sub.cooldownUntil));
   }
   for (const machine of profile.machines) {
-    keys(machine, ['id', 'kind', 'maxWorkers', 'maxHeavyBuilds', 'environmentId']);
+    keys(machine, [
+      'id',
+      'kind',
+      'maxWorkers',
+      'maxHeavyBuilds',
+      'environmentId',
+      'gitRemote',
+      'trustedBuilds',
+      'down',
+    ]);
     check(
       label(machine.id) &&
         ['local', 't3-env', 'ssh'].includes(machine.kind) &&
@@ -49,6 +58,12 @@ export function validateExecutionProfile(profile, options = { knownValues: [] })
         machine.maxHeavyBuilds >= 1 &&
         machine.maxHeavyBuilds <= machine.maxWorkers,
     );
+    check(
+      machine.gitRemote === undefined ||
+        (label(machine.gitRemote) && !machine.gitRemote.includes('..') && !machine.gitRemote.endsWith('/')),
+    );
+    check(machine.trustedBuilds === undefined || typeof machine.trustedBuilds === 'boolean');
+    check(machine.down === undefined || typeof machine.down === 'boolean');
     check(machine.environmentId === undefined || label(machine.environmentId));
   }
   check(
@@ -61,8 +76,9 @@ export function validateExecutionProfile(profile, options = { knownValues: [] })
 }
 
 const active = (profile, now) => profile.subscriptions.filter(sub => !(Date.parse(sub.cooldownUntil) > now));
+const availableHosts = profile => profile.machines.filter(machine => !machine.down);
 export function waveCapacity(profile, now) {
-  return profile ? Math.min(total(active(profile, now), 'slots'), total(profile.machines, 'maxWorkers')) : 5;
+  return profile ? Math.min(total(active(profile, now), 'slots'), total(availableHosts(profile), 'maxWorkers')) : 5;
 }
 
 function remaining(resources, available, key, kind, occupied) {
@@ -75,7 +91,7 @@ function remaining(resources, available, key, kind, occupied) {
 
 export function freeWorkerSlots(profile, now, occupied) {
   const subscriptions = remaining(profile.subscriptions, active(profile, now), 'slots', 'subscription', occupied);
-  const machines = remaining(profile.machines, profile.machines, 'maxWorkers', 'machine', occupied);
+  const machines = remaining(profile.machines, availableHosts(profile), 'maxWorkers', 'machine', occupied);
   return Math.max(0, Math.min(subscriptions, machines));
 }
 
@@ -92,7 +108,7 @@ export function chargedBriefs(profile, now, briefs) {
       count++;
       continue;
     }
-    if (Date.parse(pool.cooldownUntil) > now) continue;
+    if (host.down || Date.parse(pool.cooldownUntil) > now) continue;
     const p = used.get(pool.id) ?? 0,
       m = hosts.get(host.id) ?? 0;
     if (p >= pool.slots || m >= host.maxWorkers) continue;
@@ -111,7 +127,7 @@ export function assignWorker(profile, now, occupied, tiers) {
     rows.filter(row => occupied.filter(p => p?.[kind]?.id === row.id).length < row[key]);
   const pools = free(active(profile, now), 'subscription', 'slots');
   const pool = tiers.map(tier => pools.find(p => p.tier === tier)).find(Boolean);
-  const host = free(profile.machines, 'machine', 'maxWorkers')[0];
+  const host = free(availableHosts(profile), 'machine', 'maxWorkers')[0];
   if (!pool || !host) return null;
   return {
     subscription: { id: pool.id, provider: pool.provider, model: pool.model, tier: pool.tier },

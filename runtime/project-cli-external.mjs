@@ -9,11 +9,17 @@ const sha = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 const booleans = ['--json', '--retry-failed', '--defer-gate', '--abandon'];
 const flagsFor = {
   'next-wave': ['--json', '--host', '--limit', '--stall-minutes', '--retry-failed'],
-  'complete-task': ['--json', '--head', '--defer-gate', '--abandon', '--command-id', '--attempt'],
+  'complete-task': ['--json', '--head', '--defer-gate', '--abandon', '--command-id', '--attempt', '--receipt'],
   gates: ['--json', '--retry-failed'],
 };
 // Constant codes of the protocol itself; never data, paths or provider output.
 const reported = new Set([
+  'project_transport_failed',
+  'project_transport_too_large',
+  'project_submission_locked',
+  'project_brief_path_leak',
+  'project_transport_head_mismatch',
+  'project_receipt_mismatch',
   'project_dependency_cycle',
   'project_dependency_missing',
   'project_dependency_duplicate',
@@ -126,7 +132,7 @@ function human(report) {
   for (const brief of result.briefs)
     lines.push(
       `- ${brief.chatTitle} (${brief.role})`,
-      `  worktree: ${brief.worktree}`,
+      brief.repository ? `  repository: ${brief.repository}` : `  worktree: ${brief.worktree}`,
       `  branch: ${brief.branch}`,
       `  self-check: ${brief.selfCheck}`,
       `  complete: ${brief.completeCommand}`,
@@ -191,6 +197,7 @@ async function operate(options, ports, safety) {
         projectId: options.projectId,
         taskId: options.taskId,
         head: flags['--head'],
+        receipt: flags['--receipt'],
         deferGate: flags['--defer-gate'] === true,
         abandon: flags['--abandon'] === true,
         ...(flags['--command-id'] ? { commandId: flags['--command-id'] } : {}),

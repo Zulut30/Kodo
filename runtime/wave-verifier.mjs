@@ -634,9 +634,16 @@ export async function runEpicGate({ engine, run: input, signal, arbitration = nu
  * `{ passed: false, skipped: true, code: 'run_integrated' }` without touching the Run. With
  * `expectedHeadSha`, a worktree that moved to another head is `{ skipped: true, code: 'head_changed' }`
  * and its proof is kept as well.
- * @param {{ engine: any, run: any, signal?: AbortSignal, maxHeavyBuilds?: number, expectedHeadSha?: string }} input
+ * @param {{ engine: any, run: any, signal?: AbortSignal, maxHeavyBuilds?: number, remoteChecks?: object, expectedHeadSha?: string }} input
  */
-export async function verifyTaskFastOnce({ engine, run: input, signal, maxHeavyBuilds = 1, expectedHeadSha }) {
+export async function verifyTaskFastOnce({
+  engine,
+  run: input,
+  signal,
+  maxHeavyBuilds = 1,
+  expectedHeadSha,
+  remoteChecks,
+}) {
   const id = typeof input === 'string' ? input : input?.id;
   engine.store.getRun(id);
   return withRunLease(engine, id, signal, async (leased, leaseError) => {
@@ -652,7 +659,10 @@ export async function verifyTaskFastOnce({ engine, run: input, signal, maxHeavyB
     run.behavior = null;
     engine.save(run);
     try {
-      await runFastChecks({ engine, run, signal: leased, maxHeavyBuilds });
+      if (remoteChecks) {
+        run.checks = remoteChecks;
+        run.trustedRemoteVerification = true;
+      } else await runFastChecks({ engine, run, signal: leased, maxHeavyBuilds });
       await engine.behaviorGate(run, leased);
       if (run.behavior.headSha !== run.checks.headSha)
         throw fail('HEAD изменился между быстрыми проверками и behaviour gate', 'stale_checks');
@@ -668,6 +678,7 @@ export async function verifyTaskFastOnce({ engine, run: input, signal, maxHeavyB
       )
         throw error;
       const diagnostics = buildDiagnosticPack({
+        run,
         checks: run.checks,
         behavior: run.behavior,
         error,

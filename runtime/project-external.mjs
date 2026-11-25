@@ -18,8 +18,13 @@
  * `project-director-waves.mjs`. Kodo never starts or archives the host's chats.
  */
 import { createHash, randomUUID } from 'node:crypto';
+import path from 'node:path';
+import { assertRemoteBriefPaths, privateBriefRoots } from './remote-brief-paths.mjs';
+import { cleanupRemoteRefs, fetchSubmission, pushBase, remoteRefs, transport } from './project-remote-transport.mjs';
+import { portableDirectorTaskInput } from './project-contracts.mjs';
 import { isDeepStrictEqual } from 'node:util';
 import { stat } from 'node:fs/promises';
+import { matchesReceiptFile, receiptBinding } from './remote-task-receipt.mjs';
 import { execute } from './command.mjs';
 import { retryDiff } from './project-retry-diff.mjs';
 import { git, makeWorktree, plannedWorktreeHome } from './workspace.mjs';
@@ -164,7 +169,12 @@ async function briefFor(state, attempt, task, run) {
   need(run.task === input, 'binding_invalid');
   const { role, instructions } = workerRole(task.owner);
   // The caller's CLI (`cli`): a chat runs the same Kodo package that issued the brief.
-  const selfCheck = `${cli} ci feedback --base ${run.baseSha} --project ${quotePath(run.cwd)} --json`;
+  const remote = remoteRefs(project.projectId, run);
+  if (remote) await pushBase(run, remote, state.signal);
+  const dispatcher = remote ? 'kodo' : cli;
+  const selfCheck = remote
+    ? 'kodo ci feedback --base ' + run.baseSha + ' --json'
+    : `${cli} ci feedback --base ${run.baseSha} --project ${quotePath(run.cwd)} --json`;
   const prior = await latestPriorTaskRun({ store: storeOf(state.ctx), project, task, run, attempt });
   const previousAttempt = prior?.externalConflict?.previousAttempt;
   let carry = previousAttempt ? '\nPort the changes in previousAttempt.diff onto the fresh baseSha.' : '';
@@ -173,7 +183,32 @@ async function briefFor(state, attempt, task, run) {
       ' If truncated is true the diff is incomplete. Recover omittedFiles from previousAttempt.headSha in this repository.';
     if (previousAttempt.truncated === undefined) state.pendingDiffs.set(attempt.id, prior.id);
   }
-  const basePrompt = `${input}\n\n${workerContract(run, task.writePaths, selfCheck)}${carry}`;
+  const referencePath = ref => {
+    if (!remote || !path.isAbsolute(ref.path)) return ref.path;
+    const relative = path.relative(project.root, ref.path);
+    return relative === '..' || relative.startsWith('..' + path.sep) || path.isAbsolute(relative)
+      ? 'sha256:' + ref.sha256
+      : relative.split(path.sep).join('/');
+  };
+  const interfaces = task.interfaceRefs.map(referencePath);
+  const workerInput = remote ? portableDirectorTaskInput(input, referencePath) : input;
+  const taskPrompt = remote
+    ? [
+        workerInput,
+        'In your clone, run:',
+        'git fetch ' + remote.repository + ' ' + remote.baseRef,
+        'git worktree add -b ' + run.branch + ' ' + run.id + ' ' + run.baseSha,
+        'cd ' + run.id,
+        'Implement only the assigned write paths. Preserve existing tests and add tests for new behaviour.',
+        'Stage the assigned changes with git add.',
+        'git commit -m "Implement assigned task"',
+        selfCheck,
+        'git push ' + remote.repository + ' HEAD:' + remote.workRef,
+        'Report the full commit SHA.',
+      ].join('\n')
+    : `${input}\n\n${workerContract(run, task.writePaths, selfCheck)}`;
+  // An automatic retry after an integration conflict (16B2) carries the earlier attempt's diff.
+  const basePrompt = taskPrompt + carry;
   const { prompt, extra } = await enrichExternalWaveBrief({
     state,
     attempt,
@@ -181,6 +216,7 @@ async function briefFor(state, attempt, task, run) {
     run,
     basePrompt,
     roleInstructions: instructions,
+    diagnosticWorktrees: remote ? [run.cwd, state.integration.worktree] : null,
   });
   const brief = {
     ...run.workerPlacement,
@@ -192,17 +228,18 @@ async function briefFor(state, attempt, task, run) {
     role,
     roleInstructions: instructions,
     writePaths: [...task.writePaths],
-    worktree: run.cwd,
+    ...(remote ?? { worktree: run.cwd }),
     branch: run.branch,
     baseSha: run.baseSha,
-    interfaces: task.interfaceRefs.map(ref => ref.path),
+    interfaces,
     prompt,
     ...(previousAttempt && { previousAttempt }),
     selfCheck,
-    completeCommand: `${cli} project complete-task ${project.projectId} ${task.id} --head <SHA> --attempt ${attempt.id} --defer-gate`,
-    abandonCommand: `${cli} project complete-task ${project.projectId} ${task.id} --head <SHA> --abandon --attempt ${attempt.id}`,
+    completeCommand: `${dispatcher} project complete-task ${project.projectId} ${task.id} --head <SHA> --attempt ${attempt.id} --defer-gate`,
+    abandonCommand: `${dispatcher} project complete-task ${project.projectId} ${task.id} --head <SHA> --abandon --attempt ${attempt.id}`,
     ...extra,
   };
+  if (remote) assertRemoteBriefPaths(brief, privateBriefRoots(run, storeOf(state.ctx).home));
   C.assertDirectorSafe(brief, options);
   return brief;
 }
@@ -226,6 +263,11 @@ async function installExternalRun(state, attempt, task) {
           const placement = placementFor(state, task, attempt.id);
           need(placement, 'pool_unavailable');
           value.runDraft.workerPlacement = placement;
+          if (placement.machine.kind !== 'local') {
+            value.runDraft.remoteIntegrationWorktree = integration.worktree;
+            value.runDraft.transportRemote =
+              state.profile.machines.find(m => m.id === placement.machine.id)?.gitRemote ?? 'origin';
+          }
         }
         value.runDraft.executor = { kind: 'external', host };
         value.runDraft.verificationProfile = 'task-fast';
@@ -348,6 +390,16 @@ async function resumeInFlight(state, replayOnly) {
     if (executor.kind !== 'external' || executor.host !== state.host) continue;
     const run = storedRun(store, attempt.runId);
     if ((replayOnly && !run) || run?.integration?.status === 'merged') continue;
+    if (state.profile?.machines.some(m => m.down && m.id === run?.workerPlacement?.machine?.id)) {
+      if (run?.state === 'succeeded' || integrationStarted(run)) continue;
+      state.blocked.push({
+        taskId: attempt.taskId,
+        attemptId: attempt.id,
+        code: 'project_machine_down',
+        hint: 'Abandon the attempt and use next-wave --retry-failed.',
+      });
+      continue;
+    }
     await guarded(state, attempt.taskId, () => prepareAttempt(state, currentOf(state.snapshot, attempt.taskId)));
   }
 }
@@ -637,7 +689,7 @@ export async function nextWave(ctx, input) {
   const stallMinutes = input.stallMinutes ?? 30;
   need(Number.isSafeInteger(stallMinutes) && stallMinutes > 0, 'arguments');
   const pendingDiffs = new Map();
-  const result = await withWaveAdmissionLeases(store, projectId, async checkLease => {
+  const result = await withWaveAdmissionLeases(store, projectId, async (checkLease, admissionLost) => {
     const now = Date.parse((ctx.clock ?? (() => new Date().toISOString()))());
     const profile = ctx.repo.getProfile(projectId);
     const maximum = waveCapacity(profile, now);
@@ -667,7 +719,7 @@ export async function nextWave(ctx, input) {
       blocked: [],
       apiCardCache: createApiCardCache(),
       buildApiCards: ctx.buildApiCards ?? buildApiCards,
-      signal,
+      signal: signal ? AbortSignal.any([signal, admissionLost]) : admissionLost,
     };
 
     const canPlan = initializePlacements(state);
@@ -1209,6 +1261,17 @@ async function verifySubmission(ctx, C, step, input) {
   return withHeldLease(store, dedupe, async dedupeLost => {
     const before = await state();
     if (before !== 'go') return before === 'verified' ? null : stale;
+    let remoteChecks;
+    if (step.remote) {
+      const checked = signal ? AbortSignal.any([dedupeLost, signal]) : dedupeLost;
+      const checkLease = () => {
+        if (!leaseOwned(store, dedupe)) fail('lease_lost');
+        checked.throwIfAborted();
+      };
+      const prepared = await prepareRemoteSubmission(ctx, step, input, checked, checkLease);
+      if (prepared.defect) return prepared.defect;
+      remoteChecks = prepared.remoteChecks;
+    }
     return withMachineBuild(
       store,
       async slotLost => {
@@ -1223,6 +1286,7 @@ async function verifySubmission(ctx, C, step, input) {
             run: run.id,
             signal: checked,
             expectedHeadSha: head,
+            remoteChecks,
             ...(machine?.maxHeavyBuilds ? { maxHeavyBuilds: machine.maxHeavyBuilds } : {}),
           });
         } catch (error) {
@@ -1258,7 +1322,11 @@ async function verifySubmission(ctx, C, step, input) {
                 // A failed check keeps its diagnostic pack for the next attempt's brief (15D).
                 store.updateRun(
                   run.id,
-                  { state: 'executing', ...(verdict.diagnostics ? { lastDiagnostics: verdict.diagnostics } : {}) },
+                  {
+                    state: 'executing',
+                    ...(step.remote && !verdict.passed ? { remoteRejectedHead: head } : {}),
+                    ...(verdict.diagnostics ? { lastDiagnostics: verdict.diagnostics } : {}),
+                  },
                   { preserveCancellation: true },
                 );
                 if (!verdict.passed) {
@@ -1484,6 +1552,7 @@ const controlledProject = project => project.paused || ['cancelled', 'failed', '
 async function finishCompletion(ctx, C, input, run, replayed) {
   const store = storeOf(ctx),
     { projectId, signal } = input;
+  await cleanupRemoteRefs(run, signal);
   const receipt = () => store.getRun(run.id).externalCompletion;
   let completion = receipt(),
     gates = completion.gates,
@@ -1580,6 +1649,16 @@ function recordFailure(ctx, run, defect) {
   });
 }
 
+// A submission's inspection outcome for telemetry (16C): accepted or the defect code.
+const logSubmission = (ctx, run, attempt, head, defect) =>
+  logEvent(
+    storeOf(ctx),
+    run.id,
+    'task_submitted',
+    { attemptId: attempt.id, headSha: head, accepted: !defect, ...(defect ? { code: defect.code } : {}) },
+    clockMs(ctx),
+  );
+
 async function admitSubmission(ctx, C, input) {
   const { projectId, taskId, head, attemptId } = input;
   const current = await externalAttempt(ctx, C, projectId, taskId);
@@ -1604,31 +1683,83 @@ async function admitSubmission(ctx, C, input) {
     const missing = await replayedMerge(ctx, input, run);
     return missing ? { result: missing } : { replay: run };
   }
+  if (
+    remoteRefs(projectId, run) &&
+    run.headSha !== head &&
+    (run.state === 'succeeded' || integrationStarted(run) || run.externalCompletion)
+  )
+    return blocked('project_submission_locked');
   if (controlledProject(snapshot.project)) return blocked('project_control_blocked');
   // A verified head whose integration was interrupted (crash) continues where it stopped.
   const interrupted = run.state === 'succeeded' && run.headSha === head && integrationStarted(run);
   if (interrupted) return { ...current, verified: true };
   if (!['running', 'verifying'].includes(attempt.status) || run.integration?.status === 'merged')
     return blocked('project_attempt_not_running');
-  const defect = await inspectSubmission(ctx.engine, run, task, head);
-  logEvent(
-    storeOf(ctx),
-    run.id,
-    'task_submitted',
-    { attemptId: attempt.id, headSha: head, accepted: !defect, ...(defect ? { code: defect.code } : {}) },
-    clockMs(ctx),
-  );
-  if (defect) {
-    // After reassignment, a bare SHA off this branch (or its shared starting
-    // commit) does not identify the current worker. Its own commits still count.
-    const attributable =
-      attemptId !== undefined ||
-      attempt.number === 1 ||
-      (head !== run.baseSha && defect.code !== 'external_branch_mismatch');
-    if (attributable) recordFailure(ctx, run, defect);
-    return { result: { status: 'checks_failed', ...defect, revision: snapshot.revision } };
+  const remote = remoteRefs(projectId, run);
+  if (!remote) {
+    const defect = await inspectSubmission(ctx.engine, run, task, head);
+    logSubmission(ctx, run, attempt, head, defect);
+    if (defect) {
+      // After reassignment, a bare SHA off this branch (or its shared starting
+      // commit) does not identify the current worker. Its own commits still count.
+      const attributable =
+        attemptId !== undefined ||
+        attempt.number === 1 ||
+        (head !== run.baseSha && defect.code !== 'external_branch_mismatch');
+      if (attributable) recordFailure(ctx, run, defect);
+      return { result: { status: 'checks_failed', ...defect, revision: snapshot.revision } };
+    }
   }
-  return { ...current, verified: false };
+  return { ...current, verified: false, remote };
+}
+
+// The per-Run verification lease serializes checkout changes, including two dispatchers
+// submitting different heads. Network, scope inspection and command planning hold no project lease.
+async function prepareRemoteSubmission(ctx, step, input, signal, checkLease) {
+  const { run, task, remote } = step;
+  const { head, projectId } = input;
+  const store = storeOf(ctx);
+  const fetched = await fetchSubmission(run, remote, head, signal, checkLease);
+  if (fetched) return { defect: { blocked: fetched } };
+  if (!(await ancestor(run.project, run.baseSha, head))) return { defect: problem('external_not_descendant') };
+  const unsafe = await historyDefect(ctx.engine, run, task, head);
+  if (unsafe) return { defect: unsafe };
+  if ((await specialEntries(run.project, run.baseSha, head)).length) return { defect: problem('external_symlink') };
+  checkLease();
+  const current = store.getRun(run.id);
+  if (cancelled(current)) return { defect: { blocked: 'project_submission_stale' } };
+  if (current.state === 'succeeded' || integrationStarted(current))
+    return { defect: { blocked: 'project_submission_locked' } };
+  const previous = await git(run.cwd, ['rev-parse', 'HEAD']);
+  const changed = await workerStateDefect(run, previous);
+  if (changed) return { defect: changed };
+  checkLease();
+  if (previous !== head) {
+    if (previous === run.baseSha || (await ancestor(run.project, previous, head))) {
+      await transport(run.cwd, ['merge', '--ff-only', head], signal);
+    } else if (current.remoteRejectedHead === previous) {
+      await transport(run.cwd, ['reset', '--keep', head], signal);
+    } else return { defect: { blocked: 'project_submission_locked' } };
+  }
+  const defect = await inspectSubmission(ctx.engine, run, task, head);
+  logSubmission(ctx, run, step.attempt, head, defect);
+  if (defect) {
+    if (defect.code !== 'external_head_changed' && !cancelled(store.getRun(run.id))) {
+      store.updateRun(run.id, { remoteRejectedHead: head }, { preserveCancellation: true });
+      // The work ref of this attempt identifies its worker: the failure counts for the watchdog.
+      recordFailure(ctx, run, defect);
+    }
+    return { defect };
+  }
+  if (
+    input.receipt &&
+    ctx.repo.getProfile(projectId)?.machines.some(m => m.id === run.workerPlacement.machine.id && m.trustedBuilds)
+  ) {
+    const binding = await receiptBinding(run, head);
+    if (!(await matchesReceiptFile(input.receipt, binding))) return { defect: { blocked: 'project_receipt_mismatch' } };
+    return { remoteChecks: { ...binding, source: 'remote' } };
+  }
+  return {};
 }
 
 /**
@@ -1640,8 +1771,8 @@ async function admitSubmission(ctx, C, input) {
  * stale one is `project_attempt_stale`), and a late abandon of an earlier attempt replays its
  * result without touching the current one.
  *
- * Concurrency: the Git, scope and secret checks run in a short section under `project:<id>`
- * (waited for; `project_busy` after the wait); `task-fast` runs outside it in one build slot of
+ * For remote attempts the project section admits the submission. The per-Run verification
+ * lease covers fetch, checkout, scope checks and receipt planning. Task-fast runs in a build slot of
  * the machine (`machine`: `{ id, maxHeavyBuilds }`, default one local slot), once per Run at a
  * time. The verified head is queued (`priority`, default 0) and merged by whichever submission
  * drains the queue; this call waits for its row (`integrationWaitMs`, then
@@ -1649,7 +1780,7 @@ async function admitSubmission(ctx, C, input) {
  * row stays queued for a repeat).
  * @param {{ repo: any, engine: any, store?: any, contracts?: any, clock?: () => string, buildApiCards?: any }} ctx
  * @param {{ projectId: string, taskId: string, head: string, deferGate?: boolean, abandon?: boolean,
- *   commandId?: string, attemptId?: string, ports?: any, signal?: AbortSignal, priority?: number,
+ *   commandId?: string, attemptId?: string, receipt?: string, ports?: any, signal?: AbortSignal, priority?: number,
  *   machine?: { id?: string, maxHeavyBuilds?: number }, integrationWaitMs?: number }} input
  */
 export async function completeTask(ctx, input) {
@@ -1661,10 +1792,28 @@ export async function completeTask(ctx, input) {
     store = storeOf(ctx);
   await externalAttempt(ctx, C, projectId, taskId);
   const section = work => withProjectSection(store, projectId, work, { signal });
-  if (abandon)
-    return section(async () =>
-      abandonTarget(ctx, await externalAttempt(ctx, C, projectId, taskId), { head, attemptId, commandId }),
-    );
+  if (abandon) {
+    const { result, run } = await section(async () => {
+      const target = await externalAttempt(ctx, C, projectId, taskId);
+      const result = await abandonTarget(ctx, target, { head, attemptId, commandId });
+      return { result, run: target.run };
+    });
+    if (
+      result.status === 'abandoned' &&
+      result.attemptId === run.directorBinding.attemptId &&
+      remoteRefs(projectId, run)
+    ) {
+      try {
+        const token = await acquireLeaseWaiting(store, 'project-verify:' + run.id, { signal, waitMs: 0 });
+        await withHeldLease(store, token, lost =>
+          cleanupRemoteRefs(run, signal ? AbortSignal.any([signal, lost]) : lost),
+        );
+      } catch {
+        // Abandon is already durable. GC retries cleanup after the verifier releases the Run.
+      }
+    }
+    return result;
+  }
   const step = await section(() => admitSubmission(ctx, C, input));
   if (step.result) {
     if (step.conflictRunId) await captureConflictDiff(ctx, step.conflictRunId, step.task.writePaths);

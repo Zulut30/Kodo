@@ -134,6 +134,7 @@ const isWaveRun = run => run?.verificationProfile === TASK_FAST_PROFILE || run?.
 function recordWaveDiagnostics(run, { error = undefined, review = undefined, secrets = {} } = {}) {
   if (!isWaveRun(run)) return null;
   const diagnostics = buildDiagnosticPack({
+    run,
     error,
     checks: run.checks,
     behavior: run.behavior,
@@ -195,7 +196,9 @@ function failedCheck(run, kind, result, comparison) {
       : classification === 'regression'
         ? '[regression: passed on the base commit] '
         : '';
-  const diagnostics = isWaveRun(run) ? buildDiagnosticPack({ stdout: result.stdout, stderr: result.stderr }) : null;
+  const diagnostics = isWaveRun(run)
+    ? buildDiagnosticPack({ run, stdout: result.stdout, stderr: result.stderr })
+    : null;
   return Object.assign(
     new Error(
       `Проверка ${kind} не пройдена (exit ${result.code}): ${label}${(result.stdout + result.stderr).slice(-6000)}`,

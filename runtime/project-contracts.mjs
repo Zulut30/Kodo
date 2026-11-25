@@ -925,6 +925,16 @@ export function buildDirectorTaskInput(input, options) {
     directorBytes('taskRunInput', { schemaVersion: 1, projectContext, task: contract(task) }, options).toString('utf8')
   );
 }
+// The frozen Run input is already validated. Only the worker-facing copy changes location.
+export function portableDirectorTaskInput(input, referencePath) {
+  if (!input.startsWith(PREFIX)) fail('project_binding_invalid');
+  const payload = JSON.parse(input.slice(PREFIX.length));
+  payload.projectContext.root = '.';
+  for (const ref of [...payload.projectContext.architectureRefs, ...payload.task.interfaceRefs])
+    ref.path = referencePath(ref);
+  return PREFIX + JSON.stringify(payload);
+}
+
 /** The frozen ProjectTask writePaths of a task Run input (`buildDirectorTaskInput`). */
 export function directorTaskWritePaths(text, options) {
   if (typeof text !== 'string' || !text.startsWith(PREFIX)) fail('project_binding_invalid');
