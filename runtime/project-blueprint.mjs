@@ -19,6 +19,8 @@ import { workerEnvironment } from './security.mjs';
 import { inside } from './toolchains.mjs';
 
 export const BLUEPRINT_DIR = '.kodo/blueprint';
+export const MAX_MILESTONE_TASKS = 80;
+export const MAX_PROJECT_TASKS = 400;
 export const MAX_TASK_INPUT_BYTES = 12000;
 export const MAX_TASK_WRITE_PATHS = 24;
 export const MAX_TASK_MODULES = 3;
@@ -519,16 +521,57 @@ export function taskAncestors(tasks) {
 /** Pairs of tasks without a dependency path between them whose writePaths overlap.
  * `others` are tasks that may run concurrently with every task in `tasks`. */
 export function parallelOverlaps(tasks, { ancestors = taskAncestors(tasks), others = [] } = {}) {
-  const pairs = [];
-  for (let i = 0; i < tasks.length; i++) {
-    const left = tasks[i];
-    for (const right of tasks.slice(i + 1)) {
-      if (ancestors.get(left.id)?.has(right.id) || ancestors.get(right.id)?.has(left.id)) continue;
-      if (scopesOverlap(left.writePaths, right.writePaths)) pairs.push([left.id, right.id]);
+  // Each node indexes tasks ending at this literal directory and tasks anywhere below it.
+  // A wildcard inside a component leaves the whole component to the canonical matcher.
+  const node = () => ({ children: new Map(), ends: new Set(), below: new Set() });
+  const root = node();
+  const all = [...tasks, ...others];
+  const indexed = all.map((task, index) =>
+    task.writePaths.map(scope => {
+      const parts = scope.replace(/^\.\//, '').split('/');
+      const segments = [];
+      if (!parts.includes('..')) {
+        for (const part of parts) {
+          if (!part || part === '.' || /[^a-zA-Z0-9_.-]/.test(part)) break;
+          segments.push(part.toLowerCase());
+        }
+      }
+      return { index, scope, segments };
+    }),
+  );
+  for (const paths of indexed) {
+    for (const entry of paths) {
+      let at = root;
+      at.below.add(entry);
+      for (const part of entry.segments) {
+        if (!at.children.has(part)) at.children.set(part, node());
+        at = at.children.get(part);
+        at.below.add(entry);
+      }
+      at.ends.add(entry);
     }
-    for (const other of others)
-      if (!ancestors.get(left.id)?.has(other.id) && scopesOverlap(left.writePaths, other.writePaths))
-        pairs.push([left.id, other.id]);
+  }
+  const pairs = [];
+  for (const [i, left] of tasks.entries()) {
+    const matches = new Set();
+    for (const entry of indexed[i]) {
+      const compareEntries = candidates => {
+        for (const { index, scope } of candidates) {
+          if (index <= i || matches.has(index)) continue;
+          const right = all[index];
+          if (ancestors.get(left.id)?.has(right.id) || (index < tasks.length && ancestors.get(right.id)?.has(left.id)))
+            continue;
+          if (scopesOverlap([entry.scope], [scope])) matches.add(index);
+        }
+      };
+      let at = root;
+      for (const part of entry.segments) {
+        compareEntries(at.ends);
+        at = at.children.get(part);
+      }
+      compareEntries(at.below);
+    }
+    for (const index of [...matches].sort((a, b) => a - b)) pairs.push([left.id, all[index].id]);
   }
   return pairs;
 }
@@ -1398,6 +1441,17 @@ function analyzeFactorySpec(spec, options = {}) {
   const base = normalizeFactory(spec, { contracts, knownValues });
   const findings = [...base.findings, ...sectionFindings(projectMarkdown)];
   if (!base.spec) return { spec: null, findings };
+  if (base.spec.tasks.length > MAX_PROJECT_TASKS)
+    findings.push(finding('project_task_count', 'Проект содержит больше 400 задач'));
+  const parents = new Map(base.spec.epics.map(epic => [epic.id, epic.milestoneId]));
+  const counts = new Map();
+  for (const task of base.spec.tasks) {
+    const milestone = parents.get(task.epicId);
+    counts.set(milestone, (counts.get(milestone) ?? 0) + 1);
+  }
+  for (const [id, count] of counts)
+    if (count > MAX_MILESTONE_TASKS)
+      findings.push(finding('milestone_task_count', 'В майлстоуне ' + id + ' больше 80 задач'));
   const ancestors = taskAncestors(base.spec.tasks);
   const pairs = parallelOverlaps(base.spec.tasks, { ancestors });
   const inputFindings = taskInputFindings({

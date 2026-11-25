@@ -144,3 +144,5 @@ Git-транспорт `refs/kodo/<projectId>/base|work/<runId>`, брифы б�
 | 2026-11-25 | [PR #28](https://github.com/Zulut30/Kodo/pull/28) влит (`12ddb7a`), [Release v1.1.0](https://github.com/Zulut30/Kodo/releases/tag/v1.1.0). |
 | 2026-11-25 | Пилот Voxa: 17 задач влиты за 33 мин. Найдены два дефекта Kodo → [PR #29](https://github.com/Zulut30/Kodo/pull/29) `e831087`, [v1.1.1](https://github.com/Zulut30/Kodo/releases/tag/v1.1.1) (слот Cargo) и [PR #30](https://github.com/Zulut30/Kodo/pull/30) `509c396`, [v1.1.2](https://github.com/Zulut30/Kodo/releases/tag/v1.1.2) (происхождение в гейтах). Проект принят на 1.1.2. Контрольная точка 1 — ACCEPTED. |
 | 2026-11-25 | Стрим 16C (`kodo/16c-telemetry`): телеметрия `kodo report --project` (`throughput`, `taskDuration`, `breakdown`, `firstPassYield`, `arbitrations`, `interventions`, `utilization`), запись недостающих отметок времени жизненного цикла внешних задач/очереди/гейтов, обновлены навык `kodo-project-director`, `docs/T3-HOST.md` и `docs/OBSERVABILITY.md`. |
+
+16B2 — автоповторы конфликтов интеграции, наблюдение за внешними воркерами и волновые проекты до 400 задач.

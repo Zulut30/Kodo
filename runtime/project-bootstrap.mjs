@@ -15,6 +15,8 @@ import {
   FACTORY_ROLES,
   FOUNDATION_ID,
   MAX_TASK_INPUT_BYTES,
+  MAX_MILESTONE_TASKS,
+  MAX_PROJECT_TASKS,
   compileBlueprint,
   containerFindings,
   epicCycleFindings,
@@ -30,7 +32,7 @@ import {
 } from './project-blueprint.mjs';
 
 export const BOOTSTRAP_CLIENTS = Object.freeze(['codex', 'claude-code']);
-export const MILESTONE_TASKS = Object.freeze({ min: 1, max: 6 });
+export const MILESTONE_TASKS = Object.freeze({ min: 1, max: MAX_MILESTONE_TASKS });
 const MAX_PROMPT = 64 * 1024;
 const MAX_MILESTONE_FILE = 1024 * 1024;
 const LISTED_FILES = 400;
@@ -1197,6 +1199,8 @@ export function lintMilestone(milestone, snapshot, options = {}) {
     return done([finding('milestone_snapshot_incomplete', 'Снапшот неполный: нельзя проверить id и зависимости')]);
   const findings = [];
   const count = milestone.tasks.length;
+  if (current.tasks.length + count > MAX_PROJECT_TASKS)
+    findings.push(finding('project_task_count', 'Проект содержит больше 400 задач'));
   if (count < MILESTONE_TASKS.min || count > MILESTONE_TASKS.max)
     findings.push(
       finding(

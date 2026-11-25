@@ -20,6 +20,8 @@ test('Invalid next-wave/complete-task arguments fail before credentials or state
     ['next-wave', id, '--host'],
     ['next-wave', id, '--host', 'codex'],
     ['next-wave', id, '--host', 'T3'],
+    ['next-wave', id, '--host', 't3', '--stall-minutes', '0'],
+    ['next-wave', id, '--host', 't3', '--stall-minutes', 'abc'],
     ['next-wave', id, '--host', 't3', '--limit', '0'],
     ['next-wave', id, '--host', 't3', '--limit', '65'],
     ['next-wave', id, '--host', 't3', '--limit', '1.5'],
@@ -197,7 +199,10 @@ test('Project CLI delegates next-wave and complete-task to the pull protocol', a
       return snapshot.tasks.filter(task => task.status === 'proposed').map(task => task.id);
     },
   };
-  const next = await projectCli(['next-wave', waveId, '--host', 'orca', '--limit', '8', '--json'], { ...base, wave });
+  const next = await projectCli(
+    ['next-wave', waveId, '--host', 'orca', '--limit', '8', '--stall-minutes', '15', '--json'],
+    { ...base, wave },
+  );
   assert.equal(next.exitCode, 0, next.output);
   // Like drain, the selection sees which tasks have verified interface proofs.
   assert.deepEqual(

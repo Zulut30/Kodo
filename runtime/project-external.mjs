@@ -21,8 +21,9 @@ import { createHash, randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { stat } from 'node:fs/promises';
 import { execute } from './command.mjs';
+import { retryDiff } from './project-retry-diff.mjs';
 import { git, makeWorktree, plannedWorktreeHome } from './workspace.mjs';
-import { scopesOverlap } from './contracts.mjs';
+import { ownsPath, scopesOverlap } from './contracts.mjs';
 import { redact } from './security.mjs';
 import { markTaskWorktree } from './project-worktree-gc.mjs';
 import { isPullHost } from './job-contracts.mjs';
@@ -62,7 +63,7 @@ import {
 } from './execution-profile.mjs';
 import { planProjectHorizon, waveRanks } from './project-planner.mjs';
 import { buildApiCards } from './api-cards.mjs';
-import { createApiCardCache, enrichExternalWaveBrief } from './wave-context.mjs';
+import { createApiCardCache, enrichExternalWaveBrief, latestPriorTaskRun } from './wave-context.mjs';
 
 /** The largest batch one `nextWave` call returns. */
 export const MAX_WAVE_LIMIT = MAX_WORKERS;
@@ -164,7 +165,15 @@ async function briefFor(state, attempt, task, run) {
   const { role, instructions } = workerRole(task.owner);
   // The caller's CLI (`cli`): a chat runs the same Kodo package that issued the brief.
   const selfCheck = `${cli} ci feedback --base ${run.baseSha} --project ${quotePath(run.cwd)} --json`;
-  const basePrompt = `${input}\n\n${workerContract(run, task.writePaths, selfCheck)}`;
+  const prior = await latestPriorTaskRun({ store: storeOf(state.ctx), project, task, run, attempt });
+  const previousAttempt = prior?.externalConflict?.previousAttempt;
+  let carry = previousAttempt ? '\nPort the changes in previousAttempt.diff onto the fresh baseSha.' : '';
+  if (previousAttempt) {
+    carry +=
+      ' If truncated is true the diff is incomplete. Recover omittedFiles from previousAttempt.headSha in this repository.';
+    if (previousAttempt.truncated === undefined) state.pendingDiffs.set(attempt.id, prior.id);
+  }
+  const basePrompt = `${input}\n\n${workerContract(run, task.writePaths, selfCheck)}${carry}`;
   const { prompt, extra } = await enrichExternalWaveBrief({
     state,
     attempt,
@@ -188,6 +197,7 @@ async function briefFor(state, attempt, task, run) {
     baseSha: run.baseSha,
     interfaces: task.interfaceRefs.map(ref => ref.path),
     prompt,
+    ...(previousAttempt && { previousAttempt }),
     selfCheck,
     completeCommand: `${cli} project complete-task ${project.projectId} ${task.id} --head <SHA> --attempt ${attempt.id} --defer-gate`,
     abandonCommand: `${cli} project complete-task ${project.projectId} ${task.id} --head <SHA> --abandon --attempt ${attempt.id}`,
@@ -428,13 +438,16 @@ const byPriority = (a, b) => b.priority - a.priority || (a.id < b.id ? -1 : a.id
 
 // A retry goes to the executor of the failed attempt: this host retries only its own attempts;
 // the drain's (native) and other hosts' failed attempts are left to them.
-async function reserveRetries(state) {
+async function reserveRetries(state, manual) {
   const store = storeOf(state.ctx);
   const candidates = state.snapshot.tasks
     .filter(task => !settled.has(task.status) && task.status !== 'integrated' && task.status !== 'cancelled')
     .filter(task => retryable.has(currentOf(state.snapshot, task.id)?.status))
     .sort(byPriority);
   for (const candidate of candidates) {
+    const current = currentOf(state.snapshot, candidate.id);
+    if (!manual && !storedRun(store, current.runId)?.externalConflict) continue;
+
     if (freeSlots(state) <= 0) return;
     const executor = await waves.attemptExecutor(
       { repo: state.ctx.repo, store },
@@ -442,7 +455,7 @@ async function reserveRetries(state) {
       currentOf(state.snapshot, candidate.id),
     );
     if (executor.kind !== 'external' || executor.host !== state.host) {
-      state.blocked.push({ taskId: candidate.id, code: 'project_retry_executor' });
+      if (manual) state.blocked.push({ taskId: candidate.id, code: 'project_retry_executor' });
       continue;
     }
     await reserve(
@@ -583,7 +596,7 @@ async function explainWave(state, snapshot) {
  * the rest waits: task rows `{taskId, code}` and gate rows `{code, kind, id, gateId?, runId?}`
  * (`gateHolds`). An accepted project returns `code: 'project_accepted'` and no briefs.
  * @param {{ repo: any, engine: any, store?: any, contracts?: any, clock?: () => string, buildApiCards?: any }} ctx
- * @param {{ projectId: string, host: string, limit?: number, retryFailed?: boolean, ports?: any, cli?: string, signal?: AbortSignal }} input
+ * @param {{ projectId: string, host: string, limit?: number, retryFailed?: boolean, stallMinutes?: number, ports?: any, cli?: string, signal?: AbortSignal }} input
  */
 export async function nextWave(ctx, input) {
   const { projectId, host, retryFailed = false, ports, cli = DEFAULT_CLI, signal } = input;
@@ -609,6 +622,7 @@ export async function nextWave(ctx, input) {
       revision: snapshot.revision,
       cli,
       code: `project_${snapshot.project.status}`,
+      watch: [],
       briefs: [],
       blocked: [],
     };
@@ -620,7 +634,10 @@ export async function nextWave(ctx, input) {
   // priority, KODO_WORKTREE_HOME first) is refused before the lease or any reservation.
   const home = (ctx.engine.store ?? store)?.home;
   if (typeof home === 'string') quotePath(await plannedWorktreeHome(home));
-  return withWaveAdmissionLeases(store, projectId, async checkLease => {
+  const stallMinutes = input.stallMinutes ?? 30;
+  need(Number.isSafeInteger(stallMinutes) && stallMinutes > 0, 'arguments');
+  const pendingDiffs = new Map();
+  const result = await withWaveAdmissionLeases(store, projectId, async checkLease => {
     const now = Date.parse((ctx.clock ?? (() => new Date().toISOString()))());
     const profile = ctx.repo.getProfile(projectId);
     const maximum = waveCapacity(profile, now);
@@ -632,6 +649,7 @@ export async function nextWave(ctx, input) {
       worktreeHome: await waves.integrationHome(store),
     });
     const state = {
+      pendingDiffs,
       ctx,
       C,
       host,
@@ -655,7 +673,7 @@ export async function nextWave(ctx, input) {
     const canPlan = initializePlacements(state);
     await resumeInFlight(state, !canPlan);
     if (canPlan) {
-      if (retryFailed) await reserveRetries(state);
+      await reserveRetries(state, retryFailed);
       await reserveSelected(state, ports);
     }
     const final = await snapshotOf(ctx, projectId);
@@ -670,9 +688,62 @@ export async function nextWave(ctx, input) {
       blocked: state.blocked,
       ...(!maximum && { code: 'waiting_limits' }),
     };
-    C.assertDirectorSafe(result, options);
     return result;
   });
+  for (const brief of result.briefs) {
+    const priorId = pendingDiffs.get(brief.attemptId);
+    if (priorId) brief.previousAttempt = await captureConflictDiff(ctx, priorId, brief.writePaths);
+  }
+  const watch = await watchWorkers(ctx, result.briefs, stallMinutes, signal);
+  const report = { ...result, watch };
+  C.assertDirectorSafe(report, options);
+  return report;
+}
+
+async function watchWorkers(ctx, briefs, stallMinutes, signal) {
+  const watch = [];
+  const now = Date.parse((ctx.clock ?? (() => new Date().toISOString()))());
+  for (const brief of briefs) {
+    const run = storeOf(ctx).getRun(brief.runId);
+    const add = (code, hint, since) =>
+      watch.push({ attemptId: brief.attemptId, taskId: brief.taskId, code, hint, since });
+    if (cancelled(run) || run.externalCompletion) continue;
+    if (run.externalFailure?.repeated)
+      add('worker_repeated_failure', 'Forward the first diagnostic to the worker.', run.externalFailure.since);
+    const observe = async args => {
+      try {
+        const result = await execute('git', ['--no-optional-locks', ...args], {
+          cwd: run.cwd,
+          rawOutput: true,
+          allowFailure: true,
+          signal,
+        });
+        return result.code === 0 ? result.stdout : null;
+      } catch (error) {
+        if (error?.code === 'ENOENT') return null;
+        throw error;
+      }
+    };
+    const status = await observe(['status', '--no-renames', '--porcelain=v1', '-z', '--untracked-files=all']);
+    if (status === null) continue;
+    const dirty = status
+      .split('\0')
+      .filter(Boolean)
+      .map(entry => entry.slice(3));
+    const head = (await observe(['rev-parse', '--verify', 'refs/heads/' + run.branch]))?.trim();
+    if (!head) continue;
+    const changed =
+      head !== run.baseSha ? await observe(['diff', '--name-only', '--no-renames', '-z', run.baseSha, head]) : '';
+    if (dirty.concat((changed ?? '').split('\0').filter(Boolean)).some(file => !ownsPath(brief.writePaths, file)))
+      add(
+        'worker_scope_violation',
+        'Ask the worker to revert out-of-scope changes or abandon and reassign.',
+        new Date(now).toISOString(),
+      );
+    if (!dirty.length && head === run.baseSha && now - Date.parse(run.createdAt) > stallMinutes * 60000)
+      add('worker_no_progress', 'Remind the worker to start or abandon and reassign.', run.createdAt);
+  }
+  return watch;
 }
 
 // Symbolic links and submodules never enter the integration branch (raw output: never redacted).
@@ -813,6 +884,71 @@ async function abandonAttempt(ctx, snapshot, attempt, run, { head, commandId }) 
     attemptId: attempt.id,
     revision: (await snapshotOf(ctx, snapshot.project.projectId)).revision,
   };
+}
+
+// Runs inside the queue drain's fenced project and integration sections.
+async function scheduleConflictRetry(ctx, snapshot, task, attempt, run, headSha, integration) {
+  const code = 'project_integration_conflict';
+  const used = storeOf(ctx)
+    .db.prepare(
+      "SELECT count(*) AS n FROM kodo_project_attempts a JOIN runs r ON r.id=a.run_id WHERE a.project_id=? AND a.task_id=? AND json_type(r.body, '$.externalConflict')='object'",
+    )
+    .get(snapshot.project.projectId, task.id).n;
+  if (used >= 2) return { status: 'rejected', code, integration };
+  const previousAttempt = {
+    attemptId: attempt.id,
+    headSha,
+    reason: code,
+  };
+  const retry = { scheduled: true, remaining: 1 - used };
+  const current = currentOf(snapshot, task.id);
+  if (current.id !== attempt.id || cancelled(run)) return { status: 'rejected', code: 'project_submission_stale' };
+  if (current.status !== 'blocked')
+    await ctx.repo.apply(
+      command(snapshot, transition('attempt', attempt.id, 'blocked'), {
+        commandId: randomUUID(),
+        reason: 'project_integration_conflict_retry',
+      }),
+    );
+  storeOf(ctx).updateRun(run.id, {
+    state: 'cancelled',
+    cancelRequested: true,
+    externalAbandon: { schemaVersion: 1, attemptId: attempt.id, headSha },
+    externalConflict: {
+      previousAttempt,
+      writePaths: task.writePaths,
+      retry,
+      integration,
+      reason: integration.reason ?? code,
+      number: attempt.number,
+    },
+    error: { code: 'project_integration_conflict_retry', message: 'Integration conflict' },
+  });
+  return {
+    status: 'rejected',
+    code: 'project_integration_conflict_retry',
+    retry,
+    integration,
+    reason: integration.reason ?? code,
+  };
+}
+
+// The drain persists the immutable inputs before settling the queue. A completion,
+// its replay or a concurrent next-wave can finish capture after releasing the leases.
+async function captureConflictDiff(ctx, runId, legacyScopes) {
+  const store = storeOf(ctx);
+  const run = store.getRun(runId);
+  const conflict = run.externalConflict;
+  if (conflict.previousAttempt.truncated !== undefined) return conflict.previousAttempt;
+  const captured = await retryDiff(
+    run,
+    conflict.writePaths ?? legacyScopes,
+    conflict.previousAttempt.headSha,
+    ctx.engine.secrets,
+  );
+  const previousAttempt = { ...conflict.previousAttempt, ...captured };
+  store.updateRun(runId, { externalConflict: { ...conflict, previousAttempt } });
+  return previousAttempt;
 }
 
 // The Runs of this task's attempts that an abandon already stopped with `head`.
@@ -1117,6 +1253,8 @@ async function verifySubmission(ctx, C, step, input) {
               const written = store.getRun(run.id);
               if (cancelled(written) || integrationStarted(written) || written.externalCompletion) return stale;
               if (!verdict.passed || verdict.headSha !== head) {
+                if (verificationFailureStatus(verdict.code) === 'checks_failed')
+                  recordFailure(ctx, run, verdict.passed ? problem('external_head_changed') : verdict);
                 // A failed check keeps its diagnostic pack for the next attempt's brief (15D).
                 store.updateRun(
                   run.id,
@@ -1152,7 +1290,7 @@ async function verifySubmission(ctx, C, step, input) {
                 return stale;
               store.updateRun(
                 run.id,
-                { state: 'succeeded', error: null, lastDiagnostics: null },
+                { state: 'succeeded', error: null, lastDiagnostics: null, externalFailure: null },
                 { preserveCancellation: true },
               );
               logEvent(store, run.id, 'task_fast_started', { attemptId: attempt.id, headSha: head }, startedAt);
@@ -1187,15 +1325,25 @@ async function verifySubmission(ctx, C, step, input) {
 async function integrateQueued(ctx, C, W, waveCtx, entry, signal) {
   const store = storeOf(ctx),
     { projectId, taskId, headSha } = entry;
-  const { attempt, run } = await externalAttempt(ctx, C, projectId, taskId);
+  const { attempt, run, task, snapshot } = await externalAttempt(ctx, C, projectId, taskId);
   const stale = { status: 'rejected', code: 'project_submission_stale' };
   if (attempt.id !== entry.attemptId || run.id !== entry.runId) return stale;
+  if (run.externalConflict?.previousAttempt.headSha === headSha)
+    return {
+      status: 'rejected',
+      code: 'project_integration_conflict_retry',
+      retry: run.externalConflict.retry,
+      integration: run.externalConflict.integration,
+      reason: run.externalConflict.reason,
+    };
   if (run.externalCompletion?.headSha === headSha)
     return (await mergeRecorded(projectId, run))
       ? { status: 'integrated', integration: run.externalCompletion.integration }
       : { status: 'rejected', code: 'project_integration_missing' };
   if (run.state !== 'succeeded' || run.headSha !== headSha || run.checks?.headSha !== headSha) return stale;
   if (run.baseSha !== entry.baseSha) return stale;
+  if (attempt.status === 'blocked' && run.integration?.code === 'project_integration_conflict' && !cancelled(run))
+    return scheduleConflictRetry(ctx, snapshot, task, attempt, run, headSha, run.integration);
   // Git first, then the Run's record: a recorded merge that left the branch is missing.
   if (run.integration?.status === 'merged' && run.integration.mergedHead === headSha) {
     if (!(await mergeRecorded(projectId, run))) return { status: 'rejected', code: 'project_integration_missing' };
@@ -1248,6 +1396,8 @@ async function integrateQueued(ctx, C, W, waveCtx, entry, signal) {
       ),
     );
     if (failedMerge) return { status: 'failed', code, merged: true, integration: integration ?? null };
+    if (code === 'project_integration_conflict')
+      return scheduleConflictRetry(ctx, await snapshotOf(ctx, projectId), task, attempt, after, headSha, integration);
     return { status: 'rejected', code, integration: integration ?? null };
   }
   // Fenced (runtime/lease-fence.mjs) in one transaction: a stale drain writes nothing, and a
@@ -1410,11 +1560,45 @@ async function externalAttempt(ctx, C, projectId, taskId) {
 
 // The checks of a submission that need consistent project state, in one short project section:
 // a decided result, a replay of a recorded completion, or the attempt to verify and integrate.
+const verificationFailureStatus = code => (code === 'cargo_fetch_failed' ? 'blocked' : 'checks_failed');
+
+function recordFailure(ctx, run, defect) {
+  const store = storeOf(ctx);
+  const signature = createHash('sha256')
+    .update(
+      JSON.stringify([defect.code, defect.diagnostics?.items?.[0] ?? defect.diagnostics?.failingTests?.[0] ?? null]),
+    )
+    .digest('hex');
+  const last = store.getRun(run.id).externalFailure;
+  const repeated = last?.signature === signature;
+  store.updateRun(run.id, {
+    externalFailure: {
+      signature,
+      repeated,
+      since: repeated ? last.since : (ctx.clock?.() ?? new Date().toISOString()),
+    },
+  });
+}
+
 async function admitSubmission(ctx, C, input) {
   const { projectId, taskId, head, attemptId } = input;
   const current = await externalAttempt(ctx, C, projectId, taskId);
   const { snapshot, task, attempt, run } = current;
   const blocked = code => ({ result: { status: 'blocked', code, revision: snapshot.revision } });
+  const recorded = attemptId && attemptId !== attempt.id ? earlierAbandon(ctx, snapshot, attempt, attemptId) : run;
+  if (recorded?.externalConflict?.previousAttempt.headSha === head)
+    return {
+      conflictRunId: recorded.id,
+      task,
+      result: {
+        status: 'abandoned',
+        code: 'project_integration_conflict_retry',
+        retry: recorded.externalConflict.retry,
+        integration: recorded.externalConflict.integration ?? null,
+        reason: recorded.externalConflict.reason ?? recorded.externalConflict.previousAttempt.reason,
+        revision: snapshot.revision,
+      },
+    };
   if (attemptId !== undefined && attemptId !== attempt.id) return blocked('project_attempt_stale');
   if (run.externalCompletion?.headSha === head) {
     const missing = await replayedMerge(ctx, input, run);
@@ -1434,7 +1618,16 @@ async function admitSubmission(ctx, C, input) {
     { attemptId: attempt.id, headSha: head, accepted: !defect, ...(defect ? { code: defect.code } : {}) },
     clockMs(ctx),
   );
-  if (defect) return { result: { status: 'checks_failed', ...defect, revision: snapshot.revision } };
+  if (defect) {
+    // After reassignment, a bare SHA off this branch (or its shared starting
+    // commit) does not identify the current worker. Its own commits still count.
+    const attributable =
+      attemptId !== undefined ||
+      attempt.number === 1 ||
+      (head !== run.baseSha && defect.code !== 'external_branch_mismatch');
+    if (attributable) recordFailure(ctx, run, defect);
+    return { result: { status: 'checks_failed', ...defect, revision: snapshot.revision } };
+  }
   return { ...current, verified: false };
 }
 
@@ -1473,7 +1666,10 @@ export async function completeTask(ctx, input) {
       abandonTarget(ctx, await externalAttempt(ctx, C, projectId, taskId), { head, attemptId, commandId }),
     );
   const step = await section(() => admitSubmission(ctx, C, input));
-  if (step.result) return step.result;
+  if (step.result) {
+    if (step.conflictRunId) await captureConflictDiff(ctx, step.conflictRunId, step.task.writePaths);
+    return step.result;
+  }
   const completion = { ...input, deferGate };
   if (step.replay) return finishCompletion(ctx, C, completion, step.replay, true);
   const { snapshot, attempt, run } = step;
@@ -1484,7 +1680,7 @@ export async function completeTask(ctx, input) {
     // A dependency download failure is the environment, not the submission (15C): blocked.
     if (defect)
       return {
-        status: defect.code === 'cargo_fetch_failed' ? 'blocked' : 'checks_failed',
+        status: verificationFailureStatus(defect.code),
         ...defect,
         revision: snapshot.revision,
       };
@@ -1531,9 +1727,11 @@ export async function completeTask(ctx, input) {
   });
   const outcome = done.outcome;
   if (done.status === 'failed') throw Object.assign(new Error(`Project ${outcome.code}`), { code: outcome.code });
+  if (outcome.retry) await captureConflictDiff(ctx, run.id, step.task.writePaths);
   if (done.status === 'rejected')
     return {
-      status: 'blocked',
+      status: outcome.retry ? 'abandoned' : 'blocked',
+      ...(outcome.retry && { retry: outcome.retry, reason: outcome.reason }),
       code: outcome.code,
       integration: outcome.integration ?? null,
       revision: outcome.integration?.revision ?? (await snapshotOf(ctx, projectId)).revision,

@@ -754,7 +754,7 @@ test('A merge conflict refuses only its own task and leaves the integration bran
   f.store.releaseLease(holder);
   const results = await Promise.all(pending);
   const byTask = Object.fromEntries([...briefs.keys()].map((taskId, index) => [taskId, results[index]]));
-  assert.deepEqual([byTask.t1.status, byTask.t1.code], ['blocked', 'project_integration_conflict']);
+  assert.deepEqual([byTask.t1.status, byTask.t1.code], ['abandoned', 'project_integration_conflict_retry']);
   assert.equal(byTask.t0.status, 'integrated', JSON.stringify(byTask.t0));
   assert.equal(byTask.t2.status, 'integrated', JSON.stringify(byTask.t2));
   assert.equal(git(worktree, 'status', '--porcelain'), '', 'no half-merged files');
@@ -768,6 +768,9 @@ test('A merge conflict refuses only its own task and leaves the integration bran
   assert.deepEqual(f.merges().length, 2);
   const snapshot = await f.snapshot();
   assert.equal(snapshot.currentAttempts.find(row => row.taskId === 't1').status, 'blocked');
+  const retry = await nextWave(f.ctx, { projectId: f.projectId, host: 't3', ports: f.ports, limit: 1 });
+  assert.equal(retry.briefs[0].baseSha, f.integrationHead());
+  assert.equal(retry.briefs[0].previousAttempt.attemptId, briefs.get('t1').attemptId);
 });
 
 test('A drain that dies after a merge never merges that task twice', async t => {

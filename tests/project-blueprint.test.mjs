@@ -9,9 +9,12 @@ import {
   DEFAULT_EXECUTION,
   bindInterfaceEvidence,
   compileBlueprint,
+  parallelOverlaps,
+  taskAncestors,
   lintFactorySpec,
   readBlueprint,
 } from '../runtime/project-blueprint.mjs';
+import { scopesOverlap } from '../runtime/contracts.mjs';
 import * as projectContracts from '../runtime/project-contracts.mjs';
 
 const fixtures = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures', 'blueprint');
@@ -838,4 +841,53 @@ test('R5: readOptionalRustToolchain reads committed HEAD only and ignores uncomm
   git(root, 'commit', '-qm', 'oversized toolchain');
   const oversized = await compileBlueprint(root);
   assert.ok(codes(oversized).includes('rust_toolchain_required'));
+});
+
+test('indexed parallel overlaps match exhaustive pairs and ordering on seeded path sets', () => {
+  let seed = 731;
+  const pick = n => {
+    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+    return seed % n;
+  };
+  const scopes = [
+    'src',
+    'src/ab',
+    'src/a/b.txt',
+    'src/*.js',
+    './src/**',
+    '*',
+    '{src,lib}/x',
+    'lib/[ab].js',
+    'docs/plan',
+    'docs/pl*',
+    'Docs/Plan',
+    'src/a@(bc|de).js',
+    'lib/**/x',
+    'src/ab*',
+    'lib/a.js',
+  ];
+  for (let round = 0; round < 24; round++) {
+    const all = Array.from({ length: 22 }, (_, i) => ({
+      id: 't' + i,
+      dependsOn: i && pick(3) === 0 ? ['t' + pick(i)] : [],
+      writePaths: Array.from({ length: 1 + pick(3) }, () => scopes[pick(scopes.length)]),
+    }));
+    const others = all.slice(0, 5),
+      tasks = all.slice(5);
+    const ancestors = taskAncestors(all);
+    const expected = [];
+    for (const [i, left] of tasks.entries()) {
+      for (const right of tasks.slice(i + 1))
+        if (
+          !ancestors.get(left.id).has(right.id) &&
+          !ancestors.get(right.id).has(left.id) &&
+          scopesOverlap(left.writePaths, right.writePaths)
+        )
+          expected.push([left.id, right.id]);
+      for (const right of others)
+        if (!ancestors.get(left.id).has(right.id) && scopesOverlap(left.writePaths, right.writePaths))
+          expected.push([left.id, right.id]);
+    }
+    assert.deepEqual(parallelOverlaps(tasks, { ancestors, others }), expected);
+  }
 });

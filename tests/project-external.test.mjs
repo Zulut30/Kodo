@@ -6,14 +6,16 @@ import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promi
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { withPullLease } from '../runtime/project-controller-lease.mjs';
+import { projectSectionHeld, withPullLease } from '../runtime/project-controller-lease.mjs';
 import { Store } from '../runtime/store.mjs';
 import { Engine } from '../runtime/engine.mjs';
 import * as contracts from '../runtime/project-contracts.mjs';
 import { openProjectStore } from '../runtime/project-store.mjs';
 import { scopesOverlap } from '../runtime/contracts.mjs';
 import { ensureIntegration, mergeTask } from '../runtime/project-integration.mjs';
-import { withIntegrationLease } from '../runtime/project-integration-lease.mjs';
+import { integrationLeaseHeld, withIntegrationLease } from '../runtime/project-integration-lease.mjs';
+import { retryDiff } from '../runtime/project-retry-diff.mjs';
+import { execute } from '../runtime/command.mjs';
 import { completeTask, nextWave, runProjectGates } from '../runtime/project-external.mjs';
 import { createProjectTransitionAuthorizer } from '../runtime/project-director.mjs';
 import { gateHolds } from '../runtime/project-director-waves.mjs';
@@ -466,7 +468,7 @@ test('next-wave checks the CLI against known values before the lease and guards 
   await nextWave({ ...f.ctx, contracts: C }, { ...input, cli });
   assert.equal(calls[0], cli, 'the prefix is checked first');
   assert.ok(calls.indexOf('lease') > 0);
-  assert.equal(calls.at(-1), 'blocked,briefs,cli,projectId,revision', 'the whole result is guarded');
+  assert.equal(calls.at(-1), 'blocked,briefs,cli,projectId,revision,watch', 'the whole result is guarded');
   // A prefix carrying a known secret value is refused before the lease.
   calls.length = 0;
   const secrets = f.engine.secrets;
@@ -844,6 +846,7 @@ test('next-wave names a pending epic gate and answers an accepted project with i
     revision: real(f.projectId).revision,
     cli: 'kodo',
     code: 'project_accepted',
+    watch: [],
     briefs: [],
     blocked: [],
   });
@@ -1458,4 +1461,102 @@ test('complete-task reports cargo_fetch_failed as an environment block for the s
   assert.equal(result.code, 'cargo_fetch_failed');
   assert.equal(result.status, 'blocked');
   assert.match(result.message, /fetch unavailable/);
+  await f.complete('task-a', head);
+  assert.equal(f.store.getRun(task.runId).externalFailure, undefined);
+});
+
+test('integration conflict schedules two bounded retries with the previous diff', async t => {
+  const f = await fixture(t);
+  const update = f.store.updateRun.bind(f.store);
+  f.store.updateRun = (id, patch, ...rest) => {
+    if (patch.externalConflict?.previousAttempt.truncated !== undefined) {
+      assert.ok(!projectSectionHeld(f.store, f.projectId));
+      assert.ok(!integrationLeaseHeld(f.store, f.projectId));
+    }
+    return update(id, patch, ...rest);
+  };
+  f.ports.integrateAndAdvance = async () => ({
+    status: 'blocked',
+    code: 'project_integration_conflict',
+    reason: 'content conflict',
+  });
+  let a = brief(await f.wave({ limit: 1 }), 'task-a');
+  for (let i = 0; i < 3; i++) {
+    const head = await commit(a.worktree, {
+      'src/a.mjs': 'export const a = 42;\n//' + 'large delta '.repeat(6500) + '\n',
+    });
+    const done = await f.complete(a.taskId, head, { attemptId: a.attemptId });
+    if (i === 2) {
+      assert.equal(done.status, 'blocked');
+      assert.equal(done.retry, undefined);
+    } else {
+      assert.deepEqual(done.retry, { scheduled: true, remaining: 1 - i });
+      assert.equal(done.integration.reason, 'content conflict');
+      assert.equal(done.reason, 'content conflict');
+      const other = await nextWave(f.ctx, { projectId: f.projectId, host: 'orca', ports: f.ports, limit: 1 });
+      assert.ok(!other.blocked.some(row => row.code === 'project_retry_executor'));
+      const fresh = brief(await f.wave({ limit: 1 }), a.taskId);
+      assert.equal(fresh.previousAttempt.attemptId, a.attemptId);
+      assert.equal(fresh.previousAttempt.diff, '');
+      assert.deepEqual(fresh.previousAttempt.omittedFiles, ['src/a.mjs']);
+      assert.equal(fresh.previousAttempt.truncated, true);
+      assert.match(fresh.prompt, /previousAttempt.headSha/);
+      await f.complete(a.taskId, head);
+      assert.equal(f.store.getRun(fresh.runId).externalFailure, undefined);
+      const replay = await f.complete(a.taskId, head, { attemptId: a.attemptId });
+      assert.deepEqual(replay.retry, done.retry);
+      assert.equal(replay.status, 'abandoned');
+      a = fresh;
+    }
+  }
+});
+
+test('watch reports stalls, repeated submissions and dirty scope', async t => {
+  const f = await fixture(t);
+  const a = brief(await f.wave({ limit: 1 }), 'task-a');
+  const fixed = new Date(Date.now() + 3600000).toISOString();
+  f.ctx.clock = () => fixed;
+  const codes = async () =>
+    (await f.wave({ limit: 1 })).watch.filter(row => row.taskId === a.taskId).map(row => row.code);
+  assert.equal((await f.wave({ limit: 1, stallMinutes: 90 })).watch.length, 0);
+  assert.deepEqual(await codes(), ['worker_no_progress']);
+  await writeFile(path.join(a.worktree, 'src/a.mjs'), 'updated');
+  assert.deepEqual(await codes(), []);
+  await writeFile(path.join(a.worktree, 'outside'), 'outside');
+  assert.deepEqual(await codes(), ['worker_scope_violation']);
+  await f.complete(a.taskId, a.baseSha);
+  await f.complete(a.taskId, a.baseSha);
+  assert.ok((await codes()).includes('worker_repeated_failure'));
+  assert.equal(f.store.getRun(a.runId).externalFailure.since, fixed);
+});
+
+test('one scoped git diff captures whole text patches and classifies every omission', async t => {
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'kodo-retry-')));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  git(root, 'init');
+  git(root, 'config', 'user.name', 'Kodo Diff');
+  git(root, 'config', 'user.email', 'diff@example.invalid');
+  const baseSha = await commit(root, { '.gitattributes': '* -text\n' });
+  const head = await commit(root, {
+    'src/a.txt': 'good\n',
+    'src/b.bin': Buffer.from([0, 1, 2]),
+    'src/c.txt': 'has\u0001control\n',
+    'src/d.txt': 'oversize'.repeat(12000),
+    'src/e.txt': 'last\n',
+    outside: 'foreign',
+  });
+  let calls = 0;
+  const invoke = async (cmd, args, options) => {
+    calls++;
+    assert.deepEqual(args.slice(args.indexOf('--') + 1), ['src']);
+    return execute(cmd, args, options);
+  };
+  const mixed = await retryDiff({ project: root, baseSha }, ['src/**'], head, {}, invoke);
+  assert.equal(calls, 1);
+  assert.deepEqual(mixed.omittedFiles, ['src/b.bin', 'src/c.txt', 'src/d.txt']);
+  assert.equal(mixed.truncated, true);
+  assert.equal(mixed.diff, git(root, 'diff', '--no-color', baseSha, head, '--', 'src/a.txt', 'src/e.txt') + '\n');
+  const clean = await retryDiff({ project: root, baseSha }, ['src/a.txt'], head, {});
+  assert.equal(clean.truncated, false);
+  assert.deepEqual(clean.omittedFiles, []);
 });
