@@ -148,3 +148,4 @@ Git-транспорт `refs/kodo/<projectId>/base|work/<runId>`, брифы б�
 | 2026-11-25 | Стрим 16C (`kodo/16c-telemetry`): телеметрия `kodo report --project` (`throughput`, `taskDuration`, `breakdown`, `firstPassYield`, `arbitrations`, `interventions`, `utilization`), запись недостающих отметок времени жизненного цикла внешних задач/очереди/гейтов, обновлены навык `kodo-project-director`, `docs/T3-HOST.md` и `docs/OBSERVABILITY.md`. |
 
 16B2 — автоповторы конфликтов интеграции, наблюдение за внешними воркерами и волновые проекты до 400 задач.
+| 2026-11-25 | 16E, запас времени Windows CI: 19 самых долгих файлов (этап 15 и `priority`) вынесены из L2 в обязательный шаг `npm run test:heavy`, медиана Windows L2 по оценке ≈ 33,9 → 25,0 мин; кейсы волновых наборов получили общий предел 900 с. Замеры — [CI](../CI.md). |

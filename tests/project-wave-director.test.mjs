@@ -19,6 +19,11 @@ import { confirmedCriteria } from './helpers/gate-review.mjs';
 
 // Wave execution through the real Engine with fake subscription providers, a real
 // temporary Git repository and the production transition authorizer.
+// Every case of this file has one limit, { timeout: 900000 } (stage 16E). On Windows CI single cases took up to
+// 278 s on passing runs ("Tasks with overlapping write paths never share a wave", run 45645526524), and the
+// former 300 s limit stopped "Three disjoint tasks run in parallel…" (runs 45605431480, 45652087454), "Tasks
+// with overlapping write paths…" (45630500497, 45652087454), "appendMilestone reopens…" (45605431480,
+// 45630500497) and "drain replaces a gate reservation…" (45652087454) on slow runners. See docs/CI.md.
 const wave = { cadence: 'wave', integration: 'branch' };
 const proof = id => ({ id, text: 'The observable wave requirement holds.', evidenceKinds: ['acceptance'] });
 const task = (id, overrides = {}) => ({
@@ -296,7 +301,7 @@ const statuses = rows => Object.fromEntries(rows.map(row => [row.id ?? row.taskI
 
 test(
   'Three disjoint tasks run in parallel, integrate into the project branch and one gate accepts the chain',
-  { timeout: 300000 },
+  { timeout: 900000 },
   async t => {
     const f = await fixture(t, {
       hooks: {
@@ -363,7 +368,7 @@ test(
   },
 );
 
-test('Tasks with overlapping write paths never share a wave', { timeout: 300000 }, async t => {
+test('Tasks with overlapping write paths never share a wave', { timeout: 900000 }, async t => {
   const f = await fixture(t, {
     tasks: [
       task('wide', { writePaths: ['notes/**'] }),
@@ -392,7 +397,7 @@ test('Tasks with overlapping write paths never share a wave', { timeout: 300000 
 
 test(
   'The watchdog stops a gate on its second round without progress; --retry-failed creates a new gate',
-  { timeout: 300000 },
+  { timeout: 900000 },
   async t => {
     let round = 0;
     const f = await fixture(t, {
@@ -442,7 +447,7 @@ test(
   },
 );
 
-test('A quota stop returns waiting_limits and the next drain resumes the same Run', { timeout: 300000 }, async t => {
+test('A quota stop returns waiting_limits and the next drain resumes the same Run', { timeout: 900000 }, async t => {
   let quota = true;
   const f = await fixture(t, {
     tasks: [task('alpha')],
@@ -473,7 +478,7 @@ test('A quota stop returns waiting_limits and the next drain resumes the same Ru
 
 test(
   'A write outside writePaths blocks the wave task with scope_conflict without a repair round',
-  { timeout: 300000 },
+  { timeout: 900000 },
   async t => {
     const f = await fixture(t, {
       tasks: [task('alpha'), task('beta')],
@@ -523,7 +528,7 @@ test('A missing risk approval blocks the drain before any reservation', async t 
   assert.deepEqual(selectWave(f.repo.snapshot(f.id), { limit: 3 }), ['alpha']);
 });
 
-test('resume of a wave project executes exactly one task', { timeout: 300000 }, async t => {
+test('resume of a wave project executes exactly one task', { timeout: 900000 }, async t => {
   const f = await fixture(t, { tasks: [task('alpha'), task('beta')] });
   const first = await f.director.resume(f.id);
   assert.equal(first.status, 'succeeded', JSON.stringify(first));
@@ -541,7 +546,7 @@ test('resume of a wave project executes exactly one task', { timeout: 300000 }, 
   assert.equal(snapshot.project.status, 'accepted');
 });
 
-test('appendMilestone reopens an accepted project and drain accepts it again', { timeout: 300000 }, async t => {
+test('appendMilestone reopens an accepted project and drain accepts it again', { timeout: 900000 }, async t => {
   const f = await fixture(t, { tasks: [task('alpha')] });
   assert.equal((await f.director.drain(f.id)).status, 'accepted');
   const reopened = await f.repo.apply(
@@ -577,7 +582,7 @@ test('appendMilestone reopens an accepted project and drain accepts it again', {
   );
 });
 
-test('cancel during a gate cancels its Run and the drain', { timeout: 300000 }, async t => {
+test('cancel during a gate cancels its Run and the drain', { timeout: 900000 }, async t => {
   let director;
   const f = await fixture(t, {
     tasks: [task('alpha')],
@@ -598,7 +603,7 @@ test('cancel during a gate cancels its Run and the drain', { timeout: 300000 }, 
   assert.equal(snapshot.tasks[0].status, 'integrated', 'no acceptance without a finished gate');
 });
 
-test('A repeated drain after a crash mid-wave never duplicates merges', { timeout: 300000 }, async t => {
+test('A repeated drain after a crash mid-wave never duplicates merges', { timeout: 900000 }, async t => {
   const f = await fixture(t, { tasks: [task('alpha'), task('beta')] });
   const updateRun = f.store.updateRun.bind(f.store);
   let crashed = false;
@@ -633,7 +638,7 @@ test('drain refuses a legacy project and invalid bounds', async t => {
 
 test(
   'integrated is authorized only under the integration lease, by a merge still on the branch with its recorded parents',
-  { timeout: 300000 },
+  { timeout: 900000 },
   async t => {
     // Review finding F1-2a: a stored merge receipt was enough after the branch had moved; the
     // Git checks ran outside the lease and the first parent was never compared.
@@ -688,7 +693,7 @@ test(
 
 test(
   'The project is accepted only on a head still current after every check; a moved branch gets a project gate',
-  { timeout: 300000 },
+  { timeout: 900000 },
   async t => {
     // Review finding F1-2c: the integration head was read before the asynchronous proof, so a
     // branch moved during the check let the project be accepted on a stale head.
@@ -723,7 +728,7 @@ test(
 
 test(
   'When the branch moves after an epic gate covering the project, drain reserves a project gate on the current head',
-  { timeout: 300000 },
+  { timeout: 900000 },
   async t => {
     // F2 open question: the project stayed `integrated` with wave_project_head_mismatch.
     let moved = null,
@@ -757,7 +762,7 @@ test(
 
 test(
   'A gate whose install is refused names its reserved Run, the install stage and the diagnosis',
-  { timeout: 300000 },
+  { timeout: 900000 },
   async t => {
     // Review findings (minor): gate_invalid carried no runId, stage or diagnosis, although the
     // reservation already names its Run; and the first install (right after the reservation)
@@ -799,7 +804,7 @@ test(
 
 test(
   'drain replaces a gate reservation whose install was interrupted and whose head went stale',
-  { timeout: 300000 },
+  { timeout: 900000 },
   async t => {
     // Review finding F1-3a: the stale reservation stayed blocked with gate_head_stale.
     let crash = true;

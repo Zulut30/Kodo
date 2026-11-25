@@ -21,6 +21,9 @@ import { confirmedCriteria } from './helpers/gate-review.mjs';
 // End to end without fake ports: the real Store, project store, production
 // authorizer, Engine (fake subscription providers only), wave director, pull
 // protocol and CLI over a temporary Git repository.
+// Every case of this file has one limit, { timeout: 900000 } (stage 16E). On slow Windows CI runners
+// "drain accepts two epics…" took 497 s of the former 600 s limit (run 45605431480) and 428 s (run
+// 45652087454). See docs/CI.md.
 const wave = { cadence: 'wave', integration: 'branch' };
 const proof = id => ({ id, text: 'The observable wave requirement holds.', evidenceKinds: ['acceptance'] });
 const task = (id, overrides = {}) => ({
@@ -258,7 +261,7 @@ async function fixture(
 
 test(
   'drain accepts two epics: wave 0, two parallel tasks and an epic gate that repairs the combined result',
-  { timeout: 600000 },
+  { timeout: 900000 },
   async t => {
     const f = await fixture(t, {
       epics: ['e0', 'e1'],
@@ -320,7 +323,7 @@ test(
 
 test(
   'T3 pull path: next-wave, a worker commit, complete-task, the epic gate, a replay, and drain leaves the external attempt alone',
-  { timeout: 600000 },
+  { timeout: 900000 },
   async t => {
     const f = await fixture(t, { epics: ['e1'], tasks: [task('alpha', { priority: 90 }), task('beta')] });
     const next = await f.cli(['next-wave', f.id, '--host', 't3', '--limit', '1']);
@@ -373,7 +376,7 @@ test(
   },
 );
 
-test('drain --retry-failed never executes natively a task an external chat abandoned', { timeout: 600000 }, async t => {
+test('drain --retry-failed never executes natively a task an external chat abandoned', { timeout: 900000 }, async t => {
   // F2 open question: the retry went to the drain, which re-ran the external task natively.
   const f = await fixture(t, { epics: ['e1'], tasks: [task('ext')] });
   const next = await f.cli(['next-wave', f.id, '--host', 't3']);
@@ -408,7 +411,7 @@ test('drain --retry-failed never executes natively a task an external chat aband
   assert.deepEqual(f.store.getRun(retried.report.result.briefs[0].runId).executor, { kind: 'external', host: 't3' });
 });
 
-test('A reservation without a Run is resumed only by its own executor', { timeout: 600000 }, async t => {
+test('A reservation without a Run is resumed only by its own executor', { timeout: 900000 }, async t => {
   const f = await fixture(t, { epics: ['e1'], tasks: [task('ext'), task('own')] });
   // Crashes between reserveAttempt and the Run install: one for host t3, one for the drain.
   for (const [id, actor] of [
@@ -488,7 +491,7 @@ function authorizeByGate(f, run) {
 
 test(
   'A behavioural oracle a task adds to kodo.config.json runs in the epic gate: its exit 19 never accepts the project',
-  { timeout: 600000 },
+  { timeout: 900000 },
   async t => {
     // Review finding (blocker): the gate took its policy from the user's checkout and ran no oracle.
     const f = await fixture(t, {
@@ -537,7 +540,7 @@ test(
 
 test(
   'commands.smoke a task adds runs in its epic gate, the task never hangs, and the validator binds the commit policy and every criterion',
-  { timeout: 600000 },
+  { timeout: 900000 },
   async t => {
     // Review finding (blocker, reverse failure): a task that added smoke stayed running with a recorded merge.
     const f = await fixture(t, {
@@ -590,7 +593,7 @@ test(
 
 test(
   'An epic gate confirms the epic criteria: a reviewer that finds them unmet never accepts the epic',
-  { timeout: 600000 },
+  { timeout: 900000 },
   async t => {
     // Review finding (major): an epic "keep scores across restarts" was accepted by a commit of one text file.
     const scores = { id: 'scores-persist', text: 'Scores persist between restarts', evidenceKinds: ['acceptance'] };
@@ -632,7 +635,7 @@ test(
 
 test(
   'complete-task inspects every commit: a credentials file committed and deleted later is never integrated',
-  { timeout: 600000 },
+  { timeout: 900000 },
   async t => {
     // Review finding (major): only the final diff was checked; the secret stayed reachable on the branch.
     const f = await fixture(t, { epics: ['e1'], tasks: [task('alpha', { writePaths: ['alpha/**'] })] });
@@ -664,7 +667,7 @@ test(
 
 test(
   'A replayed complete-task reports a merge that left the integration branch as a recovery blocker',
-  { timeout: 600000 },
+  { timeout: 900000 },
   async t => {
     // Review finding (major): the replay answered `integrated` after the merge was rolled back.
     const f = await fixture(t, { epics: ['e1'], tasks: [task('alpha')] });
@@ -694,7 +697,7 @@ test(
   },
 );
 
-test('A late repeat of --abandon replays its own attempt and never blocks the retry', { timeout: 600000 }, async t => {
+test('A late repeat of --abandon replays its own attempt and never blocks the retry', { timeout: 900000 }, async t => {
   // Review finding (major): the original command repeated after next-wave --retry-failed blocked the NEW attempt.
   const f = await fixture(t, { epics: ['e1'], tasks: [task('ext')] });
   const [brief] = (await f.cli(['next-wave', f.id, '--host', 't3'])).report.result.briefs;
@@ -735,7 +738,7 @@ test('A late repeat of --abandon replays its own attempt and never blocks the re
 
 test(
   'A policy the Store would record redacted is refused: a command that exits 19 intact never accepts the project',
-  { timeout: 600000 },
+  { timeout: 900000 },
   async t => {
     // Review finding (blocker): the policy was read through the redacting runner; `?key=intact-value`
     // became `?key=[REDACTED]`, so the gate executed a command that exits 0 instead of 19.
@@ -773,7 +776,7 @@ test(
 
 test(
   'Every repair commit of a gate is inspected: a credentials file committed and deleted never enters the branch',
-  { timeout: 600000 },
+  { timeout: 900000 },
   async t => {
     // Review finding (major): only the verified result of the repairs was checked; the project was
     // accepted and the commit with credentials.json was on the integration branch.
@@ -815,7 +818,7 @@ test(
 
 test(
   'A full node --test of the gate that passes no test fails the gate and records the parsed count',
-  { timeout: 600000 },
+  { timeout: 900000 },
   async t => {
     // Review finding (major): a task switched commands.test to `node --test --test-reporter=tap` in a
     // repository without tests; `# tests 0`, `# pass 0` and exit 0 accepted the project.
@@ -850,7 +853,7 @@ test(
 
 test(
   'A gate whose node --test passed tests records the count, and the validator binds it to the evidence log',
-  { timeout: 600000 },
+  { timeout: 900000 },
   async t => {
     const paths = ['kodo.config.json', 'counted.txt', 'counted.test.mjs'];
     const f = await fixture(t, {
@@ -926,7 +929,7 @@ const defaultNpmTest = async (cwd, scripts = { test: 'node --test' }) => {
 
 test(
   'The default npm test running node --test without test files never lets the gate accept the project',
-  { timeout: 600000 },
+  { timeout: 900000 },
   async t => {
     // Review finding: `npm test` -> `node --test` without tests logged `tests 0`, `pass 0`, exit 0 and the
     // project was accepted: Kodo counted only a direct `node --test` and judged `npm test` by exit code.
@@ -960,7 +963,7 @@ test(
 
 test(
   'The default npm test with one node --test test is accepted with a count of 1, and the validator binds the count',
-  { timeout: 600000 },
+  { timeout: 900000 },
   async t => {
     const paths = ['kodo.config.json', 'package.json', 'npmone.txt', 'npmone.test.mjs'];
     const f = await fixture(t, {
@@ -1079,7 +1082,7 @@ const npmManifest = JSON.stringify({ name: 'wave', private: true, scripts: { tes
 
 test(
   'apply-spec -> drain never accepts a project whose default npm test runs node --test without test files',
-  { timeout: 600000 },
+  { timeout: 900000 },
   async t => {
     // Review finding (reproduced on Node 24.19.0): the default commands.test (`npm test`) and
     // `"test": "node --test"` without test files logged `tests 0`, exit 0, and drain accepted the project.
@@ -1107,7 +1110,7 @@ test(
 
 test(
   'A task Run of the default npm test counts its node --test, and its validator binds the script of its head',
-  { timeout: 600000 },
+  { timeout: 900000 },
   async t => {
     const f = await fixture(t, {
       epics: ['e1'],
@@ -1153,7 +1156,7 @@ test(
 
 test(
   'apply-spec -> drain accepts a project whose tests need npm: the npm exit code decides when the counting run fails',
-  { timeout: 600000 },
+  { timeout: 900000 },
   async t => {
     // Review finding (Windows, Node 24.19.0): a test using `npm_package_version` passed through npm but
     // failed when Kodo replaced `npm test` by Node. npm decides now; the counting run only adds evidence.
@@ -1200,7 +1203,7 @@ test(
 
 test(
   'complete-task after a crash between integration and its record reports a merge that left the branch',
-  { timeout: 600000 },
+  { timeout: 900000 },
   async t => {
     // Review finding (major): the write of externalCompletion failed after attempt and task reached
     // `integrated`; after the branch was reset, the repeat answered exit 0 `integrated`.
@@ -1245,7 +1248,7 @@ test(
 
 test(
   'A standalone epic gate lets the T3 host submit and reserve siblings during review',
-  { timeout: 600000 },
+  { timeout: 900000 },
   async t => {
     const observed = [];
     let betaHead;
@@ -1304,7 +1307,7 @@ async function editWorker(brief, file, content) {
 }
 
 for (const scenario of ['conflict', 'pause']) {
-  test('Gate repair merge-back handles ' + scenario + ' during review', { timeout: 600000 }, async t => {
+  test('Gate repair merge-back handles ' + scenario + ' during review', { timeout: 900000 }, async t => {
     let reviews = 0;
     const hooks = {
       onRepair: request => writeFile(path.join(request.cwd, 'shared.txt'), 'repair\n'),
@@ -1378,7 +1381,7 @@ for (const scenario of ['conflict', 'pause']) {
 
 test(
   'Missing milestone delivery proof stays visible and an explicit retry verifies a new gate',
-  { timeout: 600000 },
+  { timeout: 900000 },
   async t => {
     const f = await fixture(t, {
       epics: ['e1'],
@@ -1438,7 +1441,7 @@ test(
 
 test(
   'Evidence integrity refusal after verification retries with fresh proof and accepts the project',
-  { timeout: 600000 },
+  { timeout: 900000 },
   async t => {
     const f = await fixture(t, { epics: ['e1'], tasks: [task('alpha')] });
     const [brief] = (await f.cli(['next-wave', f.id, '--host', 't3'])).report.result.briefs;
