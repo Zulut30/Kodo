@@ -321,6 +321,17 @@ test(
     assert.deepEqual(statuses(snapshot.tasks), { alpha: 'accepted', beta: 'accepted', gamma: 'accepted' });
     assert.ok(snapshot.currentAttempts.every(row => row.status === 'accepted'));
     assert.equal(snapshot.gates.length, 1);
+    const [gate] = snapshot.gates;
+    assert.deepEqual(
+      new Set(gate.provenance.map(entry => entry.commit)),
+      new Set(gate.merges.map(entry => entry.mergeCommit)),
+    );
+    for (const entry of gate.provenance) {
+      const attempt = snapshot.currentAttempts.find(row => row.id === entry.ref);
+      assert.equal(entry.kind, 'task');
+      assert.deepEqual(entry.writePaths, snapshot.tasks.find(task => task.id === attempt.taskId).writePaths);
+    }
+    assert.deepEqual(f.store.getRun(gate.runId).directorBinding.provenance, gate.provenance);
     assert.deepEqual(snapshot.gates[0].containers, [
       { kind: 'epic', id: 'e1' },
       { kind: 'milestone', id: 'm1' },

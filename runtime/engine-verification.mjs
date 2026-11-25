@@ -9,6 +9,7 @@ import { compactReviewEvidence } from './context-pack.mjs';
 import { buildDiagnosticPack, formatDiagnosticPack, hasStructuredDiagnostics } from './diagnostic-pack.mjs';
 import {
   architectureTaskPathsForRun,
+  architectureOriginForRun,
   architectureTaskScopesForRun,
   normalizeArchitectureConfig,
 } from './architecture-gate.mjs';
@@ -605,6 +606,7 @@ export class EngineVerification extends EngineExecution {
           previous,
           secrets: this.secrets,
           ...(taskPaths ? { taskPaths } : {}),
+          ...(field === 'architectureChecks' ? architectureOriginForRun(run) : {}),
           ...(taskScopes ? { taskScopes } : {}),
           signal,
         });
@@ -621,6 +623,7 @@ export class EngineVerification extends EngineExecution {
           baseSha: run.baseSha,
           config,
           ...(taskPaths ? { taskPaths } : {}),
+          ...(field === 'architectureChecks' ? architectureOriginForRun(run) : {}),
           ...(taskScopes ? { taskScopes } : {}),
           signal,
         }))
@@ -894,6 +897,7 @@ export class EngineVerification extends EngineExecution {
               baseSha: run.baseSha,
               config: run.config.architecture,
               taskPaths: architectureTaskPathsForRun(run),
+              ...architectureOriginForRun(run),
               ...(architectureTaskScopesForRun(run) ? { taskScopes: architectureTaskScopesForRun(run) } : {}),
               signal,
             }))

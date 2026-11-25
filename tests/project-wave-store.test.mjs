@@ -113,7 +113,8 @@ async function fixture(t) {
   // Fixture SHAs are not Git objects: the Git range of a reservation is a fake port here
   // (tests/wave-verifier.test.mjs covers the real Git one).
   const ranges = { refused: new Set() };
-  const gateRange = async ({ baseSha, headSha }) => !ranges.refused.has(`${baseSha}..${headSha}`);
+  const gateRange = async ({ baseSha, headSha }) =>
+    !ranges.refused.has(`${baseSha}..${headSha}`) && (ranges.history ?? true);
   const open = async () => {
     const store = new Store(home, {});
     stores.push(store);
@@ -506,8 +507,18 @@ function recordMerge(store, attempt, mergeCommit, headSha = 'b'.repeat(40)) {
 
 test('reserveGate validates scope, merges and retries; installGateRun binds exactly one Run', async t => {
   const f = await fixture(t);
-  const pid = await f.create(waveSpec(f.root()));
+  const pid = await f.create(
+    waveSpec(f.root(), [
+      taskSpec('a', { writePaths: ['crates'] }),
+      taskSpec('b', { dependsOn: ['a'], writePaths: ['crates'] }),
+    ]),
+  );
   const a = await f.integrate(pid, 'a');
+  const orphan = await f.integrate(pid, 'b');
+  recordMerge(f.store, orphan, '7'.repeat(40));
+  await f.drive(pid, 'attempt', orphan.id, ['failed']);
+  await f.drive(pid, 'task', 'b', ['failed']);
+  await f.run(pid, { op: 'reserveAttempt', taskId: 'b', retryFailed: true });
   // Wave dependency rule in the store: an integrated prerequisite unlocks ready.
   const b = await f.integrate(pid, 'b');
   recordMerge(f.store, a, '4'.repeat(40));
@@ -633,7 +644,18 @@ test('reserveGate validates scope, merges and retries; installGateRun binds exac
 
   // A running gate still blocks retries; a failed gate admits exactly one retry.
   await assert.rejects(f.run(pid, reserve({ retry: true })), { code: 'project_gate_exists' });
-  f.store.updateRun(gate.runId, { state: 'failed' });
+  const repair = '6'.repeat(40);
+  const verified = '8'.repeat(40);
+  f.store.updateRun(gate.runId, {
+    state: 'failed',
+    headSha: verified,
+    gateReturn: { before: gate.headSha, target: repair, status: 'pending' },
+  });
+  f.ranges.history = new Map([
+    [repair, [gate.headSha, verified]],
+    [gate.headSha, ['7'.repeat(40)]],
+    ['7'.repeat(40), ['0'.repeat(40), 'b'.repeat(40)]],
+  ]);
   await assert.rejects(f.run(pid, reserve()), { code: 'project_gate_exists' });
   const retried = await f.run(pid, reserve({ retry: true, headSha: '6'.repeat(40) }));
   const gates = f.repo.snapshot(pid).gates;
@@ -644,6 +666,11 @@ test('reserveGate validates scope, merges and retries; installGateRun binds exac
       [2, false],
     ],
   );
+  const tasks = f.repo.snapshot(pid).tasks;
+  assert.deepEqual(gates[1].provenance, [
+    { commit: '7'.repeat(40), kind: 'task', ref: orphan.id, writePaths: tasks.find(t => t.id === 'b').writePaths },
+    { commit: repair, kind: 'gate', ref: gate.id, writePaths: [...new Set(tasks.flatMap(t => t.writePaths))] },
+  ]);
   assert.equal(gates[1].id, retried.entity.id);
   assert.notEqual(gates[1].runId, gate.runId);
   // An uninstalled reservation on the same head is not duplicated.

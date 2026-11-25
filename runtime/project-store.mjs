@@ -158,13 +158,13 @@ async function migrate(store, skipMigration) {
 
 // The Git range of a wave gate reservation in the project root (the default `gateRange` port).
 const gitGateRange = async ({ root, baseSha, headSha, mergeCommits }) =>
-  (await gateRange({ cwd: root, baseSha, headSha, mergeCommits })) !== null;
+  gateRange({ cwd: root, baseSha, headSha, mergeCommits });
 
 /** Additive Project Director repository on the existing legacy Store connection.
  * `gateRange({ root, baseSha, headSha, mergeCommits })` (default: Git in the project root)
  * checks the commit range of a wave gate reservation before its transaction.
  * @param {{ store?: any, contracts?: any, authorizeTransition?: any, skipMigration?: boolean,
- *   gateRange?: (input: { root: string, baseSha: string, headSha: string, mergeCommits: string[] }) => Promise<boolean> }} [options]
+ *   gateRange?: (input: { root: string, baseSha: string, headSha: string, mergeCommits: string[] }) => Promise<boolean | Map<string, string[]> | null> }} [options]
  */
 export async function openProjectStore({
   store,
@@ -947,7 +947,51 @@ function replaceable(ctx, latest, action) {
   return latest.containers[0].kind === 'project' && state === 'succeeded' && latest.headSha !== action.headSha;
 }
 
-function applyReserveGate(ctx, { action, project, projectId, now }, change) {
+function recordedOrigins(ctx, snapshot, history) {
+  const tasks = new Map(snapshot.tasks.map(task => [task.id, task.writePaths]));
+  const origins = new Map();
+  const attempts = ctx.db
+    .prepare('SELECT id, task_id, run_id FROM kodo_project_attempts WHERE project_id=?')
+    .all(snapshot.project.projectId);
+  for (const attempt of attempts) {
+    const integration = storedRun(ctx, attempt.run_id)?.integration;
+    const parents = history.get(integration?.mergeCommit);
+    // Only a merge that passed the integration checks (published or awaiting publication) is
+    // attributed; a released pending record keeps its commit fields but proves nothing.
+    if (
+      ['merged', 'pending'].includes(integration?.status) &&
+      parents?.length === 2 &&
+      parents[0] === integration.before &&
+      parents[1] === (integration.mergedHead ?? integration.headSha)
+    )
+      origins.set(integration.mergeCommit, { kind: 'task', ref: attempt.id, writePaths: tasks.get(attempt.task_id) });
+  }
+  for (const gate of snapshot.gates) {
+    const run = storedRun(ctx, gate.runId);
+    const saved = run?.gateReturn;
+    if (!saved || !history.has(saved.target)) continue;
+    const parents = history.get(saved.target);
+    const fastForward = saved.before === gate.headSha && saved.target === run.headSha;
+    const mergeBack = parents.length === 2 && parents[0] === saved.before && parents[1] === run.headSha;
+    if (!fastForward && !mergeBack) continue;
+    const writePaths = [...new Set(gate.merges.flatMap(m => tasks.get(m.taskId)))];
+    // A fast-forward return may publish several repair commits; they are attributed only when
+    // their first-parent chain actually reaches the recorded base.
+    const chain = [];
+    let commit = saved.target;
+    while (history.has(commit) && commit !== saved.before) {
+      chain.push(commit);
+      commit = history.get(commit)[0];
+    }
+    if (commit !== saved.before) continue;
+    for (const repair of chain) origins.set(repair, { kind: 'gate', ref: gate.id, writePaths });
+  }
+  return [...history.keys()]
+    .reverse()
+    .filter(commit => origins.has(commit))
+    .map(commit => ({ commit, ...origins.get(commit) }));
+}
+function applyReserveGate(ctx, { action, project, projectId, now, history }, change) {
   requireValue(isWave(ctx, project), 'gate_unsupported');
   control(ctx, project);
   const s = readSnapshot(ctx, projectId);
@@ -967,6 +1011,7 @@ function applyReserveGate(ctx, { action, project, projectId, now }, change) {
     baseSha: action.baseSha,
     headSha: action.headSha,
     merges: action.merges,
+    provenance: history instanceof Map ? recordedOrigins(ctx, s, history) : [],
     installed: false,
     createdAt: now,
     updatedAt: now,
@@ -988,16 +1033,14 @@ async function assertGateAncestry(ctx, command) {
   }
   if (!isWave(ctx, project)) return; // The transaction refuses it (gate_unsupported).
   const { baseSha, headSha, merges } = command.action;
-  requireValue(
-    baseSha !== headSha &&
-      (await ctx.gateRange({
-        root: project.root,
-        baseSha,
-        headSha,
-        mergeCommits: merges.map(merge => merge.mergeCommit),
-      })) === true,
-    'gate_invalid',
-  );
+  const history = await ctx.gateRange({
+    root: project.root,
+    baseSha,
+    headSha,
+    mergeCommits: merges.map(merge => merge.mergeCommit),
+  });
+  requireValue(baseSha !== headSha && (history === true || history instanceof Map), 'gate_invalid');
+  return history;
 }
 
 const operations = {
@@ -1026,7 +1069,7 @@ async function apply(ctx, input) {
   const payloadHash = recordHash(ctx, 'command', command);
   const prior = replay(ctx, namespace, command.commandId, payloadHash);
   if (prior) return prior;
-  if (action.op === 'reserveGate') await assertGateAncestry(ctx, command);
+  const history = action.op === 'reserveGate' ? await assertGateAncestry(ctx, command) : null;
   let authorizedSnapshot = null;
   if (action.op === 'transition' && forwardStates.has(action.to)) {
     requireValue(typeof ctx.authorizeTransition === 'function', 'authorization_required');
@@ -1098,7 +1141,7 @@ async function apply(ctx, input) {
       {
         const change = { kind, previous, record, attempt };
         if (!Object.hasOwn(operations, action.op)) fail('command_invalid');
-        operations[action.op](ctx, { command, action, project, projectId, now }, change);
+        operations[action.op](ctx, { command, action, project, projectId, now, history }, change);
         ({ kind, previous, record, attempt } = change);
       }
       project = { ...(kind === 'project' ? record : project), revision: project.revision + 1, updatedAt: now };

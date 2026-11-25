@@ -245,7 +245,7 @@ export async function mergeOnBranch({ cwd, branchHead, mergeCommit, before, merg
 }
 
 /**
- * The parents of every merge of a gate when `baseSha..headSha` is its range: each merge lies on
+ * The parents of every first-parent commit (newest first) when `baseSha..headSha` is its range: each merge lies on
  * the first-parent history of `headSha` after `baseSha`, and the earliest of them has `baseSha`
  * as its first parent, so the range is non-empty and contains all of them. Null otherwise.
  * One Git call. `headSha` may also be a later head of the integration branch.
@@ -270,7 +270,7 @@ export async function gateRange({ cwd, baseSha, headSha, mergeCommits }) {
     !mergeCommits.every(commit => parents.get(commit)?.length === 2)
   )
     return null;
-  return new Map(mergeCommits.map(commit => [commit, parents.get(commit)]));
+  return parents;
 }
 
 /**

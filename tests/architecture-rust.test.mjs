@@ -167,10 +167,19 @@ async function rustFixture(t, { files = {}, policy = rustPolicy() } = {}) {
     git(['commit', '-qm', message]);
     return git(['rev-parse', 'HEAD']);
   };
+  const mergeTask = message => {
+    const branch = git(['symbolic-ref', '--short', 'HEAD']);
+    const topic = 'task-' + git(['rev-parse', '--short', 'HEAD']);
+    git(['checkout', '-qb', topic]);
+    commit(message);
+    git(['checkout', '-q', branch]);
+    git(['merge', '--no-ff', '-qm', message, topic]);
+    return git(['rev-parse', 'HEAD']);
+  };
   for (const [file, content] of Object.entries({ ...defaultWorkspaceFiles(), ...files })) await put(file, content);
   if (policy) await put('architecture.policy.json', policy);
   const baseSha = commit('base');
-  return { scratch, project, artifacts, git, put, commit, baseSha, policy };
+  return { scratch, project, artifacts, git, put, commit, mergeTask, baseSha, policy };
 }
 
 test('parseCargoWorkspace resolves glob members, path deps, workspace deps, dev/build deps and CRLF without cargo', () => {
@@ -2609,10 +2618,10 @@ test('X1: brace-expanded globs like {crates/game-contracts,crates/world}/src/** 
   // 3) Epic gate: sibling migration task's authorization must NOT hide an unauthorized contract edit in another task.
   const epicFx = await rustFixture(t);
   await epicFx.put('crates/game-contracts/src/types.rs', 'pub struct EventId(pub u64);\n');
-  const migrateCommit = epicFx.commit('task migrate-contracts');
+  const migrateCommit = epicFx.mergeTask('task migrate-contracts');
   await epicFx.put('crates/world/src/lib.rs', 'pub fn tick() -> u64 { 1 }\n');
   await epicFx.put('crates/game-contracts/src/lib.rs', 'pub struct SneakyEdit;\n');
-  const sneakyWorldCommit = epicFx.commit('task world-feature sneaks contract edit');
+  const sneakyWorldCommit = epicFx.mergeTask('task world-feature sneaks contract edit');
 
   const gateMod = await import('../runtime/architecture-gate.mjs');
   const epicRunBad = {
@@ -2648,9 +2657,9 @@ test('X1: brace-expanded globs like {crates/game-contracts,crates/world}/src/** 
   // Clean epic: migrate-contracts edits contract, world-feature edits only world -> PASS + fresh receipt.
   const cleanFx = await rustFixture(t);
   await cleanFx.put('crates/game-contracts/src/lib.rs', 'pub struct CleanV2;\n');
-  const cleanMigrate = cleanFx.commit('task migrate-contracts clean');
+  const cleanMigrate = cleanFx.mergeTask('task migrate-contracts clean');
   await cleanFx.put('crates/world/src/lib.rs', 'pub fn tick() -> u64 { 2 }\n');
-  const cleanWorld = cleanFx.commit('task world-feature clean');
+  const cleanWorld = cleanFx.mergeTask('task world-feature clean');
   const epicRunClean = {
     planSource: 'gate',
     plan: {
@@ -3202,9 +3211,9 @@ test('Y1: Rust v2 epic gate blocks fail-closed when any gate task lacks valid he
   // Revalidation: a valid clean epic gate receipt MUST fail freshness when revalidated with missing headSha or mismatched gate manifest.
   const cleanFx = await rustFixture(t);
   await cleanFx.put('crates/game-contracts/src/lib.rs', 'pub struct CleanV3;\n');
-  const cleanMigrate = cleanFx.commit('clean migrate');
+  const cleanMigrate = cleanFx.mergeTask('clean migrate');
   await cleanFx.put('crates/world/src/lib.rs', 'pub fn tick() -> u64 { 11 }\n');
-  const cleanWorld = cleanFx.commit('clean world');
+  const cleanWorld = cleanFx.mergeTask('clean world');
   const cleanGateRun = {
     planSource: 'gate',
     directorBinding: { kind: 'gate' },
@@ -3543,4 +3552,82 @@ test('Y5: package.workspace mismatch on member or conflict with exclude blocks a
   const blocked = await checkArchitecture({ project: fx.project, baseSha: fx.baseSha });
   assert.equal(blocked.status, 'blocked');
   assert.ok(blocked.unsupported.some(u => u.reason === 'wrong-workspace-root'));
+});
+test('gate provenance attributes foreign repairs and integrations with their recorded scope', async t => {
+  const fx = await rustFixture(t);
+  await fx.put('crates/game-contracts/src/lib.rs', 'pub struct Repair;\n');
+  const branch = fx.git(['symbolic-ref', '--short', 'HEAD']);
+  fx.git(['checkout', '-qb', 'producer']);
+  fx.commit('repair');
+  fx.git(['checkout', '-q', branch]);
+  fx.git(['merge', '--no-ff', '-qm', 'integration', 'producer']);
+  const commit = fx.git(['rev-parse', 'HEAD']);
+  for (const kind of ['gate', 'task']) {
+    for (const allowed of [true, false]) {
+      const report = await checkArchitecture({
+        project: fx.project,
+        baseSha: fx.baseSha,
+        taskPaths: allowed ? ['crates/world'] : ['crates/game-contracts'],
+        gateOrigin: {
+          headSha: commit,
+          provenance: [{ commit, kind, ref: 'source', writePaths: [allowed ? 'crates/game-contracts' : 'crates'] }],
+        },
+      });
+      assert.equal(report.passed, allowed);
+      if (allowed) assert.ok(report.requiresReview && report.fullVerificationRequired);
+      else assert.ok(report.findings.some(f => f.ruleId === 'contract_change_not_allowed'));
+    }
+  }
+});
+test('gate receipt binds provenance and reviews a covered migration over the original range', async t => {
+  const fx = await rustFixture(t);
+  await fx.put('crates/game-contracts/src/lib.rs', 'pub struct Migration;\n');
+  const headSha = fx.mergeTask('contract migration');
+  const writePaths = ['crates/game-contracts'];
+  const options = {
+    cwd: fx.project,
+    artifacts: fx.artifacts,
+    config: { enabled: true },
+    baseSha: fx.baseSha,
+    headSha,
+    taskPaths: writePaths,
+    taskScopes: [{ id: 'own', mode: 'merge', commit: headSha, writePaths }],
+    gateOrigin: { headSha, provenance: [{ kind: 'task', ref: 'attempt', commit: headSha, writePaths }] },
+  };
+  const receipt = await runArchitectureChecks(options);
+  assert.equal(receipt.status, 'passed');
+  assert.ok(receipt.requiresReview && receipt.fullVerificationRequired);
+  assert.ok(await isCurrentArchitectureReceipt(receipt, options));
+  assert.equal(
+    await isCurrentArchitectureReceipt(receipt, { ...options, gateOrigin: { headSha, provenance: [] } }),
+    false,
+  );
+  for (const key of ['gateOrigin', 'provenanceHash']) {
+    const altered = { ...receipt };
+    delete altered[key];
+    assert.equal(await isCurrentArchitectureReceipt(altered, options), false);
+  }
+});
+
+test('gate rejects a task merge whose integration base is only on its second-parent side', async t => {
+  const fx = await rustFixture(t);
+  const branch = fx.git(['symbolic-ref', '--short', 'HEAD']);
+  fx.git(['branch', 'producer']);
+  await fx.put('crates/world/src/lib.rs', 'pub fn integration() {}\n');
+  const baseSha = fx.commit('integration advanced');
+  fx.git(['checkout', '-q', 'producer']);
+  await fx.put('crates/game-contracts/src/lib.rs', 'pub struct WrongSide;\n');
+  fx.commit('producer changed contract');
+  fx.git(['merge', '--no-ff', '-qm', 'reversed', branch]);
+  const commit = fx.git(['rev-parse', 'HEAD']);
+  await assert.rejects(
+    checkArchitecture({
+      project: fx.project,
+      baseSha,
+      taskPaths: ['crates/game-contracts'],
+      gateOrigin: { headSha: commit, provenance: [] },
+      taskScopes: [{ id: 'world', mode: 'merge', commit, writePaths: ['crates/world'] }],
+    }),
+    { code: 'configuration' },
+  );
 });

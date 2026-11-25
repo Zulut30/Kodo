@@ -412,7 +412,13 @@ const gateFields = {
   updatedAt: timestamp,
 };
 // A reservation replaced before its install (its head went stale) names its successor.
-const gateOptional = { supersededBy: uuid };
+const provenance = v =>
+  list(
+    v,
+    x => object(x, { commit: sha, kind: member(['task', 'gate']), writePaths: v => list(v, scope), ref: uuid }),
+    x => x.commit,
+  );
+const gateOptional = { supersededBy: uuid, provenance };
 // The acceptance criteria of one covered container, as the gate manifest carries them.
 const gateContainerCriteriaRow = v => object(v, { kind: member(containerKinds), id: short, criteria });
 function gateRecord(value) {
@@ -805,7 +811,7 @@ const normalize = {
   },
   installBinding: v => object(v, bindingFields),
   gate: gateRecord,
-  gateBinding: v => object(v, gateBindingFields),
+  gateBinding: v => extended(v, gateBindingFields, { provenance }),
   taskContract: v => {
     const c = object(v, taskContractFields);
     if (c.dependsOn.includes(c.taskId)) fail('project_dag');
@@ -821,19 +827,23 @@ const normalize = {
     return input;
   },
   gateManifest: v => {
-    const input = object(v, {
-      schemaVersion: v => int(v, 2, 2),
-      projectContext: v => object(v, projectContextFields),
-      gate: v => object(v, { containers: gateContainers, baseSha: sha, headSha: sha }),
-      containers: v => list(v, gateContainerCriteriaRow, c => c.kind, 1),
-      tasks: v =>
-        list(
-          v,
-          x => normalize.taskContract(x),
-          t => t.taskId,
-          1,
-        ),
-    });
+    const input = extended(
+      v,
+      {
+        schemaVersion: v => int(v, 2, 2),
+        projectContext: v => object(v, projectContextFields),
+        gate: v => object(v, { containers: gateContainers, baseSha: sha, headSha: sha }),
+        containers: v => list(v, gateContainerCriteriaRow, c => c.kind, 1),
+        tasks: v =>
+          list(
+            v,
+            x => normalize.taskContract(x),
+            t => t.taskId,
+            1,
+          ),
+      },
+      { provenance },
+    );
     if (
       input.tasks.some(t => t.projectId !== input.projectContext.projectId) ||
       input.containers.length !== input.gate.containers.length ||
@@ -995,6 +1005,7 @@ function gateManifestBody(input, options) {
   return {
     schemaVersion: 2,
     projectContext: contextOf(project),
+    ...(gate.provenance ? { provenance: gate.provenance } : {}),
     gate: { containers: gate.containers, baseSha: gate.baseSha, headSha: gate.headSha },
     containers,
     tasks: gate.merges.map(m => contract(byId.get(m.taskId))),
@@ -1035,6 +1046,7 @@ export function gateBindingFor(input, options = { knownValues: [] }) {
       runId: gate.runId,
       baseSha: gate.baseSha,
       headSha: gate.headSha,
+      ...(gate.provenance ? { provenance: gate.provenance } : {}),
       mergesHash: createHash('sha256').update(JSON.stringify(gate.merges)).digest('hex'),
     },
     options,
