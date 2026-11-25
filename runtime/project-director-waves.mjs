@@ -45,6 +45,7 @@ import { withIntegrationLease as withLease } from './project-integration-lease.m
 import { GATE_WATCHDOG, createGateRunDraft, runEpicGate } from './wave-verifier.mjs';
 import { normalizeWatchdogConfig, recordBlocker } from './watchdog.mjs';
 import { applyWavePolicy, assertWavePolicy } from './wave-policy.mjs';
+import { createApiCardCache, prepareWaveTaskContext } from './wave-context.mjs';
 import {
   bindingFor,
   known,
@@ -1042,7 +1043,7 @@ async function frontierOf(ctx, snapshot) {
 }
 
 // Install (or find) the native task Run of an attempt and create its worktree.
-async function installTaskRun(ctx, projectId, attempt, options, control) {
+async function installTaskRun(ctx, projectId, attempt, options, control, apiCardCache = null) {
   let snapshot = await snapshotOf(ctx, projectId);
   const task = taskOf(snapshot, attempt.taskId),
     project = snapshot.project;
@@ -1098,6 +1099,19 @@ async function installTaskRun(ctx, projectId, attempt, options, control) {
     signal: control.signal,
     onCreated: () => markTaskWorktree(run),
   });
+  if (project.execution?.cadence === 'wave') {
+    const waveContext = await prepareWaveTaskContext({
+      ctx,
+      snapshot,
+      attempt,
+      task,
+      run,
+      apiCardCache,
+      buildApiCardsImpl: ctx.buildApiCards,
+      signal: control.signal,
+    });
+    run = ctx.store.updateRun(run.id, { waveContext });
+  }
   return run;
 }
 
@@ -1157,7 +1171,9 @@ async function runWave(ctx, projectId, runs, control) {
 
 async function executeWave(ctx, projectId, attempts, options, control, state) {
   const runs = [];
-  for (const attempt of attempts) runs.push(await installTaskRun(ctx, projectId, attempt, options, control));
+  const apiCardCache = createApiCardCache();
+  for (const attempt of attempts)
+    runs.push(await installTaskRun(ctx, projectId, attempt, options, control, apiCardCache));
   state.waves++;
   const outcomes = await runWave(ctx, projectId, runs, control);
   control.check();

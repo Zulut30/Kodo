@@ -22,6 +22,8 @@ import { runFastChecks } from './task-fast-checks.mjs';
 import { buildGateInput, buildGateManifest, gateBindingFor, gateReviewCriteria } from './project-contracts.mjs';
 import { applyWavePolicy, assertWavePolicy } from './wave-policy.mjs';
 import { gateRange, gateRepairInScope, integrationHeadOf } from './project-integration.mjs';
+import { buildDiagnosticPack } from './diagnostic-pack.mjs';
+import { modulesFromWritePaths, verifiedLessonSummaries } from './context-pack.mjs';
 
 /** The watchdog of a wave gate when the project sets none. */
 export const GATE_WATCHDOG = Object.freeze({ stalledRounds: 2, rejectUnchanged: true });
@@ -258,7 +260,108 @@ async function gateDraft({ engine, project, gate, covered, containers, input }) 
   draft.gateManifest = await engine.persistEvidence(draft, 'gate-manifest', manifest, { headSha: gate.headSha });
   // The independent review confirms each of them (review.criteria).
   draft.gateCriteria = gateReviewCriteria(manifest);
+  const coveredWritePaths = covered.flatMap(({ task }) => task.writePaths || []);
+  const epicIds = [
+    ...new Set([
+      ...(gate.containers || []).filter(c => c.kind === 'epic').map(c => c.id),
+      ...covered.map(({ task }) => task.epicId).filter(nonEmpty),
+    ]),
+  ];
+  draft.gateScope = {
+    epicIds,
+    modules: modulesFromWritePaths(coveredWritePaths),
+    writePaths: [...new Set(coveredWritePaths)],
+  };
   return draft;
+}
+
+function verifiedGateCheckReceipt(run) {
+  const checks = run.checks;
+  if (
+    checks?.complete !== true ||
+    typeof checks.headSha !== 'string' ||
+    checks.headSha !== run.headSha ||
+    checks.passed === false ||
+    (checks.status !== undefined && checks.status !== 'passed') ||
+    !Array.isArray(checks.results) ||
+    !checks.results.length
+  )
+    return null;
+  const results = checks.results.map(item => ({
+    command: item?.command,
+    exitCode: item?.exitCode,
+    ...(item?.status !== undefined ? { status: item.status } : {}),
+    ...(item?.passed !== undefined ? { passed: item.passed } : {}),
+  }));
+  const allPassed = results.every(
+    item => item.exitCode === 0 && item.passed !== false && (item.status === undefined || item.status === 'passed'),
+  );
+  if (!allPassed) return null;
+  return {
+    complete: true,
+    headSha: checks.headSha,
+    ...(checks.status !== undefined ? { status: checks.status } : {}),
+    results,
+  };
+}
+
+function verifiedGateCriterionIds(run) {
+  const criteria = run.review?.criteria;
+  if (!Array.isArray(criteria) || !criteria.length) return null;
+  if (!criteria.every(row => row && row.met === true && typeof row.id === 'string' && row.id.trim())) return null;
+  const ids = [...new Set(criteria.map(row => row.id.trim()))];
+  if (
+    Array.isArray(run.gateCriteria) &&
+    run.gateCriteria.length > 0 &&
+    !run.gateCriteria.every(row => ids.includes(row.id))
+  )
+    return null;
+  return ids;
+}
+
+/**
+ * Record a head-verified, criterion-bound gate lesson (<= 200 Unicode chars, bound to `run.headSha`,
+ * passing checks and passing review, redacted, without raw review findings) into
+ * the project's knowledge store so subsequent tasks of the same module/epic receive it.
+ * @param {any} engine
+ * @param {any} run
+ */
+export function recordGateLesson(engine, run) {
+  if (!engine?.store || !run || run.directorBinding?.kind !== 'gate') return null;
+  const rawLesson =
+    typeof run.review?.lesson === 'string' ? run.review.lesson : typeof run.lesson === 'string' ? run.lesson : '';
+  const trimmed = redact(rawLesson.trim(), engine.secrets || {});
+  if (!trimmed) return null;
+  if (!shaPattern.test(run.headSha) || run.review?.passed !== true || run.review.headSha !== run.headSha) return null;
+  const checks = verifiedGateCheckReceipt(run);
+  const criterionIds = verifiedGateCriterionIds(run);
+  if (!checks || !criterionIds) return null;
+  const chars = Array.from(trimmed);
+  const summary = chars.length <= 200 ? trimmed : chars.slice(0, 199).join('') + '…';
+  const scope = run.gateScope ?? {
+    epicIds: [],
+    modules: modulesFromWritePaths((run.plan?.tasks || []).flatMap(task => task.writePaths || [])),
+    writePaths: [...new Set((run.plan?.tasks || []).flatMap(task => task.writePaths || []))],
+  };
+  const candidate = {
+    runId: run.id,
+    headSha: run.headSha,
+    summary,
+    lesson: summary,
+    kind: 'gate-lesson',
+    projectId: run.directorBinding.projectId,
+    gateId: run.directorBinding.gateId,
+    criterionIds,
+    epicIds: [...new Set(scope.epicIds || [])],
+    modules: [...new Set(scope.modules || [])],
+    writePaths: [...new Set(scope.writePaths || [])],
+    checks,
+    review: { passed: true, headSha: run.headSha },
+  };
+  if (!verifiedLessonSummaries([candidate], 1, { includeGateLessons: true, requireCriteria: true }).length) return null;
+  if (typeof engine.store.rememberLesson === 'function')
+    return engine.store.rememberLesson(run.project, run.id, candidate);
+  return null;
 }
 
 /** Hold `run:<id>` like Engine.run(): heartbeat, cancellation requests and the caller's signal. */
@@ -446,6 +549,8 @@ export async function runEpicGate({ engine, run: input, signal }) {
       run.state = 'succeeded';
       run.error = null;
       run.blocker = resolveBlocker(run.blocker, { at: new Date().toISOString(), outcome: 'succeeded' });
+      const recordedLesson = recordGateLesson(engine, run);
+      if (recordedLesson) run.gateLesson = { headSha: run.headSha, lesson: recordedLesson.lesson };
       engine.save(run);
       engine.log(run, 'gate_succeeded', { headSha: run.headSha, smoke: run.smoke.results.length });
       return run;
@@ -474,16 +579,26 @@ export async function verifyTaskFastOnce({ engine, run: input, signal, maxHeavyB
       if (run.behavior.headSha !== run.checks.headSha)
         throw fail('HEAD изменился между быстрыми проверками и behaviour gate', 'stale_checks');
       run.headSha = run.checks.headSha;
+      run.lastDiagnostics = null;
       engine.save(run);
       return { passed: true, headSha: run.headSha, checks: run.checks, behavior: run.behavior };
     } catch (caught) {
       const error = leaseError() || caught;
       if (leased.aborted || ['cancelled', 'quota', 'auth', 'lease_lost', 'evidence_integrity'].includes(error.code))
         throw error;
+      const diagnostics = buildDiagnosticPack({
+        checks: run.checks,
+        behavior: run.behavior,
+        error,
+        secrets: engine.secrets,
+      });
+      run.lastDiagnostics = diagnostics;
+      engine.save(run);
       return {
         passed: false,
         code: error.code || 'error',
         message: redact(String(error.message), engine.secrets).slice(0, 6000),
+        diagnostics,
         headSha: run.checks?.headSha ?? null,
         checks: run.checks,
         behavior: run.behavior,

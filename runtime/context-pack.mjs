@@ -1,3 +1,5 @@
+import { scopesOverlap } from './contracts.mjs';
+
 /** Actual UTF-8 text bytes. These are neither billed tokens nor quota usage. */
 export function measureContext(text) {
   if (typeof text !== 'string') throw new TypeError('Context measurement requires a string');
@@ -107,14 +109,35 @@ function addStrings(fields, owner, key, value, field) {
   fields.push([owner, key, field]);
 }
 
+function verifiedLessonChecks(lesson) {
+  const isGate = lesson.kind === 'gate-lesson';
+  if (isGate) {
+    if (!record(lesson.checks) || lesson.checks.complete !== true || lesson.checks.headSha !== lesson.headSha)
+      return false;
+    const results = lesson.checks.results;
+    if (!Array.isArray(results) || !results.length || !Array.from(results).every(record)) return false;
+    return checkEvidence(lesson.checks, lesson.headSha, []).status === 'passed';
+  }
+  const results = Array.isArray(lesson.checks) ? lesson.checks : lesson.checks?.results;
+  if (!Array.isArray(results) || !results.length || !Array.from(results).every(record)) return false;
+  const checks = Array.isArray(lesson.checks) ? { complete: true, headSha: lesson.headSha, results } : lesson.checks;
+  return checkEvidence(checks, lesson.headSha, []).status === 'passed';
+}
+
 // The caller supplies relevant project-scoped lessons in priority order. This
 // projects existing recorded evidence; it performs no new review or storage.
-function verifiedLessonSummaries(lessons) {
+export function verifiedLessonSummaries(
+  lessons,
+  maxLessons = 3,
+  { includeGateLessons = false, deduplicate = false, requireCriteria = false } = {},
+) {
   const selected = [];
+  const seenText = new Set();
   if (!Array.isArray(lessons)) return selected;
   for (const lesson of lessons) {
+    if (!record(lesson)) continue;
+    if (!includeGateLessons && lesson.kind === 'gate-lesson') continue;
     if (
-      !record(lesson) ||
       typeof lesson.runId !== 'string' ||
       !lesson.runId.trim() ||
       typeof lesson.headSha !== 'string' ||
@@ -125,22 +148,72 @@ function verifiedLessonSummaries(lessons) {
       lesson.review.headSha !== lesson.headSha
     )
       continue;
-    const results = Array.isArray(lesson.checks) ? lesson.checks : lesson.checks?.results;
-    if (!Array.isArray(results) || !results.length || !Array.from(results).every(record)) continue;
-    // Stored knowledge uses command/exit arrays. Also accept complete receipts
-    // only when their own head matches; unknown, skipped or failed checks do
-    // not establish verified knowledge, even alongside a passing review.
-    const checks = Array.isArray(lesson.checks) ? { complete: true, headSha: lesson.headSha, results } : lesson.checks;
-    if (checkEvidence(checks, lesson.headSha, []).status !== 'passed') continue;
-    const summary = Array.from(lesson.summary.trim());
+    const criterionIds = Array.isArray(lesson.criterionIds)
+      ? [...new Set(lesson.criterionIds.filter(id => typeof id === 'string' && id.trim()).map(id => id.trim()))]
+      : [];
+    if (requireCriteria && !criterionIds.length) continue;
+    if (!verifiedLessonChecks(lesson)) continue;
+    const trimmed = lesson.summary.trim();
+    if (deduplicate) {
+      const norm = trimmed.replace(/\s+/g, ' ').toLowerCase();
+      if (seenText.has(norm)) continue;
+      seenText.add(norm);
+    }
+    const summary = Array.from(trimmed);
     selected.push({
       runId: lesson.runId,
       headSha: lesson.headSha,
       summary: summary.length <= 200 ? summary.join('') : summary.slice(0, 199).join('') + '…',
+      ...(requireCriteria ? { criterionIds } : {}),
     });
-    if (selected.length === 3) break;
+    if (selected.length === maxLessons) break;
   }
   return selected;
+}
+
+const MODULE_CONTAINER = /^((?:src|crates|packages|modules|libs|services|apps|runtime)\/[^/*?[{]+)/;
+
+/** Extract normalized full module paths (e.g. `crates/core`, `packages/core`) from writePaths. */
+export function modulesFromWritePaths(writePaths) {
+  const modules = new Set();
+  for (const raw of strings(writePaths)) {
+    const normalized = raw.replaceAll('\\', '/').replace(/^\.\//, '').replace(/\/+$/, '');
+    const match = MODULE_CONTAINER.exec(normalized);
+    if (!match) continue;
+    const mod = match[1].toLowerCase();
+    if (mod) modules.add(mod);
+  }
+  return [...modules];
+}
+
+/**
+ * Select up to `maxLessons` head-verified, criterion-bound gate lessons matching a wave task's
+ * epic or full module path/writePaths. Filters by scope and deduplicates normalized text BEFORE
+ * applying `maxLessons`. Never returns secrets or raw review text.
+ * @param {any[]} lessons
+ * @param {{ task: { epicId?: string, writePaths?: string[] }, projectId?: string, maxLessons?: number }} options
+ */
+export function selectWaveVerifiedLessons(lessons, { task, projectId, maxLessons = 3 } = /** @type {any} */ ({})) {
+  if (!Array.isArray(lessons) || !record(task)) return [];
+  const taskModules = modulesFromWritePaths(task.writePaths);
+  const taskPaths = strings(task.writePaths);
+  const matched = lessons.filter(lesson => {
+    if (!record(lesson) || lesson.kind !== 'gate-lesson') return false;
+    if (projectId && typeof lesson.projectId === 'string' && lesson.projectId !== projectId) return false;
+    const epicIds = strings(lesson.epicIds);
+    const modules = strings(lesson.modules).map(m => m.toLowerCase());
+    const writePaths = strings(lesson.writePaths);
+    if (!epicIds.length && !modules.length && !writePaths.length) return false;
+    if (typeof task.epicId === 'string' && epicIds.includes(task.epicId)) return true;
+    if (taskModules.some(mod => modules.includes(mod))) return true;
+    if (taskPaths.length && writePaths.length && scopesOverlap(writePaths, taskPaths)) return true;
+    return false;
+  });
+  return verifiedLessonSummaries(matched, maxLessons, {
+    includeGateLessons: true,
+    deduplicate: true,
+    requireCriteria: true,
+  });
 }
 
 /** Bounded allowlisted analysis/discovery metadata; source bodies, cache,

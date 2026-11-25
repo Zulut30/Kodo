@@ -411,11 +411,44 @@ export class Store {
       .run(run.id, projectKey(run.project), JSON.stringify(lesson), Date.now());
     return lesson;
   }
+  rememberLesson(project, id, record) {
+    const lesson = redact(record, this.secrets);
+    this.db
+      .prepare('INSERT OR REPLACE INTO knowledge VALUES(?,?,?,?)')
+      .run(id, projectKey(project), JSON.stringify(lesson), Date.now());
+    return lesson;
+  }
   lessons(project, limit = 5) {
     return this.db
-      .prepare('SELECT body FROM knowledge WHERE project=? ORDER BY time DESC LIMIT ?')
+      .prepare(
+        "SELECT body FROM knowledge WHERE project=? AND (json_extract(body, '$.kind') IS NULL OR json_extract(body, '$.kind') != 'gate-lesson') ORDER BY time DESC LIMIT ?",
+      )
       .all(projectKey(project), limit)
       .map(row => JSON.parse(row.body));
+  }
+  gateLessons(project, limit = 200) {
+    return this.db
+      .prepare(
+        "SELECT body FROM knowledge WHERE project=? AND json_extract(body, '$.kind') = 'gate-lesson' ORDER BY time DESC, rowid DESC LIMIT ?",
+      )
+      .all(projectKey(project), limit)
+      .map(row => JSON.parse(String(row.body)));
+  }
+  gateLessonsPage(project, { projectId = null, limit = 50, offset = 0 } = {}) {
+    if (projectId) {
+      return this.db
+        .prepare(
+          "SELECT body FROM knowledge WHERE project=? AND json_extract(body, '$.kind') = 'gate-lesson' AND (json_extract(body, '$.projectId') IS NULL OR json_extract(body, '$.projectId') = ?) ORDER BY time DESC, rowid DESC LIMIT ? OFFSET ?",
+        )
+        .all(projectKey(project), projectId, limit, offset)
+        .map(row => JSON.parse(String(row.body)));
+    }
+    return this.db
+      .prepare(
+        "SELECT body FROM knowledge WHERE project=? AND json_extract(body, '$.kind') = 'gate-lesson' ORDER BY time DESC, rowid DESC LIMIT ? OFFSET ?",
+      )
+      .all(projectKey(project), limit, offset)
+      .map(row => JSON.parse(String(row.body)));
   }
   findKnowledgeCapture(project, captureId) {
     return readKnowledgeCapture(this.db, knowledgeProjectKey(project), captureId);

@@ -21,6 +21,7 @@ import { stateHome, workerEnvironment } from './security.mjs';
 import { inspectCurrentSource, planAffected } from './ci-graph.mjs';
 import { cargoFetchError, cargoLockFailure, cargoOfflineMiss, warmCargoDependencies } from './cargo-fetch.mjs';
 import { cacheFingerprint, readCheckCache, writeCheckCache } from './ci-cache.mjs';
+import { buildDiagnosticPack } from './diagnostic-pack.mjs';
 
 export const TASK_FAST_PROFILE = 'task-fast';
 export { fastCheckTimeout, FAST_CHECK_TIMEOUT_MS };
@@ -1001,17 +1002,26 @@ async function runStep({ engine, run, step, headSha, env, cache, counting, signa
     };
   }
   await assertClean(run.cwd, headSha, 'Команда проверки изменила проверяемый commit или файлы', unrelatedCargoLinks);
-  if (result.code !== 0)
+  if (result.code !== 0) {
+    const diagnostics = buildDiagnosticPack({
+      stdout: value.stdout,
+      stderr: value.stderr,
+      secrets: engine.secrets,
+    });
+    row.diagnostics = diagnostics;
     return {
       row,
       cargoOfflineMiss: cargoCommand(step) && cargoOfflineMiss(value.stderr),
-      error:
+      error: Object.assign(
         (cargoCommand(step) ? cargoLockFailure(value.stderr) : null) ??
-        fail(
-          `Проверка ${step.kind} не пройдена (exit ${result.code}): ${(value.stdout + value.stderr).slice(-6000)}`,
-          'check_failed',
-        ),
+          fail(
+            `Проверка ${step.kind} не пройдена (exit ${result.code}): ${(value.stdout + value.stderr).slice(-6000)}`,
+            'check_failed',
+          ),
+        { diagnostics },
+      ),
     };
+  }
   if (npm?.error?.code === 'cancelled') return { row, error: npm.error };
   // npm passed, but its plain `node --test` passed no test by Kodo's events: not a pass. A counting run
   // that failed, stopped or gave no complete event file leaves the decision to npm's exit code.
@@ -1086,6 +1096,7 @@ export async function runFastChecks({ engine, run, signal, maxHeavyBuilds = 1 })
     outcome = await executePlan({ engine, run, plan, headSha, signal, maxHeavyBuilds });
   }
   run.checks.complete = true;
+  run.lastDiagnostics = null;
   engine.save(run);
   engine.log(run, 'fast_checks', {
     headSha,
@@ -1231,6 +1242,10 @@ async function executePlanSteps({ engine, run, plan, headSha, signal }, env) {
     }
     const { row, error, noTests, unknown } = outcome;
     results.push(row);
+    if (error?.diagnostics) {
+      run.checks.diagnostics = error.diagnostics;
+      run.lastDiagnostics = error.diagnostics;
+    }
     engine.save(run);
     if (error) throw error;
     // A narrowed run that passed no test is replaced by the full suite.

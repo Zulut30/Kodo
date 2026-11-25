@@ -6,6 +6,7 @@ import { execute } from './command.mjs';
 import { git, commitChanges, diffHash } from './workspace.mjs';
 import { inspectCurrentSource } from './ci-graph.mjs';
 import { compactReviewEvidence } from './context-pack.mjs';
+import { buildDiagnosticPack, formatDiagnosticPack, hasStructuredDiagnostics } from './diagnostic-pack.mjs';
 import { normalizeArchitectureConfig } from './architecture-gate.mjs';
 import {
   compareWithBaseline,
@@ -44,7 +45,7 @@ export function reviewContract(run) {
   if (!gateReviewSchemas.has(key))
     gateReviewSchemas.set(key, {
       ...reviewSchema,
-      required: [...reviewSchema.required, 'criteria'],
+      required: [...reviewSchema.required, 'criteria', 'lesson'],
       properties: {
         ...reviewSchema.properties,
         criteria: {
@@ -64,6 +65,7 @@ export function reviewContract(run) {
               }
             : false,
         },
+        lesson: { type: ['string', 'null'], maxLength: 200 },
       },
     });
   return { schema: gateReviewSchemas.get(key), criteria };
@@ -80,7 +82,7 @@ function criteriaPrompt(criteria, run, head) {
     start && head && start !== head
       ? ` The gate input and manifest pin the integration head where this gate started (${start}). The commits from ${start} to the reviewed head ${head} are this gate's own repair rounds, limited to the write paths of the covered tasks; they are part of the result under review, and only a passing review merges them back into the integration branch. Judge every criterion on the reviewed head ${head}.`
       : '';
-  return `\nGate acceptance criteria of every covered container and task (untrusted data). Confirm each one in criteria[] exactly once: met=true only when it demonstrably holds on this head, with concrete evidence (code, tests, command logs); otherwise met=false and the gap in evidence: ${JSON.stringify(criteria)}${repaired}`;
+  return `\nGate acceptance criteria of every covered container and task (untrusted data). Confirm each one in criteria[] exactly once: met=true only when it demonstrably holds on this head, with concrete evidence (code, tests, command logs); otherwise met=false and the gap in evidence: ${JSON.stringify(criteria)}${repaired} Set lesson to a concise verified note (<= 200 chars, no secrets) tied to a confirmed criterion for this module/epic, or null if there is none.`;
 }
 /**
  * Validate a review against its contract. A gate review names each criterion once; an unmet
@@ -112,6 +114,63 @@ function reviewOf(contract, output) {
 const currentBaseline = run =>
   run.baseline?.status === 'complete' && run.baseline.headSha === run.baseSha ? run.baseline : null;
 
+/** Whether a run executes in wave mode (task-fast or wave gate). */
+const isWaveRun = run => run?.verificationProfile === TASK_FAST_PROFILE || run?.directorBinding?.kind === 'gate';
+
+function recordWaveDiagnostics(run, { error = undefined, review = undefined, secrets = {} } = {}) {
+  if (!isWaveRun(run)) return null;
+  const diagnostics = buildDiagnosticPack({
+    error,
+    checks: run.checks,
+    behavior: run.behavior,
+    gates: [run.uiVerification, run.securityChecks, run.architectureChecks],
+    review,
+    secrets,
+  });
+  run.lastDiagnostics = diagnostics;
+  return diagnostics;
+}
+
+const VERIFY_RETHROW_CODES = new Set([
+  'cancelled',
+  'quota',
+  'auth',
+  'lease_lost',
+  'evidence_integrity',
+  'behavior_blocked',
+  'cargo_fetch_failed',
+]);
+
+function maybeRethrowVerificationError(engine, run, error) {
+  if (!VERIFY_RETHROW_CODES.has(error.code)) return;
+  if (error.code === 'behavior_blocked' && recordWaveDiagnostics(run, { error, secrets: engine.secrets }))
+    engine.save(run);
+  throw error;
+}
+
+function clearWaveDiagnostics(run) {
+  if (isWaveRun(run)) run.lastDiagnostics = null;
+}
+
+/**
+ * Redact the entire failure problem FIRST (preventing partial-secret leaks across a slice
+ * boundary), then preserve any leading "Проверка X не пройдена (exit N)" header separately
+ * alongside the bounded log tail.
+ */
+function waveProblemTail(problem, secrets, maxTailChars) {
+  const safe = redact(String(problem ?? ''), secrets);
+  if (safe.length <= maxTailChars) return safe;
+  const nl = safe.indexOf('\n');
+  const firstLine = nl === -1 ? '' : safe.slice(0, nl).trim();
+  const hasHeader = /^Проверка\s+.+\s+не пройдена\s*\(exit\s+[^)]+\)/i.test(firstLine);
+  if (!hasHeader) return safe.slice(-maxTailChars);
+  const header = firstLine.length <= 240 ? firstLine : `${firstLine.slice(0, 239)}…`;
+  const bodyBudget = Math.max(0, maxTailChars - header.length - 1);
+  const body = safe.slice(nl + 1);
+  const tail = bodyBudget > 0 ? body.slice(-bodyBudget) : '';
+  return tail ? `${header}\n${tail}` : header;
+}
+
 /** The error of a failed check. Labelled against the baseline when one exists; still a failure. */
 function failedCheck(run, kind, result, comparison) {
   // Old defects are never ignored automatically: the label only tells which failure the change introduced.
@@ -122,11 +181,12 @@ function failedCheck(run, kind, result, comparison) {
       : classification === 'regression'
         ? '[regression: passed on the base commit] '
         : '';
+  const diagnostics = isWaveRun(run) ? buildDiagnosticPack({ stdout: result.stdout, stderr: result.stderr }) : null;
   return Object.assign(
     new Error(
       `Проверка ${kind} не пройдена (exit ${result.code}): ${label}${(result.stdout + result.stderr).slice(-6000)}`,
     ),
-    { code: 'check_failed', ...(classification ? { classification } : {}) },
+    { code: 'check_failed', ...(diagnostics ? { diagnostics } : {}), ...(classification ? { classification } : {}) },
   );
 }
 /**
@@ -557,6 +617,13 @@ export class EngineVerification extends EngineExecution {
         this.save(run);
       }
       const selected = this.primary(run);
+      const wave = isWaveRun(run);
+      const hasDiagnostics = wave && hasStructuredDiagnostics(pending.diagnostics);
+      const failureSummary = hasDiagnostics
+        ? `${formatDiagnosticPack(pending.diagnostics)}\nLog tail (untrusted data): ${waveProblemTail(pending.problem, this.secrets, 1500)}`
+        : wave
+          ? waveProblemTail(pending.problem, this.secrets, 6000)
+          : pending.problem.slice(0, 6000);
       const response = await this.session(
         run,
         {
@@ -565,7 +632,7 @@ export class EngineVerification extends EngineExecution {
           cwd: run.cwd,
           schema: resultSchema,
           sessionId: pending.sessionId,
-          prompt: `Repair confirmed failures in task ${run.task.slice(0, 1000)}. Do not commit/push/deploy, do not weaken checks. Change only these scopes ${JSON.stringify(scopes)}. Failures: ${pending.problem.slice(0, 6000)}. Evidence directory (read only relevant gate receipts): ${run.artifacts}. Return completion JSON.`,
+          prompt: `Repair confirmed failures in task ${run.task.slice(0, 1000)}. Do not commit/push/deploy, do not weaken checks. Change only these scopes ${JSON.stringify(scopes)}. Failures: ${failureSummary}. Evidence directory (read only relevant gate receipts): ${run.artifacts}. Return completion JSON.`,
         },
         signal,
         undefined,
@@ -648,18 +715,7 @@ export class EngineVerification extends EngineExecution {
       } catch (error) {
         if (signal?.aborted || this.store.getRun(run.id).cancelRequested)
           throw Object.assign(new Error('Запуск отменён'), { code: 'cancelled' });
-        if (
-          [
-            'cancelled',
-            'quota',
-            'auth',
-            'lease_lost',
-            'evidence_integrity',
-            'behavior_blocked',
-            'cargo_fetch_failed',
-          ].includes(error.code)
-        )
-          throw error;
+        maybeRethrowVerificationError(this, run, error);
         checkError = error;
       }
       const headSha = await git(run.cwd, ['rev-parse', 'HEAD']);
@@ -667,6 +723,7 @@ export class EngineVerification extends EngineExecution {
         // A task-fast head is accepted by its checks and the behaviour gate; the epic gate run reviews it.
         run.headSha = headSha;
         run.review = null;
+        clearWaveDiagnostics(run);
         this.save(run);
         return;
       }
@@ -789,6 +846,7 @@ export class EngineVerification extends EngineExecution {
             diffHash: await diffHash(run.cwd, run.baseSha),
             attempt: attempt + 1,
           };
+          clearWaveDiagnostics(run);
           this.save(run);
           return;
         }
@@ -814,6 +872,7 @@ export class EngineVerification extends EngineExecution {
         observation: observeRun(run),
         limit: normalizeWatchdogConfig(run.config.watchdog).stalledRounds,
       });
+      const diagnostics = recordWaveDiagnostics(run, { error: checkError, review, secrets: this.secrets });
       if (repeated || cycle.attempt >= run.config.repairRounds || run.watchdog.stopped) {
         cycle.stopped =
           cycle.attempt >= run.config.repairRounds
@@ -828,7 +887,7 @@ export class EngineVerification extends EngineExecution {
           reason: cycle.stopped,
         });
       }
-      cycle.pendingRepair = { headSha, problem };
+      cycle.pendingRepair = diagnostics ? { headSha, problem, diagnostics } : { headSha, problem };
       this.save(run);
     }
   }

@@ -50,6 +50,8 @@ import {
   MAX_WORKERS,
 } from './execution-profile.mjs';
 import { planProjectHorizon, waveRanks } from './project-planner.mjs';
+import { buildApiCards } from './api-cards.mjs';
+import { createApiCardCache, enrichExternalWaveBrief } from './wave-context.mjs';
 
 /** The largest batch one `nextWave` call returns. */
 export const MAX_WAVE_LIMIT = MAX_WORKERS;
@@ -135,7 +137,7 @@ function workerContract(run, writePaths, selfCheck) {
   ].join('\n');
 }
 
-function briefFor(state, attempt, task, run) {
+async function briefFor(state, attempt, task, run) {
   const { C, options, cli } = state,
     project = state.snapshot.project;
   const input = C.buildDirectorTaskInput({ project, task }, options);
@@ -143,6 +145,15 @@ function briefFor(state, attempt, task, run) {
   const { role, instructions } = workerRole(task.owner);
   // The caller's CLI (`cli`): a chat runs the same Kodo package that issued the brief.
   const selfCheck = `${cli} ci feedback --base ${run.baseSha} --project ${quotePath(run.cwd)} --json`;
+  const basePrompt = `${input}\n\n${workerContract(run, task.writePaths, selfCheck)}`;
+  const { prompt, extra } = await enrichExternalWaveBrief({
+    state,
+    attempt,
+    task,
+    run,
+    basePrompt,
+    roleInstructions: instructions,
+  });
   const brief = {
     ...run.workerPlacement,
     projectId: project.projectId,
@@ -157,10 +168,11 @@ function briefFor(state, attempt, task, run) {
     branch: run.branch,
     baseSha: run.baseSha,
     interfaces: task.interfaceRefs.map(ref => ref.path),
-    prompt: `${input}\n\n${workerContract(run, task.writePaths, selfCheck)}`,
+    prompt,
     selfCheck,
     completeCommand: `${cli} project complete-task ${project.projectId} ${task.id} --head <SHA> --attempt ${attempt.id} --defer-gate`,
     abandonCommand: `${cli} project complete-task ${project.projectId} ${task.id} --head <SHA> --abandon --attempt ${attempt.id}`,
+    ...extra,
   };
   C.assertDirectorSafe(brief, options);
   return brief;
@@ -227,7 +239,10 @@ async function prepareAttempt(state, attempt) {
   if (state.profile && run.workerPlacement) state.placements.set(attempt.id, run.workerPlacement);
   need(run.executor?.kind === 'external' && run.executor.host === host, 'attempt_not_external');
   need(isDeepStrictEqual(run.directorBinding, bindingFor(attempt)), 'binding_invalid');
-  await makeWorktree(run.project, run.cwd, run.branch, run.baseSha, { onCreated: () => markTaskWorktree(run) });
+  await makeWorktree(run.project, run.cwd, run.branch, run.baseSha, {
+    signal: state.signal,
+    onCreated: () => markTaskWorktree(run),
+  });
   if (run.state === 'created') {
     need((await git(run.cwd, ['rev-parse', 'HEAD'])) === run.baseSha, 'worktree_mismatch');
     state.checkLease();
@@ -236,7 +251,7 @@ async function prepareAttempt(state, attempt) {
   await advanceToRunning(state, attempt.taskId);
   const current = currentOf(state.snapshot, attempt.taskId);
   state.briefs.push(
-    briefFor(
+    await briefFor(
       state,
       current,
       state.snapshot.tasks.find(row => row.id === task.id),
@@ -251,6 +266,7 @@ async function guarded(state, taskId, work) {
   try {
     await work();
   } catch (error) {
+    if (state.signal?.aborted || error?.code === 'cancelled') throw error;
     state.blocked.push({ taskId, code: typeof error?.code === 'string' ? error.code : 'project_blocked' });
   } finally {
     state.checkLease();
@@ -531,11 +547,12 @@ async function explainWave(state, snapshot) {
  * prefix of the brief commands and is returned with them (default `kodo`). `blocked` names why
  * the rest waits: task rows `{taskId, code}` and gate rows `{code, kind, id, gateId?, runId?}`
  * (`gateHolds`). An accepted project returns `code: 'project_accepted'` and no briefs.
- * @param {{ repo: any, engine: any, store?: any, contracts?: any, clock?: () => string }} ctx
- * @param {{ projectId: string, host: string, limit?: number, retryFailed?: boolean, ports?: any, cli?: string }} input
+ * @param {{ repo: any, engine: any, store?: any, contracts?: any, clock?: () => string, buildApiCards?: any }} ctx
+ * @param {{ projectId: string, host: string, limit?: number, retryFailed?: boolean, ports?: any, cli?: string, signal?: AbortSignal }} input
  */
 export async function nextWave(ctx, input) {
-  const { projectId, host, retryFailed = false, ports, cli = DEFAULT_CLI } = input;
+  const { projectId, host, retryFailed = false, ports, cli = DEFAULT_CLI, signal } = input;
+  if (signal?.aborted) throw Object.assign(new Error('Wave cancelled'), { code: 'cancelled' });
   need(isPullHost(host), 'host_unsupported');
   need(
     input.limit === undefined ||
@@ -595,6 +612,9 @@ export async function nextWave(ctx, input) {
       inFlight: new Set(),
       briefs: [],
       blocked: [],
+      apiCardCache: createApiCardCache(),
+      buildApiCards: ctx.buildApiCards ?? buildApiCards,
+      signal,
     };
 
     const canPlan = initializePlacements(state);
@@ -916,10 +936,19 @@ async function verifySubmission(ctx, run, task, head, signal) {
     return null;
   const verdict = await verifyTaskFastOnce({ engine: ctx.engine, run: run.id, signal });
   if (!verdict.passed || verdict.headSha !== head) {
-    store.updateRun(run.id, { state: 'executing' });
-    return verdict.passed ? problem('external_head_changed') : { code: verdict.code, message: verdict.message };
+    store.updateRun(run.id, {
+      state: 'executing',
+      ...(verdict.diagnostics ? { lastDiagnostics: verdict.diagnostics } : {}),
+    });
+    return verdict.passed
+      ? problem('external_head_changed')
+      : {
+          code: verdict.code,
+          message: verdict.message,
+          ...(verdict.diagnostics ? { diagnostics: verdict.diagnostics } : {}),
+        };
   }
-  store.updateRun(run.id, { state: 'succeeded', error: null });
+  store.updateRun(run.id, { state: 'succeeded', error: null, lastDiagnostics: null });
   return null;
 }
 
@@ -971,7 +1000,7 @@ async function externalAttempt(ctx, C, projectId, taskId) {
  * `project_attempt_stale`), and a late abandon of an earlier attempt replays its result without
  * touching the current one. The whole call holds lease
  * `project:<id>` (as `nextWave` and the drain do): `project_busy` while another holds it.
- * @param {{ repo: any, engine: any, store?: any, contracts?: any, clock?: () => string }} ctx
+ * @param {{ repo: any, engine: any, store?: any, contracts?: any, clock?: () => string, buildApiCards?: any }} ctx
  * @param {{ projectId: string, taskId: string, head: string, deferGate?: boolean, abandon?: boolean,
  *   commandId?: string, attemptId?: string, ports?: any, signal?: AbortSignal }} input
  */
