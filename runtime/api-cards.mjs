@@ -71,12 +71,14 @@ function scanRustChar(source, start) {
     while (i < source.length && source[i] !== "'" && source[i] !== '\n' && i - start < 14) i++;
     return source[i] === "'" ? i + 1 : -1;
   }
-  return source[i + 1] === "'" ? i + 2 : -1;
+  const step = (source.codePointAt(i) ?? 0) > 0xffff ? 2 : 1;
+  return source[i + step] === "'" ? i + step + 1 : -1;
 }
 
 function maskRust(source) {
-  const code = Array.from(source);
-  const noComments = Array.from(source);
+  // Use UTF-16 code-unit arrays so mask indices stay aligned with source[i] and .slice() even for non-BMP chars.
+  const code = source.split('');
+  const noComments = source.split('');
   const blank = (arr, from, to) => {
     for (let k = from; k < to; k++) if (arr[k] !== '\n') arr[k] = ' ';
   };
@@ -456,8 +458,9 @@ function scanJsRegex(source, start) {
 }
 
 function maskJsTs(source) {
-  const code = Array.from(source);
-  const noComments = Array.from(source);
+  // Use UTF-16 code-unit arrays so mask indices stay aligned with source[i] and .slice() even for non-BMP chars.
+  const code = source.split('');
+  const noComments = source.split('');
   const blank = (arr, from, to) => {
     for (let k = from; k < to; k++) if (arr[k] !== '\n') arr[k] = ' ';
   };

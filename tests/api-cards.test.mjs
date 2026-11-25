@@ -576,3 +576,39 @@ export const NEXT = 'ok'
     "export const NEXT = 'ok'",
   ]);
 });
+
+test('V5: non-BMP characters (emoji/surrogate pairs) do not desynchronize JS/TS or Rust mask indices', () => {
+  const ts = `
+// 🚀 launch module
+export const icon = "🚀";
+export function launch() {
+  return "🛸";
+}
+export const badge = "🧭🔥";
+export function status(): "🚀" | "ok" { return "ok"; }
+`;
+  assert.deepEqual(extractJsTsPublicApi(ts), [
+    'export const icon = "🚀"',
+    'export function launch()',
+    'export const badge = "🧭🔥"',
+    'export function status(): "🚀" | "ok"',
+  ]);
+
+  const rs = `
+// 🚀 rust module
+pub const ICON: &str = "🚀";
+pub const EMOJI: char = '🚀';
+pub fn launch() -> &'static str {
+    "🛸"
+}
+pub struct Rocket {
+    pub tag: &'static str,
+}
+`;
+  assert.deepEqual(extractRustPublicApi(rs), [
+    'pub const ICON: &str = "🚀"',
+    "pub const EMOJI: char = '🚀'",
+    "pub fn launch() -> &'static str",
+    'pub struct Rocket',
+  ]);
+});
