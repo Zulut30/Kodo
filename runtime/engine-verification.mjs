@@ -117,6 +117,40 @@ const currentBaseline = run =>
 /** Whether a run executes in wave mode (task-fast or wave gate). */
 const isWaveRun = run => run?.verificationProfile === TASK_FAST_PROFILE || run?.directorBinding?.kind === 'gate';
 
+function recordWaveDiagnostics(run, { error = undefined, review = undefined, secrets = {} } = {}) {
+  if (!isWaveRun(run)) return null;
+  const diagnostics = buildDiagnosticPack({
+    error,
+    checks: run.checks,
+    behavior: run.behavior,
+    gates: [run.uiVerification, run.securityChecks, run.architectureChecks],
+    review,
+    secrets,
+  });
+  run.lastDiagnostics = diagnostics;
+  return diagnostics;
+}
+
+const VERIFY_RETHROW_CODES = new Set([
+  'cancelled',
+  'quota',
+  'auth',
+  'lease_lost',
+  'evidence_integrity',
+  'behavior_blocked',
+]);
+
+function maybeRethrowVerificationError(engine, run, error) {
+  if (!VERIFY_RETHROW_CODES.has(error.code)) return;
+  if (error.code === 'behavior_blocked' && recordWaveDiagnostics(run, { error, secrets: engine.secrets }))
+    engine.save(run);
+  throw error;
+}
+
+function clearWaveDiagnostics(run) {
+  if (isWaveRun(run)) run.lastDiagnostics = null;
+}
+
 /**
  * Redact the entire failure problem FIRST (preventing partial-secret leaks across a slice
  * boundary), then preserve any leading "Проверка X не пройдена (exit N)" header separately
@@ -678,8 +712,7 @@ export class EngineVerification extends EngineExecution {
       } catch (error) {
         if (signal?.aborted || this.store.getRun(run.id).cancelRequested)
           throw Object.assign(new Error('Запуск отменён'), { code: 'cancelled' });
-        if (['cancelled', 'quota', 'auth', 'lease_lost', 'evidence_integrity', 'behavior_blocked'].includes(error.code))
-          throw error;
+        maybeRethrowVerificationError(this, run, error);
         checkError = error;
       }
       const headSha = await git(run.cwd, ['rev-parse', 'HEAD']);
@@ -687,6 +720,7 @@ export class EngineVerification extends EngineExecution {
         // A task-fast head is accepted by its checks and the behaviour gate; the epic gate run reviews it.
         run.headSha = headSha;
         run.review = null;
+        clearWaveDiagnostics(run);
         this.save(run);
         return;
       }
@@ -809,6 +843,7 @@ export class EngineVerification extends EngineExecution {
             diffHash: await diffHash(run.cwd, run.baseSha),
             attempt: attempt + 1,
           };
+          clearWaveDiagnostics(run);
           this.save(run);
           return;
         }
@@ -834,6 +869,7 @@ export class EngineVerification extends EngineExecution {
         observation: observeRun(run),
         limit: normalizeWatchdogConfig(run.config.watchdog).stalledRounds,
       });
+      const diagnostics = recordWaveDiagnostics(run, { error: checkError, review, secrets: this.secrets });
       if (repeated || cycle.attempt >= run.config.repairRounds || run.watchdog.stopped) {
         cycle.stopped =
           cycle.attempt >= run.config.repairRounds
@@ -848,20 +884,7 @@ export class EngineVerification extends EngineExecution {
           reason: cycle.stopped,
         });
       }
-      cycle.pendingRepair = isWaveRun(run)
-        ? {
-            headSha,
-            problem,
-            diagnostics: buildDiagnosticPack({
-              error: checkError,
-              checks: run.checks,
-              behavior: run.behavior,
-              gates: [run.uiVerification, run.securityChecks, run.architectureChecks],
-              review,
-              secrets: this.secrets,
-            }),
-          }
-        : { headSha, problem };
+      cycle.pendingRepair = diagnostics ? { headSha, problem, diagnostics } : { headSha, problem };
       this.save(run);
     }
   }

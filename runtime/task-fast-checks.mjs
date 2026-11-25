@@ -1031,6 +1031,7 @@ export async function runFastChecks({ engine, run, signal }) {
     outcome = await executePlan({ engine, run, plan, headSha, signal });
   }
   run.checks.complete = true;
+  run.lastDiagnostics = null;
   engine.save(run);
   engine.log(run, 'fast_checks', {
     headSha,
@@ -1113,7 +1114,10 @@ async function executePlan({ engine, run, plan, headSha, signal }) {
       signal,
     });
     results.push(row);
-    if (error?.diagnostics) run.checks.diagnostics = error.diagnostics;
+    if (error?.diagnostics) {
+      run.checks.diagnostics = error.diagnostics;
+      run.lastDiagnostics = error.diagnostics;
+    }
     engine.save(run);
     if (error) throw error;
     // A narrowed run that passed no test is replaced by the full suite.
