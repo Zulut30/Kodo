@@ -998,6 +998,7 @@ function rustBodyFindings(base, head) {
 
 /** How many files a search for macro calls reads at most; past it the macro counts as called. */
 const MAX_CALL_FILES = 200;
+const MAX_TEMPLATE_HOPS = 128;
 
 /**
  * `weak_or_empty_test` for a `macro_rules!` template: a test it defines that is new or changed
@@ -1047,7 +1048,9 @@ async function templateFindings(cwd, headSha, base, head) {
   };
   const reached = async (template, file, seen = new Set()) => {
     const slot = `${file}\u0000${template.name}`;
-    if (seen.has(slot) || seen.size > 32) return false;
+    if (seen.has(slot)) return false;
+    // A work cap, not a verdict: past it the template is treated as reached and still checked.
+    if (seen.size >= MAX_TEMPLATE_HOPS) return true;
     seen.add(slot);
     const crate = rustCrateDir(file),
       inScope = other => template.exported || rustCrateDir(other) === crate;

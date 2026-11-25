@@ -1422,6 +1422,11 @@ test('Round 5: empty targets, moves into ignore, nested templates, checkout boun
       'src/use_it.rs': '// nothing calls them\n',
     });
     assert.deepEqual(await weakened(cycle.change({ 'src/gen.rs': make(' ') })), []);
+    // A long chain of wrappers is followed to its real call: a search budget never means "unreached".
+    const chain = ['macro_rules! w0 {\n    () => {\n        make_case!(adds);\n    };\n}\n'];
+    for (let n = 1; n < 36; n++) chain.push(`macro_rules! w${n} {\n    () => {\n        w${n - 1}!();\n    };\n}\n`);
+    const deep = repository(s, { ...files, 'src/wrap.rs': chain.join(''), 'src/use_it.rs': 'w35!();\n' });
+    assert.deepEqual(await weakened(deep.change({ 'src/gen.rs': make(' ') })), ['weak_or_empty_test:src/gen.rs']);
   });
   await t.test(
     'Z4: the base checkout must lie strictly inside the registry home, as the file system resolves it',
@@ -1457,26 +1462,47 @@ test('Round 5: empty targets, moves into ignore, nested templates, checkout boun
       assert.equal(readFileSync(path.join(outside, 'precious.txt'), 'utf8'), 'kept\n');
     },
   );
-  await t.test('Z4: a checkout another repository registered is rebuilt for this one, the other untouched', async s => {
+  await t.test('Z4: a checkout of another repository is never moved, cleaned or deleted', async s => {
     const home = homes(s);
+    const checkout = path.join(home, 'base-checkout');
     const other = repository(s, { 'README.md': '# other\n' });
-    other.git('worktree', 'add', '--detach', '--quiet', path.join(home, 'base-checkout'), other.baseSha);
+    other.git('worktree', 'add', '--detach', '--quiet', checkout, other.baseSha);
+    writeFileSync(path.join(checkout, 'scratch.txt'), 'theirs\n');
     const repo = repository(s, {
       'Cargo.toml': cargoToml,
       'src/lib.rs': lib,
       'registry.json': registry(libTarget(['tests::adds'])),
     });
     const head = repo.change({ 'README.md': '# again\n' });
-    const receipt = await runBehaviorGate({
-      ...head,
-      config: {},
-      registry: true,
-      registryHome: home,
-      runner: fakeCargo([]),
-    });
-    assert.equal(receipt.testRegistry.status, 'compared');
-    assert.equal(repo.git('-C', path.join(home, 'base-checkout'), 'rev-parse', 'HEAD'), repo.baseSha);
+    const gate = () =>
+      runBehaviorGate({ ...head, config: {}, registry: true, registryHome: home, runner: fakeCargo([]) });
+    const receipt = await gate();
+    assert.equal(receipt.status, 'incomplete');
+    assert.match(receipt.testRegistry.reason, /another repository/);
+    assert.equal(other.git('-C', checkout, 'rev-parse', 'HEAD'), other.baseSha, 'their checkout was not moved');
+    assert.equal(readFileSync(path.join(checkout, 'scratch.txt'), 'utf8'), 'theirs\n', 'nor cleaned');
     assert.equal(other.git('rev-parse', 'HEAD'), other.baseSha, 'the other repository was not moved');
+  });
+  await t.test('Z4: a stale registration reused by another clone at the same path is left untouched', async s => {
+    const home = homes(s);
+    const checkout = path.join(home, 'base-checkout');
+    const repo = repository(s, {
+      'Cargo.toml': cargoToml,
+      'src/lib.rs': lib,
+      'registry.json': registry(libTarget(['tests::adds'])),
+    });
+    const head = repo.change({ 'README.md': '# again\n' });
+    const gate = () =>
+      runBehaviorGate({ ...head, config: {}, registry: true, registryHome: home, runner: fakeCargo([]) });
+    assert.equal((await gate()).testRegistry.status, 'compared');
+    // The directory goes away without `worktree prune`: this repository still lists the path.
+    rmSync(checkout, { recursive: true, force: true });
+    const other = repository(s, { 'README.md': '# other\n' });
+    other.git('worktree', 'add', '--detach', '--quiet', checkout, other.baseSha);
+    const receipt = await gate();
+    assert.equal(receipt.status, 'incomplete');
+    assert.match(receipt.testRegistry.reason, /another repository/);
+    assert.equal(other.git('-C', checkout, 'rev-parse', 'HEAD'), other.baseSha, 'their HEAD was not moved');
   });
 });
 

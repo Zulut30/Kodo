@@ -923,8 +923,32 @@ async function registeredIn(cwd, checkout) {
  * A checkout of this repository's own: its `.git` exists, Git names it as the top of its work
  * tree, and the repository at `cwd` has it registered.
  */
+async function commonDir(cwd) {
+  const result = await execute('git', ['rev-parse', '--path-format=absolute', '--git-common-dir'], {
+    cwd,
+    allowFailure: true,
+    timeoutMs: 60000,
+  });
+  return result.code === 0 ? canonicalKey(result.stdout.trim()) : null;
+}
+
+/**
+ * A checkout path whose own Git metadata belongs to another repository (a stale registration
+ * reused by another clone) is never touched: no checkout, clean, removal or deletion.
+ */
+async function foreignCheckout(cwd, checkout) {
+  if (!existsSync(path.join(checkout, '.git'))) return false;
+  try {
+    const [own, theirs] = await Promise.all([commonDir(cwd), commonDir(checkout)]);
+    return Boolean(own && theirs && own !== theirs);
+  } catch {
+    return false;
+  }
+}
+
 async function healthyCheckout(cwd, checkout) {
   if (!existsSync(path.join(checkout, '.git'))) return false;
+  if (await foreignCheckout(cwd, checkout)) return false;
   try {
     const top = await execute('git', ['rev-parse', '--show-toplevel'], {
       cwd: checkout,
@@ -952,6 +976,8 @@ async function rebuildCheckout(cwd, home, checkout, baseSha) {
     async () => {
       // Checked again under the lock, just before Git and the file system act on it.
       if (!strictlyInside(home, checkout)) throw new Error(`base checkout ${checkout} is outside the registry home`);
+      if (await foreignCheckout(cwd, checkout))
+        throw new Error(`base checkout ${checkout} belongs to another repository and is left untouched`);
       const options = { cwd, allowFailure: true, timeoutMs: 60000 };
       await execute('git', ['worktree', 'remove', '--force', '--force', checkout], options);
       if (existsSync(checkout)) rmSync(checkout, { recursive: true, force: true });
@@ -971,6 +997,8 @@ async function rebuildCheckout(cwd, home, checkout, baseSha) {
 async function prepareCheckout(cwd, home, checkout, baseSha, signal) {
   // Before any Git command or deletion: the checkout, as the file system resolves it, is in the home.
   if (!strictlyInside(home, checkout)) throw new Error(`base checkout ${checkout} is outside the registry home`);
+  if (await foreignCheckout(cwd, checkout))
+    throw new Error(`base checkout ${checkout} belongs to another repository and is left untouched`);
   if (await healthyCheckout(cwd, checkout)) {
     try {
       const options = { cwd: checkout, allowFailure: true, signal };
