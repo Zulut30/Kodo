@@ -237,6 +237,10 @@ test('A drain stopped mid-row resumes its rows first and never finishes a row tw
   let crash;
   const stopped = new Promise(resolve => (crash = resolve));
   // The first drain "dies" inside b: its promise never settles, the rows stay merging.
+  // The "dead" drain settles only when the test ends (its error is swallowed), never in between.
+  const died = new Promise((resolve, reject) =>
+    t.after(() => reject(Object.assign(new Error('The process died'), { code: 'injected_crash' }))),
+  );
   void drainIntegrationQueue({
     queue,
     projectId,
@@ -245,11 +249,11 @@ test('A drain stopped mid-row resumes its rows first and never finishes a row tw
       integrated.push(entry.taskId);
       if (entry.taskId === 'b') {
         crash();
-        await new Promise(() => {});
+        await died;
       }
       return { status: 'integrated' };
     },
-  });
+  }).catch(() => {});
   await stopped;
   const resumed = openIntegrationQueue(h.open());
   assert.deepEqual(

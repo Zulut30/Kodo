@@ -361,12 +361,33 @@ export function updateRefsAtomically(cwd, { verify = [], update }, { timeoutMs =
   const { args, env } = gitBoundary(['update-ref', '--stdin'], process.env);
   const result = spawnSync('git', args, { cwd, env, input, encoding: 'utf8', timeout: timeoutMs, windowsHide: true });
   if (result.status === 0) return;
-  if (verify.some(row => refValue(cwd, row.ref, timeoutMs) !== row.sha)) throw coded('project_submission_stale');
-  throw coded('project_lease_lost');
+  // A Git that did not run or timed out changed nothing that can be trusted: a lost publish at
+  // once. A refused transaction is classified by `refusedPublish` after the caller's SQLite
+  // transaction ended (no second Git call while the write lock is held).
+  if (result.error || result.status === null) throw coded('project_lease_lost');
+  throw Object.assign(coded('project_lease_lost'), { refused: true });
+}
+
+/**
+ * The code of a refused ref transaction (outside any SQLite transaction): `project_submission_stale`
+ * when a `verify` row (the worker's branch) moved, otherwise the error itself.
+ * @param {any} error
+ * @param {string} cwd
+ * @param {{ ref: string, sha: string }[]} [verify]
+ */
+export function refusedPublish(error, cwd, verify = []) {
+  if (error?.refused !== true) return error;
+  return verify.some(row => refValue(cwd, row.ref, 5000) !== row.sha) ? coded('project_submission_stale') : error;
 }
 
 /** The default ref publisher: the atomic update without a lease fence (callers without a Store). */
-export const atomicPublisher = async ({ cwd, verify, update }) => updateRefsAtomically(cwd, { verify, update });
+export const atomicPublisher = async ({ cwd, verify, update }) => {
+  try {
+    updateRefsAtomically(cwd, { verify, update });
+  } catch (error) {
+    throw refusedPublish(error, cwd, verify);
+  }
+};
 
 // The worktree that has the integration branch checked out follows the branch's current head
 // (never moves the branch itself), under the repository's worktree lock.
@@ -693,11 +714,31 @@ export async function gateRepairInScope({ worktree, from, to, writePaths }) {
  * belongs to the verified gate head; project acceptance additionally requires a
  * gate whose verified head equals the branch head at acceptance time.
  * The caller holds lease `project-integration:<projectId>`.
+ * `savePending({ before, target })` records the return before it is published; `pending` (that record)
+ * lets a repeat sync a worktree that a crash left between the publish and the sync.
  * @param {{ worktree: string, expectedHead: string, gateHead: string,
- *   publish?: (commands: { cwd: string, verify: any[], update: any[] }) => Promise<unknown> }} options
+ *   publish?: (commands: { cwd: string, verify: any[], update: any[] }) => Promise<unknown>,
+ *   pending?: { before: string, target: string } | null,
+ *   savePending?: (pending: { before: string, target: string }) => unknown }} options
  */
-export async function mergeBackGate({ worktree, expectedHead, gateHead, publish = atomicPublisher }) {
-  if (!sha(gateHead) || !sha(expectedHead) || typeof publish !== 'function') fail('integration_invalid');
+export async function mergeBackGate({
+  worktree,
+  expectedHead,
+  gateHead,
+  publish = atomicPublisher,
+  pending = null,
+  savePending = () => {},
+}) {
+  if (
+    !sha(gateHead) ||
+    !sha(expectedHead) ||
+    typeof publish !== 'function' ||
+    typeof savePending !== 'function' ||
+    (pending !== null && (!sha(pending?.before) || !sha(pending?.target)))
+  )
+    fail('integration_invalid');
+  // A crash between the publish of this return and the worktree sync: the same recovery as a task.
+  if (pending) await resumePublishedMerge(worktree, { before: pending.before, mergeCommit: pending.target });
   const branch = await assertIntegrationWorktree(worktree);
   await assertCommit(worktree, gateHead);
   await assertCommit(worktree, expectedHead);
@@ -706,11 +747,14 @@ export async function mergeBackGate({ worktree, expectedHead, gateHead, publish 
   if (await ancestor(worktree, gateHead, before)) return before;
   // The branch is never rewritten: it must still contain the gate head.
   if (!(await ancestor(worktree, expectedHead, before))) fail('integration_invalid');
+  // `merge.verifySignatures` holds for the gate head in both forms of the return.
+  await assertSignature(worktree, gateHead);
   // Fast-forward to the verified head, or merge the repairs; either way by compare-and-swap.
   const next =
     before === expectedHead
       ? gateHead
       : await mergeCommitOf(worktree, before, gateHead, 'Kodo: integrate gate repairs');
+  await savePending({ before, target: next });
   await advanceBranch(worktree, branch, next, before, publish);
   return next;
 }

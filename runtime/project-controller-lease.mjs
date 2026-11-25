@@ -28,15 +28,18 @@ export async function acquireLeaseWaiting(store, name, options = {}) {
   } = options;
   const owner = randomUUID(),
     deadline = now() + waitMs;
+  // A signal aborted by a lost lease keeps that reason, never a cancel.
+  const stopped = () =>
+    coded(signal?.reason?.code === 'project_lease_lost' ? 'project_lease_lost' : 'project_cancelled');
   for (;;) {
-    if (signal?.aborted) throw coded('project_cancelled');
+    if (signal?.aborted) throw stopped();
     const token = store.acquireLease(name, owner, { ttlMs, limit });
     if (token) return token;
     if (now() >= deadline) throw coded(busyCode);
     try {
       await delay(pollMs, undefined, signal ? { signal } : undefined);
     } catch (error) {
-      if (signal?.aborted) throw coded('project_cancelled');
+      if (signal?.aborted) throw stopped();
       throw error;
     }
   }

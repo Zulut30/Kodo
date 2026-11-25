@@ -3,7 +3,7 @@
 // every state write a holder makes is checked against its live lease tokens in its own transaction.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { mkdtemp, mkdir, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
@@ -20,7 +20,8 @@ import {
 } from '../runtime/project-integration.mjs';
 import { integrationLeaseName, withIntegrationLease } from '../runtime/project-integration-lease.mjs';
 import { fencedPublisher } from '../runtime/project-publish.mjs';
-import { withGateController } from '../runtime/project-controller-lease.mjs';
+import { acquireLeaseWaiting, withGateController } from '../runtime/project-controller-lease.mjs';
+import { updateRefsAtomically } from '../runtime/project-integration.mjs';
 import { fencedBy } from '../runtime/lease-fence.mjs';
 
 function git(cwd, ...args) {
@@ -315,4 +316,116 @@ test('The gate controller aborts its pass and fences its writes once its lease i
   );
   assert.equal(outcome, 'project_lease_lost');
   assert.equal(f.store.getRun(run.id).externalCompletion, undefined);
+});
+
+// A gate repair commit on top of the current integration head (a fast-forward candidate).
+async function gateRepair(f, name = 'gate') {
+  const worktree = path.join(f.temp, 'tasks', name);
+  git(f.root, 'worktree', 'add', '-q', '-b', `kodo/${name}`, worktree, f.branchHead());
+  await writeFile(path.join(worktree, `${name}.txt`), `${name}\n`);
+  git(worktree, 'add', '-A');
+  git(worktree, 'commit', '-q', '-m', 'Gate repair');
+  return git(worktree, 'rev-parse', 'HEAD');
+}
+
+test('A crash between returning a gate head and syncing the worktree is recovered on the next acceptance', async t => {
+  const f = await fixture(t);
+  const gateHead = await gateRepair(f);
+  const expectedHead = f.branchHead();
+  let pending = null;
+  const crash = async commands => {
+    await atomicPublisher(commands);
+    throw Object.assign(new Error('Injected crash after update-ref'), { code: 'injected_crash' });
+  };
+  const back = options =>
+    mergeBackGate({ worktree: f.integration.worktree, expectedHead, gateHead, publish: atomicPublisher, ...options });
+  await assert.rejects(back({ publish: crash, savePending: value => (pending = value) }), { code: 'injected_crash' });
+  assert.deepEqual(pending, { before: expectedHead, target: gateHead });
+  assert.equal(f.branchHead(), gateHead, 'the return is published');
+  // Without the record the interrupted state is refused (it blocked every later gate and merge).
+  await assert.rejects(back({}), { code: 'project_integration_worktree_invalid' });
+  // A held index.lock stops the sync: the repeat fails and changes nothing.
+  const lock = path.join(git(f.integration.worktree, 'rev-parse', '--absolute-git-dir'), 'index.lock');
+  await writeFile(lock, '');
+  await assert.rejects(back({ pending }));
+  await rm(lock);
+  assert.equal(await back({ pending }), gateHead);
+  assert.equal(git(f.integration.worktree, 'status', '--porcelain'), '');
+});
+
+test('merge.verifySignatures refuses an unsigned gate head in both forms of the return', async t => {
+  const f = await fixture(t);
+  git(f.root, 'config', 'merge.verifySignatures', 'true');
+  const expectedHead = f.branchHead();
+  const gateHead = await gateRepair(f);
+  const back = () =>
+    mergeBackGate({ worktree: f.integration.worktree, expectedHead, gateHead, publish: atomicPublisher });
+  // Fast-forward.
+  await assert.rejects(back(), { code: 'project_integration_unverified_signature' });
+  assert.equal(f.branchHead(), expectedHead);
+  // Merge commit: another merge moved the branch first.
+  git(f.root, 'config', 'merge.verifySignatures', 'false');
+  await f.merge('alpha', await f.task('alpha'), () => {}, { publish: atomicPublisher });
+  git(f.root, 'config', 'merge.verifySignatures', 'true');
+  const moved = f.branchHead();
+  await assert.rejects(back(), { code: 'project_integration_unverified_signature' });
+  assert.equal(f.branchHead(), moved);
+});
+
+test('A renewal that waited for another writer past the TTL does not revive the lease', async t => {
+  const f = await fixture(t);
+  const token = f.store.acquireLease('renew:boundary', 'holder', { ttlMs: 400 });
+  // Another process holds the write lock longer than the lease has left.
+  const child = spawn(
+    process.execPath,
+    [
+      '-e',
+      `const { DatabaseSync } = require('node:sqlite');
+const db = new DatabaseSync(process.argv[1]);
+db.exec('PRAGMA busy_timeout=5000; BEGIN IMMEDIATE');
+process.stdout.write('locked\\n');
+Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 900);
+db.exec('COMMIT');
+db.close();`,
+      path.join(f.temp, 'state', 'state.sqlite'),
+    ],
+    { stdio: ['ignore', 'pipe', 'inherit'] },
+  );
+  const exited = new Promise(resolve => child.on('exit', resolve));
+  await new Promise((resolve, reject) => {
+    child.stdout.on('data', data => String(data).includes('locked') && resolve());
+    child.on('exit', code => reject(new Error(`writer exited early: ${code}`)));
+  });
+  assert.equal(f.store.renewLease(token), false, 'the TTL passed while the renewal waited');
+  assert.equal(await exited, 0);
+});
+
+test('A lost lease keeps its code while waiting, and a Git that did not run is a lost publish', async t => {
+  const f = await fixture(t);
+  const lostLease = Object.assign(new Error('Project lease lost'), { code: 'project_lease_lost' });
+  const controller = new AbortController();
+  controller.abort(lostLease);
+  f.store.acquireLease('wait:test', 'other', { ttlMs: 60000 });
+  await assert.rejects(acquireLeaseWaiting(f.store, 'wait:test', { signal: controller.signal, pollMs: 1 }), {
+    code: 'project_lease_lost',
+  });
+  f.store.acquireLease(integrationLeaseName(f.projectId), 'other', { ttlMs: 60000 });
+  await assert.rejects(
+    withIntegrationLease(f.store, f.projectId, async () => assert.fail('never held'), { signal: controller.signal }),
+    { code: 'project_lease_lost' },
+  );
+  // A Git that timed out is not classified (no second Git call inside the transaction).
+  const head = f.branchHead();
+  let error;
+  try {
+    updateRefsAtomically(
+      f.root,
+      { update: [{ ref: `refs/heads/${f.integration.branch}`, next: head, expected: head }] },
+      { timeoutMs: 1 },
+    );
+  } catch (caught) {
+    error = caught;
+  }
+  assert.equal(error?.code, 'project_lease_lost');
+  assert.equal(error?.refused, undefined, 'never classified by a second Git call');
 });

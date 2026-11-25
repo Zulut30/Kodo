@@ -37,7 +37,7 @@ export async function withIntegrationLease(store, projectId, work, options = {})
   const deadline = Date.now() + waitMs;
   let token;
   while (!(token = store.acquireLease(name, randomUUID(), { ttlMs: 60000, limit: 1 }))) {
-    if (signal?.aborted) fail('control_blocked');
+    if (signal?.aborted) fail(signal.reason?.code === 'project_lease_lost' ? 'lease_lost' : 'control_blocked');
     if (Date.now() >= deadline) fail('integration_busy');
     await delay(50);
   }

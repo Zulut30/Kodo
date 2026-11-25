@@ -989,8 +989,14 @@ async function integrateQueued(ctx, C, W, waveCtx, entry, signal) {
   } else if (!(await headOnBranch(projectId, run, headSha))) {
     // A new merge — also after a `pending` record whose merge never reached the branch: the full
     // check of the normal path (attempt, no abandon, the worker's branch and worktree on this head).
-    if (cancelled(run) || !['running', 'verifying'].includes(attempt.status)) return stale;
-    if (await workerStateDefect(run, headSha)) return stale;
+    const refused =
+      cancelled(run) || !['running', 'verifying'].includes(attempt.status) || (await workerStateDefect(run, headSha));
+    if (refused) {
+      // Under the integration lease this head is not on the branch: its `pending` record (a merge
+      // that never reached the branch) is released, so a new head of the attempt can go on.
+      waves.releasePending(store, run.id, headSha, stale.code);
+      return stale;
+    }
   }
   let integration;
   try {

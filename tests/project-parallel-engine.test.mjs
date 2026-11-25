@@ -608,11 +608,39 @@ test('A pending merge that never reached the branch is checked again: a moved wo
   f.store.db.prepare("DELETE FROM leases WHERE name LIKE 'project%'").run();
   f.ports.integrateAndAdvance = integrate;
   // The worker commits again before the host repeats the old submission.
-  await f.change(brief, 9);
+  const next = await f.change(brief, 9);
   const result = await f.complete(brief, head);
   assert.deepEqual([result.status, result.code], ['blocked', 'project_submission_stale']);
   assert.deepEqual(f.calls.integrate, ['t0'], 'the old head is never merged');
   assert.equal(f.merges().length, 0);
+  assert.notEqual(f.store.getRun(brief.runId).integration.status, 'pending', 'the pending record is released');
+  // The attempt is not bricked: the worker's new head is verified and merged.
+  const resumed = await f.complete(brief, next);
+  assert.equal(resumed.status, 'integrated', JSON.stringify(resumed));
+  assert.deepEqual(f.calls.integrate, ['t0', 't0']);
+  assert.equal(f.merges().length, 1);
+});
+
+test('A publish refused for a moved worker branch never bricks the attempt: the new head merges', async t => {
+  const f = await fixture(t, { count: 1 });
+  const [brief] = (await f.briefs()).values();
+  const first = await f.change(brief);
+  let next;
+  const integrate = f.ports.integrateAndAdvance;
+  // The worker commits again after the drain checked its branch and before the ref transaction.
+  f.ports.integrateAndAdvance = async (waveCtx, input) => {
+    if (!next) next = await f.change(brief, 7);
+    return integrate(waveCtx, input);
+  };
+  const refused = await f.complete(brief, first);
+  assert.deepEqual([refused.status, refused.code], ['blocked', 'project_submission_stale']);
+  assert.equal(f.merges().length, 0, 'nothing was published');
+  const run = f.store.getRun(brief.runId);
+  assert.equal(run.integration.status, 'failed', 'the pending record of the old head is released');
+  const merged = await f.complete(brief, next);
+  assert.equal(merged.status, 'integrated', JSON.stringify(merged));
+  assert.equal(f.merges().length, 1);
+  assert.equal(f.store.getRun(brief.runId).headSha, next);
 });
 
 // The private worktree of the integration branch (where Kodo merges).

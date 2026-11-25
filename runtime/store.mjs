@@ -566,12 +566,22 @@ export class Store {
   }
   // An expired lease is never renewed (another holder may already have taken it): one `now` for
   // the check and the new expiry; no row changed means the lease is lost.
+  // `now` is read after the write lock was taken (BEGIN IMMEDIATE): a renewal that waited for
+  // another writer past the TTL fails instead of reviving the lease.
   renewLease(token, ttlMs = 60000) {
-    const now = Date.now();
-    return (
-      this.db.prepare('UPDATE leases SET expires=? WHERE token=? AND expires>?').run(now + ttlMs, token, now).changes >
-      0
-    );
+    const own = !this.db.isTransaction;
+    if (own) this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const now = Date.now();
+      const renewed =
+        this.db.prepare('UPDATE leases SET expires=? WHERE token=? AND expires>?').run(now + ttlMs, token, now)
+          .changes > 0;
+      if (own) this.db.exec('COMMIT');
+      return renewed;
+    } catch (error) {
+      if (own) rollback(this.db);
+      throw error;
+    }
   }
   releaseLease(token) {
     this.db.prepare('DELETE FROM leases WHERE token=?').run(token);

@@ -211,7 +211,7 @@ async function withProjectControl(ctx, projectId, signal, work) {
       /* A failed renewal also loses ownership. */
     }
     leaseLost = true;
-    abort();
+    controller.abort(Object.assign(new Error('Project lease lost'), { code: 'project_lease_lost' }));
   };
   const timer = setInterval(renew, ctx.engine.leaseHeartbeatMs || 10000);
   timer.unref();
@@ -355,7 +355,30 @@ const integrationFailures = [
   'project_integration_scope',
   'project_integration_history',
   'project_integration_history_unverifiable',
+  'project_integration_unverified_signature',
 ];
+
+/**
+ * Release the `pending` integration record of `headSha` once it is known that its merge never
+ * reached the branch (a refused publish, or a head that is not on the branch under the
+ * integration lease). Fenced and conditional: only a `pending` record of this very head changes.
+ * @param {any} store
+ * @param {string} runId
+ * @param {string} headSha
+ * @param {string} code
+ */
+export function releasePending(store, runId, headSha, code) {
+  store.withFence([], () => {
+    const current = store.getRun(runId);
+    const integration = current.integration;
+    if (
+      integration?.status === 'pending' &&
+      current.headSha === headSha &&
+      (integration.headSha === undefined || integration.headSha === headSha)
+    )
+      store.updateRun(runId, { integration: { ...integration, status: 'failed', code } });
+  });
+}
 
 // Merge the task head once; a recorded or recovered merge is never repeated. A recorded merge
 // that left the branch is `project_integration_missing`, never a replayed success.
@@ -374,7 +397,9 @@ async function mergeRun(ctx, snapshot, task, run) {
       // Every commit of the task enters the branch: each one is inspected, not only the result.
       secrets: ctx.engine.secrets,
       savePending: ({ before, mergeCommit }) =>
-        ctx.store.updateRun(run.id, { integration: { branch, before, mergeCommit, status: 'pending' } }),
+        ctx.store.updateRun(run.id, {
+          integration: { branch, before, mergeCommit, headSha: run.headSha, status: 'pending' },
+        }),
       // A crash after savePending may have published the merge without syncing the worktree.
       pending:
         run.integration?.status === 'pending'
@@ -401,6 +426,13 @@ async function mergeRun(ctx, snapshot, task, run) {
     ctx.store.updateRun(run.id, { integration });
     return integration;
   } catch (error) {
+    // The ref transaction refused the publish (the worker's branch left its verified head): nothing
+    // reached the branch, so this head's `pending` record is released (fenced, this head only) and a
+    // new submission of the attempt can be verified and merged.
+    if (error?.code === 'project_submission_stale') {
+      releasePending(ctx.store, run.id, run.headSha, error.code);
+      throw error;
+    }
     if (!integrationFailures.includes(error?.code)) throw error;
     ctx.store.updateRun(run.id, {
       integration: { branch, before: run.integration?.before ?? null, status: 'failed', code: error.code },
@@ -731,11 +763,17 @@ async function acceptGate(ctx, projectId, gate, run, out, signal) {
       out.stopped ??= stopped;
       return;
     }
+    // The return is recorded on the gate Run before it is published: a crash between the ref
+    // transaction and the worktree sync is recovered by the next acceptance of this gate.
+    const saved = storedRun(ctx.store, run.id)?.gateReturn;
     await mergeBackGate({
       worktree,
       expectedHead: gate.headSha,
       gateHead: run.headSha,
       publish: fencedPublisher(ctx.store),
+      pending: saved?.status === 'pending' ? { before: saved.before, target: saved.target } : null,
+      savePending: ({ before, target }) =>
+        ctx.store.updateRun(run.id, { gateReturn: { before, target, status: 'pending' } }),
     });
     const refs = await persistRefs(ctx, run, gateKinds);
     for (const merge of gate.merges)
@@ -805,6 +843,8 @@ async function epicGate(ctx, snapshot, epic, retryFailed, out) {
 // Failures of Git merge-back and immutable evidence publication that invalidate this Run.
 const gateReturnErrors = {
   project_integration_conflict: 'Verified gate repairs conflict with the current integration head',
+  project_integration_unverified_signature:
+    'The verified gate head has no valid signature while merge.verifySignatures is set',
   project_integration_invalid: 'The gate head cannot be integrated on the current branch history',
   evidence_integrity: 'The immutable acceptance evidence of this gate failed its integrity check',
 };
@@ -1514,6 +1554,11 @@ async function drainLoop(ctx, projectId, options, control, state) {
     const snapshot = await snapshotOf(ctx, projectId);
     if (settled(snapshot.project.status)) return finish(ctx, projectId, state, 'accepted');
     stop = controlState(snapshot);
+    // A lost project lease is a blocker of its own, never a cancel.
+    if (control.signal.aborted && control.signal.reason?.code === 'project_lease_lost') {
+      state.code = 'project_lease_lost';
+      return finish(ctx, projectId, state, 'blocked');
+    }
     if (stop || control.signal.aborted) return finish(ctx, projectId, state, stop || 'cancelled');
     if (gates.blocked.length)
       return finish(

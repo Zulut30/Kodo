@@ -1,4 +1,4 @@
-import { updateRefsAtomically } from './project-integration.mjs';
+import { refusedPublish, updateRefsAtomically } from './project-integration.mjs';
 
 // Fenced publish of project refs. A compare-and-swap on a SHA alone does not stop a holder whose
 // lease passed on before the new holder moved the branch: that stale holder would still win the
@@ -18,7 +18,12 @@ import { updateRefsAtomically } from './project-integration.mjs';
  * @param {{ timeoutMs?: number }} [options]
  */
 export function publishRefs(store, tokens, cwd, commands, options = {}) {
-  return store.withFence(tokens, () => updateRefsAtomically(cwd, commands, options));
+  try {
+    return store.withFence(tokens, () => updateRefsAtomically(cwd, commands, options));
+  } catch (error) {
+    // Classified after the transaction ended: no Git call while the write lock is held.
+    throw refusedPublish(error, cwd, commands.verify);
+  }
 }
 
 /**
