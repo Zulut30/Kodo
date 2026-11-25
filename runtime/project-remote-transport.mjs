@@ -130,26 +130,42 @@ export async function fetchSubmission(run, remote, head, signal, checkLease) {
   }
 }
 
-export async function cleanupRemoteRefs(run, signal) {
-  const remote = remoteRefs(run.directorBinding.projectId, run);
+async function listRemoteRefs(run, remote, patterns, signal) {
+  await configured(run, remote, signal);
+  const output = await transport(run.project, ['ls-remote', '--refs', remote.repository, ...patterns], signal);
+  const heads = new Map();
+  for (const line of output.split(/\r?\n/)) {
+    const [sha, ref] = line.split('\t');
+    if (/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(sha) && ref) heads.set(ref, sha);
+  }
+  return heads;
+}
+
+// GC supplies a cache scoped to this project and this pass. A failed listing is
+// retried on the next GC. Deletion remains restricted to exact terminal Run refs.
+export async function cleanupRemoteRefs(run, signal, gcListings = null) {
+  const projectId = run.directorBinding.projectId;
+  const remote = remoteRefs(projectId, run);
   if (!remote) return;
   await transport(run.project, ['update-ref', '-d', 'refs/kodo/fetched/' + run.id], signal);
   try {
-    await configured(run, remote, signal);
     const refs = [remote.baseRef, remote.workRef];
-    const listed = await transport(run.project, ['ls-remote', '--refs', remote.repository, ...refs], signal);
-    const live = listed
-      .split(/\r?\n/)
-      .map(row => row.split('\t'))
-      .filter(([sha, ref]) => /^[a-f0-9]{40,64}$/.test(sha) && refs.includes(ref));
+    let heads = gcListings?.get(remote.repository);
+    if (!heads) {
+      gcListings?.set(remote.repository, new Map());
+      const patterns = gcListings ? ['refs/kodo/' + projectId + '/*'] : refs;
+      heads = await listRemoteRefs(run, remote, patterns, signal);
+      gcListings?.set(remote.repository, heads);
+    }
+    const live = refs.filter(ref => heads.has(ref));
     if (live.length)
       await transport(
         run.project,
         [
           'push',
-          ...live.map(([sha, ref]) => '--force-with-lease=' + ref + ':' + sha),
+          ...live.map(ref => '--force-with-lease=' + ref + ':' + heads.get(ref)),
           remote.repository,
-          ...live.map(([, ref]) => ':' + ref),
+          ...live.map(ref => ':' + ref),
         ],
         signal,
       );

@@ -20,6 +20,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
 import os from 'node:os';
+import { assertRemoteBriefPaths } from './remote-brief-paths.mjs';
 import { fileURLToPath } from 'node:url';
 import { cleanupRemoteRefs, fetchSubmission, pushBase, remoteRefs, transport } from './project-remote-transport.mjs';
 import { portableDirectorTaskInput } from './project-contracts.mjs';
@@ -198,6 +199,7 @@ async function briefFor(state, attempt, task, run) {
     run,
     basePrompt,
     roleInstructions: instructions,
+    diagnosticWorktrees: remote ? [run.cwd, state.integration.worktree] : null,
   });
   const brief = {
     ...run.workerPlacement,
@@ -219,22 +221,14 @@ async function briefFor(state, attempt, task, run) {
     abandonCommand: `${dispatcher} project complete-task ${project.projectId} ${task.id} --head <SHA> --abandon --attempt ${attempt.id}`,
     ...extra,
   };
-  if (remote) {
-    const normalize = text => {
-      const slashes = text.replace(/\\+/g, '/');
-      return process.platform === 'win32' ? slashes.toLowerCase() : slashes;
-    };
-    const serialized = normalize(JSON.stringify(brief));
-    for (const root of [
+  if (remote)
+    assertRemoteBriefPaths(brief, [
       project.root,
       storeOf(state.ctx).home,
       path.dirname(run.worktreeRoot),
       fileURLToPath(new URL('..', import.meta.url)),
       os.homedir(),
-    ]) {
-      if (root && serialized.includes(normalize(path.resolve(root)))) fail('brief_path_leak');
-    }
-  }
+    ]);
   C.assertDirectorSafe(brief, options);
   return brief;
 }
@@ -1521,10 +1515,14 @@ export async function completeTask(ctx, input) {
       result.attemptId === run.directorBinding.attemptId &&
       remoteRefs(projectId, run)
     ) {
-      const token = await acquireLeaseWaiting(store, 'project-verify:' + run.id, { signal });
-      await withHeldLease(store, token, lost =>
-        cleanupRemoteRefs(run, signal ? AbortSignal.any([signal, lost]) : lost),
-      );
+      try {
+        const token = await acquireLeaseWaiting(store, 'project-verify:' + run.id, { signal, waitMs: 0 });
+        await withHeldLease(store, token, lost =>
+          cleanupRemoteRefs(run, signal ? AbortSignal.any([signal, lost]) : lost),
+        );
+      } catch {
+        // Abandon is already durable. GC retries cleanup after the verifier releases the Run.
+      }
     }
     return result;
   }

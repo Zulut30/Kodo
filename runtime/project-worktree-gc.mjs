@@ -150,6 +150,7 @@ function terminalHead(run, snapshot) {
 
 export async function gcProjectWorktrees(store, snapshot) {
   const { project } = snapshot;
+  const gcListings = new Map();
   const report = { removed: [], retained: [], incomplete: [] };
   for (const run of store.listRuns(project.root)) {
     if (run.directorBinding?.projectId !== project.projectId || !run.directorBinding.attemptId) continue;
@@ -173,7 +174,7 @@ export async function gcProjectWorktrees(store, snapshot) {
     }, 10000);
     try {
       await noLinks(run.project);
-      await cleanupRemoteRefs(run, controller.signal);
+      await cleanupRemoteRefs(run, controller.signal, gcListings);
       const result = await withWorktreeLock(run.project, () => removeOwned(run, head, renew));
       if (result) report[result].push(run.id);
     } catch {

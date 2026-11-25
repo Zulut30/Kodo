@@ -8,6 +8,7 @@ import { createHash } from 'node:crypto';
 import { DEFAULT_API_CARD_MAX_BYTES, buildApiCards, createApiCardCache, unavailableApiCard } from './api-cards.mjs';
 import { buildContextManifest } from './context-manifest.mjs';
 import { measureContext, selectWaveVerifiedLessons } from './context-pack.mjs';
+import { portableDiagnostics } from './remote-brief-paths.mjs';
 import { formatDiagnosticPack } from './diagnostic-pack.mjs';
 
 export { createApiCardCache };
@@ -52,17 +53,15 @@ export async function latestPriorTaskRun({ store, project, attempt, task, run })
 }
 
 /** Return usable diagnostics from the current run or ONLY the immediately preceding attempt (no fallback to older attempts). */
-export async function retryDiagnosticsFor({ ctx, snapshot, attempt, task, run }) {
-  if (run.lastDiagnostics !== undefined) return usableDiagnostics(run.lastDiagnostics) ? run.lastDiagnostics : null;
-  if (!(attempt.number > 1)) return null;
-  const previous = await latestPriorTaskRun({
-    store: storeOf(ctx),
-    project: snapshot.project,
-    attempt,
-    task,
-    run,
-  });
-  return usableDiagnostics(previous?.lastDiagnostics) ? previous.lastDiagnostics : null;
+export async function retryDiagnosticsFor({ ctx, snapshot, attempt, task, run, diagnosticWorktrees = null }) {
+  const source =
+    run.lastDiagnostics === undefined
+      ? await latestPriorTaskRun({ store: storeOf(ctx), project: snapshot.project, attempt, task, run })
+      : run;
+  if (!usableDiagnostics(source?.lastDiagnostics)) return null;
+  return diagnosticWorktrees
+    ? portableDiagnostics(source.lastDiagnostics, [...diagnosticWorktrees, source.cwd])
+    : source.lastDiagnostics;
 }
 
 function apiCardScopeKey({ baseSha, maxBytes, project, task }) {
@@ -321,6 +320,7 @@ export async function prepareWaveTaskContext({
   apiCardCache = null,
   buildApiCardsImpl = buildApiCards,
   signal = undefined,
+  diagnosticWorktrees = null,
 }) {
   const project = snapshot.project;
   const store = storeOf(ctx);
@@ -341,7 +341,7 @@ export async function prepareWaveTaskContext({
     task,
     projectId: project.projectId,
   });
-  const diagnostics = await retryDiagnosticsFor({ ctx, snapshot, attempt, task, run });
+  const diagnostics = await retryDiagnosticsFor({ ctx, snapshot, attempt, task, run, diagnosticWorktrees });
   return {
     schemaVersion: 1,
     baseSha: run.baseSha,
@@ -356,7 +356,15 @@ export async function prepareWaveTaskContext({
  * Enrich an external wave brief (`next-wave`), accounting for the ENTIRE mandatory worker
  * text (`roleInstructions` + `\n\n` + `basePrompt`) before computing remaining budget.
  */
-export async function enrichExternalWaveBrief({ state, attempt, task, run, basePrompt, roleInstructions = '' }) {
+export async function enrichExternalWaveBrief({
+  state,
+  attempt,
+  task,
+  run,
+  basePrompt,
+  roleInstructions = '',
+  diagnosticWorktrees = null,
+}) {
   const project = state.snapshot.project;
   if (project.execution?.cadence !== 'wave') return { prompt: basePrompt, extra: {} };
   const limitBytes = run.config?.budgets?.contextBytes ?? null;
@@ -380,6 +388,7 @@ export async function enrichExternalWaveBrief({ state, attempt, task, run, baseP
     apiCardCache: state.apiCardCache,
     buildApiCardsImpl: state.buildApiCards,
     signal: state.signal,
+    diagnosticWorktrees,
   });
   const packed = packWaveContextBlocks({
     apiCards: prepared.apiCards,
