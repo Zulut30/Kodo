@@ -1466,7 +1466,9 @@ test('integration conflict schedules two bounded retries with the previous diff'
   f.ports.integrateAndAdvance = async () => ({ status: 'blocked', code: 'project_integration_conflict' });
   let a = brief(await f.wave({ limit: 1 }), 'task-a');
   for (let i = 0; i < 3; i++) {
-    const head = await commit(a.worktree, { 'src/a.mjs': 'export const a = 42;\n' });
+    const head = await commit(a.worktree, {
+      'src/a.mjs': 'export const a = 42;\n//' + 'large delta '.repeat(6500) + '\n',
+    });
     const done = await f.complete(a.taskId, head, { attemptId: a.attemptId });
     if (i === 2) {
       assert.equal(done.status, 'blocked');
@@ -1475,6 +1477,7 @@ test('integration conflict schedules two bounded retries with the previous diff'
       assert.deepEqual(done.retry, { scheduled: true, remaining: 1 - i });
       const fresh = brief(await f.wave({ limit: 1 }), a.taskId);
       assert.equal(fresh.previousAttempt.attemptId, a.attemptId);
+      assert.equal(Buffer.byteLength(fresh.previousAttempt.diff), 65536);
       assert.match(fresh.previousAttempt.diff, /export const a = 42/);
       const replay = await f.complete(a.taskId, head, { attemptId: a.attemptId });
       assert.deepEqual(replay.retry, done.retry);
@@ -1490,6 +1493,7 @@ test('watch reports stalls, repeated submissions and dirty scope', async t => {
   f.ctx.clock = () => new Date(Date.now() + 3600000).toISOString();
   const codes = async () =>
     (await f.wave({ limit: 1 })).watch.filter(row => row.taskId === a.taskId).map(row => row.code);
+  assert.equal((await f.wave({ limit: 1, stallMinutes: 90 })).watch.length, 0);
   assert.deepEqual(await codes(), ['worker_no_progress']);
   await writeFile(path.join(a.worktree, 'src/a.mjs'), 'updated');
   assert.deepEqual(await codes(), []);

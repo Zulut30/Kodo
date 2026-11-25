@@ -62,7 +62,7 @@ import {
 } from './execution-profile.mjs';
 import { planProjectHorizon, waveRanks } from './project-planner.mjs';
 import { buildApiCards } from './api-cards.mjs';
-import { createApiCardCache, enrichExternalWaveBrief } from './wave-context.mjs';
+import { createApiCardCache, enrichExternalWaveBrief, latestPriorTaskRun } from './wave-context.mjs';
 
 /** The largest batch one `nextWave` call returns. */
 export const MAX_WAVE_LIMIT = MAX_WORKERS;
@@ -156,7 +156,10 @@ async function briefFor(state, attempt, task, run) {
   const { role, instructions } = workerRole(task.owner);
   // The caller's CLI (`cli`): a chat runs the same Kodo package that issued the brief.
   const selfCheck = `${cli} ci feedback --base ${run.baseSha} --project ${quotePath(run.cwd)} --json`;
-  const basePrompt = `${input}\n\n${workerContract(run, task.writePaths, selfCheck)}`;
+  const prior = await latestPriorTaskRun({ store: storeOf(state.ctx), project, task, run, attempt });
+  const previousAttempt = prior?.externalConflict?.previousAttempt;
+  const carry = previousAttempt ? '\nPort the changes in previousAttempt.diff onto the fresh baseSha.' : '';
+  const basePrompt = `${input}\n\n${workerContract(run, task.writePaths, selfCheck)}${carry}`;
   const { prompt, extra } = await enrichExternalWaveBrief({
     state,
     attempt,
@@ -165,9 +168,6 @@ async function briefFor(state, attempt, task, run) {
     basePrompt,
     roleInstructions: instructions,
   });
-  const previous =
-    attempt.number > 1 &&
-    conflictRuns(state.ctx, project, task.id).find(row => row.externalConflict.number === attempt.number - 1);
   const brief = {
     ...run.workerPlacement,
     projectId: project.projectId,
@@ -182,8 +182,8 @@ async function briefFor(state, attempt, task, run) {
     branch: run.branch,
     baseSha: run.baseSha,
     interfaces: task.interfaceRefs.map(ref => ref.path),
-    prompt: previous ? prompt + '\nPort the changes in previousAttempt.diff onto the fresh baseSha.' : prompt,
-    ...(previous && { previousAttempt: previous.externalConflict.previousAttempt }),
+    prompt,
+    ...(previousAttempt && { previousAttempt }),
     selfCheck,
     completeCommand: `${cli} project complete-task ${project.projectId} ${task.id} --head <SHA> --attempt ${attempt.id} --defer-gate`,
     abandonCommand: `${cli} project complete-task ${project.projectId} ${task.id} --head <SHA> --abandon --attempt ${attempt.id}`,
@@ -877,7 +877,11 @@ async function retryDiff(ctx, run, task, head) {
 // Runs inside the queue drain's fenced project and integration sections.
 async function scheduleConflictRetry(ctx, snapshot, task, attempt, run, headSha, integration) {
   const code = 'project_integration_conflict';
-  const used = conflictRuns(ctx, snapshot.project, task.id).length;
+  const used = storeOf(ctx)
+    .db.prepare(
+      "SELECT count(*) AS n FROM kodo_project_attempts a JOIN runs r ON r.id=a.run_id WHERE a.project_id=? AND a.task_id=? AND json_type(r.body, '$.externalConflict')='object'",
+    )
+    .get(snapshot.project.projectId, task.id).n;
   if (used >= 2) return { status: 'rejected', code, integration };
   const previousAttempt = {
     attemptId: attempt.id,
@@ -903,17 +907,6 @@ async function scheduleConflictRetry(ctx, snapshot, task, attempt, run, headSha,
     error: { code: 'project_integration_conflict_retry', message: 'Integration conflict' },
   });
   return { status: 'rejected', code: 'project_integration_conflict_retry', retry };
-}
-
-function conflictRuns(ctx, project, taskId) {
-  return storeOf(ctx)
-    .listRuns(project.root)
-    .filter(
-      row =>
-        row.directorBinding?.projectId === project.projectId &&
-        row.directorBinding.taskId === taskId &&
-        row.externalConflict,
-    );
 }
 
 // The Runs of this task's attempts that an abandon already stopped with `head`.
@@ -1466,7 +1459,9 @@ async function externalAttempt(ctx, C, projectId, taskId) {
 // a decided result, a replay of a recorded completion, or the attempt to verify and integrate.
 function recordFailure(store, run, defect) {
   const signature = createHash('sha256')
-    .update(JSON.stringify([defect.code, defect.diagnostics?.items?.[0] ?? defect.message ?? null]))
+    .update(
+      JSON.stringify([defect.code, defect.diagnostics?.items?.[0] ?? defect.diagnostics?.failingTests?.[0] ?? null]),
+    )
     .digest('hex');
   const last = store.getRun(run.id).externalFailure;
   const repeated = last?.signature === signature;

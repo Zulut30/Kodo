@@ -1057,10 +1057,23 @@ test('apply-spec and append-milestone support 400 tasks and bounded planning tim
   const last = chunk(5);
   const milestoneFile = path.join(f.dir, 'milestone.json');
   await writeFile(milestoneFile, JSON.stringify(last));
-  const accepted = await acceptedProject(f);
-  const appended = await f.run(['append-milestone', accepted.projectId, '--file', milestoneFile]);
+  const priorRoot = await f.root();
+  const priorDir = await writeBlueprint(priorRoot);
+  await writeFile(path.join(priorDir, 'spec.json'), JSON.stringify({ ...spec, root: priorRoot }));
+  const prior = await f.run(['apply-spec', '--root', priorRoot]);
+  assert.equal(prior.exitCode, 0, JSON.stringify(prior.report.result));
+  const { repo, store } = await f.direct();
+  const priorId = prior.report.projectId;
+  assert.equal(repo.snapshot(priorId).tasks.length, 320);
+  // Stage the closed historical rows for this size benchmark. The separate lifecycle test
+  // reaches acceptance through real transitions, while this test exercises the append itself.
+  store.db
+    .prepare("UPDATE kodo_project_records SET body=json_set(body, '$.status', 'accepted') WHERE project_id=?")
+    .run(priorId);
+  const appended = await f.run(['append-milestone', priorId, '--file', milestoneFile]);
   assert.equal(appended.exitCode, 0, JSON.stringify(appended.report.result));
   assert.equal(appended.report.result.tasks.length, 80);
+  assert.equal(repo.snapshot(priorId).tasks.length, 400);
   spec.milestones.push(last.milestone);
   spec.epics.push(...last.epics);
   spec.tasks.push(...last.tasks.map(task => ({ ...task, dependsOn: ['test-bench'] })));
