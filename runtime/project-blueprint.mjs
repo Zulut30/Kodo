@@ -5,6 +5,7 @@
 import { createHash } from 'node:crypto';
 import { lstat, open, readdir, realpath, stat } from 'node:fs/promises';
 import path from 'node:path';
+import { parse as parseToml } from 'smol-toml';
 import * as projectContracts from './project-contracts.mjs';
 import {
   isBroadContractScope,
@@ -910,7 +911,25 @@ function ownerWorkspaceOf(crateRoot, sortedWorkspaceRoots) {
   );
 }
 
-function selectContractRootsForWorkspace({ wsRoot, wsCrates, workspaceRoots, explicitTokens, architecturePolicy }) {
+function normalizePackageNames(raw) {
+  const map = new Map();
+  const entries = raw instanceof Map ? [...raw.entries()] : isPlain(raw) ? Object.entries(raw) : [];
+  for (const [dir, name] of entries) {
+    if (typeof dir !== 'string' || typeof name !== 'string' || !name.trim()) continue;
+    const cleaned = dir === '' || dir === '.' ? '' : normalizeRelScope(dir);
+    map.set(cleaned, name.trim());
+  }
+  return map;
+}
+
+function selectContractRootsForWorkspace({
+  wsRoot,
+  wsCrates,
+  workspaceRoots,
+  explicitTokens,
+  architecturePolicy,
+  actualNames,
+}) {
   const roots = new Set();
   const isRustV2Policy =
     wsRoot === '' && architecturePolicy?.schemaVersion === 2 && architecturePolicy?.language === 'rust';
@@ -922,6 +941,11 @@ function selectContractRootsForWorkspace({ wsRoot, wsCrates, workspaceRoots, exp
     );
     for (const [root, name] of wsCrates.entries()) {
       if (policyNames.has(name)) roots.add(root);
+    }
+    for (const token of explicitTokens) {
+      const dir = token === '.' ? '' : token;
+      const pkgName = actualNames?.get(dir);
+      if (pkgName && policyNames.has(pkgName) && ownerWorkspaceOf(dir, workspaceRoots) === wsRoot) roots.add(dir);
     }
     return roots;
   }
@@ -1018,13 +1042,20 @@ function waveZeroPolicyFindings({ waveZeroTasks, ancestors, architecturePolicy, 
 
 /** Multi-crate Rust workspaces (>= 3 crates sharing a workspace root) must create a compilable
  * contract crate (`Cargo.toml` + `src/**`) and `architecture.policy.json` in Wave 0. */
-export function rustContractCrateFindings(spec, projectMarkdown = '', architecturePolicy = null, ancestors = null) {
+export function rustContractCrateFindings(
+  spec,
+  projectMarkdown = '',
+  architecturePolicy = null,
+  ancestors = null,
+  packageNames = null,
+) {
   if (!isRustBlueprint(spec, projectMarkdown, architecturePolicy)) return [];
+  const actualNames = normalizePackageNames(packageNames);
   const allCrates = new Map();
   for (const task of spec.tasks) {
     for (const scope of task.writePaths ?? []) {
       const crate = crateFromWritePath(scope);
-      if (crate) allCrates.set(crate.root, crate.name);
+      if (crate) allCrates.set(crate.root, actualNames.get(crate.root) ?? crate.name);
     }
   }
   const explicitTokens = declaredContractTokens(spec, projectMarkdown);
@@ -1038,8 +1069,11 @@ export function rustContractCrateFindings(spec, projectMarkdown = '', architectu
     if (ownerWs !== undefined && crateRoot !== ownerWs) byWorkspace.get(ownerWs).set(crateRoot, crateName);
   }
   for (const [wsRoot, wsCrates] of byWorkspace.entries()) {
-    if (!wsCrates.has(wsRoot) && hasRootPackageMember(spec, wsRoot, explicitRootPackages, explicitTokens)) {
-      wsCrates.set(wsRoot, wsRoot ? wsRoot.split('/').at(-1) : spec.id || 'root');
+    if (
+      !wsCrates.has(wsRoot) &&
+      (actualNames.has(wsRoot) || hasRootPackageMember(spec, wsRoot, explicitRootPackages, explicitTokens))
+    ) {
+      wsCrates.set(wsRoot, actualNames.get(wsRoot) ?? (wsRoot ? wsRoot.split('/').at(-1) : spec.id || 'root'));
     }
   }
 
@@ -1052,6 +1086,7 @@ export function rustContractCrateFindings(spec, projectMarkdown = '', architectu
         workspaceRoots,
         explicitTokens,
         architecturePolicy,
+        actualNames,
       }))
         allContractRoots.add(root);
     }
@@ -1083,6 +1118,7 @@ export function rustContractCrateFindings(spec, projectMarkdown = '', architectu
       workspaceRoots,
       explicitTokens,
       architecturePolicy,
+      actualNames,
     });
     requiredWorkspaces.push({ wsRoot, wsContracts });
     const satisfied = waveZeroTasks.some(task =>
@@ -1121,6 +1157,7 @@ function analyzeFactorySpec(spec, options = {}) {
     interfaces = [],
     projectMarkdown = '',
     architecturePolicy = null,
+    packageNames = null,
   } = options;
   const base = normalizeFactory(spec, { contracts, knownValues });
   const findings = [...base.findings, ...sectionFindings(projectMarkdown)];
@@ -1129,7 +1166,7 @@ function analyzeFactorySpec(spec, options = {}) {
   findings.push(
     ...ownerFindings(base.spec.tasks),
     ...waveZeroFindings(base.spec, ancestors),
-    ...rustContractCrateFindings(base.spec, projectMarkdown, architecturePolicy, ancestors),
+    ...rustContractCrateFindings(base.spec, projectMarkdown, architecturePolicy, ancestors, packageNames),
     ...containerFindings(base.spec),
     ...epicCycleFindings(base.spec.tasks),
     ...overlapFindings(parallelOverlaps(base.spec.tasks, { ancestors })),
@@ -1235,14 +1272,46 @@ async function readOptionalArchitecturePolicy(root) {
   }
 }
 
+async function readOptionalCargoPackageNames(root, specValue, projectMarkdown) {
+  const dirs = new Set(['']);
+  if (isPlain(specValue) && Array.isArray(specValue.tasks)) {
+    for (const task of specValue.tasks) {
+      if (!isPlain(task) || !Array.isArray(task.writePaths)) continue;
+      for (const scope of task.writePaths) {
+        if (typeof scope !== 'string') continue;
+        const crate = crateFromWritePath(scope);
+        if (crate) dirs.add(crate.root);
+      }
+    }
+    for (const token of declaredContractTokens(specValue, projectMarkdown)) {
+      if (token.includes('/')) dirs.add(token);
+    }
+  }
+  const names = new Map();
+  for (const dir of dirs) {
+    if (dir && dir.split('/').some(part => !part || part === '.' || part === '..' || /[*?[{]/.test(part))) continue;
+    const target = dir ? path.join(root, ...dir.split('/'), 'Cargo.toml') : path.join(root, 'Cargo.toml');
+    if (!inside(root, target)) continue;
+    try {
+      const file = await readBoundedFile(target, BLUEPRINT_LIMITS.project);
+      const doc = parseToml(file.text);
+      const pkgName = typeof doc?.package?.name === 'string' ? doc.package.name.trim() : '';
+      if (pkgName) names.set(dir, pkgName);
+    } catch {
+      /* Missing or unreadable manifest: fall back to directory name. */
+    }
+  }
+  return names;
+}
+
 /** Read, resolve and lint the blueprint. Returns the compiled ProjectSpec
  * (with execution) even when findings exist; ok is the only acceptance signal.
  * `specFile` optionally replaces .kodo/blueprint/spec.json. Nothing is written to disk.
  * @param {string} root
- * @param {{ contracts?: typeof projectContracts, knownValues?: string[], specFile?: string, architecturePolicy?: Record<string, any> | null }} [options] */
+ * @param {{ contracts?: typeof projectContracts, knownValues?: string[], specFile?: string, architecturePolicy?: Record<string, any> | null, packageNames?: Map<string, string> | Record<string, string> | null }} [options] */
 export async function compileBlueprint(
   root,
-  { contracts = projectContracts, knownValues = [], specFile, architecturePolicy } = {},
+  { contracts = projectContracts, knownValues = [], specFile, architecturePolicy, packageNames } = {},
 ) {
   let blueprint;
   try {
@@ -1255,12 +1324,17 @@ export async function compileBlueprint(
   const source = await resolveSource(blueprint);
   const policy =
     architecturePolicy === undefined ? await readOptionalArchitecturePolicy(blueprint.root) : architecturePolicy;
+  const resolvedPackageNames =
+    packageNames === undefined
+      ? await readOptionalCargoPackageNames(blueprint.root, source.value, blueprint.project.text)
+      : packageNames;
   const analysis = analyzeFactorySpec(source.value, {
     contracts,
     knownValues,
     interfaces: blueprint.interfaces,
     projectMarkdown: blueprint.project.text,
     architecturePolicy: policy,
+    packageNames: resolvedPackageNames,
   });
   const findings = [...source.findings, ...analysis.findings];
   return { ok: findings.length === 0, spec: analysis.spec, interfaces: blueprint.interfaces, findings };

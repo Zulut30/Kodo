@@ -2918,3 +2918,118 @@ test('X2: nested virtual workspace root is not a package, non-Rust src/** is not
   ]);
   assert.deepEqual(rustContractCrateFindings(sameEpicWave0, md), []);
 });
+
+test('X3: existing Cargo.toml [package].name maps crate directory (crates/protocol -> game-contracts) against policy.contractCrates', async t => {
+  const { compileBlueprint } = await import('../runtime/project-blueprint.mjs');
+  const root = await mkdtemp(path.join(os.tmpdir(), 'kodo-rust-x3-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const put = async (rel, content) => {
+    const full = path.join(root, rel);
+    await mkdir(path.dirname(full), { recursive: true });
+    await writeFile(full, typeof content === 'string' ? content : JSON.stringify(content, null, 2) + '\n', 'utf8');
+  };
+  const criterion = id => ({ id, text: 'cargo test passes', evidenceKinds: ['checks'] });
+  const mkTask = (id, epicId, dependsOn, writePaths) => ({
+    id,
+    epicId,
+    title: `Task ${id}`,
+    description: `Implement ${id}`,
+    owner: 'developer',
+    dependsOn,
+    writePaths,
+    acceptance: [criterion(`${id}-done`)],
+    interfaceRefs: [],
+    priority: 50,
+    userValue: 3,
+    risk: 1,
+    estimatedEffort: 1,
+    riskApprovalRequired: false,
+  });
+
+  await put('Cargo.toml', '[workspace]\nresolver = "2"\nmembers = ["crates/*"]\n');
+  await put('crates/protocol/Cargo.toml', '[package]\nname = "game-contracts"\nversion = "0.1.0"\nedition = "2021"\n');
+  await put('crates/protocol/src/lib.rs', 'pub struct Id(pub u64);\n');
+  await put('architecture.policy.json', {
+    schemaVersion: 2,
+    version: 1,
+    language: 'rust',
+    productRoots: ['crates'],
+    layers: [
+      { id: 'contracts', crates: ['game-contracts'] },
+      { id: 'domain', crates: ['world', 'combat'] },
+    ],
+    cycles: 'forbid',
+    allowedExternalCrates: [],
+    allowedDevExternalCrates: [],
+    contractCrates: ['game-contracts'],
+    baseline: [],
+    exceptions: [],
+    protectedPaths: ['architecture.policy.json'],
+  });
+  await put(
+    '.kodo/blueprint/PROJECT.md',
+    [
+      '# Game',
+      '## Цель',
+      'Игра.',
+      '## Модули',
+      'protocol (game-contracts), world, combat.',
+      '## Стек',
+      'Rust 2024, Cargo workspace.',
+      'contractCrate: crates/protocol',
+      '## Критерии готовности',
+      '- cargo test',
+    ].join('\n') + '\n',
+  );
+  const spec = {
+    schemaVersion: 1,
+    id: 'rust-x3',
+    root,
+    title: 'Rust X3',
+    definitionOfDone: [criterion('done')],
+    constraints: [],
+    businessContext: 'Rust game',
+    architectureRefs: [],
+    execution: { cadence: 'wave', integration: 'branch' },
+    milestones: [
+      { id: 'foundation', title: 'Wave 0', acceptance: [criterion('f-done')], releaseRequired: false },
+      { id: 'mvp', title: 'MVP', acceptance: [criterion('m-done')], releaseRequired: false },
+    ],
+    epics: [
+      { id: 'foundation', milestoneId: 'foundation', title: 'W0', acceptance: [criterion('fe-done')] },
+      { id: 'domain', milestoneId: 'mvp', title: 'Domain', acceptance: [criterion('me-done')] },
+    ],
+    tasks: [
+      mkTask('w0', 'foundation', [], ['Cargo.toml', 'crates/protocol/Cargo.toml', 'crates/protocol/src/**']),
+      mkTask('world', 'domain', ['w0'], ['crates/world/Cargo.toml', 'crates/world/src/**']),
+      mkTask('combat', 'domain', ['w0'], ['crates/combat/Cargo.toml', 'crates/combat/src/**']),
+    ],
+  };
+  await put('.kodo/blueprint/spec.json', spec);
+
+  // 1) Existing crates/protocol/Cargo.toml has [package].name = "game-contracts" matching policy.contractCrates -> PASS.
+  const compiledOk = await compileBlueprint(root);
+  assert.equal(compiledOk.ok, true, `expected compileBlueprint OK, got ${JSON.stringify(compiledOk.findings)}`);
+  assert.deepEqual(compiledOk.findings, []);
+
+  // 2) Broad mask on ordinary task still catches crates/protocol via resolved contract crate.
+  const broadSpec = structuredClone(spec);
+  broadSpec.tasks[1].writePaths = ['crates/**'];
+  await put('.kodo/blueprint/spec.json', broadSpec);
+  const compiledBroad = await compileBlueprint(root);
+  assert.equal(compiledBroad.ok, false);
+  assert.ok(
+    compiledBroad.findings.some(f => f.code === 'contract_scope_too_broad' && f.taskIds?.includes('world')),
+    `expected contract_scope_too_broad for crates/protocol, got ${JSON.stringify(compiledBroad.findings)}`,
+  );
+
+  // 3) Negative control: [package].name = "wrong-name" NOT in policy.contractCrates -> contract_crate_required.
+  await put('.kodo/blueprint/spec.json', spec);
+  await put('crates/protocol/Cargo.toml', '[package]\nname = "wrong-name"\nversion = "0.1.0"\nedition = "2021"\n');
+  const compiledMismatch = await compileBlueprint(root);
+  assert.equal(compiledMismatch.ok, false);
+  assert.ok(
+    compiledMismatch.findings.some(f => f.code === 'contract_crate_required'),
+    `mismatched [package].name must still fail contract_crate_required, got ${JSON.stringify(compiledMismatch.findings)}`,
+  );
+});
