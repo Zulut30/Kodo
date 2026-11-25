@@ -1,0 +1,16 @@
+{
+  "cargoVersion": "cargo 1.96.0 (30a34c682 2026-05-25)",
+  "startDir": "",
+  "ok": false,
+  "expectedReason": "member-glob-no-match",
+  "cargoError": "error: failed to load manifest for workspace member `<ROOT>/crates/missing-*`\nreferenced by workspace at `<ROOT>/Cargo.toml`\n\nCaused by:\n  failed to read `<ROOT>/crates/missing-*/Cargo.toml`\n",
+  "files": [
+    "Cargo.toml",
+    "crates/a/Cargo.toml",
+    "crates/a/src/lib.rs"
+  ],
+  "manifests": {
+    "Cargo.toml": "[workspace]\nresolver = \"2\"\nmembers = [\"crates/missing-*\"]\n",
+    "crates/a/Cargo.toml": "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+  }
+}

@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { isExplicitContractScope } from './cargo-workspace.mjs';
 
 const limits = { files: 20000, modules: 256, edges: 100000, findings: 10000 };
 const digest = /^[a-f0-9]{64}$/;
@@ -130,8 +131,84 @@ function debt(value) {
   });
 }
 
+const RUST_POLICY_REQUIRED = [
+  'schemaVersion',
+  'version',
+  'language',
+  'productRoots',
+  'layers',
+  'cycles',
+  'allowedExternalCrates',
+  'contractCrates',
+  'baseline',
+  'exceptions',
+  'protectedPaths',
+];
+const RUST_POLICY_OPTIONAL = ['allowedDevExternalCrates'];
+
+function shapeWithOptional(value, required, optional = []) {
+  record(value);
+  const allowed = new Set([...required, ...optional]);
+  const actual = Object.keys(value);
+  if (actual.some(key => !allowed.has(key)) || required.some(key => !Object.hasOwn(value, key))) fail();
+}
+
+function validateRustPolicy(value) {
+  shapeWithOptional(value, RUST_POLICY_REQUIRED, RUST_POLICY_OPTIONAL);
+  if (
+    value.schemaVersion !== 2 ||
+    value.language !== 'rust' ||
+    !Number.isSafeInteger(value.version) ||
+    value.version < 1 ||
+    value.cycles !== 'forbid'
+  )
+    fail();
+  const productRoots = set(value.productRoots, relative, limits.modules, 1);
+  disjoint(productRoots);
+  const rawLayers = array(value.layers, limits.modules, 1);
+  const seenLayerIds = new Set();
+  const seenCrates = new Set();
+  const layers = rawLayers.map(layer => {
+    shape(layer, ['id', 'crates']);
+    const id = identifier(layer.id);
+    if (seenLayerIds.has(id)) fail();
+    seenLayerIds.add(id);
+    const crates = set(layer.crates, identifier, limits.modules, 0);
+    for (const crateName of crates) {
+      if (seenCrates.has(crateName)) fail();
+      seenCrates.add(crateName);
+    }
+    return { id, crates };
+  });
+  const allowedExternalCrates = set(value.allowedExternalCrates, identifier, limits.files);
+  const allowedDevExternalCrates =
+    value.allowedDevExternalCrates === undefined ? [] : set(value.allowedDevExternalCrates, identifier, limits.files);
+  const contractCrates = set(value.contractCrates, identifier, limits.modules);
+  for (const crateName of contractCrates) if (!seenCrates.has(crateName)) fail();
+  const protectedPaths = set(value.protectedPaths, relative);
+  const baseline = debt(value.baseline),
+    exceptions = debt(value.exceptions);
+  if (baseline.length + exceptions.length > limits.findings) fail('scope_limit');
+  return {
+    schemaVersion: 2,
+    version: value.version,
+    language: 'rust',
+    productRoots,
+    layers,
+    cycles: 'forbid',
+    allowedExternalCrates,
+    allowedDevExternalCrates,
+    contractCrates,
+    baseline,
+    exceptions,
+    protectedPaths,
+  };
+}
+
 /** Pure, strict policy normalization. No filesystem discovery or implicit presets. */
 export function validateArchitecturePolicy(value) {
+  record(value);
+  if (value.schemaVersion === 2 && value.language === 'rust') return validateRustPolicy(value);
   shape(value, [
     'schemaVersion',
     'version',
@@ -291,8 +368,286 @@ function inspectGraph(graph) {
   return nodes;
 }
 
+function safeScope(value) {
+  text(value);
+  const cleaned = value.replace(/^(?:\.\/)+/, '').replace(/\/+$/, '');
+  if (
+    !cleaned ||
+    /[\\:\x00-\x1f\x7f]/.test(cleaned) ||
+    cleaned.startsWith('/') ||
+    cleaned.split('/').some(part => !part || part === '.' || part === '..')
+  )
+    fail('unsafe_path');
+  return cleaned;
+}
+
+function inspectRustGraph(graph) {
+  shape(graph, [
+    'schemaVersion',
+    'language',
+    'headSha',
+    'sourceHash',
+    'policyHash',
+    'productRoots',
+    'rootManifestHash',
+    'files',
+    'modules',
+    'crates',
+    'nodes',
+    'edges',
+    'unsupported',
+  ]);
+  if (
+    graph.schemaVersion !== 2 ||
+    graph.language !== 'rust' ||
+    !isSha(graph.headSha) ||
+    !isDigest(graph.sourceHash) ||
+    !isDigest(graph.policyHash) ||
+    (graph.rootManifestHash !== null && !isDigest(graph.rootManifestHash))
+  )
+    fail();
+  set(graph.productRoots, relative, limits.modules, 1);
+  array(graph.modules, limits.modules);
+  array(graph.files, limits.files);
+  array(graph.crates, limits.modules);
+  array(graph.nodes, limits.files + limits.edges);
+  array(graph.edges, limits.edges);
+  array(graph.unsupported, limits.edges);
+  const crates = new Map();
+  for (const crate of graph.crates) {
+    shape(crate, ['name', 'root', 'manifest', 'manifestHash', 'files', 'layer', 'layerIndex', 'isContract']);
+    identifier(crate.name);
+    if (crate.root !== '') relative(crate.root);
+    relative(crate.manifest);
+    if (!isDigest(crate.manifestHash) || crates.has(crate.name) || typeof crate.isContract !== 'boolean') fail();
+    array(crate.files, limits.files).forEach(relative);
+    crates.set(crate.name, crate);
+  }
+  const edgeIds = new Set();
+  for (const edge of graph.edges) {
+    shape(edge, ['id', 'from', 'to', 'kind', 'specifier', 'offset', 'workspaceInherited']);
+    if (
+      !isDigest(edge.id) ||
+      edgeIds.has(edge.id) ||
+      typeof edge.from !== 'string' ||
+      !edge.from.startsWith('crate:') ||
+      !crates.has(edge.from.slice('crate:'.length)) ||
+      (edge.to !== null &&
+        typeof edge.to === 'string' &&
+        !edge.to.startsWith('crate:') &&
+        !edge.to.startsWith('external:')) ||
+      !['dependency', 'dev-dependency', 'build-dependency'].includes(edge.kind) ||
+      typeof edge.workspaceInherited !== 'boolean' ||
+      !Number.isSafeInteger(edge.offset) ||
+      edge.offset < 0
+    )
+      fail();
+    text(edge.specifier);
+    edgeIds.add(edge.id);
+  }
+  return crates;
+}
+
+function rustCycleFindings({ crates, adjacency, crossEdges, add }) {
+  let index = 0;
+  const indices = new Map(),
+    low = new Map(),
+    stack = [],
+    active = new Set();
+  function connect(name) {
+    indices.set(name, index);
+    low.set(name, index++);
+    stack.push(name);
+    active.add(name);
+    for (const target of sorted(adjacency.get(name) ?? [])) {
+      if (!indices.has(target)) {
+        connect(target);
+        low.set(name, Math.min(low.get(name), low.get(target)));
+      } else if (active.has(target)) low.set(name, Math.min(low.get(name), indices.get(target)));
+    }
+    if (low.get(name) !== indices.get(name)) return;
+    const component = [];
+    let member;
+    do {
+      member = stack.pop();
+      active.delete(member);
+      component.push(member);
+    } while (member !== name);
+    if (component.length < 2) return;
+    const members = new Set(component);
+    const manifests = new Set();
+    for (const edge of crossEdges) {
+      if (members.has(edge.fromName) && members.has(edge.toName)) {
+        manifests.add(edge.fromManifest);
+        manifests.add(edge.toManifest);
+        if (edge.workspaceInherited) manifests.add('Cargo.toml');
+      }
+    }
+    add('dependency_cycle', null, null, null, null, [...manifests], [...manifests]);
+  }
+  for (const name of sorted(crates.keys())) if (!indices.has(name)) connect(name);
+}
+
+function evaluateRustContractChanges({
+  normalized,
+  basePolicy,
+  crates,
+  baseCrates,
+  changedPaths,
+  taskPaths,
+  taskDiffs,
+  add,
+}) {
+  if (!changedPaths.length && !taskDiffs.length) return;
+  const protectedInstances = [];
+  const collect = (policyObj, crateMap) => {
+    if (!policyObj || policyObj.schemaVersion !== 2 || !crateMap) return;
+    for (const name of policyObj.contractCrates) {
+      const crate = crateMap.get(name);
+      if (crate) protectedInstances.push(crate);
+    }
+  };
+  collect(normalized, crates);
+  collect(basePolicy, baseCrates);
+  if (!protectedInstances.length) return;
+  const checkBatch = (paths, scopes) => {
+    for (const changedFile of paths) {
+      for (const crate of protectedInstances) {
+        const insideCrate = crate.root ? within(changedFile, crate.root) : crate.files.includes(changedFile);
+        if (!insideCrate) continue;
+        const authorized = scopes.some(scope => isExplicitContractScope(scope, crate.root, changedFile));
+        if (!authorized) {
+          const related = changedFile !== crate.manifest ? [crate.manifest] : [];
+          add('contract_change_not_allowed', changedFile, null, crate.name, null, related, [crate.manifest]);
+        }
+      }
+    }
+  };
+  checkBatch(changedPaths, taskPaths);
+  for (const entry of taskDiffs) checkBatch(entry.changedPaths, entry.writePaths);
+}
+
+function evaluateRustArchitecture(input) {
+  shapeWithOptional(input, ['policy', 'graph'], ['changedPaths', 'taskPaths', 'taskDiffs', 'basePolicy', 'baseGraph']);
+  const normalized = validateArchitecturePolicy(input.policy);
+  const crates = inspectRustGraph(input.graph);
+  if (
+    input.graph.policyHash !== hash(normalized) ||
+    JSON.stringify(sorted(input.graph.productRoots)) !== JSON.stringify(normalized.productRoots)
+  )
+    fail();
+  const basePolicy = input.basePolicy ? validateArchitecturePolicy(input.basePolicy) : null;
+  const baseCrates = input.baseGraph && basePolicy?.schemaVersion === 2 ? inspectRustGraph(input.baseGraph) : null;
+  const changedPaths = input.changedPaths === undefined ? [] : array(input.changedPaths, limits.files).map(relative);
+  const taskPaths = input.taskPaths === undefined ? [] : array(input.taskPaths, limits.files).map(safeScope);
+  const taskDiffs =
+    input.taskDiffs === undefined
+      ? []
+      : array(input.taskDiffs, limits.modules).map(entry => {
+          shape(entry, ['id', 'changedPaths', 'writePaths']);
+          return {
+            id: text(entry.id),
+            changedPaths: array(entry.changedPaths, limits.files).map(relative),
+            writePaths: array(entry.writePaths, limits.files).map(safeScope),
+          };
+        });
+  const layerIndexByCrate = new Map();
+  for (const [layerIdx, layer] of normalized.layers.entries()) {
+    for (const name of layer.crates) layerIndexByCrate.set(name, layerIdx);
+  }
+  const hashesByFile = new Map();
+  for (const crate of crates.values()) hashesByFile.set(crate.manifest, crate.manifestHash);
+  if (input.graph.rootManifestHash) hashesByFile.set('Cargo.toml', input.graph.rootManifestHash);
+  if (baseCrates) {
+    for (const crate of baseCrates.values())
+      if (!hashesByFile.has(crate.manifest)) hashesByFile.set(crate.manifest, crate.manifestHash);
+  }
+  const findings = new Map();
+  function add(ruleId, file, offset, fromModule, toModule, relatedFiles, participants) {
+    const sourceHashes = sorted(new Set(participants))
+      .filter(p => hashesByFile.has(p))
+      .map(p => ({ file: p, sha256: hashesByFile.get(p) }));
+    const body = {
+      ruleId,
+      severity: 'error',
+      file,
+      offset,
+      fromModule,
+      toModule,
+      relatedFiles: sorted(new Set(relatedFiles)),
+      sourceHashes,
+    };
+    const id = hash(body);
+    findings.set(id, { id, ...body });
+    if (findings.size > limits.findings) fail('scope_limit');
+  }
+  for (const crate of crates.values()) {
+    if (!layerIndexByCrate.has(crate.name))
+      add('ownership.unowned', crate.manifest, null, crate.name, null, [], [crate.manifest]);
+  }
+  for (const contractName of normalized.contractCrates) {
+    if (!crates.has(contractName))
+      add('contract_crate_missing', 'Cargo.toml', null, contractName, null, [], ['Cargo.toml']);
+  }
+  const allowedProd = new Set(normalized.allowedExternalCrates);
+  const allowedDev = new Set([...normalized.allowedExternalCrates, ...normalized.allowedDevExternalCrates]);
+  const adjacency = new Map([...crates.keys()].map(name => [name, new Set()]));
+  const crossEdges = [];
+  for (const edge of input.graph.edges) {
+    const fromName = edge.from.slice('crate:'.length);
+    const fromCrate = crates.get(fromName);
+    if (!fromCrate || edge.to === null) continue;
+    const inheritedFile = edge.workspaceInherited && hashesByFile.has('Cargo.toml') ? ['Cargo.toml'] : [];
+    if (edge.to.startsWith('external:')) {
+      const extName = edge.to.slice('external:'.length);
+      const allowed = edge.kind === 'dev-dependency' ? allowedDev : allowedProd;
+      if (!allowed.has(extName)) {
+        add('external_dependency_not_allowed', fromCrate.manifest, null, fromName, extName, inheritedFile, [
+          fromCrate.manifest,
+          ...inheritedFile,
+        ]);
+      }
+      continue;
+    }
+    const toName = edge.to.slice('crate:'.length);
+    const toCrate = crates.get(toName);
+    if (!toCrate || fromName === toName) continue;
+    const fromLayer = layerIndexByCrate.get(fromName);
+    const toLayer = layerIndexByCrate.get(toName);
+    if (fromLayer !== undefined && toLayer !== undefined && fromLayer < toLayer) {
+      add(
+        'layer_violation',
+        fromCrate.manifest,
+        null,
+        fromName,
+        toName,
+        [toCrate.manifest, ...inheritedFile],
+        [fromCrate.manifest, toCrate.manifest, ...inheritedFile],
+      );
+    }
+    if (edge.kind !== 'dev-dependency') {
+      adjacency.get(fromName).add(toName);
+      crossEdges.push({
+        fromName,
+        toName,
+        fromManifest: fromCrate.manifest,
+        toManifest: toCrate.manifest,
+        workspaceInherited: edge.workspaceInherited && hashesByFile.has('Cargo.toml'),
+      });
+    }
+  }
+  rustCycleFindings({ crates, adjacency, crossEdges, add });
+  evaluateRustContractChanges({ normalized, basePolicy, crates, baseCrates, changedPaths, taskPaths, taskDiffs, add });
+  return {
+    schemaVersion: 1,
+    findings: [...findings.values()].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)),
+  };
+}
+
 /** Base rules only; graph construction, contracts and debt remain separate ports. */
 export function evaluateArchitecture(input) {
+  record(input);
+  if (input.policy?.schemaVersion === 2 && input.policy?.language === 'rust') return evaluateRustArchitecture(input);
   shape(input, ['policy', 'graph']);
   const { policy, graph } = input;
   const normalized = validateArchitecturePolicy(policy),

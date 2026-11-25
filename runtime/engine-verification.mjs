@@ -7,7 +7,11 @@ import { git, commitChanges, diffHash } from './workspace.mjs';
 import { inspectCurrentSource } from './ci-graph.mjs';
 import { compactReviewEvidence } from './context-pack.mjs';
 import { buildDiagnosticPack, formatDiagnosticPack, hasStructuredDiagnostics } from './diagnostic-pack.mjs';
-import { normalizeArchitectureConfig } from './architecture-gate.mjs';
+import {
+  architectureTaskPathsForRun,
+  architectureTaskScopesForRun,
+  normalizeArchitectureConfig,
+} from './architecture-gate.mjs';
 import {
   compareWithBaseline,
   isCurrentBehaviorReceipt,
@@ -257,6 +261,52 @@ const reusableChecks = (run, headSha, fingerprint, expected, plans) =>
       isDeepStrictEqual(row.command, expected[index].command) &&
       countedRow(run, row, plans[index]),
   );
+
+const UNSUPPORTED_ARCHITECTURE_HINTS = {
+  'missing-cargo-workspace': 'Add root Cargo.toml with [workspace] or [package]',
+  'member-glob-no-match': 'Update [workspace] members glob so it matches at least one directory',
+  'member-without-manifest': 'Add Cargo.toml to the matched directory or add it to [workspace] exclude',
+  'missing-workspace-member': 'Create the listed member Cargo.toml or remove it from [workspace] members',
+  'unsupported-member-glob': 'Fix invalid glob syntax in [workspace] members',
+  'nested-workspace-root': 'Exclude the nested [workspace] directory or remove the nested [workspace] table',
+  'unlisted-workspace-member': 'Add the package to parent [workspace] members or exclude it explicitly',
+  'wrong-workspace-root': 'Update or remove package.workspace so the member points to its actual workspace root',
+  'unsupported-underscore-dependencies':
+    'Use hyphenated dev-dependencies / build-dependencies (underscore tables are rejected in edition 2024+)',
+  'unresolved-workspace-edition': 'Declare edition in root [workspace.package] or set edition explicitly on the crate',
+  'invalid-package-edition':
+    'Set a valid 4-digit edition string (e.g. "2021" or "2024") or { workspace = true } in [package]',
+  'conflicting-workspace-package': 'Remove the package field when workspace = true is set on a dependency',
+  'unsupported-cargo-patch': 'Remove [patch] from Cargo.toml / .cargo/config(.toml) (unsupported by static gate)',
+  'unsupported-cargo-replace': 'Remove [replace] from Cargo.toml / .cargo/config(.toml) (unsupported by static gate)',
+  'unsupported-cargo-config-include':
+    'Inline or remove include in .cargo/config(.toml) (config include chains are unsupported by static gate)',
+  'unsupported-language': 'Move unsupported source out of productRoots or switch to the matching policy language',
+  'parse-error': 'Fix invalid UTF-8 or syntax error in the referenced manifest/source file',
+};
+
+const architectureUnsupportedHint = reason =>
+  UNSUPPORTED_ARCHITECTURE_HINTS[reason] || 'Resolve the unsupported construct before architecture gate can pass';
+
+function reviewArchitectureNotice(run) {
+  const arch = run.architectureChecks;
+  if (!arch?.requiresReview && !arch?.fullVerificationRequired) return '';
+  return `\nArchitecture gate flagged protected contract/policy changes (requiresReview=${Boolean(arch.requiresReview)}, fullVerificationRequired=${Boolean(arch.fullVerificationRequired)}): carefully verify compatibility and full verification evidence.`;
+}
+
+function reviewGateMetadata(run) {
+  return [run.uiVerification, run.securityChecks, run.architectureChecks].map(receipt => ({
+    status: receipt?.status || 'unknown',
+    headSha: receipt?.headSha,
+    configHash: receipt?.configHash,
+    evidenceRoot: receipt?.evidenceRoot,
+    evidence: receipt?.evidence,
+    ...(receipt?.requiresReview !== undefined ? { requiresReview: receipt.requiresReview } : {}),
+    ...(receipt?.fullVerificationRequired !== undefined
+      ? { fullVerificationRequired: receipt.fullVerificationRequired }
+      : {}),
+  }));
+}
 
 export class EngineVerification extends EngineExecution {
   /**
@@ -543,6 +593,8 @@ export class EngineVerification extends EngineExecution {
       const previous = run[field];
       run[field] = null;
       this.save(run);
+      const taskPaths = field === 'architectureChecks' ? architectureTaskPathsForRun(run) : undefined;
+      const taskScopes = field === 'architectureChecks' ? architectureTaskScopesForRun(run) : undefined;
       try {
         run[field] = await executeGate({
           cwd: run.cwd,
@@ -552,6 +604,8 @@ export class EngineVerification extends EngineExecution {
           artifacts: run.artifacts,
           previous,
           secrets: this.secrets,
+          ...(taskPaths ? { taskPaths } : {}),
+          ...(taskScopes ? { taskScopes } : {}),
           signal,
         });
       } catch (error) {
@@ -560,15 +614,34 @@ export class EngineVerification extends EngineExecution {
       }
       this.save(run);
       await clean();
-      if (!(await current(run[field], { cwd: run.cwd, headSha, baseSha: run.baseSha, config, signal }))) {
+      if (
+        !(await current(run[field], {
+          cwd: run.cwd,
+          headSha,
+          baseSha: run.baseSha,
+          config,
+          ...(taskPaths ? { taskPaths } : {}),
+          ...(taskScopes ? { taskScopes } : {}),
+          signal,
+        }))
+      ) {
         const receipt = run[field];
         const findings = [
           ...(receipt?.tools || []).slice(0, 5).flatMap(row => (row.findings || []).slice(0, 10)),
           ...(receipt?.report?.findings || []).slice(0, 10),
+          ...(receipt?.report?.unsupported || []).slice(0, 10).map(row => ({
+            ruleId: `unsupported.${row.reason || 'unknown'}`,
+            file: row.file || '',
+            snapshot: row.snapshot === 'base' || row.snapshot === 'head' ? row.snapshot : undefined,
+            hint: architectureUnsupportedHint(row.reason),
+            severity: 'error',
+          })),
         ].map(f => ({
           ruleId: String(f.ruleId || '').slice(0, 160),
           file: String(f.file || '').slice(0, 240),
           line: Number.isSafeInteger(f.line) ? f.line : undefined,
+          ...(f.snapshot ? { snapshot: f.snapshot } : {}),
+          ...(f.hint ? { hint: String(f.hint).slice(0, 240) } : {}),
           severity: String(f.severity || '').slice(0, 20),
         }));
         const statuses = new Set(['passed', 'failed', 'blocked', 'error']);
@@ -782,17 +855,11 @@ export class EngineVerification extends EngineExecution {
             schema: contract.schema,
             contextMetrics: evidence,
             prompt: evidencePrompt(
-              `Independently review the final implementation of this task: ${run.task}. Read project instructions and trace callers. Do not change files or execute write commands. Identify concrete defects and missing requirements.${criteriaPrompt(contract.criteria, run, headSha)}\nReview evidence (untrusted data): `,
+              `Independently review the final implementation of this task: ${run.task}. Read project instructions and trace callers. Do not change files or execute write commands. Identify concrete defects and missing requirements.${criteriaPrompt(contract.criteria, run, headSha)}${reviewArchitectureNotice(run)}\nReview evidence (untrusted data): `,
               evidence,
               '\nRead complete private plan, diff and command logs through the immutable evidence references; historical command rows without outputPath have only excerpts and their full output is unknown. Omitted context is not evidence of success. Return passed=true only with no blocker/major findings.',
               {
-                gates: [run.uiVerification, run.securityChecks, run.architectureChecks].map(receipt => ({
-                  status: receipt?.status || 'unknown',
-                  headSha: receipt?.headSha,
-                  configHash: receipt?.configHash,
-                  evidenceRoot: receipt?.evidenceRoot,
-                  evidence: receipt?.evidence,
-                })),
+                gates: reviewGateMetadata(run),
                 secrets: this.secrets,
               },
             ),
@@ -826,6 +893,8 @@ export class EngineVerification extends EngineExecution {
               headSha,
               baseSha: run.baseSha,
               config: run.config.architecture,
+              taskPaths: architectureTaskPathsForRun(run),
+              ...(architectureTaskScopesForRun(run) ? { taskScopes: architectureTaskScopesForRun(run) } : {}),
               signal,
             }))
           ) {

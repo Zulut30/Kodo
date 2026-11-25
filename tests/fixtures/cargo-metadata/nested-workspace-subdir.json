@@ -1,0 +1,17 @@
+{
+  "cargoVersion": "cargo 1.96.0 (30a34c682 2026-05-25)",
+  "startDir": "nested/subws/crates/inner",
+  "workspace_root": "nested/subws",
+  "workspace_members": [
+    {
+      "name": "inner",
+      "manifest": "nested/subws/crates/inner/Cargo.toml"
+    }
+  ],
+  "manifests": {
+    "Cargo.toml": "[workspace]\nresolver = \"2\"\nmembers = [\"crates/*\"]\n",
+    "crates/a/Cargo.toml": "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    "nested/subws/Cargo.toml": "[workspace]\nresolver = \"2\"\nmembers = [\"crates/*\"]\n",
+    "nested/subws/crates/inner/Cargo.toml": "[package]\nname = \"inner\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+  }
+}

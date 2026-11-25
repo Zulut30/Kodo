@@ -1,0 +1,18 @@
+{
+  "cargoVersion": "cargo 1.96.0 (30a34c682 2026-05-25)",
+  "startDir": "",
+  "ok": false,
+  "expectedReason": "wrong-workspace-root",
+  "cargoError": "error: package `<ROOT>/crates/a/Cargo.toml` is a member of the wrong workspace\nexpected: <ROOT>/Cargo.toml\nactual:   <ROOT>/other-ws/Cargo.toml",
+  "files": [
+    "Cargo.toml",
+    "crates/a/Cargo.toml",
+    "crates/a/src/lib.rs",
+    "other-ws/Cargo.toml"
+  ],
+  "manifests": {
+    "Cargo.toml": "[workspace]\nresolver = \"2\"\nmembers = [\"crates/a\"]\n",
+    "crates/a/Cargo.toml": "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2021\"\nworkspace = \"../../other-ws\"\n",
+    "other-ws/Cargo.toml": "[workspace]\nresolver = \"2\"\nmembers = [\"../crates/a\"]\n"
+  }
+}

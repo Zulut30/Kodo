@@ -1,0 +1,19 @@
+{
+  "cargoVersion": "cargo 1.96.0 (30a34c682 2026-05-25)",
+  "startDir": "",
+  "ok": false,
+  "expectedReason": "unsupported-underscore-dependencies",
+  "cargoError": "error: failed to load manifest for workspace member `<ROOT>/crates/a`\nreferenced via `crates/*` by workspace at `<ROOT>/Cargo.toml`\n\nCaused by:\n  failed to parse manifest at `<ROOT>/crates/a/Cargo.toml`\n",
+  "files": [
+    "Cargo.toml",
+    "crates/a/Cargo.toml",
+    "crates/a/src/lib.rs",
+    "crates/b/Cargo.toml",
+    "crates/b/src/lib.rs"
+  ],
+  "manifests": {
+    "Cargo.toml": "[workspace]\nresolver = \"2\"\nmembers = [\"crates/*\"]\n[workspace.package]\nedition = \"2024\"\n",
+    "crates/a/Cargo.toml": "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition.workspace = true\n[dev_dependencies]\nb = { path = \"../b\" }\n",
+    "crates/b/Cargo.toml": "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+  }
+}

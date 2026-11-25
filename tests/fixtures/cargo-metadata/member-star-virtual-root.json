@@ -1,0 +1,27 @@
+{
+  "cargoVersion": "cargo 1.96.0 (30a34c682 2026-05-25)",
+  "ok": true,
+  "workspace_root": "",
+  "workspace_members": [
+    {
+      "name": "a",
+      "manifest": "a/Cargo.toml"
+    },
+    {
+      "name": "b",
+      "manifest": "b/Cargo.toml"
+    }
+  ],
+  "files": [
+    "Cargo.toml",
+    "a/Cargo.toml",
+    "a/src/lib.rs",
+    "b/Cargo.toml",
+    "b/src/lib.rs"
+  ],
+  "manifests": {
+    "Cargo.toml": "[workspace]\nresolver = \"2\"\nmembers = [\"*\"]\n",
+    "a/Cargo.toml": "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    "b/Cargo.toml": "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+  }
+}
