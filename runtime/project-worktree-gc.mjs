@@ -1,3 +1,4 @@
+import { cleanupRemoteRefs } from './project-remote-transport.mjs';
 import path from 'node:path';
 import { realpath as fsRealpath } from 'node:fs';
 import { promisify } from 'node:util';
@@ -159,17 +160,20 @@ export async function gcProjectWorktrees(store, snapshot) {
       report.retained.push(run.id);
       continue;
     }
+    const controller = new AbortController();
     let lost = false;
     const renew = () => !lost && store.renewLease(token);
     const timer = setInterval(() => {
       try {
         lost = !renew();
+        if (lost) controller.abort();
       } catch {
         lost = true;
       }
     }, 10000);
     try {
       await noLinks(run.project);
+      await cleanupRemoteRefs(run, controller.signal);
       const result = await withWorktreeLock(run.project, () => removeOwned(run, head, renew));
       if (result) report[result].push(run.id);
     } catch {

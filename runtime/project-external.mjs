@@ -19,6 +19,10 @@
  */
 import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
+import os from 'node:os';
+import { fileURLToPath } from 'node:url';
+import { cleanupRemoteRefs, fetchSubmission, pushBase, remoteRefs, transport } from './project-remote-transport.mjs';
+import { portableDirectorTaskInput } from './project-contracts.mjs';
 import { isDeepStrictEqual } from 'node:util';
 import { stat } from 'node:fs/promises';
 import { matchesReceiptFile, receiptBinding } from './remote-task-receipt.mjs';
@@ -150,32 +154,6 @@ function workerContract(run, writePaths, selfCheck) {
   ].join('\n');
 }
 
-function remoteRefs(projectId, run) {
-  if (!['ssh', 't3-env'].includes(run.workerPlacement?.machine?.kind)) return null;
-  const prefix = 'refs/kodo/' + projectId;
-  return {
-    repository: run.transportRemote ?? 'origin',
-    baseRef: prefix + '/base/' + run.id,
-    workRef: prefix + '/work/' + run.id,
-  };
-}
-
-async function transport(cwd, args, signal) {
-  try {
-    const result = await execute('git', args, { cwd, signal, timeoutMs: 120000, allowFailure: true });
-    if (result.code === 0) return result.stdout.trim();
-  } catch (error) {
-    if (signal?.aborted) throw error;
-  }
-  fail('transport_failed');
-}
-
-async function pushBase(run, remote, signal) {
-  const names = await transport(run.project, ['remote'], signal);
-  need(names.split(/\r?\n/).includes(remote.repository), 'transport_failed');
-  await transport(run.project, ['push', remote.repository, run.baseSha + ':' + remote.baseRef], signal);
-}
-
 async function briefFor(state, attempt, task, run) {
   const { C, options, cli } = state,
     project = state.snapshot.project;
@@ -189,20 +167,15 @@ async function briefFor(state, attempt, task, run) {
   const selfCheck = remote
     ? 'kodo ci feedback --base ' + run.baseSha + ' --json'
     : `${cli} ci feedback --base ${run.baseSha} --project ${quotePath(run.cwd)} --json`;
-  const interfaces = task.interfaceRefs.map(ref => {
+  const referencePath = ref => {
     if (!remote || !path.isAbsolute(ref.path)) return ref.path;
     const relative = path.relative(project.root, ref.path);
-    return relative.startsWith('..') || path.isAbsolute(relative)
+    return relative === '..' || relative.startsWith('..' + path.sep) || path.isAbsolute(relative)
       ? 'sha256:' + ref.sha256
       : relative.split(path.sep).join('/');
-  });
-  let workerInput = input;
-  if (remote) {
-    workerInput = input.replaceAll(JSON.stringify(project.root), JSON.stringify('.'));
-    task.interfaceRefs.forEach((ref, index) => {
-      workerInput = workerInput.replaceAll(JSON.stringify(ref.path), JSON.stringify(interfaces[index]));
-    });
-  }
+  };
+  const interfaces = task.interfaceRefs.map(referencePath);
+  const workerInput = remote ? portableDirectorTaskInput(input, referencePath) : input;
   const basePrompt = remote
     ? [
         workerInput,
@@ -246,6 +219,22 @@ async function briefFor(state, attempt, task, run) {
     abandonCommand: `${dispatcher} project complete-task ${project.projectId} ${task.id} --head <SHA> --abandon --attempt ${attempt.id}`,
     ...extra,
   };
+  if (remote) {
+    const normalize = text => {
+      const slashes = text.replace(/\\+/g, '/');
+      return process.platform === 'win32' ? slashes.toLowerCase() : slashes;
+    };
+    const serialized = normalize(JSON.stringify(brief));
+    for (const root of [
+      project.root,
+      storeOf(state.ctx).home,
+      path.dirname(run.worktreeRoot),
+      fileURLToPath(new URL('..', import.meta.url)),
+      os.homedir(),
+    ]) {
+      if (root && serialized.includes(normalize(path.resolve(root)))) fail('brief_path_leak');
+    }
+  }
   C.assertDirectorSafe(brief, options);
   return brief;
 }
@@ -379,6 +368,7 @@ async function resumeInFlight(state, replayOnly) {
     const run = storedRun(store, attempt.runId);
     if ((replayOnly && !run) || run?.integration?.status === 'merged') continue;
     if (state.profile?.machines.some(m => m.down && m.id === run?.workerPlacement?.machine?.id)) {
+      if (run?.state === 'succeeded' || integrationStarted(run)) continue;
       state.blocked.push({
         taskId: attempt.taskId,
         attemptId: attempt.id,
@@ -669,7 +659,7 @@ export async function nextWave(ctx, input) {
   // priority, KODO_WORKTREE_HOME first) is refused before the lease or any reservation.
   const home = (ctx.engine.store ?? store)?.home;
   if (typeof home === 'string') quotePath(await plannedWorktreeHome(home));
-  return withWaveAdmissionLeases(store, projectId, async checkLease => {
+  return withWaveAdmissionLeases(store, projectId, async (checkLease, admissionLost) => {
     const now = Date.parse((ctx.clock ?? (() => new Date().toISOString()))());
     const profile = ctx.repo.getProfile(projectId);
     const maximum = waveCapacity(profile, now);
@@ -698,7 +688,7 @@ export async function nextWave(ctx, input) {
       blocked: [],
       apiCardCache: createApiCardCache(),
       buildApiCards: ctx.buildApiCards ?? buildApiCards,
-      signal,
+      signal: signal ? AbortSignal.any([signal, admissionLost]) : admissionLost,
     };
 
     const canPlan = initializePlacements(state);
@@ -1115,6 +1105,17 @@ async function verifySubmission(ctx, C, step, input) {
   return withHeldLease(store, dedupe, async dedupeLost => {
     const before = await state();
     if (before !== 'go') return before === 'verified' ? null : stale;
+    let remoteChecks;
+    if (step.remote) {
+      const checked = signal ? AbortSignal.any([dedupeLost, signal]) : dedupeLost;
+      const checkLease = () => {
+        if (!leaseOwned(store, dedupe)) fail('lease_lost');
+        checked.throwIfAborted();
+      };
+      const prepared = await prepareRemoteSubmission(ctx, step, input, checked, checkLease);
+      if (prepared.defect) return prepared.defect;
+      remoteChecks = prepared.remoteChecks;
+    }
     return withMachineBuild(
       store,
       async slotLost => {
@@ -1128,7 +1129,7 @@ async function verifySubmission(ctx, C, step, input) {
             run: run.id,
             signal: checked,
             expectedHeadSha: head,
-            remoteChecks: step.remoteChecks,
+            remoteChecks,
             ...(machine?.maxHeavyBuilds ? { maxHeavyBuilds: machine.maxHeavyBuilds } : {}),
           });
         } catch (error) {
@@ -1161,7 +1162,11 @@ async function verifySubmission(ctx, C, step, input) {
                 // A failed check keeps its diagnostic pack for the next attempt's brief (15D).
                 store.updateRun(
                   run.id,
-                  { state: 'executing', ...(verdict.diagnostics ? { lastDiagnostics: verdict.diagnostics } : {}) },
+                  {
+                    state: 'executing',
+                    ...(step.remote && !verdict.passed ? { remoteRejectedHead: head } : {}),
+                    ...(verdict.diagnostics ? { lastDiagnostics: verdict.diagnostics } : {}),
+                  },
                   { preserveCancellation: true },
                 );
                 return verdict.passed
@@ -1323,6 +1328,7 @@ const controlledProject = project => project.paused || ['cancelled', 'failed', '
 async function finishCompletion(ctx, C, input, run, replayed) {
   const store = storeOf(ctx),
     { projectId, signal } = input;
+  await cleanupRemoteRefs(run, signal);
   const receipt = () => store.getRun(run.id).externalCompletion;
   let completion = receipt(),
     gates = completion.gates,
@@ -1409,6 +1415,12 @@ async function admitSubmission(ctx, C, input) {
     const missing = await replayedMerge(ctx, input, run);
     return missing ? { result: missing } : { replay: run };
   }
+  if (
+    remoteRefs(projectId, run) &&
+    run.headSha !== head &&
+    (run.state === 'succeeded' || integrationStarted(run) || run.externalCompletion)
+  )
+    return blocked('project_submission_locked');
   if (controlledProject(snapshot.project)) return blocked('project_control_blocked');
   // A verified head whose integration was interrupted (crash) continues where it stopped.
   const interrupted = run.state === 'succeeded' && run.headSha === head && integrationStarted(run);
@@ -1416,38 +1428,56 @@ async function admitSubmission(ctx, C, input) {
   if (!['running', 'verifying'].includes(attempt.status) || run.integration?.status === 'merged')
     return blocked('project_attempt_not_running');
   const remote = remoteRefs(projectId, run);
-  if (remote) {
-    const names = await transport(run.project, ['remote'], input.signal);
-    if (!names.split(/\r?\n/).includes(remote.repository)) fail('transport_failed');
-    const tracking = 'refs/kodo/fetched/' + run.id;
-    await transport(
-      run.project,
-      ['fetch', '--no-tags', '--no-write-fetch-head', remote.repository, '+' + remote.workRef + ':' + tracking],
-      input.signal,
-    );
-    if ((await git(run.project, ['rev-parse', tracking])) !== head) return blocked('project_transport_head_mismatch');
-    if (!(await ancestor(run.project, run.baseSha, head)))
-      return {
-        result: { status: 'checks_failed', ...problem('external_not_descendant'), revision: snapshot.revision },
-      };
-    const unsafe = await historyDefect(ctx.engine, run, task, head);
-    if (unsafe) return { result: { status: 'checks_failed', ...unsafe, revision: snapshot.revision } };
-    if ((await specialEntries(run.project, run.baseSha, head)).length) return blocked('project_external_symlink');
-    await transport(run.cwd, ['merge', '--ff-only', head], input.signal);
+  if (!remote) {
+    const defect = await inspectSubmission(ctx.engine, run, task, head);
+    if (defect) return { result: { status: 'checks_failed', ...defect, revision: snapshot.revision } };
+  }
+  return { ...current, verified: false, remote };
+}
+
+// The per-Run verification lease serializes checkout changes, including two dispatchers
+// submitting different heads. Network, scope inspection and command planning hold no project lease.
+async function prepareRemoteSubmission(ctx, step, input, signal, checkLease) {
+  const { run, task, remote } = step;
+  const { head, projectId } = input;
+  const store = storeOf(ctx);
+  const fetched = await fetchSubmission(run, remote, head, signal, checkLease);
+  if (fetched) return { defect: { blocked: fetched } };
+  if (!(await ancestor(run.project, run.baseSha, head))) return { defect: problem('external_not_descendant') };
+  const unsafe = await historyDefect(ctx.engine, run, task, head);
+  if (unsafe) return { defect: unsafe };
+  if ((await specialEntries(run.project, run.baseSha, head)).length) return { defect: problem('external_symlink') };
+  checkLease();
+  const current = store.getRun(run.id);
+  if (cancelled(current)) return { defect: { blocked: 'project_submission_stale' } };
+  if (current.state === 'succeeded' || integrationStarted(current))
+    return { defect: { blocked: 'project_submission_locked' } };
+  const previous = await git(run.cwd, ['rev-parse', 'HEAD']);
+  const changed = await workerStateDefect(run, previous);
+  if (changed) return { defect: changed };
+  checkLease();
+  if (previous !== head) {
+    if (previous === run.baseSha || (await ancestor(run.project, previous, head))) {
+      await transport(run.cwd, ['merge', '--ff-only', head], signal);
+    } else if (current.remoteRejectedHead === previous) {
+      await transport(run.cwd, ['reset', '--keep', head], signal);
+    } else return { defect: { blocked: 'project_submission_locked' } };
   }
   const defect = await inspectSubmission(ctx.engine, run, task, head);
-  if (defect) return { result: { status: 'checks_failed', ...defect, revision: snapshot.revision } };
-  let remoteChecks;
+  if (defect) {
+    if (defect.code !== 'external_head_changed' && !cancelled(store.getRun(run.id)))
+      store.updateRun(run.id, { remoteRejectedHead: head }, { preserveCancellation: true });
+    return { defect };
+  }
   if (
-    remote &&
     input.receipt &&
     ctx.repo.getProfile(projectId)?.machines.some(m => m.id === run.workerPlacement.machine.id && m.trustedBuilds)
   ) {
     const binding = await receiptBinding(run, head);
-    if (!(await matchesReceiptFile(input.receipt, binding))) return blocked('project_receipt_mismatch');
-    remoteChecks = { ...binding, source: 'remote' };
+    if (!(await matchesReceiptFile(input.receipt, binding))) return { defect: { blocked: 'project_receipt_mismatch' } };
+    return { remoteChecks: { ...binding, source: 'remote' } };
   }
-  return { ...current, verified: false, remoteChecks };
+  return {};
 }
 
 /**
@@ -1459,8 +1489,8 @@ async function admitSubmission(ctx, C, input) {
  * stale one is `project_attempt_stale`), and a late abandon of an earlier attempt replays its
  * result without touching the current one.
  *
- * Concurrency: the Git, scope and secret checks run in a short section under `project:<id>`
- * (waited for; `project_busy` after the wait); `task-fast` runs outside it in one build slot of
+ * For remote attempts the project section admits the submission. The per-Run verification
+ * lease covers fetch, checkout, scope checks and receipt planning. Task-fast runs in a build slot of
  * the machine (`machine`: `{ id, maxHeavyBuilds }`, default one local slot), once per Run at a
  * time. The verified head is queued (`priority`, default 0) and merged by whichever submission
  * drains the queue; this call waits for its row (`integrationWaitMs`, then
@@ -1480,10 +1510,24 @@ export async function completeTask(ctx, input) {
     store = storeOf(ctx);
   await externalAttempt(ctx, C, projectId, taskId);
   const section = work => withProjectSection(store, projectId, work, { signal });
-  if (abandon)
-    return section(async () =>
-      abandonTarget(ctx, await externalAttempt(ctx, C, projectId, taskId), { head, attemptId, commandId }),
-    );
+  if (abandon) {
+    const { result, run } = await section(async () => {
+      const target = await externalAttempt(ctx, C, projectId, taskId);
+      const result = await abandonTarget(ctx, target, { head, attemptId, commandId });
+      return { result, run: target.run };
+    });
+    if (
+      result.status === 'abandoned' &&
+      result.attemptId === run.directorBinding.attemptId &&
+      remoteRefs(projectId, run)
+    ) {
+      const token = await acquireLeaseWaiting(store, 'project-verify:' + run.id, { signal });
+      await withHeldLease(store, token, lost =>
+        cleanupRemoteRefs(run, signal ? AbortSignal.any([signal, lost]) : lost),
+      );
+    }
+    return result;
+  }
   const step = await section(() => admitSubmission(ctx, C, input));
   if (step.result) return step.result;
   const completion = { ...input, deferGate };

@@ -15,6 +15,9 @@ const flagsFor = {
 // Constant codes of the protocol itself; never data, paths or provider output.
 const reported = new Set([
   'project_transport_failed',
+  'project_transport_too_large',
+  'project_submission_locked',
+  'project_brief_path_leak',
   'project_transport_head_mismatch',
   'project_receipt_mismatch',
   'project_dependency_cycle',

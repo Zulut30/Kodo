@@ -7,11 +7,16 @@ export async function receiptBinding(run, headSha) {
   const plan = await planFastChecks({ run, headSha });
   return {
     profile: 'task-fast',
+    attemptId: run.directorBinding.attemptId,
     complete: true,
     headSha,
     wavePolicyHash: run.wavePolicy.hash,
     kodoVersion: metadata.version,
-    commands: plan.commands.map(step => (step.command === process.execPath ? { ...step, command: 'node' } : step)),
+    commands: plan.commands.map(step => ({
+      ...step,
+      command: step.command === process.execPath ? 'node' : step.command,
+      exitCode: 0,
+    })),
   };
 }
 
@@ -24,11 +29,13 @@ export function remoteProof(run) {
     checks?.source === 'remote' &&
     checks.profile === 'task-fast' &&
     checks.complete === true &&
+    checks.attemptId === run.directorBinding?.attemptId &&
     checks.headSha === run.headSha &&
     checks.wavePolicyHash === run.wavePolicy?.hash &&
     checks.kodoVersion === metadata.version &&
     Array.isArray(checks.commands) &&
-    checks.commands.length > 0
+    checks.commands.length > 0 &&
+    checks.commands.every(row => row?.exitCode === 0)
   );
 }
 
