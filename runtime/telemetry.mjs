@@ -12,6 +12,7 @@
  */
 import { aggregateMetrics } from './metrics.mjs';
 import { DELIVERY_OPERATIONS, OPERATION_EVENT } from './delivery-operations.mjs';
+import { buildProjectTelemetry } from './project-telemetry.mjs';
 
 export const REPORT_SCHEMA_VERSION = 1;
 export const REPORT_STAGES = Object.freeze([
@@ -480,7 +481,9 @@ function timing(run, events, stages) {
   const created = millis(run.createdAt) ?? millis(events.find(event => event.type === 'created')?.time);
   let finished = null;
   if (terminalStates.has(run.state))
-    for (const event of events) if (event.type === run.state) finished = millis(event.time) ?? finished;
+    for (const event of events)
+      if (event.type === run.state || (run.state === 'succeeded' && event.type === 'gate_succeeded'))
+        finished = millis(event.time) ?? finished;
   return { createdAt: iso(created), finishedAt: iso(finished), wallMs: interval(created, finished), stages };
 }
 
@@ -825,15 +828,17 @@ function snapshotCompleteness(snapshot) {
  * @param {any} snapshot Project snapshot (`repo.snapshot`).
  * @param {Map<string, any> | Record<string, any>} runsById Saved Runs by id.
  * @param {Map<string, any[]> | Record<string, any[]>} eventsByRun Saved Run events by Run id.
- * @param {{ now?: number, attempts?: any[], jobEvents?: Map<string, any[]> | Record<string, any[]> }} [options]
+ * @param {{ now?: number, attempts?: any[], jobEvents?: Map<string, any[]> | Record<string, any[]>,
+ *   integrationQueue?: any[], profile?: any }} [options]
  *   `attempts`: every attempt `{ taskId, number, runId }` of the Project; defaults to the snapshot's
  *   current attempts. `jobEvents`: durable job receipts by Run id (see `buildRunReport`).
+ *   `integrationQueue`: rows of `kodo_integration_queue` for the Project. `profile`: saved ExecutionProfile.
  */
 export function buildProjectReport(
   snapshot,
   runsById,
   eventsByRun,
-  { now = null, attempts = undefined, jobEvents = {} } = {},
+  { now = null, attempts = undefined, jobEvents = {}, integrationQueue = [], profile = null } = {},
 ) {
   if (!record(snapshot) || !record(snapshot.project)) throw new TypeError('Project report requires a snapshot');
   const current = new Map(
@@ -886,6 +891,16 @@ export function buildProjectReport(
     runs: { known: found.length, total: attemptsTotal, complete: found.length === attemptsTotal },
   };
   const seenPlatforms = platforms(runs);
+  const kpis = buildProjectTelemetry({
+    snapshot,
+    attempts: all,
+    runsById,
+    eventsByRun,
+    integrationQueue,
+    profile,
+    waveGates,
+    runsComplete: completeness.runs.complete,
+  });
   const notes = new Set();
   if (!completeness.runs.complete) notes.add('runs_missing');
   if (Object.entries(completeness).some(([key, value]) => key !== 'runs' && !value.complete))
@@ -910,6 +925,7 @@ export function buildProjectReport(
     tasks: rows.map(item => item.row),
     attempts: attemptRows.map(item => item.row),
     totals,
+    ...kpis,
     ...(waveGates ? { gates: waveGates.map(gate => gate.row) } : {}),
     blockers: [...projectBlockers(snapshot, rows, current), ...(waveGates ? gateBlockers(waveGates) : [])],
     completeness,

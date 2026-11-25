@@ -118,12 +118,13 @@ const ORDER = 'ORDER BY priority DESC, seq ASC';
 /**
  * The integration queue on the legacy Store's SQLite connection (migrated on first open).
  * @param {{ db: any }} store
+ * @param {{ clock?: () => string }} [options]
  */
-export function openIntegrationQueue(store) {
+export function openIntegrationQueue(store, options = {}) {
   need(store?.db, 'store_invalid');
   const db = store.db;
   migrate(db);
-  const now = () => new Date().toISOString();
+  const now = typeof options?.clock === 'function' ? options.clock : () => new Date().toISOString();
   const select = (where, ...values) =>
     db
       .prepare(`SELECT * FROM kodo_integration_queue WHERE ${where} ${ORDER}`)
@@ -140,6 +141,7 @@ export function openIntegrationQueue(store) {
         .get(projectId, runId, headSha, ...statuses),
     );
   const queue = {
+    now,
     /** @param {number} seq */
     get: seq => entryOf(db.prepare('SELECT * FROM kodo_integration_queue WHERE seq=?').get(seq)),
     /** Every row of the project in queue order. @param {string} projectId */
@@ -315,6 +317,7 @@ export async function drainIntegrationQueue(input) {
         }
         return finished;
       }
+      const dequeuedAt = typeof queue.now === 'function' ? queue.now() : new Date().toISOString();
       let outcome;
       try {
         outcome = await integrate(entry);
@@ -326,9 +329,15 @@ export async function drainIntegrationQueue(input) {
         if (['project_lease_lost', 'project_integration_unreadable'].includes(error?.code)) return finished;
         outcome = { status: 'failed', code: errorCode(error) };
       }
+      const finishedAt = typeof queue.now === 'function' ? queue.now() : new Date().toISOString();
+      const stamped = {
+        ...outcome,
+        dequeuedAt: outcome.dequeuedAt ?? dequeuedAt,
+        finishedAt: outcome.finishedAt ?? finishedAt,
+      };
       let done;
       try {
-        done = queue.finish(entry.seq, claim, outcome);
+        done = queue.finish(entry.seq, claim, stamped);
       } catch (error) {
         if (error?.code === 'project_lease_lost') return finished;
         throw error;

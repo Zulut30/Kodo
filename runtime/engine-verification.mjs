@@ -36,6 +36,9 @@ import {
 } from './task-fast-checks.mjs';
 
 const gateReviewSchemas = new Map();
+const logGateVerify = (engine, run, type, data) => {
+  if (run.directorBinding?.kind === 'gate') engine.log(run, type, data);
+};
 /**
  * The review contract of a run. A wave gate Run (`directorBinding.kind === 'gate'`) confirms
  * every criterion of its gate manifest (`run.gateCriteria`, ids from `gateReviewCriteria`)
@@ -777,6 +780,7 @@ export class EngineVerification extends EngineExecution {
       if (cycle.pendingRepair) await this.repairVerification(run, signal);
       const attempt = cycle.attempt;
       let checkError;
+      logGateVerify(this, run, 'gate_verify_started', { attempt });
       try {
         run.uiVerification = null;
         run.securityChecks = null;
@@ -793,6 +797,8 @@ export class EngineVerification extends EngineExecution {
           throw Object.assign(new Error('Запуск отменён'), { code: 'cancelled' });
         maybeRethrowVerificationError(this, run, error);
         checkError = error;
+      } finally {
+        logGateVerify(this, run, 'gate_verify_finished', { attempt, passed: !checkError });
       }
       const headSha = await git(run.cwd, ['rev-parse', 'HEAD']);
       if (!checkError && fast) {

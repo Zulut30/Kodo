@@ -113,13 +113,49 @@ async function projectRepository(state) {
   });
 }
 
+function readIntegrationQueue(state, projectId) {
+  if (!state.tables.has('kodo_integration_queue')) return [];
+  return state.db
+    .prepare('SELECT * FROM kodo_integration_queue WHERE project_id=? ORDER BY seq')
+    .all(projectId)
+    .map(row => ({
+      seq: Number(row.seq),
+      projectId: String(row.project_id),
+      taskId: String(row.task_id),
+      attemptId: String(row.attempt_id),
+      runId: String(row.run_id),
+      baseSha: String(row.base_sha),
+      headSha: String(row.head_sha),
+      priority: Number(row.priority),
+      status: String(row.status),
+      enqueuedAt: String(row.enqueued_at),
+      updatedAt: String(row.updated_at),
+      outcome: JSON.parse(String(row.outcome)),
+    }));
+}
+
 async function projectReport(state, projectId, secrets, now) {
   const repo = await projectRepository(state);
   const snapshot = repo.snapshot(projectId);
   const attempts = state.db
-    .prepare('SELECT task_id,number,run_id FROM kodo_project_attempts WHERE project_id=? ORDER BY task_id,number')
+    .prepare(
+      'SELECT id,task_id,number,run_id,body FROM kodo_project_attempts WHERE project_id=? ORDER BY task_id,number',
+    )
     .all(projectId)
-    .map(row => ({ taskId: row.task_id, number: row.number, runId: row.run_id }));
+    .map(row => {
+      const parsed = JSON.parse(String(row.body));
+      return {
+        id: row.id,
+        taskId: row.task_id,
+        number: row.number,
+        runId: row.run_id,
+        status: parsed?.status ?? null,
+        createdAt: parsed?.createdAt ?? null,
+        updatedAt: parsed?.updatedAt ?? null,
+      };
+    });
+  const integrationQueue = readIntegrationQueue(state, projectId);
+  const profile = state.tables.has('kodo_project_profiles') ? repo.getProfile(projectId) : null;
   const runs = new Map(),
     events = new Map(),
     jobEvents = new Map();
@@ -135,7 +171,7 @@ async function projectReport(state, projectId, secrets, now) {
     events.set(runId, readEvents(state, runId));
     jobEvents.set(runId, readJobEvents(state, runId));
   }
-  return buildProjectReport(snapshot, runs, events, { now, attempts, jobEvents });
+  return buildProjectReport(snapshot, runs, events, { now, attempts, jobEvents, integrationQueue, profile });
 }
 
 const time = value => {
@@ -195,6 +231,47 @@ const gateLines = gates =>
       ]
     : [];
 
+const bucket = item =>
+  item ? `${time(item.durationMs)} (${item.known}/${value(item.total)} known${measuredPart(item)})` : 'unknown';
+const rateText = item =>
+  item?.tasksPerHour === null || item?.tasksPerHour === undefined ? 'unknown' : `${item.tasksPerHour} tasks/h`;
+const percentText = item =>
+  item?.rate === null || item?.rate === undefined ? 'unknown' : `${Math.round(item.rate * 1000) / 10}%`;
+const arbitrationLines = item => {
+  if (!item) return [];
+  const entries = Object.entries(item.decisions ?? {}).sort(([a], [b]) => a.localeCompare(b));
+  const detail = entries.length ? ` (${entries.map(([k, v]) => `${k} ${v}`).join(', ')})` : '';
+  return [`Arbitrations: ${value(item.count)}${detail}`];
+};
+const utilizationLines = item => {
+  if (!item) return [];
+  const cap = item.overall.capacity === null ? '' : `/${item.overall.capacity}`;
+  return [
+    `Utilization: slots median ${value(item.overall.median)}, peak ${value(item.overall.peak)}${cap} (${item.overall.known}/${value(item.overall.total)} known)`,
+    ...item.subscriptions.map(
+      sub =>
+        `  subscription ${sub.id} (${value(sub.provider)}/${value(sub.model)}): median ${value(sub.median)}, peak ${value(sub.peak)}/${value(sub.slots)}`,
+    ),
+    ...item.machines.map(
+      m =>
+        `  machine ${m.id} (${value(m.kind)}): median ${value(m.median)}, peak ${value(m.peak)}/${value(m.maxWorkers)}`,
+    ),
+  ];
+};
+const telemetryLines = report => {
+  if (!report.throughput) return [];
+  const { throughput, taskDuration, breakdown, firstPassYield, arbitrations, interventions, utilization } = report;
+  return [
+    `Throughput: integrated ${rateText(throughput.integrated)} (${throughput.integrated.count}, window ${time(throughput.integrated.windowMs)}), accepted ${rateText(throughput.accepted)} (${throughput.accepted.count}, window ${time(throughput.accepted.windowMs)})`,
+    `Task duration: p50 ${time(taskDuration.p50Ms)}, p95 ${time(taskDuration.p95Ms)} (${taskDuration.known}/${value(taskDuration.total)} known)`,
+    `Breakdown: agent ${bucket(breakdown.agent)}, task-fast ${bucket(breakdown.taskFast)}, queue wait ${bucket(breakdown.integrationQueue.wait)} (p95 ${time(breakdown.integrationQueue.wait.p95Ms)}), queue merge ${bucket(breakdown.integrationQueue.merge)}, gate verify ${bucket(breakdown.gates.verify)}, gate review ${bucket(breakdown.gates.review)}, gate repair ${bucket(breakdown.gates.repair)}, quota ${bucket(breakdown.quota)}, human ${bucket(breakdown.human)}`,
+    `First-pass yield: task-fast ${percentText(firstPassYield.taskFast)} (${firstPassYield.taskFast.passed}/${firstPassYield.taskFast.total}), gate ${percentText(firstPassYield.gate)} (${firstPassYield.gate.passed}/${firstPassYield.gate.total})`,
+    ...arbitrationLines(arbitrations),
+    `Interventions: abandon ${value(interventions.abandon)}, retry-failed ${value(interventions.retryFailed)}, rejections ${value(interventions.rejections)}`,
+    ...utilizationLines(utilization),
+  ];
+};
+
 /** The text summary of a project report (`kodo report --project` without `--json`). */
 export function humanProject(report) {
   const { totals } = report;
@@ -204,6 +281,7 @@ export function humanProject(report) {
     `Epics: ${statusCounts(report.progress?.epics)}`,
     `Wall time: ${time(totals.wallMs)}; verification share: ${value(totals.verificationShare)}; total tokens ${value(totals.usage?.usage.totalTokens)} (observed ${value(totals.observedUsage.usage.totalTokens)})`,
     `Waits: queue ${wait(totals.waits.queue)}, delivery queue ${wait(totals.waits.deliveryQueue)}, CI ${wait(totals.waits.ci)}`,
+    ...telemetryLines(report),
     ...report.tasks.map(
       row =>
         `  ${row.id}  ${row.status}  attempts ${row.attempts}  wall ${time(row.wallMs)}  last run ${value(row.lastRunState)}`,
