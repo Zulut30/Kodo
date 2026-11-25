@@ -142,3 +142,84 @@ test('separate Node processes cannot share a slot and a killed holder releases i
     waiter?.kill();
   }
 });
+
+test('A slot built from another checkout starts empty; the same checkout keeps its state', async t => {
+  const { mkdir: makeDir, readdir: list } = await import('node:fs/promises');
+  const { base: home } = await fixture(t);
+  const target = path.join(home, 'cargo-target', 'game', 'slot-1');
+  // Fingerprints of a registry and a path package, a build-script output and a test binary.
+  const seed = async () => {
+    for (const dir of ['debug/.fingerprint/serde-1111222233334444', 'debug/build/voxa-mesh-0123456789abcdef/out'])
+      await makeDir(path.join(target, dir), { recursive: true });
+    await writeFile(path.join(target, 'debug/build/voxa-mesh-0123456789abcdef/out/generated.rs'), 'A');
+    await writeFile(path.join(target, 'debug/api-0123456789abcdef.exe'), 'old test binary');
+  };
+  const contents = async () => (await list(target)).filter(name => name !== '.kodo-checkout').sort();
+  const build = checkout =>
+    withCargoSlot({ home, projectId: 'game', checkout, env: { CARGO_BUILD_BUILD_DIR: 'outside' } }, env => env);
+  await seed();
+  const first = await build(path.join(home, 'a'));
+  assert.equal(first.CARGO_TARGET_DIR, target);
+  assert.equal(first.CARGO_BUILD_BUILD_DIR, target, "a project's build-dir cannot move artifacts out of the slot");
+  assert.deepEqual(await contents(), [], 'a slot without a recorded checkout starts empty');
+  await seed();
+  await build(path.join(home, 'a'));
+  assert.deepEqual(await contents(), ['debug'], 'the same checkout keeps its incremental state');
+  await build(path.join(home, 'b'));
+  assert.deepEqual(await contents(), [], 'another checkout gets an empty slot (no stale OUT_DIR or binary)');
+  await seed();
+  await build(undefined);
+  assert.deepEqual(await contents(), ['debug'], 'a build without a checkout leaves the slot alone');
+});
+
+test('Two checkouts of one workspace never share a stale library through the slot', { timeout: 300000 }, t =>
+  staleLibraryScenario(t),
+);
+
+async function staleLibraryScenario(t) {
+  const { spawnSync } = await import('node:child_process');
+  const { mkdir: makeDir, utimes } = await import('node:fs/promises');
+  if (spawnSync('cargo', ['--version'], { windowsHide: true }).status !== 0) return t.skip('cargo is not installed');
+  const { base: home } = await fixture(t);
+  const checkout = async (name, lib, testBody) => {
+    const root = path.join(home, name);
+    await makeDir(path.join(root, 'crates', 'demo', 'src'), { recursive: true });
+    await makeDir(path.join(root, 'crates', 'demo', 'tests'), { recursive: true });
+    await writeFile(path.join(root, 'Cargo.toml'), '[workspace]\nresolver = "2"\nmembers = ["crates/*"]\n');
+    await writeFile(
+      path.join(root, 'crates', 'demo', 'Cargo.toml'),
+      '[package]\nname = "demo"\nversion = "0.1.0"\nedition = "2021"\n',
+    );
+    await writeFile(path.join(root, 'crates', 'demo', 'src', 'lib.rs'), lib);
+    await writeFile(path.join(root, 'crates', 'demo', 'tests', 'api.rs'), testBody);
+    return root;
+  };
+  const older = await checkout('a', 'pub fn a() -> u32 { 1 }\n', '#[test]\nfn a() { assert_eq!(demo::a(), 1); }\n');
+  const newer = await checkout(
+    'b',
+    'pub fn a() -> u32 { 1 }\npub fn b() -> u32 { 2 }\n',
+    '#[test]\nfn b() { assert_eq!(demo::b(), 2); }\n',
+  );
+  // The second task wrote its sources before the first one's library was built into the slot.
+  const past = new Date(Date.now() - 3600_000);
+  for (const file of ['Cargo.toml', 'crates/demo/Cargo.toml', 'crates/demo/src/lib.rs', 'crates/demo/tests/api.rs'])
+    await utimes(path.join(newer, file), past, past);
+  const cargoTest = (cwd, slotCheckout) =>
+    withCargoSlot({ home, projectId: 'game', checkout: slotCheckout, env: process.env }, env => {
+      const result = spawnSync('cargo', ['test', '--offline'], { cwd, env, encoding: 'utf8', windowsHide: true });
+      return { status: result.status, output: result.stdout + result.stderr };
+    });
+  // A host whose Cargo cannot lock, compile and link at all (no toolchain or linker) is not this
+  // test's subject: it is skipped with Cargo's own words.
+  for (const cwd of [older, newer]) {
+    const locked = spawnSync('cargo', ['generate-lockfile', '--offline'], { cwd, encoding: 'utf8', windowsHide: true });
+    if (locked.status !== 0)
+      return t.skip(`cargo cannot lock here: ${`${locked.error ?? ''}${locked.stderr ?? ''}`.slice(-400)}`);
+  }
+  const baseline = await cargoTest(older, older);
+  if (baseline.status !== 0) return t.skip(`cargo cannot build here: ${baseline.output.slice(-400)}`);
+  const verified = await cargoTest(newer, newer);
+  // The runner's stderr failure line keeps 200 characters of this message: Cargo's last words.
+  assert.equal(verified.status, 0, `cargo: ${verified.output.replace(/\s+/g, ' ').slice(-180)}`);
+  assert.match(verified.output, /test b \.\.\. ok/, `cargo: ${verified.output.replace(/\s+/g, ' ').slice(-180)}`);
+}
