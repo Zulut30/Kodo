@@ -956,7 +956,10 @@ function recordedOrigins(ctx, snapshot, history) {
   for (const attempt of attempts) {
     const integration = storedRun(ctx, attempt.run_id)?.integration;
     const parents = history.get(integration?.mergeCommit);
+    // Only a merge that passed the integration checks (published or awaiting publication) is
+    // attributed; a released pending record keeps its commit fields but proves nothing.
     if (
+      ['merged', 'pending'].includes(integration?.status) &&
       parents?.length === 2 &&
       parents[0] === integration.before &&
       parents[1] === (integration.mergedHead ?? integration.headSha)
@@ -972,12 +975,16 @@ function recordedOrigins(ctx, snapshot, history) {
     const mergeBack = parents.length === 2 && parents[0] === saved.before && parents[1] === run.headSha;
     if (!fastForward && !mergeBack) continue;
     const writePaths = [...new Set(gate.merges.flatMap(m => tasks.get(m.taskId)))];
+    // A fast-forward return may publish several repair commits; they are attributed only when
+    // their first-parent chain actually reaches the recorded base.
+    const chain = [];
     let commit = saved.target;
-    // A fast-forward return may publish several repair commits.
     while (history.has(commit) && commit !== saved.before) {
-      origins.set(commit, { kind: 'gate', ref: gate.id, writePaths });
+      chain.push(commit);
       commit = history.get(commit)[0];
     }
+    if (commit !== saved.before) continue;
+    for (const repair of chain) origins.set(repair, { kind: 'gate', ref: gate.id, writePaths });
   }
   return [...history.keys()]
     .reverse()
