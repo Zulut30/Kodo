@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { constants } from 'node:fs';
-import { access, mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { access, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { DatabaseSync } from 'node:sqlite';
 import { setTimeout as delay } from 'node:timers/promises';
 import { noLinks } from './toolchains.mjs';
@@ -39,61 +39,12 @@ async function sccachePath(env) {
 // Cargo names the artifacts of a workspace (path) package by a hash taken relative to its
 // workspace root and judges their freshness by file mtimes. Two worktrees of one repository that
 // share a target directory therefore share artifact names: a slot last built from another
-// checkout can hand a task that checkout's library when the task's sources are older than the
-// artifact (a false failure, or a false pass). The slot remembers the checkout it last built;
-// on a change the fingerprints of path packages (a `local` entry that checks dep-info) are
-// removed, so Cargo rebuilds the workspace crates and keeps the registry dependencies.
+// checkout can hand a task that checkout's library, test binary or build-script output (OUT_DIR)
+// when the task's sources are older than the artifact (a false failure, or a false pass). A
+// selective purge cannot see every such state (OUT_DIR contents, renamed units), so the slot
+// remembers the checkout it last built and starts empty for another one; the same checkout keeps
+// its incremental state. sccache (`rust.sccache`) keys by content and keeps a switch cheap.
 const CHECKOUT_MARKER = '.kodo-checkout';
-
-async function entries(dir) {
-  try {
-    return await readdir(dir, { withFileTypes: true });
-  } catch (error) {
-    if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return [];
-    throw error;
-  }
-}
-
-// A unit fingerprint that checks dep-info is a path package; unreadable ones count as one.
-async function localUnit(dir) {
-  for (const entry of await entries(dir)) {
-    if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
-    try {
-      const local = JSON.parse(await readFile(path.join(dir, entry.name), 'utf8'))?.local;
-      if (!Array.isArray(local)) return true;
-      if (local.some(item => item && typeof item === 'object' && 'CheckDepInfo' in item)) return true;
-    } catch {
-      return true;
-    }
-  }
-  return false;
-}
-
-// `<package>-<metadata hash>`: the package part of a unit directory.
-const unitPackage = name => name.replace(/-[0-9a-f]{16}$/, '');
-
-// `.fingerprint` of each profile (`debug`, `release`, `<triple>/<profile>`) under the slot.
-async function purgeLocalFingerprints(target) {
-  const profiles = [];
-  for (const first of await entries(target)) {
-    if (!first.isDirectory()) continue;
-    profiles.push(path.join(target, first.name));
-    for (const second of await entries(path.join(target, first.name)))
-      if (second.isDirectory() && second.name !== '.fingerprint')
-        profiles.push(path.join(target, first.name, second.name));
-  }
-  for (const profile of profiles) {
-    const fingerprints = path.join(profile, '.fingerprint');
-    const units = (await entries(fingerprints)).filter(unit => unit.isDirectory());
-    // Every unit of a path package goes, its build-script run (`RerunIfChanged`) included.
-    const local = new Set();
-    for (const unit of units)
-      if (await localUnit(path.join(fingerprints, unit.name))) local.add(unitPackage(unit.name));
-    for (const unit of units)
-      if (local.has(unitPackage(unit.name)))
-        await rm(path.join(fingerprints, unit.name), { recursive: true, force: true });
-  }
-}
 
 async function claimForCheckout(target, checkout) {
   if (checkout === undefined) return;
@@ -107,13 +58,15 @@ async function claimForCheckout(target, checkout) {
     if (error.code !== 'ENOENT') throw error;
   }
   if (previous === current) return;
-  await purgeLocalFingerprints(target);
+  // `target` itself passed noLinks; rm removes links inside without following them.
+  await rm(target, { recursive: true, force: true });
+  await mkdir(target, { recursive: true, mode: 0o700 });
   await writeFile(marker, current, { mode: 0o600 });
 }
 
 /**
- * `checkout`: the worktree the build runs in; a slot last built from another checkout first drops
- * the fingerprints of its path packages (see CHECKOUT_MARKER).
+ * `checkout`: the worktree the build runs in; a slot last built from another checkout starts
+ * empty (see CHECKOUT_MARKER).
  * @param {{home:string, projectId:string, maxHeavyBuilds?:number, sccache?:boolean|'auto', env?:NodeJS.ProcessEnv,
  *   signal?:AbortSignal, checkout?:string}} options
  */
@@ -153,6 +106,7 @@ export async function withCargoSlot(
                 'CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER',
                 'CARGO_BUILD_TARGET_DIR',
                 'CARGO_TARGET_DIR',
+                'CARGO_BUILD_BUILD_DIR',
                 'CARGO_NET_OFFLINE',
                 'RUSTUP_AUTO_INSTALL',
               ].includes(key.toUpperCase()),
@@ -162,6 +116,9 @@ export async function withCargoSlot(
         const buildEnv = {
           ...inherited,
           CARGO_TARGET_DIR: target,
+          // A project's `build.build-dir` would keep intermediate artifacts (test binaries) outside
+          // the slot and its checkout guard; the environment overrides the config.
+          CARGO_BUILD_BUILD_DIR: target,
           CARGO_NET_OFFLINE: 'true',
           RUSTUP_AUTO_INSTALL: '0',
         };

@@ -143,44 +143,33 @@ test('separate Node processes cannot share a slot and a killed holder releases i
   }
 });
 
-test('A slot built from another checkout drops only the fingerprints of path packages', async t => {
+test('A slot built from another checkout starts empty; the same checkout keeps its state', async t => {
   const { mkdir: makeDir, readdir: list } = await import('node:fs/promises');
   const { base: home } = await fixture(t);
   const target = path.join(home, 'cargo-target', 'game', 'slot-1');
-  const unit = async (dir, file, local) => {
-    await makeDir(path.join(target, dir), { recursive: true });
-    await writeFile(path.join(target, dir, file), JSON.stringify({ local }));
-  };
+  // Fingerprints of a registry and a path package, a build-script output and a test binary.
   const seed = async () => {
-    await unit('debug/.fingerprint/voxa-mesh-0123456789abcdef', 'lib-voxa_mesh.json', [
-      { CheckDepInfo: { dep_info: 'lib-voxa_mesh' } },
-    ]);
-    // The build-script run of the same path package fingerprints RerunIfChanged, not dep-info.
-    await unit('debug/.fingerprint/voxa-mesh-fedcba9876543210', 'run-build-script-build-script-build.json', [
-      { RerunIfChanged: { output: 'x', paths: ['build.rs'] } },
-    ]);
-    await unit('debug/.fingerprint/serde-1111222233334444', 'lib-serde.json', [{ Precalculated: '1.0.0' }]);
-    await unit('x86_64-pc-windows-msvc/release/.fingerprint/voxa-io-aaaabbbbccccdddd', 'lib-voxa_io.json', [
-      { CheckDepInfo: {} },
-    ]);
+    for (const dir of ['debug/.fingerprint/serde-1111222233334444', 'debug/build/voxa-mesh-0123456789abcdef/out'])
+      await makeDir(path.join(target, dir), { recursive: true });
+    await writeFile(path.join(target, 'debug/build/voxa-mesh-0123456789abcdef/out/generated.rs'), 'A');
+    await writeFile(path.join(target, 'debug/api-0123456789abcdef.exe'), 'old test binary');
   };
-  const units = async () =>
-    [
-      ...(await list(path.join(target, 'debug/.fingerprint'))),
-      ...(await list(path.join(target, 'x86_64-pc-windows-msvc/release/.fingerprint'))),
-    ].sort();
-  const build = checkout => withCargoSlot({ home, projectId: 'game', checkout }, env => env.CARGO_TARGET_DIR);
+  const contents = async () => (await list(target)).filter(name => name !== '.kodo-checkout').sort();
+  const build = checkout =>
+    withCargoSlot({ home, projectId: 'game', checkout, env: { CARGO_BUILD_BUILD_DIR: 'outside' } }, env => env);
   await seed();
-  assert.equal(await build(path.join(home, 'a')), target);
-  assert.deepEqual(await units(), ['serde-1111222233334444'], 'a slot without a recorded checkout is cleaned');
+  const first = await build(path.join(home, 'a'));
+  assert.equal(first.CARGO_TARGET_DIR, target);
+  assert.equal(first.CARGO_BUILD_BUILD_DIR, target, "a project's build-dir cannot move artifacts out of the slot");
+  assert.deepEqual(await contents(), [], 'a slot without a recorded checkout starts empty');
   await seed();
   await build(path.join(home, 'a'));
-  assert.equal((await units()).length, 4, 'the same checkout keeps its incremental state');
+  assert.deepEqual(await contents(), ['debug'], 'the same checkout keeps its incremental state');
   await build(path.join(home, 'b'));
-  assert.deepEqual(await units(), ['serde-1111222233334444'], 'another checkout rebuilds the path packages');
+  assert.deepEqual(await contents(), [], 'another checkout gets an empty slot (no stale OUT_DIR or binary)');
   await seed();
   await build(undefined);
-  assert.equal((await units()).length, 4, 'a build without a checkout leaves the slot alone');
+  assert.deepEqual(await contents(), ['debug'], 'a build without a checkout leaves the slot alone');
 });
 
 test('Two checkouts of one workspace never share a stale library through the slot', { timeout: 300000 }, t =>
