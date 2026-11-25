@@ -1004,6 +1004,7 @@ async function runStep({ engine, run, step, headSha, env, cache, counting, signa
   await assertClean(run.cwd, headSha, 'Команда проверки изменила проверяемый commit или файлы', unrelatedCargoLinks);
   if (result.code !== 0) {
     const diagnostics = buildDiagnosticPack({
+      run,
       stdout: value.stdout,
       stderr: value.stderr,
       secrets: engine.secrets,

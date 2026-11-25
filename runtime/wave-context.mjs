@@ -8,7 +8,7 @@ import { createHash } from 'node:crypto';
 import { DEFAULT_API_CARD_MAX_BYTES, buildApiCards, createApiCardCache, unavailableApiCard } from './api-cards.mjs';
 import { buildContextManifest } from './context-manifest.mjs';
 import { measureContext, selectWaveVerifiedLessons } from './context-pack.mjs';
-import { portableDiagnostics } from './remote-brief-paths.mjs';
+import { portableDiagnostics, privateBriefRoots } from './remote-brief-paths.mjs';
 import { formatDiagnosticPack } from './diagnostic-pack.mjs';
 
 export { createApiCardCache };
@@ -60,7 +60,12 @@ export async function retryDiagnosticsFor({ ctx, snapshot, attempt, task, run, d
       : run;
   if (!usableDiagnostics(source?.lastDiagnostics)) return null;
   return diagnosticWorktrees
-    ? portableDiagnostics(source.lastDiagnostics, [...diagnosticWorktrees, source.cwd])
+    ? portableDiagnostics(
+        source.lastDiagnostics,
+        [...diagnosticWorktrees, source.cwd],
+        process.platform,
+        privateBriefRoots(run, storeOf(ctx).home),
+      )
     : source.lastDiagnostics;
 }
 

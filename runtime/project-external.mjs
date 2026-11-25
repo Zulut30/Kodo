@@ -19,9 +19,7 @@
  */
 import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
-import os from 'node:os';
-import { assertRemoteBriefPaths } from './remote-brief-paths.mjs';
-import { fileURLToPath } from 'node:url';
+import { assertRemoteBriefPaths, privateBriefRoots } from './remote-brief-paths.mjs';
 import { cleanupRemoteRefs, fetchSubmission, pushBase, remoteRefs, transport } from './project-remote-transport.mjs';
 import { portableDirectorTaskInput } from './project-contracts.mjs';
 import { isDeepStrictEqual } from 'node:util';
@@ -221,14 +219,7 @@ async function briefFor(state, attempt, task, run) {
     abandonCommand: `${dispatcher} project complete-task ${project.projectId} ${task.id} --head <SHA> --abandon --attempt ${attempt.id}`,
     ...extra,
   };
-  if (remote)
-    assertRemoteBriefPaths(brief, [
-      project.root,
-      storeOf(state.ctx).home,
-      path.dirname(run.worktreeRoot),
-      fileURLToPath(new URL('..', import.meta.url)),
-      os.homedir(),
-    ]);
+  if (remote) assertRemoteBriefPaths(brief, privateBriefRoots(run, storeOf(state.ctx).home));
   C.assertDirectorSafe(brief, options);
   return brief;
 }
@@ -252,9 +243,11 @@ async function installExternalRun(state, attempt, task) {
           const placement = placementFor(state, task, attempt.id);
           need(placement, 'pool_unavailable');
           value.runDraft.workerPlacement = placement;
-          if (placement.machine.kind !== 'local')
+          if (placement.machine.kind !== 'local') {
+            value.runDraft.remoteIntegrationWorktree = integration.worktree;
             value.runDraft.transportRemote =
               state.profile.machines.find(m => m.id === placement.machine.id)?.gitRemote ?? 'origin';
+          }
         }
         value.runDraft.executor = { kind: 'external', host };
         value.runDraft.verificationProfile = 'task-fast';

@@ -301,6 +301,89 @@ function assertNoLocalPath(brief, paths) {
   }
 }
 
+test('round4 T1 long TypeError stays actionable before trimming on replay and retry', async t => {
+  const f = await remoteFixture(t);
+  const [brief] = (await f.pull()).briefs;
+  f.checkout(brief);
+  const head = await commit(f.clone, {
+    'src/t0.mjs':
+      "export const t0 = { valueOf() { throw new TypeError('detail '.repeat(31) + '(' + import.meta.url + ')'); } };\n",
+  });
+  git(f.clone, 'push', 'origin', 'HEAD:' + brief.workRef);
+  assert.equal((await f.complete(brief, head)).status, 'checks_failed');
+  const failed = f.store.getRun(brief.runId);
+  assert.ok(failed.lastDiagnostics.items.some(item => item.message.includes('detail (src/t0.mjs)')));
+  // Simulate a pack persisted by an older Kodo which cut through this Run's directory name.
+  const legacy = structuredClone(failed.lastDiagnostics);
+  const partial = failed.cwd.slice(0, failed.cwd.indexOf(failed.id) + 8);
+  legacy.items.push({ ...legacy.items[0], message: 'older stack (' + partial + '\u2026)' });
+  f.store.updateRun(brief.runId, { lastDiagnostics: legacy });
+  const check = pull => {
+    assert.equal(pull.briefs.length, 1, JSON.stringify(pull.blocked));
+    const [row] = pull.briefs;
+    assert.ok(row.prompt.includes('older stack (<local-path>)'));
+    assert.match(row.prompt, /detail \(src\/t0\.mjs\)/);
+    assert.ok(row.diagnostics.items.some(item => item.message.includes('detail (src/t0.mjs)')));
+    assertNoLocalPath(row, [f.store.getRun(brief.runId).cwd, f.home, os.homedir()]);
+    return row;
+  };
+  check(await f.pull());
+  assert.equal((await f.complete(brief, head, { abandon: true, deferGate: false })).status, 'abandoned');
+  assert.notEqual(
+    check(await nextWave(f.ctx, { projectId: f.projectId, host: 't3', ports: f.ports, retryFailed: true })).attemptId,
+    brief.attemptId,
+  );
+});
+
+test('round4 T1 masks stored local paths and truncated checkout prefixes in diagnostics only', async () => {
+  const { portableDiagnostics, assertRemoteBriefPaths } = await import('../runtime/remote-brief-paths.mjs');
+  const cwd = 'C:/Users/worker/state-worktrees/31f76caf-3333/integration';
+  const roots = ['C:/Users/worker', 'D:/private/state'];
+  const pack = {
+    items: [
+      {
+        message: 'at (file:///c:/Users/worker/state-worktrees/31f76caf-33\u2026)',
+        file: 'D:/private/state/errors/log',
+      },
+      { message: 'before home (file:///C:/Us\u2026)', file: cwd + '/src/ok.mjs' },
+    ],
+  };
+  const result = portableDiagnostics(pack, [cwd], 'win32', roots);
+  assert.deepEqual(result.items, [
+    { message: 'at (<local-path>)', file: '<local-path>' },
+    { message: 'before home (<local-path>)', file: 'src/ok.mjs' },
+  ]);
+  assert.throws(
+    () => assertRemoteBriefPaths({ prompt: 'outside diagnostics: D:/private/state/errors/log' }, roots, 'win32'),
+    { code: 'project_brief_path_leak' },
+  );
+});
+
+test('round4 T2 recognizes decorated local paths and skips short roots and relative paths', async () => {
+  const { assertRemoteBriefPaths } = await import('../runtime/remote-brief-paths.mjs');
+  const roots = ['/home/worker', '/'];
+  for (const text of [
+    '**/home/worker/state**',
+    '\x1b[31m/home/worker/state\x1b[0m',
+    'x|/home/worker/state',
+    'x>/home/worker/state',
+    'x@/home/worker/state',
+  ])
+    assert.throws(() => assertRemoteBriefPaths({ prompt: text }, roots, 'linux'), { code: 'project_brief_path_leak' });
+  assert.throws(
+    () => assertRemoteBriefPaths({ prompt: '\u00abC:\\Users\\worker\\state\u00bb' }, ['C:\\Users\\worker'], 'win32'),
+    { code: 'project_brief_path_leak' },
+  );
+  assert.doesNotThrow(() =>
+    assertRemoteBriefPaths(
+      { prompt: 'root /; app/root.tsx; src/home/worker/file; https://site/home/worker/file' },
+      roots,
+      'linux',
+    ),
+  );
+  assert.doesNotThrow(() => assertRemoteBriefPaths({ prompt: 'volume C:\\' }, ['C:\\'], 'win32'));
+});
+
 test('round3 N1 remote pull and retry receive portable task-fast diagnostics from the failing worktree', async t => {
   const f = await remoteFixture(t);
   const [brief] = (await f.pull()).briefs;
@@ -311,7 +394,7 @@ test('round3 N1 remote pull and retry receive portable task-fast diagnostics fro
   git(f.clone, 'push', 'origin', 'HEAD:' + brief.workRef);
   assert.equal((await f.complete(brief, head)).status, 'checks_failed');
   const failed = f.store.getRun(brief.runId);
-  assert.ok(JSON.stringify(failed.lastDiagnostics).includes(failed.id), JSON.stringify(failed.lastDiagnostics));
+  assert.match(JSON.stringify(failed.lastDiagnostics), /src\/t0\.mjs/);
   const check = pull => {
     assert.equal(pull.briefs.length, 1, JSON.stringify(pull.blocked));
     const [row] = pull.briefs;

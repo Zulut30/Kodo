@@ -7,6 +7,7 @@
  * Output items carry `{ file, line, column, code, level, message, failingTests[] }`.
  * No model calls, no network, secrets redacted before serialization.
  */
+import { portableDiagnostics } from './remote-brief-paths.mjs';
 import { redact } from './security.mjs';
 
 export const DEFAULT_MAX_DIAGNOSTICS = 25;
@@ -575,6 +576,7 @@ function packDiagnostics({ items, failingTests, maxItems, maxBytes }) {
  *   review?: any,
  *   error?: any,
  *   secrets?: Record<string, any>,
+ *   run?: any,
  *   maxItems?: number,
  *   maxBytes?: number,
  * }} [input]
@@ -645,10 +647,17 @@ export function buildDiagnosticPack(input = {}) {
   });
   rawItems.push(...gateItems);
 
-  const items = deduplicateItems(rawItems, secrets);
+  // Keep the source location while the complete parser output is still available.
+  // Both item-level trimming and the overall byte budget are applied afterwards.
+  const run = input.run;
+  const parsed = { items: rawItems, failingTests: rawFailingTests };
+  const data = ['t3-env', 'ssh'].includes(run?.workerPlacement?.machine?.kind)
+    ? portableDiagnostics(parsed, [run.cwd, run.remoteIntegrationWorktree])
+    : parsed;
+  const items = deduplicateItems(data.items, secrets);
   const failingTests = [
     ...new Set(
-      [...rawFailingTests, ...items.flatMap(item => item.failingTests)]
+      [...data.failingTests, ...items.flatMap(item => item.failingTests)]
         .map(name => redact(String(name), secrets).trim())
         .filter(Boolean),
     ),

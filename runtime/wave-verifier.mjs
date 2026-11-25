@@ -611,6 +611,7 @@ export async function verifyTaskFastOnce({
       )
         throw error;
       const diagnostics = buildDiagnosticPack({
+        run,
         checks: run.checks,
         behavior: run.behavior,
         error,
