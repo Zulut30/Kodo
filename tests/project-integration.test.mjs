@@ -15,6 +15,7 @@ import {
   ensureIntegration,
   waveFrontier,
   mergeTask,
+  inspectHistory,
   mergeBackGate,
   gateRepairInScope,
 } from '../runtime/project-integration.mjs';
@@ -691,4 +692,109 @@ test('A changed name that begins with U+FEFF is kept whole: NUL-separated names 
   assert.deepEqual(files, ['﻿ordinary.txt']);
   // A scope for the trimmed name does not own the real file.
   assert.equal(ownsPath(['ordinary.txt'], files[0]), false);
+});
+test('Cargo.lock conflict regenerates offline before publishing, mixed and invalid merges stay unpublished', async t => {
+  try {
+    await execute('cargo', ['--version']);
+  } catch {
+    return t.skip('cargo --version unavailable');
+  }
+  const oldRustup = process.env.RUSTUP_HOME;
+  process.env.RUSTUP_HOME ??= path.join(os.homedir(), '.rustup');
+  t.after(() => {
+    if (oldRustup === undefined) delete process.env.RUSTUP_HOME;
+  });
+  const f = await fixture(t);
+  const manifest = name => `[package]\nname = "${name}"\nversion = "0.1.0"\nedition = "2021"\n`;
+  const deps = name => manifest(name) + '[dependencies]\nc = { path = "../c" }\n';
+  const lock = (comment, dependent) =>
+    '# ' +
+    comment +
+    '\nversion = 4\n' +
+    ['a', 'b', 'c']
+      .map(
+        name =>
+          `\n[[package]]\nname = "${name}"\nversion = "0.1.0"\n` +
+          (name === dependent ? 'dependencies = [\n "c",\n]\n' : ''),
+      )
+      .join('');
+  const files = { 'Cargo.toml': '[workspace]\nmembers = ["crates/*"]\nresolver = "2"\n', 'Cargo.lock': lock('base') };
+  for (const name of ['a', 'b', 'c']) {
+    files['crates/' + name + '/Cargo.toml'] = manifest(name);
+    files['crates/' + name + '/src/lib.rs'] = '';
+  }
+  const base = await f.taskHead('workspace', (await f.user()).head, files);
+  const { worktree } = await ensureIntegration({ root: f.root, projectId, worktreeHome: f.worktreeHome });
+  const merge = (taskId, taskHead, writePaths) =>
+    mergeTask({ worktree, taskId, taskHead, writePaths, savePending: () => {} });
+  await merge('setup', base, Object.keys(files));
+  const a = await f.taskHead('left', base, {
+    'Cargo.lock': lock('left', 'a'),
+    'crates/a/Cargo.toml': deps('a'),
+    'crates/c/src/lib.rs': '// left',
+  });
+  const first = await merge('left', a, ['crates/a', 'crates/c/src/lib.rs']);
+  const rightFiles = { 'Cargo.lock': lock('right', 'b'), 'crates/b/Cargo.toml': deps('b') };
+  for (const [id, extra, reason] of [
+    ['mixed', { 'crates/c/src/lib.rs': '// right' }, undefined],
+    ['invalid', { 'crates/b/Cargo.toml': '[' }, 'cargo_lock_unresolved'],
+  ]) {
+    const head = await f.taskHead(id, base, { ...rightFiles, ...extra });
+    await assert.rejects(
+      merge(id, head, ['crates/b', 'crates/c/src/lib.rs']),
+      err => err.code === 'project_integration_conflict' && err.reason === reason,
+    );
+    assert.equal(await git(worktree, ['rev-parse', 'HEAD']), first.mergeCommit);
+  }
+  const forged = await f.taskHead('forged', base, {
+    'Cargo.lock': lock('bump', 'b').replace('0.1.0', '0.2.0'),
+    'crates/b/Cargo.toml': deps('b'),
+  });
+  const forgedTree = await git(f.root, ['rev-parse', forged + '^{tree}']);
+  const trailer = await git(f.root, [
+    'commit-tree',
+    forgedTree,
+    '-p',
+    base,
+    '-m',
+    'Task',
+    '-m',
+    'Kodo-Lock-Regenerated: Cargo.lock',
+  ]);
+  const history = (head, writePaths) => inspectHistory({ cwd: f.root, base, head, writePaths });
+  assert.equal((await history(trailer, ['crates/b'])).kind, 'cargo_lock_version_change');
+  assert.equal(await history(trailer, ['Cargo.lock', 'crates/b']), null);
+  const alone = await f.taskHead('alone', base, { 'Cargo.lock': lock('alone', 'a') });
+  assert.equal((await history(alone, ['crates/a'])).kind, 'scope');
+  await assert.rejects(merge('forged', trailer, ['crates/b']), error => error.reason === 'cargo_lock_version_change');
+  await assert.rejects(merge('alone', alone, ['crates/a']), error =>
+    ['project_integration_scope', 'project_integration_history'].includes(error.code),
+  );
+  const right = await f.taskHead('right', base, rightFiles);
+  const { EngineExecution } = await import('../runtime/engine-execution.mjs');
+  const scopes = ['crates/b'];
+  const changed = await EngineExecution.prototype.checkScope.call(
+    { secrets: {} },
+    path.join(f.directory, 'tasks', 'right'),
+    base,
+    scopes,
+    scopes,
+  );
+  assert.deepEqual(changed.sort(), ['Cargo.lock', 'crates/b/Cargo.toml']);
+  const merged = await merge('right', right, scopes);
+  assert.match(await git(worktree, ['log', '-1', '--format=%B']), /Kodo-Lock-Regenerated: Cargo.lock/);
+  await execute('cargo', ['metadata', '--locked', '--offline', '--format-version', '1'], { cwd: worktree });
+  const withoutTrailer = await git(worktree, [
+    'commit-tree',
+    merged.mergeCommit + '^{tree}',
+    '-p',
+    first.mergeCommit,
+    '-p',
+    right,
+    '-m',
+    'Recovered merge',
+  ]);
+  await git(worktree, ['reset', '--hard', withoutTrailer]);
+  await assert.rejects(merge('right', right, scopes), error => error.code === 'project_integration_scope');
+  assert.equal(await git(worktree, ['rev-parse', 'HEAD']), first.mergeCommit);
 });

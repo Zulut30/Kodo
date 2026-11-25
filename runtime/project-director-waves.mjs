@@ -400,7 +400,7 @@ export function releasePending(store, runId, headSha, code) {
 
 // Merge the task head once; a recorded or recovered merge is never repeated. A recorded merge
 // that left the branch is `project_integration_missing`, never a replayed success.
-async function mergeRun(ctx, snapshot, task, run) {
+async function mergeRun(ctx, snapshot, task, run, signal) {
   if (run.integration?.status === 'merged' && run.integration.mergedHead === run.headSha)
     return (await recordedMergePresent(snapshot, run))
       ? run.integration
@@ -408,6 +408,7 @@ async function mergeRun(ctx, snapshot, task, run) {
   const { branch, worktree } = await integrationOf(ctx, snapshot);
   try {
     const merged = await mergeTask({
+      signal,
       worktree,
       taskId: task.id,
       taskHead: run.headSha,
@@ -452,10 +453,9 @@ async function mergeRun(ctx, snapshot, task, run) {
       throw error;
     }
     if (!integrationFailures.includes(error?.code)) throw error;
-    ctx.store.updateRun(run.id, {
-      integration: { branch, before: run.integration?.before ?? null, status: 'failed', code: error.code },
-    });
-    return { status: 'failed', code: error.code };
+    const failure = { status: 'failed', code: error.code, ...(error.reason ? { reason: error.reason } : {}) };
+    ctx.store.updateRun(run.id, { integration: { branch, before: run.integration?.before ?? null, ...failure } });
+    return failure;
   }
 }
 
@@ -562,14 +562,14 @@ export async function integrateAndAdvance(ctx, { projectId, taskId, run, signal 
       return blocked('wave_fast_proof_missing');
     // The task verified under the policy of its base; its head may change it only in its write paths.
     const policy = await taskPolicy(ctx, stored, task);
-    const merged = policy ? { status: 'failed', code: policy } : await mergeRun(ctx, snapshot, task, stored);
+    const merged = policy ? { status: 'failed', code: policy } : await mergeRun(ctx, snapshot, task, stored, signal);
     if (merged.status !== 'merged') {
       // The result cannot be integrated; an explicit retry starts from the current frontier.
       snapshot = await snapshotOf(ctx, projectId);
       const current = currentOf(snapshot, taskId);
       if (!retryStates.includes(current.status) && !reached(current.status, 'integrated'))
         await ctx.repo.apply(commandFor(snapshot, transitionAction('attempt', current.id, 'blocked')));
-      return blocked(merged.code);
+      return { ...(await blocked(merged.code)), ...(merged.reason ? { reason: merged.reason } : {}) };
     }
     stored = ctx.store.getRun(stored.id);
     const stop = await advanceTask(ctx, projectId, stored.id, await persistRefs(ctx, stored, taskKinds));
