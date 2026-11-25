@@ -234,6 +234,67 @@ test('A submission takes the build slot of the machine its profile placement nam
   assert.deepEqual(seen, [2]);
 });
 
+// Lease names of machine-build requests made while `work` runs.
+async function buildLeases(f, work) {
+  const requested = [];
+  const acquire = f.store.acquireLease.bind(f.store);
+  f.store.acquireLease = (name, owner, options) => {
+    if (name.startsWith('machine-build:')) requested.push([name, options?.limit]);
+    return acquire(name, owner, options);
+  };
+  try {
+    await work();
+  } finally {
+    f.store.acquireLease = acquire;
+  }
+  return requested;
+}
+
+test('A profile machine id the build semaphore cannot name still gets one stable slot', async t => {
+  const f = await fixture(t, { count: 1 });
+  const id = 'team/pc-' + 'x'.repeat(70);
+  f.repo.setProfile(f.projectId, {
+    subscriptions: [{ id: 'a', slots: 1, provider: 'codex', model: 'gpt', tier: 'fast' }],
+    machines: [{ id, kind: 'local', maxWorkers: 2, maxHeavyBuilds: 2 }],
+  });
+  const [brief] = (await f.briefs()).values();
+  assert.equal(brief.machine?.id, id);
+  let result;
+  const requested = await buildLeases(f, async () => {
+    result = await f.complete(brief, await f.change(brief));
+  });
+  assert.equal(result.status, 'integrated', JSON.stringify(result));
+  assert.equal(requested.length, 1);
+  assert.match(requested[0][0], /^machine-build:m-[0-9a-f]{24}$/);
+  assert.equal(requested[0][1], 2);
+});
+
+test('Until remote builds (16A), a remote placement verifies in the slot of this PC', async t => {
+  const f = await fixture(t, { count: 2 });
+  f.repo.setProfile(f.projectId, {
+    subscriptions: [{ id: 'a', slots: 2, provider: 'codex', model: 'gpt', tier: 'fast' }],
+    machines: [
+      { id: 'remote', kind: 'ssh', maxWorkers: 1, maxHeavyBuilds: 1 },
+      { id: 'pc', kind: 'local', maxWorkers: 1, maxHeavyBuilds: 1 },
+    ],
+  });
+  const briefs = [...(await f.briefs()).values()];
+  assert.deepEqual(briefs.map(brief => brief.machine?.id).sort(), ['pc', 'remote']);
+  const results = [];
+  const requested = await buildLeases(f, async () => {
+    for (const brief of briefs) results.push(await f.complete(brief, await f.change(brief)));
+  });
+  assert.deepEqual(
+    results.map(row => row.status),
+    ['integrated', 'integrated'],
+    JSON.stringify(results),
+  );
+  assert.deepEqual(requested, [
+    ['machine-build:pc', 1],
+    ['machine-build:pc', 1],
+  ]);
+});
+
 test('One build slot serializes task-fast across concurrent completions', async t => {
   const f = await fixture(t, { count: 2 });
   const briefs = await f.briefs();

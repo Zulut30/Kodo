@@ -17,7 +17,7 @@
  * `integrateAndAdvance`, `runPendingGates`), by default from
  * `project-director-waves.mjs`. Kodo never starts or archives the host's chats.
  */
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { stat } from 'node:fs/promises';
 import { execute } from './command.mjs';
@@ -1001,15 +1001,26 @@ async function verificationState(ctx, C, input, attemptId, runId) {
   return ['running', 'verifying'].includes(attempt.status) ? 'go' : 'stale';
 }
 
-// The build slot of a submission: an explicit `input.machine` (library callers), else the machine
-// the profile placed the attempt on (15A `workerPlacement`) with that machine's current
-// `maxHeavyBuilds` (1 when the profile no longer lists it), else this machine's default slot.
+// A profile machine id as a build-semaphore id: profile ids may hold `/` and run to 128
+// characters, the semaphore takes `[a-z0-9._-]{1,64}`; others get a stable digest.
+const buildSlotId = id =>
+  /^[a-z0-9][a-z0-9._-]{0,63}$/i.test(id) ? id : `m-${createHash('sha256').update(id).digest('hex').slice(0, 24)}`;
+
+// The build slot of a submission: an explicit `input.machine` (library callers); else, for an
+// attempt the profile placed (15A `workerPlacement`), the slot of the PC that runs task-fast. In
+// 1.1.0 that is always this PC (remote builds come with 16A): a local placement keeps its machine
+// and current `maxHeavyBuilds` (1 when the profile no longer lists it); a t3-env/ssh placement uses
+// the profile's local machine, else this PC's default slot.
 function submissionMachine(ctx, projectId, run, input) {
   if (input.machine) return input.machine;
-  const id = run.workerPlacement?.machine?.id;
-  if (typeof id !== 'string') return undefined;
-  const host = ctx.repo.getProfile?.(projectId)?.machines?.find(row => row.id === id);
-  return { id, maxHeavyBuilds: host?.maxHeavyBuilds ?? 1 };
+  const placed = run.workerPlacement?.machine;
+  if (typeof placed?.id !== 'string') return undefined;
+  const machines = ctx.repo.getProfile?.(projectId)?.machines ?? [];
+  const host =
+    placed.kind === 'local'
+      ? (machines.find(row => row.id === placed.id) ?? { id: placed.id, maxHeavyBuilds: 1 })
+      : machines.find(row => row.kind === 'local');
+  return host ? { id: buildSlotId(host.id), maxHeavyBuilds: host.maxHeavyBuilds ?? 1 } : undefined;
 }
 
 // Verify the submitted head once. One verification per Run at a time (`project-verify:<runId>`,
