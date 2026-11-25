@@ -17,6 +17,8 @@ import { scopesOverlap } from './contracts.mjs';
 import { inside } from './toolchains.mjs';
 
 export const BLUEPRINT_DIR = '.kodo/blueprint';
+export const MAX_MILESTONE_TASKS = 80;
+export const MAX_PROJECT_TASKS = 400;
 export const MAX_TASK_INPUT_BYTES = 12000;
 export const MAX_TASK_WRITE_PATHS = 24;
 export const MAX_TASK_MODULES = 3;
@@ -1345,6 +1347,17 @@ function analyzeFactorySpec(spec, options = {}) {
   const base = normalizeFactory(spec, { contracts, knownValues });
   const findings = [...base.findings, ...sectionFindings(projectMarkdown)];
   if (!base.spec) return { spec: null, findings };
+  if (base.spec.tasks.length > MAX_PROJECT_TASKS)
+    findings.push(finding('project_task_count', 'Проект содержит больше 400 задач'));
+  const parents = new Map(base.spec.epics.map(epic => [epic.id, epic.milestoneId]));
+  const counts = new Map();
+  for (const task of base.spec.tasks) {
+    const milestone = parents.get(task.epicId);
+    counts.set(milestone, (counts.get(milestone) ?? 0) + 1);
+  }
+  for (const [id, count] of counts)
+    if (count > MAX_MILESTONE_TASKS)
+      findings.push(finding('milestone_task_count', 'В майлстоуне ' + id + ' больше 80 задач'));
   const ancestors = taskAncestors(base.spec.tasks);
   const pairs = parallelOverlaps(base.spec.tasks, { ancestors });
   const inputFindings = taskInputFindings({

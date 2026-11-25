@@ -466,7 +466,7 @@ test('next-wave checks the CLI against known values before the lease and guards 
   await nextWave({ ...f.ctx, contracts: C }, { ...input, cli });
   assert.equal(calls[0], cli, 'the prefix is checked first');
   assert.ok(calls.indexOf('lease') > 0);
-  assert.equal(calls.at(-1), 'blocked,briefs,cli,projectId,revision', 'the whole result is guarded');
+  assert.equal(calls.at(-1), 'blocked,briefs,cli,projectId,revision,watch', 'the whole result is guarded');
   // A prefix carrying a known secret value is refused before the lease.
   calls.length = 0;
   const secrets = f.engine.secrets;
@@ -844,6 +844,7 @@ test('next-wave names a pending epic gate and answers an accepted project with i
     revision: real(f.projectId).revision,
     cli: 'kodo',
     code: 'project_accepted',
+    watch: [],
     briefs: [],
     blocked: [],
   });
@@ -1458,4 +1459,43 @@ test('complete-task reports cargo_fetch_failed as an environment block for the s
   assert.equal(result.code, 'cargo_fetch_failed');
   assert.equal(result.status, 'blocked');
   assert.match(result.message, /fetch unavailable/);
+});
+
+test('integration conflict schedules two bounded retries with the previous diff', async t => {
+  const f = await fixture(t);
+  f.ports.integrateAndAdvance = async () => ({ status: 'blocked', code: 'project_integration_conflict' });
+  let a = brief(await f.wave({ limit: 1 }), 'task-a');
+  for (let i = 0; i < 3; i++) {
+    const head = await commit(a.worktree, { 'src/a.mjs': 'export const a = 42;\n' });
+    const done = await f.complete(a.taskId, head, { attemptId: a.attemptId });
+    if (i === 2) {
+      assert.equal(done.status, 'blocked');
+      assert.equal(done.retry, undefined);
+    } else {
+      assert.deepEqual(done.retry, { scheduled: true, remaining: 1 - i });
+      const fresh = brief(await f.wave({ limit: 1 }), a.taskId);
+      assert.equal(fresh.previousAttempt.attemptId, a.attemptId);
+      assert.match(fresh.previousAttempt.diff, /export const a = 42/);
+      const replay = await f.complete(a.taskId, head, { attemptId: a.attemptId });
+      assert.deepEqual(replay.retry, done.retry);
+      assert.equal(replay.status, 'abandoned');
+      a = fresh;
+    }
+  }
+});
+
+test('watch reports stalls, repeated submissions and dirty scope', async t => {
+  const f = await fixture(t);
+  const a = brief(await f.wave({ limit: 1 }), 'task-a');
+  f.ctx.clock = () => new Date(Date.now() + 3600000).toISOString();
+  const codes = async () =>
+    (await f.wave({ limit: 1 })).watch.filter(row => row.taskId === a.taskId).map(row => row.code);
+  assert.deepEqual(await codes(), ['worker_no_progress']);
+  await writeFile(path.join(a.worktree, 'src/a.mjs'), 'updated');
+  assert.deepEqual(await codes(), []);
+  await writeFile(path.join(a.worktree, 'outside'), 'outside');
+  assert.deepEqual(await codes(), ['worker_scope_violation']);
+  await f.complete(a.taskId, a.baseSha);
+  await f.complete(a.taskId, a.baseSha);
+  assert.ok((await codes()).includes('worker_repeated_failure'));
 });

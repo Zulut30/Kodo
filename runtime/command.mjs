@@ -100,6 +100,7 @@ function stoppedOutput(text, secrets) {
  * @property {number} [timeoutMs]
  * @property {boolean} [allowFailure] Resolve instead of reject on a non-zero exit code.
  * @property {Record<string, string>} [secrets] Values redacted from output and errors.
+ * @property {number} [stdoutPrefixBytes] Retain a redacted UTF-8 prefix while draining remaining stdout.
  * @property {boolean} [rawOutput] Resolve with unredacted stdout/stderr.
  */
 
@@ -131,6 +132,7 @@ export async function execute(
     allowFailure = false,
     secrets = {},
     rawOutput = false,
+    stdoutPrefixBytes,
   } = {},
 ) {
   if (/(?:^|[\\/])git(?:\.exe)?$/i.test(command)) ({ args, env } = gitBoundary(args, env));
@@ -167,7 +169,23 @@ export async function execute(
     const aborted = () => stop('cancelled');
     signal?.addEventListener('abort', aborted, { once: true });
     if (signal?.aborted) aborted();
+    let prefixBytes = 0,
+      prefixClipped = false;
     child.stdout.on('data', data => {
+      if (stdoutPrefixBytes !== undefined) {
+        if (prefixClipped) return;
+        const bytes = Buffer.from(data);
+        const remaining = stdoutPrefixBytes - prefixBytes;
+        if (bytes.length > remaining) {
+          stdout += bytes
+            .subarray(0, remaining)
+            .toString('utf8')
+            .replace(/\uFFFD$/, '');
+          prefixClipped = true;
+        } else stdout += data;
+        prefixBytes += bytes.length;
+        return;
+      }
       const remaining = 16 * 1024 * 1024 - stdout.length;
       stdout += data.slice(0, remaining);
       if (data.length > remaining) {
@@ -205,7 +223,11 @@ export async function execute(
         reject(stopCause);
         return;
       }
-      const clean = { stdout: redact(stdout, secrets), stderr: redact(stderr, secrets), code };
+      const clean = {
+        stdout: prefixClipped ? stoppedOutput(stdout, secrets) : redact(stdout, secrets),
+        stderr: redact(stderr, secrets),
+        code,
+      };
       const result = rawOutput ? { stdout, stderr, code } : clean;
       if (code && !allowFailure)
         reject(
