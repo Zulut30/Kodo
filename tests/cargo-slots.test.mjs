@@ -184,7 +184,17 @@ test('A slot built from another checkout drops only the fingerprints of path pac
 });
 
 test('Two checkouts of one workspace never share a stale library through the slot', { timeout: 300000 }, async t => {
-  const { execFileSync, spawnSync } = await import('node:child_process');
+  try {
+    await staleLibraryScenario(t);
+  } catch (error) {
+    // CI keeps only the tail of stderr: an unexpected failure prints its stack there.
+    console.error(`cargo-slots stale-library failure: ${error?.stack ?? error}`);
+    throw error;
+  }
+});
+
+async function staleLibraryScenario(t) {
+  const { spawnSync } = await import('node:child_process');
   const { mkdir: makeDir, utimes } = await import('node:fs/promises');
   if (spawnSync('cargo', ['--version'], { windowsHide: true }).status !== 0) return t.skip('cargo is not installed');
   const { base: home } = await fixture(t);
@@ -216,9 +226,13 @@ test('Two checkouts of one workspace never share a stale library through the slo
       const result = spawnSync('cargo', ['test', '--offline'], { cwd, env, encoding: 'utf8', windowsHide: true });
       return { status: result.status, output: result.stdout + result.stderr };
     });
-  execFileSync('cargo', ['generate-lockfile', '--offline'], { cwd: older, windowsHide: true });
-  execFileSync('cargo', ['generate-lockfile', '--offline'], { cwd: newer, windowsHide: true });
-  // A host whose Cargo cannot compile and link at all (no toolchain or linker) is not this test's subject.
+  // A host whose Cargo cannot lock, compile and link at all (no toolchain or linker) is not this
+  // test's subject: it is skipped with Cargo's own words.
+  for (const cwd of [older, newer]) {
+    const locked = spawnSync('cargo', ['generate-lockfile', '--offline'], { cwd, encoding: 'utf8', windowsHide: true });
+    if (locked.status !== 0)
+      return t.skip(`cargo cannot lock here: ${`${locked.error ?? ''}${locked.stderr ?? ''}`.slice(-400)}`);
+  }
   const baseline = await cargoTest(older, older);
   if (baseline.status !== 0) return t.skip(`cargo cannot build here: ${baseline.output.slice(-400)}`);
   const verified = await cargoTest(newer, newer);
@@ -226,4 +240,4 @@ test('Two checkouts of one workspace never share a stale library through the slo
   if (verified.status !== 0) console.error(`cargo-slots stale-library output:\n${verified.output.slice(-1500)}`);
   assert.equal(verified.status, 0, verified.output);
   assert.match(verified.output, /test b \.\.\. ok/);
-});
+}
