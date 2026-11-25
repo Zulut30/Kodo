@@ -162,14 +162,16 @@ test('blueprint linter rejects task without unambiguous owner, shared-file wave 
       title: 'Wire workspace manifests',
       owner: 'integrator',
       dependsOn: ['storage-module', 'api-module', 'web-module'],
+      // Seven shared integration files across modules; fewer than three Rust crates, so the
+      // Wave 0 contract-crate rule of 15E1 (>= 3 crates) is not what this case checks.
       writePaths: [
         'Cargo.toml',
         'package.json',
-        'src/main.rs',
+        'src/index.js',
         'crates/a/Cargo.toml',
         'crates/b/Cargo.toml',
-        'crates/c/Cargo.toml',
-        'crates/d/Cargo.toml',
+        'packages/c/package.json',
+        'packages/d/package.json',
       ],
     };
     spec.tasks.push(wiring);

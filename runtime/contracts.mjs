@@ -126,9 +126,13 @@ export function validatePlan(plan) {
   }
   return plan;
 }
+// `./x` names the same path as `x`, as in ownsPath (validatePlan accepts both spellings).
+const withoutDot = scope => scope.replace(/^\.\//, '');
 export function scopesOverlap(left, right) {
-  return left.some(a =>
-    right.some(b => {
+  return left.some(rawA =>
+    right.some(rawB => {
+      const a = withoutDot(rawA),
+        b = withoutDot(rawB);
       const ap = a.split(/[*?[{]/)[0].replace(/\/$/, ''),
         bp = b.split(/[*?[{]/)[0].replace(/\/$/, '');
       return (

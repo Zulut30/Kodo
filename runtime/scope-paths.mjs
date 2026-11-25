@@ -7,8 +7,9 @@ import path from 'node:path';
  * @param {string} name
  */
 export function ownsPath(scopes, name) {
-  return scopes.some(
-    scope =>
-      path.posix.matchesGlob(name, scope) || name === scope || name.startsWith(scope.replace(/\/\*\*$/, '') + '/'),
-  );
+  return scopes.some(value => {
+    // `./x` names the same path as `x` (validatePlan accepts both spellings).
+    const scope = value.replace(/^\.\//, '');
+    return path.posix.matchesGlob(name, scope) || name === scope || name.startsWith(scope.replace(/\/\*\*$/, '') + '/');
+  });
 }

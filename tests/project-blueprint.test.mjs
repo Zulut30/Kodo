@@ -607,3 +607,20 @@ test('an empty epic or milestone of the blueprint is reported before apply-spec'
   const lint = lintFactorySpec(result.spec, { interfaces: result.interfaces, projectMarkdown: markdown });
   assert.deepEqual(codes(lint), ['blueprint_container_empty']);
 });
+test('separate Cargo manifests can share a wave and two explicit Cargo.lock owners overlap', async t => {
+  for (const owners of [0, 1, 2]) {
+    const { root } = await blueprint(t, {
+      mutate(spec) {
+        for (const [index, id] of ['storage-module', 'api-module'].entries()) {
+          const current = task(spec, id);
+          current.writePaths = ['crates/' + id + '/Cargo.toml'];
+          if (index < owners) {
+            current.owner = 'integrator';
+            current.writePaths.push('Cargo.lock');
+          }
+        }
+      },
+    });
+    assert.deepEqual(codes(await compileBlueprint(root)), owners === 2 ? ['integrator_required'] : []);
+  }
+});

@@ -684,6 +684,7 @@ const problem = (code, error, secrets = {}) => ({
 
 const historyCodes = {
   scope: 'external_scope',
+  cargo_lock_version_change: 'external_scope',
   secret_path: 'external_scope',
   special: 'external_symlink',
   secret: 'external_unsafe_change',
@@ -742,7 +743,7 @@ async function inspectSubmission(engine, run, task, head) {
   if (history) return history;
   if ((await specialEntries(run.project, run.baseSha, head)).length) return problem('external_symlink');
   try {
-    await engine.checkScope(run.cwd, run.baseSha, task.writePaths);
+    await engine.checkScope(run.cwd, run.baseSha, task.writePaths, task.writePaths);
   } catch (error) {
     return problem(
       error.code === 'scope_conflict' ? 'external_scope' : 'external_unsafe_change',

@@ -15,6 +15,7 @@ import {
   ensureIntegration,
   waveFrontier,
   mergeTask,
+  inspectHistory,
   mergeBackGate,
   gateRepairInScope,
 } from '../runtime/project-integration.mjs';
@@ -691,4 +692,285 @@ test('A changed name that begins with U+FEFF is kept whole: NUL-separated names 
   assert.deepEqual(files, ['﻿ordinary.txt']);
   // A scope for the trimmed name does not own the real file.
   assert.equal(ownsPath(['ordinary.txt'], files[0]), false);
+});
+test('Cargo.lock conflict regenerates offline before publishing, mixed and invalid merges stay unpublished', async t => {
+  try {
+    await execute('cargo', ['--version']);
+  } catch {
+    return t.skip('cargo --version unavailable');
+  }
+  const oldRustup = process.env.RUSTUP_HOME;
+  process.env.RUSTUP_HOME ??= path.join(os.homedir(), '.rustup');
+  t.after(() => {
+    if (oldRustup === undefined) delete process.env.RUSTUP_HOME;
+  });
+  const f = await fixture(t);
+  const manifest = name => `[package]\nname = "${name}"\nversion = "0.1.0"\nedition = "2021"\n`;
+  const deps = name => manifest(name) + '[dependencies]\nc = { path = "../c" }\n';
+  const lock = (comment, dependent) =>
+    '# ' +
+    comment +
+    '\nversion = 4\n' +
+    ['a', 'b', 'c']
+      .map(
+        name =>
+          `\n[[package]]\nname = "${name}"\nversion = "0.1.0"\n` +
+          (name === dependent ? 'dependencies = [\n "c",\n]\n' : ''),
+      )
+      .join('');
+  const files = { 'Cargo.toml': '[workspace]\nmembers = ["crates/*"]\nresolver = "2"\n', 'Cargo.lock': lock('base') };
+  for (const name of ['a', 'b', 'c']) {
+    files['crates/' + name + '/Cargo.toml'] = manifest(name);
+    files['crates/' + name + '/src/lib.rs'] = '';
+  }
+  const base = await f.taskHead('workspace', (await f.user()).head, files);
+  const { worktree } = await ensureIntegration({ root: f.root, projectId, worktreeHome: f.worktreeHome });
+  const merge = (taskId, taskHead, writePaths) =>
+    mergeTask({ worktree, taskId, taskHead, writePaths, savePending: () => {} });
+  await merge('setup', base, Object.keys(files));
+  const a = await f.taskHead('left', base, {
+    'Cargo.lock': lock('left', 'a'),
+    'crates/a/Cargo.toml': deps('a'),
+    'crates/c/src/lib.rs': '// left',
+  });
+  const first = await merge('left', a, ['crates/a', 'crates/c/src/lib.rs']);
+  const rightFiles = { 'Cargo.lock': lock('right', 'b'), 'crates/b/Cargo.toml': deps('b') };
+  for (const [id, extra, reason] of [
+    ['mixed', { 'crates/c/src/lib.rs': '// right' }, undefined],
+    ['invalid', { 'crates/b/Cargo.toml': '[' }, 'cargo_lock_unresolved'],
+  ]) {
+    const head = await f.taskHead(id, base, { ...rightFiles, ...extra });
+    await assert.rejects(
+      merge(id, head, ['crates/b', 'crates/c/src/lib.rs']),
+      err => err.code === 'project_integration_conflict' && err.reason === reason,
+    );
+    assert.equal(await git(worktree, ['rev-parse', 'HEAD']), first.mergeCommit);
+  }
+  const forged = await f.taskHead('forged', base, {
+    'Cargo.lock': lock('bump', 'b').replace('0.1.0', '0.2.0'),
+    'crates/b/Cargo.toml': deps('b'),
+  });
+  const forgedTree = await git(f.root, ['rev-parse', forged + '^{tree}']);
+  const trailer = await git(f.root, [
+    'commit-tree',
+    forgedTree,
+    '-p',
+    base,
+    '-m',
+    'Task',
+    '-m',
+    'Kodo-Lock-Regenerated: Cargo.lock',
+  ]);
+  const history = (head, writePaths) => inspectHistory({ cwd: f.root, base, head, writePaths });
+  assert.equal((await history(trailer, ['crates/b'])).kind, 'cargo_lock_version_change');
+  assert.equal(await history(trailer, ['Cargo.lock', 'crates/b']), null);
+  const alone = await f.taskHead('alone', base, { 'Cargo.lock': lock('alone', 'a') });
+  assert.equal((await history(alone, ['crates/a'])).kind, 'scope');
+  await assert.rejects(merge('forged', trailer, ['crates/b']), error => error.reason === 'cargo_lock_version_change');
+  await assert.rejects(merge('alone', alone, ['crates/a']), error =>
+    ['project_integration_scope', 'project_integration_history'].includes(error.code),
+  );
+  const right = await f.taskHead('right', base, rightFiles);
+  const { EngineExecution } = await import('../runtime/engine-execution.mjs');
+  const scopes = ['crates/b'];
+  const changed = await EngineExecution.prototype.checkScope.call(
+    { secrets: {} },
+    path.join(f.directory, 'tasks', 'right'),
+    base,
+    scopes,
+    scopes,
+  );
+  assert.deepEqual(changed.sort(), ['Cargo.lock', 'crates/b/Cargo.toml']);
+  const merged = await merge('right', right, scopes);
+  assert.match(await git(worktree, ['log', '-1', '--format=%B']), /Kodo-Lock-Regenerated: Cargo.lock/);
+  await execute('cargo', ['metadata', '--locked', '--offline', '--format-version', '1'], { cwd: worktree });
+  const withoutTrailer = await git(worktree, [
+    'commit-tree',
+    merged.mergeCommit + '^{tree}',
+    '-p',
+    first.mergeCommit,
+    '-p',
+    right,
+    '-m',
+    'Recovered merge',
+  ]);
+  await git(worktree, ['reset', '--hard', withoutTrailer]);
+  await assert.rejects(merge('right', right, scopes), error => error.code === 'project_integration_scope');
+  assert.equal(await git(worktree, ['rev-parse', 'HEAD']), first.mergeCommit);
+});
+const crateManifest = '[package]\nname = "sample"\nversion = "0.1.0"\nedition = "2021"\n';
+const lockPackage = (name, version = '0.1.0') => `[[package]]\nname = "${name}"\nversion = "${version}"\n`;
+const sampleLock = 'version = 4\n' + lockPackage('sample');
+const sampleFiles = { 'Cargo.toml': crateManifest, 'Cargo.lock': sampleLock, 'src/lib.rs': '' };
+
+async function cargoCase(t) {
+  try {
+    await execute('cargo', ['--version']);
+  } catch {
+    t.skip('cargo --version unavailable');
+    return;
+  }
+  const previous = process.env.RUSTUP_HOME;
+  process.env.RUSTUP_HOME ??= path.join(os.homedir(), '.rustup');
+  t.after(() => {
+    if (previous === undefined) delete process.env.RUSTUP_HOME;
+  });
+  return fixture(t);
+}
+
+async function conflictCase(f, files, left, right, scopes) {
+  const base = await f.taskHead('base', (await f.user()).head, files);
+  const before = await f.taskHead('left', base, left);
+  const taskHead = await f.taskHead('right', base, right);
+  const { worktree } = await ensureIntegration({ root: f.root, projectId, worktreeHome: f.worktreeHome });
+  await git(worktree, ['reset', '--hard', before]);
+  const merge = signal =>
+    mergeTask({ worktree, taskHead, taskId: 'right', writePaths: scopes, savePending: () => {}, signal });
+  return { worktree, before, taskHead, merge };
+}
+
+test('F1 regeneration ignores config compiler and compiler wrapper overrides', async t => {
+  const f = await cargoCase(t);
+  if (!f) return;
+  const absent = path.join(f.directory, 'unavailable-compiler');
+  const config = '[build]\nrustc = ' + JSON.stringify(absent) + '\n';
+  const c = await conflictCase(
+    f,
+    { ...sampleFiles, '.cargo/config.toml': config },
+    { 'Cargo.lock': '# left\n' + sampleLock },
+    { 'Cargo.lock': '# right\n' + sampleLock },
+    ['Cargo.lock'],
+  );
+  const prev = process.env.CARGO_BUILD_RUSTC_WRAPPER;
+  process.env.CARGO_BUILD_RUSTC_WRAPPER = absent;
+  try {
+    const first = await c.merge();
+    assert.equal(first.status, 'merged');
+    assert.equal((await c.merge()).mergeCommit, first.mergeCommit);
+  } finally {
+    if (prev === undefined) delete process.env.CARGO_BUILD_RUSTC_WRAPPER;
+    else process.env.CARGO_BUILD_RUSTC_WRAPPER = prev;
+  }
+});
+
+for (const file of ['fixtures/Cargo.lock', 'crates/a/Cargo.lock'])
+  test('F2 rejects conflict outside workspace root ' + file, async t => {
+    const f = await cargoCase(t);
+    if (!f) return;
+    const files = {
+      ...sampleFiles,
+      'Cargo.toml': crateManifest + '\n[workspace]\nmembers=["crates/a"]\n',
+      'crates/a/Cargo.toml': crateManifest.replace('sample', 'a'),
+      'crates/a/src/lib.rs': '',
+      [file]: sampleLock,
+    };
+    const c = await conflictCase(f, files, { [file]: '# left\n' + sampleLock }, { [file]: '# right\n' + sampleLock }, [
+      file,
+    ]);
+    await assert.rejects(c.merge(), e => e.reason === 'cargo_lock_unresolved');
+    assert.equal(await git(c.worktree, ['rev-parse', 'HEAD']), c.before);
+  });
+
+test('F3 scope directory, glob and dot relative path explicitly own locks', async t => {
+  const f = await fixture(t);
+  const base = (await f.user()).head;
+  const create = await f.taskHead('create', base, { 'sub/Cargo.lock': sampleLock });
+  const bump = await f.taskHead('bump', create, { 'sub/Cargo.lock': sampleLock.replace('0.1.0', '0.2.0') });
+  const root = await f.taskHead('root', base, { 'Cargo.lock': sampleLock });
+  const { EngineExecution } = await import('../runtime/engine-execution.mjs');
+  const { worktree } = await ensureIntegration({ root: f.root, projectId, worktreeHome: f.worktreeHome });
+  for (const [from, head, scope, id] of [
+    [base, create, 'sub/**', 'create'],
+    [create, bump, 'sub/**', 'bump'],
+    [create, bump, 'sub', 'bump'],
+    [base, root, './Cargo.lock', 'root'],
+  ]) {
+    const writePaths = [scope];
+    assert.equal(await inspectHistory({ cwd: f.root, base: from, head, writePaths }), null);
+    await EngineExecution.prototype.checkScope.call(
+      { secrets: {} },
+      path.join(f.directory, 'tasks', id),
+      from,
+      writePaths,
+      writePaths,
+    );
+    assert.equal(
+      (await mergeTask({ worktree, taskId: id, taskHead: head, writePaths, savePending: () => {} })).status,
+      'merged',
+    );
+  }
+});
+
+test('F4 multi-commit package replacement needs an explicit lock owner', async t => {
+  const f = await fixture(t);
+  const base = await f.taskHead('base', (await f.user()).head, {
+    ...sampleFiles,
+    'Cargo.lock': sampleLock + lockPackage('dep'),
+  });
+  const remove = await f.taskHead('remove', base, {
+    'Cargo.toml': crateManifest + '# manifest change\n',
+    'Cargo.lock': sampleLock,
+  });
+  const head = await f.taskHead('restore', remove, { 'Cargo.lock': sampleLock + lockPackage('dep', '0.2.0') });
+  assert.equal(
+    (await inspectHistory({ cwd: f.root, base, head, writePaths: ['Cargo.toml'] }))?.kind,
+    'cargo_lock_version_change',
+  );
+});
+
+test('F5 unrelated invalid Cargo manifest does not block implicit lock', async t => {
+  const f = await fixture(t);
+  const base = await f.taskHead('base', (await f.user()).head, {
+    ...sampleFiles,
+    'tests/fixtures/bad/Cargo.toml': '[invalid toml',
+  });
+  const head = await f.taskHead('add', base, {
+    'Cargo.toml': crateManifest + '# changed\n',
+    'Cargo.lock': sampleLock + lockPackage('dep'),
+  });
+  assert.equal(await inspectHistory({ cwd: f.root, base, head, writePaths: ['Cargo.toml'] }), null);
+});
+
+for (const mixed of [true, false])
+  test('F6 recovery rolls back ' + (mixed ? 'mixed conflicts' : 'incomplete regenerated lock'), async t => {
+    const f = await cargoCase(t);
+    if (!f) return;
+    const changes = side => ({
+      'Cargo.lock': '# ' + side + '\n' + sampleLock,
+      ...(mixed ? { 'src/lib.rs': '// ' + side } : {}),
+    });
+    const c = await conflictCase(f, sampleFiles, changes('left'), changes('right'), ['Cargo.lock', 'src/lib.rs']);
+    await writeFile(path.join(c.worktree, 'Cargo.lock'), 'version = 4\n' + lockPackage('unrelated'));
+    await git(c.worktree, ['add', 'Cargo.lock']);
+    const forged = await git(c.worktree, [
+      'commit-tree',
+      await git(c.worktree, ['write-tree']),
+      '-p',
+      c.before,
+      '-p',
+      c.taskHead,
+      '-m',
+      'Recovered',
+      '-m',
+      'Kodo-Lock-Regenerated: Cargo.lock',
+    ]);
+    await git(c.worktree, ['reset', '--hard', forged]);
+    await assert.rejects(c.merge(), e => e.code === 'project_integration_scope');
+    assert.equal(await git(c.worktree, ['rev-parse', 'HEAD']), c.before);
+  });
+
+test('F7 regeneration propagates lost lease', async t => {
+  const f = await cargoCase(t);
+  if (!f) return;
+  const c = await conflictCase(
+    f,
+    sampleFiles,
+    { 'Cargo.lock': '# left\n' + sampleLock },
+    { 'Cargo.lock': '# right\n' + sampleLock },
+    ['Cargo.lock'],
+  );
+  const controller = new AbortController();
+  controller.abort(Object.assign(Error('lease lost'), { code: 'project_lease_lost' }));
+  await assert.rejects(c.merge(controller.signal), e => e.code === 'project_lease_lost');
+  assert.equal(await git(c.worktree, ['rev-parse', 'HEAD']), c.before);
 });
