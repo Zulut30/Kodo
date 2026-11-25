@@ -593,7 +593,7 @@ export function next() {}
   const sigs = extractJsTsPublicApi(method);
   assert.equal(sigs.length, 2, JSON.stringify(sigs));
   assert.match(sigs[0], /^export const result\b/);
-  assert.ok(!sigs.some(sig => /^export\(\)/.test(sig)), 'no phantom export() entry');
+  assert.ok(!sigs.some(sig => sig.startsWith('export()')), 'no phantom export() entry');
   assert.equal(sigs[1], 'export function next()');
 });
 
