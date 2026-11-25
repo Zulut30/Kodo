@@ -19,8 +19,15 @@
  */
 import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
-import { assertRemoteBriefPaths, privateBriefRoots } from './remote-brief-paths.mjs';
-import { cleanupRemoteRefs, fetchSubmission, pushBase, remoteRefs, transport } from './project-remote-transport.mjs';
+import { assertRemoteBriefPaths, portableDiagnostics, privateBriefRoots } from './remote-brief-paths.mjs';
+import {
+  cleanupRemoteRefs,
+  fetchSubmission,
+  previousAttemptRef,
+  pushBase,
+  remoteRefs,
+  transport,
+} from './project-remote-transport.mjs';
 import { portableDirectorTaskInput } from './project-contracts.mjs';
 import { isDeepStrictEqual } from 'node:util';
 import { stat } from 'node:fs/promises';
@@ -177,11 +184,33 @@ async function briefFor(state, attempt, task, run) {
     : `${cli} ci feedback --base ${run.baseSha} --project ${quotePath(run.cwd)} --json`;
   const prior = await latestPriorTaskRun({ store: storeOf(state.ctx), project, task, run, attempt });
   const previousAttempt = prior?.externalConflict?.previousAttempt;
+  const previousRef = remote && previousAttempt && previousAttemptRef(project.projectId, run.id);
+  if (previousRef) {
+    await transport(
+      run.project,
+      ['push', remote.repository, previousAttempt.headSha + ':' + previousRef],
+      state.signal,
+    );
+    if (!prior.retryRefPublished) storeOf(state.ctx).updateRun(prior.id, { retryRefPublished: true });
+  }
+  const portablePrevious = value =>
+    remote
+      ? {
+          ...portableDiagnostics(
+            value,
+            [prior.cwd, run.cwd, state.integration.worktree],
+            process.platform,
+            privateBriefRoots(run, storeOf(state.ctx).home),
+          ),
+          ref: previousRef,
+        }
+      : value;
   let carry = previousAttempt ? '\nPort the changes in previousAttempt.diff onto the fresh baseSha.' : '';
   if (previousAttempt) {
     carry +=
       ' If truncated is true the diff is incomplete. Recover omittedFiles from previousAttempt.headSha in this repository.';
-    if (previousAttempt.truncated === undefined) state.pendingDiffs.set(attempt.id, prior.id);
+    if (previousAttempt.truncated === undefined)
+      state.pendingDiffs.set(attempt.id, { priorId: prior.id, portablePrevious });
   }
   const referencePath = ref => {
     if (!remote || !path.isAbsolute(ref.path)) return ref.path;
@@ -197,6 +226,7 @@ async function briefFor(state, attempt, task, run) {
         workerInput,
         'In your clone, run:',
         'git fetch ' + remote.repository + ' ' + remote.baseRef,
+        ...(previousRef ? ['git fetch ' + remote.repository + ' ' + previousRef] : []),
         'git worktree add -b ' + run.branch + ' ' + run.id + ' ' + run.baseSha,
         'cd ' + run.id,
         'Implement only the assigned write paths. Preserve existing tests and add tests for new behaviour.',
@@ -233,7 +263,7 @@ async function briefFor(state, attempt, task, run) {
     baseSha: run.baseSha,
     interfaces,
     prompt,
-    ...(previousAttempt && { previousAttempt }),
+    ...(previousAttempt && { previousAttempt: portablePrevious(previousAttempt) }),
     selfCheck,
     completeCommand: `${dispatcher} project complete-task ${project.projectId} ${task.id} --head <SHA> --attempt ${attempt.id} --defer-gate`,
     abandonCommand: `${dispatcher} project complete-task ${project.projectId} ${task.id} --head <SHA> --abandon --attempt ${attempt.id}`,
@@ -743,8 +773,14 @@ export async function nextWave(ctx, input) {
     return result;
   });
   for (const brief of result.briefs) {
-    const priorId = pendingDiffs.get(brief.attemptId);
-    if (priorId) brief.previousAttempt = await captureConflictDiff(ctx, priorId, brief.writePaths);
+    const pending = pendingDiffs.get(brief.attemptId);
+    if (pending) {
+      brief.previousAttempt = pending.portablePrevious(
+        await captureConflictDiff(ctx, pending.priorId, brief.writePaths),
+      );
+      if (brief.baseRef)
+        assertRemoteBriefPaths(brief, privateBriefRoots(storeOf(ctx).getRun(brief.runId), storeOf(ctx).home));
+    }
   }
   const watch = await watchWorkers(ctx, result.briefs, stallMinutes, signal);
   const report = { ...result, watch };
@@ -762,6 +798,15 @@ async function watchWorkers(ctx, briefs, stallMinutes, signal) {
     if (cancelled(run) || run.externalCompletion) continue;
     if (run.externalFailure?.repeated)
       add('worker_repeated_failure', 'Forward the first diagnostic to the worker.', run.externalFailure.since);
+    if (brief.baseRef) {
+      if (run.externalFailure?.code === 'external_scope')
+        add(
+          'worker_scope_violation',
+          'Ask the worker to revert out-of-scope changes or abandon and reassign.',
+          run.externalFailure.since,
+        );
+      continue;
+    }
     const observe = async args => {
       try {
         const result = await execute('git', ['--no-optional-locks', ...args], {
@@ -1269,6 +1314,25 @@ async function verifySubmission(ctx, C, step, input) {
         checked.throwIfAborted();
       };
       const prepared = await prepareRemoteSubmission(ctx, step, input, checked, checkLease);
+      if (prepared.fetched !== false) {
+        const rejected = prepared.defect;
+        const defect = rejected && ('code' in rejected ? rejected : { code: rejected.blocked });
+        logSubmission(ctx, run, step.attempt, input.head, defect);
+        if (
+          defect &&
+          ![
+            'external_head_changed',
+            'external_branch_mismatch',
+            'external_worktree_missing',
+            'external_worktree_dirty',
+            'external_worktree_mismatch',
+            'project_submission_locked',
+            'project_submission_stale',
+          ].includes(defect.code) &&
+          !cancelled(store.getRun(run.id))
+        )
+          recordFailure(ctx, run, defect);
+      }
       if (prepared.defect) return prepared.defect;
       remoteChecks = prepared.remoteChecks;
     }
@@ -1643,6 +1707,7 @@ function recordFailure(ctx, run, defect) {
   store.updateRun(run.id, {
     externalFailure: {
       signature,
+      code: defect.code,
       repeated,
       since: repeated ? last.since : (ctx.clock?.() ?? new Date().toISOString()),
     },
@@ -1720,7 +1785,7 @@ async function prepareRemoteSubmission(ctx, step, input, signal, checkLease) {
   const { head, projectId } = input;
   const store = storeOf(ctx);
   const fetched = await fetchSubmission(run, remote, head, signal, checkLease);
-  if (fetched) return { defect: { blocked: fetched } };
+  if (fetched) return { fetched: false, defect: { blocked: fetched } };
   if (!(await ancestor(run.project, run.baseSha, head))) return { defect: problem('external_not_descendant') };
   const unsafe = await historyDefect(ctx.engine, run, task, head);
   if (unsafe) return { defect: unsafe };
@@ -1742,12 +1807,9 @@ async function prepareRemoteSubmission(ctx, step, input, signal, checkLease) {
     } else return { defect: { blocked: 'project_submission_locked' } };
   }
   const defect = await inspectSubmission(ctx.engine, run, task, head);
-  logSubmission(ctx, run, step.attempt, head, defect);
   if (defect) {
     if (defect.code !== 'external_head_changed' && !cancelled(store.getRun(run.id))) {
       store.updateRun(run.id, { remoteRejectedHead: head }, { preserveCancellation: true });
-      // The work ref of this attempt identifies its worker: the failure counts for the watchdog.
-      recordFailure(ctx, run, defect);
     }
     return { defect };
   }

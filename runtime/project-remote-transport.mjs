@@ -6,6 +6,8 @@ import { execute } from './command.mjs';
 const LIMIT = 64 * 1024 * 1024;
 const error = code => Object.assign(new Error('Project transport'), { code });
 
+export const previousAttemptRef = (projectId, runId) => `refs/kodo/${projectId}/prev/${runId}`;
+
 export function remoteRefs(projectId, run) {
   if (!['ssh', 't3-env'].includes(run.workerPlacement?.machine?.kind)) return null;
   return {
@@ -146,10 +148,10 @@ async function listRemoteRefs(run, remote, patterns, signal) {
 export async function cleanupRemoteRefs(run, signal, gcListings = null) {
   const projectId = run.directorBinding.projectId;
   const remote = remoteRefs(projectId, run);
-  if (!remote) return;
+  if (!remote || (run.externalConflict && !run.retryRefPublished)) return;
   await transport(run.project, ['update-ref', '-d', 'refs/kodo/fetched/' + run.id], signal);
   try {
-    const refs = [remote.baseRef, remote.workRef];
+    const refs = [remote.baseRef, remote.workRef, previousAttemptRef(projectId, run.id)];
     let heads = gcListings?.get(remote.repository);
     if (!heads) {
       gcListings?.set(remote.repository, new Map());
