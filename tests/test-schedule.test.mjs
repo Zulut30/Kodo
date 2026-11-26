@@ -204,14 +204,20 @@ test('The wave factory suites run in their own command and parallel CI shards, o
   assert.equal(scripts['test:waves:parallel'], `node scripts/run-tests.mjs ${waveShards.parallel.join(' ')}`);
   const workflow = readFileSync(path.join(root, '.github/workflows/ci.yml'), 'utf8');
   const fast = workflowJob(workflow, 'fast');
-  const wavesJob = workflowJob(workflow, 'ci-waves');
   assert.doesNotMatch(fast, /npm run test:waves/);
-  assert.match(wavesJob, /os: \[ubuntu-latest, windows-latest\]/);
-  assert.match(wavesJob, /shard: \[director, parallel\]/);
-  assert.match(wavesJob, /run: npm run test:waves:\$\{\{ matrix\.shard \}\}\n/);
+  for (const [shard, osName] of [
+    ['director', 'ubuntu'],
+    ['director', 'windows'],
+    ['parallel', 'ubuntu'],
+    ['parallel', 'windows'],
+  ]) {
+    const job = workflowJob(workflow, `ci-waves-${shard}-${osName}`);
+    assert.match(job, new RegExp(`runs-on: ${osName}-latest`));
+    assert.match(job, new RegExp(`run: npm run test:waves:${shard}\\n`));
+  }
 });
 
-test('The heavy integration suites run in their own command and parallel CI job, outside default discovery', async () => {
+test('The heavy integration suites run in their own command and parallel CI jobs, outside default discovery', async () => {
   const { discoverTests, heavySuites } = await import(scheduleUrl);
   // Stage 16E: with them, one Windows L2 command took 2032658-2325940 ms and timed out on a slow runner.
   // The per-file measurements behind this list are in docs/CI.md.
@@ -245,10 +251,12 @@ test('The heavy integration suites run in their own command and parallel CI job,
   assert.equal(scripts['test:heavy'], `node scripts/run-tests.mjs ${heavySuites.join(' ')}`);
   const workflow = readFileSync(path.join(root, '.github/workflows/ci.yml'), 'utf8');
   const fast = workflowJob(workflow, 'fast');
-  const heavyJob = workflowJob(workflow, 'ci-heavy');
   assert.doesNotMatch(fast, /npm run test:heavy/);
-  assert.match(heavyJob, /os: \[ubuntu-latest, windows-latest\]/);
-  assert.match(heavyJob, /\n {6}- name: Heavy integration suites\n {8}run: npm run test:heavy\n/);
+  for (const osName of ['ubuntu', 'windows']) {
+    const heavyJob = workflowJob(workflow, `ci-heavy-${osName}`);
+    assert.match(heavyJob, new RegExp(`runs-on: ${osName}-latest`));
+    assert.match(heavyJob, /\n {6}- name: Heavy integration suites\n {8}run: npm run test:heavy\n/);
+  }
 });
 
 test('Every default-pattern test file runs in exactly one required check shard', async () => {
@@ -288,32 +296,43 @@ test('Every default-pattern test file runs in exactly one required check shard',
   for (const file of all)
     assert.deepEqual(runs.get(file)?.length, 1, `${file} runs in exactly one shard: ${runs.get(file) ?? 'none'}`);
   assert.deepEqual([...runs.keys()].sort(), [...all].sort(), 'no shard names a file outside the default pattern');
-  // Every mandatory shard runs on both platforms and gates the required `check` contexts; never in `fast`.
+  // Every mandatory leg is a dedicated single-OS job emitting positive `outputs.passed`, gated by `check` with `if: always()`.
   const workflow = readFileSync(path.join(root, '.github/workflows/ci.yml'), 'utf8');
   const fast = workflowJob(workflow, 'fast');
   const check = workflowJob(workflow, 'check');
-  assert.match(check, /needs: \[ci-l2, ci-heavy, ci-waves, ci-final\]/);
+  assert.match(check, /\n {4}if: always\(\)\n/);
   assert.match(check, /os: \[ubuntu-latest, windows-latest\]/);
   assert.match(check, /node: \[24\]/);
-  const requiredJobs = {
-    'ci-l2': 'node scripts/ci.mjs run --tier L2',
-    'ci-heavy': 'npm run test:heavy',
-    'ci-waves': 'npm run test:waves:${{ matrix.shard }}',
-    'ci-final': 'npm run test:final',
-  };
-  for (const [jobName, command] of Object.entries(requiredJobs)) {
+  const requiredLegs = [
+    ['ci-l2-ubuntu', 'ubuntu-latest', ['node scripts/ci.mjs run --tier L2']],
+    ['ci-l2-windows', 'windows-latest', ['node scripts/ci.mjs run --tier L2']],
+    ['ci-heavy-ubuntu', 'ubuntu-latest', ['npm run test:heavy']],
+    ['ci-heavy-windows', 'windows-latest', ['npm run test:heavy']],
+    ['ci-waves-director-ubuntu', 'ubuntu-latest', ['npm run test:waves:director']],
+    ['ci-waves-director-windows', 'windows-latest', ['npm run test:waves:director']],
+    ['ci-waves-parallel-ubuntu', 'ubuntu-latest', ['npm run test:waves:parallel']],
+    ['ci-waves-parallel-windows', 'windows-latest', ['npm run test:waves:parallel']],
+    ['ci-final-ubuntu', 'ubuntu-latest', ['npm run test:final', 'node scripts/package-smoke.mjs']],
+    ['ci-final-windows', 'windows-latest', ['npm run test:final', 'node scripts/package-smoke.mjs']],
+  ];
+  for (const [jobName, runnerOs, commands] of requiredLegs) {
     const job = workflowJob(workflow, jobName);
-    assert.match(job, /os: \[ubuntu-latest, windows-latest\]/, `${jobName} covers both OSes`);
-    assert.match(job, /node: \[24\]/, `${jobName} covers Node 24`);
-    assert.equal(job.split(`run: ${command}`).length - 1, 1, `${command} runs once in ${jobName}`);
-    assert.ok(!fast.includes(command), `${command} is not in the fast job`);
-    assert.ok(check.includes(`needs.${jobName}.result`), `check verifies ${jobName} result`);
+    assert.match(job, new RegExp(`runs-on: ${runnerOs}`), `${jobName} runs on ${runnerOs}`);
+    assert.match(job, /node-version: 24/, `${jobName} uses Node 24`);
+    assert.match(
+      job,
+      /passed: \$\{\{ steps\.verify\.outputs\.passed \}\}/,
+      `${jobName} exports positive passed output`,
+    );
+    assert.doesNotMatch(job, /matrix:/, `${jobName} has no matrix rollup ambiguity`);
+    for (const command of commands) {
+      assert.equal(job.split(`run: ${command}`).length - 1, 1, `${command} runs once in ${jobName}`);
+      assert.ok(!fast.includes(command), `${command} is not in the fast job`);
+    }
+    assert.ok(check.includes(`- ${jobName}\n`), `check depends on ${jobName}`);
+    assert.ok(check.includes(`needs.${jobName}.result`), `check verifies ${jobName}.result`);
+    assert.ok(check.includes(`needs.${jobName}.outputs.passed`), `check verifies ${jobName}.outputs.passed`);
   }
-  assert.equal(
-    workflowJob(workflow, 'ci-final').split('run: node scripts/package-smoke.mjs').length - 1,
-    1,
-    'package smoke runs once in ci-final',
-  );
 });
 test(
   'Scheduler starts heuristic heavy files before lexical files in real isolated children',

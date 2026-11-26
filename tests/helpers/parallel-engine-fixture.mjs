@@ -233,7 +233,7 @@ export async function until(condition, label, ms = 120000) {
 }
 
 export const queueOf = async f => {
-  const { openIntegrationQueue } = await import('../runtime/project-integration-queue.mjs');
+  const { openIntegrationQueue } = await import('../../runtime/project-integration-queue.mjs');
   return openIntegrationQueue(f.store);
 };
 export const queued = (queue, f) => queue.list(f.projectId).filter(row => row.status === 'queued').length;

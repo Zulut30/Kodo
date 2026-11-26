@@ -60,10 +60,22 @@ jobs:
           fi
 
   # Required branch-protection gate preserving `check (ubuntu-latest, 24)` and
-  # `check (windows-latest, 24)` while the four platform suites run in parallel below.
+  # `check (windows-latest, 24)`. Each of the 10 mandatory platform legs is a
+  # dedicated non-matrix job emitting positive `outputs.passed == 'true'` only
+  # after its commands exit 0, avoiding matrix-rollup cancellation ambiguity.
   check:
-    needs: [ci-l2, ci-heavy, ci-waves, ci-final]
-    if: ${{ !cancelled() }}
+    needs:
+      - ci-l2-ubuntu
+      - ci-l2-windows
+      - ci-heavy-ubuntu
+      - ci-heavy-windows
+      - ci-waves-director-ubuntu
+      - ci-waves-director-windows
+      - ci-waves-parallel-ubuntu
+      - ci-waves-parallel-windows
+      - ci-final-ubuntu
+      - ci-final-windows
+    if: always()
     strategy:
       fail-fast: false
       matrix:
@@ -71,28 +83,64 @@ jobs:
         node: [24]
     runs-on: ubuntu-latest
     steps:
-      - name: Verify all mandatory shards passed
+      - name: Verify every mandatory leg passed with positive evidence
         shell: bash
+        env:
+          TARGET_OS: ${{ matrix.os }}
+          L2_UBUNTU_RESULT: ${{ needs.ci-l2-ubuntu.result }}
+          L2_UBUNTU_PASSED: ${{ needs.ci-l2-ubuntu.outputs.passed }}
+          HEAVY_UBUNTU_RESULT: ${{ needs.ci-heavy-ubuntu.result }}
+          HEAVY_UBUNTU_PASSED: ${{ needs.ci-heavy-ubuntu.outputs.passed }}
+          WAVES_DIR_UBUNTU_RESULT: ${{ needs.ci-waves-director-ubuntu.result }}
+          WAVES_DIR_UBUNTU_PASSED: ${{ needs.ci-waves-director-ubuntu.outputs.passed }}
+          WAVES_PAR_UBUNTU_RESULT: ${{ needs.ci-waves-parallel-ubuntu.result }}
+          WAVES_PAR_UBUNTU_PASSED: ${{ needs.ci-waves-parallel-ubuntu.outputs.passed }}
+          FINAL_UBUNTU_RESULT: ${{ needs.ci-final-ubuntu.result }}
+          FINAL_UBUNTU_PASSED: ${{ needs.ci-final-ubuntu.outputs.passed }}
+          L2_WINDOWS_RESULT: ${{ needs.ci-l2-windows.result }}
+          L2_WINDOWS_PASSED: ${{ needs.ci-l2-windows.outputs.passed }}
+          HEAVY_WINDOWS_RESULT: ${{ needs.ci-heavy-windows.result }}
+          HEAVY_WINDOWS_PASSED: ${{ needs.ci-heavy-windows.outputs.passed }}
+          WAVES_DIR_WINDOWS_RESULT: ${{ needs.ci-waves-director-windows.result }}
+          WAVES_DIR_WINDOWS_PASSED: ${{ needs.ci-waves-director-windows.outputs.passed }}
+          WAVES_PAR_WINDOWS_RESULT: ${{ needs.ci-waves-parallel-windows.result }}
+          WAVES_PAR_WINDOWS_PASSED: ${{ needs.ci-waves-parallel-windows.outputs.passed }}
+          FINAL_WINDOWS_RESULT: ${{ needs.ci-final-windows.result }}
+          FINAL_WINDOWS_PASSED: ${{ needs.ci-final-windows.outputs.passed }}
         run: |
-          for result in "${{ needs.ci-l2.result }}" "${{ needs.ci-heavy.result }}" "${{ needs.ci-waves.result }}" "${{ needs.ci-final.result }}"; do
-            if [ "$result" != "success" ]; then
-              echo "Mandatory CI shard did not succeed: $result"
+          verify_leg() {
+            local name="$1" res="$2" passed="$3"
+            if [ "$res" != "success" ] || [ "$passed" != "true" ]; then
+              echo "Mandatory leg $name failed verification (result='$res', passed='$passed')"
               exit 1
             fi
-          done
+          }
+          if [ "$TARGET_OS" = "ubuntu-latest" ]; then
+            verify_leg "ci-l2-ubuntu" "$L2_UBUNTU_RESULT" "$L2_UBUNTU_PASSED"
+            verify_leg "ci-heavy-ubuntu" "$HEAVY_UBUNTU_RESULT" "$HEAVY_UBUNTU_PASSED"
+            verify_leg "ci-waves-director-ubuntu" "$WAVES_DIR_UBUNTU_RESULT" "$WAVES_DIR_UBUNTU_PASSED"
+            verify_leg "ci-waves-parallel-ubuntu" "$WAVES_PAR_UBUNTU_RESULT" "$WAVES_PAR_UBUNTU_PASSED"
+            verify_leg "ci-final-ubuntu" "$FINAL_UBUNTU_RESULT" "$FINAL_UBUNTU_PASSED"
+          elif [ "$TARGET_OS" = "windows-latest" ]; then
+            verify_leg "ci-l2-windows" "$L2_WINDOWS_RESULT" "$L2_WINDOWS_PASSED"
+            verify_leg "ci-heavy-windows" "$HEAVY_WINDOWS_RESULT" "$HEAVY_WINDOWS_PASSED"
+            verify_leg "ci-waves-director-windows" "$WAVES_DIR_WINDOWS_RESULT" "$WAVES_DIR_WINDOWS_PASSED"
+            verify_leg "ci-waves-parallel-windows" "$WAVES_PAR_WINDOWS_RESULT" "$WAVES_PAR_WINDOWS_PASSED"
+            verify_leg "ci-final-windows" "$FINAL_WINDOWS_RESULT" "$FINAL_WINDOWS_PASSED"
+          else
+            echo "Unknown TARGET_OS: $TARGET_OS"
+            exit 1
+          fi
 
-  ci-l2:
-    strategy:
-      fail-fast: true
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-        node: [24]
-    runs-on: ${{ matrix.os }}
+  ci-l2-ubuntu:
+    runs-on: ubuntu-latest
+    outputs:
+      passed: ${{ steps.verify.outputs.passed }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: ${{ matrix.node }}
+          node-version: 24
           cache: npm
           cache-dependency-path: package-lock.json
       - run: npm ci --ignore-scripts
@@ -108,7 +156,47 @@ jobs:
         with:
           version: '0.12.3'
           enable-cache: false
-      # Separate steps keep a failed install fatal under both bash and PowerShell.
+      - name: Install pinned Semgrep
+        env:
+          KODO_TOOL_HOME: ${{ runner.temp }}/kodo-security-tools
+        run: node cli/index.mjs tools install semgrep --json
+      - name: Install pinned Gitleaks
+        env:
+          KODO_TOOL_HOME: ${{ runner.temp }}/kodo-security-tools
+        run: node cli/index.mjs tools install gitleaks --json
+      - name: L2 npm run check and fresh mandatory security
+        env:
+          KODO_TOOL_HOME: ${{ runner.temp }}/kodo-security-tools
+        run: node scripts/ci.mjs run --tier L2 --json
+      - name: Record verified leg pass
+        id: verify
+        shell: bash
+        run: echo "passed=true" >> "$GITHUB_OUTPUT"
+
+  ci-l2-windows:
+    runs-on: windows-latest
+    outputs:
+      passed: ${{ steps.verify.outputs.passed }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - run: npm ci --ignore-scripts
+      # The runtime installer requires existing Python 3.12 and uv; CI owns setup.
+      - name: Set up Python 3.12 for Semgrep
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Record resolved Python patch version
+        run: python --version
+      - name: Set up pinned uv for Semgrep
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: '0.12.3'
+          enable-cache: false
       - name: Install pinned Semgrep
         env:
           KODO_TOOL_HOME: ${{ runner.temp }}/kodo-security-tools
@@ -118,7 +206,6 @@ jobs:
           KODO_TOOL_HOME: ${{ runner.temp }}/kodo-security-tools
         run: node cli/index.mjs tools install gitleaks --json
       - name: Canonicalize Windows temporary paths for L2
-        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $kodoCanonicalTemp = node -e "process.stdout.write(require('node:fs').realpathSync.native(require('node:os').tmpdir()))"
@@ -132,25 +219,43 @@ jobs:
         env:
           KODO_TOOL_HOME: ${{ runner.temp }}/kodo-security-tools
         run: node scripts/ci.mjs run --tier L2 --json
+      - name: Record verified leg pass
+        id: verify
+        shell: pwsh
+        run: '"passed=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append'
 
-  # Heavy integration suites (stage 16E: real Git, Cargo and Engine work) run in parallel with L2.
-  ci-heavy:
-    strategy:
-      fail-fast: true
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-        node: [24]
-    runs-on: ${{ matrix.os }}
+  ci-heavy-ubuntu:
+    runs-on: ubuntu-latest
+    outputs:
+      passed: ${{ steps.verify.outputs.passed }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: ${{ matrix.node }}
+          node-version: 24
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - run: npm ci --ignore-scripts
+      - name: Heavy integration suites
+        run: npm run test:heavy
+      - name: Record verified leg pass
+        id: verify
+        shell: bash
+        run: echo "passed=true" >> "$GITHUB_OUTPUT"
+
+  ci-heavy-windows:
+    runs-on: windows-latest
+    outputs:
+      passed: ${{ steps.verify.outputs.passed }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
           cache: npm
           cache-dependency-path: package-lock.json
       - run: npm ci --ignore-scripts
       - name: Canonicalize Windows temporary paths
-        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $kodoCanonicalTemp = node -e "process.stdout.write(require('node:fs').realpathSync.native(require('node:os').tmpdir()))"
@@ -162,26 +267,43 @@ jobs:
           "TMP=$kodoCanonicalTemp" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Heavy integration suites
         run: npm run test:heavy
+      - name: Record verified leg pass
+        id: verify
+        shell: pwsh
+        run: '"passed=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append'
 
-  # Wave factory and parallel-engine suites split across 2 balanced shards (4 files each).
-  ci-waves:
-    strategy:
-      fail-fast: true
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-        node: [24]
-        shard: [director, parallel]
-    runs-on: ${{ matrix.os }}
+  ci-waves-director-ubuntu:
+    runs-on: ubuntu-latest
+    outputs:
+      passed: ${{ steps.verify.outputs.passed }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: ${{ matrix.node }}
+          node-version: 24
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - run: npm ci --ignore-scripts
+      - name: Wave factory suites (director)
+        run: npm run test:waves:director
+      - name: Record verified leg pass
+        id: verify
+        shell: bash
+        run: echo "passed=true" >> "$GITHUB_OUTPUT"
+
+  ci-waves-director-windows:
+    runs-on: windows-latest
+    outputs:
+      passed: ${{ steps.verify.outputs.passed }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
           cache: npm
           cache-dependency-path: package-lock.json
       - run: npm ci --ignore-scripts
       - name: Canonicalize Windows temporary paths
-        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $kodoCanonicalTemp = node -e "process.stdout.write(require('node:fs').realpathSync.native(require('node:os').tmpdir()))"
@@ -191,27 +313,97 @@ jobs:
           }
           "TEMP=$kodoCanonicalTemp" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "TMP=$kodoCanonicalTemp" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-      - name: Wave factory suites (${{ matrix.shard }})
-        run: npm run test:waves:${{ matrix.shard }}
+      - name: Wave factory suites (director)
+        run: npm run test:waves:director
+      - name: Record verified leg pass
+        id: verify
+        shell: pwsh
+        run: '"passed=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append'
 
-  # Final acceptance scenarios and installed CLI package smoke run in parallel with L2/heavy/waves.
-  ci-final:
-    strategy:
-      fail-fast: true
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-        node: [24]
-    runs-on: ${{ matrix.os }}
+  ci-waves-parallel-ubuntu:
+    runs-on: ubuntu-latest
+    outputs:
+      passed: ${{ steps.verify.outputs.passed }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: ${{ matrix.node }}
+          node-version: 24
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - run: npm ci --ignore-scripts
+      - name: Wave factory suites (parallel)
+        run: npm run test:waves:parallel
+      - name: Record verified leg pass
+        id: verify
+        shell: bash
+        run: echo "passed=true" >> "$GITHUB_OUTPUT"
+
+  ci-waves-parallel-windows:
+    runs-on: windows-latest
+    outputs:
+      passed: ${{ steps.verify.outputs.passed }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
           cache: npm
           cache-dependency-path: package-lock.json
       - run: npm ci --ignore-scripts
       - name: Canonicalize Windows temporary paths
-        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $kodoCanonicalTemp = node -e "process.stdout.write(require('node:fs').realpathSync.native(require('node:os').tmpdir()))"
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve the Windows temporary directory' }
+          if ([string]::IsNullOrWhiteSpace($kodoCanonicalTemp) -or -not (Test-Path -LiteralPath $kodoCanonicalTemp -PathType Container)) {
+            throw 'The canonical Windows temporary directory must exist'
+          }
+          "TEMP=$kodoCanonicalTemp" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "TMP=$kodoCanonicalTemp" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Wave factory suites (parallel)
+        run: npm run test:waves:parallel
+      - name: Record verified leg pass
+        id: verify
+        shell: pwsh
+        run: '"passed=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append'
+
+  ci-final-ubuntu:
+    runs-on: ubuntu-latest
+    outputs:
+      passed: ${{ steps.verify.outputs.passed }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - run: npm ci --ignore-scripts
+      - name: Final acceptance scenarios
+        run: npm run test:final
+      - name: Verify installed CLI package
+        env:
+          KODO_TOOL_HOME: ${{ runner.temp }}/kodo-security-tools
+        run: node scripts/package-smoke.mjs
+      - name: Record verified leg pass
+        id: verify
+        shell: bash
+        run: echo "passed=true" >> "$GITHUB_OUTPUT"
+
+  ci-final-windows:
+    runs-on: windows-latest
+    outputs:
+      passed: ${{ steps.verify.outputs.passed }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - run: npm ci --ignore-scripts
+      - name: Canonicalize Windows temporary paths
         shell: pwsh
         run: |
           $kodoCanonicalTemp = node -e "process.stdout.write(require('node:fs').realpathSync.native(require('node:os').tmpdir()))"
@@ -227,3 +419,7 @@ jobs:
         env:
           KODO_TOOL_HOME: ${{ runner.temp }}/kodo-security-tools
         run: node scripts/package-smoke.mjs
+      - name: Record verified leg pass
+        id: verify
+        shell: pwsh
+        run: '"passed=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append'
