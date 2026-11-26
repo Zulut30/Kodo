@@ -209,7 +209,7 @@ npm run test:waves  # 8 файлов фабрики волн — три ноги
 npm run test:final  # финальные сценарии приёмки — отдельная нога CI (в CI следом идёт package smoke)
 ```
 
-CI запускает эти команды 12 параллельными ногами (по 6 на Linux и Windows); полный прогон после [PR #33](https://github.com/Zulut30/Kodo/pull/33) занял 26 мин 10 с. Как вносить изменения — [CONTRIBUTING](https://github.com/Zulut30/Kodo/blob/main/CONTRIBUTING.md); история выпусков — [CHANGELOG](https://github.com/Zulut30/Kodo/blob/main/CHANGELOG.md).
+CI запускает эти команды 12 параллельными ногами (по 6 на Linux и Windows); полный прогон после [PR #33](https://github.com/Zulut30/Kodo/pull/33) занял 26 мин 10 с. Как вносить изменения — [CONTRIBUTING](CONTRIBUTING.md); история выпусков — [CHANGELOG](CHANGELOG.md).
 
 [Оглавление документации](docs/README.md) делит её на руководство, ADR и архив проверок; там же описаны команды разработки.
 

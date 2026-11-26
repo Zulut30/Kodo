@@ -68,7 +68,7 @@
 
 ## Разработка Kodo
 
-Порядок работы, ярусы тестов и требования к PR — в [CONTRIBUTING](https://github.com/Zulut30/Kodo/blob/main/CONTRIBUTING.md); изменения по выпускам — в [CHANGELOG](https://github.com/Zulut30/Kodo/blob/main/CHANGELOG.md).
+Порядок работы, ярусы тестов и требования к PR — в [CONTRIBUTING](../CONTRIBUTING.md); изменения по выпускам — в [CHANGELOG](../CHANGELOG.md).
 
 ```powershell
 npm ci
