@@ -23,15 +23,22 @@ kodo doctor --json
 1. Установи Node.js 24 и войди в официальный клиент Codex или Claude Code своей подпиской.
 2. Установи CLI из релиза (см. выше) и проверь версию пакета: `kodo registry stats --json`.
 3. Перейди в Git-репозиторий проекта с хотя бы одним commit и подключи навыки: `kodo init`.
-4. Проверь предпосылки без обращения к провайдерам: `kodo doctor --client codex --json`.
-5. Запусти задачу и следи за ней:
+4. Проверь предпосылки выбранного клиента без обращения к провайдерам (`codex` или `claude-code`):
 
 ```powershell
-kodo run "Добавь экспорт в CSV и проверь его" --client codex --mode quick
-kodo status <runId> --json
+$client = "codex" # или "claude-code"
+kodo doctor --client $client --json
 ```
 
-`--mode quick` — один developer-проход с проверками и независимым ревью; без флага режим выбирает оценка Jev. Доставка по умолчанию не выполняется, пока её не включит `--delivery pr|release` или конфигурация проекта.
+5. Запусти задачу тем же клиентом и проверь статус по `runId` из ответа `kodo run`:
+
+```powershell
+kodo run "Добавь экспорт в CSV и проверь его" --client $client --mode quick
+$runId = "<runId из ответа kodo run>"
+kodo status $runId --json
+```
+
+`--mode quick` — один developer-проход с проверками и независимым ревью; без флага действует `executionMode` из конфигурации проекта, а если он не задан — режим выбирает оценка Jev. Доставка по умолчанию не выполняется, пока её не включит `--delivery pr|release` или конфигурация проекта.
 
 ## Запуск из исходников
 
@@ -199,10 +206,10 @@ npm run test:fast   # быстрые модульные тесты, меньше
 npm run check       # validate, формат, lint, типы и suite — шаг L2 в CI
 npm run test:heavy  # тяжёлые наборы с настоящими Git, Cargo и Engine — отдельная нога CI
 npm run test:waves  # 8 файлов фабрики волн — три ноги CI (director, e2e, parallel)
-npm run test:final  # финальные сценарии приёмки и package smoke — отдельная нога CI
+npm run test:final  # финальные сценарии приёмки — отдельная нога CI (в CI следом идёт package smoke)
 ```
 
-CI запускает эти команды 12 параллельными ногами (по 6 на Linux и Windows); полный прогон после [PR #33](https://github.com/Zulut30/Kodo/pull/33) занял 26 мин 10 с. Как вносить изменения — [CONTRIBUTING](CONTRIBUTING.md); история выпусков — [CHANGELOG](CHANGELOG.md).
+CI запускает эти команды 12 параллельными ногами (по 6 на Linux и Windows); полный прогон после [PR #33](https://github.com/Zulut30/Kodo/pull/33) занял 26 мин 10 с. Как вносить изменения — [CONTRIBUTING](https://github.com/Zulut30/Kodo/blob/main/CONTRIBUTING.md); история выпусков — [CHANGELOG](https://github.com/Zulut30/Kodo/blob/main/CHANGELOG.md).
 
 [Оглавление документации](docs/README.md) делит её на руководство, ADR и архив проверок; там же описаны команды разработки.
 

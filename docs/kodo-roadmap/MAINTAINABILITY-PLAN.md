@@ -119,7 +119,7 @@ T1–T4 независимы друг от друга. T5–T8 начинают�
 - Итог: в четырёх файлах 3 диагностики (было 78, цель не больше 15). Весь baseline: 251 → 155.
 - JSDoc ставится над меткой `oxlint-disable-next-line`, а не между ней и функцией, иначе метка перестаёт действовать. Lint с `--report-unused-disable-directives` это ловит.
 
-**4c. Запись запуска — сделано (`78a0dd1`).** `@typedef {object} KodoRun` в `runtime/store.mjs` (там создаются записи `run`), `run` аннотирован в методах `EngineCore`, `EnginePlanning`, `EngineExecution` и `EngineVerification`. Итог: baseline 143 → 108 диагностик (92 группы «файл + код»), цель была не больше 150.
+**4c. Запись запуска — сделано (`78a0dd1`).** `@typedef {object} KodoRun` в `runtime/store.mjs` (там создаются записи `run`), `run` аннотирован в методах `EngineCore`, `EnginePlanning`, `EngineExecution` и `EngineVerification`. Итог: baseline 143 → 108 диагностик (92 записи по паре «файл + сообщение», 46 уникальных пар «файл + код»), цель была не больше 150.
 
 **Проверка каждой подзадачи.** `npm run typecheck`, `npm run lint`, `npm run test:fast`, затем `npm run check` перед PR.
 
