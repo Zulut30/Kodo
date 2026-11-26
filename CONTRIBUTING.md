@@ -1,0 +1,61 @@
+# Как вносить изменения в Kodo
+
+Сначала прочитай [AGENTS.md](AGENTS.md): там правила подписок, доставки и рабочих чатов. Архитектура и решения — в [оглавлении документации](docs/README.md) и [ADR](docs/decisions/).
+
+## Настройка
+
+Нужны Node.js 24 и Git.
+
+```powershell
+git clone https://github.com/Zulut30/Kodo.git
+cd Kodo
+npm ci
+node cli/index.mjs validate
+```
+
+Каждая задача делается в отдельном worktree на своей ветке от свежего `main`. Один PR — одна задача.
+
+## Ярусы тестов
+
+| Команда | Что запускает | Когда |
+| --- | --- | --- |
+| `npm run test:fast` | Быстрые модульные файлы (`fastTests` в `scripts/run-tests.mjs`), меньше минуты | Во время правки. Полную проверку не заменяет |
+| `npm run check` | `validate` → `format:check` → `lint` → `typecheck` → полная suite `npm test` | Перед каждым PR; нога L2 в CI |
+| `npm run test:heavy` | 19 тяжёлых интеграционных файлов с настоящими Git, Cargo и Engine (`heavySuites`) | Перед PR, если правка затрагивает Engine, доставку, Rust или Project Director |
+| `npm run test:waves` | 8 файлов фабрики волн; шарды `test:waves:director` (2), `test:waves:e2e` (2), `test:waves:parallel` (4) | Перед PR, если правка затрагивает волны, интеграцию или внешних воркеров |
+| `npm run test:final` | Финальные сценарии приёмки | Перед PR, меняющим поведение CLI или конвейера |
+
+Полное локальное покрытие — все четыре команды: `check`, `test:heavy`, `test:waves` и `test:final`. Файлы из `test:heavy` и `test:waves` не входят в обычное обнаружение `npm test`; `tests/test-schedule.test.mjs` проверяет, что каждый тестовый файл запускается ровно в одной команде. Новый медленный файл добавляй в нужный список, а не в `npm test`.
+
+Реальные проверки провайдеров (`kodo doctor --live`) отделены от обычных тестов и расходуют квоты подписок. Обычные тесты к платным сервисам не обращаются.
+
+## Храповики
+
+- **`lint` (oxlint 1.91.0)** — предупреждения запрещены. Вне `tests/` функция не длиннее 150 строк и не сложнее 40, файл — не длиннее 900 строк кода (`max-lines-per-function`, `complexity`, `max-lines`). Существующий долг помечен `-- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md`. Новых меток не добавляй. Метку, ставшую лишней после рефакторинга, lint требует удалить (`--report-unused-disable-directives`).
+- **`typecheck`** — `tsc --checkJs` против `scripts/typecheck-baseline.json`. Новая диагностика валит проверку. Исправленную закрепи командой `npm run typecheck -- --update`, чтобы baseline только уменьшался.
+- **`format:check`** — Prettier. Перед коммитом выполни `npm run format`.
+
+## Правило `pins()`
+
+Новый модуль в `runtime/` добавь в `pins()` в `runtime/architecture-gate.mjs`: квитанция архитектурного гейта привязана к байтам этих файлов. Если модуль читает Engine, добавь его ещё и в `metadata().sources` в `runtime/benchmark.mjs`. При разбиении модуля фасад остаётся в обоих списках вместе с новыми файлами.
+
+## Рефакторинг и исправления
+
+- При рефакторинге тела функций переносятся без изменения логики.
+- Найденный по ходу баг исправляется отдельным коммитом с тестом, который падал до исправления (red/green).
+- Замороженные файлы `tests/*-oracle.test.mjs` и `tests/*-acceptance.test.mjs` не меняются: они должны остаться байт в байт такими же и проходить.
+
+## Pull request
+
+Перед открытием PR:
+
+1. `npm run check` проходит локально; при затронутых областях — также `test:heavy`, `test:waves`, `test:final`.
+2. Документация в `docs/` обновлена вместе с поведением. Квитанции (SHA, run ID, тайминги) указывай только наблюдённые, без оценок под видом фактов.
+3. Изменение выпуска описано в [CHANGELOG](CHANGELOG.md).
+
+Для слияния в `main` защита ветки требует:
+
+- `check (ubuntu-latest, 24)` и `check (windows-latest, 24)`: каждый проверяет шесть ног своей ОС — `ci-l2`, `ci-heavy`, `ci-waves-director`, `ci-waves-e2e`, `ci-waves-parallel`, `ci-final` ([CI](docs/CI.md#параллельный-ci-12-ног-pr-33));
+- `kodo/review` — независимое ревью.
+
+Обход защиты ветки (`--admin`) не используется. Доставку, теги и выпуски выполняет координатор по [docs/DELIVERY-RECOVERY.md](docs/DELIVERY-RECOVERY.md).

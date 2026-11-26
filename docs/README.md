@@ -68,6 +68,8 @@
 
 ## Разработка Kodo
 
+Порядок работы, ярусы тестов и требования к PR — в [CONTRIBUTING](../CONTRIBUTING.md); изменения по выпускам — в [CHANGELOG](../CHANGELOG.md).
+
 ```powershell
 npm ci
 npm run test:fast     # быстрые модульные тесты, меньше минуты
@@ -76,12 +78,15 @@ npm run format        # Prettier для собственного JavaScript
 npm run lint          # oxlint, предупреждения запрещены, сложность ограничена
 npm run typecheck     # tsc --checkJs против baseline известных диагностик
 npm run check         # validate + format:check + lint + typecheck + полная suite
+npm run test:heavy    # 19 тяжёлых интеграционных файлов (вне npm test)
+npm run test:waves    # 8 файлов фабрики волн (шарды test:waves:director|e2e|parallel)
+npm run test:final    # финальные сценарии приёмки
 ```
 
-`npm run check` — обязательная проверка, её выполняет CI на Linux и Windows. Полная suite в основном интеграционная: в CI 3–4 минуты на Linux и 16–20 минут на Windows; одна команда CI ограничена 40 минутами; `test:fast` даёт обратную связь при правке, но не заменяет её.
+`npm run check` — обязательная проверка, её выполняет CI на Linux и Windows. Полное локальное покрытие — четыре команды: `npm run check`, `npm run test:heavy`, `npm run test:waves` и `npm run test:final`. В CI они идут 12 параллельными ногами (по 6 на ОС); обязательные contexts — `check (ubuntu-latest, 24)` и `check (windows-latest, 24)`. В run [45857094167](https://github.com/Zulut30/Kodo/actions/runs/45857094167) (PR #33) весь CI занял 26 мин 10 с: самая долгая нога Ubuntu — 11 мин 14 с, Windows — 25 мин 59 с; нога L2 (`npm run check` + security) — 4 мин 34 с и 20 мин 58 с. Одна команда L2 ограничена 40 минутами. Подробности — [CI](CI.md#параллельный-ci-12-ног-pr-33). `test:fast` даёт обратную связь при правке, но не заменяет полную проверку.
 
 `typecheck` работает как храповик: новые диагностики `tsc --checkJs` валят проверку, а исправленные требуют `npm run typecheck -- --update`, чтобы baseline (`scripts/typecheck-baseline.json`) только уменьшался.
 
-`lint` тоже храповик для размера функций: вне `tests/` функция не длиннее 150 строк и не сложнее 40 (`max-lines-per-function`, `complexity`). Существующие нарушители помечены `oxlint-disable-next-line … -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md`; `--report-unused-disable-directives` валит lint, если пометка осталась после рефакторинга.
+`lint` тоже храповик размера: вне `tests/` функция не длиннее 150 строк и не сложнее 40 (`max-lines-per-function`, `complexity`), а файл — не длиннее 900 строк кода без пустых строк и комментариев (`max-lines`). Существующие нарушители помечены `oxlint-disable-next-line … -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md` (функции) или `/* oxlint-disable max-lines -- debt: … */` в начале файла (шесть файлов); `--report-unused-disable-directives` валит lint, если пометка осталась после рефакторинга. Остаток долга — в [плане сопровождаемости](kodo-roadmap/MAINTAINABILITY-PLAN.md).
 
 Покрытие (`test:coverage`) — встроенный V8-отчёт Node по `adapters/`, `cli/`, `runtime/`, `scripts/`; в отчёт попадают только модули, загруженные тестами. Это не гейт. Замер 2026-11-06, Windows, полная suite: строки 93.7 %, ветки 89.4 %, функции 94.9 %. Самые низкие — модули, которые обычные тесты намеренно не запускают по-настоящему: `providers.mjs` (19.6 % строк: вызовы подписочных клиентов), `ui-browser.mjs` (66 %: браузер), `process.mjs` (72 %).

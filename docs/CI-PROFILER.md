@@ -1,6 +1,6 @@
-# CI profiler (phase 03 draft)
+# CI profiler
 
-Профайлер измеряет локально выполненную команду через существующий owned-process port `runtime/delivery-process.mjs` (реэкспортируется из `runtime/delivery.mjs`). Он не запускает провайдеров и не заменяет обязательные checks. Phase02 принят (PR #11 / `dabecb7`); phase03 остаётся pending full/review/CI у координатора. Этот документ не подтверждает CI, публикацию или deployment.
+Профайлер измеряет локально выполненную команду через существующий owned-process port `runtime/delivery-process.mjs` (реэкспортируется из `runtime/delivery.mjs`). Он не запускает провайдеров и не заменяет обязательные checks. Модуль этапа 03, принятого в [PR #12](https://github.com/Zulut30/Kodo/pull/12) (`b3304b4`). Этот документ не подтверждает CI, публикацию или deployment.
 
 ## Контракт для CI task 5
 

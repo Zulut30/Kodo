@@ -18,6 +18,21 @@ kodo doctor --json
 
 `kodo init` включает [все 13 стандартных навыков](docs/DEFAULT-SKILLS.md) для Codex, Claude Code и OpenCode. Они также входят во все пресеты. Движок рассматривает их на каждом этапе; React/Next.js и monorepo-рекомендации применяются к соответствующим проектам.
 
+## Быстрый старт за 5 минут
+
+1. Установи Node.js 24 и войди в официальный клиент Codex или Claude Code своей подпиской.
+2. Установи CLI из релиза (см. выше) и проверь версию пакета: `kodo registry stats --json`.
+3. Перейди в Git-репозиторий проекта с хотя бы одним commit и подключи навыки: `kodo init`.
+4. Проверь предпосылки без обращения к провайдерам: `kodo doctor --client codex --json`.
+5. Запусти задачу и следи за ней:
+
+```powershell
+kodo run "Добавь экспорт в CSV и проверь его" --client codex --mode quick
+kodo status <runId> --json
+```
+
+`--mode quick` — один developer-проход с проверками и независимым ревью; без флага режим выбирает оценка Jev. Доставка по умолчанию не выполняется, пока её не включит `--delivery pr|release` или конфигурация проекта.
+
 ## Запуск из исходников
 
 ```powershell
@@ -182,10 +197,12 @@ MCP-шаблоны лежат в `.kodo/components/mcp/<name>/`. Они не п�
 ```powershell
 npm run test:fast   # быстрые модульные тесты, меньше минуты
 npm run check       # validate, формат, lint, типы и suite — шаг L2 в CI
-npm run test:heavy  # тяжёлые наборы с настоящими Git, Cargo и Engine — отдельный шаг CI
-npm run test:waves  # сквозные наборы фабрики волн — отдельный шаг CI
-npm run test:final  # финальные сценарии приёмки — отдельный шаг CI
+npm run test:heavy  # тяжёлые наборы с настоящими Git, Cargo и Engine — отдельная нога CI
+npm run test:waves  # 8 файлов фабрики волн — три ноги CI (director, e2e, parallel)
+npm run test:final  # финальные сценарии приёмки и package smoke — отдельная нога CI
 ```
+
+CI запускает эти команды 12 параллельными ногами (по 6 на Linux и Windows); полный прогон после [PR #33](https://github.com/Zulut30/Kodo/pull/33) занял 26 мин 10 с. Как вносить изменения — [CONTRIBUTING](CONTRIBUTING.md); история выпусков — [CHANGELOG](CHANGELOG.md).
 
 [Оглавление документации](docs/README.md) делит её на руководство, ADR и архив проверок; там же описаны команды разработки.
 

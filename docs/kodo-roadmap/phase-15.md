@@ -1,6 +1,6 @@
 # Этапы 15–16: движок большого проекта — параллельно, быстро, правильно
 
-Статус на 2026-11-24: **в работе.** Решение — [ADR-0017](../decisions/0017-parallel-engine.md). План составлен с Gemini 4 Neon и сведён координатором. Пользователь утвердил выполнение всего плана до конца (2026-11-24). Воркеры: `codex/gpt-6.2-astra`, `antigravity/gemini-4-neon`, Claude Opus 5.5. Машина — только этот ПК, пока пользователь не назовёт другие.
+Статус на 2026-11-26: **этапы 15 и 16 приняты.** Этап 15 — выпуски 1.1.0–1.1.2 и пилот Voxa (контрольная точка 1 — ACCEPTED). Этап 16 — [PR #32](https://github.com/Zulut30/Kodo/pull/32), [выпуск 1.2.0](https://github.com/Zulut30/Kodo/releases/tag/v1.2.0). Большой пилот контрольной точки 2 и живой прогон удалённой машины — NOT RUN (см. «Известные ограничения 1.2.0»). План утверждён 2026-11-24. Решение — [ADR-0017](../decisions/0017-parallel-engine.md). План составлен с Gemini 4 Neon и сведён координатором. Пользователь утвердил выполнение всего плана до конца (2026-11-24). Воркеры: `codex/gpt-6.2-astra`, `antigravity/gemini-4-neon`, Claude Opus 5.5. Машина — только этот ПК, пока пользователь не назовёт другие.
 
 ## Видение пользователя
 
@@ -124,6 +124,7 @@ Git-транспорт `refs/kodo/<projectId>/base|work/<runId>`, брифы б�
 Арбитр гейта на другой подписке из профиля (`confirm_pass`/`confirm_defect`/`split_needed`); автоповтор `project_integration_conflict` от свежей головы с прошлым диффом (до 2 раз); живой сторож внешних воркеров (нет прогресса, повтор одной ошибки, выход за область записи → подсказка → `--abandon` и переназначение); пределы чертежа и `extend`/`append-milestone` для 50+ задач на веху.
 
 - **16B1 (`kodo/16b1-arbiter`).** Арбитр гейта. Отказ ревью после исчерпанного ремонта при зелёных детерминированных проверках, включая smoke, рассматривает одна сессия на подписке другого провайдера из профиля. Сессия одна на gate Run. Решения: `confirm_pass` — гейт принят по `gateArbitration`, привязанному к head и квитанции ревью; `confirm_defect` — блок, как раньше; `split_needed` — `gate_split_needed` со `splitWork`. Без профиля или второй подписки поведение прежнее. Отчёт показывает число арбитражей. Подробности — [VERIFICATION.md](../VERIFICATION.md), «Арбитр гейта».
+- **16B2.** Автоповторы конфликтов интеграции, наблюдение за внешними воркерами и волновые проекты до 400 задач.
 
 ### 16C. Телеметрия и диспетчер T3
 
@@ -155,6 +156,8 @@ Git-транспорт `refs/kodo/<projectId>/base|work/<runId>`, брифы б�
 
 Слияние 16A–16C, полные проверки, CI, ревью, PR, `v1.2.0`, глобальный `kodo`. Большой прогон: многовеховая оригинальная воксельная игра на Rust, 50–80 задач, 10–20 параллельных воркеров; веха 2 через `kodo project extend`; итог по KPI.
 
+Статус на 2026-11-26: слияние, полные проверки, CI, ревью, PR #32, `v1.2.0` и глобальный `kodo` — выполнены (см. журнал). Большой прогон контрольной точки 2 — NOT RUN.
+
 ## Журнал
 
 | Дата | Событие |
@@ -164,6 +167,7 @@ Git-транспорт `refs/kodo/<projectId>/base|work/<runId>`, брифы б�
 | 2026-11-25 | [PR #28](https://github.com/Zulut30/Kodo/pull/28) влит (`12ddb7a`), [Release v1.1.0](https://github.com/Zulut30/Kodo/releases/tag/v1.1.0). |
 | 2026-11-25 | Пилот Voxa: 17 задач влиты за 33 мин. Найдены два дефекта Kodo → [PR #29](https://github.com/Zulut30/Kodo/pull/29) `e831087`, [v1.1.1](https://github.com/Zulut30/Kodo/releases/tag/v1.1.1) (слот Cargo) и [PR #30](https://github.com/Zulut30/Kodo/pull/30) `509c396`, [v1.1.2](https://github.com/Zulut30/Kodo/releases/tag/v1.1.2) (происхождение в гейтах). Проект принят на 1.1.2. Контрольная точка 1 — ACCEPTED. |
 | 2026-11-25 | Стрим 16C (`kodo/16c-telemetry`): телеметрия `kodo report --project` (`throughput`, `taskDuration`, `breakdown`, `firstPassYield`, `arbitrations`, `interventions`, `utilization`), запись недостающих отметок времени жизненного цикла внешних задач/очереди/гейтов, обновлены навык `kodo-project-director`, `docs/T3-HOST.md` и `docs/OBSERVABILITY.md`. |
-
-16B2 — автоповторы конфликтов интеграции, наблюдение за внешними воркерами и волновые проекты до 400 задач.
 | 2026-11-25 | 16E, запас времени Windows CI: 19 самых долгих файлов (этап 15 и `priority`) вынесены из L2 в обязательный шаг `npm run test:heavy`, медиана Windows L2 по оценке ≈ 33,9 → 25,0 мин; кейсы волновых наборов получили общий предел 900 с. Замеры — [CI](../CI.md). |
+| 2026-11-26 | [PR #32](https://github.com/Zulut30/Kodo/pull/32) влит (`39ef196`): 16A–16E. [CI 45707798608](https://github.com/Zulut30/Kodo/actions/runs/45707798608): `check (ubuntu-latest, 24)` 17 мин, `check (windows-latest, 24)` 141 мин, `kodo/review` PASS. |
+| 2026-11-26 | Тег `v1.2.0` и [Release v1.2.0](https://github.com/Zulut30/Kodo/releases/tag/v1.2.0): `zulut30-kodo-1.2.0.tgz`, SHA-256 `ef476061fe3d3eac9bd7de3eaab7374046debb1544cd3c61cc083106f52faeae`, скачан обратно и сверен с `SHA256SUMS`. `node scripts/package-smoke.mjs` PASS (34 компонента, 13 навыков по умолчанию, 183 upstream-файла). Глобальный `kodo` 1.2.0 проверен `registry stats`, `validate`, `doctor` (`--json`). Этап 16 — ACCEPTED; удалённая машина вживую и контрольная точка 2 — NOT RUN. |
+| 2026-11-26 | [PR #33](https://github.com/Zulut30/Kodo/pull/33) влит (`85619f5`): 12 параллельных ног CI, волновые тесты — 8 файлов в 3 шардах. [CI 45857094167](https://github.com/Zulut30/Kodo/actions/runs/45857094167): все ноги и оба `check` PASS за 26 мин 10 с вместо 141 мин (≈ 5,4×). Замеры — [CI](../CI.md#параллельный-ci-12-ног-pr-33). |
