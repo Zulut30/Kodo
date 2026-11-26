@@ -2,7 +2,7 @@
 import path from 'node:path';
 import { lstat, readFile, readdir, realpath } from 'node:fs/promises';
 import { parse as parseToml } from 'smol-toml';
-import { cargoMembers } from './cargo-graph.mjs';
+import { resolveCargoWorkspaceRoots } from './cargo-workspace.mjs';
 import { toolCatalog } from './tools.mjs';
 import { inside, noLinks, sha256 } from './toolchains.mjs';
 import { secretFile } from './security.mjs';
@@ -533,7 +533,7 @@ const at = (root, name) => (root ? root + '/' + name : name);
 function metadataKind(name) {
   const base = path.posix.basename(name);
   if (
-    /^(?:package(?:-lock)?\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?|tsconfig[^/]*\.json|Cargo\.(?:toml|lock)|rust-toolchain(?:\.toml)?|go\.(?:mod|sum|work|work\.sum)|composer\.(?:json|lock)|global\.json|Directory\.(?:Build\.(?:props|targets)|Packages\.props)|NuGet\.Config|kodo\.config\.json|(?:next|astro|stylelint|oxlint|oxfmt)\.config\.[^/]+|\.?(?:stylelintrc|htmlvalidate|oxlintrc|oxfmtrc)[^/]*|\.sqlfluff|\.editorconfig|phpstan[^/]*\.(?:neon|json)|phpcs\.xml(?:\.dist)?|\.phpcs\.xml(?:\.dist)?)$/i.test(
+    /^(?:package(?:-lock)?\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?|tsconfig[^/]*\.json|Cargo\.(?:toml|lock)|rust-toolchain(?:\.toml)?|\.?rustfmt\.toml|\.?clippy\.toml|\.gitignore|architecture\.policy\.json|go\.(?:mod|sum|work|work\.sum)|composer\.(?:json|lock)|global\.json|Directory\.(?:Build\.(?:props|targets)|Packages\.props)|NuGet\.Config|kodo\.config\.json|(?:next|astro|stylelint|oxlint|oxfmt)\.config\.[^/]+|\.?(?:stylelintrc|htmlvalidate|oxlintrc|oxfmtrc)[^/]*|\.sqlfluff|\.editorconfig|phpstan[^/]*\.(?:neon|json)|phpcs\.xml(?:\.dist)?|\.phpcs\.xml(?:\.dist)?)$/i.test(
       base,
     ) ||
     /\.(?:csproj|slnx?)$/i.test(base)
@@ -580,16 +580,13 @@ function metadataScope(report, scope, affected) {
     return { widened, blocked: unknown };
   return { widened, blocked: [] };
 }
-function rustWorkspaceRoots(documents) {
-  const roots = new Map();
+export function rustWorkspaceRoots(documents, files) {
+  const manifests = new Map();
   for (const [name, doc] of documents) {
-    if (path.posix.basename(name) !== 'Cargo.toml' || !doc.workspace) continue;
-    const root = dir(name);
-    for (const member of cargoMembers(documents, root).keys()) {
-      if (!roots.has(member) || roots.get(member).length < root.length) roots.set(member, root);
-    }
+    if (path.posix.basename(name) === 'Cargo.toml') manifests.set(name, doc);
   }
-  return roots;
+  if (!manifests.size) return new Map();
+  return resolveCargoWorkspaceRoots({ manifests, files });
 }
 
 function inheritedDocument(root, filename, documents) {
@@ -824,7 +821,8 @@ export class QualityProfileRegistry {
     const metadata =
       mode === 'quick' && scope ? metadataScope(report, scope, affected) : { widened: new Map(), blocked: [] };
     const checks = [];
-    const workspaceRoots = rustWorkspaceRoots(documents);
+    const projectFilePaths = report.files.filter(f => !f.dependency).map(f => f.path);
+    const workspaceRoots = rustWorkspaceRoots(documents, projectFilePaths);
     for (const profile of report.profiles)
       for (const capability of selected) {
         const triggers = metadata.widened.get(profile.id);
@@ -915,12 +913,29 @@ export class QualityProfileRegistry {
               }
               if (check.tool === 'cargo') {
                 check.rustcVersion = nativePin(profile, 'rustc', config, documents) ?? null;
-                if (!check.rustcVersion) check = { ...check, status: 'missing', reason: 'exact_rustc_pin_required' };
+                const unpinnedCargo = !check.version;
+                const unpinnedRustc = !check.rustcVersion;
                 if (capability === 'lint') {
                   check.clippyVersion = config.tools.clippy?.version ?? null;
                   if (!check.clippyVersion && exact(channel)) check.toolchain = channel;
-                  else if (!check.clippyVersion)
-                    check = { ...check, status: 'missing', reason: 'exact_clippy_pin_required' };
+                }
+                const unpinnedClippy = capability === 'lint' && !check.clippyVersion && !exact(channel);
+                const feedbackUnpinned =
+                  options.feedback === true &&
+                  ['lint', 'typecheck'].includes(capability) &&
+                  (unpinnedCargo || unpinnedRustc || unpinnedClippy);
+                if (feedbackUnpinned) {
+                  if (check.status === 'missing' && check.reason === 'exact_project_tool_pin_required') {
+                    check.status = 'applicable';
+                    delete check.reason;
+                  }
+                  if (check.status === 'applicable') {
+                    check.unpinnedToolchain = true;
+                    check.warnings = ['toolchain_unpinned'];
+                  }
+                } else {
+                  if (unpinnedRustc) check = { ...check, status: 'missing', reason: 'exact_rustc_pin_required' };
+                  if (unpinnedClippy) check = { ...check, status: 'missing', reason: 'exact_clippy_pin_required' };
                 }
               }
             }

@@ -1,3 +1,4 @@
+import { verifyRemoteProof } from './remote-task-receipt.mjs';
 import path from 'node:path';
 import { realpath, readFile } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
@@ -30,6 +31,7 @@ import {
   npmContextFor,
   npmCountOutcome,
 } from './task-fast-checks.mjs';
+import { arbitrationAccepts, arbitrationReceiptValue } from './gate-arbiter.mjs';
 
 const fail = code => {
   throw Object.assign(new Error(`Project ${code}`), { code: `project_${code}` });
@@ -158,8 +160,9 @@ async function assertRunSource(snapshot, run, wave = false) {
   );
   requireValue((await inspectCurrentSource({ project: run.cwd, headSha: run.headSha })) === 'clean', 'head_changed');
 }
-// Full checks with their logs, the independent review and every enabled gate on the verified head.
-async function assertFullReceipts(engine, run, gateContext = null) {
+// The full check receipt of `run.headSha`: the configured test and build commands of this
+// runtime, each passed, with an intact log of exactly that passing command.
+async function assertCheckReceipts(engine, run) {
   validateCommandTimeouts(run.config.commands);
   const expected = ['test', 'build'].flatMap(kind => run.config.commands[kind].map(command => ({ kind, command })));
   const fingerprint = hash({
@@ -198,14 +201,16 @@ async function assertFullReceipts(engine, run, gateContext = null) {
         isDeepStrictEqual(log.value.command, row.command),
     );
   }
-  requireValue(
-    run.review?.passed === true &&
-      run.review.headSha === run.headSha &&
-      run.review.sessionId &&
-      !run.review.findings?.some(row => ['major', 'blocker'].includes(row.severity)) &&
-      run.review.diffHash === (await diffHash(run.cwd, run.baseSha)),
-    'review_stale',
-  );
+}
+
+// The review receipt of `run.headSha` (its session and the current diff of the Run).
+const reviewOfHead = async run =>
+  run.review.headSha === run.headSha &&
+  run.review.sessionId &&
+  run.review.diffHash === (await diffHash(run.cwd, run.baseSha));
+
+// Every enabled UI/security/architecture gate holds a current receipt for `run.headSha`.
+async function assertGateReceipts(engine, run, gateContext) {
   const archTaskPaths = architectureTaskPathsForRun(run);
   const archTaskScopes = architectureTaskScopesForRun(run, gateContext ?? undefined);
   for (const [field, setting, method] of [
@@ -234,6 +239,49 @@ async function assertFullReceipts(engine, run, gateContext = null) {
         'gate_stale',
       );
   }
+}
+
+// Full checks with their logs, the independent review and every enabled gate on the verified head.
+async function assertFullReceipts(engine, run, gateContext = null) {
+  await assertCheckReceipts(engine, run);
+  // A gate Run whose review refused may be accepted only by a `confirm_pass` arbitration bound to
+  // this verified head and to that review receipt (16B1); its immutable receipt is checked too.
+  const arbitrated = gateContext !== null && run.review?.passed === false && arbitrationAccepts(run);
+  requireValue(
+    (arbitrated ||
+      (run.review?.passed === true &&
+        !run.review.findings?.some(row => ['major', 'blocker'].includes(row.severity)))) &&
+      (await reviewOfHead(run)),
+    'review_stale',
+  );
+  if (arbitrated) await assertArbitrationReceipt(engine, run);
+  await assertGateReceipts(engine, run, gateContext);
+}
+
+/**
+ * The receipts a gate arbiter relies on (16B1), checked like the Director's acceptance does
+ * before any arbiter session: on the reviewed `headSha` of a refused gate review, the full check
+ * receipt with intact logs and positive test counts, a current behaviour receipt, the review bound
+ * to the current diff of the gate (`diffHash`), current UI/security/architecture receipts and,
+ * with `smoke`, the smoke receipt with its logs. Throws the receipt's `project_*` code (or
+ * `evidence_integrity`) on any mismatch.
+ * @param {any} engine
+ * @param {any} run the gate Run (its `run.headSha` is not changed)
+ * @param {string} headSha the reviewed head
+ * @param {{ smoke?: boolean }} [options]
+ */
+export async function assertArbitrableReceipts(engine, run, headSha, { smoke = false } = {}) {
+  requireValue(run?.directorBinding?.kind === 'gate' && typeof headSha === 'string', 'binding_invalid');
+  const view = { ...run, headSha };
+  await assertCheckReceipts(engine, view);
+  await assertTestCounts(view, { step: row => row.command, positive: true, code: 'gate_tests_uncounted' });
+  requireValue(
+    isCurrentBehaviorReceipt(view.behavior, { headSha, baseSha: view.baseSha, config: view.config }),
+    'behavior_stale',
+  );
+  requireValue(view.review?.passed === false && (await reviewOfHead(view)), 'review_stale');
+  await assertGateReceipts(engine, view, null);
+  if (smoke) await assertSmoke(engine, view);
 }
 async function assertPublication(engine, run) {
   requireValue(
@@ -320,11 +368,36 @@ async function assertGateManifest({ engine, contracts, run, gate, input, options
   return manifest;
 }
 
+// The arbitration of a gate Run: its frozen input and its record are intact immutable evidence of
+// this Run on the arbitrated head, and the receipt holds exactly the record on the Run.
+async function assertArbitrationReceipt(engine, run) {
+  const record = run.gateArbitration;
+  for (const [kind, ref] of [
+    ['gate-arbitration-input', record.input],
+    ['gate-arbitration', record.receipt],
+  ])
+    await verifyRef(engine, { kind, path: ref?.path, sha256: ref?.sha256, headSha: record.headSha }, run).catch(() =>
+      fail('arbitration_invalid'),
+    );
+  const envelope = JSON.parse(await readFile(record.receipt.path, 'utf8'));
+  requireValue(
+    envelope.kind === 'gate-arbitration' &&
+      envelope.headSha === run.headSha &&
+      isDeepStrictEqual(envelope.value, arbitrationReceiptValue(record)),
+    'arbitration_invalid',
+  );
+}
+
 // The independent review of a gate confirmed every criterion of its manifest (each covered
-// container's and task's), each exactly once, met, with evidence.
+// container's and task's), each exactly once, met, with evidence. After a refused review, the
+// `confirm_pass` arbitration that accepted the Run confirms them instead.
 function assertGateCriteria(contracts, run, manifest) {
+  const source =
+    run.review?.passed === false && arbitrationAccepts(run)
+      ? run.gateArbitration.evidence.criteria
+      : run.review?.criteria;
   const expected = contracts.gateReviewCriteria(manifest),
-    confirmed = Array.isArray(run.review?.criteria) ? run.review.criteria : [];
+    confirmed = Array.isArray(source) ? source : [];
   requireValue(
     isDeepStrictEqual(run.gateCriteria, expected) &&
       confirmed.length === expected.length &&
@@ -409,6 +482,11 @@ async function validateWaveTask({ engine, contracts, snapshot, run, options }) {
     secrets: engine.secrets,
   });
   if (!succeeded) return;
+  if (run.checks?.source === 'remote') {
+    requireValue(await verifyRemoteProof(run), 'checks_stale');
+    await assertTaskMerge(snapshot, run);
+    return;
+  }
   requireValue(run.checks?.profile === 'task-fast' && Array.isArray(run.checks.results), 'checks_stale');
   await assertLogs(engine, run, run.checks.results, 'fast-check');
   await assertTestCounts(run, { step: row => row, positive: false, code: 'fast_tests_uncounted' });

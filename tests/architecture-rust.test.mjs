@@ -510,7 +510,7 @@ test('Rust workspace blueprint with >= 3 crates requires a Wave 0 contract crate
       { id: 'gameplay', milestoneId: 'mvp', title: 'Gameplay', acceptance: [criterion('ge-done')] },
     ],
     tasks: [
-      makeTask('scaffold', 'foundation', [], ['Cargo.toml', 'architecture.policy.json']),
+      makeTask('scaffold', 'foundation', [], ['Cargo.toml', 'rust-toolchain.toml', 'architecture.policy.json']),
       makeTask('core-crate', 'gameplay', ['scaffold'], ['crates/core']),
       makeTask('world-crate', 'gameplay', ['core-crate'], ['crates/world']),
       makeTask('render-crate', 'gameplay', ['world-crate'], ['crates/render']),
@@ -1164,7 +1164,13 @@ test('E5: contract_crate_required requires Cargo.toml + src/**, supports explici
         'w0',
         'foundation',
         [],
-        ['Cargo.toml', 'architecture.policy.json', 'crates/game-contracts/Cargo.toml', 'crates/game-contracts/src/**'],
+        [
+          'Cargo.toml',
+          'rust-toolchain.toml',
+          'architecture.policy.json',
+          'crates/game-contracts/Cargo.toml',
+          'crates/game-contracts/src/**',
+        ],
       ),
       mkTask('core', 'mvp', ['w0'], ['crates/core']),
       mkTask('world', 'mvp', ['core'], ['crates/world']),
@@ -1179,7 +1185,12 @@ test('E5: contract_crate_required requires Cargo.toml + src/**, supports explici
   const protocolMarkdown = wsMarkdown + '\ncontractCrate: crates/protocol\n';
   const withProtocol = lintFactorySpec(
     baseSpec([
-      mkTask('w0', 'foundation', [], ['Cargo.toml', 'architecture.policy.json', 'crates/protocol']),
+      mkTask(
+        'w0',
+        'foundation',
+        [],
+        ['Cargo.toml', 'rust-toolchain.toml', 'architecture.policy.json', 'crates/protocol'],
+      ),
       mkTask('core', 'mvp', ['w0'], ['crates/core']),
       mkTask('world', 'mvp', ['core'], ['crates/world']),
       mkTask('render', 'mvp', ['world'], ['crates/render']),
@@ -1196,7 +1207,12 @@ test('E5: contract_crate_required requires Cargo.toml + src/**, supports explici
   // Also works when contract crate is declared via architecturePolicy option (policy.contractCrates)
   const withPolicyDecl = lintFactorySpec(
     baseSpec([
-      mkTask('w0', 'foundation', [], ['Cargo.toml', 'architecture.policy.json', 'crates/protocol']),
+      mkTask(
+        'w0',
+        'foundation',
+        [],
+        ['Cargo.toml', 'rust-toolchain.toml', 'architecture.policy.json', 'crates/protocol'],
+      ),
       mkTask('core', 'mvp', ['w0'], ['crates/core']),
       mkTask('world', 'mvp', ['core'], ['crates/world']),
       mkTask('render', 'mvp', ['world'], ['crates/render']),
@@ -3019,7 +3035,12 @@ test('X3: existing Cargo.toml [package].name maps crate directory (crates/protoc
       { id: 'domain', milestoneId: 'mvp', title: 'Domain', acceptance: [criterion('me-done')] },
     ],
     tasks: [
-      mkTask('w0', 'foundation', [], ['Cargo.toml', 'crates/protocol/Cargo.toml', 'crates/protocol/src/**']),
+      mkTask(
+        'w0',
+        'foundation',
+        [],
+        ['Cargo.toml', 'rust-toolchain.toml', 'crates/protocol/Cargo.toml', 'crates/protocol/src/**'],
+      ),
       mkTask('world', 'domain', ['w0'], ['crates/world/Cargo.toml', 'crates/world/src/**']),
       mkTask('combat', 'domain', ['w0'], ['crates/combat/Cargo.toml', 'crates/combat/src/**']),
     ],
@@ -3068,6 +3089,8 @@ test('X6: Wave 0 Rust docs/skill/bootstrap cover crate stubs, Cargo.lock, .gitig
     assert.match(text, /заготовк/i, `${label}: must instruct Wave 0 to create stubs for all module crates`);
     assert.match(text, /src\/lib\.rs/, `${label}: must mention src/lib.rs stubs in Wave 0`);
     assert.match(text, /Cargo\.lock/, `${label}: must instruct Wave 0 to commit Cargo.lock`);
+    assert.match(text, /rust-toolchain\.toml/, `${label}: must instruct Wave 0 to include rust-toolchain.toml`);
+    assert.match(text, /rust_toolchain_required/, `${label}: must document rust_toolchain_required`);
     assert.match(text, /\.gitignore[^\n]*target\//, `${label}: must instruct Wave 0 to commit .gitignore with target/`);
     assert.match(
       text,

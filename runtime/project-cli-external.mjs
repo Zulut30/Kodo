@@ -8,12 +8,18 @@ const slug = /^[a-z][a-z0-9-]{0,47}$/;
 const sha = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 const booleans = ['--json', '--retry-failed', '--defer-gate', '--abandon'];
 const flagsFor = {
-  'next-wave': ['--json', '--host', '--limit', '--retry-failed'],
-  'complete-task': ['--json', '--head', '--defer-gate', '--abandon', '--command-id', '--attempt'],
+  'next-wave': ['--json', '--host', '--limit', '--stall-minutes', '--retry-failed'],
+  'complete-task': ['--json', '--head', '--defer-gate', '--abandon', '--command-id', '--attempt', '--receipt'],
   gates: ['--json', '--retry-failed'],
 };
 // Constant codes of the protocol itself; never data, paths or provider output.
 const reported = new Set([
+  'project_transport_failed',
+  'project_transport_too_large',
+  'project_submission_locked',
+  'project_brief_path_leak',
+  'project_transport_head_mismatch',
+  'project_receipt_mismatch',
   'project_dependency_cycle',
   'project_dependency_missing',
   'project_dependency_duplicate',
@@ -106,6 +112,11 @@ function argumentsFor(argv) {
       (flags['--limit'] !== undefined && (!/^[1-9]\d?$/.test(flags['--limit']) || Number(flags['--limit']) > 64)))
   )
     invalid();
+  if (
+    flags['--stall-minutes'] !== undefined &&
+    (!/^[1-9]\d*$/.test(flags['--stall-minutes']) || !Number.isSafeInteger(Number(flags['--stall-minutes'])))
+  )
+    invalid();
   if (complete && (!sha.test(flags['--head'] ?? '') || (flags['--defer-gate'] && flags['--abandon']))) invalid();
   if (flags['--command-id'] !== undefined && !uuid.test(flags['--command-id'])) invalid();
   if (flags['--attempt'] !== undefined && !uuid.test(flags['--attempt'])) invalid();
@@ -121,11 +132,13 @@ function human(report) {
   for (const brief of result.briefs)
     lines.push(
       `- ${brief.chatTitle} (${brief.role})`,
-      `  worktree: ${brief.worktree}`,
+      brief.repository ? `  repository: ${brief.repository}` : `  worktree: ${brief.worktree}`,
       `  branch: ${brief.branch}`,
       `  self-check: ${brief.selfCheck}`,
       `  complete: ${brief.completeCommand}`,
     );
+  for (const row of result.watch ?? [])
+    lines.push(`- watch ${row.taskId} (${row.attemptId}): ${row.code}. ${row.hint}`);
   for (const row of result.blocked) lines.push(`- blocked ${row.taskId ?? `${row.kind} ${row.id}`}: ${row.code}`);
   if (result.code) lines.push(`Project: ${result.code}`);
   else if (!result.briefs.length && !result.blocked.length) lines.push('No task is ready for this host.');
@@ -162,6 +175,7 @@ async function operate(options, ports, safety) {
       result = await external.nextWave(ctx, {
         projectId: options.projectId,
         host: flags['--host'],
+        ...(flags['--stall-minutes'] && { stallMinutes: Number(flags['--stall-minutes']) }),
         ...(flags['--limit'] && { limit: Number(flags['--limit']) }),
         retryFailed: flags['--retry-failed'] === true,
         ports: ports.wave,
@@ -183,6 +197,7 @@ async function operate(options, ports, safety) {
         projectId: options.projectId,
         taskId: options.taskId,
         head: flags['--head'],
+        receipt: flags['--receipt'],
         deferGate: flags['--defer-gate'] === true,
         abandon: flags['--abandon'] === true,
         ...(flags['--command-id'] ? { commandId: flags['--command-id'] } : {}),

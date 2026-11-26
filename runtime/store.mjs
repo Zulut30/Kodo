@@ -323,9 +323,15 @@ export function openKnowledgeReader(home = stateHome()) {
 }
 
 export class Store {
-  constructor(home = stateHome(), secrets = {}) {
+  /**
+   * @param {string} [home]
+   * @param {Record<string, string>} [secrets]
+   * @param {{ clock?: () => number }} [options]
+   */
+  constructor(home = stateHome(), secrets = {}, { clock } = {}) {
     this.home = home;
     this.secrets = secrets;
+    this.clock = typeof clock === 'function' ? clock : () => Date.now();
     mkdirSync(home, { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(path.join(home, 'state.sqlite'));
     this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;
@@ -340,19 +346,18 @@ export class Store {
     `);
   }
   createRun(run) {
+    const now = this.clock();
     const value = {
       ...run,
       id: run.id || randomUUID(),
-      createdAt: new Date().toISOString(),
+      createdAt: new Date(now).toISOString(),
       state: 'created',
       completed: {},
       nodes: {},
       ...run,
     };
-    this.db
-      .prepare('INSERT INTO runs VALUES(?,?,?)')
-      .run(value.id, JSON.stringify(redact(value, this.secrets)), Date.now());
-    this.event(value.id, 'created', { task: value.task });
+    this.db.prepare('INSERT INTO runs VALUES(?,?,?)').run(value.id, JSON.stringify(redact(value, this.secrets)), now);
+    this.event(value.id, 'created', { task: value.task }, now);
     return value;
   }
   getRun(id) {
@@ -369,7 +374,8 @@ export class Store {
     try {
       assertFence(this.db);
       const current = this.getRun(id);
-      const run = { ...current, ...patch, updatedAt: new Date().toISOString() };
+      const now = this.clock();
+      const run = { ...current, ...patch, updatedAt: new Date(now).toISOString() };
       if (preserveCancellation) {
         run.cancelRequested = Boolean(current.cancelRequested);
         if (run.cancelRequested && !run.release?.published) {
@@ -379,7 +385,7 @@ export class Store {
       }
       this.db
         .prepare('UPDATE runs SET body=?,updated=? WHERE id=?')
-        .run(JSON.stringify(redact(run, this.secrets)), Date.now(), id);
+        .run(JSON.stringify(redact(run, this.secrets)), now, id);
       if (own) this.db.exec('COMMIT');
       return run;
     } catch (error) {
@@ -415,10 +421,10 @@ export class Store {
       .map(row => JSON.parse(row.body))
       .filter(run => !project || projectKey(run.project) === projectKey(project));
   }
-  event(runId, type, data = {}) {
+  event(runId, type, data = {}, time = this.clock()) {
     this.db
       .prepare('INSERT INTO events(run_id,type,data,time) VALUES(?,?,?,?)')
-      .run(runId, type, JSON.stringify(redact(data, this.secrets)), Date.now());
+      .run(runId, type, JSON.stringify(redact(data, this.secrets)), time);
   }
   events(runId, after = 0) {
     return this.db

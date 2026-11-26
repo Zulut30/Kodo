@@ -12,6 +12,7 @@
  */
 import { aggregateMetrics } from './metrics.mjs';
 import { DELIVERY_OPERATIONS, OPERATION_EVENT } from './delivery-operations.mjs';
+import { buildProjectTelemetry } from './project-telemetry.mjs';
 
 export const REPORT_SCHEMA_VERSION = 1;
 export const REPORT_STAGES = Object.freeze([
@@ -480,7 +481,9 @@ function timing(run, events, stages) {
   const created = millis(run.createdAt) ?? millis(events.find(event => event.type === 'created')?.time);
   let finished = null;
   if (terminalStates.has(run.state))
-    for (const event of events) if (event.type === run.state) finished = millis(event.time) ?? finished;
+    for (const event of events)
+      if (event.type === run.state || (run.state === 'succeeded' && event.type === 'gate_succeeded'))
+        finished = millis(event.time) ?? finished;
   return { createdAt: iso(created), finishedAt: iso(finished), wallMs: interval(created, finished), stages };
 }
 
@@ -711,6 +714,13 @@ function projectBlockers(snapshot, rows, current) {
   return blockers;
 }
 
+// Decisions of the gate arbiter (gate-arbiter.mjs); any other saved value is not reported.
+const arbiterDecisions = ['confirm_pass', 'confirm_defect', 'split_needed'];
+const arbitrationOf = run =>
+  record(run?.gateArbitration) && arbiterDecisions.includes(run.gateArbitration.decision)
+    ? run.gateArbitration.decision
+    : null;
+
 /**
  * Wave gates with the state of their gate Runs: a gate record has no status of its own. A gate
  * whose Run is not found keeps `unknown` (or a status the record itself carries).
@@ -730,6 +740,7 @@ function gateRows(snapshot, runsById, eventsByRun, options) {
       const containers = list(gate.containers)
         .filter(record)
         .map(item => `${code(item.kind, 'unknown')}:${slug(item.id)}`);
+      const arbitration = report ? arbitrationOf(run) : null;
       return {
         row: {
           id: slug(gate.id),
@@ -737,6 +748,8 @@ function gateRows(snapshot, runsById, eventsByRun, options) {
           runId: runId === null ? null : slug(runId),
           containers,
           sessions: report ? report.attempts.sessions : null,
+          // The decision of the gate arbiter (16B1), only when one was recorded.
+          ...(arbitration ? { arbitration } : {}),
         },
         number: integer(gate.number),
         key: containers[0] ?? null,
@@ -771,12 +784,17 @@ function gateBlockers(gates) {
 // whose Run is missing makes the session total unknown; `observedUsage` keeps what was found.
 function gateTotals(gates) {
   const found = gates.filter(gate => gate.report);
+  const decisions = found.map(gate => gate.row.arbitration).filter(Boolean);
   return {
     gates: gates.length,
     runs: found.length,
     complete: found.length === gates.length,
     sessions: gates.length ? total(gates.map(gate => gate.row.sessions)).value : 0,
     observedUsage: usageOf(found.flatMap(gate => list(gate.run.sessionAttempts))),
+    arbitrations: {
+      total: decisions.length,
+      ...Object.fromEntries(arbiterDecisions.map(name => [name, decisions.filter(item => item === name).length])),
+    },
   };
 }
 
@@ -825,15 +843,17 @@ function snapshotCompleteness(snapshot) {
  * @param {any} snapshot Project snapshot (`repo.snapshot`).
  * @param {Map<string, any> | Record<string, any>} runsById Saved Runs by id.
  * @param {Map<string, any[]> | Record<string, any[]>} eventsByRun Saved Run events by Run id.
- * @param {{ now?: number, attempts?: any[], jobEvents?: Map<string, any[]> | Record<string, any[]> }} [options]
+ * @param {{ now?: number, attempts?: any[], jobEvents?: Map<string, any[]> | Record<string, any[]>,
+ *   integrationQueue?: any[], profile?: any }} [options]
  *   `attempts`: every attempt `{ taskId, number, runId }` of the Project; defaults to the snapshot's
  *   current attempts. `jobEvents`: durable job receipts by Run id (see `buildRunReport`).
+ *   `integrationQueue`: rows of `kodo_integration_queue` for the Project. `profile`: saved ExecutionProfile.
  */
 export function buildProjectReport(
   snapshot,
   runsById,
   eventsByRun,
-  { now = null, attempts = undefined, jobEvents = {} } = {},
+  { now = null, attempts = undefined, jobEvents = {}, integrationQueue = [], profile = null } = {},
 ) {
   if (!record(snapshot) || !record(snapshot.project)) throw new TypeError('Project report requires a snapshot');
   const current = new Map(
@@ -886,6 +906,18 @@ export function buildProjectReport(
     runs: { known: found.length, total: attemptsTotal, complete: found.length === attemptsTotal },
   };
   const seenPlatforms = platforms(runs);
+  const snapshotComplete = !Object.entries(completeness).some(([key, value]) => key !== 'runs' && !value.complete);
+  const kpis = buildProjectTelemetry({
+    snapshot,
+    attempts: all,
+    runsById,
+    eventsByRun,
+    integrationQueue,
+    profile,
+    waveGates,
+    runsComplete: completeness.runs.complete,
+    snapshotComplete,
+  });
   const notes = new Set();
   if (!completeness.runs.complete) notes.add('runs_missing');
   if (Object.entries(completeness).some(([key, value]) => key !== 'runs' && !value.complete))
@@ -910,6 +942,7 @@ export function buildProjectReport(
     tasks: rows.map(item => item.row),
     attempts: attemptRows.map(item => item.row),
     totals,
+    ...kpis,
     ...(waveGates ? { gates: waveGates.map(gate => gate.row) } : {}),
     blockers: [...projectBlockers(snapshot, rows, current), ...(waveGates ? gateBlockers(waveGates) : [])],
     completeness,

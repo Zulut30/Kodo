@@ -19,8 +19,11 @@ const testFile = file =>
   /(?:^|\/)(?:[^/]+[._-](?:test|spec)|test-[^/]+)\.(?:mjs|cjs|js|ts|tsx|mts|cts|jsx)$/.test(file) ||
   /(?:^|\/)(?:test|__tests__)\/.*\.(?:mjs|cjs|js|ts|tsx|mts|cts|jsx)$/.test(file);
 const lockFile = file =>
-  /(?:^|\/)(?:package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb?)$/.test(file);
+  /(?:^|\/)(?:package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb?|Cargo\.lock)$/.test(file);
 const manifestFile = file => /(?:^|\/)package\.json$/.test(file);
+const knownConfigFile = file =>
+  /(?:^|\/)(?:[^/]*[.-]config(?:[.-]|$)|\.[^/]*rc(?:[.-]|$))/.test(file) ||
+  /(?:^|\/)(?:\.gitignore|architecture\.policy\.json|rust-toolchain(?:\.toml)?|kodo\.config\.json)$/.test(file);
 
 function relative(file) {
   if (
@@ -387,8 +390,7 @@ export async function planAffected({ project, baseSha, headSha, changedPaths = [
     if (lockFile(file)) reasons.add(`lock-change:${file}`);
     else if (manifestFile(file)) reasons.add(`package-change:${file}`);
     else if (file.startsWith('.github/') || file.startsWith('.gitlab/')) reasons.add(`ci-change:${file}`);
-    else if (/(?:^|\/)(?:[^/]*[.-]config(?:[.-]|$)|\.[^/]*rc(?:[.-]|$))/.test(file))
-      reasons.add(`config-change:${file}`);
+    else if (knownConfigFile(file)) reasons.add(`config-change:${file}`);
     else if (!javascript(file)) reasons.add(`unknown-file-or-config:${file}`);
     if (oldGraph.publicEntries.has(file) || graph.publicEntries.has(file)) reasons.add(`public-api-change:${file}`);
   }

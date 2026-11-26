@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { mkdtemp, mkdir, writeFile, readFile, rm, symlink } from 'node:fs/promises';
-import { readFileSync, statSync } from 'node:fs';
+import { readFileSync, readdirSync, statSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -112,7 +112,7 @@ test(
 
 test('Scheduler orders observed file durations longest first and retains every discovered file once', async t => {
   const { temp, put } = await fixture(t);
-  const { orderTests, discoverTests } = await import(scheduleUrl);
+  const { orderTests, discoverTests, heavySuites } = await import(scheduleUrl);
   // Independent oracle locked from source821 receipt c9b54c3c: all 19 completed
   // files >=90000 ms descending, then scheduling's 100233.5395 ms case-work
   // lower-bound heuristic (not file elapsed), then the three retained lighter
@@ -156,7 +156,12 @@ test('Scheduler orders observed file durations longest first and retains every d
   assert.equal(new Set(ordered).size, expected.length);
   assert.deepEqual([...ordered].sort(), [...expected].sort(), 'same complete file multiset');
   assert.deepEqual(input, original, 'ordering must not mutate caller input');
-  assert.deepEqual([...discoverTests(temp)].sort(), [...expected].sort(), 'default discovery remains complete');
+  // Default discovery keeps every file except the heavy suites, which `npm run test:heavy` runs (stage 16E).
+  assert.deepEqual(
+    [...discoverTests(temp)].sort(),
+    expected.filter(file => !heavySuites.includes(path.relative(temp, file).replaceAll('\\', '/'))).sort(),
+    'default discovery remains complete outside the separate steps',
+  );
   assert.deepEqual(ordered, expected);
   assert.deepEqual(orderTests([...input].reverse(), temp), expected);
 });
@@ -184,19 +189,108 @@ test('The wave factory suites run in their own command and CI step, outside defa
   assert.doesNotMatch(fast, /npm run test:waves/);
   assert.match(check, /\n {6}- name: Wave factory suites\n {8}run: npm run test:waves\n/);
 });
+
+test('The heavy integration suites run in their own command and CI step, outside default discovery', async () => {
+  const { discoverTests, heavySuites } = await import(scheduleUrl);
+  // Stage 16E: with them, one Windows L2 command took 2032658-2325940 ms and timed out on a slow runner.
+  // The per-file measurements behind this list are in docs/CI.md.
+  assert.deepEqual(heavySuites, [
+    'tests/delivery.test.mjs',
+    'tests/architecture-rust.test.mjs',
+    'tests/project-director.test.mjs',
+    'tests/wave-context-integration.test.mjs',
+    'tests/task-fast-checks.test.mjs',
+    'tests/behavior-rust.test.mjs',
+    'tests/architecture-gate-integration.test.mjs',
+    'tests/project-integration.test.mjs',
+    'tests/engine-2.test.mjs',
+    'tests/engine-4.test.mjs',
+    'tests/engine-3.test.mjs',
+    'tests/benchmark.test.mjs',
+    'tests/engine.test.mjs',
+    'tests/architecture-cli.test.mjs',
+    'tests/ci-graph.test.mjs',
+    'tests/knowledge-refresh.test.mjs',
+    'tests/knowledge-cli.test.mjs',
+    'tests/cargo-fetch-recovery.test.mjs',
+    'tests/project-integration-fence.test.mjs',
+  ]);
+  const discovered = discoverTests(root).map(file => path.relative(root, file).replaceAll('\\', '/'));
+  for (const suite of heavySuites) {
+    assert.ok(!discovered.includes(suite), `${suite} is not in the default suite`);
+    assert.ok(statSync(path.join(root, suite)).isFile(), `${suite} exists`);
+  }
+  const scripts = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8')).scripts;
+  assert.equal(scripts['test:heavy'], `node scripts/run-tests.mjs ${heavySuites.join(' ')}`);
+  const workflow = readFileSync(path.join(root, '.github/workflows/ci.yml'), 'utf8');
+  const [fast, rest] = workflow.split('\n  check:');
+  const check = rest.split(/\n {2}[A-Za-z0-9_-]+:\n/)[0];
+  assert.doesNotMatch(fast, /npm run test:heavy/);
+  assert.match(check, /\n {6}- name: Heavy integration suites\n {8}run: npm run test:heavy\n/);
+});
+
+test('Every default-pattern test file runs in exactly one required check step', async () => {
+  const { discoverTests } = await import(scheduleUrl);
+  // Independent oracle: Node's default test glob over the checkout, without the runner's exclusions.
+  const extensions = process.features.typescript ? 'js,mjs,cjs,ts,mts,cts' : 'js,mjs,cjs';
+  const pattern = `**/{test,test/**/*,test-*,*[._-]test}.{${extensions}}`;
+  const all = [];
+  const visit = directory => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      if (entry.name === 'node_modules' || entry.name === '.git' || entry.isSymbolicLink()) continue;
+      const file = path.join(directory, entry.name);
+      const relative = path.relative(root, file).replaceAll('\\', '/');
+      if (entry.isDirectory() && !entry.name.startsWith('.')) visit(file);
+      else if (entry.isFile() && path.matchesGlob(relative, pattern)) all.push(relative);
+    }
+  };
+  visit(root);
+  assert.ok(all.length > 100, 'the checkout has its test files');
+  const scripts = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8')).scripts;
+  assert.match(scripts.check, /&& npm test$/);
+  assert.equal(scripts.test, 'node scripts/run-tests.mjs');
+  const listed = name => {
+    const [command, ...files] = scripts[name].split(' ');
+    assert.equal(`${command} ${files.shift()}`, 'node scripts/run-tests.mjs', `${name} uses the repository runner`);
+    return files;
+  };
+  const steps = {
+    'npm run check': discoverTests(root).map(file => path.relative(root, file).replaceAll('\\', '/')),
+    'npm run test:waves': listed('test:waves'),
+    'npm run test:heavy': listed('test:heavy'),
+  };
+  const runs = new Map();
+  for (const [step, files] of Object.entries(steps))
+    for (const file of files) runs.set(file, [...(runs.get(file) ?? []), step]);
+  for (const file of all)
+    assert.deepEqual(runs.get(file)?.length, 1, `${file} runs in exactly one step: ${runs.get(file) ?? 'none'}`);
+  assert.deepEqual([...runs.keys()].sort(), [...all].sort(), 'no step names a file outside the default pattern');
+  // Each command runs once in the required check job of both platforms and never in the optional fast job.
+  const workflow = readFileSync(path.join(root, '.github/workflows/ci.yml'), 'utf8');
+  const [fast, rest] = workflow.split('\n  check:');
+  const check = rest.split(/\n {2}[A-Za-z0-9_-]+:\n/)[0];
+  assert.match(check, /os: \[ubuntu-latest, windows-latest\]/);
+  for (const command of ['node scripts/ci.mjs run --tier L2', 'npm run test:waves', 'npm run test:heavy']) {
+    assert.equal(check.split(`run: ${command}`).length - 1, 1, `${command} runs once in check`);
+    assert.ok(!fast.includes(command), `${command} is not in the fast job`);
+  }
+});
 test(
   'Scheduler starts heuristic heavy files before lexical files in real isolated children',
   { timeout: 15000 },
   async t => {
     const { temp, put } = await fixture(t);
     const observed = path.join(temp, 'starts');
-    const expected = [
+    // Stage 16E moved these priority files to `npm run test:heavy`: default discovery never starts them.
+    const heavy = [
       'tests/project-director.test.mjs',
       'tests/architecture-gate-integration.test.mjs',
       'tests/architecture-cli.test.mjs',
       'tests/knowledge-cli.test.mjs',
       'tests/ci-graph.test.mjs',
       'tests/knowledge-refresh.test.mjs',
+    ];
+    const expected = [
       'tests/mode-engine-2.test.mjs',
       'tests/ci-cache.test.mjs',
       'tests/efficiency-engine.test.mjs',
@@ -209,7 +303,7 @@ test(
       'tests/a.test.mjs',
       'tests/z.test.mjs',
     ];
-    for (const name of [...expected].reverse()) {
+    for (const name of [...expected, ...heavy].reverse()) {
       await put(
         name,
         `import { appendFileSync } from 'node:fs'; import test from 'node:test'; appendFileSync(${JSON.stringify(observed)}, ${JSON.stringify(name + '\n')}); test('ok', () => {});`,

@@ -112,6 +112,10 @@ jobs:
         env:
           KODO_TOOL_HOME: ${{ runner.temp }}/kodo-security-tools
         run: node scripts/ci.mjs run --tier L2 --json
+      # Stage 15 suites with real Git, Cargo and Engine work (stage 16E, measurements in docs/CI.md): on
+      # their own, outside the fixed deadline of one L2 command (runtime/ci-cli.mjs CI_COMMAND_TIMEOUT_MS).
+      - name: Heavy integration suites
+        run: npm run test:heavy
       # The wave factory suites (real Engine, Git and director drains, ~20 minutes on Windows; plus the
       # stage 15B parallel engine suite): on their own, outside the fixed deadline of one L2 command
       # (runtime/ci-cli.mjs CI_COMMAND_TIMEOUT_MS).

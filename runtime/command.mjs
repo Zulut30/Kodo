@@ -100,6 +100,7 @@ function stoppedOutput(text, secrets) {
  * @property {number} [timeoutMs]
  * @property {boolean} [allowFailure] Resolve instead of reject on a non-zero exit code.
  * @property {Record<string, string>} [secrets] Values redacted from output and errors.
+ * @property {(chunk: string) => void} [consumeStdout] Stream raw decoded stdout to a trusted local parser.
  * @property {boolean} [rawOutput] Resolve with unredacted stdout/stderr.
  */
 
@@ -131,6 +132,7 @@ export async function execute(
     allowFailure = false,
     secrets = {},
     rawOutput = false,
+    consumeStdout,
   } = {},
 ) {
   if (/(?:^|[\\/])git(?:\.exe)?$/i.test(command)) ({ args, env } = gitBoundary(args, env));
@@ -168,6 +170,10 @@ export async function execute(
     signal?.addEventListener('abort', aborted, { once: true });
     if (signal?.aborted) aborted();
     child.stdout.on('data', data => {
+      if (consumeStdout) {
+        consumeStdout(data);
+        return;
+      }
       const remaining = 16 * 1024 * 1024 - stdout.length;
       stdout += data.slice(0, remaining);
       if (data.length > remaining) {
@@ -205,7 +211,11 @@ export async function execute(
         reject(stopCause);
         return;
       }
-      const clean = { stdout: redact(stdout, secrets), stderr: redact(stderr, secrets), code };
+      const clean = {
+        stdout: redact(stdout, secrets),
+        stderr: redact(stderr, secrets),
+        code,
+      };
       const result = rawOutput ? { stdout, stderr, code } : clean;
       if (code && !allowFailure)
         reject(

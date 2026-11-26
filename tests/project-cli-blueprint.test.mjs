@@ -1026,3 +1026,78 @@ test('apply-spec requires kodo.config.json to be a regular file of HEAD, not a d
   assert.equal(result.exitCode, 1, JSON.stringify(result.report));
   assert.deepEqual(codes(result.report), ['blueprint_config_missing']);
 });
+
+test('apply-spec and append-milestone support 400 tasks and bounded planning time', async t => {
+  const f = await fixture(t);
+  const root = await f.root();
+  const dir = await writeBlueprint(root);
+  const file = path.join(dir, 'spec.json');
+  const spec = JSON.parse(await readFile(file, 'utf8'));
+  const chunk = index => {
+    const milestone = { ...spec.milestones[1], id: 'batch-' + index };
+    const epic = { ...spec.epics[1], id: 'group-' + index, milestoneId: milestone.id };
+    const tasks = Array.from({ length: 80 }, (_, i) => ({
+      ...spec.tasks[2],
+      id: 'unit-' + index + '-' + i,
+      epicId: epic.id,
+      writePaths: Array.from({ length: 12 }, (_, j) => 'docs/shared/unit-' + index + '-' + i + '/file-' + j),
+      interfaceRefs: [],
+      dependsOn: [],
+    }));
+    return { milestone, epics: [epic], tasks };
+  };
+  for (let index = 0; spec.tasks.length < 320; index++) {
+    const batch = chunk(index);
+    spec.milestones.push(batch.milestone);
+    spec.epics.push(...batch.epics);
+    spec.tasks.push(
+      ...batch.tasks.slice(0, 320 - spec.tasks.length).map(task => ({ ...task, dependsOn: ['test-bench'] })),
+    );
+  }
+  for (const task of spec.tasks) {
+    while (task.writePaths.length < 12)
+      task.writePaths.push('docs/shared/' + task.id + '/file-' + task.writePaths.length);
+  }
+  const last = chunk(5);
+  const milestoneFile = path.join(f.dir, 'milestone.json');
+  await writeFile(milestoneFile, JSON.stringify(last));
+  const priorRoot = await f.root();
+  const priorDir = await writeBlueprint(priorRoot);
+  await writeFile(path.join(priorDir, 'spec.json'), JSON.stringify({ ...spec, root: priorRoot }));
+  const prior = await f.run(['apply-spec', '--root', priorRoot]);
+  assert.equal(prior.exitCode, 0, JSON.stringify(prior.report.result));
+  const { repo, store } = await f.direct();
+  const priorId = prior.report.projectId;
+  assert.equal(repo.snapshot(priorId).tasks.length, 320);
+  const { lintMilestone } = await import('../runtime/project-bootstrap.mjs');
+  const openHistory = repo.snapshot(priorId);
+  const lintStart = performance.now();
+  assert.deepEqual(lintMilestone(last, openHistory).findings, []);
+  assert.ok(performance.now() - lintStart < 10000, '80 fresh tasks against 320 open tasks within 10 seconds');
+  // Stage the closed historical rows for this size benchmark. The separate lifecycle test
+  // reaches acceptance through real transitions, while this test exercises the append itself.
+  store.db
+    .prepare("UPDATE kodo_project_records SET body=json_set(body, '$.status', 'accepted') WHERE project_id=?")
+    .run(priorId);
+  const appendStart = performance.now();
+  const appended = await f.run(['append-milestone', priorId, '--file', milestoneFile]);
+  assert.equal(appended.exitCode, 0, JSON.stringify(appended.report.result));
+  assert.equal(appended.report.result.tasks.length, 80);
+  assert.ok(performance.now() - appendStart < 10000, '80-task append within 10 seconds');
+  assert.equal(repo.snapshot(priorId).tasks.length, 400);
+  spec.milestones.push(last.milestone);
+  spec.epics.push(...last.epics);
+  spec.tasks.push(...last.tasks.map(task => ({ ...task, dependsOn: ['test-bench'] })));
+  await writeFile(file, JSON.stringify(spec));
+  const applied = await f.run(['apply-spec', '--root', root]);
+  assert.equal(applied.exitCode, 0, JSON.stringify(applied.report.result));
+  const snapshot = (await f.direct()).repo.snapshot(applied.report.projectId);
+  assert.equal(snapshot.tasks.length, 400);
+  const { compileBlueprint } = await import('../runtime/project-blueprint.mjs');
+  const { selectWave } = await import('../runtime/project-director-waves.mjs');
+  const start = performance.now();
+  const compiled = await compileBlueprint(root);
+  assert.deepEqual(compiled.findings, []);
+  assert.ok(selectWave(snapshot, { limit: 5 }).length > 0);
+  assert.ok(performance.now() - start < 10000, 'compileBlueprint and selectWave within 10 seconds');
+});

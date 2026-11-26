@@ -416,6 +416,15 @@ function toManifestMap(manifests) {
 
 function parseManifestEntry(raw) {
   if (raw === undefined) return { error: 'missing' };
+  if (isPlainObject(raw)) {
+    let manifestHash;
+    try {
+      manifestHash = hash(raw);
+    } catch {
+      manifestHash = digest(JSON.stringify(raw));
+    }
+    return { doc: raw, hash: manifestHash };
+  }
   const decoded = decodeUtf8(raw);
   if (!decoded) return { error: 'parse-error' };
   try {
@@ -556,10 +565,12 @@ function collectDeclaredMembers({
         return rel !== null && rel !== '' && regex.test(rel);
       })
       .sort(compare);
-    const matchedAnyFile = [...snapshotFiles].some(file => {
-      const rel = relativeToRoot(rootDir, file);
-      return rel !== null && regex.test(rel);
-    });
+    const matchedAnyFile = matchedDirs.length
+      ? true
+      : [...snapshotFiles].some(file => {
+          const rel = relativeToRoot(rootDir, file);
+          return rel !== null && regex.test(rel);
+        });
     if (!matchedDirs.length && !matchedAnyFile) {
       unknown('workspace', rootManifest, 'member-glob-no-match');
       continue;
@@ -791,11 +802,7 @@ function resolveWorkspaceAtRoot({ rootDir, rootEntry, manifestDirs, snapshotDirs
   };
 }
 
-/**
- * Resolve a Cargo workspace offline using Cargo's member/exclude/path-dependency rules.
- * @param {{ manifests: Map<string, Buffer | string> | Record<string, Buffer | string>, files?: Array<string | { path: string }>, startDir?: string }} input
- */
-export function resolveCargoWorkspace({ manifests, files, startDir = '' }) {
+function createWorkspaceIndex({ manifests, files }) {
   const rawMap = toManifestMap(manifests);
   const { snapshotDirs, snapshotFiles } = collectSnapshotEntries(rawMap, files);
   const manifestDirs = new Map();
@@ -814,7 +821,11 @@ export function resolveCargoWorkspace({ manifests, files, startDir = '' }) {
     cache.set(dir, parsed);
     return parsed;
   };
+  return { rawMap, snapshotDirs, snapshotFiles, manifestDirs, parsedCache };
+}
 
+function resolveStartDir(index, startDir, resolvedCache = new Map()) {
+  const { snapshotDirs, snapshotFiles, manifestDirs, parsedCache } = index;
   const cleanStart = normalizeWorkspacePath(startDir === '' ? '.' : startDir) ?? '';
   const { workspaceCandidate, packageCandidate, explicitError, explicitWorkspace } = findCandidateRoots(
     cleanStart,
@@ -828,8 +839,9 @@ export function resolveCargoWorkspace({ manifests, files, startDir = '' }) {
     const rootManifest = cleanStart ? `${cleanStart}/Cargo.toml` : 'Cargo.toml';
     return emptyWorkspaceResult(cleanStart, rootManifest, null, null, unsupported);
   }
-  const resolveFrom = candidate =>
-    resolveWorkspaceAtRoot({
+  const resolveFrom = candidate => {
+    if (resolvedCache.has(candidate.rootDir)) return resolvedCache.get(candidate.rootDir);
+    const resolved = resolveWorkspaceAtRoot({
       rootDir: candidate.rootDir,
       rootEntry: candidate.entry,
       manifestDirs,
@@ -837,6 +849,10 @@ export function resolveCargoWorkspace({ manifests, files, startDir = '' }) {
       snapshotFiles,
       parsedCache,
     });
+    resolved.memberRoots = new Set(resolved.result.members.map(item => item.root));
+    resolvedCache.set(candidate.rootDir, resolved);
+    return resolved;
+  };
 
   if (!workspaceCandidate) {
     const fallback = packageCandidate ?? {
@@ -867,4 +883,34 @@ export function resolveCargoWorkspace({ manifests, files, startDir = '' }) {
       (a, b) => compare(a.file ?? '', b.file ?? '') || (a.offset ?? -1) - (b.offset ?? -1) || compare(a.id, b.id),
     ),
   };
+}
+
+/**
+ * Resolve a Cargo workspace offline using Cargo's member/exclude/path-dependency rules.
+ * @param {{ manifests: Map<string, Buffer | string | Record<string, any>> | Record<string, Buffer | string | Record<string, any>>, files?: Array<string | { path: string }>, startDir?: string }} input
+ */
+export function resolveCargoWorkspace({ manifests, files, startDir = '' }) {
+  return resolveStartDir(createWorkspaceIndex({ manifests, files }), startDir);
+}
+
+/**
+ * Map every package directory belonging to a valid Cargo workspace to its workspace root.
+ * Indexes manifests and snapshot files once and caches resolution per workspace root.
+ * @param {{ manifests: Map<string, Buffer | string | Record<string, any>> | Record<string, Buffer | string | Record<string, any>>, files?: Array<string | { path: string }> }} input
+ * @returns {Map<string, string>}
+ */
+export function resolveCargoWorkspaceRoots({ manifests, files }) {
+  const index = createWorkspaceIndex({ manifests, files });
+  const resolvedCache = new Map();
+  const roots = new Map();
+  for (const member of index.manifestDirs.keys()) {
+    const entry = index.parsedCache(member);
+    if (entry.error || !isPlainObject(entry.doc?.package)) continue;
+    const resolved = resolveStartDir(index, member, resolvedCache);
+    if (resolved.unsupported.length || !resolved.hasWorkspace) continue;
+    const cached = resolvedCache.get(resolved.root);
+    const isMember = cached ? cached.memberRoots.has(member) : resolved.members.some(item => item.root === member);
+    if (isMember) roots.set(member, resolved.root);
+  }
+  return roots;
 }

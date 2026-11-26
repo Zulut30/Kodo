@@ -45,6 +45,7 @@ import { withIntegrationLease as withLease } from './project-integration-lease.m
 import { fencedBy } from './lease-fence.mjs';
 import { fencedPublisher } from './project-publish.mjs';
 import { GATE_WATCHDOG, createGateRunDraft, runEpicGate } from './wave-verifier.mjs';
+import { arbitrationBlockerFields } from './gate-arbiter.mjs';
 import { normalizeWatchdogConfig, recordBlocker } from './watchdog.mjs';
 import { applyWavePolicy, assertWavePolicy } from './wave-policy.mjs';
 import { createApiCardCache, prepareWaveTaskContext } from './wave-context.mjs';
@@ -441,6 +442,7 @@ async function mergeRun(ctx, snapshot, task, run, signal) {
       mergeCommit: merged.mergeCommit,
       mergedHead: merged.mergedHead,
       status: 'merged',
+      mergedAt: ctx.clock(),
     };
     ctx.store.updateRun(run.id, { integration });
     return integration;
@@ -794,6 +796,7 @@ async function acceptGate(ctx, projectId, gate, run, out, signal) {
         ctx.store.updateRun(run.id, { gateReturn: { before, target, status: 'pending' } }),
     });
     const refs = await persistRefs(ctx, run, gateKinds);
+    const acceptedTasks = [];
     for (const merge of gate.merges)
       for (const kind of ['attempt', 'task']) {
         const snapshot = await snapshotOf(ctx, projectId);
@@ -802,7 +805,17 @@ async function acceptGate(ctx, projectId, gate, run, out, signal) {
         if (settled(record.status)) continue;
         const refusal = await accept(ctx, snapshot, kind, record, task.acceptance, refs, out);
         if (refusal) return refusal;
+        if (kind === 'task') acceptedTasks.push(merge.taskId);
       }
+    if (acceptedTasks.length && typeof ctx.store.event === 'function') {
+      const parsed = Date.parse(ctx.clock());
+      ctx.store.event(
+        run.id,
+        'gate_accepted',
+        { gateId: gate.id, taskIds: acceptedTasks },
+        Number.isFinite(parsed) ? parsed : Date.now(),
+      );
+    }
     const blockers = await advanceContainers(ctx, projectId);
     const blocked = blockers.find(row =>
       gate.containers.some(container => container.kind === row.kind && container.id === row.id),
@@ -850,7 +863,14 @@ async function epicGate(ctx, snapshot, epic, retryFailed, out) {
   if (gate && run && retryStates.includes(run.state)) {
     if (retryFailed) return reserveGate(ctx, snapshot, containers, true);
     out.gates.push({ gateId: gate.id, runId: run.id, state: run.state });
-    out.blocked.push({ code: blockerOf(run), kind: 'epic', id: epic.id, gateId: gate.id, runId: run.id });
+    out.blocked.push({
+      code: blockerOf(run),
+      kind: 'epic',
+      id: epic.id,
+      gateId: gate.id,
+      runId: run.id,
+      ...arbitrationBlockerFields(run),
+    });
     return null;
   }
   if (!gate) return reserveGate(ctx, snapshot, containers, false);
@@ -884,7 +904,10 @@ const temporaryAcceptanceCodes = new Set([
 // Execute an installed gate Run once, then accept what it verified. Every blocker of this gate
 // names it (`gateId`, `runId`): the host reads the gate Run behind the code.
 async function runAndAccept(ctx, projectId, { gate, run }, signal, out, entity) {
-  if (run.state !== 'succeeded') run = await (ctx.runGate ?? runEpicGate)({ engine: ctx.engine, run, signal });
+  // The gate arbiter (16B1) takes a subscription of the project's execution profile.
+  const arbitration = { profile: ctx.repo.getProfile?.(projectId) ?? null, now: Date.parse(ctx.clock()) };
+  if (run.state !== 'succeeded')
+    run = await (ctx.runGate ?? runEpicGate)({ engine: ctx.engine, run, signal, arbitration });
   if (run.state !== 'succeeded') {
     out.gates.push({ gateId: gate.id, runId: run.id, state: run.state });
     out.blocked.push({
@@ -893,6 +916,7 @@ async function runAndAccept(ctx, projectId, { gate, run }, signal, out, entity) 
       gateId: gate.id,
       runId: run.id,
       state: run.state,
+      ...arbitrationBlockerFields(run),
     });
     return;
   }
@@ -950,7 +974,14 @@ async function projectGateRun(ctx, snapshot, { retryFailed, stale }, out) {
   if (!retryStates.includes(run.state)) return { gate, run };
   if (retryFailed) return reserveGate(ctx, snapshot, containers, true);
   out.gates.push({ gateId: gate.id, runId: run.id, state: run.state });
-  out.blocked.push({ code: blockerOf(run), kind: 'project', id: projectId, gateId: gate.id, runId: run.id });
+  out.blocked.push({
+    code: blockerOf(run),
+    kind: 'project',
+    id: projectId,
+    gateId: gate.id,
+    runId: run.id,
+    ...arbitrationBlockerFields(run),
+  });
   return null;
 }
 

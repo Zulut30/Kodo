@@ -36,6 +36,15 @@ import {
 } from './task-fast-checks.mjs';
 
 const gateReviewSchemas = new Map();
+const logGateVerify = (engine, run, type, data) => {
+  if (run.directorBinding?.kind === 'gate') engine.log(run, type, data);
+};
+// Whether this verification was cancelled (its signal or a cancel request on the stored Run).
+const verifyCancelled = (engine, run, signal) =>
+  Boolean(signal?.aborted || engine.store.getRun(run.id).cancelRequested);
+const throwIfVerifyCancelled = (engine, run, signal) => {
+  if (verifyCancelled(engine, run, signal)) throw Object.assign(new Error('Запуск отменён'), { code: 'cancelled' });
+};
 /**
  * The review contract of a run. A wave gate Run (`directorBinding.kind === 'gate'`) confirms
  * every criterion of its gate manifest (`run.gateCriteria`, ids from `gateReviewCriteria`)
@@ -125,6 +134,7 @@ const isWaveRun = run => run?.verificationProfile === TASK_FAST_PROFILE || run?.
 function recordWaveDiagnostics(run, { error = undefined, review = undefined, secrets = {} } = {}) {
   if (!isWaveRun(run)) return null;
   const diagnostics = buildDiagnosticPack({
+    run,
     error,
     checks: run.checks,
     behavior: run.behavior,
@@ -186,7 +196,9 @@ function failedCheck(run, kind, result, comparison) {
       : classification === 'regression'
         ? '[regression: passed on the base commit] '
         : '';
-  const diagnostics = isWaveRun(run) ? buildDiagnosticPack({ stdout: result.stdout, stderr: result.stderr }) : null;
+  const diagnostics = isWaveRun(run)
+    ? buildDiagnosticPack({ run, stdout: result.stdout, stderr: result.stderr })
+    : null;
   return Object.assign(
     new Error(
       `Проверка ${kind} не пройдена (exit ${result.code}): ${label}${(result.stdout + result.stderr).slice(-6000)}`,
@@ -777,6 +789,8 @@ export class EngineVerification extends EngineExecution {
       if (cycle.pendingRepair) await this.repairVerification(run, signal);
       const attempt = cycle.attempt;
       let checkError;
+      let verifyOutcome = 'failed';
+      logGateVerify(this, run, 'gate_verify_started', { attempt });
       try {
         run.uiVerification = null;
         run.securityChecks = null;
@@ -788,11 +802,22 @@ export class EngineVerification extends EngineExecution {
         else await this.checks(run, signal);
         await this.behaviorGate(run, signal);
         if (!fast) await this.verificationGates(run, signal);
+        // A cancel that arrived during the last check is a cancel, never a pass (telemetry 16C).
+        throwIfVerifyCancelled(this, run, signal);
+        verifyOutcome = 'passed';
       } catch (error) {
-        if (signal?.aborted || this.store.getRun(run.id).cancelRequested)
+        if (verifyCancelled(this, run, signal)) {
+          verifyOutcome = 'cancelled';
           throw Object.assign(new Error('Запуск отменён'), { code: 'cancelled' });
+        }
         maybeRethrowVerificationError(this, run, error);
         checkError = error;
+      } finally {
+        logGateVerify(this, run, 'gate_verify_finished', {
+          attempt,
+          passed: verifyOutcome === 'passed',
+          outcome: verifyOutcome,
+        });
       }
       const headSha = await git(run.cwd, ['rev-parse', 'HEAD']);
       if (!checkError && fast) {

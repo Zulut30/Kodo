@@ -97,7 +97,8 @@ export class Engine extends EngineVerification {
     const token = this.store.acquireLease(`run:${id}`, id);
     if (!token) throw new Error('Этот запуск уже исполняется');
     // The saved error describes the previous attempt: from here on it is history, not the current blocker.
-    run.blocker = resolveBlocker(run.blocker, { at: new Date().toISOString(), outcome: 'resumed' });
+    const resumedAt = new Date(typeof this.store.clock === 'function' ? this.store.clock() : Date.now()).toISOString();
+    run.blocker = resolveBlocker(run.blocker, { at: resumedAt, outcome: 'resumed' });
     if (resumeCancelled) {
       this.store.updateRun(id, { cancelRequested: false, state: 'resuming' });
       delete run.cancelRequested;

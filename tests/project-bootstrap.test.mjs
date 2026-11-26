@@ -533,8 +533,10 @@ test('lintMilestone enforces new ids, size, parallel paths, task input and snaps
   assert.deepEqual(conflict.findings[0].taskIds, ['api-module']);
 
   const many = milestoneFile();
-  for (let index = 0; index < 5; index++)
+  for (let index = 0; index < 78; index++)
     many.tasks.push({ ...many.tasks[1], id: `extra-${index}`, writePaths: [`docs/extra-${index}.md`] });
+  assert.deepEqual(codes(lintMilestone(many, snapshot)), []);
+  many.tasks.push({ ...many.tasks[1], id: 'overflow', writePaths: ['docs/overflow.md'] });
   assert.deepEqual(codes(lintMilestone(many, snapshot)), ['milestone_task_count']);
 
   const overlap = lintMilestone(milestoneFile({ index: { writePaths: ['src/web/search'] } }), snapshot);

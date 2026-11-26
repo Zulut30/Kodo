@@ -675,3 +675,18 @@ test('Current source rejects unsupported immutable symlink and submodule modes',
     assert.ok(plan.reasons.includes('unsupported-tree-entry:src/value.mjs'));
   }
 });
+
+test('D1: Wave 0 config files classify as config/lock changes instead of unknown-file-or-config', async t => {
+  for (const [file, content, prefix] of [
+    ['.gitignore', 'target/\n', 'config-change:.gitignore'],
+    ['architecture.policy.json', '{"schemaVersion":2}\n', 'config-change:architecture.policy.json'],
+    ['rust-toolchain.toml', '[toolchain]\nchannel="1.85.0"\n', 'config-change:rust-toolchain.toml'],
+    ['Cargo.lock', 'version = 4\n', 'lock-change:Cargo.lock'],
+  ]) {
+    const fx = await fixture(t);
+    await put(fx.project, file, content);
+    const plan = await planAffected({ ...fx, headSha: fx.commit() });
+    assert.ok(plan.reasons.includes(prefix), `${file}: expected ${prefix}, got ${JSON.stringify(plan.reasons)}`);
+    assert.ok(!plan.reasons.includes(`unknown-file-or-config:${file}`), `${file}: must not be unknown-file-or-config`);
+  }
+});

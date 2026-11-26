@@ -22,6 +22,32 @@ export const separateSuites = [
   'tests/project-parallel-engine.test.mjs',
 ];
 
+// Stage 16E. After stage 15 one Windows L2 command took 2032658, 2325940 and 2230687 ms and reached its
+// fixed 2400000 ms deadline on a slow runner. These suites (real Git, Cargo and Engine work) run in
+// their own step, `npm run test:heavy`, like the wave suites; default discovery skips them. Sequential
+// per-file measurements on one local Windows PC (observations, not receipts) are in docs/CI.md.
+export const heavySuites = [
+  'tests/delivery.test.mjs', // 445075 ms
+  'tests/architecture-rust.test.mjs', // 319540 ms
+  'tests/project-director.test.mjs', // 274403 ms
+  'tests/wave-context-integration.test.mjs', // 270006 ms
+  'tests/task-fast-checks.test.mjs', // 250077 ms
+  'tests/behavior-rust.test.mjs', // 234389 ms
+  'tests/architecture-gate-integration.test.mjs', // 207942 ms
+  'tests/project-integration.test.mjs', // 171110 ms
+  'tests/engine-2.test.mjs', // 138395 ms
+  'tests/engine-4.test.mjs', // 133341 ms
+  'tests/engine-3.test.mjs', // 123189 ms
+  'tests/benchmark.test.mjs', // 119250 ms
+  'tests/engine.test.mjs', // 117653 ms
+  'tests/architecture-cli.test.mjs', // 112324 ms
+  'tests/ci-graph.test.mjs', // 109399 ms
+  'tests/knowledge-refresh.test.mjs', // 99970 ms
+  'tests/knowledge-cli.test.mjs', // 82864 ms
+  'tests/cargo-fetch-recovery.test.mjs', // 60640 ms
+  'tests/project-integration-fence.test.mjs', // 52467 ms
+];
+
 const priority = [
   // Source821 Windows/Node24.22.1 receipt c9b54c3c: all completed files >=90000 ms
   // in descending durationMs, not reporter delivery order. Static observations,
@@ -149,7 +175,12 @@ export function discoverTests(cwd = process.cwd()) {
       const relative = path.relative(cwd, file).replaceAll('\\', '/');
       // Like Node's default glob, ** does not descend into hidden directories.
       if (entry.isDirectory() && !entry.name.startsWith('.')) visit(file);
-      else if (entry.isFile() && path.matchesGlob(relative, defaultPattern) && !separateSuites.includes(relative))
+      else if (
+        entry.isFile() &&
+        path.matchesGlob(relative, defaultPattern) &&
+        !separateSuites.includes(relative) &&
+        !heavySuites.includes(relative)
+      )
         files.push(file);
     }
   }
@@ -209,11 +240,11 @@ export async function runTests({
 } = {}) {
   // Never accept Node's recursive-run warning as a successful empty suite.
   if (process.env.NODE_TEST_CONTEXT !== undefined) throw new Error('Unsupported recursive test runner invocation');
-  // A full coverage run keeps the separate wave suites; `--fast` and explicit paths select their own.
+  // A full coverage run keeps the separate wave and heavy suites; `--fast` and explicit paths select their own.
   const files = paths.length
     ? explicitTests(cwd, paths)
     : coverage
-      ? orderTests([...discoverTests(cwd), ...explicitTests(cwd, separateSuites)], cwd)
+      ? orderTests([...discoverTests(cwd), ...explicitTests(cwd, [...separateSuites, ...heavySuites])], cwd)
       : discoverTests(cwd);
   const aborted = () => {
     process.exitCode = 1;

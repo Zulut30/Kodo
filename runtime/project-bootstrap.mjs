@@ -15,6 +15,8 @@ import {
   FACTORY_ROLES,
   FOUNDATION_ID,
   MAX_TASK_INPUT_BYTES,
+  MAX_MILESTONE_TASKS,
+  MAX_PROJECT_TASKS,
   compileBlueprint,
   containerFindings,
   epicCycleFindings,
@@ -30,7 +32,7 @@ import {
 } from './project-blueprint.mjs';
 
 export const BOOTSTRAP_CLIENTS = Object.freeze(['codex', 'claude-code']);
-export const MILESTONE_TASKS = Object.freeze({ min: 1, max: 6 });
+export const MILESTONE_TASKS = Object.freeze({ min: 1, max: MAX_MILESTONE_TASKS });
 const MAX_PROMPT = 64 * 1024;
 const MAX_MILESTONE_FILE = 1024 * 1024;
 const LISTED_FILES = 400;
@@ -420,7 +422,7 @@ const RULES = `# Правила чертежа Kodo
 6. \`root\` — абсолютный путь каталога проекта; id — slug; остальные поля строго по ProjectSpec v1.
 7. **Эпики без циклов.** Если задача эпика X зависит от задачи эпика Y, никакая задача Y не должна зависеть (через задачи любых эпиков) от задач X: гейты эпиков закрываются по порядку.
 8. **Минимальный тест в Волне 0.** Первая задача Волны 0 создаёт минимальный проходящий тест, его путь — в её \`writePaths\`: без тестов проверка задачи ничего не доказывает, а прогон \`node --test\` без единого теста — отказ (\`fast_check_no_tests\`).
-9. **Контрактный крейт Волны 0 (единый Rust workspace с ≥ 3 крейтами).** Волна 0 (\`${FOUNDATION_ID}\`) должна содержать задачу, чьи \`writePaths\` покрывают \`Cargo.toml\` и \`src/**\` компилируемого контрактного крейта (\`crates/<name>-contracts\` или крейта, явно объявленного строкой \`contractCrate: crates/<name>\` в \`PROJECT.md\`), и \`architecture.policy.json\` (\`schemaVersion: 2, language: "rust"\`): в корневом \`Cargo.toml\` задайте \`members = ["crates/*"]\` и \`[workspace.dependencies]\`, создайте заготовки всех крейтов карты модулей (\`Cargo.toml\` и \`src/lib.rs\` с заглушкой), закоммитьте \`Cargo.lock\` и \`.gitignore\` с \`target/\`, а в политике заранее перечислите все крейты карты модулей в \`layers\` (включая будущие крейты Волны 1+, иначе они получат \`ownership.unowned\`) и нужные внешние крейты в \`allowedExternalCrates\`/\`allowedDevExternalCrates\`. Задачи Волн 1+ наполняют \`src/\` своих крейтов; новая внешняя зависимость добавляется отдельной задачей-интегратором, у которой в \`writePaths\` есть корневой \`Cargo.toml\`, \`Cargo.toml\` крейта-потребителя (для добавления \`dep.workspace = true\`), \`Cargo.lock\` и \`architecture.policy.json\`. Обычным задачам нельзя накрывать контрактный крейт широкой маской (\`crates/**\` → \`contract_scope_too_broad\`). Отсутствие такой задачи Волны 0 — finding \`contract_crate_required\`.
+9. **Контрактный крейт и toolchain Волны 0 (Rust).** Для любого Rust-проекта Волна 0 (\`${FOUNDATION_ID}\`) должна содержать задачу, в \`writePaths\` которой указан \`rust-toolchain.toml\` с точной версией (\`channel = "1.x.y"\`, компоненты \`clippy\` и \`rustfmt\`, если такой файл ещё не закоммичен в корне) — иначе линтер вернёт \`rust_toolchain_required\`. Для единого Rust workspace с ≥ 3 крейтами Волна 0 также обязана содержать задачу, чьи \`writePaths\` покрывают \`Cargo.toml\` и \`src/**\` компилируемого контрактного крейта (\`crates/<name>-contracts\` или крейта, явно объявленного строкой \`contractCrate: crates/<name>\` в \`PROJECT.md\`), и \`architecture.policy.json\` (\`schemaVersion: 2, language: "rust"\`): в корневом \`Cargo.toml\` задайте \`members = ["crates/*"]\` и \`[workspace.dependencies]\`, создайте заготовки всех крейтов карты модулей (\`Cargo.toml\` и \`src/lib.rs\` с заглушкой), закоммитьте \`Cargo.lock\`, \`rust-toolchain.toml\` и \`.gitignore\` с \`target/\`, а в политике заранее перечислите все крейты карты модулей в \`layers\` (включая будущие крейты Волны 1+, иначе они получат \`ownership.unowned\`) и нужные внешние крейты в \`allowedExternalCrates\`/\`allowedDevExternalCrates\`. Задачи Волн 1+ наполняют \`src/\` своих крейтов; новая внешняя зависимость добавляется отдельной задачей-интегратором, у которой в \`writePaths\` есть корневой \`Cargo.toml\`, \`Cargo.toml\` крейта-потребителя (для добавления \`dep.workspace = true\`), \`Cargo.lock\` и \`architecture.policy.json\`. Обычным задачам нельзя накрывать контрактный крейт широкой маской (\`crates/**\` → \`contract_scope_too_broad\`). Отсутствие такой задачи Волны 0 — finding \`contract_crate_required\`.
 
 ## kodo.config.json — до apply-spec
 
@@ -444,6 +446,7 @@ const RULES = `# Правила чертежа Kodo
 | \`blueprint_section_missing\`, \`blueprint_section_empty\` | Разделы PROJECT.md |
 | \`blueprint_owner_unknown\` | owner — одна из ролей |
 | \`blueprint_wave0_missing\`, \`blueprint_wave0_bypassed\`, \`blueprint_wave0_order\` | Волна 0 |
+| \`rust_toolchain_required\` | Rust-проект: добавить \`rust-toolchain.toml\` (\`channel = "1.x.y"\`, компоненты \`clippy\` и \`rustfmt\`) в \`writePaths\` задачи Волны 0 |
 | \`contract_crate_required\` | Единый Rust workspace с ≥ 3 крейтами: добавить в Волну 0 задачу с \`Cargo.toml\` + \`src/**\` контрактного крейта (\`crates/<name>-contracts\` или \`contractCrate: …\` в \`PROJECT.md\`) и \`architecture.policy.json\` в её \`writePaths\` |
 | \`architecture_policy_required\`, \`architecture_policy_order\` | Добавить \`architecture.policy.json\` в \`writePaths\` задачи Волны 0 и поставить остальные задачи Волны 0 в зависимость от неё |
 | \`contract_scope_too_broad\` | Сузить \`writePaths\` обычной задачи, чтобы не накрывать контрактный крейт широкой маской |
@@ -1196,6 +1199,8 @@ export function lintMilestone(milestone, snapshot, options = {}) {
     return done([finding('milestone_snapshot_incomplete', 'Снапшот неполный: нельзя проверить id и зависимости')]);
   const findings = [];
   const count = milestone.tasks.length;
+  if (current.tasks.length + count > MAX_PROJECT_TASKS)
+    findings.push(finding('project_task_count', 'Проект содержит больше 400 задач'));
   if (count < MILESTONE_TASKS.min || count > MILESTONE_TASKS.max)
     findings.push(
       finding(

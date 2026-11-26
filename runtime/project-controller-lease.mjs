@@ -147,12 +147,15 @@ export function withPullLease(store, projectId, runsGates, work) {
 // A pull holds the profile only while issuing its batch. Profile writers take just
 // the inner lease, so they can run while a native drain is executing a gate.
 export function withWaveAdmissionLeases(store, projectId, work) {
-  return withControllerLease(store, `project:${projectId}`, (_, _lostProject, checkProject) =>
-    withControllerLease(store, `project-profile:${projectId}`, (_, _lostProfile, checkProfile) =>
-      work(() => {
-        checkProject();
-        checkProfile();
-      }),
+  return withControllerLease(store, `project:${projectId}`, (_, lostProject, checkProject) =>
+    withControllerLease(store, `project-profile:${projectId}`, (_, lostProfile, checkProfile) =>
+      work(
+        () => {
+          checkProject();
+          checkProfile();
+        },
+        AbortSignal.any([lostProject, lostProfile]),
+      ),
     ),
   );
 }

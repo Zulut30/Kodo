@@ -489,3 +489,75 @@ test('Quality compiler and configured command scopes cannot escape through confi
   });
   await assert.rejects(() => registry.plan(native.project), /scope|path/i);
 });
+
+test('D1: Wave 0 config files (.gitignore, architecture.policy.json, Cargo.lock, rust-toolchain.toml) classify as known metadata', async t => {
+  const { QualityProfileRegistry } = await api(),
+    registry = new QualityProfileRegistry();
+  const fx = await fixture(t, {
+    'Cargo.toml': '[workspace]\nmembers = ["crates/*"]\n[workspace.package]\nedition = "2021"\n',
+    'Cargo.lock': 'version = 4\n',
+    'rust-toolchain.toml': '[toolchain]\nchannel = "1.85.0"\ncomponents = ["clippy", "rustfmt"]\n',
+    '.gitignore': 'target/\n',
+    'architecture.policy.json': { schemaVersion: 2, version: 1, language: 'rust', layers: [] },
+    'crates/core/Cargo.toml': '[package]\nname = "core"\nversion = "0.1.0"\nedition.workspace = true\n',
+    'crates/core/src/lib.rs': 'pub fn answer() -> i32 { 42 }\n',
+  });
+  for (const configFile of ['.gitignore', 'architecture.policy.json', 'Cargo.lock', 'rust-toolchain.toml']) {
+    const plan = await registry.plan(fx.project, {
+      mode: 'quick',
+      changedPaths: [configFile],
+      capabilities: ['lint', 'typecheck'],
+    });
+    assert.equal(plan.status, 'applicable', `${configFile}: expected applicable, got ${JSON.stringify(plan.checks)}`);
+    assert.ok(
+      plan.checks.every(c => c.status === 'applicable' && c.reason !== 'explicit_affected_scope_required'),
+      `${configFile}: must not block with explicit_affected_scope_required`,
+    );
+  }
+});
+
+test('D1: unpinned Rust toolchain warns toolchain_unpinned in feedback mode only, stays blocked in regular quality gates', async t => {
+  const { QualityProfileRegistry } = await api(),
+    registry = new QualityProfileRegistry();
+  const fx = await fixture(t, {
+    'Cargo.toml': '[package]\nname = "demo"\nversion = "0.1.0"\nedition = "2021"\n',
+    'Cargo.lock': 'version = 4\n',
+    'src/lib.rs': 'pub fn answer() -> i32 { 42 }\n',
+  });
+  // Regular quality gate (non-feedback) stays blocked/missing without rust-toolchain.toml.
+  const gatePlan = await registry.plan(fx.project, {
+    mode: 'quick',
+    changedPaths: ['src/lib.rs'],
+    capabilities: ['lint', 'typecheck'],
+  });
+  assert.equal(gatePlan.status, 'blocked');
+  assert.equal(gatePlan.checks.find(c => c.capability === 'typecheck').reason, 'exact_rustc_pin_required');
+  assert.equal(gatePlan.checks.find(c => c.capability === 'lint').reason, 'exact_clippy_pin_required');
+
+  // Self-check feedback mode relaxes pins into toolchain_unpinned warnings.
+  const feedbackPlan = await registry.plan(fx.project, {
+    mode: 'quick',
+    changedPaths: ['src/lib.rs'],
+    capabilities: ['lint', 'typecheck'],
+    feedback: true,
+  });
+  assert.equal(feedbackPlan.status, 'applicable');
+  for (const check of feedbackPlan.checks) {
+    assert.equal(check.status, 'applicable', check.id);
+    assert.deepEqual(check.warnings, ['toolchain_unpinned'], check.id);
+  }
+
+  // With rust-toolchain.toml pinned, no toolchain_unpinned warning is emitted.
+  await put(fx.project, 'rust-toolchain.toml', '[toolchain]\nchannel = "1.85.0"\ncomponents = ["clippy", "rustfmt"]\n');
+  const pinnedPlan = await registry.plan(fx.project, {
+    mode: 'quick',
+    changedPaths: ['src/lib.rs'],
+    capabilities: ['lint', 'typecheck'],
+    feedback: true,
+  });
+  assert.equal(pinnedPlan.status, 'applicable');
+  for (const check of pinnedPlan.checks) {
+    assert.equal(check.status, 'applicable', check.id);
+    assert.equal(check.warnings, undefined, check.id);
+  }
+});
