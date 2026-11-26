@@ -5,7 +5,7 @@
 ## Не выпущено
 
 - **CI: 12 параллельных ног** ([PR #33](https://github.com/Zulut30/Kodo/pull/33), `85619f5`, в `main`). По шесть отдельных jobs на Linux и Windows: `ci-l2`, `ci-heavy`, `ci-waves-director`, `ci-waves-e2e`, `ci-waves-parallel`, `ci-final`. Обязательные contexts `check (ubuntu-latest, 24)` и `check (windows-latest, 24)` проверяют каждую ногу через `verify_leg`. Три волновых тестовых файла разделены на восемь в трёх шардах (`test:waves:director`, `test:waves:e2e`, `test:waves:parallel`). Run 45857094167 — 26 мин 10 с против 141 мин в PR #32 (≈ 5,4×). [Замеры](docs/CI.md#параллельный-ci-12-ног-pr-33).
-- **Сопровождаемость** (ветка `kodo/runtime-modularization`, ещё не в `main`): типизирован `KodoRun` (baseline `tsc` 143 → 108), разделены Project Store, Project Director и Engine (T4c, T5, T6, T8), разбиты крупные модули этапов 15–16, включён храповик `max-lines: 900`. [План](docs/kodo-roadmap/MAINTAINABILITY-PLAN.md).
+- **Сопровождаемость.** В `main` вошёл коммит `46fffa2`. Типизирован `KodoRun` (baseline `tsc` 143 → 108), разделены Project Store, Project Director и Engine (T4c, T5, T6, T8), разбиты крупные модули этапов 15–16, включён храповик `max-lines: 900`. [PR #34](https://github.com/Zulut30/Kodo/pull/34) · [План](docs/kodo-roadmap/MAINTAINABILITY-PLAN.md).
 
 ## [1.2.0] — 2026-11-26
 
