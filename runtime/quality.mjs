@@ -1,3 +1,4 @@
+/* oxlint-disable max-lines -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md */
 /** Offline discovery/planning. No process, installer, provider or state startup. */
 import path from 'node:path';
 import { lstat, readFile, readdir, realpath } from 'node:fs/promises';

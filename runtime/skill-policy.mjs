@@ -275,6 +275,7 @@ function resolveReferenceLinks(text, { root, base, component, resources, upstrea
   });
 }
 
+/** @param {{project?: string, stage?: string, task?: string, run?: import('./store.mjs').KodoRun, root?: string}} [options] */
 export async function loadDefaultPolicy({ project, stage, task = '', run, root = bundledRoot } = {}) {
   if (!stages.has(stage)) throw new Error(`Unknown Kodo skill stage: ${stage}`);
   root = path.resolve(root);

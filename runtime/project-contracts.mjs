@@ -1,3 +1,4 @@
+/* oxlint-disable max-lines -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md */
 import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { redact, secretFile } from './security.mjs';

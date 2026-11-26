@@ -16,10 +16,13 @@ import { EnginePlanning } from './engine-planning.mjs';
 import { contentHash, evidencePrompt, lstatSafe } from './engine-core.mjs';
 import { fastPathScope } from './fast-path.mjs';
 
+/** @typedef {import('./store.mjs').KodoRun} KodoRun */
+
 /** Node execution, integration and base synchronization stages. */
 export class EngineExecution extends EnginePlanning {
   /** The node (or repair) scope check; a wave task Run (task-fast) also keeps its actual
    * changes inside the frozen ProjectTask writePaths, not only inside the plan's node scopes. */
+  /** @param {KodoRun} run */
   async checkTaskScope(run, cwd, baseSha, scopes) {
     if (run.verificationProfile !== TASK_FAST_PROFILE || !run.directorBinding)
       return this.checkScope(cwd, baseSha, scopes);
@@ -39,6 +42,7 @@ export class EngineExecution extends EnginePlanning {
    * @param {string[]} files
    * @param {string[]} [extra]
    */
+  /** @param {KodoRun} run */
   async assertFastPathDiff(run, cwd, base, files, extra = []) {
     if (run.executionMode?.source !== 'fast-path') return files;
     const listed = new Set(fastPathScope(run.fastPath));
@@ -68,6 +72,7 @@ export class EngineExecution extends EnginePlanning {
    * fast path, the exact check of the same changes. `base` is the incoming base, so its own
    * changes are not counted as the executor's.
    */
+  /** @param {KodoRun} run */
   async checkRunScope(run, cwd, base, scopes, extra = []) {
     return this.assertFastPathDiff(run, cwd, base, await this.checkTaskScope(run, cwd, base, scopes), extra);
   }
@@ -148,6 +153,7 @@ export class EngineExecution extends EnginePlanning {
       untrackedCount: names.length,
     };
   }
+  /** @param {KodoRun} run */
   async refreshNode(run, task, node, integratedHead, selected, signal) {
     while (node.baseSha !== integratedHead || node.pendingRefresh) {
       this.checkCancelled(run, signal);
@@ -240,6 +246,7 @@ export class EngineExecution extends EnginePlanning {
       this.save(run);
     }
   }
+  /** @param {KodoRun} run */
   async performNode(run, task, signal) {
     const node = (run.nodes[task.id] ||= { id: task.id, attempt: 0, status: 'pending' });
     if (['completed', 'integrated'].includes(node.status)) return;
@@ -392,6 +399,7 @@ export class EngineExecution extends EnginePlanning {
       }
     }
   }
+  /** @param {KodoRun} run */
   async integrateNode(run, task, signal) {
     const node = run.nodes[task.id];
     if (node.status === 'integrated') return;
@@ -481,6 +489,7 @@ export class EngineExecution extends EnginePlanning {
     this.save(run);
     this.log(run, 'integrated', { node: task.id, headSha: run.headSha });
   }
+  /** @param {KodoRun} run */
   async executeTasks(run, signal) {
     run.state = 'implementing';
     this.save(run);
@@ -536,6 +545,7 @@ export class EngineExecution extends EnginePlanning {
       },
     });
   }
+  /** @param {KodoRun} run */
   async synchronizeBase(run, signal) {
     await git(run.cwd, ['fetch', 'origin', run.config.baseBranch]);
     const remoteBase = await git(run.cwd, ['rev-parse', `origin/${run.config.baseBranch}`]);
@@ -620,6 +630,7 @@ export class EngineExecution extends EnginePlanning {
     this.save(run);
     if (remoteBase !== base) await this.synchronizeBase(run, signal);
   }
+  /** @param {KodoRun} run */
   async recoverIntegrationEdits(run, signal) {
     this.checkCancelled(run, signal);
     if (

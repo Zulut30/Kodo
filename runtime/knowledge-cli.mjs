@@ -82,6 +82,7 @@ async function ownedSnapshot(project, snapshotCwd, ownedCwds, repository = true)
 }
 
 /** Fresh fixed context -> readonly claims -> actual evidence -> evaluation -> projection. */
+/** @param {{project: string, snapshotCwd?: string, contextPath?: string, subject?: any, task?: string | Record<string, any>, ownedCwds?: string[], now?: any}} options */
 export async function knowledgeSnapshot(
   { project, snapshotCwd = project, contextPath = null, subject, task = '', ownedCwds, now },
   ports = {},

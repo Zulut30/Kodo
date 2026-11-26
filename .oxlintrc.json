@@ -24,13 +24,14 @@
     ],
     "no-useless-escape": "off",
     "no-undef": "error",
+    "max-lines": ["error", { "max": 900, "skipBlankLines": true, "skipComments": true }],
     "max-lines-per-function": ["error", { "max": 150, "skipBlankLines": true, "skipComments": true }],
     "complexity": ["error", { "max": 40 }]
   },
   "overrides": [
     {
       "files": ["tests/**"],
-      "rules": { "max-lines-per-function": "off", "complexity": "off" }
+      "rules": { "max-lines": "off", "max-lines-per-function": "off", "complexity": "off" }
     }
   ]
 }

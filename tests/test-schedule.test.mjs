@@ -346,8 +346,9 @@ test('Every default-pattern test file runs in exactly one required check shard',
       `check binds ${envPrefix}_PASSED to ${jobName}.outputs.passed`,
     );
     const branch = runnerOs === 'ubuntu-latest' ? ubuntuVerifier : windowsVerifier;
+    const activeLines = branch.split(/\r?\n/).map(line => line.trim());
     assert.ok(
-      branch.includes(`verify_leg "${jobName}" "$${envPrefix}_RESULT" "$${envPrefix}_PASSED"`),
+      activeLines.includes(`verify_leg "${jobName}" "$${envPrefix}_RESULT" "$${envPrefix}_PASSED"`),
       `check ${runnerOs} branch calls verify_leg for ${jobName}`,
     );
   }

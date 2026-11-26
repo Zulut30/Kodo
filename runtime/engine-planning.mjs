@@ -16,9 +16,12 @@ import {
 } from './fast-path.mjs';
 import { EngineCore, contentHash, defaultModel, evidencePrompt, lstatSafe } from './engine-core.mjs';
 
+/** @typedef {import('./store.mjs').KodoRun} KodoRun */
+
 /** Assessment, research, planning and routing stages. */
 const budgetKeys = ['researchBudget', 'repairRounds', 'concurrency', 'maxTasks'];
 export class EnginePlanning extends EngineCore {
+  /** @param {KodoRun} run */
   async preparePlanningContext(run) {
     const before = `${await this.policy(run, 'plan')}\n${this.planInstructions(run)}`;
     const knowledge = await this.nativeKnowledge(run, run.cwd);
@@ -28,6 +31,7 @@ export class EnginePlanning extends EngineCore {
     for (const reference of knowledge.references) await this.assertEvidence(reference);
     return before + knowledge.text;
   }
+  /** @param {KodoRun} run */
   async assessmentContext(run, bundle) {
     const names = (await git(run.cwd, ['ls-files', '-z']))
       .split('\0')
@@ -97,6 +101,7 @@ export class EnginePlanning extends EngineCore {
     };
   }
   /** The ordinary route: one Jev assessment, then quick, standard or deep. */
+  /** @param {KodoRun} run */
   async assessedMode(run, context, signal) {
     let assessment;
     try {
@@ -129,6 +134,7 @@ export class EnginePlanning extends EngineCore {
    * proof no longer covers the work: restore the saved budgets and take the
    * ordinary route. Returns true when the mode was re-resolved.
    */
+  /** @param {KodoRun} run */
   async fastPathGuard(run, candidate, signal) {
     if (run.executionMode?.source !== 'fast-path' || fastPathAllowsPlan(candidate, fastPathScope(run.fastPath)))
       return false;
@@ -136,6 +142,7 @@ export class EnginePlanning extends EngineCore {
     return true;
   }
   /** Restore the saved budgets and take the ordinary route (assessment, analysis) from the start. */
+  /** @param {KodoRun} run */
   async revokeFastPath(run, reason, signal) {
     for (const key of budgetKeys) {
       if (run.fastPath.budgets[key] === null) delete run.config[key];
@@ -153,6 +160,7 @@ export class EnginePlanning extends EngineCore {
    * its files) is not migrated: before any worker starts, its plan is dropped and the ordinary
    * route plans again. Once a node has worked under it, the run stops with that reason instead.
    */
+  /** @param {KodoRun} run */
   async revokeOutdatedFastPath(run, signal) {
     if (run.executionMode?.source !== 'fast-path' || !fastPathOutdated(run.fastPath)) return;
     // A started session counts, whatever the counters say after quota or a retry cycle.
@@ -173,6 +181,7 @@ export class EnginePlanning extends EngineCore {
     run.nodes = {};
     await this.revokeFastPath(run, 'proof_outdated', signal);
   }
+  /** @param {KodoRun} run */
   async prepare(run, signal) {
     await makeWorktree(run.project, run.cwd, run.branch, run.baseSha, { signal });
     let bundle;
@@ -292,6 +301,7 @@ export class EnginePlanning extends EngineCore {
       });
     }
   }
+  /** @param {KodoRun} run */
   async plan(run, planInput, signal) {
     await this.policy(run, 'plan');
     await this.revokeOutdatedFastPath(run, signal);
@@ -375,6 +385,7 @@ export class EnginePlanning extends EngineCore {
     run.plannerSession = result.sessionId;
     this.save(run);
   }
+  /** @param {KodoRun} run */
   planInstructions(run) {
     // The fast path was proven for named files only: a plan that writes anything else revokes it.
     const proven =
@@ -391,6 +402,7 @@ export class EnginePlanning extends EngineCore {
       proven
     );
   }
+  /** @param {KodoRun} run */
   async route(run, task, state, signal) {
     if (run.executionMode.selected === 'quick') {
       const selected = this.primary(run);
@@ -515,6 +527,7 @@ export class EnginePlanning extends EngineCore {
     this.checkCancelled(run, signal);
     return selected;
   }
+  /** @param {KodoRun} run */
   async moreResearch(run, reason, signal) {
     if (run.config.researchBudget <= 0) return;
     return this.withLease(

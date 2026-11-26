@@ -1,3 +1,4 @@
+/* oxlint-disable max-lines -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md */
 // Project factory bootstrap: context bundles for the main chat (outside the
 // repository, under <home>/bootstrap/<id>/), one native subscription session that
 // writes .kodo/blueprint/, and checks for a new milestone of an existing project.

@@ -6,6 +6,86 @@ import { pathToFileURL } from 'node:url';
 import { stateHome, redact } from './security.mjs';
 import { assertFence } from './lease-fence.mjs';
 
+/** Stage-specific receipt or configuration object stored as JSON.
+ * @typedef {Record<string, any>} RunData
+ * @typedef {RunData & {status: string, attempt: number}} RunNode
+ * @typedef {{path:string, sha256:string, headSha?:string}} RunEvidence
+ */
+
+/** Durable Engine run. Stage outputs are populated as the run advances.
+ * @typedef {object} KodoRun
+ * @property {string} id
+ * @property {string} state
+ * @property {string} task
+ * @property {string} project
+ * @property {string} client
+ * @property {string} providers
+ * @property {string} baseSha
+ * @property {string} createdAt
+ * @property {string} [updatedAt]
+ * @property {string} [cwd]
+ * @property {string} [artifacts]
+ * @property {string} [branch]
+ * @property {string} [worktreeRoot]
+ * @property {string} [headSha]
+ * @property {string} [requestedMode]
+ * @property {string} [retryAt]
+ * @property {string} [nextRetryAt]
+ * @property {string} [planningContext]
+ * @property {string} [analysisFallback]
+ * @property {string} [verificationProfile]
+ * @property {string} [planSource]
+ * @property {string} [plannerSession]
+ * @property {boolean} [pendingPrepare]
+ * @property {boolean} [cancelRequested]
+ * @property {number} [requestedConcurrency]
+ * @property {{implementation?:boolean, analysis?: {baseSha:string, inputHash:string}}} completed
+ * @property {Record<string, RunNode>} nodes
+ * @property {RunData} config
+ * @property {RunData} [analysis]
+ * @property {RunData} [research]
+ * @property {RunData} [architectureChecks]
+ * @property {RunData} [securityChecks]
+ * @property {RunData} [uiVerification]
+ * @property {RunData} [baseline]
+ * @property {RunData} [checks]
+ * @property {RunData} [behavior]
+ * @property {RunData} [blocker]
+ * @property {RunData} [delivery]
+ * @property {RunData} [deployment]
+ * @property {RunData} [directorBinding]
+ * @property {RunData} [executor]
+ * @property {RunData} [executionMode]
+ * @property {RunData & {files:string[]}} [fastPath]
+ * @property {RunData} [lastDiagnostics]
+ * @property {RunData} [metrics]
+ * @property {RunData} [modeContext]
+ * @property {RunData} [snapshot]
+ * @property {RunData} [release]
+ * @property {RunData} [releaseAssignment]
+ * @property {RunData} [review]
+ * @property {RunData} [verification]
+ * @property {RunData} [watchdog]
+ * @property {RunData} [defaultSkills]
+ * @property {RunData} [controllerAssessment]
+ * @property {RunData} [pendingMerge]
+ * @property {RunData} [knowledge]
+ * @property {RunData} [waveContext]
+ * @property {RunData[]} [controllerAssessments]
+ * @property {RunData[]} [coordinatorOperations]
+ * @property {RunData[]} [deliveryOperations]
+ * @property {RunData[]} [gateCriteria]
+ * @property {(RunData & {stage:string})[]} [sessionAttempts]
+ * @property {{summary: string, tasks: (RunData & {role:string})[]}} [plan]
+ * @property {{client: string, model: string}} [fixedModel]
+ * @property {{client: string, model: string, id: string, available?: boolean}[]} [models]
+ * @property {{raw:string, sha256:string}} [pendingPlan]
+ * @property {{code:string, message:string, retryAt?:string}} [error]
+ * @property {RunEvidence} [analysisEvidence]
+ * @property {RunEvidence} [researchEvidence]
+ * @property {RunEvidence[]} [planningKnowledgeEvidence]
+ */
+
 // Roll back only an open transaction and never mask the error that caused it.
 function rollback(db) {
   try {

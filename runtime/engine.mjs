@@ -12,6 +12,8 @@ import { deliveryOperations, deploymentStatus } from './delivery-operations.mjs'
 import { normalizeArchitectureConfig } from './architecture-gate.mjs';
 import { EngineVerification } from './engine-verification.mjs';
 
+/** @typedef {import('./store.mjs').KodoRun} KodoRun */
+
 /** Public engine: the durable run loop over the layered stages. */
 /** Why the run stopped now, with the facts and evidence the next session needs. */
 export function currentBlocker(run, error) {
@@ -47,6 +49,7 @@ export class Engine extends EngineVerification {
    * What the delivery journal and the deployment configuration say, for status and the recovery
    * summary. Observational: a failure to read the journal never changes the outcome of the run.
    */
+  /** @param {KodoRun} run */
   deliverySummary(run) {
     if (!run.config?.delivery?.enabled) return;
     try {
@@ -57,6 +60,7 @@ export class Engine extends EngineVerification {
     }
   }
   /** Discover the subscription models this run may use and settle its primary model. */
+  /** @param {KodoRun} run */
   async selectModels(run) {
     run.models = (
       await this.logical(run, 'discovery', () =>
@@ -81,21 +85,8 @@ export class Engine extends EngineVerification {
     this.save(run);
     return run.models;
   }
-  // oxlint-disable-next-line max-lines-per-function, complexity -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
-  async run(id, { prepare = false, planFile, signal, resumeCancelled = false, retryFailed = false } = {}) {
-    const run = this.store.getRun(id);
-    // An external chat or an epic gate run is executed elsewhere: refuse before taking any lease.
-    if (run.executor?.kind === 'external' || run.directorBinding?.kind === 'gate')
-      throw Object.assign(new Error('Этот запуск исполняется не Engine: внешний исполнитель или гейт эпика'), {
-        code: 'project_run_not_native',
-      });
-    writeProgress(run, {
-      home: run.artifacts ? path.resolve(run.artifacts, '../..') : this.store.home,
-      secrets: this.secrets,
-    });
-    if (run.state === 'succeeded' || (run.state === 'cancelled' && !resumeCancelled)) return run;
-    const token = this.store.acquireLease(`run:${id}`, id);
-    if (!token) throw new Error('Этот запуск уже исполняется');
+  /** @param {KodoRun} run */
+  #resumeRunPhase(run, id, resumeCancelled, retryFailed) {
     // The saved error describes the previous attempt: from here on it is history, not the current blocker.
     const resumedAt = new Date(typeof this.store.clock === 'function' ? this.store.clock() : Date.now()).toISOString();
     run.blocker = resolveBlocker(run.blocker, { at: resumedAt, outcome: 'resumed' });
@@ -135,6 +126,272 @@ export class Engine extends EngineVerification {
       this.save(run);
       this.log(run, 'retry_requested');
     }
+  }
+  /** @param {KodoRun} run */
+  async #prepareRunPhase(run, prepare, planFile, signal) {
+    // Saved runs bypass readConfig; reject invalid timer values before any
+    // preparation, check reuse or coordinator delivery command can start.
+    validateCommandTimeouts(run.config.commands);
+    validateStartupTimeout(run.config.startupTimeoutMs);
+    normalizeArchitectureConfig(run.config.architecture);
+    this.checkCancelled(run, signal);
+    const hadNextRetryAt = Object.hasOwn(run, 'nextRetryAt');
+    if (hadNextRetryAt) run.nextRetryAt = undefined;
+    const wantPrepare = Boolean(prepare && !run.plan);
+    if (wantPrepare) {
+      run.pendingPrepare = true;
+      run.pendingPlan = undefined;
+    } else if (planFile) {
+      const raw = redact(await readFile(planFile, 'utf8'), this.secrets);
+      JSON.parse(raw);
+      run.pendingPlan = { raw, sha256: createHash('sha256').update(raw).digest('hex') };
+      run.pendingPrepare = undefined;
+    }
+    if (hadNextRetryAt || wantPrepare || planFile) {
+      this.save(run);
+      delete run.nextRetryAt;
+      if (run.pendingPrepare === undefined) delete run.pendingPrepare;
+      if (run.pendingPlan === undefined) delete run.pendingPlan;
+    }
+    const shouldPrepare = Boolean((wantPrepare || run.pendingPrepare) && !run.plan);
+    const effectivePlan = shouldPrepare ? undefined : run.pendingPlan;
+    await this.prepare(run, signal);
+    if (shouldPrepare && !run.plan) {
+      const planningContext = await this.preparePlanningContext(run);
+      await writeFile(path.join(run.artifacts, 'plan-context.md'), planningContext);
+      await writeFile(
+        path.join(run.artifacts, 'plan.schema.json'),
+        JSON.stringify(
+          {
+            ...planSchema,
+            properties: {
+              ...planSchema.properties,
+              tasks: { ...planSchema.properties.tasks, maxItems: run.executionMode.profile.maxTasks },
+            },
+          },
+          null,
+          2,
+        ),
+      );
+      run.planningContext = planningContext;
+      run.state = 'awaiting_plan';
+      run.pendingPrepare = undefined;
+      run.nextRetryAt = undefined;
+      this.save(run);
+      delete run.pendingPrepare;
+      delete run.nextRetryAt;
+      return { awaitingPlan: true };
+    }
+    return { effectivePlan };
+  }
+  /** @param {KodoRun} run */
+  async #planPhase(run, effectivePlan, signal) {
+    if (run.verification?.stopped)
+      throw Object.assign(new Error('Verification repair cycle stopped; use --retry-failed for a new cycle'), {
+        code: 'blocked',
+        scope: 'verification',
+        reason: run.verification.stopped,
+      });
+    // Recover a completed external merge before requiring native clients.
+    // A lost delivery receipt must not rediscover models or replay analysis.
+    if (run.delivery?.pr && this.delivery.reconcileDelivery) {
+      const recovered = await this.delivery.reconcileDelivery({
+        run,
+        config: run.config,
+        store: this.store,
+        cwd: run.cwd,
+        secrets: this.secrets,
+        signal,
+      });
+      if (recovered) {
+        run.delivery = recovered;
+        this.save(run);
+      }
+    }
+    if (!run.delivery?.mergeCommit) await this.selectModels(run);
+    await this.plan(run, effectivePlan, signal);
+    await this.assertProjectPlan(run);
+  }
+  /** @param {KodoRun} run */
+  async #executePhase(run, signal) {
+    if (!run.completed.implementation) {
+      await this.baseline(run, signal);
+      await this.executeTasks(run, signal);
+      run.completed.implementation = true;
+      this.save(run);
+    }
+    // Finish and scope-check the saved repair against its original HEAD
+    // before generic recovery can commit partial writes or base/release
+    // updates can introduce unrelated changes into that scope comparison.
+    if (run.verification?.pendingRepair) await this.repairVerification(run, signal);
+    await this.recoverIntegrationEdits(run, signal);
+    if (run.config.delivery.enabled) await this.synchronizeBase(run, signal);
+    if (run.config.delivery.release) {
+      if (this.delivery.prepareReleaseVersion)
+        await this.delivery.prepareReleaseVersion({
+          run,
+          config: run.config,
+          store: this.store,
+          cwd: run.cwd,
+          secrets: this.secrets,
+          signal,
+        });
+      await commitChanges(run.cwd, 'Kodo assign release version', [
+        'package.json',
+        'package-lock.json',
+        'registry.json',
+      ]);
+    }
+    await this.verify(run, signal);
+  }
+  /** @param {KodoRun} run */
+  async #deliverPhase(run, signal) {
+    this.checkCancelled(run, signal);
+    if (run.config.delivery.enabled) {
+      run.state = 'delivering';
+      this.save(run);
+      for (let attempt = 0; ; attempt++) {
+        try {
+          run.delivery = await this.delivery.deliver({
+            run,
+            config: run.config,
+            store: this.store,
+            cwd: run.cwd,
+            review: run.review,
+            secrets: this.secrets,
+            signal,
+            onEvent: event => this.log(run, 'delivery', event),
+          });
+          break;
+        } catch (error) {
+          if (error.code !== 'stale_base' || attempt >= 3) throw error;
+          if (run.delivery?.pr && this.delivery.reconcileDelivery) {
+            const recovered = await this.delivery.reconcileDelivery({
+              run,
+              config: run.config,
+              store: this.store,
+              cwd: run.cwd,
+              secrets: this.secrets,
+              signal,
+            });
+            if (recovered) {
+              run.delivery = recovered;
+              break;
+            }
+          }
+          await this.synchronizeBase(run, signal);
+          if (run.config.delivery.release && this.delivery.prepareReleaseVersion) {
+            await this.delivery.prepareReleaseVersion({
+              run,
+              config: run.config,
+              store: this.store,
+              cwd: run.cwd,
+              secrets: this.secrets,
+              signal,
+            });
+            await commitChanges(run.cwd, 'Kodo refresh release version', [
+              'package.json',
+              'package-lock.json',
+              'registry.json',
+            ]);
+          }
+          await this.verify(run, signal);
+        }
+      }
+      this.save(run);
+      this.checkCancelled(run, signal);
+      if (run.config.delivery.release) {
+        run.state = 'releasing';
+        this.save(run);
+        run.release = await this.delivery.releasePackage({
+          run,
+          config: run.config,
+          store: this.store,
+          cwd: run.cwd,
+          mergeCommit: run.delivery.mergeCommit,
+          secrets: this.secrets,
+          signal,
+          onEvent: event => this.log(run, 'release', event),
+        });
+      }
+    }
+  }
+  /** @param {KodoRun} run */
+  async #completeRunPhase(run, signal) {
+    if (!run.release?.published) this.checkCancelled(run, signal);
+    run.state = 'succeeded';
+    run.error = null;
+    run.nextRetryAt = undefined;
+    run.pendingPrepare = undefined;
+    run.pendingPlan = undefined;
+    run.blocker = resolveBlocker(run.blocker, { at: new Date().toISOString(), outcome: 'succeeded' });
+    this.deliverySummary(run);
+    this.save(run);
+    delete run.nextRetryAt;
+    delete run.pendingPrepare;
+    delete run.pendingPlan;
+    this.log(run, 'succeeded', { headSha: run.headSha, pr: run.delivery?.pr, release: run.release });
+    await this.policy(run, 'complete');
+    run.knowledge = this.store.remember(run);
+    this.save(run);
+    await writeFile(path.join(run.artifacts, 'receipt.json'), JSON.stringify(redact(run, this.secrets), null, 2));
+    return run;
+  }
+  /** @param {KodoRun} run */
+  #recordRunFailure(run, error, signal) {
+    run.state = this.store.getRun(run.id).cancelRequested
+      ? 'cancelled'
+      : error.code === 'lease_lost'
+        ? 'blocked'
+        : error.code === 'quota'
+          ? 'waiting_limits'
+          : error.code === 'cancelled' || signal?.aborted
+            ? 'cancelled'
+            : 'blocked';
+    run.error = {
+      code: error.code || 'error',
+      message: redact(error.message, this.secrets),
+      ...(error.retryAt ? { retryAt: error.retryAt } : {}),
+    };
+    this.deliverySummary(run);
+    if (['blocked', 'waiting_limits'].includes(run.state)) run.blocker = currentBlocker(run, error);
+    if (run.state === 'waiting_limits') {
+      const parsed = Date.parse(run.error?.retryAt || '');
+      const nextRetry = Number.isFinite(parsed) && parsed > Date.now() ? parsed : Date.now() + 15 * 60 * 1000;
+      run.nextRetryAt = new Date(nextRetry).toISOString();
+    } else {
+      run.nextRetryAt = undefined;
+      if (run.plan && run.pendingPlan) run.pendingPlan = undefined;
+    }
+    const saved = this.save(run);
+    if (saved.state === 'cancelled') {
+      run.state = 'cancelled';
+      delete run.nextRetryAt;
+    } else if (run.state !== 'waiting_limits') {
+      delete run.nextRetryAt;
+    }
+    if (run.pendingPlan === undefined) delete run.pendingPlan;
+    this.log(run, run.state, run.error);
+    return run;
+  }
+  /** @param {string} id
+   * @param {{prepare?: boolean, planFile?: string, signal?: AbortSignal, resumeCancelled?: boolean, retryFailed?: boolean}} [options] */
+  async run(id, { prepare = false, planFile, signal, resumeCancelled = false, retryFailed = false } = {}) {
+    /** @type {KodoRun} */
+    const run = this.store.getRun(id);
+    // An external chat or an epic gate run is executed elsewhere: refuse before taking any lease.
+    if (run.executor?.kind === 'external' || run.directorBinding?.kind === 'gate')
+      throw Object.assign(new Error('Этот запуск исполняется не Engine: внешний исполнитель или гейт эпика'), {
+        code: 'project_run_not_native',
+      });
+    writeProgress(run, {
+      home: run.artifacts ? path.resolve(run.artifacts, '../..') : this.store.home,
+      secrets: this.secrets,
+    });
+    if (run.state === 'succeeded' || (run.state === 'cancelled' && !resumeCancelled)) return run;
+    const token = this.store.acquireLease(`run:${id}`, id);
+    if (!token) throw new Error('Этот запуск уже исполняется');
+    this.#resumeRunPhase(run, id, resumeCancelled, retryFailed);
     const parentSignal = signal,
       controller = new AbortController(),
       cancel = () => controller.abort();
@@ -154,239 +411,16 @@ export class Engine extends EngineVerification {
     }, 500);
     cancellation.unref();
     try {
-      // Saved runs bypass readConfig; reject invalid timer values before any
-      // preparation, check reuse or coordinator delivery command can start.
-      validateCommandTimeouts(run.config.commands);
-      validateStartupTimeout(run.config.startupTimeoutMs);
-      normalizeArchitectureConfig(run.config.architecture);
-      this.checkCancelled(run, signal);
-      const hadNextRetryAt = Object.hasOwn(run, 'nextRetryAt');
-      if (hadNextRetryAt) run.nextRetryAt = undefined;
-      const wantPrepare = Boolean(prepare && !run.plan);
-      if (wantPrepare) {
-        run.pendingPrepare = true;
-        run.pendingPlan = undefined;
-      } else if (planFile) {
-        const raw = redact(await readFile(planFile, 'utf8'), this.secrets);
-        JSON.parse(raw);
-        run.pendingPlan = { raw, sha256: createHash('sha256').update(raw).digest('hex') };
-        run.pendingPrepare = undefined;
-      }
-      if (hadNextRetryAt || wantPrepare || planFile) {
-        this.save(run);
-        delete run.nextRetryAt;
-        if (run.pendingPrepare === undefined) delete run.pendingPrepare;
-        if (run.pendingPlan === undefined) delete run.pendingPlan;
-      }
-      const shouldPrepare = Boolean((wantPrepare || run.pendingPrepare) && !run.plan);
-      const effectivePlan = shouldPrepare ? undefined : run.pendingPlan;
-      await this.prepare(run, signal);
-      if (shouldPrepare && !run.plan) {
-        const planningContext = await this.preparePlanningContext(run);
-        await writeFile(path.join(run.artifacts, 'plan-context.md'), planningContext);
-        await writeFile(
-          path.join(run.artifacts, 'plan.schema.json'),
-          JSON.stringify(
-            {
-              ...planSchema,
-              properties: {
-                ...planSchema.properties,
-                tasks: { ...planSchema.properties.tasks, maxItems: run.executionMode.profile.maxTasks },
-              },
-            },
-            null,
-            2,
-          ),
-        );
-        run.planningContext = planningContext;
-        run.state = 'awaiting_plan';
-        run.pendingPrepare = undefined;
-        run.nextRetryAt = undefined;
-        this.save(run);
-        delete run.pendingPrepare;
-        delete run.nextRetryAt;
-        return run;
-      }
-      if (run.verification?.stopped)
-        throw Object.assign(new Error('Verification repair cycle stopped; use --retry-failed for a new cycle'), {
-          code: 'blocked',
-          scope: 'verification',
-          reason: run.verification.stopped,
-        });
-      // Recover a completed external merge before requiring native clients.
-      // A lost delivery receipt must not rediscover models or replay analysis.
-      if (run.delivery?.pr && this.delivery.reconcileDelivery) {
-        const recovered = await this.delivery.reconcileDelivery({
-          run,
-          config: run.config,
-          store: this.store,
-          cwd: run.cwd,
-          secrets: this.secrets,
-          signal,
-        });
-        if (recovered) {
-          run.delivery = recovered;
-          this.save(run);
-        }
-      }
-      if (!run.delivery?.mergeCommit) await this.selectModels(run);
-      await this.plan(run, effectivePlan, signal);
-      await this.assertProjectPlan(run);
-      if (!run.delivery?.mergeCommit) {
-        if (!run.completed.implementation) {
-          await this.baseline(run, signal);
-          await this.executeTasks(run, signal);
-          run.completed.implementation = true;
-          this.save(run);
-        }
-        // Finish and scope-check the saved repair against its original HEAD
-        // before generic recovery can commit partial writes or base/release
-        // updates can introduce unrelated changes into that scope comparison.
-        if (run.verification?.pendingRepair) await this.repairVerification(run, signal);
-        await this.recoverIntegrationEdits(run, signal);
-        if (run.config.delivery.enabled) await this.synchronizeBase(run, signal);
-        if (run.config.delivery.release) {
-          if (this.delivery.prepareReleaseVersion)
-            await this.delivery.prepareReleaseVersion({
-              run,
-              config: run.config,
-              store: this.store,
-              cwd: run.cwd,
-              secrets: this.secrets,
-              signal,
-            });
-          await commitChanges(run.cwd, 'Kodo assign release version', [
-            'package.json',
-            'package-lock.json',
-            'registry.json',
-          ]);
-        }
-        await this.verify(run, signal);
-      }
-      this.checkCancelled(run, signal);
-      if (run.config.delivery.enabled) {
-        run.state = 'delivering';
-        this.save(run);
-        for (let attempt = 0; ; attempt++) {
-          try {
-            run.delivery = await this.delivery.deliver({
-              run,
-              config: run.config,
-              store: this.store,
-              cwd: run.cwd,
-              review: run.review,
-              secrets: this.secrets,
-              signal,
-              onEvent: event => this.log(run, 'delivery', event),
-            });
-            break;
-          } catch (error) {
-            if (error.code !== 'stale_base' || attempt >= 3) throw error;
-            if (run.delivery?.pr && this.delivery.reconcileDelivery) {
-              const recovered = await this.delivery.reconcileDelivery({
-                run,
-                config: run.config,
-                store: this.store,
-                cwd: run.cwd,
-                secrets: this.secrets,
-                signal,
-              });
-              if (recovered) {
-                run.delivery = recovered;
-                break;
-              }
-            }
-            await this.synchronizeBase(run, signal);
-            if (run.config.delivery.release && this.delivery.prepareReleaseVersion) {
-              await this.delivery.prepareReleaseVersion({
-                run,
-                config: run.config,
-                store: this.store,
-                cwd: run.cwd,
-                secrets: this.secrets,
-                signal,
-              });
-              await commitChanges(run.cwd, 'Kodo refresh release version', [
-                'package.json',
-                'package-lock.json',
-                'registry.json',
-              ]);
-            }
-            await this.verify(run, signal);
-          }
-        }
-        this.save(run);
-        this.checkCancelled(run, signal);
-        if (run.config.delivery.release) {
-          run.state = 'releasing';
-          this.save(run);
-          run.release = await this.delivery.releasePackage({
-            run,
-            config: run.config,
-            store: this.store,
-            cwd: run.cwd,
-            mergeCommit: run.delivery.mergeCommit,
-            secrets: this.secrets,
-            signal,
-            onEvent: event => this.log(run, 'release', event),
-          });
-        }
-      }
-      if (!run.release?.published) this.checkCancelled(run, signal);
-      run.state = 'succeeded';
-      run.error = null;
-      run.nextRetryAt = undefined;
-      run.pendingPrepare = undefined;
-      run.pendingPlan = undefined;
-      run.blocker = resolveBlocker(run.blocker, { at: new Date().toISOString(), outcome: 'succeeded' });
-      this.deliverySummary(run);
-      this.save(run);
-      delete run.nextRetryAt;
-      delete run.pendingPrepare;
-      delete run.pendingPlan;
-      this.log(run, 'succeeded', { headSha: run.headSha, pr: run.delivery?.pr, release: run.release });
-      await this.policy(run, 'complete');
-      run.knowledge = this.store.remember(run);
-      this.save(run);
-      await writeFile(path.join(run.artifacts, 'receipt.json'), JSON.stringify(redact(run, this.secrets), null, 2));
-      return run;
+      const prepared = await this.#prepareRunPhase(run, prepare, planFile, signal);
+      if (prepared.awaitingPlan) return run;
+      await this.#planPhase(run, prepared.effectivePlan, signal);
+      if (!run.delivery?.mergeCommit) await this.#executePhase(run, signal);
+      await this.#deliverPhase(run, signal);
+      return await this.#completeRunPhase(run, signal);
     } catch (error) {
       // oxlint-disable-next-line no-ex-assign -- a lost lease outranks the stage error
       error = leaseError || error;
-      run.state = this.store.getRun(run.id).cancelRequested
-        ? 'cancelled'
-        : error.code === 'lease_lost'
-          ? 'blocked'
-          : error.code === 'quota'
-            ? 'waiting_limits'
-            : error.code === 'cancelled' || signal?.aborted
-              ? 'cancelled'
-              : 'blocked';
-      run.error = {
-        code: error.code || 'error',
-        message: redact(error.message, this.secrets),
-        ...(error.retryAt ? { retryAt: error.retryAt } : {}),
-      };
-      this.deliverySummary(run);
-      if (['blocked', 'waiting_limits'].includes(run.state)) run.blocker = currentBlocker(run, error);
-      if (run.state === 'waiting_limits') {
-        const parsed = Date.parse(run.error?.retryAt || '');
-        const nextRetry = Number.isFinite(parsed) && parsed > Date.now() ? parsed : Date.now() + 15 * 60 * 1000;
-        run.nextRetryAt = new Date(nextRetry).toISOString();
-      } else {
-        run.nextRetryAt = undefined;
-        if (run.plan && run.pendingPlan) run.pendingPlan = undefined;
-      }
-      const saved = this.save(run);
-      if (saved.state === 'cancelled') {
-        run.state = 'cancelled';
-        delete run.nextRetryAt;
-      } else if (run.state !== 'waiting_limits') {
-        delete run.nextRetryAt;
-      }
-      if (run.pendingPlan === undefined) delete run.pendingPlan;
-      this.log(run, run.state, run.error);
-      return run;
+      return this.#recordRunFailure(run, error, signal);
     } finally {
       clearInterval(heartbeat);
       clearInterval(cancellation);

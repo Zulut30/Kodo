@@ -183,6 +183,7 @@ function taskWords(task) {
  * References remain untrusted JSON data. No source text becomes instructions.
  * unknownCounts counts excluded rows by state (or malformed), while omitted
  * records only byte-budget losses, using the existing context-pack convention.
+ * @param {{evaluation?: {schemaVersion:number, rows:any[], unknowns:any}, task?: string | Record<string, any>, maxBytes?: number}} [options]
  */
 export function projectKnowledge({ evaluation, task = '', maxBytes = 2048 } = {}) {
   if (!positive(maxBytes))
