@@ -31,12 +31,11 @@ $client = "codex" # или "claude-code"
 kodo doctor --client $client --json
 ```
 
-6. Запусти задачу тем же клиентом. Скопируй `runId` из ответа `kodo run`, чтобы проверить статус.
+6. Запусти задачу тем же клиентом и передай в `kodo status` корневое поле `id` из ответа.
 
 ```powershell
-kodo run "Добавь экспорт в CSV и проверь его" --client $client --mode quick
-$runId = "<runId из ответа kodo run>"
-kodo status $runId --json
+$result = kodo run "Добавь экспорт в CSV и проверь его" --client $client --mode quick --json | ConvertFrom-Json
+kodo status $result.id --json
 ```
 
 `--mode quick` выполняет до двух задач плана последовательно, затем запускает настроенные проверки и независимое ревью. Без флага действует `executionMode` из конфигурации проекта. Если режим не задан и там, его выбирает Jev. Доставку включает `--delivery pr|release` или конфигурация проекта.

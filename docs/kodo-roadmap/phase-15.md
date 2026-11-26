@@ -132,7 +132,7 @@ Git-транспорт `refs/kodo/<projectId>/base|work/<runId>`, брифы б�
 
 ### 16D. Бэклог живого пилота (`kodo/16d-pilot-backlog`)
 
-Самопроверка `kodo ci feedback` на Rust-проектах: правило Волны 0 `rust_toolchain_required` для `rust-toolchain.toml` (`channel = "1.x.y"`, `clippy`, `rustfmt`), предупреждение `toolchain_unpinned` вместо `blocked` только в самопроверке воркера (гейты и `task-fast` без ослабления), выбор затронутых крейтов по графу Cargo без `affected_graph_fallback`, классификация конфиг-файлов Волны 0 (`.gitignore`, `architecture.policy.json`, `Cargo.lock`, `rust-toolchain.toml`). Перевод `cargoMembers` (`runtime/cargo-graph.mjs`) и `rustWorkspaceRoots` (`runtime/quality.mjs`) на канонический `resolveCargoWorkspace` (`runtime/cargo-workspace.mjs`) с консервативным `cargo-workspace-unsupported` при `unsupported` и дифференциальным тестом по фикстурам `cargo metadata`.
+Самопроверка `kodo ci feedback` на Rust-проектах: правило Волны 0 `rust_toolchain_required` для `rust-toolchain.toml` (`channel = "1.x.y"`, `clippy`, `rustfmt`), предупреждение `toolchain_unpinned` вместо `blocked` только в самопроверке воркера (обычные Rust-проверки `quality` по `lint` и `typecheck` требуют точных пинов), выбор затронутых крейтов по графу Cargo без `affected_graph_fallback`, классификация конфиг-файлов Волны 0 (`.gitignore`, `architecture.policy.json`, `Cargo.lock`, `rust-toolchain.toml`). Перевод `cargoMembers` (`runtime/cargo-graph.mjs`) и `rustWorkspaceRoots` (`runtime/quality.mjs`) на канонический `resolveCargoWorkspace` (`runtime/cargo-workspace.mjs`) с консервативным `cargo-workspace-unsupported` при `unsupported` и дифференциальным тестом по фикстурам `cargo metadata`.
 
 ### 16E. Запас времени Windows CI (`kodo/16e-ci-headroom`)
 
