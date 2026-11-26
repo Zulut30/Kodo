@@ -60,7 +60,7 @@ jobs:
           fi
 
   # Required branch-protection gate preserving `check (ubuntu-latest, 24)` and
-  # `check (windows-latest, 24)`. Each of the 10 mandatory platform legs is a
+  # `check (windows-latest, 24)`. Each of the 12 mandatory platform legs is a
   # dedicated non-matrix job emitting positive `outputs.passed == 'true'` only
   # after its commands exit 0, avoiding matrix-rollup cancellation ambiguity.
   check:
@@ -71,6 +71,8 @@ jobs:
       - ci-heavy-windows
       - ci-waves-director-ubuntu
       - ci-waves-director-windows
+      - ci-waves-e2e-ubuntu
+      - ci-waves-e2e-windows
       - ci-waves-parallel-ubuntu
       - ci-waves-parallel-windows
       - ci-final-ubuntu
@@ -93,6 +95,8 @@ jobs:
           HEAVY_UBUNTU_PASSED: ${{ needs.ci-heavy-ubuntu.outputs.passed }}
           WAVES_DIR_UBUNTU_RESULT: ${{ needs.ci-waves-director-ubuntu.result }}
           WAVES_DIR_UBUNTU_PASSED: ${{ needs.ci-waves-director-ubuntu.outputs.passed }}
+          WAVES_E2E_UBUNTU_RESULT: ${{ needs.ci-waves-e2e-ubuntu.result }}
+          WAVES_E2E_UBUNTU_PASSED: ${{ needs.ci-waves-e2e-ubuntu.outputs.passed }}
           WAVES_PAR_UBUNTU_RESULT: ${{ needs.ci-waves-parallel-ubuntu.result }}
           WAVES_PAR_UBUNTU_PASSED: ${{ needs.ci-waves-parallel-ubuntu.outputs.passed }}
           FINAL_UBUNTU_RESULT: ${{ needs.ci-final-ubuntu.result }}
@@ -103,6 +107,8 @@ jobs:
           HEAVY_WINDOWS_PASSED: ${{ needs.ci-heavy-windows.outputs.passed }}
           WAVES_DIR_WINDOWS_RESULT: ${{ needs.ci-waves-director-windows.result }}
           WAVES_DIR_WINDOWS_PASSED: ${{ needs.ci-waves-director-windows.outputs.passed }}
+          WAVES_E2E_WINDOWS_RESULT: ${{ needs.ci-waves-e2e-windows.result }}
+          WAVES_E2E_WINDOWS_PASSED: ${{ needs.ci-waves-e2e-windows.outputs.passed }}
           WAVES_PAR_WINDOWS_RESULT: ${{ needs.ci-waves-parallel-windows.result }}
           WAVES_PAR_WINDOWS_PASSED: ${{ needs.ci-waves-parallel-windows.outputs.passed }}
           FINAL_WINDOWS_RESULT: ${{ needs.ci-final-windows.result }}
@@ -119,12 +125,14 @@ jobs:
             verify_leg "ci-l2-ubuntu" "$L2_UBUNTU_RESULT" "$L2_UBUNTU_PASSED"
             verify_leg "ci-heavy-ubuntu" "$HEAVY_UBUNTU_RESULT" "$HEAVY_UBUNTU_PASSED"
             verify_leg "ci-waves-director-ubuntu" "$WAVES_DIR_UBUNTU_RESULT" "$WAVES_DIR_UBUNTU_PASSED"
+            verify_leg "ci-waves-e2e-ubuntu" "$WAVES_E2E_UBUNTU_RESULT" "$WAVES_E2E_UBUNTU_PASSED"
             verify_leg "ci-waves-parallel-ubuntu" "$WAVES_PAR_UBUNTU_RESULT" "$WAVES_PAR_UBUNTU_PASSED"
             verify_leg "ci-final-ubuntu" "$FINAL_UBUNTU_RESULT" "$FINAL_UBUNTU_PASSED"
           elif [ "$TARGET_OS" = "windows-latest" ]; then
             verify_leg "ci-l2-windows" "$L2_WINDOWS_RESULT" "$L2_WINDOWS_PASSED"
             verify_leg "ci-heavy-windows" "$HEAVY_WINDOWS_RESULT" "$HEAVY_WINDOWS_PASSED"
             verify_leg "ci-waves-director-windows" "$WAVES_DIR_WINDOWS_RESULT" "$WAVES_DIR_WINDOWS_PASSED"
+            verify_leg "ci-waves-e2e-windows" "$WAVES_E2E_WINDOWS_RESULT" "$WAVES_E2E_WINDOWS_PASSED"
             verify_leg "ci-waves-parallel-windows" "$WAVES_PAR_WINDOWS_RESULT" "$WAVES_PAR_WINDOWS_PASSED"
             verify_leg "ci-final-windows" "$FINAL_WINDOWS_RESULT" "$FINAL_WINDOWS_PASSED"
           else
@@ -315,6 +323,54 @@ jobs:
           "TMP=$kodoCanonicalTemp" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Wave factory suites (director)
         run: npm run test:waves:director
+      - name: Record verified leg pass
+        id: verify
+        shell: pwsh
+        run: '"passed=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append'
+
+  ci-waves-e2e-ubuntu:
+    runs-on: ubuntu-latest
+    outputs:
+      passed: ${{ steps.verify.outputs.passed }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - run: npm ci --ignore-scripts
+      - name: Wave factory suites (e2e)
+        run: npm run test:waves:e2e
+      - name: Record verified leg pass
+        id: verify
+        shell: bash
+        run: echo "passed=true" >> "$GITHUB_OUTPUT"
+
+  ci-waves-e2e-windows:
+    runs-on: windows-latest
+    outputs:
+      passed: ${{ steps.verify.outputs.passed }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - run: npm ci --ignore-scripts
+      - name: Canonicalize Windows temporary paths
+        shell: pwsh
+        run: |
+          $kodoCanonicalTemp = node -e "process.stdout.write(require('node:fs').realpathSync.native(require('node:os').tmpdir()))"
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve the Windows temporary directory' }
+          if ([string]::IsNullOrWhiteSpace($kodoCanonicalTemp) -or -not (Test-Path -LiteralPath $kodoCanonicalTemp -PathType Container)) {
+            throw 'The canonical Windows temporary directory must exist'
+          }
+          "TEMP=$kodoCanonicalTemp" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "TMP=$kodoCanonicalTemp" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Wave factory suites (e2e)
+        run: npm run test:waves:e2e
       - name: Record verified leg pass
         id: verify
         shell: pwsh

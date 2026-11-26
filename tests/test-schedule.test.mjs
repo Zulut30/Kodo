@@ -177,14 +177,11 @@ function workflowJob(workflow, name) {
 test('The wave factory suites run in their own command and parallel CI shards, outside default discovery', async () => {
   const { discoverTests, separateSuites, waveShards } = await import(scheduleUrl);
   // With them, one L2 command reached its fixed Windows deadline (runs 45410439061, 45418257242).
-  // Split into balanced 4-file shards so each Windows CI shard runs all files in one concurrent wave.
+  // Split into balanced shards (2 heavy director files, 2 heavy e2e files, 4 parallel/remote files)
+  // so 4-vCPU Windows runners never thrash 4 Engine-heavy wave suites on one VM.
   assert.deepEqual(waveShards, {
-    director: [
-      'tests/project-wave-director.test.mjs',
-      'tests/project-wave-director-recovery.test.mjs',
-      'tests/project-wave-e2e.test.mjs',
-      'tests/project-wave-e2e-gates.test.mjs',
-    ],
+    director: ['tests/project-wave-director.test.mjs', 'tests/project-wave-director-recovery.test.mjs'],
+    e2e: ['tests/project-wave-e2e.test.mjs', 'tests/project-wave-e2e-gates.test.mjs'],
     parallel: [
       'tests/project-parallel-engine.test.mjs',
       'tests/project-parallel-fencing.test.mjs',
@@ -192,7 +189,7 @@ test('The wave factory suites run in their own command and parallel CI shards, o
       'tests/project-remote-transport.test.mjs',
     ],
   });
-  assert.deepEqual(separateSuites, [...waveShards.director, ...waveShards.parallel]);
+  assert.deepEqual(separateSuites, [...waveShards.director, ...waveShards.e2e, ...waveShards.parallel]);
   const discovered = discoverTests(root).map(file => path.relative(root, file).replaceAll('\\', '/'));
   for (const suite of separateSuites) {
     assert.ok(!discovered.includes(suite), `${suite} is not in the default suite`);
@@ -201,6 +198,7 @@ test('The wave factory suites run in their own command and parallel CI shards, o
   const scripts = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8')).scripts;
   assert.equal(scripts['test:waves'], `node scripts/run-tests.mjs ${separateSuites.join(' ')}`);
   assert.equal(scripts['test:waves:director'], `node scripts/run-tests.mjs ${waveShards.director.join(' ')}`);
+  assert.equal(scripts['test:waves:e2e'], `node scripts/run-tests.mjs ${waveShards.e2e.join(' ')}`);
   assert.equal(scripts['test:waves:parallel'], `node scripts/run-tests.mjs ${waveShards.parallel.join(' ')}`);
   const workflow = readFileSync(path.join(root, '.github/workflows/ci.yml'), 'utf8');
   const fast = workflowJob(workflow, 'fast');
@@ -208,6 +206,8 @@ test('The wave factory suites run in their own command and parallel CI shards, o
   for (const [shard, osName] of [
     ['director', 'ubuntu'],
     ['director', 'windows'],
+    ['e2e', 'ubuntu'],
+    ['e2e', 'windows'],
     ['parallel', 'ubuntu'],
     ['parallel', 'windows'],
   ]) {
@@ -287,6 +287,7 @@ test('Every default-pattern test file runs in exactly one required check shard',
   const steps = {
     'npm run check': discoverTests(root).map(file => path.relative(root, file).replaceAll('\\', '/')),
     'npm run test:waves:director': listed('test:waves:director'),
+    'npm run test:waves:e2e': listed('test:waves:e2e'),
     'npm run test:waves:parallel': listed('test:waves:parallel'),
     'npm run test:heavy': listed('test:heavy'),
   };
@@ -303,19 +304,25 @@ test('Every default-pattern test file runs in exactly one required check shard',
   assert.match(check, /\n {4}if: always\(\)\n/);
   assert.match(check, /os: \[ubuntu-latest, windows-latest\]/);
   assert.match(check, /node: \[24\]/);
+  const [ubuntuBranch, windowsBranchAndElse] = check.split('elif [ "$TARGET_OS" = "windows-latest" ]; then');
+  assert.ok(ubuntuBranch && windowsBranchAndElse, 'check branches by TARGET_OS');
+  const ubuntuVerifier = ubuntuBranch.split('if [ "$TARGET_OS" = "ubuntu-latest" ]; then')[1] ?? '';
+  const windowsVerifier = windowsBranchAndElse.split('else')[0] ?? '';
   const requiredLegs = [
-    ['ci-l2-ubuntu', 'ubuntu-latest', ['node scripts/ci.mjs run --tier L2']],
-    ['ci-l2-windows', 'windows-latest', ['node scripts/ci.mjs run --tier L2']],
-    ['ci-heavy-ubuntu', 'ubuntu-latest', ['npm run test:heavy']],
-    ['ci-heavy-windows', 'windows-latest', ['npm run test:heavy']],
-    ['ci-waves-director-ubuntu', 'ubuntu-latest', ['npm run test:waves:director']],
-    ['ci-waves-director-windows', 'windows-latest', ['npm run test:waves:director']],
-    ['ci-waves-parallel-ubuntu', 'ubuntu-latest', ['npm run test:waves:parallel']],
-    ['ci-waves-parallel-windows', 'windows-latest', ['npm run test:waves:parallel']],
-    ['ci-final-ubuntu', 'ubuntu-latest', ['npm run test:final', 'node scripts/package-smoke.mjs']],
-    ['ci-final-windows', 'windows-latest', ['npm run test:final', 'node scripts/package-smoke.mjs']],
+    ['ci-l2-ubuntu', 'ubuntu-latest', 'L2_UBUNTU', ['node scripts/ci.mjs run --tier L2']],
+    ['ci-l2-windows', 'windows-latest', 'L2_WINDOWS', ['node scripts/ci.mjs run --tier L2']],
+    ['ci-heavy-ubuntu', 'ubuntu-latest', 'HEAVY_UBUNTU', ['npm run test:heavy']],
+    ['ci-heavy-windows', 'windows-latest', 'HEAVY_WINDOWS', ['npm run test:heavy']],
+    ['ci-waves-director-ubuntu', 'ubuntu-latest', 'WAVES_DIR_UBUNTU', ['npm run test:waves:director']],
+    ['ci-waves-director-windows', 'windows-latest', 'WAVES_DIR_WINDOWS', ['npm run test:waves:director']],
+    ['ci-waves-e2e-ubuntu', 'ubuntu-latest', 'WAVES_E2E_UBUNTU', ['npm run test:waves:e2e']],
+    ['ci-waves-e2e-windows', 'windows-latest', 'WAVES_E2E_WINDOWS', ['npm run test:waves:e2e']],
+    ['ci-waves-parallel-ubuntu', 'ubuntu-latest', 'WAVES_PAR_UBUNTU', ['npm run test:waves:parallel']],
+    ['ci-waves-parallel-windows', 'windows-latest', 'WAVES_PAR_WINDOWS', ['npm run test:waves:parallel']],
+    ['ci-final-ubuntu', 'ubuntu-latest', 'FINAL_UBUNTU', ['npm run test:final', 'node scripts/package-smoke.mjs']],
+    ['ci-final-windows', 'windows-latest', 'FINAL_WINDOWS', ['npm run test:final', 'node scripts/package-smoke.mjs']],
   ];
-  for (const [jobName, runnerOs, commands] of requiredLegs) {
+  for (const [jobName, runnerOs, envPrefix, commands] of requiredLegs) {
     const job = workflowJob(workflow, jobName);
     assert.match(job, new RegExp(`runs-on: ${runnerOs}`), `${jobName} runs on ${runnerOs}`);
     assert.match(job, /node-version: 24/, `${jobName} uses Node 24`);
@@ -330,8 +337,19 @@ test('Every default-pattern test file runs in exactly one required check shard',
       assert.ok(!fast.includes(command), `${command} is not in the fast job`);
     }
     assert.ok(check.includes(`- ${jobName}\n`), `check depends on ${jobName}`);
-    assert.ok(check.includes(`needs.${jobName}.result`), `check verifies ${jobName}.result`);
-    assert.ok(check.includes(`needs.${jobName}.outputs.passed`), `check verifies ${jobName}.outputs.passed`);
+    assert.ok(
+      check.includes(`${envPrefix}_RESULT: \${{ needs.${jobName}.result }}`),
+      `check binds ${envPrefix}_RESULT to ${jobName}.result`,
+    );
+    assert.ok(
+      check.includes(`${envPrefix}_PASSED: \${{ needs.${jobName}.outputs.passed }}`),
+      `check binds ${envPrefix}_PASSED to ${jobName}.outputs.passed`,
+    );
+    const branch = runnerOs === 'ubuntu-latest' ? ubuntuVerifier : windowsVerifier;
+    assert.ok(
+      branch.includes(`verify_leg "${jobName}" "$${envPrefix}_RESULT" "$${envPrefix}_PASSED"`),
+      `check ${runnerOs} branch calls verify_leg for ${jobName}`,
+    );
   }
 });
 test(
