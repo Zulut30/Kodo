@@ -1,44 +1,26 @@
 import path from 'node:path';
 import os from 'node:os';
-import {
-  readFile,
-  writeFile,
-  mkdir,
-  rename,
-  mkdtemp,
-  realpath,
-  lstat,
-  chmod,
-  unlink,
-  rmdir,
-  link,
-} from 'node:fs/promises';
+import { readFile, writeFile, mkdir, rename, mkdtemp, realpath, lstat, chmod, unlink, link } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
-import { Store } from './store.mjs';
 import { redact, workerEnvironment } from './security.mjs';
-import { readConfig, configuredConcurrency, normalizeConcurrency } from './config.mjs';
+import { normalizeConcurrency } from './config.mjs';
 import { buildContextManifest } from './context-manifest.mjs';
-import { validatePlan } from './contracts.mjs';
-import { execute, resolveCommand } from './command.mjs';
-import { git, inspectProject, worktreeHomeFor } from './workspace.mjs';
-import * as providers from './providers.mjs';
-import { research } from './research.mjs';
-import { deliver, releasePackage, prepareReleaseVersion, reconcileDelivery } from './delivery.mjs';
-import { loadDefaultPolicy } from './skill-policy.mjs';
-import { buildTaskContext, validateTaskContract } from './task-context.mjs';
+import { execute } from './command.mjs';
+import { git, worktreeHomeFor } from './workspace.mjs';
+import { buildTaskContext } from './task-context.mjs';
 import { compactPlanEvidence, measureContext } from './context-pack.mjs';
 import { packWaveContextBlocks } from './wave-context.mjs';
-import { isManagedRtkReady, rtkWorkerEnvironment } from './rtk.mjs';
 import { writeProgress, assertPrivateArtifactPath } from './progress.mjs';
-import { resolveTool, formatToolContext } from './tools.mjs';
-import { runUIVerification, isCurrentUIReceipt } from './ui-verification.mjs';
-import { runSecurityChecks, isCurrentSecurityReceipt } from './security-gates.mjs';
-import { runArchitectureChecks, isCurrentArchitectureReceipt } from './architecture-gate.mjs';
-import { normalizeMode } from './modes.mjs';
-import { aggregateMetrics, normalizeUsage } from './metrics.mjs';
+import { normalizeUsage, aggregateMetrics } from './metrics.mjs';
 import { knowledgeSnapshot } from './knowledge-cli.mjs';
+import { contentHash, executionEnvironment } from './worker-environment.mjs';
+import { policy, prepareRun, validateModePlan } from './engine-run-preparation.mjs';
+import { Store, providers, research, defaultDelivery, defaultGates, defaultTools } from './engine-services.mjs';
 
+/** @typedef {import('./store.mjs').KodoRun} KodoRun */
+
+/** @returns {Promise<void>} */
 const delay = (ms, signal) =>
   new Promise((resolve, reject) => {
     const timer = setTimeout(done, ms);
@@ -53,7 +35,6 @@ const delay = (ms, signal) =>
     signal?.addEventListener('abort', abort, { once: true });
     if (signal?.aborted) abort();
   });
-const contentHash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const defaultModel = client => (client === 'claude-code' ? 'opus' : 'gpt-6.1-sol');
 const evidenceBatchDirectory = Symbol('evidenceBatchDirectory');
 
@@ -67,7 +48,11 @@ function packSessionEvidence(packer, value, options, secrets, references) {
   packedSessionEvidence.add(evidence);
   return evidence;
 }
-/** @returns {Readonly<object>} Opaque prompt; its packed evidence/metrics share identity. */
+/** @param {string} before
+ * @param {object} evidence
+ * @param {string} [after]
+ * @param {{nodeContext?: {run: KodoRun, task: any, contractPath?: string}, gates?: any, secrets?: import('./security.mjs').Secrets}} [options]
+ * @returns {Readonly<object>} Opaque prompt; its packed evidence/metrics share identity. */
 function evidencePrompt(before, evidence, after = '', { nodeContext, gates, secrets = {} } = {}) {
   if (!packedSessionEvidence.has(evidence))
     throw Object.assign(new Error('Untrusted packed session evidence'), { code: 'evidence_integrity' });
@@ -178,12 +163,16 @@ function settleSilentStart(attempt, reason, elapsed) {
 
 /** State, evidence, leases and native sessions shared by every engine stage. */
 export class EngineCore {
+  /** @param {{store?: import('./store.mjs').Store, secrets?: import('./security.mjs').Secrets,
+   * provider?: typeof providers & {assessTask?: typeof import('./modes.mjs').assessTask}, researcher?: typeof research,
+   * delivery?: ReturnType<typeof defaultDelivery>, gates?: Partial<ReturnType<typeof defaultGates>>,
+   * tools?: Partial<ReturnType<typeof defaultTools>>, onEvent?: (event: object) => void, leaseHeartbeatMs?: number}} [options] */
   constructor({
     store,
     secrets = {},
     provider = providers,
     researcher = research,
-    delivery = { deliver, releasePackage, prepareReleaseVersion, reconcileDelivery },
+    delivery = defaultDelivery(),
     gates = {},
     tools = {},
     onEvent = () => {},
@@ -197,15 +186,10 @@ export class EngineCore {
     this.onEvent = onEvent;
     this.leaseHeartbeatMs = leaseHeartbeatMs;
     this.gates = {
-      runUIVerification,
-      isCurrentUIReceipt,
-      runSecurityChecks,
-      isCurrentSecurityReceipt,
-      runArchitectureChecks,
-      isCurrentArchitectureReceipt,
+      ...defaultGates(),
       ...gates,
     };
-    this.tools = { resolveTool, formatToolContext, ...tools };
+    this.tools = { ...defaultTools(), ...tools };
     // Login checks of native clients, one cache per loaded run object: a new `run()` loads a new
     // object and checks again, so nothing is shared between runs.
     this.subscriptionChecks = new WeakMap();
@@ -215,6 +199,7 @@ export class EngineCore {
    * automatic restart, across resume, retry cycles and parallel workers. It is checked and
    * recorded in one synchronous step.
    */
+  /** @param {KodoRun} run */
   admitSessionStart(run, { stage, node, request, references, manifest, localBytes, restart }) {
     const sessionCap = run.config.budgets?.sessions ?? null;
     if (sessionCap !== null && (run.sessionAttempts?.length ?? 0) >= sessionCap)
@@ -246,15 +231,18 @@ export class EngineCore {
     return attempt;
   }
   /** The login cache of this loaded run, shared by model discovery and every native session. */
+  /** @param {KodoRun} run */
   runSubscriptionChecks(run) {
     if (!this.subscriptionChecks.has(run)) this.subscriptionChecks.set(run, new Map());
     return this.subscriptionChecks.get(run);
   }
+  /** @param {KodoRun} run */
   log(run, type, data = {}) {
     const clean = redact(data, this.secrets);
     this.store.event(run.id, type, clean);
     this.onEvent({ runId: run.id, type, data: clean });
   }
+  /** @param {KodoRun} run */
   save(run) {
     if (run.sessionAttempts || run.coordinatorOperations) {
       const counts = Object.fromEntries(
@@ -279,6 +267,7 @@ export class EngineCore {
     });
     return saved;
   }
+  /** @param {KodoRun} run */
   async logical(run, kind, action) {
     const operation = { kind, status: 'started', durationMs: null };
     (run.coordinatorOperations ||= []).push(operation);
@@ -297,6 +286,7 @@ export class EngineCore {
       this.save(run);
     }
   }
+  /** @param {KodoRun} run */
   primary(run) {
     const model = run.fixedModel?.model || run.config.primaryModel || defaultModel(run.client);
     const selected =
@@ -305,16 +295,11 @@ export class EngineCore {
     if (!selected) throw Object.assign(new Error(`Выбранная модель недоступна: ${model}`), { code: 'auth' });
     return selected;
   }
-  validateModePlan(run, candidate, { legacy = false } = {}) {
-    validatePlan(candidate);
-    if (candidate.tasks.length > run.executionMode.profile.maxTasks)
-      throw Object.assign(
-        new Error(`План превышает maxTasks=${run.executionMode.profile.maxTasks} для ${run.executionMode.selected}`),
-        { code: 'invalid_plan' },
-      );
-    if (!legacy) candidate.tasks.forEach(validateTaskContract);
-    return candidate;
+  /** @param {KodoRun} run */
+  validateModePlan(run, candidate, options = {}) {
+    return validateModePlan(run, candidate, options);
   }
+  /** @param {KodoRun} run */
   assess(run, { scope, attempts, reason, problem }) {
     const assessment = {
       scope,
@@ -339,6 +324,9 @@ export class EngineCore {
       ),
     );
   }
+  /** @param {KodoRun} run
+   * @param {string} stage
+   * @param {any[]} [resolvedTools] */
   async toolContext(run, stage, resolvedTools) {
     // Workers use rg; expensive browser/scanner installation verification stays
     // with their coordinator gates. Unchecked capabilities remain unavailable.
@@ -392,6 +380,7 @@ try {
     } else await chmod(directory, 0o700);
     return directory;
   }
+  /** @param {KodoRun} run */
   async withEvidenceBatch(run, action) {
     // Prepare ACLs once for this bounded write batch, before any worker starts.
     // Never cache successful protection across batches or native sessions.
@@ -406,6 +395,10 @@ try {
       batch.active = false;
     }
   }
+  /** @param {KodoRun} run
+   * @param {string} kind
+   * @param {unknown} value
+   * @param {{headSha?: string, [evidenceBatchDirectory]?: {directory:string, dev:number, ino:number, active:boolean}}} [options] */
   async persistEvidence(
     run,
     kind,
@@ -490,11 +483,15 @@ try {
       );
     }
   }
+  /** @param {KodoRun} run */
   checkEvidenceReferences(run) {
     return (run.checks?.results || [])
       .filter(row => row.outputPath !== undefined)
       .map(row => ({ path: row.outputPath, sha256: row.outputHash, headSha: run.checks.headSha }));
   }
+  /** @param {KodoRun} run
+   * @param {object} [options]
+   * @param {Function} [persist] */
   async planningEvidence(run, options, persist) {
     const snapshot = redact({ analysis: run.analysis, research: run.research }, this.secrets);
     const headSha = await git(run.cwd, ['rev-parse', 'HEAD']);
@@ -511,69 +508,14 @@ try {
     };
     return persist ? write(persist) : this.withEvidenceBatch(run, write);
   }
+  /** @param {KodoRun} run */
   async policy(run, stage) {
-    const policy = await loadDefaultPolicy({ project: run.cwd, stage, task: run.task, run });
-    run.defaultSkills ||= {};
-    run.defaultSkills[stage] = { hash: policy.hash, skills: policy.skills };
-    this.save(run);
-    return `Kodo default engineering skills (user-selected; follow within the authorized task and coordinator-owned worktree/model/delivery rules):\n${policy.context}\n`;
+    return policy(this, run, stage);
   }
   async prepareRun(task, options = {}, reserved = false) {
-    if (!task?.trim()) throw new Error('Требуется описание задачи');
-    const project = path.resolve(options.project || process.cwd());
-    normalizeMode(options.mode);
-    const config = await readConfig(project, {
-      ...(options.client ? { client: options.client } : {}),
-      ...(options.model ? { primaryModel: options.model } : {}),
-      ...(options.mode !== undefined ? { executionMode: options.mode } : {}),
-      ...(options.concurrency !== undefined ? { concurrency: options.concurrency } : {}),
-    });
-    if (options.model && !config.models[config.client]?.includes(options.model))
-      throw new Error('Выбранная модель отсутствует в allowlist проекта');
-    const snapshot = await inspectProject(project);
-    const mode =
-      options.providers ||
-      (!reserved && /использ\S*\s+обе\s+подпис|use both subscriptions/i.test(task) ? 'both' : 'current');
-    if (!['current', 'both'].includes(mode)) throw new Error('providers должен быть current или both');
-    if (!['none', 'pr', 'release'].includes(options.delivery || 'none')) throw new Error('Некорректный режим доставки');
-    if (options.delivery)
-      config.delivery = {
-        ...config.delivery,
-        enabled: options.delivery !== 'none',
-        release: options.delivery === 'release',
-      };
-    if (config.delivery.enabled && !config.repository)
-      throw new Error('Для доставки укажи repository в kodo.config.json');
-    let baseSha = snapshot.head;
-    if (config.delivery.enabled) {
-      await git(snapshot.root, ['fetch', 'origin', config.baseBranch]);
-      baseSha = await git(snapshot.root, ['rev-parse', `origin/${config.baseBranch}`]);
-    }
-    if (reserved && options.baseSha !== undefined) {
-      if (
-        !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(options.baseSha) ||
-        (await git(snapshot.root, ['rev-parse', '--verify', `${options.baseSha}^{commit}`])) !== options.baseSha
-      )
-        throw Object.assign(new Error('Invalid project integration frontier'), { code: 'project_frontier_blocked' });
-      baseSha = options.baseSha;
-    }
-    return {
-      task: redact(task, this.secrets),
-      project: snapshot.root,
-      config: reserved ? { ...config } : config,
-      client: config.client,
-      providers: mode,
-      baseSha,
-      snapshot,
-      completed: {},
-      nodes: {},
-      requestedMode: config.executionMode ?? null,
-      requestedConcurrency: config[configuredConcurrency],
-      ...(options.model ? { fixedModel: { client: config.client, model: options.model } } : {}),
-      sessionAttempts: [],
-      coordinatorOperations: [],
-    };
+    return prepareRun(this, task, options, reserved);
   }
+  /** @param {KodoRun} run */
   async initializeRun(run) {
     // A caller may keep SQLite in a fixture/project directory. Private artifacts
     // and worktrees still belong outside Git, without changing that store.
@@ -597,6 +539,9 @@ try {
     this.save(run);
     return run;
   }
+  /** @param {string} task
+   * @param {object} [options]
+   * @param {{binding?: object, installRun?: (input: object) => any}} [reservation] */
   async createReserved(task, options = {}, { binding, installRun } = {}) {
     const contracts = await import('./project-contracts.mjs');
     const safety = { knownValues: Object.values(this.secrets).filter(value => typeof value === 'string') };
@@ -617,6 +562,7 @@ try {
       throw Object.assign(new Error('Invalid reserved Run input'), { code: 'project_binding_invalid' });
     return await installRun({ binding: frozen, runDraft: run });
   }
+  /** @param {KodoRun} run */
   async assertProjectPlan(run) {
     if (!run.directorBinding) return;
     const contracts = await import('./project-contracts.mjs');
@@ -653,6 +599,7 @@ try {
       });
     if (run.plan.tasks.some(task => task.writePaths.some(scope => !contains(scope)))) deny();
   }
+  /** @param {KodoRun} run */
   async withLease(run, name, limit, action, signal) {
     let token;
     while (!(token = this.store.acquireLease(name, run.id, { limit, ttlMs: 60000 }))) {
@@ -683,96 +630,21 @@ try {
       this.store.releaseLease(token);
     }
   }
+  /** @param {KodoRun} run */
   checkCancelled(run, signal) {
     if (signal?.aborted || this.store.getRun(run.id).cancelRequested)
       throw Object.assign(new Error('Запуск отменён'), { code: 'cancelled' });
   }
+  /** @param {KodoRun} run
+   * @param {string} cwd
+   * @param {any[]} [resolvedTools] */
   async executionEnvironment(run, cwd, resolvedTools) {
-    const environment = workerEnvironment();
-    // Native workspace-write sessions can write OS temp while the user's global
-    // npm cache may be outside their writable roots. A private random cache
-    // avoids predictable shared /tmp paths and reuses npm's concurrent CAS across
-    // all runs/worktrees using this user's state store.
-    const home = path.resolve(os.homedir()),
-      tempRoot = await realpath(os.tmpdir());
-    const homeHash = contentHash(process.platform === 'win32' ? home.toLowerCase() : home).slice(0, 24),
-      prefix = `kodo-npm-cache-${homeHash}-`;
-    const pointerFile = path.join(this.store.home, 'npm-cache.json');
-    const privateOwned = info =>
-      process.platform === 'win32' || (info.uid === process.getuid() && (info.mode & 0o077) === 0);
-    const validCache = async candidate => {
-      if (typeof candidate !== 'string' || !path.isAbsolute(candidate)) return false;
-      const resolved = path.resolve(candidate),
-        parent = path.dirname(resolved);
-      if (
-        (process.platform === 'win32' ? parent.toLowerCase() !== tempRoot.toLowerCase() : parent !== tempRoot) ||
-        !path.basename(resolved).startsWith(prefix) ||
-        path.basename(resolved).length < prefix.length + 6
-      )
-        return false;
-      try {
-        const info = await lstat(resolved);
-        return info.isDirectory() && !info.isSymbolicLink() && privateOwned(info);
-      } catch {
-        return false;
-      }
-    };
-    const cache = await this.withLease(run, 'npm-cache:initialization', 1, async () => {
-      try {
-        const info = await lstat(pointerFile);
-        if (info.isFile() && !info.isSymbolicLink() && info.size <= 8192 && privateOwned(info)) {
-          const pointer = JSON.parse(await readFile(pointerFile, 'utf8'));
-          if (pointer.schemaVersion === 1 && pointer.homeHash === homeHash && (await validCache(pointer.cache)))
-            return path.resolve(pointer.cache);
-        }
-      } catch {} // Missing, foreign, malformed or unsafe pointers get a fresh cache.
-      const fresh = await mkdtemp(path.join(tempRoot, prefix)),
-        temporary = path.join(this.store.home, `.npm-cache-${randomUUID()}.tmp`);
-      try {
-        if (process.platform !== 'win32') await chmod(fresh, 0o700);
-        if (!(await validCache(fresh))) throw new Error('Не удалось создать закрытый npm cache Kodo');
-        await writeFile(temporary, JSON.stringify({ schemaVersion: 1, homeHash, cache: fresh }) + '\n', {
-          flag: 'wx',
-          mode: 0o600,
-        });
-        await rename(temporary, pointerFile);
-        return fresh;
-      } catch (error) {
-        if (await validCache(fresh)) await rmdir(fresh).catch(() => {}); // Only our new, still-empty directory.
-        throw error;
-      } finally {
-        await unlink(temporary).catch(() => {});
-      }
-    });
-    for (const name of Object.keys(environment))
-      if (name.toUpperCase() === 'NPM_CONFIG_CACHE') delete environment[name];
-    environment.NPM_CONFIG_CACHE = cache;
-    const pathName = Object.keys(environment).find(name => name.toLowerCase() === 'path') || 'PATH';
-    const tools = resolvedTools || (await this.resolveWorkerTools(cwd, { rtk: false }));
-    const rg = tools.find(tool => tool.id === 'ripgrep'),
-      rtk = tools.find(isManagedRtkReady);
-    for (const name of Object.keys(environment)) if (/^RTK_/i.test(name)) delete environment[name];
-    if (rtk) {
-      const root = await this.privateDirectory(path.join(run.artifacts || this.store.home, 'worker-tools'));
-      const directory = await mkdtemp(path.join(root, 'rtk-'));
-      if (process.platform !== 'win32') await chmod(directory, 0o700);
-      assertPrivateArtifactPath(directory);
-      Object.assign(environment, rtkWorkerEnvironment(rtk, directory));
-    }
-    environment[pathName] = [
-      path.dirname(process.execPath),
-      rtk ? path.dirname(rtk.command) : null,
-      rg?.ready ? path.dirname(rg.command) : null,
-      environment[pathName],
-    ]
-      .filter(Boolean)
-      .join(path.delimiter);
-    try {
-      const npm = resolveCommand('npm', []);
-      if (npm.command === process.execPath && npm.args[0]) environment.npm_execpath = npm.args[0];
-    } catch {} // Non-Node projects do not require an npm installation to start a worker.
-    return environment;
+    return executionEnvironment(this, run, cwd, resolvedTools);
   }
+  /** @param {KodoRun} run
+   * @param {string} cwd
+   * @param {any} [node]
+   * @param {any} [identity] */
   async nativeKnowledge(run, cwd, node, identity = node) {
     // Legacy runs have no original project identity. A worker cwd cannot supply it.
     if (typeof run.project !== 'string' || !run.project.trim()) return { text: '', references: [], metrics: {} };
@@ -817,6 +689,11 @@ try {
       metrics: { knowledgeBytes: measureContext(text), knowledgeStatus: 'ready' },
     };
   }
+  /** @param {KodoRun} run
+   * @param {Omit<import("./providers.mjs").SessionRequest,"prompt"> & {prompt: string | Readonly<object>, contextMetrics?: Record<string, any>}} request
+   * @param {AbortSignal} [signal]
+   * @param {any} [node]
+   * @param {any} [identity] */
   async session(run, request, signal, node, identity = node) {
     if (run.fixedModel && (request.client !== run.fixedModel.client || request.model !== run.fixedModel.model))
       throw Object.assign(new Error('Fixed model boundary violated'), { code: 'fixed_model' });
@@ -886,21 +763,21 @@ try {
             sections: [...baseSections, ...(waveBlocks?.sections ?? [])],
             references,
           });
-          request = { ...request, prompt: guidance + rendered + knowledge.text + (waveBlocks?.text ?? '') };
+          const nativeRequest = { ...request, prompt: guidance + rendered + knowledge.text + (waveBlocks?.text ?? '') };
           localBytes = {
-            promptBytes: measureContext(request.prompt),
-            contextOriginalBytes: request.contextMetrics?.originalBytes ?? null,
-            contextSentBytes: request.contextMetrics?.sentBytes ?? null,
+            promptBytes: measureContext(nativeRequest.prompt),
+            contextOriginalBytes: nativeRequest.contextMetrics?.originalBytes ?? null,
+            contextSentBytes: nativeRequest.contextMetrics?.sentBytes ?? null,
             ...knowledge.metrics,
           };
-          const env = await this.executionEnvironment(run, request.cwd, tools);
+          const env = await this.executionEnvironment(run, nativeRequest.cwd, tools);
           for (const reference of references) await this.assertEvidence(reference);
           this.checkCancelled(run, controller.signal);
           const admit = restart =>
             (attempt = this.admitSessionStart(run, {
               stage,
               node,
-              request,
+              request: nativeRequest,
               references,
               manifest,
               localBytes,
@@ -909,7 +786,7 @@ try {
           admit();
           started = performance.now();
           const result = await this.provider.runSession({
-            ...request,
+            ...nativeRequest,
             signal: controller.signal,
             env,
             subscriptionChecks: this.runSubscriptionChecks(run),
@@ -939,7 +816,7 @@ try {
           });
           attempt.metrics = result.metrics || {
             ...attempt.metrics,
-            usage: normalizeUsage(request.client, result.usage),
+            usage: normalizeUsage(nativeRequest.client, result.usage),
           };
           for (const reference of references) await this.assertEvidence(reference);
           attempt.status = 'completed';
@@ -963,6 +840,7 @@ try {
       signal,
     );
   }
+  /** @param {KodoRun} run */
   async setup(cwd, run, signal) {
     let lock;
     try {

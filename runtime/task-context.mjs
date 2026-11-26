@@ -31,6 +31,9 @@ export function validateTaskContract(task) {
 
 /** Deliberate allowlist: never serialize a run, analysis, research body or a
  * previous request. The pinned policy and optional tool guidance are separate. */
+/** @param {import("./store.mjs").KodoRun} run
+ * @param {Record<string, any>} task
+ * @param {{contractPath?: string, secrets?: import('./security.mjs').Secrets}} [options] */
 export function buildTaskContext(run, task, { contractPath, secrets = {} } = {}) {
   const core = taskContract(task, secrets);
   if (contractPath) contractPath = redact(contractPath, secrets);
