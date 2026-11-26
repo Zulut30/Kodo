@@ -140,6 +140,7 @@ async function metadata() {
     'runtime/context-manifest.mjs',
     'runtime/behavior-gate.mjs',
     'runtime/behavior-scanners.mjs',
+    'runtime/behavior-rust.mjs',
     'runtime/behavior-rust-registry.mjs',
     'runtime/watchdog.mjs',
     'runtime/engine-verification.mjs',

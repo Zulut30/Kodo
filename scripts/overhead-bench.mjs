@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+/* oxlint-disable max-lines -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md */
 /**
  * Local reproducible benchmark of Kodo's own orchestration overhead on a small
  * `quick` task: real Engine, real Git worktrees, SQLite Store, evidence ACLs

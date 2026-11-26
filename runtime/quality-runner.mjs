@@ -1,3 +1,4 @@
+/* oxlint-disable max-lines -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md */
 /** Read-only source checks through the existing owned-process execution port.
  * Configured project commands are trusted executable code, not an OS sandbox.
  * Passing receipts require unchanged inventory/head and intact private evidence.
