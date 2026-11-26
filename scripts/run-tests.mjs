@@ -16,11 +16,18 @@ const defaultPattern = `**/{test,test/**/*,test-*,*[._-]test}.{${extensions}}`;
 // (runs 45410439061 and 45418257242, ~2400 s). Default discovery skips them; explicit paths run them.
 // The parallel engine suite (stage 15B: real task-fast, merges and concurrent completions, 45-100 s
 // per case in one local Windows run, not a receipt) joins them for the same reason.
-export const separateSuites = [
-  'tests/project-wave-director.test.mjs',
-  'tests/project-wave-e2e.test.mjs',
-  'tests/project-parallel-engine.test.mjs',
-];
+export const waveShards = {
+  director: ['tests/project-wave-director.test.mjs', 'tests/project-wave-director-recovery.test.mjs'],
+  e2e: ['tests/project-wave-e2e.test.mjs', 'tests/project-wave-e2e-gates.test.mjs'],
+  parallel: [
+    'tests/project-parallel-engine.test.mjs',
+    'tests/project-parallel-fencing.test.mjs',
+    'tests/project-remote-diagnostics.test.mjs',
+    'tests/project-remote-transport.test.mjs',
+  ],
+};
+
+export const separateSuites = [...waveShards.director, ...waveShards.e2e, ...waveShards.parallel];
 
 // Stage 16E. After stage 15 one Windows L2 command took 2032658, 2325940 and 2230687 ms and reached its
 // fixed 2400000 ms deadline on a slow runner. These suites (real Git, Cargo and Engine work) run in
