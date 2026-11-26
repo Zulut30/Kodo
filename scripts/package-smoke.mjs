@@ -54,6 +54,8 @@ async function smoke() {
     const installed = JSON.parse(await readFile(path.join(installedRoot, 'package.json'), 'utf8'));
     assert.equal(installed.name, expected.name);
     assert.equal(installed.version, expected.version);
+    for (const guide of ['CONTRIBUTING.md', 'AGENTS.md'])
+      assert.deepEqual(await readFile(path.join(installedRoot, guide)), await readFile(path.join(root, guide)), guide);
     const bin = path.resolve(installedRoot, installed.bin.kodo);
     const relativeBin = path.relative(installedRoot, bin);
     assert.ok(
@@ -94,6 +96,7 @@ async function smoke() {
           checks: [
             'npm pack',
             'isolated install --ignore-scripts',
+            'installed contributor guide and linked AGENTS.md',
             'installed package bin and launcher',
             'installed CLI help',
             'installed CLI validate --json',

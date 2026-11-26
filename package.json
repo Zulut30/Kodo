@@ -42,6 +42,7 @@
     "docs",
     "registry.json",
     "README.md",
+    "AGENTS.md",
     "CHANGELOG.md",
     "CONTRIBUTING.md",
     "third-party-skills.lock.json"

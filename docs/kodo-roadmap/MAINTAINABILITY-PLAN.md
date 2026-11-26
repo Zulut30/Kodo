@@ -210,7 +210,7 @@ T1–T4 независимы друг от друга. T5–T8 начинают�
 
 ## Храповик размера файлов и остаток долга
 
-**Сделано (`bd3b6f0`).** В `.oxlintrc.json` включено `"max-lines": ["error", { "max": 900, "skipBlankLines": true, "skipComments": true }]`; для `tests/**` правило выключено. Новый файл длиннее 900 строк кода роняет `npm run lint`. Фасады вынесенных модулей внесены в `pins()` (`runtime/architecture-gate.mjs`) и `metadata().sources` (`runtime/benchmark.mjs`).
+**Сделано (`bd3b6f0`).** В `.oxlintrc.json` включено `"max-lines": ["error", { "max": 900, "skipBlankLines": true, "skipComments": true }]`; для `tests/**` правило выключено. Новый файл длиннее 900 строк кода роняет `npm run lint`. В `pins()` архитектурного гейта учтены фасады `project-external`, `project-blueprint`, `project-director-waves` и их части. После [PR #34](https://github.com/Zulut30/Kodo/pull/34) `metadata().sources` бенчмарка включает фасад `api-cards` и три его модуля.
 
 **Декомпозиции этапов 15–16 — сделано.**
 - `4e4f33c`: `project-external` → `-integration`/`-shared`/`-submission`/`-wave`; `project-blueprint` → `-io`/`-lint`/`-rust`/`-shared`/`-spec`; `project-director-waves` → `project-wave-gates`/`-integration`/`-shared`.
