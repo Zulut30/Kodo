@@ -166,15 +166,33 @@ test('Scheduler orders observed file durations longest first and retains every d
   assert.deepEqual(orderTests([...input].reverse(), temp), expected);
 });
 
-test('The wave factory suites run in their own command and CI step, outside default discovery', async () => {
-  const { discoverTests, separateSuites } = await import(scheduleUrl);
+function workflowJob(workflow, name) {
+  const marker = `\n  ${name}:\n`;
+  const start = workflow.indexOf(marker);
+  assert.notEqual(start, -1, `workflow defines job ${name}`);
+  const rest = workflow.slice(start + marker.length);
+  return rest.split(/\n {2}[A-Za-z0-9_-]+:\n/)[0];
+}
+
+test('The wave factory suites run in their own command and parallel CI shards, outside default discovery', async () => {
+  const { discoverTests, separateSuites, waveShards } = await import(scheduleUrl);
   // With them, one L2 command reached its fixed Windows deadline (runs 45410439061, 45418257242).
-  // Stage 15B added the parallel engine suite (concurrent completions with real task-fast and merges).
-  assert.deepEqual(separateSuites, [
-    'tests/project-wave-director.test.mjs',
-    'tests/project-wave-e2e.test.mjs',
-    'tests/project-parallel-engine.test.mjs',
-  ]);
+  // Split into balanced 4-file shards so each Windows CI shard runs all files in one concurrent wave.
+  assert.deepEqual(waveShards, {
+    director: [
+      'tests/project-wave-director.test.mjs',
+      'tests/project-wave-director-recovery.test.mjs',
+      'tests/project-wave-e2e.test.mjs',
+      'tests/project-wave-e2e-gates.test.mjs',
+    ],
+    parallel: [
+      'tests/project-parallel-engine.test.mjs',
+      'tests/project-parallel-fencing.test.mjs',
+      'tests/project-remote-diagnostics.test.mjs',
+      'tests/project-remote-transport.test.mjs',
+    ],
+  });
+  assert.deepEqual(separateSuites, [...waveShards.director, ...waveShards.parallel]);
   const discovered = discoverTests(root).map(file => path.relative(root, file).replaceAll('\\', '/'));
   for (const suite of separateSuites) {
     assert.ok(!discovered.includes(suite), `${suite} is not in the default suite`);
@@ -182,15 +200,18 @@ test('The wave factory suites run in their own command and CI step, outside defa
   }
   const scripts = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8')).scripts;
   assert.equal(scripts['test:waves'], `node scripts/run-tests.mjs ${separateSuites.join(' ')}`);
+  assert.equal(scripts['test:waves:director'], `node scripts/run-tests.mjs ${waveShards.director.join(' ')}`);
+  assert.equal(scripts['test:waves:parallel'], `node scripts/run-tests.mjs ${waveShards.parallel.join(' ')}`);
   const workflow = readFileSync(path.join(root, '.github/workflows/ci.yml'), 'utf8');
-  // The step belongs to the required check job of both platforms, not to the optional fast job.
-  const [fast, rest] = workflow.split('\n  check:');
-  const check = rest.split(/\n {2}[A-Za-z0-9_-]+:\n/)[0];
+  const fast = workflowJob(workflow, 'fast');
+  const wavesJob = workflowJob(workflow, 'ci-waves');
   assert.doesNotMatch(fast, /npm run test:waves/);
-  assert.match(check, /\n {6}- name: Wave factory suites\n {8}run: npm run test:waves\n/);
+  assert.match(wavesJob, /os: \[ubuntu-latest, windows-latest\]/);
+  assert.match(wavesJob, /shard: \[director, parallel\]/);
+  assert.match(wavesJob, /run: npm run test:waves:\$\{\{ matrix\.shard \}\}\n/);
 });
 
-test('The heavy integration suites run in their own command and CI step, outside default discovery', async () => {
+test('The heavy integration suites run in their own command and parallel CI job, outside default discovery', async () => {
   const { discoverTests, heavySuites } = await import(scheduleUrl);
   // Stage 16E: with them, one Windows L2 command took 2032658-2325940 ms and timed out on a slow runner.
   // The per-file measurements behind this list are in docs/CI.md.
@@ -223,13 +244,14 @@ test('The heavy integration suites run in their own command and CI step, outside
   const scripts = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8')).scripts;
   assert.equal(scripts['test:heavy'], `node scripts/run-tests.mjs ${heavySuites.join(' ')}`);
   const workflow = readFileSync(path.join(root, '.github/workflows/ci.yml'), 'utf8');
-  const [fast, rest] = workflow.split('\n  check:');
-  const check = rest.split(/\n {2}[A-Za-z0-9_-]+:\n/)[0];
+  const fast = workflowJob(workflow, 'fast');
+  const heavyJob = workflowJob(workflow, 'ci-heavy');
   assert.doesNotMatch(fast, /npm run test:heavy/);
-  assert.match(check, /\n {6}- name: Heavy integration suites\n {8}run: npm run test:heavy\n/);
+  assert.match(heavyJob, /os: \[ubuntu-latest, windows-latest\]/);
+  assert.match(heavyJob, /\n {6}- name: Heavy integration suites\n {8}run: npm run test:heavy\n/);
 });
 
-test('Every default-pattern test file runs in exactly one required check step', async () => {
+test('Every default-pattern test file runs in exactly one required check shard', async () => {
   const { discoverTests } = await import(scheduleUrl);
   // Independent oracle: Node's default test glob over the checkout, without the runner's exclusions.
   const extensions = process.features.typescript ? 'js,mjs,cjs,ts,mts,cts' : 'js,mjs,cjs';
@@ -256,24 +278,42 @@ test('Every default-pattern test file runs in exactly one required check step', 
   };
   const steps = {
     'npm run check': discoverTests(root).map(file => path.relative(root, file).replaceAll('\\', '/')),
-    'npm run test:waves': listed('test:waves'),
+    'npm run test:waves:director': listed('test:waves:director'),
+    'npm run test:waves:parallel': listed('test:waves:parallel'),
     'npm run test:heavy': listed('test:heavy'),
   };
   const runs = new Map();
   for (const [step, files] of Object.entries(steps))
     for (const file of files) runs.set(file, [...(runs.get(file) ?? []), step]);
   for (const file of all)
-    assert.deepEqual(runs.get(file)?.length, 1, `${file} runs in exactly one step: ${runs.get(file) ?? 'none'}`);
-  assert.deepEqual([...runs.keys()].sort(), [...all].sort(), 'no step names a file outside the default pattern');
-  // Each command runs once in the required check job of both platforms and never in the optional fast job.
+    assert.deepEqual(runs.get(file)?.length, 1, `${file} runs in exactly one shard: ${runs.get(file) ?? 'none'}`);
+  assert.deepEqual([...runs.keys()].sort(), [...all].sort(), 'no shard names a file outside the default pattern');
+  // Every mandatory shard runs on both platforms and gates the required `check` contexts; never in `fast`.
   const workflow = readFileSync(path.join(root, '.github/workflows/ci.yml'), 'utf8');
-  const [fast, rest] = workflow.split('\n  check:');
-  const check = rest.split(/\n {2}[A-Za-z0-9_-]+:\n/)[0];
+  const fast = workflowJob(workflow, 'fast');
+  const check = workflowJob(workflow, 'check');
+  assert.match(check, /needs: \[ci-l2, ci-heavy, ci-waves, ci-final\]/);
   assert.match(check, /os: \[ubuntu-latest, windows-latest\]/);
-  for (const command of ['node scripts/ci.mjs run --tier L2', 'npm run test:waves', 'npm run test:heavy']) {
-    assert.equal(check.split(`run: ${command}`).length - 1, 1, `${command} runs once in check`);
+  assert.match(check, /node: \[24\]/);
+  const requiredJobs = {
+    'ci-l2': 'node scripts/ci.mjs run --tier L2',
+    'ci-heavy': 'npm run test:heavy',
+    'ci-waves': 'npm run test:waves:${{ matrix.shard }}',
+    'ci-final': 'npm run test:final',
+  };
+  for (const [jobName, command] of Object.entries(requiredJobs)) {
+    const job = workflowJob(workflow, jobName);
+    assert.match(job, /os: \[ubuntu-latest, windows-latest\]/, `${jobName} covers both OSes`);
+    assert.match(job, /node: \[24\]/, `${jobName} covers Node 24`);
+    assert.equal(job.split(`run: ${command}`).length - 1, 1, `${command} runs once in ${jobName}`);
     assert.ok(!fast.includes(command), `${command} is not in the fast job`);
+    assert.ok(check.includes(`needs.${jobName}.result`), `check verifies ${jobName} result`);
   }
+  assert.equal(
+    workflowJob(workflow, 'ci-final').split('run: node scripts/package-smoke.mjs').length - 1,
+    1,
+    'package smoke runs once in ci-final',
+  );
 });
 test(
   'Scheduler starts heuristic heavy files before lexical files in real isolated children',

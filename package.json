@@ -22,7 +22,9 @@
     "test:coverage": "node scripts/run-tests.mjs --coverage",
     "check": "npm run validate && npm run format:check && npm run lint && npm run typecheck && npm test",
     "test:heavy": "node scripts/run-tests.mjs tests/delivery.test.mjs tests/architecture-rust.test.mjs tests/project-director.test.mjs tests/wave-context-integration.test.mjs tests/task-fast-checks.test.mjs tests/behavior-rust.test.mjs tests/architecture-gate-integration.test.mjs tests/project-integration.test.mjs tests/engine-2.test.mjs tests/engine-4.test.mjs tests/engine-3.test.mjs tests/benchmark.test.mjs tests/engine.test.mjs tests/architecture-cli.test.mjs tests/ci-graph.test.mjs tests/knowledge-refresh.test.mjs tests/knowledge-cli.test.mjs tests/cargo-fetch-recovery.test.mjs tests/project-integration-fence.test.mjs",
-    "test:waves": "node scripts/run-tests.mjs tests/project-wave-director.test.mjs tests/project-wave-e2e.test.mjs tests/project-parallel-engine.test.mjs",
+    "test:waves": "node scripts/run-tests.mjs tests/project-wave-director.test.mjs tests/project-wave-director-recovery.test.mjs tests/project-wave-e2e.test.mjs tests/project-wave-e2e-gates.test.mjs tests/project-parallel-engine.test.mjs tests/project-parallel-fencing.test.mjs tests/project-remote-diagnostics.test.mjs tests/project-remote-transport.test.mjs",
+    "test:waves:director": "node scripts/run-tests.mjs tests/project-wave-director.test.mjs tests/project-wave-director-recovery.test.mjs tests/project-wave-e2e.test.mjs tests/project-wave-e2e-gates.test.mjs",
+    "test:waves:parallel": "node scripts/run-tests.mjs tests/project-parallel-engine.test.mjs tests/project-parallel-fencing.test.mjs tests/project-remote-diagnostics.test.mjs tests/project-remote-transport.test.mjs",
     "test:final": "node --test --test-reporter=spec tests/final-scenarios.mjs"
   },
   "files": [

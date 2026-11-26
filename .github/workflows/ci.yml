@@ -59,10 +59,30 @@ jobs:
             node scripts/ci.mjs feedback --base "$CI_BASE" --json
           fi
 
+  # Required branch-protection gate preserving `check (ubuntu-latest, 24)` and
+  # `check (windows-latest, 24)` while the four platform suites run in parallel below.
   check:
+    needs: [ci-l2, ci-heavy, ci-waves, ci-final]
+    if: ${{ !cancelled() }}
     strategy:
-      # A failed mandatory platform keeps merge blocked and cancels obsolete
-      # sibling work; a passing head still requires both platform checks.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: [24]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify all mandatory shards passed
+        shell: bash
+        run: |
+          for result in "${{ needs.ci-l2.result }}" "${{ needs.ci-heavy.result }}" "${{ needs.ci-waves.result }}" "${{ needs.ci-final.result }}"; do
+            if [ "$result" != "success" ]; then
+              echo "Mandatory CI shard did not succeed: $result"
+              exit 1
+            fi
+          done
+
+  ci-l2:
+    strategy:
       fail-fast: true
       matrix:
         os: [ubuntu-latest, windows-latest]
@@ -112,17 +132,95 @@ jobs:
         env:
           KODO_TOOL_HOME: ${{ runner.temp }}/kodo-security-tools
         run: node scripts/ci.mjs run --tier L2 --json
-      # Stage 15 suites with real Git, Cargo and Engine work (stage 16E, measurements in docs/CI.md): on
-      # their own, outside the fixed deadline of one L2 command (runtime/ci-cli.mjs CI_COMMAND_TIMEOUT_MS).
+
+  # Heavy integration suites (stage 16E: real Git, Cargo and Engine work) run in parallel with L2.
+  ci-heavy:
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: [24]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - run: npm ci --ignore-scripts
+      - name: Canonicalize Windows temporary paths
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $kodoCanonicalTemp = node -e "process.stdout.write(require('node:fs').realpathSync.native(require('node:os').tmpdir()))"
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve the Windows temporary directory' }
+          if ([string]::IsNullOrWhiteSpace($kodoCanonicalTemp) -or -not (Test-Path -LiteralPath $kodoCanonicalTemp -PathType Container)) {
+            throw 'The canonical Windows temporary directory must exist'
+          }
+          "TEMP=$kodoCanonicalTemp" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "TMP=$kodoCanonicalTemp" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Heavy integration suites
         run: npm run test:heavy
-      # The wave factory suites (real Engine, Git and director drains, ~20 minutes on Windows; plus the
-      # stage 15B parallel engine suite): on their own, outside the fixed deadline of one L2 command
-      # (runtime/ci-cli.mjs CI_COMMAND_TIMEOUT_MS).
-      - name: Wave factory suites
-        run: npm run test:waves
-      # About 20 minutes of real Engine, Git and director work: run on its own, outside the fixed
-      # deadline of one L2 command (runtime/ci-cli.mjs CI_COMMAND_TIMEOUT_MS).
+
+  # Wave factory and parallel-engine suites split across 2 balanced shards (4 files each).
+  ci-waves:
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: [24]
+        shard: [director, parallel]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - run: npm ci --ignore-scripts
+      - name: Canonicalize Windows temporary paths
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $kodoCanonicalTemp = node -e "process.stdout.write(require('node:fs').realpathSync.native(require('node:os').tmpdir()))"
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve the Windows temporary directory' }
+          if ([string]::IsNullOrWhiteSpace($kodoCanonicalTemp) -or -not (Test-Path -LiteralPath $kodoCanonicalTemp -PathType Container)) {
+            throw 'The canonical Windows temporary directory must exist'
+          }
+          "TEMP=$kodoCanonicalTemp" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "TMP=$kodoCanonicalTemp" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Wave factory suites (${{ matrix.shard }})
+        run: npm run test:waves:${{ matrix.shard }}
+
+  # Final acceptance scenarios and installed CLI package smoke run in parallel with L2/heavy/waves.
+  ci-final:
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: [24]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - run: npm ci --ignore-scripts
+      - name: Canonicalize Windows temporary paths
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $kodoCanonicalTemp = node -e "process.stdout.write(require('node:fs').realpathSync.native(require('node:os').tmpdir()))"
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve the Windows temporary directory' }
+          if ([string]::IsNullOrWhiteSpace($kodoCanonicalTemp) -or -not (Test-Path -LiteralPath $kodoCanonicalTemp -PathType Container)) {
+            throw 'The canonical Windows temporary directory must exist'
+          }
+          "TEMP=$kodoCanonicalTemp" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "TMP=$kodoCanonicalTemp" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Final acceptance scenarios
         run: npm run test:final
       - name: Verify installed CLI package
