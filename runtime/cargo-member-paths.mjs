@@ -241,6 +241,10 @@ function* walkMemberSpellings(steps, dir, names) {
     yield dir;
     return;
   }
+  // A caller asking for one spelling keeps the exact snapshot path when it is
+  // available. Other walks remain available to callers applying exclusions.
+  const exact = memberSuffixes(steps, entries, () => false) !== null;
+  if (exact) yield dir;
   // Filesystem lookups are only needed for a directory that matches an entire
   // pattern with a case variant. Verify those lookups before enumerating paths.
   let parent = '';
@@ -250,9 +254,10 @@ function* walkMemberSpellings(steps, dir, names) {
     return current;
   });
   const confirmed = memberSuffixes(steps, entries, (d, spelling) => names.matches(parents[d], entries[d], spelling));
-  if (!confirmed) return;
+  if (!confirmed?.hasAlias) return;
   const { rows } = confirmed;
   const seen = Array.from({ length: steps.length + 1 }, () => new Set());
+  if (exact) seen[steps.length].add(dir);
   const pending = [{ pos: 0, depth: 0, spelling: '' }];
   while (pending.length) {
     const { pos, depth, spelling } = pending.pop();

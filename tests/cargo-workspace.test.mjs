@@ -6,6 +6,7 @@ import { runQuality } from '../runtime/quality-runner.mjs';
 import { QualityProfileRegistry } from '../runtime/quality.mjs';
 import { planFastChecks } from '../runtime/task-fast-checks.mjs';
 import { git } from '../runtime/workspace.mjs';
+import { CargoDirectoryNames, cargoMemberMatcher } from '../runtime/cargo-member-paths.mjs';
 import {
   isBroadContractScope,
   isExplicitContractScope,
@@ -152,6 +153,14 @@ test('recursive Cargo member walks apply exclusions to each spelling of a packag
     duplicate.unsupported.map(row => row.reason),
     windows ? ['duplicate-crate-name'] : [],
   );
+});
+
+test('a single Cargo member lookup prefers the exact spelling across recursive walks', () => {
+  const dir = 'extras/plugins/exporter/vendor/plugins/Exporter/Unit';
+  const alternate = dir.replace('plugins/exporter', 'plugins/Exporter');
+  const match = cargoMemberMatcher('extras/**/plugins/Exporter/**/Unit', new CargoDirectoryNames([dir]));
+  assert.equal(match(dir), dir);
+  assert.deepEqual([...match.spellings(dir)], path.sep === '\\' ? [dir, alternate] : [dir]);
 });
 
 test('Cargo only probes native aliases on paths that can match the whole member pattern', () => {
