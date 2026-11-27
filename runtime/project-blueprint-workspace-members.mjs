@@ -1,10 +1,11 @@
 // Only resolve membership for packages whose identity can affect this blueprint.
 // Follow local dependencies only when a direct declaration cannot settle it.
 import { parse as parseToml } from 'smol-toml';
+import path from 'node:path';
+import { CargoDirectoryNames, cargoMemberMatcher, cargoNameKey, hasCargoGlob } from './cargo-member-paths.mjs';
 import {
   cargoPackageTable,
   collectManifestDependencies,
-  compileCargoGlob,
   parseWorkspaceDependencies,
   resolveDepTargetDir,
   resolveManifestDir,
@@ -12,23 +13,53 @@ import {
   workspaceExclusionMatcher,
   workspaceMemberPattern,
 } from './cargo-workspace.mjs';
-import { readBlueprintCargoTree, readOptionalBlueprintMetadata } from './project-blueprint-io.mjs';
+import {
+  blueprintChildDirectories,
+  blueprintPathAlias,
+  readBlueprintCargoTree,
+  readOptionalBlueprintMetadata,
+} from './project-blueprint-io.mjs';
 import { pathAndAncestors } from './scope-paths.mjs';
 import { BLUEPRINT_LIMITS, failure, isPlain } from './project-blueprint-shared.mjs';
 
 const manifestFile = dir => (dir ? dir + '/Cargo.toml' : 'Cargo.toml');
-const hasGlob = pattern => /[*?[]/.test(pattern);
 const isWithin = (root, dir) => !root || dir === root || dir.startsWith(root + '/');
 
 export function blueprintManifestReader(root, revision, tree) {
   const docs = new Map();
   const blobs = new Map();
   const known = new Set([...tree.manifests.keys()].map(dir => (dir === '.' ? '' : dir)));
+  const names = new CargoDirectoryNames(known, (original, spelling) => blueprintPathAlias(root, original, spelling));
+  const listed = new Set();
+
+  async function nativeLead(pattern) {
+    if (path.sep !== '\\' || names.paths.has(pattern)) return pattern;
+    const parts = pattern.split('/');
+    let parent = '';
+    for (const [i, part] of parts.entries()) {
+      if (hasCargoGlob(part)) break;
+      const requested = parent ? parent + '/' + part : part;
+      if (!names.paths.has(requested) && !listed.has(parent)) {
+        for (const child of await blueprintChildDirectories(root, parent, revision)) names.add(child);
+        listed.add(parent);
+      }
+      const stored = names.resolve(requested);
+      if (!names.paths.has(stored)) break;
+      parts[i] = stored.slice(stored.lastIndexOf('/') + 1);
+      parent = stored;
+    }
+    return parts.join('/');
+  }
 
   async function discover(patterns) {
-    const scopes = new Set(patterns.map(manifestFile));
+    const scopes = new Set();
+    for (const pattern of patterns) scopes.add(manifestFile(await nativeLead(pattern)));
     const extra = await readBlueprintCargoTree(root, scopes, revision);
-    for (const dir of extra.manifests.keys()) known.add(dir === '.' ? '' : dir);
+    for (const dir of extra.manifests.keys()) {
+      const stored = dir === '.' ? '' : dir;
+      known.add(stored);
+      names.add(stored);
+    }
     return known;
   }
 
@@ -38,9 +69,11 @@ export function blueprintManifestReader(root, revision, tree) {
     // A path dependency can be outside every blueprint search lead. Git only
     // resolves entries inside the tree. On disk also verify its parent path
     // through the link-free directory walk before opening the manifest.
-    const unknown = missing.filter(dir => !known.has(dir));
+    const stored = new Map();
+    for (const dir of missing) stored.set(dir, known.has(dir) ? dir : await nativeLead(dir));
+    const unknown = [...new Set(stored.values())].filter(dir => !known.has(dir));
     if (!revision && unknown.length) await discover(unknown);
-    const files = missing.filter(dir => revision || known.has(dir)).map(manifestFile);
+    const files = [...new Set(stored.values())].filter(dir => revision || known.has(dir)).map(manifestFile);
     const parsed = await readOptionalBlueprintMetadata(
       root,
       files,
@@ -49,31 +82,48 @@ export function blueprintManifestReader(root, revision, tree) {
       parseToml,
       blobs,
     );
-    for (const dir of missing) docs.set(dir, parsed.get(manifestFile(dir)));
+    for (const [dir, actual] of stored) {
+      const doc = parsed.get(manifestFile(actual));
+      docs.set(actual, doc);
+      docs.set(dir, doc);
+    }
   }
-  return { docs, read, discover };
+  return { docs, read, discover, names };
 }
 
-function workspaceRules(root, rootDoc) {
+function workspaceRules(root, rootDoc, names) {
   const ws = isPlain(rootDoc.workspace) ? rootDoc.workspace : null;
   const declared = (Array.isArray(ws?.members) ? ws.members : [])
     .map(item => workspaceMemberPattern(root, item))
     .filter(pattern => pattern !== null);
-  const literal = new Set(declared.filter(pattern => !hasGlob(pattern)));
-  const globPatterns = declared.filter(hasGlob);
+  const literal = new Set(declared.filter(pattern => !hasCargoGlob(pattern)));
+  const byName = Map.groupBy(literal, cargoNameKey);
+  const globPatterns = declared.filter(hasCargoGlob);
   const globs = globPatterns.flatMap(pattern => {
-    const matcher = compileCargoGlob(pattern);
+    const matcher = cargoMemberMatcher(pattern, names);
     const name = pattern.slice(pattern.lastIndexOf('/') + 1);
     return matcher ? [{ matcher, namesMember: /[^*?]/.test(name) }] : [];
   });
-  const isExcluded = workspaceExclusionMatcher(root, ws);
-  const allows = dir => dir === root || (ws !== null && !isExcluded(dir));
+  const excludedSpelling = workspaceExclusionMatcher(root, ws);
   // A catch-all member glob alone does not establish the type of an absent
   // source or manifest. A literal member or a named pattern such as *.rs can.
-  const declares = (dir, requireName = false) =>
-    !isExcluded(dir) &&
-    (literal.has(dir) || globs.some(({ matcher, namesMember }) => (!requireName || namesMember) && matcher.test(dir)));
-  return { ws, literal, globPatterns, isExcluded, allows, declares };
+  function* spellings(dir, requireName = false) {
+    for (const spelled of byName.get(cargoNameKey(dir)) ?? [])
+      if (names.samePath(dir, spelled) && !excludedSpelling(spelled)) yield spelled;
+    for (const { matcher, namesMember } of globs) {
+      if (requireName && !namesMember) continue;
+      const spelled = matcher(dir);
+      if (spelled !== null && !excludedSpelling(spelled)) yield spelled;
+    }
+  }
+  const declares = (dir, requireName = false) => !spellings(dir, requireName).next().done;
+  const isExcluded = dir => excludedSpelling(dir) && !declares(dir);
+  const allows = dir => dir === root || (ws !== null && !isExcluded(dir));
+  // A member can reach a nested dependency under a different spelling from
+  // its tree entry. Only a real edge, checked as spelled, proves inclusion.
+  const mayReach = dir =>
+    allows(dir) || (path.sep === '\\' && [...pathAndAncestors(dir)].some(p => p && p !== dir && declares(p)));
+  return { ws, literal, globPatterns, isExcluded, excludedSpelling, allows, mayReach, declares, spellings };
 }
 
 function* enclosingWorkspaces(dir, workspaces) {
@@ -85,7 +135,7 @@ async function loadWorkspaceRules(reader, workspaces, roots) {
   await reader.read(unread);
   for (const root of unread) {
     const doc = reader.docs.get(root);
-    workspaces.set(root, doc ? workspaceRules(root, doc) : null);
+    workspaces.set(root, doc ? workspaceRules(root, doc, reader.names) : null);
   }
 }
 
@@ -141,13 +191,13 @@ function memberEdition(dir, doc, ws) {
 }
 
 async function reachablePackages(reader, rules, root, candidates, needsPath) {
-  const { ws, literal, globPatterns, declares, allows } = rules;
+  const { ws, literal, globPatterns, declares, excludedSpelling } = rules;
   const rootDoc = reader.docs.get(root);
   const reached = new Set();
   if (candidates.has(root) && cargoPackageTable(rootDoc)) reached.add(root);
   const pending = new Set();
   for (const dir of candidates) {
-    if (dir === root || !allows(dir)) continue;
+    if (dir === root) continue;
     if (declares(dir)) reached.add(dir);
     else if (needsPath(dir)) pending.add(dir);
   }
@@ -155,10 +205,11 @@ async function reachablePackages(reader, rules, root, candidates, needsPath) {
   // Only a path dependency can still make a candidate a member. Start at
   // the root package and declared members, following Cargo's dependency
   // tables (including inherited paths and edition-specific table aliases).
-  const frontier = new Set([...literal].filter(allows));
+  const frontier = new Set([...literal].filter(dir => !excludedSpelling(dir)));
   if (cargoPackageTable(rootDoc)) frontier.add(root);
   if (globPatterns.length) {
-    for (const dir of await reader.discover(globPatterns)) if (declares(dir)) frontier.add(dir);
+    for (const dir of await reader.discover(globPatterns))
+      for (const spelling of rules.spellings(dir)) frontier.add(spelling);
   }
   const dependencies = parseWorkspaceDependencies(ws?.dependencies);
   const visited = new Set();
@@ -172,12 +223,14 @@ async function reachablePackages(reader, rules, root, candidates, needsPath) {
       frontier.delete(dir);
       visited.add(dir);
       const doc = reader.docs.get(dir);
-      if (!eligibleMember(dir, doc, root)) continue;
-      for (const dep of collectManifestDependencies(doc, { edition: memberEdition(dir, doc, ws) })) {
-        const target = resolveDepTargetDir(dep, dir, root, dependencies, '');
-        if (target === null || !allows(target)) continue;
+      const actual = reader.names.resolve(dir);
+      if (!eligibleMember(actual, doc, root)) continue;
+      for (const dep of collectManifestDependencies(doc, { edition: memberEdition(actual, doc, ws) })) {
+        const spelling = resolveDepTargetDir(dep, dir, root, dependencies, '');
+        if (spelling === null || excludedSpelling(spelling)) continue;
+        const target = reader.names.resolve(spelling);
         if (pending.delete(target)) reached.add(target);
-        if (!visited.has(target)) frontier.add(target);
+        if (!visited.has(spelling)) frontier.add(spelling);
       }
     }
   }
@@ -187,7 +240,9 @@ async function reachablePackages(reader, rules, root, candidates, needsPath) {
 async function reachableWorkspaceCandidates(reader, workspaces, root, local, deferred, upperCount, needsPath) {
   const rules = workspaces.get(root);
   if (rules === null) return []; // A planned scaffold cannot enroll a sibling.
-  const outside = root && (!rules || rules.ws) ? deferred.filter(dir => !isWithin(root, dir)) : [];
+  const outside = deferred.filter(dir =>
+    isWithin(root, dir) ? rules?.isExcluded(dir) && rules.mayReach(dir) : root && (!rules || rules.ws),
+  );
   const possibleSiblings = () => {
     const possible = outside.filter(dir => !reader.docs.has(dir) || eligibleMember(dir, reader.docs.get(dir), root));
     const upper = upperCount(possible);
@@ -245,7 +300,7 @@ export async function blueprintWorkspaceOwners(
       const rules = workspaces.get(root);
       if (rules?.ws) {
         hasWorkspace = true;
-        if (rules.allows(dir) && eligibleMember(dir, doc, root)) query(root, dir);
+        if (rules.mayReach(dir) && eligibleMember(dir, doc, root)) query(root, dir);
       } else if (!hasWorkspace && binding === undefined && (!rules || dir === root)) {
         fallback ??= root;
       }

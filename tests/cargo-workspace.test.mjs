@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import path from 'node:path';
 import { fixture, toolRunner, put } from './fixtures/quality/helpers.mjs';
 import { runQuality } from '../runtime/quality-runner.mjs';
 import { QualityProfileRegistry } from '../runtime/quality.mjs';
@@ -37,6 +38,61 @@ test('Cargo normalizes current-directory components in member and exclude paths'
   }
 });
 
+test('Cargo resolves native member spellings and compares exclusions using the selected spelling', () => {
+  const windows = path.sep === '\\';
+  for (const [members, exclude, present, supported] of [
+    [['native\\codec'], [], windows, windows],
+    [['native\\co*'], [], windows, windows],
+    [['Native/Codec'], [], windows, windows],
+    [['Native/co*'], [], windows, windows],
+    [['*/Codec'], [], windows, windows],
+    [['native/Co*'], [], false, false],
+    [['native/*'], ['native\\codec'], !windows, windows],
+    [['native/*'], ['native/Codec'], true, true],
+    [['Native/Codec'], ['native/codec'], windows, windows],
+    [['native/*', 'native/Codec'], ['native/codec'], windows, windows],
+  ]) {
+    const result = resolveCargoWorkspace({
+      manifests: {
+        'Cargo.toml': { workspace: { members, exclude } },
+        'native/codec/Cargo.toml': { package: { name: 'wire-contracts' } },
+      },
+    });
+    assert.deepEqual(
+      result.members.map(pkg => pkg.root),
+      present ? ['native/codec'] : [],
+      String(members),
+    );
+    assert.equal(result.unsupported.length === 0, supported, JSON.stringify({ members, exclude }));
+  }
+});
+
+test('Cargo preserves distinct snapshot entries and detects two member spellings for one package', () => {
+  const manifests = {
+    'native/Codec/Cargo.toml': { package: { name: 'upper' } },
+    'native/codec/Cargo.toml': { package: { name: 'lower' } },
+  };
+  const resolve = (members, files = manifests) =>
+    resolveCargoWorkspace({ manifests: { 'Cargo.toml': { workspace: { members } }, ...files } });
+  assert.deepEqual(
+    resolve(['native/Codec']).members.map(pkg => pkg.name),
+    ['upper'],
+  );
+  assert.deepEqual(
+    resolve(['native/codec']).members.map(pkg => pkg.name),
+    ['lower'],
+  );
+  assert.deepEqual(
+    resolve(['native/CODEC']).unsupported.map(row => row.reason),
+    ['missing-workspace-member'],
+  );
+  const single = { 'native/codec/Cargo.toml': manifests['native/codec/Cargo.toml'] };
+  assert.deepEqual(
+    resolve(['native/*', 'native/Codec'], single).unsupported.map(row => row.reason),
+    [path.sep === '\\' ? 'duplicate-crate-name' : 'missing-workspace-member'],
+  );
+});
+
 test('a literal workspace member overrides exclude below it when its plugin is selected', () => {
   const host = 'crates/host';
   const plugin = host + '/plugins/exporter';
@@ -50,6 +106,14 @@ test('a literal workspace member overrides exclude below it when its plugin is s
     [['crates/other/../host', glob], {}, ['host']],
     [['crates/hos?', glob], {}, ['host'], [plugin + '/Cargo.toml']],
     [['.', host, glob], {}, ['host', 'exporter']],
+    ...(path.sep === '\\'
+      ? [
+          [['crates/Host'], { exporter: { path: 'plugins/exporter' } }, ['host', 'exporter']],
+          [['crates/hos?'], { exporter: { path: 'plugins/Exporter' } }, ['host', 'exporter']],
+          [['crates/hos?'], { exporter: { path: 'plugins/Exporter' } }, ['host'], [host + '/plugins/Exporter']],
+          [['crates/Host', glob], {}, ['host']],
+        ]
+      : []),
   ]) {
     const manifests = {
       'Cargo.toml': { workspace: { members, exclude } },

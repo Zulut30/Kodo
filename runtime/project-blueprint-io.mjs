@@ -4,6 +4,7 @@
 
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { lstatSync } from 'node:fs';
 import { lstat, open, readdir, realpath, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -550,6 +551,46 @@ export async function readBlueprintCargoTree(root, scopes, revision) {
   if (!revision) return draftCargoTree(root, scopes);
   try {
     return await committedCargoTree(root, revision, scopes);
+  } catch {
+    throw cargoEvidenceFailure();
+  }
+}
+
+// A literal Cargo member outside the initial write scopes can use a different
+// native spelling. List one level of directories from the same source as its
+// manifest. A symlink or gitlink is never a directory for this walk.
+export async function blueprintChildDirectories(root, parent, revision) {
+  if (!revision) {
+    try {
+      return (await readdir(path.join(root, parent), { withFileTypes: true }))
+        .filter(entry => entry.isDirectory() && entry.name.toLowerCase() !== '.git')
+        .map(entry => (parent ? parent + '/' + entry.name : entry.name));
+    } catch {
+      return [];
+    }
+  }
+  const listing = await gitRead(root, ['ls-tree', '-z', revision, '--', parent ? parent + '/' : '.'], {
+    ...workerEnvironment(),
+    GIT_NO_LAZY_FETCH: '1',
+  });
+  if (listing.code !== 0 || listing.stderr.trim() || (listing.stdout && !listing.stdout.endsWith('\0')))
+    throw metadataFailure();
+  return listing.stdout
+    .split('\0')
+    .filter(row => row.startsWith('040000 tree '))
+    .map(row => row.slice(row.indexOf('\t') + 1));
+}
+
+// A Windows directory can be case-sensitive even with a single tracked child.
+// Probe file identity only for two candidate spellings. The selected tree
+// supplies every name, file type and manifest used to build the package plan.
+export function blueprintPathAlias(root, original, spelling) {
+  const statEntry = file => lstatSync(path.join(root, file), { bigint: true, throwIfNoEntry: false });
+  try {
+    const entry = statEntry(original);
+    if (!entry) return true;
+    const alias = statEntry(spelling);
+    return alias?.ino === entry.ino && alias.dev === entry.dev;
   } catch {
     throw cargoEvidenceFailure();
   }

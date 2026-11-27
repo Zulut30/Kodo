@@ -72,6 +72,30 @@ async function fixture(t, rootManifest = workspace(mainMembers, [side])) {
   return { root, git, commit, write, compile, spec };
 }
 
+test('Wave 0 follows Cargo member spellings and exclusions in draft and registration', async t => {
+  const f = await fixture(t);
+  const windows = path.sep === '\\';
+  const sources = mainMembers.map(dir => dir + '/src/lib.rs');
+  for (const [membership, exclude, includesCodec] of [
+    [['native\\codec'], [], windows],
+    [['Native/Codec'], [], windows],
+    [['Native/co*'], [], windows],
+    [['native/Co*'], [], false],
+    [['native/*'], ['native\\codec'], !windows],
+    [['native/*'], ['native/Codec'], true],
+    [['native/*', 'native/Codec'], ['native/codec'], windows],
+  ]) {
+    await f.write('Cargo.toml', workspace([...mainMembers.slice(1), ...membership], exclude));
+    f.commit();
+    for (const forRegistration of [false, true])
+      assert.deepEqual(
+        await f.compile(sources, { forRegistration }),
+        includesCodec ? threshold : [],
+        String(membership),
+      );
+  }
+});
+
 test('Cargo path dependencies use native separators when counting workspace packages', async t => {
   const members = ['native/client', 'native/server'];
   const f = await fixture(t, workspace(members));
@@ -100,6 +124,25 @@ test('Cargo path dependencies use native separators when counting workspace pack
   assert.deepEqual(await f.compile(sources, { forRegistration: true }), threshold);
 });
 
+test('an indirect Cargo member can be reached through the native spelling of its declaring member', async t => {
+  const f = await fixture(t, workspace(['Support/Bridge', ...mainMembers.slice(1)]));
+  await f.write(
+    'support/bridge/Cargo.toml',
+    manifest('bridge') + '[dependencies]\nwire-contracts={path="../../native/codec"}\n',
+  );
+  await f.write('support/bridge/src/lib.rs', '');
+  f.commit();
+  for (const forRegistration of [false, true]) {
+    assert.deepEqual(
+      await f.compile(
+        mainMembers.map(dir => dir + '/src/lib.rs'),
+        { forRegistration },
+      ),
+      path.sep === '\\' ? threshold : [],
+    );
+  }
+});
+
 test('Wave 0 counts an excluded plugin reachable below a literal workspace member', async t => {
   const f = await fixture(t);
   const host = 'native/client';
@@ -116,6 +159,12 @@ test('Wave 0 counts an excluded plugin reachable below a literal workspace membe
     [['native/other/../client', glob], false, false],
     [['native/clien?', glob], false, false, [plugin + '/Cargo.toml']],
     [['.', host, glob], false, true],
+    ...(path.sep === '\\'
+      ? [
+          [['Native/Client'], true, true],
+          [['Native/Client', glob], false, false],
+        ]
+      : []),
   ]) {
     await f.write('Cargo.toml', workspace([...members, 'native/server'], exclude));
     await f.write(

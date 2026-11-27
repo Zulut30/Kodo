@@ -38,6 +38,8 @@
 
    В пороге трёх крейтов каждый запланированный пакет учитывается один раз. Обе записи `native/{codec,control}/Cargo.toml` и `native/@(codec|control)/Cargo.toml` выбирают два манифеста. Если третьему пакету задача меняет только файл схемы `crates/events/schemas/event.proto`, число запланированных Rust-крейтов остаётся равным двум.
 
+   В Windows Cargo принимает оба разделителя пути в `members` и `exclude`. В каталоге без учёта регистра буквальная запись `crates/Exporter` может выбрать каталог `crates/exporter`. В шаблоне `crates/Exp*` регистр букв внутри компонента с `*` имеет значение. Для `exclude` Cargo сравнивает компоненты пути в том написании, с которым пакет был выбран.
+
    Если в `crates/exporter` уже лежит README, задача может добавить этот пакет в workspace, изменив корневой манифест и создав библиотеку и манифест пакета. Области `crates/exporter/Cargo.{toml,lock}` и `crates/exporter/Cargo.@(toml|lock)` обе выбирают будущий `Cargo.toml`. Сам файл манифеста относится к каталогу, в котором его создают. Например, пакеты из `members = ["src/rust/crates/*"]`, явно привязанные к внешнему workspace через `package.workspace`, остаются его членами при создании `src/rust/crates/Cargo.toml` для отдельного вложенного workspace.
 
    Каталог пакета может называться `exporter.rs`. При `members = ["vendor/*.rs"]` область `vendor/exporter.rs` учитывает будущий пакет уже до создания каталога. При общем `members = ["vendor/*"]` тип такого пути уточняет запись потомка, например `vendor/exporter.rs/src/lib.rs`. Маска `vendor/exporter.{rs,v2}/docs/*.md` тоже выбирает потомка `vendor/exporter.rs`. У существующего пути учитывается его тип в проверяемом дереве.

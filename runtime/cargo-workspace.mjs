@@ -1,5 +1,7 @@
 /** Offline Cargo workspace resolver shared by Architecture Guardian and Rust tooling. */
 import path from 'node:path';
+import { CargoDirectoryNames, cargoMemberMatcher, hasCargoGlob, nativeManifestPath } from './cargo-member-paths.mjs';
+export { compileCargoGlob } from './cargo-member-paths.mjs';
 import { createHash } from 'node:crypto';
 import { parse as parseToml } from 'smol-toml';
 import { braceBeforeExtglob, ownsPath, pathAndAncestors, scopeBraceGroup, scopeGlobSyntax } from './scope-paths.mjs';
@@ -318,110 +320,17 @@ export function resolveRelativeDir(fromDir, rawPath) {
 // Cargo resolves manifest path values with the host OS. Git tree keys and
 // task scopes use slash-separated paths on every platform.
 export function resolveManifestDir(fromDir, rawPath) {
-  if (path.sep === '\\' && typeof rawPath === 'string') rawPath = rawPath.replaceAll('\\', '/');
-  return resolveRelativeDir(fromDir, rawPath);
+  return resolveRelativeDir(fromDir, nativeManifestPath(rawPath));
 }
-
-const hasGlobMeta = pattern => /[*?[]/.test(pattern);
 
 export function normalizeWorkspacePath(raw, { allowGlob = false } = {}) {
   if (typeof raw !== 'string') return null;
-  const trimmed = raw.trim();
+  const trimmed = nativeManifestPath(raw).trim();
   if (!trimmed || trimmed.length > 1024 || /[\\:\x00-\x1f\x7f]/.test(trimmed) || trimmed.startsWith('/')) return null;
-  if (!allowGlob && hasGlobMeta(trimmed)) return null;
+  if (!allowGlob && hasCargoGlob(trimmed)) return null;
   const parts = trimmed.split('/');
   if (parts.includes('..')) return null;
   return parts.filter(part => part && part !== '.').join('/');
-}
-
-function escapeRegexChar(ch) {
-  return ch.replace(/[.+^${}()|[\]\\]/g, '\\$&');
-}
-
-function compileGlobSegment(segment) {
-  let regex = '';
-  for (let i = 0; i < segment.length; i++) {
-    const ch = segment[i];
-    if (ch === '*') {
-      regex += '[^/]*';
-    } else if (ch === '?') {
-      regex += '[^/]';
-    } else if (ch === '[') {
-      let j = i + 1;
-      if (j >= segment.length) return null;
-      let cls = '[';
-      if (segment[j] === '!') {
-        cls += '^';
-        j++;
-      } else if (segment[j] === '^') {
-        cls += '\\^';
-        j++;
-      }
-      if (j < segment.length && segment[j] === ']') {
-        cls += '\\]';
-        j++;
-      }
-      let closed = false;
-      while (j < segment.length) {
-        const inner = segment[j];
-        if (inner === ']') {
-          closed = true;
-          break;
-        }
-        if (inner === '\\') cls += '\\\\';
-        else if (inner === '[') cls += '\\[';
-        else cls += inner;
-        j++;
-      }
-      if (!closed) return null;
-      cls += ']';
-      regex += cls;
-      i = j;
-    } else if (ch === ']') {
-      return null;
-    } else {
-      regex += escapeRegexChar(ch);
-    }
-  }
-  return regex;
-}
-
-/**
- * Compile a Cargo member glob pattern following the Rust `glob` crate semantics:
- * `*` matches 0+ chars in a segment, `?` matches 1 char, `[...]` / `[!...]` character class,
- * and `**` matches 0+ path segments.
- * Returns `null` if the pattern is syntactically invalid.
- * @param {string} pattern
- * @returns {RegExp | null}
- */
-export function compileCargoGlob(pattern) {
-  if (pattern === '') return /^$/;
-  const parts = pattern.split('/');
-  let expr = '^';
-  for (let i = 0; i < parts.length; i++) {
-    const part = parts[i];
-    if (part === '**') {
-      if (i === parts.length - 1) {
-        expr += i === 0 ? '.*' : '(?:/.*)?';
-      } else {
-        expr += i === 0 ? '(?:.+/)?' : '(?:/.+)?';
-      }
-      continue;
-    }
-    if (part.includes('**')) return null;
-    const compiled = compileGlobSegment(part);
-    if (compiled === null) return null;
-    if (i > 0) {
-      expr += parts[i - 1] === '**' ? (i - 1 === 0 ? '' : '/') : '/';
-    }
-    expr += compiled;
-  }
-  expr += '$';
-  try {
-    return new RegExp(expr);
-  } catch {
-    return null;
-  }
 }
 
 export function parseWorkspaceDependencies(rawDeps) {
@@ -503,6 +412,7 @@ function relativeToRoot(rootDir, dir) {
 // No parent component is passed to a tree walk or Git pathspec.
 export function workspaceMemberPattern(root, raw) {
   if (typeof raw !== 'string' || raw.length > 1024) return null;
+  raw = nativeManifestPath(raw);
   const parts = raw.trim().split('/');
   const end = parts.lastIndexOf('..') + 1;
   const base = end ? resolveRelativeDir(root, parts.slice(0, end).join('/')) : root;
@@ -642,6 +552,7 @@ function collectDeclaredMembers({
   patterns,
   rootDir,
   rootManifest,
+  names,
   manifestDirs,
   snapshotDirs,
   snapshotFiles,
@@ -649,12 +560,18 @@ function collectDeclaredMembers({
   isExcluded,
   unknown,
 }) {
-  const selected = new Set();
+  const selected = new Map();
+  const select = (dir, spelling) => {
+    if (selected.has(dir) && selected.get(dir) !== spelling)
+      unknown('workspace', joinRel(dir, 'Cargo.toml'), 'duplicate-crate-name');
+    else selected.set(dir, spelling);
+  };
   for (const pattern of patterns) {
-    if (!hasGlobMeta(pattern)) {
-      const memberDir = joinRel(rootDir, pattern);
+    const spelling = joinRel(rootDir, pattern);
+    if (!hasCargoGlob(pattern)) {
+      const memberDir = names.resolve(spelling);
       // The root package, if present, is added once after member selection.
-      if (memberDir === rootDir || isExcluded(memberDir)) continue;
+      if (memberDir === rootDir || isExcluded(spelling)) continue;
       if (!manifestDirs.has(memberDir)) {
         unknown('workspace', rootManifest, 'missing-workspace-member');
         continue;
@@ -663,42 +580,29 @@ function collectDeclaredMembers({
         unknown('workspace', `${memberDir}/Cargo.toml`, 'nested-workspace-root');
         continue;
       }
-      selected.add(memberDir);
+      select(memberDir, spelling);
       continue;
     }
-    const regex = compileCargoGlob(pattern);
-    if (!regex) {
+    const match = cargoMemberMatcher(spelling, names);
+    if (!match) {
       unknown('workspace', rootManifest, 'unsupported-member-glob');
       continue;
     }
-    const matchedDirs = [...snapshotDirs]
-      .filter(dir => {
-        const rel = relativeToRoot(rootDir, dir);
-        return rel !== null && rel !== '' && regex.test(rel);
-      })
-      .sort(compare);
-    const matchedAnyFile = matchedDirs.length
-      ? true
-      : [...snapshotFiles].some(file => {
-          const rel = relativeToRoot(rootDir, file);
-          return rel !== null && regex.test(rel);
-        });
-    if (!matchedDirs.length && !matchedAnyFile) {
-      unknown('workspace', rootManifest, 'member-glob-no-match');
-      continue;
-    }
-    for (const dir of matchedDirs) {
-      if (isExcluded(dir)) continue;
+    let matched = false;
+    for (const dir of snapshotDirs) {
+      if (dir === rootDir || relativeToRoot(rootDir, dir) === null) continue;
+      const chosen = match(dir);
+      if (chosen === null) continue;
+      matched = true;
+      if (isExcluded(chosen)) continue;
       if (!manifestDirs.has(dir)) {
         unknown('workspace', joinRel(dir, 'Cargo.toml'), 'member-without-manifest');
-        continue;
-      }
-      if (isNestedWorkspaceRoot(rootDir, dir, manifestDirs, parsedCache)) {
+      } else if (isNestedWorkspaceRoot(rootDir, dir, manifestDirs, parsedCache)) {
         unknown('workspace', `${dir}/Cargo.toml`, 'nested-workspace-root');
-        continue;
-      }
-      selected.add(dir);
+      } else select(dir, chosen);
     }
+    if (!matched && ![...snapshotFiles].some(file => relativeToRoot(rootDir, file) !== null && match(file) !== null))
+      unknown('workspace', rootManifest, 'member-glob-no-match');
   }
   return selected;
 }
@@ -723,6 +627,7 @@ export function resolveDepTargetDir(dep, dir, rootDir, workspaceDependencies, bo
 
 function expandPathMembers({
   selected,
+  names,
   rootDir,
   workspaceDependencies,
   workspacePackage,
@@ -731,7 +636,7 @@ function expandPathMembers({
   isExcluded,
   unknown,
 }) {
-  const queue = [...selected].sort(compare);
+  const queue = [...selected.keys()].sort(compare);
   const visited = new Set(queue);
   while (queue.length) {
     const dir = queue.shift();
@@ -739,16 +644,20 @@ function expandPathMembers({
     if (parsed.error) continue;
     const { edition } = resolvePackageEdition(parsed.doc, workspacePackage);
     for (const dep of collectManifestDependencies(parsed.doc, { edition: edition ?? '2015' })) {
-      const targetDir = resolveDepTargetDir(dep, dir, rootDir, workspaceDependencies);
-      if (targetDir === null || !manifestDirs.has(targetDir) || isExcluded(targetDir)) continue;
+      const spelling = resolveDepTargetDir(dep, selected.get(dir), rootDir, workspaceDependencies);
+      if (spelling === null || isExcluded(spelling)) continue;
+      const targetDir = names.resolve(spelling);
+      if (!manifestDirs.has(targetDir)) continue;
       if (isNestedWorkspaceRoot(rootDir, targetDir, manifestDirs, parsedCache)) {
         unknown('workspace', `${targetDir}/Cargo.toml`, 'nested-workspace-root');
         continue;
       }
       if (!visited.has(targetDir)) {
         visited.add(targetDir);
-        selected.add(targetDir);
+        selected.set(targetDir, spelling);
         queue.push(targetDir);
+      } else if (selected.get(targetDir) !== spelling) {
+        unknown('workspace', joinRel(targetDir, 'Cargo.toml'), 'duplicate-crate-name');
       }
     }
   }
@@ -824,7 +733,7 @@ function collectSnapshotEntries(rawMap, files) {
   return { snapshotDirs, snapshotFiles };
 }
 
-function resolveWorkspaceAtRoot({ rootDir, rootEntry, manifestDirs, snapshotDirs, snapshotFiles, parsedCache }) {
+function resolveWorkspaceAtRoot({ rootDir, rootEntry, names, manifestDirs, snapshotDirs, snapshotFiles, parsedCache }) {
   const unsupported = new Map();
   const unknown = (scope, file, reason, offset = null) => {
     const id = hash([scope, file, reason, offset]);
@@ -875,6 +784,7 @@ function resolveWorkspaceAtRoot({ rootDir, rootEntry, manifestDirs, snapshotDirs
         patterns,
         rootDir,
         rootManifest,
+        names,
         manifestDirs,
         snapshotDirs,
         snapshotFiles,
@@ -882,12 +792,13 @@ function resolveWorkspaceAtRoot({ rootDir, rootEntry, manifestDirs, snapshotDirs
         isExcluded,
         unknown,
       })
-    : new Set();
-  if (hasRootPackage) selected.add(rootDir);
+    : new Map();
+  if (hasRootPackage) selected.set(rootDir, rootDir);
 
   if (hasWorkspace) {
     expandPathMembers({
       selected,
+      names,
       rootDir,
       workspaceDependencies,
       workspacePackage,
@@ -898,7 +809,7 @@ function resolveWorkspaceAtRoot({ rootDir, rootEntry, manifestDirs, snapshotDirs
     });
   }
 
-  const members = loadMemberPackages(selected, rootDir, parsedCache, workspacePackage, unknown);
+  const members = loadMemberPackages(selected.keys(), rootDir, parsedCache, workspacePackage, unknown);
   return {
     selected,
     isExcluded,
@@ -936,7 +847,14 @@ function createWorkspaceIndex({ manifests, files }) {
     cache.set(dir, parsed);
     return parsed;
   };
-  return { rawMap, snapshotDirs, snapshotFiles, manifestDirs, parsedCache };
+  return {
+    rawMap,
+    snapshotDirs,
+    snapshotFiles,
+    manifestDirs,
+    parsedCache,
+    names: new CargoDirectoryNames(snapshotDirs),
+  };
 }
 
 function resolveStartDir(index, startDir, resolvedCache = new Map()) {
@@ -959,6 +877,7 @@ function resolveStartDir(index, startDir, resolvedCache = new Map()) {
     const resolved = resolveWorkspaceAtRoot({
       rootDir: candidate.rootDir,
       rootEntry: candidate.entry,
+      names: index.names,
       manifestDirs,
       snapshotDirs,
       snapshotFiles,
