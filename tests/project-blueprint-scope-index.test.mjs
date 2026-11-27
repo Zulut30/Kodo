@@ -72,6 +72,7 @@ test('ownership lookup agrees with ownsPath for glob matches, literal spellings 
     'src/shared/!(legacy.mjs|disabled.mjs)',
     'src/shared/s[[:alpha:]].rs',
     'src/{client/read,server/write}.test.js',
+    './src/{client,client/}/@(web{,-ui}|tool{,-cli})/read.rs',
     'src/shared/**',
     'src/.*/*.rs',
     'src/a{,b}/../shared',
@@ -80,6 +81,9 @@ test('ownership lookup agrees with ownsPath for glob matches, literal spellings 
   const files = [
     'shared.txt',
     'src/client/read.test.js',
+    'src/client/WEB-UI/read.rs',
+    'src/client/web-cli/read.rs',
+    'src/{client,client/}/@(web|web-ui|tool|tool-cli)/read.rs/child',
     'src/server/write.test.js',
     'src/shared/view-lib.js',
     'src/shared/legacy.mjs',

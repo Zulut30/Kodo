@@ -7,6 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { validateArchitecturePolicy } from '../runtime/architecture-policy.mjs';
+import { selectedManifestRoots } from '../runtime/project-blueprint-cargo-scopes.mjs';
 import { compileBlueprint, rustContractCrateFindings } from '../runtime/project-blueprint.mjs';
 import { workerEnvironment } from '../runtime/security.mjs';
 
@@ -320,6 +321,24 @@ test('the Wave 0 threshold counts concrete manifest and Rust source owners once'
     for (const rust of ['crates/events/src/lib.rs', 'crates/events/src/**', 'crates/events/Cargo.toml'])
       assert.deepEqual(publicCodes([...sources, rust], names), ['contract_crate_required'], rust);
   }
+});
+
+test('planning manifests does not send independent brace lists in sibling directory arms to Node together', t => {
+  const stems = Array.from({ length: 6 }, (_, i) => 'pkg' + i);
+  const names = stems.flatMap(stem => [stem, stem + '-cli']);
+  const expected = new Set(names.map(name => 'crates/host/plugins/' + name));
+  const packages = { 'crates/host': 'host', 'crates/codec': 'codec' };
+  const match = t.mock.method(path.posix, 'matchesGlob');
+  for (const arms of [names, stems.map(stem => stem + '{,-cli}')]) {
+    const scope = 'crates/host/{plugins,plugins/}/@(' + arms.join('|') + ')/Cargo.toml';
+    assert.deepEqual(new Set(selectedManifestRoots(scope)), expected);
+    assert.deepEqual(
+      publicCodes(['Cargo.toml', ...Object.keys(packages).map(dir => dir + '/src/lib.rs'), scope], packages),
+      ['contract_crate_required'],
+    );
+  }
+  const expensive = match.mock.calls.filter(({ arguments: [, glob] }) => glob.split('{,-cli}').length > 2);
+  assert.equal(expensive.length, 0, 'Node would multiply the brace lists before parsing the positive extglob');
 });
 
 test('internal dot components in Cargo members protect the same schema as the canonical path', async t => {

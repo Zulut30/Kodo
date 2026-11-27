@@ -8,8 +8,8 @@ import {
   scopeClassEnd as classEnd,
   unwrapContractPathGroups,
 } from './cargo-workspace.mjs';
-import { braceBeforeExtglob, ownsPath, scopeBraceGroup, scopeGlobSyntax } from './scope-paths.mjs';
-import { pathParents, scopeOwnership } from './project-blueprint-scope-index.mjs';
+import { braceBeforeExtglob, ownsScopePath, scopeBraceGroup, scopeGlobSyntax } from './scope-paths.mjs';
+import { cargoScopeGlob, pathParents, scopeOwnership } from './project-blueprint-scope-index.mjs';
 
 const join = (dir, name) => (dir ? dir + '/' + name : name);
 const braceRange = /^(-?\d+)\.\.(-?\d+)(?:\.\.(-?\d+))?$|^([A-Za-z])\.\.([A-Za-z])(?:\.\.(-?\d+))?$/;
@@ -77,7 +77,7 @@ export function selectsCargoManifest(scope, manifest, { concreteDirectory = fals
     if (pattern === manifest) return true;
     if (seen.has(pattern)) return false;
     seen.add(pattern);
-    if (!path.posix.matchesGlob(manifest, pattern)) return false;
+    if (!path.posix.matchesGlob(manifest, cargoScopeGlob(pattern))) return false;
     if (!concreteDirectory && !finiteName && !pattern.includes('*')) return true;
     const { name, choice, unbounded } = terminalSelector(pattern, concreteDirectory);
     if (!choice) {
@@ -219,7 +219,10 @@ export function scopedDirectoryMatcher(scopes) {
     for (const layout of directoryLayouts(scope)) for (const parent of directorySelectors(layout)) parents.add(parent);
   }
   return scopeOwnership(parents, (choices, dir) =>
-    choices.some(pattern => pattern === dir || (scopeGlobSyntax.test(pattern) && path.posix.matchesGlob(dir, pattern))),
+    choices.some(
+      pattern =>
+        pattern === dir || (scopeGlobSyntax.test(pattern) && path.posix.matchesGlob(dir, cargoScopeGlob(pattern))),
+    ),
   );
 }
 
@@ -394,6 +397,7 @@ function componentWitness(pattern, children, extension = '', explicitExtension =
   const valid = name => name && name.isWellFormed() && name !== '.' && name !== '..' && !children.has(name);
   if (!scopeGlobSyntax.test(pattern))
     return valid(pattern) && pattern.toLowerCase().endsWith(extension) ? pattern : null;
+  const glob = cargoScopeGlob(pattern);
 
   const reserved = new Set(['', '.', '..']);
   const alphabet = new Set('x.rs');
@@ -428,7 +432,7 @@ function componentWitness(pattern, children, extension = '', explicitExtension =
       // The sentinel puts a suffix inside the basename, where a dot is an
       // ordinary character. The complete basename keeps its actual dot rules.
       const answers = rules.map(rule => Number(path.posix.matchesGlob('x' + word, 'x' + rule)));
-      classes.set(word, prefix + Number(path.posix.matchesGlob(word, pattern)) + answers.join(''));
+      classes.set(word, prefix + Number(path.posix.matchesGlob(word, glob)) + answers.join(''));
     }
     return classes.get(word);
   }
@@ -503,7 +507,7 @@ function componentWitness(pattern, children, extension = '', explicitExtension =
   function find() {
     const names = new Set(spell(parts, ['']));
     for (const name of names) {
-      if (!name.toLowerCase().endsWith(extension) || !path.posix.matchesGlob(name, pattern)) continue;
+      if (!name.toLowerCase().endsWith(extension) || !path.posix.matchesGlob(name, glob)) continue;
       if (valid(name)) return name;
       // Git names are literal. For a mask that folds case, an unoccupied
       // spelling can lie just outside the set of occupied, matching ones.
@@ -575,12 +579,14 @@ function literalScopeTarget(pattern, root, entryKinds, allFiles) {
 }
 
 function visitScope(scope, root, candidates, entryKinds, allFiles = false) {
+  const pattern = scope.replace(/^\.\//, '');
+  const glob = cargoScopeGlob(pattern);
   const visited = new Map();
   const covered = new Set();
 
   // A scope ending at a matched directory also covers its package descendants.
   function coverDirectory(entry, inherited, matchedPath = null) {
-    if (!entry || covered.has(entry) || (matchedPath !== null && !ownsPath([scope], matchedPath))) return;
+    if (!entry || covered.has(entry) || (matchedPath !== null && !ownsScopePath(scope, matchedPath, glob))) return;
     covered.add(entry);
     const owner = entry.manifest ?? inherited;
     if (owner !== null) candidates.add(owner);
@@ -594,7 +600,7 @@ function visitScope(scope, root, candidates, entryKinds, allFiles = false) {
     else if (allFiles) file = componentWitness(part, children);
     else if (part !== '**' && (inSource || part.includes('.')))
       file = componentWitness(part, children, '.rs', !inSource);
-    if (file && ownsPath([scope], join(dir, file))) candidates.add(owner);
+    if (file && ownsScopePath(scope, join(dir, file), glob)) candidates.add(owner);
   }
 
   function visit(pattern, entry, dir, inherited) {
@@ -626,9 +632,10 @@ function visitScope(scope, root, candidates, entryKinds, allFiles = false) {
         if (part !== 'Cargo.toml' || !entry?.manifest) visit(rest, children.get(part), join(dir, part), owner);
         continue;
       }
+      const componentGlob = cargoScopeGlob(part);
       for (const [name, child] of children) {
         const childDir = join(dir, name);
-        if (path.posix.matchesGlob(name, part) || (globstar && ownsPath([scope], childDir)))
+        if (path.posix.matchesGlob(name, componentGlob) || (globstar && ownsScopePath(scope, childDir, glob)))
           visit(globstar ? layout : rest, child, childDir, owner);
       }
       // One fresh matching component covers all names outside this trie
@@ -640,7 +647,6 @@ function visitScope(scope, root, candidates, entryKinds, allFiles = false) {
     }
   }
 
-  const pattern = scope.replace(/^\.\//, '');
   const kind = entryKinds.get(pattern);
   if (kind === 'tree' || scopeGlobSyntax.test(pattern)) {
     const literal = literalScopeTarget(pattern, root, entryKinds, allFiles);

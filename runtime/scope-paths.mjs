@@ -54,9 +54,14 @@ export function braceBeforeExtglob(pattern, start, canDefer) {
  * @param {string} name
  */
 export function ownsPath(scopes, name) {
-  return scopes.some(value => {
-    // `./x` names the same path as `x` (validatePlan accepts both spellings).
-    const scope = value.replace(/^\.\//, '');
-    return path.posix.matchesGlob(name, scope) || name === scope || name.startsWith(scope.replace(/\/\*\*$/, '') + '/');
-  });
+  return scopes.some(value => ownsScopePath(value, name));
+}
+
+// A prepared glob can only replace the native match. The literal file and
+// subtree are always identified by the original write scope.
+export function ownsScopePath(value, name, glob = undefined) {
+  const scope = value.replace(/^\.\//, '');
+  return (
+    path.posix.matchesGlob(name, glob ?? scope) || name === scope || name.startsWith(scope.replace(/\/\*\*$/, '') + '/')
+  );
 }
