@@ -1,6 +1,6 @@
 # План: сопровождаемость Kodo после PR #16
 
-На 2026-11-26 **T1–T8 выполнены**. Шаги T4c, T5, T6, T8, декомпозиции этапов 15–16 и храповик `max-lines: 900` вошли в `main` коммитом `46fffa2`. У шести файлов пока есть исключения по длине. План составлен 2026-11-06 по ветке `quality/maintainability` (`c2d3940`, CI зелёный на Ubuntu и Windows). [PR #34](https://github.com/Zulut30/Kodo/pull/34) · [Храповик размера файлов и остаток долга](#храповик-размера-файлов-и-остаток-долга).
+**T1–T8 выполнены.** Шаги T4c, T5, T6, T8, декомпозиции этапов 15–16 и храповик `max-lines: 900` вошли в `main` коммитом `46fffa2`. Следующий рефакторинг снял шесть оставшихся исключений по длине файла. План составлен 2026-11-06 по ветке `quality/maintainability` (`c2d3940`, CI зелёный на Ubuntu и Windows). [PR #34](https://github.com/Zulut30/Kodo/pull/34) · [Храповик размера файлов и остаток долга](#храповик-размера-файлов-и-остаток-долга).
 
 ## Цель
 
@@ -216,23 +216,23 @@ T1–T4 независимы друг от друга. T5–T8 начинают�
 - `4e4f33c`: `project-external` → `-integration`/`-shared`/`-submission`/`-wave`; `project-blueprint` → `-io`/`-lint`/`-rust`/`-shared`/`-spec`; `project-director-waves` → `project-wave-gates`/`-integration`/`-shared`.
 - `f93c97d`: `api-cards` → `-js`/`-lexical`/`-rust`; `behavior-gate` → `behavior-scanners`; `behavior-rust` → `behavior-rust-registry`; `task-fast-checks` → `task-fast-counting`.
 
-**Остаток: шесть файлов длиннее 900 строк.** Каждый начинается с `/* oxlint-disable max-lines -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md */`. Разбиение файла снимает метку, а устаревшую метку lint сам потребует удалить (`--report-unused-disable-directives`). Число строк — физическое, на 2026-11-26:
+**Все шесть файлов разделены.** Исходные пути сохранили публичные экспорты. В таблице указаны размеры до разбиения на 2026-11-26. Oxlint проверяет предел в 900 строк кода, пропуская комментарии и пустые строки.
 
-| Файл | Строк |
-| --- | ---: |
-| `runtime/project-bootstrap.mjs` | 1 252 |
-| `runtime/project-contracts.mjs` | 1 210 |
-| `scripts/overhead-bench.mjs` | 1 151 |
-| `runtime/project-telemetry.mjs` | 1 085 |
-| `runtime/quality.mjs` | 1 079 |
-| `runtime/quality-runner.mjs` | 981 |
+| Исходный файл | Физических строк до разбиения | Выделенный модуль в том же каталоге |
+| --- | ---: | --- |
+| `runtime/project-bootstrap.mjs` | 1 252 | `project-bootstrap-context.mjs` |
+| `runtime/project-contracts.mjs` | 1 210 | `project-contracts-normalize.mjs` |
+| `scripts/overhead-bench.mjs` | 1 151 | `overhead-bench-sandbox.mjs` |
+| `runtime/project-telemetry.mjs` | 1 085 | `project-telemetry-samples.mjs` |
+| `runtime/quality.mjs` | 1 079 | `quality-config.mjs` |
+| `runtime/quality-runner.mjs` | 981 | `quality-runner-tools.mjs` |
 
 Кроме того, в коде остаются 25 точечных меток `max-lines-per-function` или `complexity` из T3.
 
 ## Итоговые критерии плана
 
 - В `.oxlintrc.json` блок `overrides` из T3 пуст или содержит только файлы с записанным обоснованием. **Выполнено:** остался только `tests/**`.
-- Baseline типов не больше 150 (было 302). **Выполнено:** 108.
+- Baseline типов не больше 150 (было 302). После T4c осталось 108 диагностик. При разбиении последних шести файлов число снизилось до 91.
 - Покрытие измерено, а цифры по модулям из T5–T7 не ниже исходных.
 - Публичный API модулей, формат хранилища и замороженные oracle/acceptance-файлы не изменились.
 - Каждый PR прошёл `npm run check` локально и в CI.
