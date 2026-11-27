@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { access, lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { access, copyFile, lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -66,6 +66,13 @@ async function smoke() {
     const launcher = path.join(prefix, 'node_modules', '.bin', process.platform === 'win32' ? 'kodo.cmd' : 'kodo');
     await access(launcher);
 
+    await copyFile(path.join(root, 'tests', 'fixtures', 'package-types.ts'), path.join(prefix, 'consumer.mts'));
+    const compiler = path.join(root, 'node_modules', 'typescript', 'bin', 'tsc');
+    for (const depth of ['1', '2']) {
+      const options = ['--noEmit', '--strict', '--allowJs', '--module', 'NodeNext', '--maxNodeModuleJsDepth', depth];
+      await execute(process.execPath, [compiler, ...options, 'consumer.mts'], { cwd: prefix, env });
+    }
+
     // Always execute the installed entry point; the checkout is not on its module path.
     const run = args => execute(process.execPath, [bin, ...args], { cwd: prefix, env });
     const help = await run(['--help']);
@@ -98,6 +105,7 @@ async function smoke() {
             'isolated install --ignore-scripts',
             'installed contributor guide and linked AGENTS.md',
             'installed package bin and launcher',
+            'installed TypeScript consumer at maxNodeModuleJsDepth 1 and 2',
             'installed CLI help',
             'installed CLI validate --json',
             'installed CLI list --json',
