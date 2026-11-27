@@ -72,7 +72,6 @@ export function qualityPath(name) {
     throw qualityError('unsafe_path', 'unsafe or secret path');
   return name;
 }
-/** @param {Record<string, unknown> & {dialect?: string}} [input] */
 // oxlint-disable-next-line max-lines-per-function, complexity -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
 export function normalizeQualityConfig(input = {}) {
   keys(
@@ -105,7 +104,8 @@ export function normalizeQualityConfig(input = {}) {
     affectedPaths: [],
     timeoutMs: 120000,
     maxOutputBytes: 1024 * 1024,
-    ...input,
+    // The dialect has no default and is validated below.
+    .../** @type {{ dialect?: string }} */ (input),
   };
   if (
     typeof config.enabled !== 'boolean' ||
