@@ -1,0 +1,331 @@
+import assert from 'node:assert/strict';
+import path from 'node:path';
+import test from 'node:test';
+import {
+  plannedPackageDirs,
+  scopedDirectoryMatcher,
+  selectedManifestRoots,
+} from '../runtime/project-blueprint-cargo-scopes.mjs';
+import { ownsPath } from '../runtime/scope-paths.mjs';
+
+function candidates(scopes, dirs) {
+  const manifests = new Map(dirs.map((dir, i) => [dir, String(i + 1).padStart(40, '0')]));
+  return plannedPackageDirs(new Set(scopes), manifests);
+}
+
+test('directory and filename choices discover the same manifest roots after brace expansion', () => {
+  const parent = 'crates/host/plugins/';
+  for (const [grouped, separate, expected] of [
+    [
+      '@({codec,cache|exporter})/Cargo.toml',
+      ['@(codec)/Cargo.toml', '@(cache|exporter)/Cargo.toml'],
+      ['cache', 'codec', 'exporter'],
+    ],
+    [
+      'exporter/Cargo.?({toml,backup)/docs/file})',
+      ['exporter/Cargo.?(toml)', 'exporter/Cargo.?(backup)/docs/file)'],
+      ['exporter'],
+    ],
+  ]) {
+    const roots = scopes => new Set(scopes.flatMap(scope => [...selectedManifestRoots(parent + scope)]));
+    assert.deepEqual(roots(separate), new Set(expected.map(name => parent + name)));
+    assert.deepEqual(roots([grouped]), roots(separate), grouped);
+  }
+
+  const members = Array.from({ length: 33 }, (_, index) => 'member' + index);
+  const grouped = parent + '@(shared|{' + members.join(',') + '})/Cargo.toml';
+  assert.deepEqual(new Set(selectedManifestRoots(grouped)), new Set(['shared', ...members].map(name => parent + name)));
+});
+
+test('checking a member directory costs the same with optional filename suffixes', t => {
+  const normalize = t.mock.method(path.posix, 'normalize');
+  const compare = filename => {
+    const before = normalize.mock.callCount();
+    const descendsInto = scopedDirectoryMatcher(['vendor/exporter.{rs,v2}/docs/' + filename]);
+    assert.equal(descendsInto('vendor/exporter.rs'), true);
+    assert.equal(descendsInto('vendor/exporter.ts'), false);
+    return normalize.mock.callCount() - before;
+  };
+  assert.equal(compare('guide' + '{,-copy}'.repeat(8) + '.md'), compare('guide.md'));
+});
+
+test('a navigation segment in a directory does not multiply optional filename suffixes', t => {
+  const normalize = t.mock.method(path.posix, 'normalize');
+  const count = filename => {
+    const before = normalize.mock.callCount();
+    const descendsInto = scopedDirectoryMatcher(['vendor/{./exporter.rs,exporter.v2}/docs/' + filename]);
+    assert.equal(descendsInto('vendor/exporter.rs'), true);
+    assert.equal(descendsInto('vendor/exporter.v2/docs'), true);
+    assert.equal(descendsInto('vendor/other'), false);
+    return normalize.mock.callCount() - before;
+  };
+  const ordinary = count('guide.md');
+  for (const filename of [
+    'guide{,-draft}{,-en}{,-v2}{,-mobile}.md',
+    '{guide,readme}{,-draft}{,-de}',
+    '{..,guide}{,-draft}',
+  ])
+    assert.equal(count(filename), ordinary, filename);
+  const navigationOnly = scopedDirectoryMatcher(['vendor/{./exporter.rs,exporter.v2}/docs/{.,..}']);
+  assert.equal(navigationOnly('vendor/exporter.rs/docs'), false);
+  assert.equal(navigationOnly('vendor/exporter.rs'), true);
+});
+
+test('a repeated choice owns a future file in the concrete package directory', () => {
+  const scope = 'native/+(@(foo|bar))/src/new.rs';
+  assert.ok(ownsPath([scope], 'native/foobar/src/new.rs'));
+  assert.deepEqual(candidates([scope], ['native/foobar', 'native/baz']), new Set(['native/foobar']));
+});
+
+test('only the owning manifest’s own src tree implies future Rust files from directory scopes', () => {
+  const dirs = ['native/engine'];
+  for (const suffix of ['', '/**']) {
+    const scope = './native/engine/src/parser' + suffix;
+    assert.ok(ownsPath([scope], 'native/engine/src/parser/token.rs'));
+    assert.deepEqual(candidates([scope], dirs), new Set(dirs), scope);
+    assert.deepEqual(candidates(['native/engine/frontend/src/components' + suffix], dirs), new Set());
+  }
+  assert.deepEqual(candidates(['native/engine/src/README.md'], dirs), new Set());
+  const nested = [...dirs, 'native/engine/src/vendor'];
+  assert.deepEqual(candidates(['native/engine/src/vendor/frontend/src/**'], nested), new Set());
+  assert.deepEqual(candidates(['native/engine/src/vendor/src/**'], nested), new Set(['native/engine/src/vendor']));
+});
+
+test('the nearest manifest shadows its parent for the literal and every equivalent singleton mask', () => {
+  const dirs = ['native', 'native/fixtures'];
+  for (const part of ['fixtures', 'f[i]xtures', '{fixtures,fixtures}']) {
+    const scope = 'native/' + part + '/web/parse.rs';
+    assert.ok(ownsPath([scope], 'native/fixtures/web/parse.rs'));
+    assert.deepEqual(candidates([scope], dirs), new Set(['native/fixtures']), scope);
+  }
+});
+
+test('Unicode ranges distinguish occupied names from a future directory in the outer package', () => {
+  const nested = ['А', 'Б', 'а', 'б'].map(name => 'native/' + name);
+  const dirs = ['native', ...nested];
+  const future = 'native/Ж/generated/new.rs';
+  for (const part of ['[А-Б]', '[А-Я]']) {
+    const scope = 'native/' + part + '/generated/new.rs';
+    const owners = nested.filter(dir => ownsPath([scope], dir + '/generated/new.rs'));
+    if (ownsPath([scope], future)) owners.push('native');
+    assert.deepEqual(candidates([scope], dirs), new Set(owners), scope);
+  }
+});
+
+test('a mask can reach both a nested manifest and future siblings in the outer package', () => {
+  const dirs = ['native', 'native/fixtures'];
+  for (const part of ['{fixtures,generated}', 'f[iu]xtures', 'fi*xtures', '+(fixtures)']) {
+    const scope = 'native/' + part + '/web/parse.rs';
+    assert.deepEqual(candidates([scope], dirs), new Set(dirs), scope);
+  }
+});
+
+test('every filename alternative stays paired with its own directory', () => {
+  const dirs = ['native/engine'];
+  for (const filename of ['@(read.rs|write.rs)', '{read.rs,write.rs}', 'parse.r[s]']) {
+    const scope = 'native/engine/generated/' + filename;
+    assert.deepEqual(candidates([scope], dirs), new Set(dirs), scope);
+  }
+  for (const scopes of [
+    ['native/engine/src/README.md', 'native/fixtures/demo.rs'],
+    ['native/{engine/src/README.md,fixtures/demo.rs}'],
+    ['native/{engine/src/@(README.md|index.ts),fixtures/@(demo.rs|other.rs)}'],
+  ])
+    assert.deepEqual(candidates(scopes, dirs), new Set(), scopes.join(', '));
+});
+
+test('directory extglobs use the canonical matcher, including choices inside repetition or negation', () => {
+  const dirs = ['foo', 'bar', 'foobar', 'barfoo', 'other', 'a!'].map(name => 'native/' + name);
+  for (const pattern of ['+(@(foo|bar))', '*(@(foo|bar))', '!(foo|bar)', '!(@(foo|bar))']) {
+    const scope = 'native/' + pattern + '/gen/new.rs';
+    const expected = dirs.filter(dir => ownsPath([scope], dir + '/gen/new.rs'));
+    assert.deepEqual(candidates([scope], dirs), new Set(expected), scope);
+  }
+});
+
+test('large filename choices keep late Rust alternatives and their package boundary', () => {
+  const dirs = ['native', 'native/fixtures'];
+  const docs = Array.from({ length: 90 }, (_, i) => 'note' + i + '.md');
+  for (const leaf of ['@(' + [...docs, 'parse.rs'].join('|') + ')', '{' + [...docs, 'parse.rs'].join(',') + '}']) {
+    const scope = 'native/f[i]xtures/web/' + leaf;
+    assert.ok(ownsPath([scope], 'native/fixtures/web/parse.rs'));
+    assert.deepEqual(candidates([scope], dirs), new Set(['native/fixtures']), scope);
+  }
+});
+
+test('each concrete directory and file combination selects exactly its deepest manifest', () => {
+  const dirs = ['.', 'native', 'native/pkg1', 'native/pkg2', 'native/pkg2/inner', 'other/pkg3'];
+  // This language is finite. Enumerate its paths independently of the planned-source resolver.
+  const files = [];
+  for (const n of [1, 2, 3])
+    for (const spelling of ['pkg', 'PKG'])
+      for (const suffix of ['parser.rs', 'inner/parser.rs', 'notes/README.md'])
+        files.push('native/' + spelling + n + '/' + suffix);
+  for (const scope of [
+    'native/pkg[12]/inner/parser.rs',
+    'native/pkg{1..3}/parser.rs',
+    'native/pkg{1..2}/{notes/README.md,inner/parser.rs}',
+    'native/{pkg1/notes/README.md,pkg2/inner/parser.rs,pkg3/notes/README.md}',
+  ]) {
+    const owners = files
+      .filter(file => file.endsWith('.rs') && ownsPath([scope], file))
+      .map(file => dirs.findLast(dir => dir === '.' || file.startsWith(dir + '/')));
+    assert.deepEqual(candidates([scope], dirs), new Set(owners), scope);
+  }
+});
+
+test('globstar may leave a nested manifest branch only when a concrete path does', () => {
+  const dirs = ['native', 'native/fixtures'];
+  assert.deepEqual(candidates(['native/f[i]xtures/**/parse.rs'], dirs), new Set(['native/fixtures']));
+  assert.deepEqual(candidates(['native/**/fixtures/web/parse.rs'], dirs), new Set(dirs));
+});
+
+test('Rust filename evidence belongs to the arm that supplies the extension', () => {
+  const dirs = ['native/engine'];
+  for (const scope of [
+    'native/engine/web/@(README.md|*)',
+    'native/{engine/web/**,fixtures/sample.rs}',
+    'native/{engine/web/*,fixtures/sample.r[s]}',
+  ])
+    assert.deepEqual(candidates([scope], dirs), new Set(), scope);
+  for (const file of ['sample{01..03}.r[s]', 'sample[.]r[s]', 'sample.+(@(r|s))']) {
+    assert.deepEqual(candidates(['native/engine/generated/' + file], dirs), new Set(dirs), file);
+  }
+});
+
+test('a literal subtree scope also owns Rust files under a hidden nested crate', () => {
+  const dirs = ['native', 'native/.hidden'];
+  for (const scope of ['native', 'native/**']) {
+    assert.ok(ownsPath([scope], 'native/.hidden/src/new.rs'));
+    assert.deepEqual(candidates([scope], dirs), new Set(dirs), scope);
+  }
+});
+
+test('future directories remain reachable when early spellings are occupied or excluded', () => {
+  for (const [part, occupied, name] of [
+    ['!(*[!b]*|b|bbb*)', [], 'bb'],
+    ['+({foo,bar})', ['foo', 'bar', 'foofoo', 'barbar', 'foofoofoo', 'barbarbar'], 'foofoofoofoo'],
+    ['@(Cargo.toml|generated)', [], 'generated'],
+  ]) {
+    const dirs = ['native', ...occupied.map(dir => 'native/' + dir)];
+    const scope = 'native/' + part + '/web/new.rs';
+    assert.ok(ownsPath([scope], 'native/' + name + '/web/new.rs'));
+    assert.deepEqual(candidates([scope], dirs), new Set(dirs), scope);
+  }
+});
+
+test('a brace alternative can change depth before the manifest prefix is matched', () => {
+  const dirs = ['native/engine'];
+  for (const scope of [
+    'native/scratch/{..,other}/engine/new.rs',
+    'native/{scratch/../engine,other}/new.rs',
+    'native/engine/{,generated}/new.rs',
+  ]) {
+    assert.ok(ownsPath([scope], 'native/engine/new.rs'));
+    assert.deepEqual(candidates([scope], dirs), new Set(dirs), scope);
+  }
+});
+
+test('Cargo follows brace expansion before interpreting bracket expressions', () => {
+  const dirs = ['native/engine'];
+  const file = 'native/engine/src/new.rs';
+  for (const prefix of ['stage/{v[1,..,2],cache}/', 'stage/{[,..,]}/', 'stage/{v[1,.,2],cache}/']) {
+    const scope = prefix + file;
+    const expected = ownsPath([scope], file) ? dirs : [];
+    assert.deepEqual(candidates([scope], dirs), new Set(expected), scope);
+  }
+});
+
+test('future Rust sources use the literal and glob meanings of a tracked package name independently', () => {
+  const dirs = ['native/[client]', 'native/c', 'native/client'];
+  for (const [scope, suffix] of [
+    ['native/[client]/src/new.rs', '/src/new.rs'],
+    ['native/[client]/src/**', '/src/future.rs'],
+    ['native/[client]/src/parser', '/src/parser/future.rs'],
+    ['native/[client]/src/README.md', '/src/new.rs'],
+  ]) {
+    const expected = dirs.filter(dir => ownsPath([scope], dir + suffix));
+    assert.deepEqual(candidates([scope], dirs), new Set(expected), scope);
+  }
+});
+
+test('a known literal package directory owns future bracketed filenames and subdirectories', () => {
+  const dirs = ['native/[client]', 'native/c'];
+  for (const [scope, globFile] of [
+    ['native/[client]/src/model/[id].rs', 'native/c/src/model/i.rs'],
+    ['native/[client]/src/pages/[id]/new.rs', 'native/c/src/pages/i/new.rs'],
+    ['native/[client]/src/pages/[id]/**', 'native/c/src/pages/i/new.rs'],
+  ]) {
+    const literalFile = scope.endsWith('/**') ? scope.slice(0, -2) + 'new.rs' : scope;
+    assert.ok(ownsPath([scope], literalFile));
+    assert.ok(ownsPath([scope], globFile));
+    assert.deepEqual(candidates([scope], dirs), new Set(dirs), scope);
+  }
+  const nested = 'native/[client]/src/pages/[id]';
+  assert.deepEqual(candidates([nested + '/new.rs'], [...dirs, nested]), new Set([nested, 'native/c']));
+  assert.deepEqual(candidates(['native/[client]/src/model/[id].ts'], dirs), new Set());
+});
+
+test('brace ranges that emit an empty string can normalize a planned path', () => {
+  const dirs = ['native/foobar'];
+  const file = 'native/foobar/src/new.rs';
+  for (const prefix of [
+    'stage/.{Z..a}./',
+    'stage/.{a..Z}./',
+    'stage/.{Z..a..2}./',
+    'stage/.{Z..a..3}./',
+    'stage/.{A..Z}./',
+    'stage/.{Z..a}{Z..a}./',
+    'stage/{v,.{Z..a}.}/',
+    '{Z..a}/',
+  ]) {
+    const scope = prefix + file;
+    assert.deepEqual(candidates([scope], dirs), new Set(ownsPath([scope], file) ? dirs : []), scope);
+  }
+  const packages = ['native/Z', 'native/a', 'native/zebra'];
+  for (const scope of ['stage/.{Z..a}./native/{Z..a}/src/new.rs', 'native/{Z..a}/stage/.{Z..a}./src/new.rs']) {
+    const expected = packages.filter(dir => ownsPath([scope], dir + '/src/new.rs'));
+    assert.deepEqual(candidates([scope], packages), new Set(expected), scope);
+  }
+});
+
+test('ordinary filename ranges share one normalized path layout', t => {
+  const normalized = t.mock.method(path.posix, 'normalize', path.posix.normalize);
+  const directories = [
+    'web',
+    '{apps/web,apps/admin,sites/blog,sites/docs}',
+    '{views/search,views/list,views/item,parts/nav}',
+    '{themes/light,themes/dark,styles/base,styles/brand}',
+    '{locales/fr,locales/es,locales/de,locales/pl}',
+  ].join('/');
+  for (const name of ['version-a.ts', 'version-{a..c}.ts', 'version-{Z..a..3}.ts', 'version{Z..a}{Z..a}{Z..a}.js']) {
+    const before = normalized.mock.callCount();
+    assert.deepEqual(candidates([directories + '/' + name], ['native/engine']), new Set());
+    assert.equal(normalized.mock.callCount() - before, 1, name);
+  }
+});
+
+test('astral filename characters can span glob atoms in a future Rust source', () => {
+  const dirs = ['native/engine'];
+  const prefix = 'native/engine/src/';
+  for (const [pattern, filename] of [
+    ['[🦀]*.rs', '🦀parser.rs'],
+    ['[🦀]?.rs', '🦀.rs'],
+    ['?[🦀].rs', '🦀.rs'],
+    ['[🦀][🦀].rs', '🦀.rs'],
+    ['[🦀].rs', '🦀.rs'],
+    ['[🦀]*.ts', '🦀parser.rs'],
+  ]) {
+    const scope = prefix + pattern;
+    const expected = ownsPath([scope], prefix + filename) ? dirs : [];
+    assert.deepEqual(candidates([scope], dirs), new Set(expected), pattern);
+  }
+});
+
+test('the native POSIX matcher determines whether a differently cased spelling can escape a Git directory', () => {
+  const dirs = ['native', 'native/fixtures'];
+  const scope = 'native/@(fixtures)/generated/test.rs';
+  const expected = new Set(['native/fixtures']);
+  if (ownsPath([scope], 'native/Fixtures/generated/test.rs')) expected.add('native');
+  assert.deepEqual(candidates([scope], dirs), expected);
+});

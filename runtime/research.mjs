@@ -187,6 +187,7 @@ export async function research(
   const items = [],
     errors = [];
   let requests = 0;
+  /** @type {{ source: string, key: string, html?: boolean, url: () => string, headers: () => Record<string, string> }[]} */
   const jobs = [
     {
       source: 'reddit',

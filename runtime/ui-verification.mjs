@@ -153,7 +153,19 @@ function checkedResult(c, result, config) {
 /** caseRunner is a coordinator/test dependency port. Return schemaVersion:1,
  * status:completed|failed|blocked and independent observations in assertion order.
  * It must never return an LLM's verdict as observed state. Previous receipts are
- * not shortcuts: this function always re-executes configured cases. */
+ * not shortcuts: this function always re-executes configured cases.
+ * @param {{
+ *   cwd?: string,
+ *   headSha?: string,
+ *   config?: Record<string, any>,
+ *   artifacts?: string,
+ *   previous?: Record<string, any> | null,
+ *   secrets?: Record<string, string>,
+ *   signal?: AbortSignal,
+ *   runner?: import('./command.mjs').CommandRunner,
+ *   caseRunner?: (input: Record<string, any>) => Promise<Record<string, any>>,
+ *   toolHome?: string,
+ * }} [options] */
 export async function runUIVerification({
   cwd = process.cwd(),
   headSha,
@@ -296,7 +308,9 @@ export async function runUIVerification({
 }
 
 /** Synchronous for delivery/resume guards. Re-read every private evidence byte;
- * saved booleans and the old receipt alone are not a trust boundary. */
+ * saved booleans and the old receipt alone are not a trust boundary.
+ * @param {Record<string, any>} receipt
+ * @param {{ headSha?: string, config?: Record<string, any> }} [current] */
 export function isCurrentUIReceipt(receipt, { headSha, config } = {}) {
   try {
     config = normalizeUIConfig(config);
@@ -348,7 +362,7 @@ export function isCurrentUIReceipt(receipt, { headSha, config } = {}) {
       if (!info.isFile() || info.size !== e.bytes) return false;
       const bytes = readFileSync(e.path);
       if (hash(bytes) !== e.sha256) return false;
-      const data = JSON.parse(bytes);
+      const data = JSON.parse(bytes.toString('utf8'));
       if (
         data.schemaVersion !== 1 ||
         data.headSha !== headSha ||

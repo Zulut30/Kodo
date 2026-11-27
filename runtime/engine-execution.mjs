@@ -424,7 +424,7 @@ export class EngineExecution extends EnginePlanning {
       // by Git: it passes the same exact check as conflicts before the coordinator commits it.
       const fastPath = run.executionMode?.source === 'fast-path';
       const merged = mergeInProgress
-        ? { code: 1 }
+        ? { code: 1, stdout: '', stderr: '' }
         : await execute(
             'git',
             // The subject stays the one of a branch merge: queues and reports recognise merges by it.
@@ -575,7 +575,7 @@ export class EngineExecution extends EnginePlanning {
     const fastPath = run.executionMode?.source === 'fast-path';
     const merged =
       pending.code === 0
-        ? { code: 1 }
+        ? { code: 1, stdout: '', stderr: '' }
         : await execute(
             'git',
             ['merge', ...(fastPath ? ['--no-ff', '--no-commit'] : []), '--no-edit', `origin/${run.config.baseBranch}`],

@@ -283,48 +283,65 @@ async function bootstrap(ctx) {
 }
 
 const BLUEPRINT_PREFIX = '.kodo/blueprint/';
+const REGISTRATION_HEAD_REQUIRED =
+  'Не удалось подтвердить HEAD, по которому проверен чертёж. Проверьте текущий коммит и повторите apply-spec после завершения параллельных операций Git.';
 
-/** apply-spec registers a wave project whose integration branch and task
- * worktrees start from the committed HEAD of root. Rule (blueprint_git_required):
- * root is the top level of a Git work tree (realpath of `rev-parse
- * --show-toplevel`), HEAD resolves to a commit, and `git status` (untracked
- * files included, ignored excluded) lists nothing outside .kodo/blueprint/.
- * A missing root is left to compile (blueprint_missing). */
-async function gitFindings(root, finding) {
+/** Registration preflight, before opening the Store. The compiled commit must
+ * still be HEAD at the Git root, with no changes outside .kodo/blueprint/.
+ * With an invalid blueprint we also report the usual Git/config findings. */
+async function gitFindings(root, finding, compiled) {
   const { realpath, stat } = await import('node:fs/promises');
   const { execute } = await import('./command.mjs');
+  const { workerEnvironment } = await import('./security.mjs');
+  const required = message => [finding('blueprint_git_required', message)];
   const real = await realpath(path.resolve(root)).catch(() => null);
-  if (!real || !(await stat(real)).isDirectory()) return [];
+  if (!real || !(await stat(real)).isDirectory()) return compiled.ok ? required(REGISTRATION_HEAD_REQUIRED) : [];
+  const env = { ...workerEnvironment(), GIT_NO_LAZY_FETCH: '1' };
   const run = args =>
-    execute('git', args, { cwd: real, allowFailure: true, rawOutput: true, timeoutMs: 30000 }).catch(() => ({
+    execute('git', args, { cwd: real, env, allowFailure: true, rawOutput: true, timeoutMs: 30000 }).catch(() => ({
       code: -1,
       stdout: '',
     }));
   const fold = process.platform === 'win32' ? value => value.toLowerCase() : value => value;
-  const required = message => [finding('blueprint_git_required', message)];
   const top = await run(['rev-parse', '--show-toplevel']);
   const topReal = top.code === 0 ? await realpath(top.stdout.trim()).catch(() => null) : null;
   if (!topReal || fold(topReal) !== fold(real))
     return required('root должен быть корнем Git-репозитория: выполните git init в каталоге проекта');
-  if ((await run(['rev-parse', '--verify', '--quiet', 'HEAD^{commit}'])).code !== 0)
-    return required('В репозитории нет коммита: закоммитьте исходное состояние проекта до apply-spec');
+  const readHead = async () => {
+    const result = await run(['rev-parse', '--verify', '--quiet', 'HEAD^{commit}']);
+    return result.code === 0 ? result.stdout.trim() : null;
+  };
+  // Failed or non-Git compilations may have no SHA. Still collect ordinary Git findings.
+  const commit = compiled.headSha ?? (await readHead());
+  if (!commit) return required('В репозитории нет коммита: закоммитьте исходное состояние проекта до apply-spec');
+  if (compiled.ok && !compiled.headSha) return required(REGISTRATION_HEAD_REQUIRED);
   // The wave verification policy comes from the committed kodo.config.json (runtime/wave-policy.mjs):
   // without it every wave would run the defaults (codex, npm test) whatever the stack. Only a regular
   // file of HEAD counts (mode 100644/100755): a directory, a link or a submodule of that name does not.
-  const tree = await run(['ls-tree', '-z', 'HEAD', '--', 'kodo.config.json']);
+  // Request the blob size so an unavailable config object is detected at registration.
+  const tree = await run(['ls-tree', '-l', '-z', commit, '--', 'kodo.config.json']);
   const config =
-    tree.code === 0 && /^100(?:644|755) blob [0-9a-f]+\tkodo\.config\.json\0?$/.test(tree.stdout)
+    tree.code === 0 && /^100(?:644|755) blob [0-9a-f]+ +\d+\tkodo\.config\.json\0?$/.test(tree.stdout)
       ? []
       : [
           finding(
             'blueprint_config_missing',
-            'В коммите HEAD нет kodo.config.json: создайте его по templates/kodo.config.json пакета bootstrap ' +
-              '(client, commands.test; правила в rules.md) или проверьте существующий и закоммитьте до apply-spec',
+            'В выбранном коммите недоступен обычный файл kodo.config.json. Проверьте объекты Git или создайте файл ' +
+              'по templates/kodo.config.json пакета bootstrap (client, commands.test) и закоммитьте до apply-spec.',
           ),
         ];
-  const status = await run(['status', '--porcelain=v1', '-z', '--untracked-files=all', '--no-renames']);
+  const status = await run([
+    '--no-optional-locks',
+    'status',
+    '--porcelain=v1',
+    '-z',
+    '--untracked-files=all',
+    '--no-renames',
+  ]);
   if (status.code !== 0)
     return [...config, ...required('git status завершился ошибкой: проверьте репозиторий проекта')];
+  if (compiled.headSha && (await readHead()) !== compiled.headSha)
+    return [...config, ...required(REGISTRATION_HEAD_REQUIRED)];
   const dirty = status.stdout
     .split('\0')
     .filter(Boolean)
@@ -343,12 +360,17 @@ async function gitFindings(root, finding) {
 async function applySpec(ctx) {
   const { options, contracts, knownValues, safety } = ctx;
   const { compileBlueprint, bindInterfaceEvidence, finding } = await import('./project-blueprint.mjs');
-  const compiled = await compileBlueprint(options.flags['--root'], {
+  const root = options.flags['--root'];
+  const compiled = await compileBlueprint(root, {
     contracts,
     knownValues,
     specFile: options.flags['--file'],
+    forRegistration: true,
   });
-  const findings = [...compiled.findings, ...(await gitFindings(options.flags['--root'], finding))];
+  const findings = [
+    ...compiled.findings,
+    ...(await gitFindings(compiled.ok ? compiled.spec.root : root, finding, compiled)),
+  ];
   if (findings.length) return findingsReport(findings);
   quotePath(compiled.spec.root); // The root of the next hints, before evidence or the project is written.
   safety(compiled.spec);
@@ -365,15 +387,19 @@ async function applySpec(ctx) {
   );
   if (!bound.ok) return findingsReport(bound.findings);
   safety(bound.spec);
-  const created = await repo.apply({
-    schemaVersion: 1,
-    commandId: options.flags['--command-id'] || randomUUID(),
-    projectId: null,
-    expectedRevision: null,
-    actor: 'project-cli',
-    reason: 'Create Project from compiled blueprint',
-    action: { op: 'create', spec: bound.spec },
-  });
+  const { withVerifiedBlueprintHead } = await import('./project-blueprint-head.mjs');
+  const created = await withVerifiedBlueprintHead(bound.spec.root, compiled.headSha, () =>
+    repo.apply({
+      schemaVersion: 1,
+      commandId: options.flags['--command-id'] || randomUUID(),
+      projectId: null,
+      expectedRevision: null,
+      actor: 'project-cli',
+      reason: 'Create Project from compiled blueprint',
+      action: { op: 'create', spec: bound.spec },
+    }),
+  );
+  if (!created) return findingsReport([finding('blueprint_git_required', REGISTRATION_HEAD_REQUIRED)]);
   const snapshot = await repo.snapshot(created.projectId);
   // Workers' self-check (ci feedback) lints JS/TS with the managed oxlint (TypeScript also needs
   // typescript); without it the feedback is blocked, never feedback_ready. Installing is the

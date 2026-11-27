@@ -22,6 +22,22 @@ function headingTitle(raw) {
 /** ATX and setext headings outside fenced code, with whether each section
  * (until the next heading of the same or higher level) has any content. */
 export function markdownHeadings(text) {
+  return headingSections(text).map(({ level, title, body }) => ({
+    level,
+    title,
+    hasContent: body.some(item => /\S/.test(item)),
+  }));
+}
+/** Body lines of every PROJECT.md section whose heading matches a required
+ * section title (e.g. 'Стек'), in document order. */
+export function sectionLines(markdown, title) {
+  const section = REQUIRED_SECTIONS.find(item => item.title === title);
+  if (!section || typeof markdown !== 'string') return [];
+  return headingSections(markdown)
+    .filter(heading => matchesSection(heading.title, section.aliases))
+    .flatMap(heading => heading.body);
+}
+function headingSections(text) {
   const lines = String(text).replace(/\r\n?/g, '\n').split('\n');
   const headings = [];
   let fence = null;
@@ -58,7 +74,7 @@ export function markdownHeadings(text) {
   return headings.map((heading, position) => {
     const next = headings.slice(position + 1).find(item => item.level <= heading.level);
     const body = lines.slice(heading.line + 1, next ? next.start : lines.length);
-    return { level: heading.level, title: heading.title, hasContent: body.some(item => /\S/.test(item)) };
+    return { level: heading.level, title: heading.title, body };
   });
 }
 function matchesSection(title, aliases) {

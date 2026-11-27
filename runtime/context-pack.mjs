@@ -221,7 +221,10 @@ export function selectWaveVerifiedLessons(lessons, { task, projectId, maxLessons
  * contains at most 3 {runId, headSha, summary} projections from priorLessons:
  * exact passing review/head binding, nonempty successful checks, <=200 Unicode
  * points per summary. Full lesson content remains at analysisPath. The byte
- * budget may omit whole projected lessons with an explicit omitted item count. */
+ * budget may omit whole projected lessons with an explicit omitted item count.
+ * Inputs are untrusted stored records: every field is shape-checked before use.
+ * @param {{ analysis?: Record<string, any>, research?: Record<string, any>, analysisPath?: unknown, researchPath?: unknown }} [evidence]
+ * @param {{ maxBytes?: number }} [options] */
 export function compactPlanEvidence(
   { analysis, research, analysisPath, researchPath } = {},
   { maxBytes = 12000 } = {},
@@ -352,7 +355,19 @@ function planTask(task) {
 /** Checks/commands/exits, head/base and references are never shortened. A
  * manifest or task summary may lose whole entries with an explicit count.
  * Impossible budgets throw context_budget rather than return invalid JSON or
- * disguise missing evidence as a successful receipt. */
+ * disguise missing evidence as a successful receipt.
+ * Inputs are untrusted stored records: every field is shape-checked before use.
+ * @param {{
+ *   plan?: Record<string, any>,
+ *   checks?: Record<string, any>[] | { results?: Record<string, any>[] },
+ *   baseSha?: unknown,
+ *   headSha?: unknown,
+ *   diffStat?: unknown,
+ *   changedPaths?: unknown,
+ *   diff?: unknown,
+ *   evidencePaths?: unknown,
+ * }} [evidence]
+ * @param {{ maxBytes?: number }} [options] */
 export function compactReviewEvidence(
   { plan, checks, baseSha, headSha, diffStat, changedPaths, diff, evidencePaths: paths } = {},
   { maxBytes = 16000 } = {},

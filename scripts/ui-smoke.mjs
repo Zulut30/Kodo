@@ -61,9 +61,10 @@ async function freePort() {
   const server = createServer();
   await new Promise((resolve, reject) => {
     server.once('error', reject);
-    server.listen(0, '127.0.0.1', resolve);
+    server.listen(0, '127.0.0.1', () => resolve(undefined));
   });
-  const port = server.address().port;
+  // A TCP listener's address is always an AddressInfo, never a pipe name.
+  const { port } = /** @type {import('node:net').AddressInfo} */ (server.address());
   await new Promise(resolve => server.close(resolve));
   return port;
 }

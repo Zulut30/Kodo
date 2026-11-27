@@ -23,12 +23,10 @@ const hash = value =>
     .digest('hex');
 const within = (file, root) => file === root || file.startsWith(root + '/');
 function fail(code = 'configuration') {
-  const error = new Error(
+  const message =
     'Invalid architecture ' +
-      (code === 'scope_limit' ? 'scope limit' : code === 'unsafe_path' ? 'path' : 'configuration'),
-  );
-  error.code = code;
-  throw error;
+    (code === 'scope_limit' ? 'scope limit' : code === 'unsafe_path' ? 'path' : 'configuration');
+  throw Object.assign(new Error(message), { code });
 }
 function record(value) {
   if (
@@ -488,33 +486,52 @@ function rustCycleFindings({ crates, adjacency, crossEdges, add }) {
   for (const name of sorted(crates.keys())) if (!indices.has(name)) connect(name);
 }
 
+function rustContractSnapshot(policy, graph) {
+  if (!graph?.crates || policy?.schemaVersion !== 2 || policy.language !== 'rust') return null;
+  const protectedNames = new Set(policy.contractCrates);
+  const roots = new Map();
+  for (const crate of graph.crates) roots.set(crate.root, protectedNames.has(crate.name) ? crate : null);
+  const tracked = new Set(graph.files.map(file => file?.path));
+  const rootPackage = roots.get('');
+  const rootFiles = new Set(rootPackage?.files);
+  function owner(file) {
+    let dir = file;
+    while (dir && !roots.has(dir)) dir = dir.substring(0, dir.lastIndexOf('/'));
+    if (dir) return roots.get(dir);
+    return rootFiles.has(file) ? rootPackage : null;
+  }
+  return { tracked, owner };
+}
+
+export function createRustContractOwnerLookup(pairs) {
+  const snapshots = pairs.map(([policy, graph]) => rustContractSnapshot(policy, graph)).filter(Boolean);
+  return file => {
+    const tracked = snapshots.filter(snapshot => snapshot.tracked.has(file));
+    // A task may touch a file absent from both endpoints. Check both directory
+    // layouts in that case, and only snapshots containing the file otherwise.
+    return (tracked.length ? tracked : snapshots).map(snapshot => snapshot.owner(file)).filter(Boolean);
+  };
+}
+
 function evaluateRustContractChanges({
   normalized,
   basePolicy,
-  crates,
-  baseCrates,
+  graph,
+  baseGraph,
   changedPaths,
   taskPaths,
   taskDiffs,
   add,
 }) {
   if (!changedPaths.length && !taskDiffs.length) return;
-  const protectedInstances = [];
-  const collect = (policyObj, crateMap) => {
-    if (!policyObj || policyObj.schemaVersion !== 2 || !crateMap) return;
-    for (const name of policyObj.contractCrates) {
-      const crate = crateMap.get(name);
-      if (crate) protectedInstances.push(crate);
-    }
-  };
-  collect(normalized, crates);
-  collect(basePolicy, baseCrates);
-  if (!protectedInstances.length) return;
+  if (!normalized.contractCrates.length && !basePolicy?.contractCrates?.length) return;
+  const ownersOf = createRustContractOwnerLookup([
+    [normalized, graph],
+    [basePolicy, baseGraph],
+  ]);
   const checkBatch = (paths, scopes) => {
     for (const changedFile of paths) {
-      for (const crate of protectedInstances) {
-        const insideCrate = crate.root ? within(changedFile, crate.root) : crate.files.includes(changedFile);
-        if (!insideCrate) continue;
+      for (const crate of ownersOf(changedFile)) {
         const authorized = scopes.some(scope => isExplicitContractScope(scope, crate.root, changedFile));
         if (!authorized) {
           const related = changedFile !== crate.manifest ? [crate.manifest] : [];
@@ -637,7 +654,16 @@ function evaluateRustArchitecture(input) {
     }
   }
   rustCycleFindings({ crates, adjacency, crossEdges, add });
-  evaluateRustContractChanges({ normalized, basePolicy, crates, baseCrates, changedPaths, taskPaths, taskDiffs, add });
+  evaluateRustContractChanges({
+    normalized,
+    basePolicy,
+    graph: input.graph,
+    baseGraph: input.baseGraph,
+    changedPaths,
+    taskPaths,
+    taskDiffs,
+    add,
+  });
   return {
     schemaVersion: 1,
     findings: [...findings.values()].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)),

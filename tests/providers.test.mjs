@@ -1207,6 +1207,32 @@ test('doctorProviders live mode skips unconfigured optional keys and unselected 
   assert.equal(checks.find(item => item.provider === 'jev').live, false);
   assert.equal(checks.find(item => item.provider === 'jev').status, 'warning');
 });
+test('live doctor propagates cancellation to the Jev probe before it sends a request', async () => {
+  const controller = new AbortController();
+  const reason = new Error('doctor stopped');
+  let requests = 0;
+  await assert.rejects(
+    doctorProviders(
+      { client: 'codex', live: true, signal: controller.signal, secrets: { TYPESAFE_API_KEY: 'fixture' } },
+      {
+        subscriptionStatusImpl: async () => {
+          controller.abort(reason);
+          throw new Error('fixture client offline');
+        },
+        decideJevImpl: (input, options) =>
+          decideJev(input, {
+            ...options,
+            fetchImpl: async () => {
+              requests++;
+              return new Response(null, { status: 400 });
+            },
+          }),
+      },
+    ),
+    error => error === reason,
+  );
+  assert.equal(requests, 0);
+});
 const claudeLoggedIn = JSON.stringify({ loggedIn: true, authMethod: 'claude.ai' });
 const claudeResult = id =>
   JSON.stringify({ type: 'result', subtype: 'success', structured_output: { ok: true }, session_id: id });
@@ -1717,3 +1743,44 @@ test('Every native providerSchema output lists all properties in required recurs
     error => error.code === 'invalid_output',
   );
 });
+
+test(
+  'A cancelled run aborts the Jev routing request instead of falling back to a model',
+  { timeout: 10000 },
+  async () => {
+    const models = [{ id: 'sol', client: 'codex', model: 'gpt-6.1-sol' }];
+    const controller = new AbortController();
+    let seen;
+    const pending = decideJev(
+      { task: 'Cancelled routing', models, node: { id: 'n1' }, signal: controller.signal },
+      {
+        secrets: { TYPESAFE_API_KEY: 'fixture-key' },
+        fetchImpl: (url, options) =>
+          new Promise((resolve, reject) => {
+            seen = options.signal;
+            options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true });
+          }),
+      },
+    );
+    await new Promise(resolve => setImmediate(resolve));
+    controller.abort(Object.assign(new Error('cancelled'), { code: 'cancelled' }));
+    await assert.rejects(pending, error => error.code === 'cancelled');
+    assert.equal(seen.aborted, true, 'the routing request itself observed the cancellation');
+    // An already-aborted signal must reject even when TYPESAFE_API_KEY is absent.
+    await assert.rejects(
+      decideJev({
+        task: 'Already cancelled',
+        models,
+        node: { id: 'n1' },
+        signal: AbortSignal.abort(Object.assign(new Error('cancelled'), { code: 'cancelled' })),
+      }),
+      error => error.code === 'cancelled',
+    );
+    // Without cancellation a failed request still degrades to the documented fallback.
+    const failed = await decideJev(
+      { task: 'Failed routing', models, node: { id: 'n1' }, signal: new AbortController().signal },
+      { secrets: { TYPESAFE_API_KEY: 'fixture-key' }, fetchImpl: async () => Promise.reject(new Error('offline')) },
+    );
+    assert.equal(failed.fallback, true);
+  },
+);

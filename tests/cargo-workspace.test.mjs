@@ -5,6 +5,70 @@ import { runQuality } from '../runtime/quality-runner.mjs';
 import { QualityProfileRegistry } from '../runtime/quality.mjs';
 import { planFastChecks } from '../runtime/task-fast-checks.mjs';
 import { git } from '../runtime/workspace.mjs';
+import {
+  isBroadContractScope,
+  isExplicitContractScope,
+  resolveCargoWorkspace,
+  scopeMatchesPath,
+} from '../runtime/cargo-workspace.mjs';
+import { rustContractCrateFindings } from '../runtime/project-blueprint.mjs';
+
+test('Cargo normalizes current-directory components in member and exclude paths', () => {
+  for (const [member, exclude, expected] of [
+    ['./native/././codec/', [], ['codec']],
+    ['native//codec', [], ['codec']],
+    ['native/./c*', [], ['codec', 'control']],
+    ['native/*/.', [], ['codec', 'control']],
+    ['native/*', ['native/./codec'], ['control']],
+    ['native/*', ['native//codec'], ['control']],
+    ['native/./codec', ['native/codec'], ['codec']],
+  ]) {
+    const manifests = {
+      'Cargo.toml': { workspace: { members: [member], exclude } },
+      'native/codec/Cargo.toml': { package: { name: 'codec' } },
+      'native/control/Cargo.toml': { package: { name: 'control' } },
+    };
+    const result = resolveCargoWorkspace({ manifests, files: Object.keys(manifests) });
+    assert.deepEqual(result.unsupported, [], String(member));
+    assert.deepEqual(
+      result.members.map(pkg => pkg.name),
+      expected,
+    );
+  }
+});
+
+test('contract scopes recognize Node glob syntax in a package name and preserve literal directories', () => {
+  const packages = new Map([
+    ['native/codec', 'wire-contracts'],
+    ['native/control', 'control'],
+  ]);
+  for (const group of ['{codec,control}', '@(codec|control)', '+(co|dec)', '!(control)', '@(co@(d|x)ec|none)']) {
+    const scope = `native/${group}/src/schema.rs`;
+    assert.equal(scopeMatchesPath(scope, 'native/codec/src/schema.rs'), true, scope);
+    assert.equal(isExplicitContractScope(scope, 'native/codec'), false, scope);
+    assert.equal(isBroadContractScope(scope, 'native/codec'), true, scope);
+    const findings = rustContractCrateFindings(
+      { id: 'sample', epics: [], tasks: [{ id: 'schema', dependsOn: [], writePaths: [scope] }] },
+      '',
+      { schemaVersion: 2, language: 'rust', contractCrates: ['wire-contracts'] },
+      undefined,
+      packages,
+    );
+    assert.deepEqual(
+      findings.map(finding => finding.code),
+      ['contract_scope_too_broad'],
+      scope,
+    );
+  }
+  assert.equal(isBroadContractScope('native/!(codec)/src/schema.rs', 'native/codec'), false);
+  assert.equal(isBroadContractScope('native/codec/src/@(model|wire).rs', 'native/codec'), false);
+  assert.equal(isExplicitContractScope('native/codec(old)/src/schema.rs', 'native/codec(old)'), true);
+  assert.equal(isBroadContractScope('native/{a..c}/src/schema.rs', 'native/b'), true);
+  assert.equal(isBroadContractScope('native/{a..c}/src/schema.rs', 'native/d'), false);
+  assert.equal(isBroadContractScope('{native/engines,libs/cores}/{a..c}/schema.rs', 'native/engines/b'), true);
+  assert.equal(isBroadContractScope('native/{codec}/schema.rs', 'native/codec'), false);
+  assert.equal(isBroadContractScope('@(model|wire).rs', ''), true);
+});
 
 const workspace = {
   'Cargo.toml':

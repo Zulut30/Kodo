@@ -76,13 +76,11 @@ try {
 } catch { exit 1 }
 `;
 function credentialError(code = 'credential_store') {
-  const error = new Error(
+  const message =
     code === 'credential_conflict'
       ? 'Конфликт миграции ключей Kodo: исходный файл сохранён'
-      : 'Не удалось прочитать или защитить пользовательское хранилище ключей Kodo',
-  );
-  error.code = code;
-  return error;
+      : 'Не удалось прочитать или защитить пользовательское хранилище ключей Kodo';
+  return Object.assign(new Error(message), { code });
 }
 function privatePowerShell(script, request) {
   return new Promise((resolve, reject) => {

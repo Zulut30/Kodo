@@ -4,6 +4,7 @@
 
 import * as projectContracts from './project-contracts.mjs';
 import { scopesOverlap } from './contracts.mjs';
+import { scopeIndexPrefix } from './project-blueprint-scope-index.mjs';
 import {
   FACTORY_ROLES,
   FOUNDATION_ID,
@@ -40,39 +41,71 @@ export function taskAncestors(tasks) {
   for (const task of tasks) visit(task.id);
   return memo;
 }
+// Overlap index. Each node is a literal directory (lower-cased) holding every scope at
+// or below it and, bucketed by `prefix`, the scopes whose literal path ends here. A
+// scope ends at its first non-literal component; `prefix` is that component's literal
+// lead (before any glob character), which every name it matches starts with. A scope
+// ending on a literal path, `.`, `..` or an empty component gets '' (matches any name).
+// Candidates are therefore only buckets and children whose names are prefix-related;
+// the canonical scopesOverlap still decides every candidate pair.
+const overlapNode = () => ({ children: new Map(), ends: new Map(), below: [], endKeys: null, childKeys: null });
+function indexScope(root, entry) {
+  let at = root;
+  at.below.push(entry);
+  for (const part of entry.segments) {
+    if (!at.children.has(part)) at.children.set(part, overlapNode());
+    at = at.children.get(part);
+    at.below.push(entry);
+  }
+  if (!at.ends.has(entry.prefix)) at.ends.set(entry.prefix, []);
+  at.ends.get(entry.prefix).push(entry);
+}
+/** The sorted `keys` that start with `prefix`, by binary search. */
+function keysStartingWith(keys, prefix) {
+  let low = 0,
+    high = keys.length;
+  while (low < high) {
+    const middle = (low + high) >> 1;
+    if (keys[middle] < prefix) low = middle + 1;
+    else high = middle;
+  }
+  const found = [];
+  for (let at = low; at < keys.length && keys[at].startsWith(prefix); at++) found.push(keys[at]);
+  return found;
+}
+/** Buckets of `node.ends` whose key is a prefix of `name` (including ''). */
+function* endsLeading(node, name) {
+  for (let length = 0; length <= name.length; length++) {
+    const bucket = node.ends.get(name.slice(0, length));
+    if (bucket) yield bucket;
+  }
+}
+/** Candidate lists for one indexed scope; together a superset of its overlaps. */
+function* overlapCandidates(root, entry) {
+  let at = root;
+  for (const part of entry.segments) {
+    yield* endsLeading(at, part);
+    at = at.children.get(part);
+  }
+  if (!entry.prefix) {
+    yield at.below;
+    return;
+  }
+  yield* endsLeading(at, entry.prefix);
+  at.endKeys ??= [...at.ends.keys()].sort();
+  for (const key of keysStartingWith(at.endKeys, entry.prefix)) if (key !== entry.prefix) yield at.ends.get(key);
+  at.childKeys ??= [...at.children.keys()].sort();
+  for (const name of keysStartingWith(at.childKeys, entry.prefix)) yield at.children.get(name).below;
+}
 /** Pairs of tasks without a dependency path between them whose writePaths overlap.
  * `others` are tasks that may run concurrently with every task in `tasks`. */
 export function parallelOverlaps(tasks, { ancestors = taskAncestors(tasks), others = [] } = {}) {
-  // Each node indexes tasks ending at this literal directory and tasks anywhere below it.
-  // A wildcard inside a component leaves the whole component to the canonical matcher.
-  const node = () => ({ children: new Map(), ends: new Set(), below: new Set() });
-  const root = node();
   const all = [...tasks, ...others];
   const indexed = all.map((task, index) =>
-    task.writePaths.map(scope => {
-      const parts = scope.replace(/^\.\//, '').split('/');
-      const segments = [];
-      if (!parts.includes('..')) {
-        for (const part of parts) {
-          if (!part || part === '.' || /[^a-zA-Z0-9_.-]/.test(part)) break;
-          segments.push(part.toLowerCase());
-        }
-      }
-      return { index, scope, segments };
-    }),
+    task.writePaths.map(scope => ({ index, scope, ...scopeIndexPrefix(scope) })),
   );
-  for (const paths of indexed) {
-    for (const entry of paths) {
-      let at = root;
-      at.below.add(entry);
-      for (const part of entry.segments) {
-        if (!at.children.has(part)) at.children.set(part, node());
-        at = at.children.get(part);
-        at.below.add(entry);
-      }
-      at.ends.add(entry);
-    }
-  }
+  const root = overlapNode();
+  for (const paths of indexed) for (const entry of paths) indexScope(root, entry);
   const pairs = [];
   for (const [i, left] of tasks.entries()) {
     const matches = new Set();
@@ -86,12 +119,7 @@ export function parallelOverlaps(tasks, { ancestors = taskAncestors(tasks), othe
           if (scopesOverlap([entry.scope], [scope])) matches.add(index);
         }
       };
-      let at = root;
-      for (const part of entry.segments) {
-        compareEntries(at.ends);
-        at = at.children.get(part);
-      }
-      compareEntries(at.below);
+      for (const candidates of overlapCandidates(root, entry)) compareEntries(candidates);
     }
     for (const index of [...matches].sort((a, b) => a - b)) pairs.push([left.id, all[index].id]);
   }

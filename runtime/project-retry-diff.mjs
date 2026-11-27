@@ -88,25 +88,36 @@ export async function retryDiff(run, scopes, head, secrets, command = execute) {
     tail = text.slice(split);
   }
 
-  await command(
-    'git',
-    [
-      '--literal-pathspecs',
-      'diff',
-      '--no-color',
-      '--no-renames',
-      '--no-ext-diff',
-      '--no-textconv',
-      '--numstat',
-      '-z',
-      '--patch',
-      run.baseSha,
-      head,
-      '--',
-      ...pathspecs(scopes),
-    ],
-    { cwd: run.project, secrets, consumeStdout },
-  );
+  let result;
+  try {
+    result = await command(
+      'git',
+      [
+        '--literal-pathspecs',
+        'diff',
+        '--no-color',
+        '--no-renames',
+        '--no-ext-diff',
+        '--no-textconv',
+        '--numstat',
+        '-z',
+        '--patch',
+        run.baseSha,
+        head,
+        '--',
+        ...pathspecs(scopes),
+      ],
+      { cwd: run.project, secrets, consumeStdout },
+    );
+  } catch {
+    // A failed capture (bad object, non-zero exit, spawn error) must not abort retry
+    // scheduling: report the attempt as truncated, without a partial patch.
+    return { diff: '', omittedFiles: [], truncated: true, reason: 'git_diff_failed' };
+  }
+  if (!result || result.code !== 0) {
+    // Signal termination resolves with `code: null` in command.mjs; never accept a partial patch.
+    return { diff: '', omittedFiles: [], truncated: true, reason: 'git_diff_failed' };
+  }
   if (files) {
     append(tail);
     while (index < files.length) finish();

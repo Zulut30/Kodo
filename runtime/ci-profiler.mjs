@@ -314,7 +314,8 @@ function cleanOutput(text, secrets) {
 }
 
 /** Executes through Kodo's owned, shell:false port. Infrastructure errors throw
- * with profilePath/stdout/stderr attached; ordinary nonzero exits are returned. */
+ * with profilePath/stdout/stderr attached; ordinary nonzero exits are returned.
+ * @param {{ command?: string, args?: string[], cwd?: string, env?: NodeJS.ProcessEnv, redactions?: Record<string, string>, timeoutMs?: number, evidenceDir?: string, phase?: string, tier?: string, signal?: AbortSignal }} [options] */
 export async function runProfiledCommand({
   command,
   args = [],

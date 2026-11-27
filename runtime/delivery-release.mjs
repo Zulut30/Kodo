@@ -250,6 +250,12 @@ async function verifyReleaseAssets(ctx, info, { tag, artifact, sha256: checksum 
   return { ...info, downloadedArtifact: path.join(downloaded, artifact) };
 }
 
+/**
+ * @param {Record<string, any>} ctx
+ * @param {Record<string, any>} info Release metadata from GitHub.
+ * @param {{ tag: string, expectedSha?: string }} release `expectedSha` defaults to the attested body.
+ * @param {string} directory
+ */
 async function reusableRemotePackage(ctx, info, { tag, expectedSha }, directory) {
   const downloaded = path.join(directory, `recover-${randomUUID()}`);
   await mkdir(downloaded);

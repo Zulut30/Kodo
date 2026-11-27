@@ -1,9 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
-import { execFileSync, spawnSync } from 'node:child_process';
+import childProcess, { execFileSync, spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import {
+import fsPromises, {
   access,
   cp,
   mkdir,
@@ -14,11 +14,15 @@ import {
   rename,
   rm,
   symlink,
+  utimes,
   writeFile,
 } from 'node:fs/promises';
+import { syncBuiltinESMExports } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
+import { gitBoundary } from '../runtime/command.mjs';
 import { Engine } from '../runtime/engine.mjs';
 import { Store } from '../runtime/store.mjs';
 import * as contracts from '../runtime/project-contracts.mjs';
@@ -577,6 +581,393 @@ test('apply-spec reports blueprint findings with exit 1 before opening state', a
   assert.deepEqual(codes(missing.report), ['blueprint_missing']);
 });
 
+function fixtureGit(root, env) {
+  return (...args) => {
+    const guarded = gitBoundary(args, { ...env, LC_ALL: 'C' });
+    return execFileSync('git', guarded.args, {
+      cwd: root,
+      env: guarded.env,
+      windowsHide: true,
+      stdio: 'pipe',
+      encoding: 'utf8',
+      timeout: 10000,
+    }).trim();
+  };
+}
+
+// Both commits are clean and plan a new .rs file in an existing nested package.
+// Only main has its pinned toolchain. The command id is stable across attempts.
+async function registrationFixture(t) {
+  const f = await fixture(t);
+  const root = await f.root();
+  const git = fixtureGit(root, f.env);
+  const specFile = path.join(await writeBlueprint(root), 'spec.json');
+  const spec = JSON.parse(await readFile(specFile, 'utf8'));
+  spec.tasks.find(task => task.id === 'storage-module').writePaths = ['native/engine/src/planned.rs'];
+  await writeFile(specFile, JSON.stringify(spec));
+  await mkdir(path.join(root, 'native', 'engine'), { recursive: true });
+  await writeFile(path.join(root, 'native', 'engine', 'Cargo.toml'), '[package]\nname="engine"\nversion="0.1.0"\n');
+  git('add', '.');
+  git('commit', '-qm', 'Plan a new Rust source');
+  git('branch', 'without-pin');
+  await writeFile(
+    path.join(root, 'rust-toolchain.toml'),
+    '[toolchain]\nchannel="1.85.1"\ncomponents=["clippy","rustfmt"]\n',
+  );
+  git('add', 'rust-toolchain.toml');
+  git('commit', '-qm', 'Pin toolchain');
+  const args = ['apply-spec', '--root', root, '--command-id', randomUUID()];
+  return { root, home: f.home, direct: f.direct, git, apply: extra => f.run(args, extra) };
+}
+
+function duringTreeRead(t, name, switchHead, restore) {
+  const spawn = childProcess.spawn;
+  t.mock.method(childProcess, 'spawn', (command, args, options) => {
+    const reading = command === 'git' && args.includes('ls-tree') && args.at(-1) === name;
+    if (reading) switchHead();
+    const child = spawn(command, args, options);
+    if (reading && restore) child.once('close', restore);
+    return child;
+  });
+  syncBuiltinESMExports();
+  t.after(() => {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+  });
+}
+
+const registrationOutcome = ({ report }) =>
+  JSON.stringify({
+    status: report.result.status,
+    projectId: report.projectId,
+    revision: report.revision,
+    findings: report.result.findings,
+  });
+
+async function metadataFixture(t, kind) {
+  const f = await fixture(t);
+  const root = await f.root();
+  const git = fixtureGit(root, f.env);
+  const dir = await writeBlueprint(root);
+  await writeFile(path.join(root, '.git', 'info', 'exclude'), '/.kodo/blueprint/\n');
+  const draft = path.join(f.dir, 'draft.json');
+  const spec = JSON.parse(await readFile(path.join(dir, 'spec.json'), 'utf8'));
+  const manifest = 'crates/codec/Cargo.toml';
+  const cargo = name => `[package]\nname="${name}"\nversion="0.1.0"\n`;
+  if (kind === 'package.name') {
+    spec.tasks.find(task => task.id === 'storage-module').writePaths = [
+      'crates/codec/src/lib.rs',
+      'crates/*/src/schema.rs',
+    ];
+    await mkdir(path.join(root, 'crates', 'codec'), { recursive: true });
+    await writeFile(path.join(root, manifest), cargo('codec'));
+    await writeFile(
+      path.join(root, 'rust-toolchain.toml'),
+      '[toolchain]\nchannel="1.85.1"\ncomponents=["rustfmt","clippy"]\n',
+    );
+    git('add', manifest, 'rust-toolchain.toml');
+    git('commit', '-qm', 'Existing codec with a pinned toolchain');
+  }
+  await writeFile(draft, JSON.stringify(spec));
+  git('checkout', '-qb', 'strict');
+  const file = kind === 'package.name' ? manifest : 'architecture.policy.json';
+  const strict =
+    kind === 'package.name' ? cargo('api-contracts') : JSON.stringify({ schemaVersion: 2, language: 'rust' });
+  await writeFile(path.join(root, file), strict);
+  git('add', file);
+  git('commit', '-qm', 'Require a different blueprint');
+  return { ...f, root, blueprintDir: dir, file, git, draft, args: ['apply-spec', '--root', root, '--file', draft] };
+}
+
+// The first race changes the checkout immediately before Git selects the commit.
+// A round trip keeps the other checkout active while the compiler reads the draft and
+// metadata, and restores the original before preflight. Both trees stay clean.
+function moveMetadataBranch(t, f, from, to, roundTrip) {
+  const moves = [];
+  const checkout = branch => {
+    f.git('checkout', '-q', branch);
+    moves.push(branch);
+  };
+  if (roundTrip) {
+    const open = fsPromises.open;
+    t.mock.method(fsPromises, 'open', (file, ...args) => {
+      if (!moves.length && file === path.join(f.blueprintDir, 'PROJECT.md')) checkout(to);
+      return open(file, ...args);
+    });
+  }
+  const spawn = childProcess.spawn;
+  t.mock.method(childProcess, 'spawn', (command, args, options) => {
+    if (command === 'git') {
+      const selectsHead = args.includes('rev-parse') && args.at(-1) === 'HEAD^{commit}';
+      const checksConfig = args.includes('ls-tree') && args.at(-1) === 'kodo.config.json';
+      if (!roundTrip && !moves.length && selectsHead) checkout(to);
+      if (roundTrip && moves.length === 1 && (selectsHead || checksConfig)) checkout(from);
+    }
+    return spawn(command, args, options);
+  });
+  syncBuiltinESMExports();
+  t.after(() => {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+  });
+  return moves;
+}
+
+function registeredProjects(home) {
+  const file = path.join(home, 'state.sqlite');
+  if (!existsSync(file)) return 0;
+  const db = new DatabaseSync(file, { readOnly: true });
+  try {
+    return db.prepare("SELECT count(*) AS n FROM kodo_project_records WHERE kind='project'").get().n;
+  } finally {
+    db.close();
+  }
+}
+
+for (const [kind, finding] of [
+  ['policy', 'rust_toolchain_required'],
+  ['package.name', 'contract_scope_too_broad'],
+]) {
+  test(`apply-spec registration metadata uses the selected commit for ${kind}`, async t => {
+    const f = await metadataFixture(t, kind);
+    for (const [from, to, roundTrip] of [
+      ['main'],
+      ['strict'],
+      ['main', 'strict'],
+      ['strict', 'main'],
+      ['strict', 'main', true],
+      ['main', 'strict', true],
+    ]) {
+      const route = [from, to, roundTrip && from].filter(Boolean);
+      await t.test(route.join(' -> '), async sub => {
+        f.git('checkout', '-q', from);
+        const moves = to ? moveMetadataBranch(sub, f, from, to, roundTrip) : [];
+        const home = path.join(f.home, route.join('-'));
+        const { report, exitCode } = await f.run(f.args, { home });
+        const selected = route.at(-1);
+        assert.deepEqual(moves, route.slice(1));
+        assert.equal(f.git('symbolic-ref', '--short', 'HEAD'), selected);
+        assert.equal(f.git('status', '--porcelain'), '');
+        assert.deepEqual(
+          [
+            exitCode,
+            report.result.status,
+            report.result.findings?.map(item => item.code) ?? [],
+            registeredProjects(home),
+          ],
+          selected === 'strict' ? [1, 'invalid', [finding], 0] : [0, 'created', [], 1],
+        );
+        if (selected === 'strict') assert.equal(existsSync(home), false, 'rejected before evidence or the Store');
+      });
+    }
+  });
+
+  test(`apply-spec registration metadata fails closed on an unreadable ${kind} blob`, async t => {
+    const f = await metadataFixture(t, kind);
+    f.git('checkout', '-q', 'main');
+    if (kind === 'policy') {
+      await writeFile(path.join(f.root, f.file), '{"schemaVersion":1}');
+      f.git('add', f.file);
+      f.git('commit', '-qm', 'Readable non-Rust policy');
+    }
+    const entries = kind === 'package.name' ? [f.file, 'crates/codec'] : [f.file];
+    for (const entry of entries) {
+      const oid = f.git('rev-parse', `HEAD:${entry}`);
+      const object = path.join(f.root, '.git', 'objects', oid.slice(0, 2), oid.slice(2));
+      const backup = path.join(f.dir, 'saved-object');
+      await rename(object, backup);
+      try {
+        const { report, exitCode } = await f.run(f.args);
+        assert.equal(exitCode, 1, registrationOutcome({ report }));
+        assert.ok(codes(report).includes('blueprint_cargo_evidence_unavailable'), registrationOutcome({ report }));
+        assert.equal(existsSync(f.home), false);
+      } finally {
+        await rename(backup, object);
+      }
+    }
+  });
+
+  test(`standalone compile reads draft ${kind} and honors explicit options`, async t => {
+    const f = await metadataFixture(t, kind);
+    const content = await readFile(path.join(f.root, f.file));
+    f.git('checkout', '-q', 'main');
+    if (kind === 'package.name') {
+      f.git('rm', '-q', f.file);
+      f.git('commit', '-qm', 'No committed manifest in the planned crate');
+      await mkdir(path.dirname(path.join(f.root, f.file)), { recursive: true });
+    }
+    await writeFile(path.join(f.root, '.git', 'info', 'exclude'), `/.kodo/blueprint/\n/${f.file}\n`);
+    await writeFile(path.join(f.root, f.file), content);
+    assert.equal(f.git('status', '--porcelain'), '');
+    const draft = { specFile: f.draft };
+    assert.deepEqual(
+      (await compileBlueprint(f.root, draft)).findings.map(item => item.code),
+      [finding],
+    );
+    const override = kind === 'policy' ? { architecturePolicy: null } : { packageNames: {} };
+    assert.deepEqual((await compileBlueprint(f.root, { ...draft, ...override })).findings, []);
+    const registered = await f.run(f.args);
+    assert.equal(registered.report.result.status, 'created', registrationOutcome(registered));
+    // A standalone draft may also predate git init. Supply the toolchain explicitly.
+    await rename(path.join(f.root, '.git'), path.join(f.dir, 'fixture-git'));
+    const options = { ...draft, hasRustToolchain: kind === 'package.name' };
+    const plain = await compileBlueprint(f.root, options);
+    assert.equal(plain.headSha, null);
+    assert.deepEqual(
+      plain.findings.map(item => item.code),
+      [finding],
+    );
+  });
+}
+
+test('apply-spec registration metadata reads only selected, bounded UTF-8 package manifests', async t => {
+  const f = await metadataFixture(t, 'package.name');
+  f.git('checkout', '-q', 'main');
+  const maxBytes = 64 * 1024;
+  const header = Buffer.from('\uFEFF[package]\nname="codec"\n#');
+  const atLimit = Buffer.concat([header, Buffer.alloc(maxBytes - header.length, 0x78)]);
+  // An unrelated manifest would exceed the package-name read limit.
+  const unrelated = 'tools/another/Cargo.toml';
+  await mkdir(path.dirname(path.join(f.root, unrelated)), { recursive: true });
+  await writeFile(path.join(f.root, unrelated), Buffer.alloc(maxBytes + 1, 0x78));
+  f.git('add', unrelated);
+  for (const [label, bytes, expected] of [
+    ['at-limit', atLimit, []],
+    ['over-limit', Buffer.concat([atLimit, Buffer.from('x')]), ['blueprint_cargo_evidence_unavailable']],
+    ['invalid-utf8', Buffer.concat([header, Buffer.from([0xff])]), ['blueprint_cargo_evidence_unavailable']],
+  ]) {
+    await writeFile(path.join(f.root, f.file), bytes);
+    f.git('add', f.file);
+    f.git('commit', '-qm', label);
+    const home = path.join(f.home, label);
+    const result = await f.run(f.args, { home });
+    assert.deepEqual(
+      result.report.result.findings?.map(item => item.code) ?? [],
+      expected,
+      registrationOutcome(result),
+    );
+    assert.equal(result.exitCode, expected.length ? 1 : 0);
+    assert.equal(existsSync(home), !expected.length);
+  }
+});
+
+test('apply-spec rejects a clean HEAD switch during the toolchain read before opening state', async t => {
+  const f = await registrationFixture(t);
+  duringTreeRead(t, 'rust-toolchain.toml', () => f.git('checkout', '-q', 'without-pin'));
+  const changed = await f.apply();
+  assert.equal(f.git('symbolic-ref', '--short', 'HEAD'), 'without-pin');
+  assert.equal(f.git('status', '--porcelain'), '');
+  assert.equal(changed.exitCode, 1, registrationOutcome(changed));
+  assert.deepEqual(codes(changed.report), ['blueprint_git_required']);
+  assert.equal(changed.report.projectId, null);
+  assert.equal(existsSync(f.home), false, 'compilation already observed the old commit');
+});
+
+test('apply-spec checks kodo.config.json in the compiled tree even if HEAD returns before registration', async t => {
+  const f = await registrationFixture(t);
+  f.git('checkout', '-qb', 'missing-config');
+  f.git('rm', '-q', '--', 'kodo.config.json');
+  f.git('commit', '-qm', 'Remove wave configuration');
+  let reads = 0;
+  duringTreeRead(
+    t,
+    'kodo.config.json',
+    () => {
+      reads++;
+      f.git('checkout', '-q', 'main');
+    },
+    () => f.git('checkout', '-q', 'missing-config'),
+  );
+  const invalid = await f.apply();
+  assert.equal(reads, 1);
+  assert.equal(f.git('symbolic-ref', '--short', 'HEAD'), 'missing-config');
+  assert.equal(invalid.exitCode, 1, registrationOutcome(invalid));
+  assert.deepEqual(codes(invalid.report), ['blueprint_config_missing']);
+  assert.equal(existsSync(f.home), false);
+});
+
+test('apply-spec rejects a clean HEAD switch after evidence, then retries and replays the same command id', async t => {
+  const f = await registrationFixture(t);
+  const { store } = await f.direct();
+  const projects = () =>
+    store.db.prepare("SELECT count(*) AS n FROM kodo_project_records WHERE kind='project'").get().n;
+  const engine = new Engine({ store, secrets: {} });
+  const batch = engine.withEvidenceBatch.bind(engine);
+  engine.withEvidenceBatch = async (...args) => {
+    const bound = await batch(...args);
+    assert.ok(bound.ok && bound.interfaces.length);
+    f.git('checkout', '-q', 'without-pin');
+    return bound;
+  };
+  const changed = await f.apply({ store, createEngine: () => engine });
+  assert.equal(f.git('symbolic-ref', '--short', 'HEAD'), 'without-pin');
+  assert.equal(f.git('status', '--porcelain'), '');
+  assert.equal(changed.exitCode, 1, registrationOutcome(changed));
+  assert.deepEqual(codes(changed.report), ['blueprint_git_required']);
+  assert.equal(projects(), 0);
+  const missing = await f.apply({ store });
+  assert.equal(missing.exitCode, 1, registrationOutcome(missing));
+  assert.deepEqual(codes(missing.report), ['rust_toolchain_required']);
+  assert.equal(projects(), 0);
+  f.git('checkout', '-q', '--detach', 'main');
+  const valid = await f.apply({ store });
+  assert.equal(valid.exitCode, 0, registrationOutcome(valid));
+  assert.equal(valid.report.result.status, 'created');
+  assert.equal(valid.report.revision, 1);
+  // The command payload is independent of the commit. HEAD can resolve to a
+  // valid newer commit via an annotated tag, as allowed by HEAD^{commit}.
+  f.git('commit', '--allow-empty', '-qm', 'Advance after registration');
+  f.git('tag', '-a', 'release', '-m', 'Annotated release');
+  f.git('symbolic-ref', 'HEAD', 'refs/tags/release');
+  const replay = await f.apply({ store });
+  assert.equal(replay.report.result.status, 'replayed', registrationOutcome(replay));
+  assert.equal(replay.report.projectId, valid.report.projectId);
+  assert.equal(replay.report.revision, 1);
+  assert.equal(projects(), 1);
+});
+
+test('apply-spec holds HEAD and its branch through the SQLite create transaction and releases both', async t => {
+  const f = await registrationFixture(t);
+  const { store } = await f.direct();
+  const pinned = f.git('rev-parse', 'main');
+  const unpinned = f.git('rev-parse', 'without-pin');
+  const attempts = [];
+  store.db.function('try_moving_head', () => {
+    for (const args of [
+      ['update-ref', 'refs/heads/main', unpinned, pinned],
+      ['symbolic-ref', 'HEAD', 'refs/heads/without-pin'],
+    ]) {
+      try {
+        f.git(...args);
+        attempts.push('moved');
+      } catch (error) {
+        attempts.push(String(error.stderr));
+      }
+    }
+    return 1;
+  });
+  store.db.exec(
+    'CREATE TEMP TRIGGER move_head AFTER INSERT ON kodo_project_commands BEGIN SELECT try_moving_head(); END',
+  );
+  const refs = f.git('show-ref', '--head');
+  const log = f.git('reflog', 'show', '--all');
+  const index = path.resolve(f.root, f.git('rev-parse', '--git-path', 'index'));
+  const indexBefore = await readFile(index);
+  // A clean file with stale stat metadata normally makes git status rewrite the index.
+  await utimes(path.join(f.root, 'kodo.config.json'), new Date(0), new Date(0));
+  const created = await f.apply({ store });
+  assert.equal(created.exitCode, 0, registrationOutcome(created));
+  assert.equal(created.report.revision, 1);
+  assert.equal(attempts.length, 2);
+  for (const error of attempts) assert.match(error, /lock/i);
+  assert.equal(f.git('show-ref', '--head'), refs);
+  assert.equal(f.git('reflog', 'show', '--all'), log);
+  assert.ok(indexBefore.equals(await readFile(index)), 'registration preserves the index');
+  f.git('checkout', '-q', 'without-pin');
+  f.git('update-ref', 'refs/heads/main', unpinned, pinned);
+  assert.equal(f.git('status', '--porcelain'), '');
+});
+
 test('append-milestone appends to an accepted wave project and keeps prior history', async t => {
   const f = await fixture(t);
   const { projectId, snapshot: closed, repo } = await acceptedProject(f);
@@ -1025,6 +1416,35 @@ test('apply-spec requires kodo.config.json to be a regular file of HEAD, not a d
   const result = await f.run(['apply-spec', '--root', root]);
   assert.equal(result.exitCode, 1, JSON.stringify(result.report));
   assert.deepEqual(codes(result.report), ['blueprint_config_missing']);
+});
+
+test('apply-spec requires the committed config blob to be available before opening the Store', async t => {
+  const f = await fixture(t);
+  const root = await f.root();
+  await writeBlueprint(root);
+  const oid = fixtureGit(root, f.env)('rev-parse', 'HEAD:kodo.config.json');
+  const blob = path.join(root, '.git', 'objects', oid.slice(0, 2), oid.slice(2));
+  const saved = path.join(f.dir, 'saved-config-blob');
+  const apply = () =>
+    spawnSync(process.execPath, [cli, 'project', 'apply-spec', '--root', root, '--json'], {
+      cwd: root,
+      env: f.env,
+      encoding: 'utf8',
+      windowsHide: true,
+      timeout: 30000,
+    });
+  await rename(blob, saved);
+  try {
+    const refused = apply();
+    assert.equal(refused.status, 1, refused.stdout);
+    assert.deepEqual(codes(JSON.parse(refused.stdout)), ['blueprint_config_missing']);
+    assert.equal(existsSync(f.home), false);
+  } finally {
+    await rename(saved, blob);
+  }
+  const restored = apply();
+  assert.equal(restored.status, 0, restored.stderr);
+  assert.equal(JSON.parse(restored.stdout).result.status, 'created');
 });
 
 test('apply-spec and append-milestone support 400 tasks and bounded planning time', async t => {

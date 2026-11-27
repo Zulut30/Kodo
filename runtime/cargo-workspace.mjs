@@ -2,11 +2,10 @@
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { parse as parseToml } from 'smol-toml';
-import { ownsPath } from './scope-paths.mjs';
+import { braceBeforeExtglob, ownsPath, scopeGlobSyntax } from './scope-paths.mjs';
 
 const compare = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
-const SCOPE_GLOB_META = /[*?[{]/;
 
 export function normalizeScopePath(raw) {
   if (typeof raw !== 'string') return '';
@@ -20,7 +19,7 @@ export function normalizeScopePath(raw) {
 function literalScopePrefix(scope) {
   const literal = [];
   for (const segment of scope.split('/')) {
-    if (SCOPE_GLOB_META.test(segment)) break;
+    if (scopeGlobSyntax.test(segment)) break;
     literal.push(segment);
   }
   return literal.join('/');
@@ -37,54 +36,88 @@ const MAX_SCOPE_BRACE_EXPANSIONS = 64;
  * @returns {string[] | null}
  */
 export function expandScopeBraces(rawScope, maxBranches = MAX_SCOPE_BRACE_EXPANSIONS) {
+  return expandScopeAlternatives(rawScope, maxBranches, false);
+}
+
+/** Enumerate braces and single-choice @(a|b) groups, keeping filenames and
+ * their directories in the same branch. Other glob operators remain patterns. */
+export function expandScopeAlternatives(rawScope, maxBranches = MAX_SCOPE_BRACE_EXPANSIONS, extglobs = true) {
   const scope = normalizeScopePath(rawScope);
   if (!scope) return [];
-  const expandOne = pattern => {
-    let open = -1;
-    for (let i = 0; i < pattern.length; i++) {
-      if (pattern[i] === '}') return null;
-      if (pattern[i] === '{') {
-        open = i;
-        break;
-      }
-    }
-    if (open === -1) return [pattern];
-    let depth = 0;
+  const expansions = new Map();
+  const expandOne = (pattern, offset = 0) => {
+    const mixed = extglobs && braceBeforeExtglob(pattern, offset);
+    if (mixed) return expandParts(pattern, mixed.start, mixed.end, mixed.arms, true);
+    const group = extglobs ? /\[[^\]]*\]|@\(|[{}]/g : /[{}]/g;
+    group.lastIndex = offset;
+    let match;
+    do {
+      match = group.exec(pattern);
+    } while (match?.[0].startsWith('['));
+    if (!match) return [pattern];
+    if (match[0] === '}') return null;
+    const brace = match[0] === '{';
+    const closers = [brace ? '}' : ')'];
     let close = -1;
     const parts = [];
-    let start = open + 1;
-    for (let i = open; i < pattern.length; i++) {
+    let start = group.lastIndex;
+    for (let i = start; i < pattern.length; i++) {
       const ch = pattern[i];
-      if (ch === '{') depth++;
-      else if (ch === '}') {
-        depth--;
-        if (depth === 0) {
+      if (extglobs && ch === '[') {
+        const end = pattern.indexOf(']', i + 1);
+        if (end !== -1) i = end;
+      } else if (ch === '{') closers.push('}');
+      else if (extglobs && ch === '(') closers.push(')');
+      else if (ch === closers.at(-1)) {
+        closers.pop();
+        if (!closers.length) {
           parts.push(pattern.slice(start, i));
           close = i;
           break;
         }
-      } else if (ch === ',' && depth === 1) {
+      } else if (ch === (brace ? ',' : '|') && closers.length === 1) {
         parts.push(pattern.slice(start, i));
         start = i + 1;
       }
     }
     if (close === -1) return null;
-    const prefix = pattern.slice(0, open);
+    // A range and a single braced word have no alternatives to split.
+    // Node distinguishes e.g. {a..c} and the literal filename {codec}.
+    if (!extglobs && brace && parts.length === 1) return expandOne(pattern, close + 1);
+    return expandParts(pattern, match.index, close, parts);
+  };
+  function expandParts(pattern, start, close, parts, distributed = false) {
+    const prefix = pattern.slice(0, start);
     const suffix = pattern.slice(close + 1);
     const out = [];
+    // In @(shared|{a,b}), brace expansion produces the same "shared" arm
+    // twice. Count and expand that alternative once against the branch budget.
+    const seen = distributed ? new Set() : null;
     for (const part of parts) {
-      const nested = expandOne(`${prefix}${part}${suffix}`);
+      const next = prefix + part + suffix;
+      if (!expansions.has(next)) expansions.set(next, expandOne(next));
+      const nested = expansions.get(next);
       if (nested === null) return null;
       for (const item of nested) {
+        if (seen?.has(item)) continue;
+        seen?.add(item);
         out.push(item);
         if (out.length > maxBranches) return null;
       }
     }
     return out;
-  };
+  }
   const expanded = expandOne(scope);
   if (expanded === null) return null;
   return [...new Set(expanded.map(normalizeScopePath).filter(Boolean))];
+}
+
+// Enumerate alternatives written out in a blueprint, even in a long flat list.
+// Products of independent groups still have a bound proportional to the input.
+export function blueprintScopeBranches(scope) {
+  if (!scope.includes('{') && !scope.includes('@(')) return [scope];
+  const alternatives = 1 + (scope.match(/[,|]/g)?.length ?? 0);
+  return expandScopeAlternatives(scope, Math.max(MAX_SCOPE_BRACE_EXPANSIONS, alternatives)) ?? [scope];
 }
 
 export function scopeMatchesPath(rawScope, rawFile) {
@@ -140,7 +173,7 @@ function branchIntersectsSubtree(branch, crateRoot) {
   if (!branch) return false;
   if (branch === '.' || branch === '**') return true;
   if (crateRoot === '') return true;
-  if (!SCOPE_GLOB_META.test(branch)) {
+  if (!scopeGlobSyntax.test(branch)) {
     return branch === crateRoot || crateRoot.startsWith(`${branch}/`) || branch.startsWith(`${crateRoot}/`);
   }
   return segmentsIntersectSubtree(branch.split('/'), crateRoot.split('/'));
@@ -160,6 +193,10 @@ export function isBroadContractScope(rawScope, rawCrateRoot) {
   if (!scope) return false;
   if (scope === '.') return true;
   if (crateRoot === '') return literalScopePrefix(scope) === '';
+  // Node matches ranges and extglobs inside a component. Keep them intact
+  // before trying alternatives such as {apps/api,libs/core} that cross '/'.
+  if (branchIntersectsSubtree(scope, crateRoot)) return true;
+  if (!scope.includes('{')) return false;
   const branches = expandScopeBraces(scope);
   if (branches === null) {
     const literal = literalScopePrefix(scope);
@@ -224,16 +261,14 @@ export function resolveRelativeDir(fromDir, rawPath) {
 
 const hasGlobMeta = pattern => /[*?[]/.test(pattern);
 
-function normalizeWorkspacePath(raw, { allowGlob = false } = {}) {
+export function normalizeWorkspacePath(raw, { allowGlob = false } = {}) {
   if (typeof raw !== 'string') return null;
   const trimmed = raw.trim();
   if (!trimmed || trimmed.length > 1024 || /[\\:\x00-\x1f\x7f]/.test(trimmed) || trimmed.startsWith('/')) return null;
   if (!allowGlob && hasGlobMeta(trimmed)) return null;
-  const cleaned = trimmed.replace(/^(?:\.\/)+/, '').replace(/\/+$/, '');
-  if (!cleaned || cleaned === '.') return '';
-  const parts = cleaned.split('/');
-  if (parts.some(part => !part || part === '.' || part === '..')) return null;
-  return cleaned;
+  const parts = trimmed.split('/');
+  if (parts.includes('..')) return null;
+  return parts.filter(part => part && part !== '.').join('/');
 }
 
 function escapeRegexChar(ch) {
@@ -344,17 +379,22 @@ export function parseWorkspaceDependencies(rawDeps) {
   return map;
 }
 
+// Cargo accepts the historical [project] table before the 2024 edition.
+// If both tables are present the [package] table takes precedence.
+export function cargoPackageTable(doc) {
+  const pkg = doc?.package === undefined ? doc?.project : doc.package;
+  return isPlainObject(pkg) ? pkg : null;
+}
+
 export function resolvePackageEdition(doc, workspacePackage = null) {
-  const raw = doc?.package?.edition;
+  const raw = cargoPackageTable(doc)?.edition;
   if (raw === undefined) return { edition: '2015', error: null };
-  if (typeof raw === 'string' && /^\d{4}$/.test(raw.trim())) return { edition: raw.trim(), error: null };
-  if (isPlainObject(raw) && raw.workspace === true) {
-    const inherited = workspacePackage?.edition;
-    if (typeof inherited === 'string' && /^\d{4}$/.test(inherited.trim()))
-      return { edition: inherited.trim(), error: null };
-    return { edition: null, error: 'unresolved-workspace-edition' };
-  }
-  return { edition: null, error: 'invalid-package-edition' };
+  const inherited = isPlainObject(raw) && raw.workspace === true;
+  const edition = inherited ? workspacePackage?.edition : raw;
+  if (typeof edition !== 'string' || !/^\d{4}$/.test(edition.trim()))
+    return { edition: null, error: inherited ? 'unresolved-workspace-edition' : 'invalid-package-edition' };
+  if (doc.project !== undefined && Number(edition) >= 2024) return { edition: null, error: 'invalid-crate-manifest' };
+  return { edition: edition.trim(), error: null };
 }
 
 export function collectManifestDependencies(doc, { edition = '2015', onUnsupported = null } = {}) {
@@ -416,6 +456,10 @@ function toManifestMap(manifests) {
 
 function parseManifestEntry(raw) {
   if (raw === undefined) return { error: 'missing' };
+  const withPackage = doc => {
+    const pkg = cargoPackageTable(doc);
+    return pkg && doc.package === undefined ? { ...doc, package: pkg } : doc;
+  };
   if (isPlainObject(raw)) {
     let manifestHash;
     try {
@@ -423,12 +467,12 @@ function parseManifestEntry(raw) {
     } catch {
       manifestHash = digest(JSON.stringify(raw));
     }
-    return { doc: raw, hash: manifestHash };
+    return { doc: withPackage(raw), hash: manifestHash };
   }
   const decoded = decodeUtf8(raw);
   if (!decoded) return { error: 'parse-error' };
   try {
-    return { doc: parseToml(decoded.text), hash: digest(decoded.bytes) };
+    return { doc: withPackage(parseToml(decoded.text)), hash: digest(decoded.bytes) };
   } catch {
     return { error: 'parse-error', hash: digest(decoded.bytes) };
   }
@@ -591,20 +635,22 @@ function collectDeclaredMembers({
   return selected;
 }
 
-function resolveDepTargetDir(dep, dir, rootDir, workspaceDependencies) {
+// Inherited paths start at the workspace manifest. The blueprint can admit
+// an explicit sibling member by using the enclosing project as its boundary.
+export function resolveDepTargetDir(dep, dir, rootDir, workspaceDependencies, boundary = rootDir) {
   const spec = dep.spec;
   if (!isPlainObject(spec)) return null;
+  let from = dir;
+  let depPath = spec.path;
   if (spec.workspace === true) {
     const inherited = workspaceDependencies.get(dep.key);
-    if (!inherited?.valid || inherited.path === null) return null;
-    const rel = resolveRelativeDir('', inherited.path);
-    return rel !== null ? joinRel(rootDir, rel) : null;
+    if (!inherited?.valid) return null;
+    from = rootDir;
+    depPath = inherited.path;
   }
-  if (typeof spec.path !== 'string') return null;
-  const relFromRoot = relativeToRoot(rootDir, dir);
-  if (relFromRoot === null) return null;
-  const resolvedRel = resolveRelativeDir(relFromRoot, spec.path);
-  return resolvedRel !== null ? joinRel(rootDir, resolvedRel) : null;
+  const base = relativeToRoot(boundary, from);
+  const resolved = base === null ? null : resolveRelativeDir(base, depPath);
+  return resolved === null ? null : joinRel(boundary, resolved);
 }
 
 function expandPathMembers({

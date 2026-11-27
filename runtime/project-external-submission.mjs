@@ -226,7 +226,9 @@ export async function captureConflictDiff(ctx, runId, legacyScopes) {
     conflict.previousAttempt.headSha,
     ctx.engine.secrets,
   );
-  const previousAttempt = { ...conflict.previousAttempt, ...captured };
+  // The attempt's `reason` is the conflict code; a failed capture keeps its own.
+  const { reason: diffReason, ...diff } = captured;
+  const previousAttempt = { ...conflict.previousAttempt, ...diff, ...(diffReason ? { diffReason } : {}) };
   store.updateRun(runId, { externalConflict: { ...conflict, previousAttempt } });
   return previousAttempt;
 }

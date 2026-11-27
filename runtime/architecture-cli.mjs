@@ -5,7 +5,11 @@ import { createHash } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { lstat, realpath, mkdir, mkdtemp, writeFile, readFile, chmod } from 'node:fs/promises';
 import { readArchitectureGraph } from './architecture-graph.mjs';
-import { validateArchitecturePolicy, evaluateArchitecture } from './architecture-policy.mjs';
+import {
+  createRustContractOwnerLookup,
+  validateArchitecturePolicy,
+  evaluateArchitecture,
+} from './architecture-policy.mjs';
 import { ContractRegistry } from './contract-registry.mjs';
 import { applyArchitectureDebt, evaluateArchitectureProtection } from './architecture-debt.mjs';
 import { inspectCurrentSource } from './ci-graph.mjs';
@@ -338,21 +342,9 @@ async function readTaskDiffs(project, taskScopes, context, parents) {
 }
 
 function touchedRustContractCrate(changedPaths, pairs) {
-  if (!changedPaths.length) return false;
-  const roots = [];
-  for (const [policy, graph] of pairs) {
-    if (!policy || policy.schemaVersion !== 2 || policy.language !== 'rust' || !graph?.crates) continue;
-    const crates = new Map(graph.crates.map(crate => [crate.name, crate]));
-    for (const name of policy.contractCrates) {
-      const crate = crates.get(name);
-      if (crate) roots.push(crate);
-    }
-  }
-  return changedPaths.some(file =>
-    roots.some(crate =>
-      crate.root ? file === crate.root || file.startsWith(crate.root + '/') : crate.files.includes(file),
-    ),
-  );
+  if (!changedPaths.length || !pairs.some(([policy]) => policy?.contractCrates?.length)) return false;
+  const ownersOf = createRustContractOwnerLookup(pairs);
+  return changedPaths.some(file => ownersOf(file).length > 0);
 }
 
 async function evidenceLocation(target, project) {

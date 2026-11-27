@@ -5,7 +5,9 @@
 import * as projectContracts from './project-contracts.mjs';
 import {
   hasCommittedCargoManifest,
-  readBlueprint,
+  projectRoot,
+  readBlueprintAtRoot,
+  readBlueprintCommit,
   readOptionalArchitecturePolicy,
   readOptionalRustToolchain,
   resolveSource,
@@ -26,11 +28,7 @@ import {
   taskScopeSizeFindings,
   waveZeroFindings,
 } from './project-blueprint-lint.mjs';
-import {
-  readOptionalCargoPackageNames,
-  rustContractCrateFindings,
-  rustToolchainFindings,
-} from './project-blueprint-rust.mjs';
+import { readCargoPackagePlan, rustContractCrateFindings, rustToolchainFindings } from './project-blueprint-rust.mjs';
 
 export {
   BLUEPRINT_DIR,
@@ -62,7 +60,7 @@ export {
 } from './project-blueprint-lint.mjs';
 export { rustContractCrateFindings, rustToolchainFindings } from './project-blueprint-rust.mjs';
 
-function analyzeFactorySpec(spec, options = {}) {
+function analyzeFactorySpec(spec, options = {}, cargoPlan = undefined) {
   const {
     contracts = projectContracts,
     knownValues = [],
@@ -105,7 +103,7 @@ function analyzeFactorySpec(spec, options = {}) {
       hasRustToolchain,
       hasCommittedCargoManifest,
     }),
-    ...rustContractCrateFindings(base.spec, projectMarkdown, architecturePolicy, ancestors, packageNames),
+    ...rustContractCrateFindings(base.spec, projectMarkdown, architecturePolicy, ancestors, packageNames, cargoPlan),
     ...containerFindings(base.spec),
     ...epicCycleFindings(base.spec.tasks),
     ...overlapFindings(pairs, base.spec.tasks),
@@ -125,15 +123,19 @@ export function lintFactorySpec(spec, options = {}) {
 }
 /** Read, resolve and lint the blueprint. Returns the compiled ProjectSpec
  * (with execution) even when findings exist; ok is the only acceptance signal.
+ * headSha identifies the commit used for Git evidence, or null if none was read.
+ * Registration also reads the policy and selected package names from that commit.
+ * Standalone compilation reads those optional files from the working directory.
  * `specFile` optionally replaces .kodo/blueprint/spec.json. Nothing is written to disk.
  * @param {string} root
- * @param {{ contracts?: typeof projectContracts, knownValues?: string[], specFile?: string, architecturePolicy?: Record<string, any> | null, packageNames?: Map<string, string> | Record<string, string> | null, hasRustToolchain?: boolean, hasCommittedCargoManifest?: boolean }} [options] */
+ * @param {{ contracts?: typeof projectContracts, knownValues?: string[], specFile?: string, forRegistration?: boolean, architecturePolicy?: Record<string, any> | null, packageNames?: Map<string, string> | Record<string, string> | null, hasRustToolchain?: boolean, hasCommittedCargoManifest?: boolean }} [options] */
 export async function compileBlueprint(
   root,
   {
     contracts = projectContracts,
     knownValues = [],
     specFile,
+    forRegistration = false,
     architecturePolicy,
     packageNames,
     hasRustToolchain,
@@ -141,34 +143,73 @@ export async function compileBlueprint(
   } = {},
 ) {
   let blueprint;
+  let headSha = null;
   try {
-    blueprint = await readBlueprint(root, { specFile });
+    const real = await projectRoot(root);
+    if (forRegistration) headSha = await readBlueprintCommit(real);
+    blueprint = await readBlueprintAtRoot(real, specFile);
   } catch (error) {
     if (typeof error?.code === 'string' && error.code.startsWith('blueprint_'))
-      return { ok: false, spec: null, interfaces: [], findings: [finding(error.code, error.message)] };
+      return { ok: false, headSha, spec: null, interfaces: [], findings: [finding(error.code, error.message)] };
     throw error;
   }
   const source = await resolveSource(blueprint);
-  const policy =
-    architecturePolicy === undefined ? await readOptionalArchitecturePolicy(blueprint.root) : architecturePolicy;
-  const resolvedPackageNames =
-    packageNames === undefined
-      ? await readOptionalCargoPackageNames(blueprint.root, source.value, blueprint.project.text)
-      : packageNames;
-  const resolvedToolchain =
-    hasRustToolchain === undefined ? await readOptionalRustToolchain(blueprint.root) : Boolean(hasRustToolchain);
-  const resolvedCommittedCargo =
-    committedCargo === undefined ? await hasCommittedCargoManifest(blueprint.root) : Boolean(committedCargo);
-  const analysis = analyzeFactorySpec(source.value, {
-    contracts,
-    knownValues,
-    interfaces: blueprint.interfaces,
-    projectMarkdown: blueprint.project.text,
-    architecturePolicy: policy,
-    packageNames: resolvedPackageNames,
-    hasRustToolchain: resolvedToolchain,
-    hasCommittedCargoManifest: resolvedCommittedCargo,
-  });
+  let cargoPlan;
+  let policy = architecturePolicy,
+    resolvedPackageNames = packageNames;
+  try {
+    if (policy === undefined) policy = await readOptionalArchitecturePolicy(blueprint.root, headSha);
+    if (resolvedPackageNames === undefined) {
+      const metadata = await readCargoPackagePlan(
+        blueprint.root,
+        source.value,
+        blueprint.project.text,
+        headSha,
+        policy,
+      );
+      resolvedPackageNames = metadata.names;
+      cargoPlan = metadata.plan;
+    }
+  } catch (error) {
+    if (error?.code !== 'blueprint_cargo_evidence_unavailable') throw error;
+    source.findings.push(finding(error.code, error.message));
+  }
+  let resolvedToolchain = Boolean(hasRustToolchain);
+  let resolvedCommittedCargo = Boolean(committedCargo);
+  if (!resolvedToolchain && (hasRustToolchain === undefined || committedCargo === undefined)) {
+    try {
+      if (!forRegistration) headSha = await readBlueprintCommit(blueprint.root);
+      if (headSha) {
+        if (hasRustToolchain === undefined)
+          resolvedToolchain = await readOptionalRustToolchain(blueprint.root, headSha);
+        if (committedCargo === undefined && !resolvedToolchain)
+          resolvedCommittedCargo = await hasCommittedCargoManifest(
+            blueprint.root,
+            source.value,
+            headSha,
+            forRegistration ? cargoPlan?.tree : undefined,
+          );
+      }
+    } catch (error) {
+      if (error?.code !== 'blueprint_cargo_evidence_unavailable') throw error;
+      if (!source.findings.some(item => item.code === error.code))
+        source.findings.push(finding(error.code, error.message));
+    }
+  }
+  const analysis = analyzeFactorySpec(
+    source.value,
+    {
+      contracts,
+      knownValues,
+      interfaces: blueprint.interfaces,
+      projectMarkdown: blueprint.project.text,
+      architecturePolicy: policy,
+      packageNames: resolvedPackageNames,
+      hasRustToolchain: resolvedToolchain,
+      hasCommittedCargoManifest: resolvedCommittedCargo,
+    },
+    cargoPlan,
+  );
   const findings = [...source.findings, ...analysis.findings];
-  return { ok: findings.length === 0, spec: analysis.spec, interfaces: blueprint.interfaces, findings };
+  return { ok: findings.length === 0, headSha, spec: analysis.spec, interfaces: blueprint.interfaces, findings };
 }
