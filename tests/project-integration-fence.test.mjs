@@ -5,9 +5,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { once } from 'node:events';
 import { mkdtemp, mkdir, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { createInterface } from 'node:readline';
 import { Store } from '../runtime/store.mjs';
 import { lstat } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -433,7 +435,7 @@ db.close();`,
   assert.equal(await exited, 0);
 });
 
-test('A lost lease keeps its code while waiting, and a Git that did not run is a lost publish', async t => {
+test('A lost lease keeps its code while waiting', async t => {
   const f = await fixture(t);
   const lostLease = Object.assign(new Error('Project lease lost'), { code: 'project_lease_lost' });
   const controller = new AbortController();
@@ -447,18 +449,40 @@ test('A lost lease keeps its code while waiting, and a Git that did not run is a
     withIntegrationLease(f.store, f.projectId, async () => assert.fail('never held'), { signal: controller.signal }),
     { code: 'project_lease_lost' },
   );
-  // A Git that timed out is not classified (no second Git call inside the transaction).
+});
+
+test('A Git ref update that cannot start or times out is a lost publish', async t => {
+  const f = await fixture(t);
   const head = f.branchHead();
-  let error;
+  const next = await f.task('publish');
+  const ref = `refs/heads/${f.integration.branch}`;
+  const first = 'refs/heads/aaa-worker';
+  git(f.root, 'update-ref', first, head);
+  const commands = { verify: [{ ref: first, sha: head }], update: [{ ref, next, expected: head }] };
+  const lostPublish = error => {
+    assert.equal(error.code, 'project_lease_lost');
+    assert.equal(error.refused, undefined, 'never classified by a second Git call');
+    return true;
+  };
+  assert.throws(() => updateRefsAtomically(path.join(f.temp, 'missing'), commands), lostPublish);
+
+  // Keep Git waiting for this ref beyond the process deadline on either ref backend.
+  git(f.root, 'config', 'core.filesRefLockTimeout', '5000');
+  git(f.root, 'config', 'reftable.lockTimeout', '5000');
+  const holder = spawn('git', ['update-ref', '--stdin'], { cwd: f.root, windowsHide: true });
+  const closed = once(holder, 'close');
+  const replies = createInterface({ input: holder.stdout, crlfDelay: Infinity })[Symbol.asyncIterator]();
   try {
-    updateRefsAtomically(
-      f.root,
-      { update: [{ ref: `refs/heads/${f.integration.branch}`, next: head, expected: head }] },
-      { timeoutMs: 1 },
-    );
-  } catch (caught) {
-    error = caught;
+    holder.stdin.write(`start\nupdate ${ref} ${next} ${head}\nprepare\n`);
+    assert.equal((await replies.next()).value, 'start: ok');
+    assert.equal((await replies.next()).value, 'prepare: ok');
+    assert.throws(() => updateRefsAtomically(f.root, commands, { timeoutMs: 100 }), lostPublish);
+    assert.equal(f.branchHead(), head);
+  } finally {
+    holder.stdin.end('abort\n');
+    assert.deepEqual(await closed, [0, null]);
   }
-  assert.equal(error?.code, 'project_lease_lost');
-  assert.equal(error?.refused, undefined, 'never classified by a second Git call');
+  assert.equal(f.branchHead(), head);
+  updateRefsAtomically(f.root, commands);
+  assert.equal(f.branchHead(), next, 'Git also released the lock on the earlier verify ref');
 });

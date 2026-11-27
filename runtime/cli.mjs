@@ -49,7 +49,7 @@ export async function runtimeCli(command, args) {
     try {
       const row = db.prepare('SELECT body FROM runs WHERE id=?').get(args[0]);
       if (!row) throw new Error(`Запуск не найден: ${args[0]}`);
-      const report = buildAuditReport(JSON.parse(row.body));
+      const report = buildAuditReport(JSON.parse(String(row.body)));
       console.log(args[1] === '--json' ? JSON.stringify(report) : formatAuditReport(report));
     } finally {
       db.close();

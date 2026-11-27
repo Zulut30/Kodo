@@ -3,6 +3,7 @@
 import path from 'node:path';
 import { lstat, readFile, readdir, realpath } from 'node:fs/promises';
 import { parse as parseToml } from 'smol-toml';
+import { cargoPathAliasProbe } from './cargo-directory-case.mjs';
 import { resolveCargoWorkspaceRoots } from './cargo-workspace.mjs';
 import { inside, noLinks, sha256 } from './toolchains.mjs';
 import {
@@ -357,13 +358,13 @@ function metadataScope(report, scope, affected) {
     return { widened, blocked: unknown };
   return { widened, blocked: [] };
 }
-export function rustWorkspaceRoots(documents, files) {
+export function rustWorkspaceRoots(documents, files, probeAlias = undefined) {
   const manifests = new Map();
   for (const [name, doc] of documents) {
     if (path.posix.basename(name) === 'Cargo.toml') manifests.set(name, doc);
   }
   if (!manifests.size) return new Map();
-  return resolveCargoWorkspaceRoots({ manifests, files });
+  return resolveCargoWorkspaceRoots({ manifests, files, probeAlias });
 }
 
 function inheritedDocument(root, filename, documents) {
@@ -599,7 +600,8 @@ export class QualityProfileRegistry {
       mode === 'quick' && scope ? metadataScope(report, scope, affected) : { widened: new Map(), blocked: [] };
     const checks = [];
     const projectFilePaths = report.files.filter(f => !f.dependency).map(f => f.path);
-    const workspaceRoots = rustWorkspaceRoots(documents, projectFilePaths);
+    const probeAlias = cargoPathAliasProbe(report.project, { materializedOnly: true });
+    const workspaceRoots = rustWorkspaceRoots(documents, projectFilePaths, probeAlias);
     for (const profile of report.profiles)
       for (const capability of selected) {
         const triggers = metadata.widened.get(profile.id);

@@ -302,7 +302,7 @@ async function accountLease(account, client, owner, action, signal, heartbeatMs 
     await new Promise((resolve, reject) => {
       const done = () => {
         signal?.removeEventListener('abort', abort);
-        resolve();
+        resolve(undefined);
       };
       const timer = setTimeout(done, 250),
         abort = () => {

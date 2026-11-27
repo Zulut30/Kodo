@@ -526,6 +526,18 @@ async function runScanner({ tool, config, source, target, scratch, cwd, headSha,
   return { ...current, status: findings.length ? 'failed' : 'passed', findings, historyCommits: count };
 }
 
+/**
+ * @param {{
+ *   cwd?: string,
+ *   headSha?: string,
+ *   config?: Record<string, any>,
+ *   artifacts?: string,
+ *   previous?: Record<string, any> | null,
+ *   secrets?: Record<string, string>,
+ *   signal?: AbortSignal,
+ *   runner?: import('./command.mjs').CommandRunner,
+ *   toolHome?: string,
+ * }} [options] */
 export async function runSecurityChecks({
   cwd = process.cwd(),
   headSha,
@@ -678,6 +690,9 @@ export async function runSecurityChecks({
   return receipt;
 }
 
+/**
+ * @param {Record<string, any>} receipt
+ * @param {{ headSha?: string, config?: Record<string, any> }} [current] */
 export function isCurrentSecurityReceipt(receipt, { headSha, config } = {}) {
   try {
     config = normalizeSecurityConfig(config);
@@ -793,5 +808,5 @@ function readEvidence(e, root) {
   if (!info.isFile() || info.size !== e.bytes) throw fail('invalid_artifacts');
   const bytes = readFileSync(e.path);
   if (hash(bytes) !== e.sha256) throw fail('invalid_artifacts');
-  return JSON.parse(bytes);
+  return JSON.parse(bytes.toString('utf8'));
 }

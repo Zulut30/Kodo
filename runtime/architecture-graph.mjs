@@ -3,6 +3,7 @@ import { realpath } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { isBuiltin } from 'node:module';
+import { cargoPathAliasProbe } from './cargo-directory-case.mjs';
 import { gitBoundary } from './command.mjs';
 import { workerEnvironment } from './security.mjs';
 import { noLinks } from './toolchains.mjs';
@@ -243,7 +244,14 @@ export async function readArchitectureGraph({ project, headSha, policy }) {
       entries.filter(entry => regular(entry) && isCargoMeta(entry.path)),
     );
     const { buildRustArchitectureGraph } = await import('./architecture-rust.mjs');
-    return buildRustArchitectureGraph({ headSha, policy, files, contents, treeUnsupported });
+    return buildRustArchitectureGraph({
+      headSha,
+      policy,
+      files,
+      contents,
+      treeUnsupported,
+      probeAlias: cargoPathAliasProbe(project),
+    });
   }
   if (
     policy.schemaVersion !== 1 ||

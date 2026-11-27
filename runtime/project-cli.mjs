@@ -68,10 +68,12 @@ function argumentsFor(argv) {
     }
   }
   validateFlags(action, flags, positional);
-  for (const [flag, required, min, max] of [
+  /** @type {[flag: string, required: boolean, min: number, max: number][]} */
+  const bounds = [
     ['--limit', false, 1, 24],
     ['--priority', action === 'reprioritize', 0, 100],
-  ]) {
+  ];
+  for (const [flag, required, min, max] of bounds) {
     const value = flags[flag];
     if (
       (required && value === undefined) ||

@@ -1,5 +1,6 @@
 import { parse } from 'smol-toml';
 import { cargoMembers } from './cargo-graph.mjs';
+import { cargoPathAliasProbe } from './cargo-directory-case.mjs';
 import path from 'node:path';
 import os from 'node:os';
 import { mkdtemp, mkdir, rm, writeFile, readFile, lstat, realpath } from 'node:fs/promises';
@@ -111,16 +112,17 @@ async function memberChanged(cwd, rev, file, changed) {
     }
   }
   if (!docs.has(rootManifest)) return false;
+  const options = { probeAlias: cargoPathAliasProbe(cwd) };
   // An ordinary member crate cannot grant implicit ownership of a second lock inside its directory.
   if (root !== '.' && !docs.get(rootManifest).workspace) {
     let parent = path.posix.dirname(root);
     while (true) {
-      if (cargoMembers(docs, parent).has(root)) return false;
+      if (cargoMembers(docs, parent, options).has(root)) return false;
       if (parent === '.') break;
       parent = path.posix.dirname(parent);
     }
   }
-  const members = cargoMembers(docs, root);
+  const members = cargoMembers(docs, root, options);
   return changed.some(
     name =>
       (name === rootManifest && (docs.get(name).workspace || docs.get(name).package)) ||

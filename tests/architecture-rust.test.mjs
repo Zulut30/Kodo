@@ -182,6 +182,92 @@ async function rustFixture(t, { files = {}, policy = rustPolicy() } = {}) {
   return { scratch, project, artifacts, git, put, commit, mergeTask, baseSha, policy };
 }
 
+test('the contract change gate uses the closest workspace member for a nested package', async t => {
+  const parent = 'crates/game-contracts';
+  const nested = parent + '/plugins/importer';
+  const workspace = defaultWorkspaceFiles()['Cargo.toml'];
+  const policy = rustPolicy();
+  policy.layers.find(layer => layer.id === 'app').crates.push('importer');
+  const fx = await rustFixture(t, {
+    files: {
+      'Cargo.toml': workspace.replace('["crates/*"]', '["crates/*", "' + parent + '/plugins/*"]'),
+      [nested + '/Cargo.toml']: '[package]\nname="importer"\nversion="0.1.0"\n',
+      [nested + '/src/lib.rs']: 'pub struct Import;\n',
+    },
+    policy,
+  });
+  const innerFile = nested + '/schemas/v2.proto';
+  const outerFile = parent + '/schemas/v2.proto';
+  await fx.put(innerFile, 'syntax = "proto3";\n');
+  const onlyImporter = {
+    cwd: fx.project,
+    baseSha: fx.baseSha,
+    headSha: fx.commit('Only the nested importer schema changes'),
+    config: { enabled: true },
+    artifacts: fx.artifacts,
+    taskPaths: ['crates/game-*/plugins/**'],
+  };
+  const receipt = await runArchitectureChecks(onlyImporter);
+  assert.equal(receipt.status, 'passed');
+  for (const result of [receipt, receipt.report]) {
+    assert.equal(result.requiresReview, false);
+    assert.equal(result.fullVerificationRequired, false);
+  }
+  assert.ok(await isCurrentArchitectureReceipt(receipt, onlyImporter));
+  const added = parent + '/plugins/exporter';
+  policy.layers.find(layer => layer.id === 'app').crates.push('exporter');
+  await fx.put('architecture.policy.json', policy);
+  await fx.put(added + '/Cargo.toml', '[package]\nname="exporter"\nversion="0.1.0"\n');
+  await fx.put(added + '/src/lib.rs', 'pub struct Export;\n');
+  await fx.put(outerFile, 'syntax = "proto3";\n');
+  const headSha = fx.commit('Change one schema in each package');
+  const result = await checkArchitecture({
+    project: fx.project,
+    baseSha: fx.baseSha,
+    headSha,
+    taskPaths: ['crates/game-*/plugins/**', 'crates/game-*/schemas/v2.proto', 'architecture.policy.json'],
+  });
+  assert.deepEqual(
+    result.findings.filter(f => f.ruleId === 'contract_change_not_allowed').map(f => f.file),
+    [outerFile],
+  );
+  assert.equal(result.requiresReview, true);
+  assert.equal(result.fullVerificationRequired, true);
+});
+
+test('the Cargo resolver accepts legacy project packages in their supported editions', async () => {
+  const { resolveCargoWorkspace } = await import('../runtime/cargo-workspace.mjs');
+  const check = (member, inherited = '2021') =>
+    resolveCargoWorkspace({
+      manifests: {
+        'Cargo.toml': '[workspace]\nmembers=["wire"]\n[workspace.package]\nedition="' + inherited + '"\n',
+        'wire/Cargo.toml': member,
+      },
+      files: ['Cargo.toml', 'wire/Cargo.toml', 'wire/src/lib.rs'],
+    });
+  const legacy = '[project]\nname="wire-contracts"\nversion="0.1.0"\n';
+  const explicit = '[package]\nname="current"\nversion="0.2.0"\n';
+  for (const [member, expected] of [
+    [legacy, 'wire-contracts'],
+    [legacy + 'edition.workspace=true\n', 'wire-contracts'],
+    [legacy + explicit, 'current'],
+  ]) {
+    const result = check(member);
+    assert.deepEqual(result.unsupported, []);
+    assert.equal(result.members[0].name, expected);
+  }
+  for (const member of [
+    legacy + 'edition="2024"\n',
+    legacy + 'edition.workspace=true\n',
+    legacy + explicit + 'edition="2024"\n',
+  ]) {
+    assert.deepEqual(
+      check(member, '2024').unsupported.map(row => [row.file, row.reason]),
+      [['wire/Cargo.toml', 'invalid-crate-manifest']],
+    );
+  }
+});
+
 test('parseCargoWorkspace resolves glob members, path deps, workspace deps, dev/build deps and CRLF without cargo', () => {
   const raw = defaultWorkspaceFiles();
   raw['Cargo.toml'] = raw['Cargo.toml'].replaceAll('\n', '\r\n');

@@ -237,6 +237,7 @@ const coverageOptions = {
   coverageExcludeGlobs: ['**/fixtures/**'],
 };
 
+/** @param {{ cwd?: string, paths?: string[], concurrency?: number, testNamePatterns?: string[], coverage?: boolean, signal?: AbortSignal }} [options] */
 export async function runTests({
   cwd = process.cwd(),
   paths = [],
@@ -273,13 +274,15 @@ export async function runTests({
       process.exitCode = 1;
       if (reportedFailures++ >= 16) return;
       const name = typeof data?.name === 'string' ? data.name : 'unnamed test';
+      // node:test reports ERR_TEST_FAILURE errors carrying their failureType.
+      const failure = /** @type {(Error & { failureType?: string }) | undefined} */ (data?.details?.error);
       // Keep the complete TAP stream. A short stderr summary survives the CI
       // wrapper's bounded tails when an early failure precedes many passing tests.
       console.error(
         JSON.stringify({
           kind: 'kodo-test-failure',
           name: (path.isAbsolute(name) ? path.basename(name) : name).slice(0, 240),
-          failureType: String(data?.details?.error?.failureType || 'unknown').slice(0, 80),
+          failureType: String(failure?.failureType || 'unknown').slice(0, 80),
           // The first line of the cause (an assertion's own message) tells a CI reader what failed.
           message: String(data?.details?.error?.cause?.message ?? data?.details?.error?.message ?? '')
             .replace(/\s+/g, ' ')

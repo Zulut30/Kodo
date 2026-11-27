@@ -1,10 +1,489 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import path from 'node:path';
 import { fixture, toolRunner, put } from './fixtures/quality/helpers.mjs';
 import { runQuality } from '../runtime/quality-runner.mjs';
 import { QualityProfileRegistry } from '../runtime/quality.mjs';
 import { planFastChecks } from '../runtime/task-fast-checks.mjs';
 import { git } from '../runtime/workspace.mjs';
+import { CargoDirectoryNames, cargoMemberMatcher } from '../runtime/cargo-member-paths.mjs';
+import {
+  compileCargoGlob,
+  isBroadContractScope,
+  isExplicitContractScope,
+  resolveCargoWorkspace,
+  scopeMatchesPath,
+} from '../runtime/cargo-workspace.mjs';
+import { rustContractCrateFindings } from '../runtime/project-blueprint.mjs';
+
+test('Cargo normalizes current-directory components in member and exclude paths', () => {
+  for (const [member, exclude, expected] of [
+    ['./native/././codec/', [], ['codec']],
+    ['native//codec', [], ['codec']],
+    ['native/./c*', [], ['codec', 'control']],
+    ['native/*/.', [], ['codec', 'control']],
+    ['native/*', ['native/./codec'], ['control']],
+    ['native/*', ['native//codec'], ['control']],
+    ['native/./codec', ['native/codec'], ['codec']],
+  ]) {
+    const manifests = {
+      'Cargo.toml': { workspace: { members: [member], exclude } },
+      'native/codec/Cargo.toml': { package: { name: 'codec' } },
+      'native/control/Cargo.toml': { package: { name: 'control' } },
+    };
+    const result = resolveCargoWorkspace({ manifests, files: Object.keys(manifests) });
+    assert.deepEqual(result.unsupported, [], String(member));
+    assert.deepEqual(
+      result.members.map(pkg => pkg.name),
+      expected,
+    );
+  }
+});
+
+test('Cargo resolves native member spellings and compares exclusions using the selected spelling', () => {
+  const windows = path.sep === '\\';
+  for (const [members, exclude, present, supported] of [
+    [['native\\codec'], [], windows, windows],
+    [['native\\co*'], [], windows, windows],
+    [['Native/Codec'], [], windows, windows],
+    [['Native/co*'], [], windows, windows],
+    [['*/Codec'], [], windows, windows],
+    [['native/Co*'], [], false, false],
+    [['native/*'], ['native\\codec'], !windows, windows],
+    [['native/*'], ['native/Codec'], true, true],
+    [['Native/Codec'], ['native/codec'], windows, windows],
+    [['native/*', 'native/Codec'], ['native/codec'], windows, windows],
+  ]) {
+    const result = resolveCargoWorkspace({
+      manifests: {
+        'Cargo.toml': { workspace: { members, exclude } },
+        'native/codec/Cargo.toml': { package: { name: 'wire-contracts' } },
+      },
+    });
+    assert.deepEqual(
+      result.members.map(pkg => pkg.root),
+      present ? ['native/codec'] : [],
+      String(members),
+    );
+    assert.equal(result.unsupported.length === 0, supported, JSON.stringify({ members, exclude }));
+  }
+});
+
+test('a recursive Cargo member glob compares the next component with the enumerated directory entry', () => {
+  const lower = 'extras/a/exporter';
+  const upper = 'extras/b/Exporter';
+  const both = [lower, upper];
+  const windows = path.sep === '\\';
+  for (const [member, exclude, expected] of [
+    ['extras/**/Exporter', [], [upper]],
+    ['extras/**/Exporter', [lower], [upper]],
+    ['extras/**/**/Exporter', [], [upper]],
+    ['**/Exporter', [], [upper]],
+    ['**/**/Exporter', [], [upper]],
+    ['extras/**/[Ee]xporter', [], both],
+    ['extras/*/Exporter', [], windows ? both : [upper]],
+    ['extras/**/a/Exporter', [], windows ? [lower] : []],
+    ['EXTRAS/**/Exporter', [], windows ? [upper] : []],
+  ]) {
+    const ws = resolveCargoWorkspace({
+      manifests: {
+        'Cargo.toml': { workspace: { members: [member], exclude } },
+        [lower + '/Cargo.toml']: { package: { name: 'exporter' } },
+        [upper + '/Cargo.toml']: { package: { name: 'monitor' } },
+      },
+    });
+    assert.deepEqual(ws.members.map(pkg => pkg.root).sort(), expected, member);
+    assert.deepEqual(
+      ws.unsupported.map(item => item.reason),
+      expected.length ? [] : ['member-glob-no-match'],
+      member,
+    );
+  }
+});
+
+test('Cargo member globs count Unicode scalars in wildcards and character classes', () => {
+  const parts = ['a', 'ab', 'é', 'e\u0301', '📦', '📮', '📦x', '𠮷'];
+  const packages = Object.fromEntries(
+    parts.map((part, i) => [`extras/${part}/Cargo.toml`, { package: { name: 'pkg' + i } }]),
+  );
+  for (const [pattern, matches] of [
+    ['?', ['a', 'é', '📦', '📮', '𠮷']],
+    ['??', ['ab', 'e\u0301', '📦x']],
+    ['[📦-📮]', ['📦', '📮']],
+    ['[!📦]', ['a', 'é', '📮', '𠮷']],
+    ['?x', ['📦x']],
+  ]) {
+    const ws = resolveCargoWorkspace({
+      manifests: { 'Cargo.toml': { workspace: { members: ['extras/' + pattern] } }, ...packages },
+    });
+    assert.deepEqual(ws.unsupported, [], pattern);
+    assert.deepEqual(ws.members.map(pkg => pkg.root).sort(), matches.map(part => 'extras/' + part).sort(), pattern);
+  }
+});
+
+test('Cargo member character classes match inside one path component', () => {
+  const entries = ['axpkg', '𠮷.pkg', '𠮷0pkg', '𠮷zpkg', '𠮷/pkg'];
+  const dir = entry => 'sensors/' + entry + '/Bridge';
+  const packages = Object.fromEntries(
+    entries.map((entry, i) => [dir(entry) + '/Cargo.toml', { package: { name: 'bridge-' + i } }]),
+  );
+  for (const [component, selected] of [
+    ['?[!z]pkg', ['axpkg', '𠮷.pkg', '𠮷0pkg']],
+    ['?[.-0]pkg', ['𠮷.pkg', '𠮷0pkg']],
+    ['?/pkg', ['𠮷/pkg']],
+  ]) {
+    const pattern = dir(component);
+    const glob = compileCargoGlob(pattern);
+    assert.deepEqual(
+      entries.filter(entry => glob.test(dir(entry))),
+      selected,
+      pattern,
+    );
+    const ws = resolveCargoWorkspace({
+      manifests: { 'Cargo.toml': { workspace: { members: [pattern] } }, ...packages },
+    });
+    assert.deepEqual(ws.unsupported, [], pattern);
+    assert.deepEqual(ws.members.map(pkg => pkg.root).sort(), selected.map(dir).sort(), pattern);
+  }
+});
+
+test('recursive Cargo member walks apply exclusions to each spelling of a package', () => {
+  const pattern = 'extras/**/plugins/Exporter/**/Unit';
+  const dir = 'extras/plugins/Exporter/vendor/plugins/exporter/Unit';
+  const alias = dir.replace('vendor/plugins/exporter', 'vendor/plugins/Exporter');
+  const windows = path.sep === '\\';
+  for (const [exclude, expected] of [
+    [[dir], windows ? [dir] : []],
+    [[alias], [dir]],
+    [[dir, alias], []],
+  ]) {
+    const ws = resolveCargoWorkspace({
+      manifests: {
+        'Cargo.toml': { workspace: { members: [pattern], exclude } },
+        [dir + '/Cargo.toml']: { package: { name: 'exporter' } },
+      },
+    });
+    assert.deepEqual(ws.unsupported, [], JSON.stringify(exclude));
+    assert.deepEqual(
+      ws.members.map(pkg => pkg.root),
+      expected,
+      JSON.stringify(exclude),
+    );
+  }
+  const duplicate = resolveCargoWorkspace({
+    manifests: {
+      'Cargo.toml': { workspace: { members: [pattern] } },
+      [dir + '/Cargo.toml']: { package: { name: 'exporter' } },
+    },
+  });
+  assert.deepEqual(
+    duplicate.unsupported.map(row => row.reason),
+    windows ? ['duplicate-crate-name'] : [],
+  );
+});
+
+test('a trailing Cargo globstar enumerates descendants of each matched directory', () => {
+  const hub = 'vault/node/Hub';
+  const leaf = hub + '/branch/node/hub';
+  const roots = [hub, hub + '/branch', hub + '/branch/node', leaf];
+  const names = new CargoDirectoryNames(roots);
+  for (const pattern of [hub + '/**', hub + '/**/**', 'vault/**/node/Hub/**']) {
+    const match = cargoMemberMatcher(pattern, names);
+    assert.deepEqual([...match.spellings(hub)], [], pattern);
+    assert.deepEqual([...match.spellings(leaf)], [leaf], pattern);
+  }
+  const current = cargoMemberMatcher('vault/**/node/Hub', names);
+  assert.equal(current(hub), hub);
+  const packages = roots.map((dir, i) => [dir + '/Cargo.toml', { package: { name: 'crate-' + i } }]);
+  for (const exclude of [[], [leaf]]) {
+    const result = resolveCargoWorkspace({
+      manifests: {
+        'Cargo.toml': { workspace: { members: ['vault/[n]ode/Hub', 'vault/**/node/Hub/**'], exclude } },
+        ...Object.fromEntries(packages),
+      },
+    });
+    assert.deepEqual(result.unsupported, []);
+    assert.deepEqual(
+      result.members.map(member => member.root).sort(),
+      roots.filter(dir => !exclude.includes(dir)).sort(),
+    );
+  }
+});
+
+test('a terminal Cargo globstar needs a directory entry even when ordinary files exist', () => {
+  const dir = 'vault/leaf';
+  const resolve = member =>
+    resolveCargoWorkspace({
+      manifests: {
+        'Cargo.toml': { workspace: { members: [member] } },
+        [dir + '/Cargo.toml']: { package: { name: 'leaf' }, lib: { path: 'unit.rs' } },
+      },
+      files: ['Cargo.toml', dir + '/Cargo.toml', dir + '/unit.rs'],
+    });
+  const recursive = resolve(dir + '/**');
+  assert.deepEqual(recursive.members, []);
+  assert.deepEqual(
+    recursive.unsupported.map(row => row.reason),
+    ['member-glob-no-match'],
+  );
+  const ordinary = resolve(dir + '/*');
+  assert.deepEqual(ordinary.members, []);
+  assert.deepEqual(ordinary.unsupported, []);
+});
+
+test('Cargo expands dot entries only at a directory that the member pattern actually reached', () => {
+  const packages = {
+    'vault/slots': 'slots',
+    'vault/slots/.plugin': 'bridge',
+    'vault/slots/.plugin/driver': 'driver',
+    'vault/reader': 'reader',
+  };
+  const resolve = pattern =>
+    resolveCargoWorkspace({
+      manifests: {
+        'Cargo.toml': { workspace: { members: [pattern] } },
+        ...Object.fromEntries(
+          Object.entries(packages).map(([dir, name]) => [dir + '/Cargo.toml', { package: { name } }]),
+        ),
+      },
+    });
+  for (const [pattern, members] of [
+    ['vault/slots/.*/**', ['bridge', 'driver', 'reader', 'slots']],
+    ['vault/slots/[.]*/**', ['driver']],
+    ['vault/slots/.p*/**', ['driver']],
+    ['vault/**/.*/driver', ['driver']],
+    ['vault/*/./.plugin', ['bridge']],
+  ]) {
+    const result = resolve(pattern);
+    assert.deepEqual(result.members.map(pkg => pkg.name).sort(), members, pattern);
+    assert.deepEqual(result.unsupported, [], pattern);
+  }
+  const invalid = resolve('vault/**/./.plugin/driver');
+  assert.deepEqual(invalid.members, []);
+  assert.deepEqual(
+    invalid.unsupported.map(row => row.reason),
+    ['member-glob-no-match'],
+  );
+});
+
+test('Cargo parent matches need a directory witness and normalize before exclusion', () => {
+  const packages = { 'vault/yes/Bridge': 'included', 'vault/no/Bridge': 'file', 'vault/absent/Bridge': 'absent' };
+  const manifests = Object.fromEntries(
+    Object.entries(packages).map(([dir, name]) => [dir + '/Cargo.toml', { package: { name } }]),
+  );
+  for (const exclude of [[], ['vault/yes/Bridge']]) {
+    const result = resolveCargoWorkspace({
+      manifests: { 'Cargo.toml': { workspace: { members: ['vault/*/slots/.[.]/Bridge'], exclude } }, ...manifests },
+      files: [...Object.keys(manifests), 'vault/yes/slots/marker', 'vault/no/slots'],
+    });
+    assert.deepEqual(
+      result.members.map(pkg => pkg.name),
+      exclude.length ? [] : ['included'],
+    );
+    assert.deepEqual(result.unsupported, []);
+  }
+});
+
+test('a descending Cargo character range contributes no characters to its class', () => {
+  for (const [pattern, accepted, rejected] of [
+    ['?[z-a0]pkg', ['𠮷0pkg'], ['𠮷zpkg', '𠮷apkg']],
+    ['[z-a0]]', ['0]'], ['z]', '0']],
+    ['[z-a0**]', ['0', '*'], ['z', 'a', '/']],
+    ['[[]-]', ['[-]'], ['[-', '-]']],
+    ['?[!z-a0]pkg', ['𠮷apkg', '𠮷zpkg'], ['𠮷0pkg', 'a/pkg']],
+    ['[🦀-🐈]x', [], ['🦀x', '🐈x']],
+    ['[!🦀-🐈]x', ['🦀x', '🐈x'], ['/x']],
+  ]) {
+    const re = compileCargoGlob(pattern);
+    assert.ok(re, pattern);
+    for (const input of accepted) assert.equal(re.test(input), true, input);
+    for (const input of rejected) assert.equal(re.test(input), false, input);
+  }
+});
+
+test('Cargo dot patterns memoize a planned path without adding its directories to the snapshot', t => {
+  const steps = 10;
+  const future = 'vault/' + Array(5).fill('.slot').join('/') + '/.pkg';
+  const names = new CargoDirectoryNames(['vault']);
+  const calls = t.mock.method(names, 'childDirs');
+  const match = cargoMemberMatcher('vault/' + Array(steps).fill('.*').join('/') + '/**', names);
+  assert.equal(match(future), future);
+  // Each pattern position can ask for children at most once per ancestor.
+  assert.ok(calls.mock.callCount() <= steps * (future.split('/').length + 1));
+  assert.equal(names.paths.has(future), false);
+
+  const reached = cargoMemberMatcher('vault/slots/.?/Bridge', names);
+  assert.equal(reached('vault/Bridge'), null);
+  names.add('vault/slots');
+  assert.equal(reached('vault/Bridge'), 'vault/Bridge');
+});
+
+test('a single Cargo member lookup prefers the exact spelling across recursive walks', () => {
+  const dir = 'extras/plugins/exporter/vendor/plugins/Exporter/Unit';
+  const alternate = dir.replace('plugins/exporter', 'plugins/Exporter');
+  const match = cargoMemberMatcher('extras/**/plugins/Exporter/**/Unit', new CargoDirectoryNames([dir]));
+  assert.equal(match(dir), dir);
+  assert.deepEqual([...match.spellings(dir)], path.sep === '\\' ? [dir, alternate] : [dir]);
+});
+
+test('Cargo only probes native aliases on paths that can match the whole member pattern', () => {
+  const dir = 'extras/plugins/exporter/vendor/plugins/exporter/Unit';
+  const unrelated = Array.from({ length: 32 }, (_, i) => [
+    'other/' + i + '/exporter/Cargo.toml',
+    { package: { name: 'other-' + i } },
+  ]);
+  const probes = [];
+  const ws = resolveCargoWorkspace({
+    manifests: {
+      ...Object.fromEntries(unrelated),
+      'Cargo.toml': { workspace: { members: ['addons/*/Exporter', 'extras/**/plugins/Exporter/**/Unit'] } },
+      [dir + '/Cargo.toml']: { package: { name: 'exporter' } },
+      'extras/anchor/plugins/Exporter/Unit/Cargo.toml': { package: { name: 'anchor' } },
+      'addons/control/Exporter/Cargo.toml': { package: { name: 'control' } },
+    },
+    probeAlias: original => {
+      probes.push(original);
+      return !original.includes('/vendor/plugins/');
+    },
+  });
+  assert.deepEqual(ws.unsupported, []);
+  assert.deepEqual(
+    ws.members.map(pkg => pkg.name).sort(),
+    path.sep === '\\' ? ['anchor', 'control', 'exporter'] : ['anchor', 'control'],
+  );
+  assert.equal(
+    probes.some(p => p.startsWith('other/')),
+    false,
+  );
+});
+
+test('recursive Cargo walks probe aliases only on reachable path components', () => {
+  const pattern = 'addons/*/unit/depot/**/unit/Depot/**/Leaf';
+  const branches = ['east', 'north', 'south', 'west'];
+  const dirs = branches.map(branch => 'addons/' + branch + '/unit/depot/area/unit/Depot/Leaf');
+  const lower = 'addons/live/unit/depot/area/unit/depot/Leaf';
+  const upper = lower.replace('area/unit/depot', 'area/unit/Depot');
+  for (const allow of [false, true]) {
+    const probes = [];
+    const names = new CargoDirectoryNames([...dirs, lower], actual => {
+      probes.push(actual);
+      return allow;
+    });
+    const matcher = cargoMemberMatcher(pattern, names);
+    for (const dir of dirs) assert.deepEqual([...matcher.spellings(dir)], [dir]);
+    assert.deepEqual(probes, []);
+    assert.deepEqual([...matcher.spellings(lower)], path.sep === '\\' && allow ? [upper] : []);
+    assert.deepEqual(probes, path.sep === '\\' ? [lower.slice(0, -'/Leaf'.length)] : []);
+  }
+});
+
+test('recursive Cargo walks stop probing after a required directory alias fails', () => {
+  const dir = 'addons/live/depot/a/unit/shelf/b/Leaf';
+  const probes = [];
+  const names = new CargoDirectoryNames([dir], actual => {
+    probes.push(actual);
+    return false;
+  });
+  const matcher = cargoMemberMatcher('addons/*/Depot/**/unit/Shelf/**/Leaf', names);
+  assert.deepEqual([...matcher.spellings(dir)], []);
+  assert.deepEqual(probes, path.sep === '\\' ? ['addons/live/depot'] : []);
+});
+
+test('Cargo preserves distinct snapshot entries and detects two member spellings for one package', () => {
+  const manifests = {
+    'native/Codec/Cargo.toml': { package: { name: 'upper' } },
+    'native/codec/Cargo.toml': { package: { name: 'lower' } },
+  };
+  const resolve = (members, files = manifests) =>
+    resolveCargoWorkspace({ manifests: { 'Cargo.toml': { workspace: { members } }, ...files } });
+  assert.deepEqual(
+    resolve(['native/Codec']).members.map(pkg => pkg.name),
+    ['upper'],
+  );
+  assert.deepEqual(
+    resolve(['native/codec']).members.map(pkg => pkg.name),
+    ['lower'],
+  );
+  assert.deepEqual(
+    resolve(['native/CODEC']).unsupported.map(row => row.reason),
+    ['missing-workspace-member'],
+  );
+  const single = { 'native/codec/Cargo.toml': manifests['native/codec/Cargo.toml'] };
+  assert.deepEqual(
+    resolve(['native/*', 'native/Codec'], single).unsupported.map(row => row.reason),
+    [path.sep === '\\' ? 'duplicate-crate-name' : 'missing-workspace-member'],
+  );
+});
+
+test('a literal workspace member overrides exclude below it when its plugin is selected', () => {
+  const host = 'crates/host';
+  const plugin = host + '/plugins/exporter';
+  const glob = host + '/plugins/*';
+  for (const [members, dependencies, expected, exclude = [plugin]] of [
+    [[host, glob], {}, ['host', 'exporter']],
+    [[host], { exporter: { path: 'plugins/exporter' } }, ['host', 'exporter']],
+    [[host], {}, ['host']],
+    [['crates/hos?', glob], {}, ['host']],
+    [['crates/hos?', glob], { exporter: { path: 'plugins/exporter' } }, ['host']],
+    [['crates/other/../host', glob], {}, ['host']],
+    [['crates/hos?', glob], {}, ['host'], [plugin + '/Cargo.toml']],
+    [['.', host, glob], {}, ['host', 'exporter']],
+    ...(path.sep === '\\'
+      ? [
+          [['crates/Host'], { exporter: { path: 'plugins/exporter' } }, ['host', 'exporter']],
+          [['crates/hos?'], { exporter: { path: 'plugins/Exporter' } }, ['host', 'exporter']],
+          [['crates/hos?'], { exporter: { path: 'plugins/Exporter' } }, ['host'], [host + '/plugins/Exporter']],
+          [['crates/Host', glob], {}, ['host']],
+        ]
+      : []),
+  ]) {
+    const manifests = {
+      'Cargo.toml': { workspace: { members, exclude } },
+      [host + '/Cargo.toml']: { package: { name: 'host' }, dependencies },
+      [plugin + '/Cargo.toml']: { package: { name: 'exporter' } },
+    };
+    const result = resolveCargoWorkspace({ manifests });
+    assert.deepEqual(result.unsupported, []);
+    assert.deepEqual(
+      result.members.map(pkg => pkg.name),
+      expected,
+      JSON.stringify(members),
+    );
+  }
+});
+
+test('contract scopes recognize Node glob syntax in a package name and preserve literal directories', () => {
+  const packages = new Map([
+    ['native/codec', 'wire-contracts'],
+    ['native/control', 'control'],
+  ]);
+  for (const group of ['{codec,control}', '@(codec|control)', '+(co|dec)', '!(control)', '@(co@(d|x)ec|none)']) {
+    const scope = `native/${group}/src/schema.rs`;
+    assert.equal(scopeMatchesPath(scope, 'native/codec/src/schema.rs'), true, scope);
+    assert.equal(isExplicitContractScope(scope, 'native/codec'), false, scope);
+    assert.equal(isBroadContractScope(scope, 'native/codec'), true, scope);
+    const findings = rustContractCrateFindings(
+      { id: 'sample', epics: [], tasks: [{ id: 'schema', dependsOn: [], writePaths: [scope] }] },
+      '',
+      { schemaVersion: 2, language: 'rust', contractCrates: ['wire-contracts'] },
+      undefined,
+      packages,
+    );
+    assert.deepEqual(
+      findings.map(finding => finding.code),
+      ['contract_scope_too_broad'],
+      scope,
+    );
+  }
+  assert.equal(isBroadContractScope('native/!(codec)/src/schema.rs', 'native/codec'), false);
+  assert.equal(isBroadContractScope('native/codec/src/@(model|wire).rs', 'native/codec'), false);
+  assert.equal(isExplicitContractScope('native/codec(old)/src/schema.rs', 'native/codec(old)'), true);
+  assert.equal(isBroadContractScope('native/{a..c}/src/schema.rs', 'native/b'), true);
+  assert.equal(isBroadContractScope('native/{a..c}/src/schema.rs', 'native/d'), false);
+  assert.equal(isBroadContractScope('{native/engines,libs/cores}/{a..c}/schema.rs', 'native/engines/b'), true);
+  assert.equal(isBroadContractScope('native/{codec}/schema.rs', 'native/codec'), false);
+  assert.equal(isBroadContractScope('@(model|wire).rs', ''), true);
+});
 
 const workspace = {
   'Cargo.toml':

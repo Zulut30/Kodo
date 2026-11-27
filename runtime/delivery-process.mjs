@@ -19,6 +19,7 @@ const parse = (text, label) => {
   }
 };
 
+/** @type {(ms: number, signal?: AbortSignal) => Promise<void>} */
 const wait = (ms, signal) =>
   new Promise((resolve, reject) => {
     if (signal?.aborted) return reject(fail('cancelled', 'Delivery cancelled'));
@@ -35,6 +36,7 @@ const wait = (ms, signal) =>
     signal?.addEventListener('abort', abort, { once: true });
   });
 
+/** @returns {Promise<[string, string[]]>} The Node executable and npm-cli.js arguments. */
 async function npmCommand() {
   const candidates = [
     process.env.npm_execpath,
@@ -256,6 +258,7 @@ function redactCommandError(value, secrets, seen = new WeakMap()) {
   if (seen.has(value)) return seen.get(value);
   // Keep mutable errors (including their type/identity), non-enumerable stack
   // and cause, and nested diagnostics. Frozen runner errors need a typed copy.
+  /** @type {Record<PropertyKey, PropertyDescriptor>} */
   const descriptors = Object.getOwnPropertyDescriptors(value);
   // V8's cached stack is still an accessor in Node 24. Materialize it before
   // changing message, then redact the original diagnostic instead of dropping it.
@@ -340,6 +343,11 @@ function commandFailure(command, code, result, extra = {}, secrets = {}) {
   );
 }
 
+/**
+ * @param {string} command
+ * @param {string[]} args
+ * @param {{ cwd?: string, signal?: AbortSignal, timeoutMs?: number, allowFailure?: boolean, env?: NodeJS.ProcessEnv, maxOutputBytes?: number, secrets?: Record<string, string> }} [options]
+ */
 export async function execute(
   command,
   args,

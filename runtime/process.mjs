@@ -85,6 +85,20 @@ const CLOSE_WAIT_MS = 3000;
  * attempt ends only after that is confirmed. An unconfirmed stop ends it with `process_teardown`,
  * never with the stop reason, so no caller starts the client again next to survivors. A process
  * outside the tree may still hold the pipes: after the confirmed stop they are awaited only briefly.
+ * @param {{
+ *   command: string,
+ *   args?: string[],
+ *   cwd?: string,
+ *   input?: string,
+ *   env?: NodeJS.ProcessEnv,
+ *   signal?: AbortSignal,
+ *   timeoutMs?: number,
+ *   startupTimeoutMs?: number,
+ *   startedBy?: (line: string) => boolean,
+ *   onLine?: (line: string) => void,
+ *   maxOutputBytes?: number,
+ *   stopImpl?: (child: import('node:child_process').ChildProcess) => Promise<unknown>,
+ * }} invocation
  */
 export async function runProcess({
   command,
@@ -229,7 +243,7 @@ export async function runProcess({
       if (stopping) stopping.then(settle);
       else settle();
     });
-    child.stdin.on('error', error => {
+    child.stdin.on('error', (/** @type {NodeJS.ErrnoException} */ error) => {
       if (error.code !== 'EPIPE') terminate(error);
     });
     child.stdin.end(input);

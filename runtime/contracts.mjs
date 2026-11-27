@@ -1,4 +1,4 @@
-import Ajv from 'ajv';
+import { Ajv } from 'ajv';
 import path from 'node:path';
 import { ownsPath } from './scope-paths.mjs';
 

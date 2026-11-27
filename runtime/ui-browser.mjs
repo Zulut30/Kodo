@@ -48,6 +48,11 @@ export function browserEnvironment(home, base = process.env, platform = process.
   if (platform === 'win32') for (const name of ['HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA']) delete env[name];
   return env;
 }
+/**
+ * @param {string} command
+ * @param {string[]} args
+ * @param {{ cwd?: string, env?: NodeJS.ProcessEnv, signal?: AbortSignal }} [options]
+ */
 export function ownedProcess(command, args, { cwd, env, signal } = {}) {
   const resolved = resolveCommand(command, args);
   const child = spawn(resolved.command, resolved.args, {
@@ -106,6 +111,13 @@ export function ownedProcess(command, args, { cwd, env, signal } = {}) {
     },
   };
 }
+/**
+ * Poll `check` every 100 ms until it returns a truthy value, which is returned.
+ * @template T
+ * @param {() => Promise<T> | T} check
+ * @param {{ signal?: AbortSignal, timeoutMs?: number }} [options]
+ * @returns {Promise<T>}
+ */
 export async function waitUntil(check, { signal, timeoutMs = 15000 } = {}) {
   const end = Date.now() + timeoutMs;
   do {
@@ -330,6 +342,8 @@ export async function runDesktopCase({ case: c, config, tool, evidenceDir, signa
   };
 }
 
+/** `connect` is a test port returning `{ client, transport }`; by default the tool's MCP server is spawned.
+ * @param {{ case: Record<string, any>, config: Record<string, any>, tool: Record<string, any>, evidenceDir: string, signal?: AbortSignal, browser?: Record<string, any>, connect?: () => Promise<{ client: any, transport: any }> }} input */
 export async function runChromeCase({ case: c, config, tool, evidenceDir, signal, browser, connect }) {
   let client, transport;
   try {
@@ -405,6 +419,7 @@ export async function runChromeCase({ case: c, config, tool, evidenceDir, signal
   }
 }
 
+/** @param {{ case: Record<string, any>, config: Record<string, any>, tool: Record<string, any>, evidenceDir: string, secrets?: Record<string, string>, signal?: AbortSignal, runner?: import('./command.mjs').CommandRunner }} input */
 export async function runInstalledCase({ case: c, config, tool, evidenceDir, secrets = {}, signal, runner = execute }) {
   if (c.tool === 'agent-desktop') return runDesktopCase({ case: c, config, tool, evidenceDir, signal, runner });
   const browsers = [];

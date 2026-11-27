@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
-import Ajv from 'ajv';
+import { Ajv } from 'ajv';
 import {
   resolveClient,
   runProcess,
@@ -142,6 +142,7 @@ export async function requestJson(
   }
 }
 
+/** @param {number} ms @param {AbortSignal} [signal] @returns {Promise<void>} */
 function delay(ms, signal) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(done, ms);
@@ -627,10 +628,8 @@ export async function runSession(
             error?.code === 'process_teardown' ? 'process_teardown' : 'unavailable',
           );
     if (failure instanceof Error && Object.isExtensible(failure))
-      failure.metrics = sessionMetrics(client, events, {
-        durationMs: nowImpl() - started,
-        firstEventMs,
-        startupRetries,
+      Object.assign(failure, {
+        metrics: sessionMetrics(client, events, { durationMs: nowImpl() - started, firstEventMs, startupRetries }),
       });
     throw failure;
   } finally {
@@ -706,10 +705,11 @@ function strongest(models) {
 }
 
 /**
- * @param {{ task: string, models: any[], node: any, attempt?: number }} input
+ * @param {{ task: string, models: any[], node: any, attempt?: number, signal?: AbortSignal }} input
  * @param {{ secrets?: import('./security.mjs').Secrets, fetchImpl?: typeof fetch }} [deps]
  */
-export async function decideJev({ task, models, node, attempt = 0 }, { secrets = {}, fetchImpl = fetch } = {}) {
+export async function decideJev({ task, models, node, attempt = 0, signal }, { secrets = {}, fetchImpl = fetch } = {}) {
+  signal?.throwIfAborted();
   const available = models.filter(item => item.available !== false);
   if (!available.length) throw new ProviderError('Нет доступных моделей по подписке', 'unavailable');
   const fallback = reason => ({
@@ -764,6 +764,7 @@ export async function decideJev({ task, models, node, attempt = 0 }, { secrets =
         },
         questions,
       },
+      signal,
       fetchImpl,
       secrets,
     });
@@ -799,6 +800,8 @@ export async function decideJev({ task, models, node, attempt = 0 }, { secrets =
       jevModel: result.model,
     };
   } catch (error) {
+    // A cancelled run is not a routing failure: the caller stops instead of using a fallback model.
+    if (signal?.aborted) throw error;
     return fallback(redact(error.message, secrets));
   }
 }
@@ -887,6 +890,7 @@ async function doctorLiveProviders(checks, { clients, secrets, config, signal },
     const result = await (deps.decideJevImpl || decideJev)(
       {
         task: 'Connectivity check',
+        signal,
         node: { id: 'health', writeScope: [] },
         models: [
           { id: `${primaryClient}:${primaryModel}`, client: primaryClient, model: primaryModel, available: true },

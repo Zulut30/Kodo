@@ -494,6 +494,7 @@ test('Installed-layout gate works without package lock and rejects changed actua
     gatePath,
     path.join(installed, 'runtime/architecture-rust.mjs'),
     path.join(installed, 'runtime/cargo-workspace.mjs'),
+    path.join(installed, 'runtime/cargo-member-paths.mjs'),
     path.join(installed, 'runtime/project-controller-lease.mjs'),
     path.join(installed, 'runtime/project-integration-lease.mjs'),
     path.join(installed, 'node_modules/acorn/dist/acorn.mjs'),

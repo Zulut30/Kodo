@@ -280,6 +280,12 @@ function readKnowledgeCapture(db, project, captureId) {
     .get(project, captureId);
   return row ? JSON.parse(row.body) : null;
 }
+/**
+ * @param {import('node:sqlite').DatabaseSync | null} db
+ * @param {string} project
+ * @param {{ domain?: string, subject?: string, limit?: number, history?: boolean }} [query]
+ * @param {boolean} [page]
+ */
 function readKnowledgeClaims(db, project, { domain, subject, limit = 200, history = false } = {}, page = false) {
   requireKnowledge(
     Number.isSafeInteger(limit) && limit >= 1 && limit <= 1000 && typeof history === 'boolean',
@@ -317,7 +323,7 @@ function readKnowledgeClaims(db, project, { domain, subject, limit = 200, histor
       ORDER BY b.revision DESC,b.claim_id ASC`,
       )
       .all(...parameters, limit, project);
-    const claims = rows.filter(row => row.body !== null).map(row => JSON.parse(row.body)),
+    const claims = rows.filter(row => row.body !== null).map(row => JSON.parse(String(row.body))),
       total = rows[0].total;
     return { claims, total, complete: total === claims.length };
   }
@@ -326,7 +332,7 @@ function readKnowledgeClaims(db, project, { domain, subject, limit = 200, histor
       `SELECT r.body FROM knowledge_claim_revisions r WHERE ${clauses.join(' AND ')} ORDER BY r.revision DESC,r.claim_id ASC LIMIT ?`,
     )
     .all(...parameters, limit)
-    .map(row => JSON.parse(row.body));
+    .map(row => JSON.parse(String(row.body)));
 }
 
 // Inspection never opens a writable Store, creates a home, or migrates tables.
@@ -443,7 +449,7 @@ export class Store {
   getRun(id) {
     const row = this.db.prepare('SELECT body FROM runs WHERE id=?').get(id);
     if (!row) throw new Error(`Запуск не найден: ${id}`);
-    return JSON.parse(row.body);
+    return JSON.parse(String(row.body));
   }
   // Inside a lease holder's async context (runtime/lease-fence.mjs) the write is fenced: it checks
   // in its own transaction that the holder's leases are still live (`project_lease_lost` otherwise).
@@ -498,7 +504,7 @@ export class Store {
     return this.db
       .prepare('SELECT body FROM runs ORDER BY updated DESC')
       .all()
-      .map(row => JSON.parse(row.body))
+      .map(row => JSON.parse(String(row.body)))
       .filter(run => !project || projectKey(run.project) === projectKey(project));
   }
   event(runId, type, data = {}, time = this.clock()) {
@@ -507,10 +513,11 @@ export class Store {
       .run(runId, type, JSON.stringify(redact(data, this.secrets)), time);
   }
   events(runId, after = 0) {
-    return this.db
-      .prepare('SELECT * FROM events WHERE run_id=? AND seq>? ORDER BY seq')
-      .all(runId, after)
-      .map(row => ({ ...row, data: JSON.parse(row.data) }));
+    // Rows of the `events` table: every column is NOT NULL, `data` holds JSON text.
+    const rows = /** @type {{ seq: number, run_id: string, type: string, data: string, time: number }[]} */ (
+      this.db.prepare('SELECT * FROM events WHERE run_id=? AND seq>? ORDER BY seq').all(runId, after)
+    );
+    return rows.map(row => ({ ...row, data: JSON.parse(row.data) }));
   }
   remember(run) {
     const lesson = redact(
@@ -546,7 +553,7 @@ export class Store {
         "SELECT body FROM knowledge WHERE project=? AND (json_extract(body, '$.kind') IS NULL OR json_extract(body, '$.kind') != 'gate-lesson') ORDER BY time DESC LIMIT ?",
       )
       .all(projectKey(project), limit)
-      .map(row => JSON.parse(row.body));
+      .map(row => JSON.parse(String(row.body)));
   }
   gateLessons(project, limit = 200) {
     return this.db
@@ -665,12 +672,12 @@ export class Store {
       this.db.prepare('DELETE FROM leases WHERE expires<?').run(now);
       for (const item of this.db.prepare('SELECT token,pid FROM leases').all()) {
         try {
-          process.kill(item.pid, 0);
+          process.kill(Number(item.pid), 0);
         } catch (error) {
           if (error.code === 'ESRCH') this.db.prepare('DELETE FROM leases WHERE token=?').run(item.token);
         }
       }
-      const count = this.db.prepare('SELECT count(*) AS count FROM leases WHERE name=?').get(name).count;
+      const count = Number(this.db.prepare('SELECT count(*) AS count FROM leases WHERE name=?').get(name).count);
       let token = null;
       if (count < limit) {
         token = randomUUID();
