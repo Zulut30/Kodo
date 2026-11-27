@@ -8,6 +8,7 @@ import { planFastChecks } from '../runtime/task-fast-checks.mjs';
 import { git } from '../runtime/workspace.mjs';
 import { CargoDirectoryNames, cargoMemberMatcher } from '../runtime/cargo-member-paths.mjs';
 import {
+  compileCargoGlob,
   isBroadContractScope,
   isExplicitContractScope,
   resolveCargoWorkspace,
@@ -117,6 +118,32 @@ test('Cargo member globs count Unicode scalars in wildcards and character classe
     });
     assert.deepEqual(ws.unsupported, [], pattern);
     assert.deepEqual(ws.members.map(pkg => pkg.root).sort(), matches.map(part => 'extras/' + part).sort(), pattern);
+  }
+});
+
+test('Cargo member character classes match inside one path component', () => {
+  const entries = ['axpkg', '𠮷.pkg', '𠮷0pkg', '𠮷zpkg', '𠮷/pkg'];
+  const dir = entry => 'sensors/' + entry + '/Bridge';
+  const packages = Object.fromEntries(
+    entries.map((entry, i) => [dir(entry) + '/Cargo.toml', { package: { name: 'bridge-' + i } }]),
+  );
+  for (const [component, selected] of [
+    ['?[!z]pkg', ['axpkg', '𠮷.pkg', '𠮷0pkg']],
+    ['?[.-0]pkg', ['𠮷.pkg', '𠮷0pkg']],
+    ['?/pkg', ['𠮷/pkg']],
+  ]) {
+    const pattern = dir(component);
+    const glob = compileCargoGlob(pattern);
+    assert.deepEqual(
+      entries.filter(entry => glob.test(dir(entry))),
+      selected,
+      pattern,
+    );
+    const ws = resolveCargoWorkspace({
+      manifests: { 'Cargo.toml': { workspace: { members: [pattern] } }, ...packages },
+    });
+    assert.deepEqual(ws.unsupported, [], pattern);
+    assert.deepEqual(ws.members.map(pkg => pkg.root).sort(), selected.map(dir).sort(), pattern);
   }
 });
 

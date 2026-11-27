@@ -111,7 +111,8 @@ function compileGlobSegment(segment) {
       }
       if (!closed) return null;
       cls += ']';
-      regex += cls;
+      // A negated class or a range such as [.-0] can include the separator.
+      regex += '(?!/)' + cls;
       i = j;
     } else if (ch === ']') {
       return null;

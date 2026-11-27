@@ -121,6 +121,34 @@ test('Wave 0 counts packages selected by a Unicode wildcard or another recursive
   }
 });
 
+test('Wave 0 follows dependencies only from bridges selected within a Cargo glob component', async t => {
+  const f = await fixture(t);
+  const visible = 'sensors/axpkg/Bridge';
+  const other = 'sensors/𠮷/pkg/Bridge';
+  await f.write(visible + '/Cargo.toml', manifest('selected-bridge'));
+  await f.write(
+    other + '/Cargo.toml',
+    manifest('nested-bridge') + '\n[dependencies]\nwire-contracts={path="../../../../native/codec"}\n',
+  );
+  for (const dir of [visible, other]) await f.write(dir + '/src/lib.rs', '');
+  for (const [member, expected] of [
+    ['sensors/?[!z]pkg/Bridge', []],
+    ['sensors/?/pkg/Bridge', threshold],
+  ]) {
+    await f.write('Cargo.toml', workspace([...mainMembers.slice(1), member]));
+    f.commit();
+    for (const forRegistration of [false, true])
+      assert.deepEqual(
+        await f.compile(
+          mainMembers.map(dir => dir + '/src/lib.rs'),
+          { forRegistration },
+        ),
+        expected,
+        member,
+      );
+  }
+});
+
 test('Cargo path dependencies use native separators when counting workspace packages', async t => {
   const members = ['native/client', 'native/server'];
   const f = await fixture(t, workspace(members));
