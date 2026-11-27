@@ -3,6 +3,7 @@ import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { lstat, realpath } from 'node:fs/promises';
 import { execute, gitBoundary } from './command.mjs';
+import { runRefTransaction } from './project-ref-transaction.mjs';
 import { git, makeWorktree, withWorktreeLock } from './workspace.mjs';
 import { ownsPath } from './contracts.mjs';
 import { secretFile } from './security.mjs';
@@ -369,16 +370,14 @@ export function updateRefsAtomically(cwd, { verify = [], update }, { timeoutMs =
     'start',
     ...verify.map(row => `verify ${row.ref} ${row.sha}`),
     ...update.map(row => `update ${row.ref} ${row.next} ${row.expected}`),
-    'commit',
     '',
   ].join('\n');
-  const { args, env } = gitBoundary(['update-ref', '--stdin'], process.env);
-  const result = spawnSync('git', args, { cwd, env, input, encoding: 'utf8', timeout: timeoutMs, windowsHide: true });
-  if (result.status === 0) return;
+  const result = runRefTransaction(cwd, input, timeoutMs);
+  if (result === 'committed') return;
   // A Git that did not run or timed out changed nothing that can be trusted: a lost publish at
   // once. A refused transaction is classified by `refusedPublish` after the caller's SQLite
   // transaction ended (no second Git call while the write lock is held).
-  if (result.error || result.status === null) throw coded('project_lease_lost');
+  if (result === 'unknown') throw coded('project_lease_lost');
   throw Object.assign(coded('project_lease_lost'), { refused: true });
 }
 

@@ -101,6 +101,7 @@ async function pins() {
     'toolchains.mjs',
     'progress.mjs',
     'project-integration.mjs',
+    'project-ref-transaction.mjs',
     'project-integration-lease.mjs',
     'project-integration-queue.mjs',
     'project-controller-lease.mjs',
