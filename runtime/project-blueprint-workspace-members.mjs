@@ -15,7 +15,7 @@ import {
 } from './cargo-workspace.mjs';
 import {
   blueprintChildDirectories,
-  blueprintPathAlias,
+  blueprintPathAliasProbe,
   readBlueprintCargoTree,
   readOptionalBlueprintMetadata,
 } from './project-blueprint-io.mjs';
@@ -24,12 +24,21 @@ import { BLUEPRINT_LIMITS, failure, isPlain } from './project-blueprint-shared.m
 
 const manifestFile = dir => (dir ? dir + '/Cargo.toml' : 'Cargo.toml');
 const isWithin = (root, dir) => !root || dir === root || dir.startsWith(root + '/');
+const malformedManifest = Symbol('malformed Cargo.toml');
+
+function parseManifest(text) {
+  try {
+    return parseToml(text);
+  } catch {
+    return malformedManifest;
+  }
+}
 
 export function blueprintManifestReader(root, revision, tree) {
   const docs = new Map();
   const blobs = new Map();
   const known = new Set([...tree.manifests.keys()].map(dir => (dir === '.' ? '' : dir)));
-  const names = new CargoDirectoryNames(known, (original, spelling) => blueprintPathAlias(root, original, spelling));
+  const names = new CargoDirectoryNames(known, blueprintPathAliasProbe(root));
   const listed = new Set();
 
   async function nativeLead(pattern) {
@@ -63,7 +72,7 @@ export function blueprintManifestReader(root, revision, tree) {
     return known;
   }
 
-  async function read(dirs) {
+  async function read(dirs, optionalSources = undefined) {
     const missing = [...new Set(dirs)].filter(dir => !docs.has(dir));
     if (!missing.length) return;
     // A path dependency can be outside every blueprint search lead. Git only
@@ -79,11 +88,18 @@ export function blueprintManifestReader(root, revision, tree) {
       files,
       BLUEPRINT_LIMITS.project,
       revision,
-      parseToml,
+      revision && optionalSources ? parseManifest : parseToml,
       blobs,
     );
     for (const [dir, actual] of stored) {
       const doc = parsed.get(manifestFile(actual));
+      if (doc === malformedManifest) {
+        if (optionalSources?.has(dir)) continue;
+        throw failure(
+          'blueprint_cargo_evidence_unavailable',
+          `Не удалось разобрать ${manifestFile(actual)} в выбранном коммите Git`,
+        );
+      }
       docs.set(actual, doc);
       docs.set(dir, doc);
     }
@@ -119,15 +135,21 @@ function workspaceRules(root, rootDoc, names) {
   const declares = (dir, requireName = false) => !spellings(dir, requireName).next().done;
   const isExcluded = dir => excludedSpelling(dir) && !declares(dir);
   const allows = dir => dir === root || (ws !== null && !isExcluded(dir));
-  // A member can reach a nested dependency under a different spelling from
-  // its tree entry. Only a real edge, checked as spelled, proves inclusion.
-  const mayReach = dir =>
-    allows(dir) || (path.sep === '\\' && [...pathAndAncestors(dir)].some(p => p && p !== dir && declares(p)));
+  // On Windows a dependency can name even an excluded sibling through a
+  // native alias. Only the spelling of its actual edge settles membership.
+  const mayReach = dir => allows(dir) || path.sep === '\\';
   return { ws, literal, globPatterns, isExcluded, excludedSpelling, allows, mayReach, declares, spellings };
 }
 
 function* enclosingWorkspaces(dir, workspaces) {
   for (const parent of pathAndAncestors(dir)) if (workspaces.has(parent)) yield parent;
+}
+
+function workspaceLookupOrder(workspaces) {
+  const roots = workspaces.keys();
+  // A more specific workspace can supply a package.workspace binding before
+  // an enclosing root needs to search its dependencies for a native alias.
+  return path.sep === '\\' ? [...roots].sort((a, b) => b.length - a.length) : roots;
 }
 
 async function loadWorkspaceRules(reader, workspaces, roots) {
@@ -190,7 +212,7 @@ function memberEdition(dir, doc, ws) {
   return edition ?? '2015';
 }
 
-async function reachablePackages(reader, rules, root, candidates, needsPath) {
+async function reachablePackages(reader, rules, root, candidates, needsPath, requiresEdge) {
   const { ws, literal, globPatterns, declares, excludedSpelling } = rules;
   const rootDoc = reader.docs.get(root);
   const reached = new Set();
@@ -211,6 +233,10 @@ async function reachablePackages(reader, rules, root, candidates, needsPath) {
     for (const dir of await reader.discover(globPatterns))
       for (const spelling of rules.spellings(dir)) frontier.add(spelling);
   }
+  // An excluded directory may still be named by a dependency with a native
+  // alias. An otherwise unrelated malformed member declares no usable edge.
+  // Once a real dependency points at a manifest its evidence is required.
+  const optionalSources = [...pending].some(requiresEdge) ? undefined : new Set(frontier);
   const dependencies = parseWorkspaceDependencies(ws?.dependencies);
   const visited = new Set();
   while (frontier.size && pending.size) {
@@ -218,10 +244,12 @@ async function reachablePackages(reader, rules, root, candidates, needsPath) {
     // before any other package body is needed.
     const cached = [...frontier].filter(dir => reader.docs.has(dir));
     const batch = cached.length ? cached : [...frontier];
-    await reader.read(batch);
+    await reader.read(batch, optionalSources);
     for (const dir of batch) {
       frontier.delete(dir);
-      visited.add(dir);
+      if (reader.docs.has(dir)) visited.add(dir);
+    }
+    for (const dir of batch) {
       const doc = reader.docs.get(dir);
       const actual = reader.names.resolve(dir);
       if (!eligibleMember(actual, doc, root)) continue;
@@ -230,6 +258,7 @@ async function reachablePackages(reader, rules, root, candidates, needsPath) {
         if (spelling === null || excludedSpelling(spelling)) continue;
         const target = reader.names.resolve(spelling);
         if (pending.delete(target)) reached.add(target);
+        optionalSources?.delete(spelling);
         if (!visited.has(spelling)) frontier.add(spelling);
       }
     }
@@ -254,7 +283,18 @@ async function reachableWorkspaceCandidates(reader, workspaces, root, local, def
     const resolved = workspaces.get(root);
     if (!resolved) return [];
     const upper = upperCount(siblings);
-    return reachablePackages(reader, resolved, root, new Set([...local, ...siblings]), dir => needsPath(dir, upper));
+    const candidates = new Set([...local, ...siblings]);
+    let upperWithoutExcluded;
+    const requiresEdge = dir => {
+      if (path.sep !== '\\' || !resolved.ws?.exclude?.length) return true;
+      if (resolved.isExcluded(dir)) return false;
+      upperWithoutExcluded ??= upperCount(
+        siblings,
+        [...candidates].filter(candidate => resolved.isExcluded(candidate)),
+      );
+      return needsPath(dir, upperWithoutExcluded);
+    };
+    return reachablePackages(reader, resolved, root, candidates, dir => needsPath(dir, upper), requiresEdge);
   };
   const siblings = possibleSiblings();
   try {
@@ -339,14 +379,15 @@ export async function blueprintWorkspaceOwners(
   for (const [dir, root] of fallbacks) count(dir, root);
   for (const [root, candidates] of queries) for (const dir of candidates) count(dir, root);
   const matters = (dir, root, upper = counts.get(root) ?? 0) => root !== undefined && needsPath(dir, root, upper);
-  for (const root of workspaces.keys()) {
+  const plannedCount = dirs => dirs.filter(dir => planned.has(dir)).length;
+  for (const root of workspaceLookupOrder(workspaces)) {
     const reachable = await reachableWorkspaceCandidates(
       reader,
       workspaces,
       root,
       queries.get(root) ?? new Set(),
       siblings,
-      possible => (counts.get(root) ?? 0) + possible.filter(dir => planned.has(dir)).length,
+      (possible, excluded = []) => (counts.get(root) ?? 0) + plannedCount(possible) - plannedCount(excluded),
       (dir, upper) => matters(dir, root, upper) || matters(dir, fallbacks.get(dir)),
     );
     // Check package.workspace only for targets the root actually reaches.

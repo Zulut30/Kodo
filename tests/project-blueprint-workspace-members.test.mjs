@@ -143,6 +143,67 @@ test('an indirect Cargo member can be reached through the native spelling of its
   }
 });
 
+test('a sibling dependency uses its selected spelling for workspace exclusions', async t => {
+  const f = await fixture(t);
+  const members = mainMembers.slice(1);
+  const sources = mainMembers.map(dir => dir + '/src/lib.rs');
+  const direct = '[dependencies]\nwire-contracts={path="../Codec"}\n';
+  const inherited = '[workspace.dependencies]\nwire-contracts={path="native/Codec"}\n';
+  await f.write(
+    'support/relay/Cargo.toml',
+    manifest('relay') + '[dependencies]\nwire-contracts={path="../../native/Codec"}\n',
+  );
+  await f.write('support/relay/src/lib.rs', '');
+  for (const [client, rootDeps, exclude, included] of [
+    [direct, '', 'native/codec', true],
+    ['[dev-dependencies]\nwire-contracts.workspace=true\n', inherited, 'native/codec', true],
+    ['[dependencies]\nrelay={path="../../support/relay"}\n', '', 'native/codec', true],
+    [direct, '', 'native/Codec', false],
+    ['', '', 'native/codec', false],
+  ]) {
+    await f.write('Cargo.toml', workspace(members, [exclude]) + rootDeps);
+    await f.write('native/client/Cargo.toml', manifest('client') + client);
+    f.commit();
+    for (const forRegistration of [false, true]) {
+      const belongs = included && path.sep === '\\';
+      assert.deepEqual(await f.compile(sources, { forRegistration }), belongs ? threshold : []);
+      assert.deepEqual(await f.compile(['native/cod*/' + schema], { forRegistration }), belongs ? broad : []);
+    }
+  }
+});
+
+test(
+  'an excluded package reached through a native alias requires its dependency evidence',
+  {
+    skip: path.sep !== '\\',
+  },
+  async t => {
+    const f = await fixture(t, workspace(mainMembers.slice(1), ['native/codec']));
+    const mask = ['native/cod*/' + schema];
+    const bridge = 'support/relay/Cargo.toml';
+    await f.write('native/server/Cargo.toml', 'invalid TOML');
+    await f.write(
+      'native/client/Cargo.toml',
+      manifest('client') + '[dependencies]\nrelay={path="../../support/relay"}\n',
+    );
+    await f.write(bridge, manifest('relay') + '[dependencies]\nwire-contracts={path="../../native/Codec"}\n');
+    f.commit();
+    assert.deepEqual(await f.compile(mask, { forRegistration: true }), broad);
+
+    await f.write(bridge, 'invalid TOML');
+    f.commit();
+    assert.deepEqual(await f.compile(mask, { forRegistration: true }), unavailable);
+    for (const members of [
+      ['native/client', 'support/relay'],
+      ['support/relay', 'native/client'],
+    ]) {
+      await f.write('Cargo.toml', workspace(members, ['native/codec']));
+      f.commit();
+      assert.deepEqual(await f.compile(mask, { forRegistration: true }), unavailable);
+    }
+  },
+);
+
 test('Wave 0 counts an excluded plugin reachable below a literal workspace member', async t => {
   const f = await fixture(t);
   const host = 'native/client';

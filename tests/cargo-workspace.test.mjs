@@ -67,6 +67,38 @@ test('Cargo resolves native member spellings and compares exclusions using the s
   }
 });
 
+test('a recursive Cargo member glob compares the next component with the enumerated directory entry', () => {
+  const lower = 'extras/a/exporter';
+  const upper = 'extras/b/Exporter';
+  const both = [lower, upper];
+  const windows = path.sep === '\\';
+  for (const [member, exclude, expected] of [
+    ['extras/**/Exporter', [], [upper]],
+    ['extras/**/Exporter', [lower], [upper]],
+    ['extras/**/**/Exporter', [], [upper]],
+    ['**/Exporter', [], [upper]],
+    ['**/**/Exporter', [], [upper]],
+    ['extras/**/[Ee]xporter', [], both],
+    ['extras/*/Exporter', [], windows ? both : [upper]],
+    ['extras/**/a/Exporter', [], windows ? [lower] : []],
+    ['EXTRAS/**/Exporter', [], windows ? [upper] : []],
+  ]) {
+    const ws = resolveCargoWorkspace({
+      manifests: {
+        'Cargo.toml': { workspace: { members: [member], exclude } },
+        [lower + '/Cargo.toml']: { package: { name: 'exporter' } },
+        [upper + '/Cargo.toml']: { package: { name: 'monitor' } },
+      },
+    });
+    assert.deepEqual(ws.members.map(pkg => pkg.root).sort(), expected, member);
+    assert.deepEqual(
+      ws.unsupported.map(item => item.reason),
+      expected.length ? [] : ['member-glob-no-match'],
+      member,
+    );
+  }
+});
+
 test('Cargo preserves distinct snapshot entries and detects two member spellings for one package', () => {
   const manifests = {
     'native/Codec/Cargo.toml': { package: { name: 'upper' } },

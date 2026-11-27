@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { lstat, readFile, realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { parse } from 'smol-toml';
+import { cargoPathAliasProbe } from './cargo-directory-case.mjs';
 import { resolveCargoWorkspace } from './cargo-workspace.mjs';
 import { execute } from './command.mjs';
 import { rustSourcePaths } from './rust-source-paths.mjs';
@@ -50,17 +51,16 @@ function dependencies(doc, rootDoc, dir, root) {
  * Resolve a Cargo workspace through the canonical resolver in cargo-workspace.mjs.
  * @param {Map<string, any>} documents
  * @param {string} [root]
- * @param {{ files?: Array<string | { path: string }> }} [options]
+ * @param {{ files?: Array<string | { path: string }>, probeAlias?: (original: string, spelling: string) => boolean }} [options]
  */
 export function cargoWorkspace(documents, root = '', options = {}) {
-  const { files } = options;
   const manifests = new Map();
   for (const [name, doc] of documents) {
     if (posix.basename(name) === 'Cargo.toml') manifests.set(name, doc);
   }
   return resolveCargoWorkspace({
+    ...options,
     manifests,
-    ...(files === undefined ? {} : { files }),
     startDir: normalized(root),
   });
 }
@@ -69,7 +69,7 @@ export function cargoWorkspace(documents, root = '', options = {}) {
  * Include implicit workspace members reached through local path dependencies.
  * @param {Map<string, any>} documents
  * @param {string} [root]
- * @param {{ files?: Array<string | { path: string }> }} [options]
+ * @param {{ files?: Array<string | { path: string }>, probeAlias?: (original: string, spelling: string) => boolean }} [options]
  */
 export function cargoMembers(documents, root = '', options = {}) {
   const resolved = cargoWorkspace(documents, root, options);
@@ -297,12 +297,17 @@ function packageSpec(doc, root) {
     : null;
 }
 
-export function affectedCrates(documents, changed, snapshot = { entries: [], sources: new Map() }) {
+export function affectedCrates(
+  documents,
+  changed,
+  snapshot = { entries: [], sources: new Map() },
+  probeAlias = undefined,
+) {
   const entries = snapshot.entries ?? [];
   const linkPaths = entries.filter(entry => entry.mode === '120000').map(entry => entry.file);
   const nonLinkEntries = entries.filter(entry => entry.mode !== '120000').map(entry => entry.file);
   const files = [...nonLinkEntries, ...(snapshot.sources ? snapshot.sources.keys() : [])];
-  const workspace = cargoWorkspace(documents, '', { files: files.length ? files : undefined });
+  const workspace = cargoWorkspace(documents, '', { files: files.length ? files : undefined, probeAlias });
   const members = new Map(workspace.members.map(member => [member.root, member.doc]));
   const root = documents.get('Cargo.toml');
   const all = [...members.values()].map(doc => doc.package.name);
@@ -457,7 +462,8 @@ export async function cargoPlanAt(cwd, baseSha, headSha) {
   const docs = new Map();
   for (const [file, text] of snapshot.sources) if (posix.basename(file) === 'Cargo.toml') docs.set(file, parse(text));
   const nonLinkFiles = snapshot.entries.filter(entry => entry.mode !== '120000').map(entry => entry.file);
-  const extra = extraTargetFiles(cargoMembers(docs, '', { files: nonLinkFiles }));
+  const probeAlias = cargoPathAliasProbe(cwd);
+  const extra = extraTargetFiles(cargoMembers(docs, '', { files: nonLinkFiles, probeAlias }));
   if (extra.size) {
     const targets = await readSourceSnapshot(cwd, headSha, file => extra.has(file));
     for (const [file, text] of targets.sources) snapshot.sources.set(file, text);
@@ -482,7 +488,7 @@ export async function cargoPlanAt(cwd, baseSha, headSha) {
     pending = [...more.sources.keys()];
     for (const [file, text] of more.sources) snapshot.sources.set(file, text);
   }
-  const scope = affectedCrates(docs, changed, { ...snapshot, references });
+  const scope = affectedCrates(docs, changed, { ...snapshot, references }, probeAlias);
   const unrelatedLinks = scope.fallback
     ? []
     : snapshot.entries.filter(entry => entry.mode === '120000').map(entry => entry.file);
@@ -571,7 +577,8 @@ export async function cargoFeedbackGraph({ project, baseSha, headSha, changedPat
   }
 
   const nonLinkFiles = snapshot.entries.filter(entry => entry.mode !== '120000').map(entry => entry.file);
-  const workspace = cargoWorkspace(docs, '', { files: nonLinkFiles });
+  const probeAlias = cargoPathAliasProbe(project);
+  const workspace = cargoWorkspace(docs, '', { files: nonLinkFiles, probeAlias });
   const members = new Map(workspace.members.map(member => [member.root, member.doc]));
   const references = await collectFeedbackReferences(
     project,
@@ -595,7 +602,7 @@ export async function cargoFeedbackGraph({ project, baseSha, headSha, changedPat
   const cargoChanged = changedFiles.filter(file => !feedbackConfigFile(file));
   if (!cargoChanged.length) return result(changedFiles, [], false, []);
 
-  const scope = affectedCrates(docs, cargoChanged, { ...snapshot, references });
+  const scope = affectedCrates(docs, cargoChanged, { ...snapshot, references }, probeAlias);
   let { fallback, reasons } = scope;
   let affectedCrateNames = sortedUnique(scope.affectedCrates);
   if (fallback && reasons.length && reasons.every(reason => reason === 'cargo-workspace-input')) {

@@ -56,6 +56,7 @@ async function pins() {
     'architecture-rust.mjs',
     'cargo-workspace.mjs',
     'cargo-member-paths.mjs',
+    'cargo-directory-case.mjs',
     'scope-paths.mjs',
     'contract-registry.mjs',
     'javascript-dependencies.mjs',

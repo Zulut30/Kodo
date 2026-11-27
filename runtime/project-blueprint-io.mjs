@@ -4,11 +4,11 @@
 
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { lstatSync } from 'node:fs';
 import { lstat, open, readdir, realpath, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { parse as parseToml } from 'smol-toml';
+import { cargoPathAliasProbe } from './cargo-directory-case.mjs';
 import { blueprintScopeBranches } from './cargo-workspace.mjs';
 import { plannedPackageDirs } from './project-blueprint-cargo-scopes.mjs';
 import { pathParents, scopeIndexPrefix, scopeOwnership } from './project-blueprint-scope-index.mjs';
@@ -581,19 +581,15 @@ export async function blueprintChildDirectories(root, parent, revision) {
     .map(row => row.slice(row.indexOf('\t') + 1));
 }
 
-// A Windows directory can be case-sensitive even with a single tracked child.
-// Probe file identity only for two candidate spellings. The selected tree
-// supplies every name, file type and manifest used to build the package plan.
-export function blueprintPathAlias(root, original, spelling) {
-  const statEntry = file => lstatSync(path.join(root, file), { bigint: true, throwIfNoEntry: false });
-  try {
-    const entry = statEntry(original);
-    if (!entry) return true;
-    const alias = statEntry(spelling);
-    return alias?.ino === entry.ino && alias.dev === entry.dev;
-  } catch {
-    throw cargoEvidenceFailure();
-  }
+export function blueprintPathAliasProbe(root) {
+  const probeAlias = cargoPathAliasProbe(root);
+  return (original, spelling) => {
+    try {
+      return probeAlias(original, spelling);
+    } catch {
+      throw cargoEvidenceFailure();
+    }
+  };
 }
 
 // A manifest scope owns that entry regardless of its contents. A source scope

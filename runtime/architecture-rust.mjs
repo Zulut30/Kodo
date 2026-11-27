@@ -1,6 +1,7 @@
 /** Offline Cargo workspace parser and Rust crate graph builder for Architecture Guardian. */
 import { createHash } from 'node:crypto';
 import { parse as parseToml } from 'smol-toml';
+import { CargoDirectoryNames } from './cargo-member-paths.mjs';
 import {
   collectManifestDependencies,
   decodeUtf8,
@@ -31,7 +32,7 @@ function canonical(value) {
 }
 const hash = value => digest(JSON.stringify(canonical(value)));
 
-function resolveDependencySpec({ crate, dep, workspaceDeps, crateByDir, unknown }) {
+function resolveDependencySpec({ crate, dep, workspaceDeps, crateAt, unknown }) {
   const { key, spec, kind } = dep;
   if (typeof spec === 'string') {
     return {
@@ -65,7 +66,7 @@ function resolveDependencySpec({ crate, dep, workspaceDeps, crateByDir, unknown 
         unknown('dependency', 'Cargo.toml', 'unsafe-path');
         return null;
       }
-      const target = crateByDir.get(targetDir);
+      const target = crateAt(targetDir);
       if (!target) {
         unknown('dependency', crate.manifest, 'out-of-workspace-dependency');
         return null;
@@ -106,7 +107,7 @@ function resolveDependencySpec({ crate, dep, workspaceDeps, crateByDir, unknown 
       unknown('dependency', crate.manifest, 'unsafe-path');
       return null;
     }
-    const target = crateByDir.get(targetDir);
+    const target = crateAt(targetDir);
     if (!target) {
       unknown('dependency', crate.manifest, 'out-of-workspace-dependency');
       return null;
@@ -168,9 +169,9 @@ function checkUnsupportedOverrides({ files, contents, rootDoc, unknown }) {
 /**
  * Pure offline Cargo workspace parser over a tracked file inventory and Cargo.toml blobs.
  * Never spawns `cargo` or touches the network.
- * @param {{ files: Array<{ path: string, mode: string, oid: string }>, contents: Map<string, Buffer | string> }} input
+ * @param {{ files: Array<{ path: string, mode: string, oid: string }>, contents: Map<string, Buffer | string>, probeAlias?: (original: string, spelling: string) => boolean }} input
  */
-export function parseCargoWorkspace({ files, contents }) {
+export function parseCargoWorkspace({ files, contents, probeAlias }) {
   const unsupported = new Map();
   const unknown = (scope, file, reason, offset = null) => {
     const id = hash([scope, file, reason, offset]);
@@ -187,7 +188,7 @@ export function parseCargoWorkspace({ files, contents }) {
       if (raw !== undefined) manifests.set(entry.path, raw);
     }
   }
-  const resolved = resolveCargoWorkspace({ manifests, files: trackedFiles, startDir: '' });
+  const resolved = resolveCargoWorkspace({ manifests, files: trackedFiles, probeAlias });
   for (const item of resolved.unsupported) unsupported.set(item.id, item);
   checkUnsupportedOverrides({ files, contents, rootDoc: resolved.rootDoc, unknown });
   if (!resolved.hasWorkspace) {
@@ -225,6 +226,8 @@ export function parseCargoWorkspace({ files, contents }) {
     if (ownerDir !== undefined) crateByDir.get(ownerDir).files.push(entry.path);
   }
   for (const crate of crates) crate.files.sort(compare);
+  const memberDirs = new CargoDirectoryNames(crateByDir.keys(), probeAlias);
+  const crateAt = dir => crateByDir.get(memberDirs.resolve(dir));
   const edges = [];
   for (const crate of crates) {
     const doc = docs.get(crate.name);
@@ -236,7 +239,7 @@ export function parseCargoWorkspace({ files, contents }) {
         crate,
         dep,
         workspaceDeps: resolved.workspaceDependencies,
-        crateByDir,
+        crateAt,
         unknown,
       });
       if (edge) edges.push(edge);
@@ -268,10 +271,11 @@ export function parseCargoWorkspace({ files, contents }) {
  *   files: Array<{ path: string, mode: string, oid: string }>,
  *   contents: Map<string, Buffer | string>,
  *   treeUnsupported?: Array<Record<string, any>>,
+ *   probeAlias?: (original: string, spelling: string) => boolean,
  * }} input
  */
-export function buildRustArchitectureGraph({ headSha, policy, files, contents, treeUnsupported = [] }) {
-  const parsed = parseCargoWorkspace({ files, contents });
+export function buildRustArchitectureGraph({ headSha, policy, files, contents, treeUnsupported = [], probeAlias }) {
+  const parsed = parseCargoWorkspace({ files, contents, probeAlias });
   const layerOf = new Map();
   for (const [index, layer] of policy.layers.entries()) {
     for (const crateName of layer.crates) layerOf.set(crateName, { id: layer.id, index });

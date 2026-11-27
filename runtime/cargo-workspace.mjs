@@ -828,7 +828,7 @@ function resolveWorkspaceAtRoot({ rootDir, rootEntry, names, manifestDirs, snaps
   };
 }
 
-function createWorkspaceIndex({ manifests, files }) {
+function createWorkspaceIndex({ manifests, files = undefined, probeAlias = undefined }) {
   const rawMap = toManifestMap(manifests);
   const { snapshotDirs, snapshotFiles } = collectSnapshotEntries(rawMap, files);
   const manifestDirs = new Map();
@@ -853,7 +853,7 @@ function createWorkspaceIndex({ manifests, files }) {
     snapshotFiles,
     manifestDirs,
     parsedCache,
-    names: new CargoDirectoryNames(snapshotDirs),
+    names: new CargoDirectoryNames(snapshotDirs, probeAlias),
   };
 }
 
@@ -921,20 +921,20 @@ function resolveStartDir(index, startDir, resolvedCache = new Map()) {
 
 /**
  * Resolve a Cargo workspace offline using Cargo's member/exclude/path-dependency rules.
- * @param {{ manifests: Map<string, Buffer | string | Record<string, any>> | Record<string, Buffer | string | Record<string, any>>, files?: Array<string | { path: string }>, startDir?: string }} input
+ * @param {{ manifests: Map<string, Buffer | string | Record<string, any>> | Record<string, Buffer | string | Record<string, any>>, files?: Array<string | { path: string }>, startDir?: string, probeAlias?: (original: string, spelling: string) => boolean }} input
  */
-export function resolveCargoWorkspace({ manifests, files, startDir = '' }) {
-  return resolveStartDir(createWorkspaceIndex({ manifests, files }), startDir);
+export function resolveCargoWorkspace(input) {
+  return resolveStartDir(createWorkspaceIndex(input), input.startDir ?? '');
 }
 
 /**
  * Map every package directory belonging to a valid Cargo workspace to its workspace root.
  * Indexes manifests and snapshot files once and caches resolution per workspace root.
- * @param {{ manifests: Map<string, Buffer | string | Record<string, any>> | Record<string, Buffer | string | Record<string, any>>, files?: Array<string | { path: string }> }} input
+ * @param {{ manifests: Map<string, Buffer | string | Record<string, any>> | Record<string, Buffer | string | Record<string, any>>, files?: Array<string | { path: string }>, probeAlias?: (original: string, spelling: string) => boolean }} input
  * @returns {Map<string, string>}
  */
-export function resolveCargoWorkspaceRoots({ manifests, files }) {
-  const index = createWorkspaceIndex({ manifests, files });
+export function resolveCargoWorkspaceRoots(input) {
+  const index = createWorkspaceIndex(input);
   const resolvedCache = new Map();
   const roots = new Map();
   for (const member of index.manifestDirs.keys()) {

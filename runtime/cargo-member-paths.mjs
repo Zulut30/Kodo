@@ -130,7 +130,7 @@ function compileGlobSegment(segment) {
  */
 function globRegex(pattern, literals = undefined) {
   if (pattern === '') return /^$/;
-  const parts = pattern.split('/');
+  const parts = pattern.split('/').filter((part, i, all) => part !== '**' || all[i - 1] !== '**');
   let expr = '^';
   for (let i = 0; i < parts.length; i++) {
     const part = parts[i];
@@ -148,7 +148,9 @@ function globRegex(pattern, literals = undefined) {
     if (i > 0) {
       expr += parts[i - 1] === '**' ? (i - 1 === 0 ? '' : '/') : '/';
     }
-    if (literals && !hasCargoGlob(part)) {
+    // A recursive walk compares its next pattern with names from read_dir.
+    // Only a subsequent literal component goes back to a native path lookup.
+    if (literals && parts[i - 1] !== '**' && !hasCargoGlob(part)) {
       literals.push(part);
       expr += `((?i:${compiled}))`;
     } else expr += compiled;
