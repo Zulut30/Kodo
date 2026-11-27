@@ -1,105 +1,131 @@
 import { spawn, spawnSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
-import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
+import { Worker, isMainThread, parentPort, workerData } from 'node:worker_threads';
 import { gitBoundary } from './command.mjs';
-import { stopOwnedTree } from './delivery-process.mjs';
 
-const entry = fileURLToPath(import.meta.url);
 const lockSettings = ['core.filesRefLockTimeout', 'core.packedRefsTimeout', 'reftable.lockTimeout'];
+const preparing = 0,
+  committing = 1,
+  aborting = 2,
+  committed = 3,
+  refused = 4,
+  unknown = 5;
 
-async function deadline(ms, signal) {
-  // Node timers take signed 32-bit delays. spawnSync also accepts longer timeouts.
-  const max = 2 ** 31 - 1;
-  while (ms > max) {
-    await delay(max, undefined, { signal });
-    ms -= max;
-  }
-  return delay(ms, 'timeout', { signal });
-}
-
-async function supervise(input, timeoutMs) {
-  // Git must be able to finish a pending prepare and clean up locks acquired
-  // earlier in the same transaction, even in a repo configured to wait forever.
-  const lockBudget = Math.min(timeoutMs, 2 ** 31 - 1);
-  const config = lockSettings.flatMap(key => ['-c', `${key}=${lockBudget}`]);
-  const { args, env } = gitBoundary([...config, 'update-ref', '--stdin'], process.env);
-  const git = spawn('git', args, { env, windowsHide: true, stdio: ['pipe', 'pipe', 'ignore'] });
-  const timer = new AbortController();
-  const expires = performance.now() + timeoutMs;
-  let phase = 'preparing';
-  const replies = createInterface({ input: git.stdout });
+/** @param {{ cwd: string, args: string[], input: string, state: Int32Array, expires: number }} request */
+async function supervise({ cwd, args, input, state, expires }) {
+  if (Atomics.load(state, 0) !== preparing) return unknown;
+  // A cancelled Git must be able to see abort/EOF and clean up its own locks,
+  // including when the caller exits before a slow prepare drains.
+  const git = spawn('git', args, { cwd, detached: true, windowsHide: true, stdio: ['pipe', 'pipe', 'ignore'] });
+  let started = false,
+    confirmed = false;
+  /** @type {Promise<number>} */
   const closed = new Promise(resolve => {
-    git.once('error', () => resolve('unknown'));
+    git.once('spawn', () => {
+      started = true;
+    });
+    git.once('error', () => {}); // A failed spawn also emits close.
     git.once('close', (code, signal) => {
-      if (signal || code === null) resolve('unknown');
-      else if (code === 0 && phase === 'committed') resolve('committed');
-      else resolve(code !== 0 && phase === 'preparing' ? 'refused' : 'unknown');
+      if (confirmed) resolve(committed);
+      else if (started && !signal && code !== null && code !== 0 && Atomics.load(state, 0) === preparing)
+        resolve(refused);
+      else resolve(unknown);
     });
   });
+  const abort = () => {
+    if (!git.stdin.writableEnded) git.stdin.end('abort\n');
+  };
+  parentPort.once('message', abort);
+  const replies = createInterface({ input: git.stdout, crlfDelay: Infinity });
+  replies.once('error', abort);
   replies.on('line', line => {
-    if (phase === 'committing' && line === 'commit: ok') phase = 'committed';
-    if (phase === 'preparing' && line === 'prepare: ok' && !git.stdin.writableEnded && performance.now() < expires) {
-      phase = 'committing';
+    if (line === 'commit: ok' && Atomics.load(state, 0) === committing) confirmed = true;
+    if (line !== 'prepare: ok' || git.stdin.writableEnded) return;
+    if (performance.now() < expires && Atomics.compareExchange(state, 0, preparing, committing) === preparing) {
+      Atomics.notify(state, 0);
       git.stdin.end('commit\n');
-    }
+    } else abort();
   });
   git.stdin.on('error', () => {});
   git.stdin.write(input + 'prepare\n');
   try {
-    const result = await Promise.race([closed, deadline(timeoutMs, timer.signal)]);
-    if (result !== 'timeout') return result;
-    // A queued abort lets Git release earlier verify/update locks itself.
-    const committing = phase !== 'preparing';
-    if (!committing) git.stdin.end('abort\n');
-    const grace = committing ? 250 : Math.min(lockBudget + 250, 2 ** 31 - 1);
-    if ((await Promise.race([closed, deadline(grace, timer.signal)])) === 'timeout') {
-      try {
-        await stopOwnedTree(git);
-      } catch (error) {
-        // If commit was sent, release the SQLite fence only once the writer is gone.
-        if (committing) await closed;
-        throw error;
-      }
-    }
-    return 'unknown';
+    return await closed;
   } finally {
-    timer.abort();
     replies.close();
+    parentPort.off('message', abort);
   }
 }
 
 /**
- * Keep the caller's SQLite fence until the Git writer has stopped. Git for
- * Windows may start a second git.exe which survives a timeout of its launcher.
+ * Synchronous inside the caller's SQLite write transaction. The Git protocol
+ * runs on a thread of the same process as the fence owner.
  * @param {string} cwd
  * @param {string} input
  * @param {number} timeoutMs
  */
 export function runRefTransaction(cwd, input, timeoutMs) {
-  const { args, env } = gitBoundary(['update-ref', '--stdin'], process.env);
-  const options = { cwd, env, input, encoding: /** @type {const} */ ('utf8'), windowsHide: true };
-  if (process.platform !== 'win32' || !Number.isInteger(timeoutMs) || timeoutMs <= 0) {
-    const result = spawnSync('git', args, { ...options, input: input + 'commit\n', timeout: timeoutMs });
+  const windows = process.platform === 'win32';
+  const supervised = windows && Number.isInteger(timeoutMs) && timeoutMs >= 0;
+  const lockBudget = Math.min(timeoutMs, 2 ** 31 - 1);
+  const config = supervised && lockBudget > 0 ? lockSettings.flatMap(key => ['-c', key + '=' + lockBudget]) : [];
+  const { args, env } = gitBoundary([...config, 'update-ref', '--stdin'], process.env);
+  // mingw consults this helper before checking whether stdin/stderr are TTYs.
+  if (windows) {
+    for (const key of Object.keys(env)) if (key.toUpperCase() === 'GIT_ASK_YESNO') delete env[key];
+  }
+  if (!supervised) {
+    const result = spawnSync('git', args, {
+      cwd,
+      env,
+      input: input + 'commit\n',
+      timeout: timeoutMs,
+      windowsHide: true,
+    });
     if (result.error || result.status === null) return 'unknown';
     return result.status === 0 ? 'committed' : 'refused';
   }
-  // The supervisor owns the deadline. Killing it here would release the fence
-  // while it is still waiting for a descendant of the Git launcher.
   for (const key of Object.keys(env))
     if (/^NODE_(?:OPTIONS|PATH|TEST_CONTEXT|TEST_WORKER_ID)$/i.test(key)) delete env[key];
-  const result = spawnSync(process.execPath, [entry, String(timeoutMs)], options);
-  if (result.error || result.status !== 0) return 'unknown';
-  return result.stdout === 'committed' || result.stdout === 'refused' ? result.stdout : 'unknown';
+
+  const state = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+  const expires = timeoutMs > 0 ? performance.now() + timeoutMs : Infinity;
+  let worker;
+  try {
+    worker = new Worker(new URL(import.meta.url), {
+      env,
+      execArgv: [],
+      workerData: { cwd, input, args, state, expires },
+    });
+  } catch {
+    return 'unknown';
+  }
+  worker.on('error', () => {}); // Startup failure cannot authorize a commit.
+  Atomics.wait(state, 0, preparing, expires - performance.now());
+  if (Atomics.compareExchange(state, 0, preparing, aborting) === preparing) {
+    worker.postMessage('abort');
+    // Bound the caller's wait for cleanup. A late prepare can only abort.
+    if (Atomics.wait(state, 0, aborting, lockBudget + 250) === 'timed-out') {
+      // Close the protocol pipes. Only the thread stops; Git owns its cleanup.
+      void worker.terminate();
+      worker.unref();
+    }
+    return 'unknown';
+  }
+  // The worker won permission to send commit or has already finished. Once
+  // granted, wait for the real Git writer to close even past the prepare deadline.
+  Atomics.wait(state, 0, committing);
+  const result = Atomics.load(state, 0);
+  return result === committed ? 'committed' : result === refused ? 'refused' : 'unknown';
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === entry) {
+if (!isMainThread && process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  let result = unknown;
   try {
-    const result = await supervise(readFileSync(0, 'utf8'), Number(process.argv[2]));
-    process.stdout.write(result);
-  } catch {
-    process.exitCode = 1;
+    result = await supervise(workerData);
+  } finally {
+    Atomics.store(workerData.state, 0, result);
+    Atomics.notify(workerData.state, 0);
   }
 }

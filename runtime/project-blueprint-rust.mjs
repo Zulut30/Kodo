@@ -204,17 +204,39 @@ function taskCreatesCompilableContractCrate(task, contractRoot) {
   }
   return coversManifest && coversSource;
 }
+function plannedContractScopeMatcher(contractRoots, tree) {
+  const futureRoots = [...contractRoots].filter(root => !tree.manifests.has(root || '.'));
+  if (!futureRoots.length) return null;
+  const manifests = new Map(tree.manifests);
+  for (const root of futureRoots) manifests.set(root || '.', null);
+  const parents = new Set();
+  for (const dir of manifests.keys()) {
+    if (dir !== '.') parents.add('');
+    for (const parent of pathParents(dir)) parents.add(parent);
+  }
+  let fileOwners;
+  return scope => {
+    let owners;
+    return futureRoots.some(root => {
+      if (!isBroadContractScope(scope, root)) return false;
+      if (!parents.has(root)) return true;
+      // A scope can enter this subtree but write only into a nested package.
+      fileOwners ??= createPackageFileOwnerResolver(manifests, tree.entryKinds);
+      owners ??= fileOwners(scope);
+      return owners.has(root || '.');
+    });
+  };
+}
+
 function broadContractScopeFindings(spec, contractRoots, plan, protectedOwner) {
-  // Wave 0 can declare a crate that has no manifest yet. For existing crates
-  // the per-scope owner already proves reachability past nested manifests.
-  const futureRoots = [...contractRoots].filter(root => !plan.tree.manifests.has(root || '.'));
-  if (!futureRoots.length && !plan.broadOwners.size) return [];
+  const targetsPlannedContract = plannedContractScopeMatcher(contractRoots, plan.tree);
+  if (!targetsPlannedContract && !plan.broadOwners.size) return [];
   const offending = new Set();
   for (const task of spec.tasks) {
     for (const scope of task.writePaths ?? []) {
       if (typeof scope !== 'string') continue;
       const owners = plan.broadOwners.get(scope.replace(/^\.\//, ''));
-      if (owners?.some(protectedOwner) || futureRoots.some(root => isBroadContractScope(scope, root))) {
+      if (owners?.some(protectedOwner) || targetsPlannedContract?.(scope)) {
         offending.add(task.id);
         break;
       }

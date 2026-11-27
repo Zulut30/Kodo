@@ -72,6 +72,108 @@ async function fixture(t, rootManifest = workspace(mainMembers, [side])) {
   return { root, git, commit, write, compile, spec };
 }
 
+test('Cargo path dependencies use native separators when counting workspace packages', async t => {
+  const members = ['native/client', 'native/server'];
+  const f = await fixture(t, workspace(members));
+  const sources = mainMembers.map(dir => dir + '/src/lib.rs');
+  for (const separator of ['/', '\\']) {
+    const relative = ['..', 'codec'].join(separator);
+    const workspaceRoot = ['..', '..'].join(separator);
+    await f.write(
+      'native/client/Cargo.toml',
+      manifest('client') + "[dependencies]\nwire-contracts={path='" + relative + "'}\n",
+    );
+    await f.write('native/codec/Cargo.toml', manifest('wire-contracts') + "workspace='" + workspaceRoot + "'\n");
+    f.commit();
+    const expected = separator === '/' || path.sep === '\\' ? threshold : [];
+    for (const forRegistration of [false, true])
+      assert.deepEqual(await f.compile(sources, { forRegistration }), expected, relative);
+  }
+  const inherited = ['native', 'codec'].join(path.sep);
+  await f.write('native/client/Cargo.toml', manifest('client') + '[dependencies]\nwire-contracts.workspace=true\n');
+  await f.write('native/codec/Cargo.toml', manifest('wire-contracts'));
+  await f.write(
+    'Cargo.toml',
+    workspace(members) + "[workspace.dependencies]\nwire-contracts={path='" + inherited + "'}\n",
+  );
+  f.commit();
+  assert.deepEqual(await f.compile(sources, { forRegistration: true }), threshold);
+});
+
+test('Wave 0 counts an excluded plugin reachable below a literal workspace member', async t => {
+  const f = await fixture(t);
+  const host = 'native/client';
+  const plugin = host + '/plugins/exporter';
+  const glob = host + '/plugins/*';
+  await f.write(plugin + '/Cargo.toml', manifest('wire-contracts'));
+  await f.write(plugin + '/src/lib.rs', '');
+  const writes = [host + '/src/lib.rs', 'native/server/src/lib.rs', plugin + '/Cargo.toml', plugin + '/src/lib.rs'];
+  for (const [members, dependency, included, exclude = [plugin]] of [
+    [[host, glob], false, true],
+    [[host], true, true],
+    [[host], false, false],
+    [['native/clien?', glob], false, false],
+    [['native/other/../client', glob], false, false],
+    [['native/clien?', glob], false, false, [plugin + '/Cargo.toml']],
+    [['.', host, glob], false, true],
+  ]) {
+    await f.write('Cargo.toml', workspace([...members, 'native/server'], exclude));
+    await f.write(
+      host + '/Cargo.toml',
+      manifest('client') + (dependency ? '[dependencies]\nwire-contracts={path="plugins/exporter"}\n' : ''),
+    );
+    f.commit();
+    for (const forRegistration of [false, true]) {
+      assert.deepEqual(await f.compile(writes, { forRegistration }), included ? threshold : []);
+      assert.deepEqual(await f.compile([glob + '/' + schema], { forRegistration }), included ? broad : []);
+    }
+  }
+});
+
+test('a planned contract respects the nearest existing package for each grouped file scope', async t => {
+  const outer = 'crates/api-contracts';
+  const child = outer + '/codegen';
+  const other = 'tools/renderer';
+  const f = await fixture(t, workspace([child, other]));
+  await rm(path.join(f.root, 'architecture.policy.json'));
+  for (const id of ['web-module', 'api-module'])
+    f.spec.tasks.find(task => task.id === id).dependsOn.push('storage-module');
+  f.spec.constraints.push('workspaceRoot: .', 'contractCrate: ' + outer);
+  f.spec.tasks.find(task => task.id === 'scaffold').writePaths = [
+    'Cargo.toml',
+    outer + '/Cargo.toml',
+    outer + '/src/lib.rs',
+    'architecture.policy.json',
+  ];
+  for (const [dir, name] of [
+    [child, 'codegen'],
+    [other, 'renderer'],
+  ]) {
+    await f.write(dir + '/Cargo.toml', manifest(name));
+    await f.write(dir + '/src/lib.rs', '');
+    await f.write(dir + '/' + schema, 'syntax = "proto3";\n');
+  }
+  f.commit();
+  for (const materialized of [false, true]) {
+    if (materialized) {
+      await f.write('Cargo.toml', workspace([child, other, outer]));
+      await f.write(outer + '/Cargo.toml', manifest('api-contracts'));
+      await f.write(outer + '/src/lib.rs', '');
+      f.commit();
+    }
+    for (const [scope, expected] of [
+      [child, []],
+      ['{' + child + '}', []],
+      ['{' + child + ',' + other + '}', []],
+      ['{' + outer + '}', broad],
+      ['{' + child + ',' + outer + '}', broad],
+    ]) {
+      for (const forRegistration of [false, true])
+        assert.deepEqual(await f.compile([scope + '/' + schema], { forRegistration }), expected, scope);
+    }
+  }
+});
+
 test('an independent workspace can change its namesake package under data, source and manifest scopes', async t => {
   const f = await fixture(t);
   f.commit();

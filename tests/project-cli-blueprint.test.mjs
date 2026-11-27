@@ -985,35 +985,45 @@ for (const refFormat of ['files', 'reftable']) {
     test(`apply-spec holds HEAD and its branch through SQLite COMMIT (${refFormat}, ${linked ? 'linked' : 'main'})`, t =>
       checkRegistrationLocks(t, refFormat, linked));
   }
-}
-
-test('an interrupted registration preserves the linked reftable branch and its reflog', async t => {
-  const f = await registrationFixture(t, { refFormat: 'reftable', linked: true });
-  if (f.git('config', '--get', '--default', 'files', 'extensions.refStorage') !== 'reftable')
-    return t.skip('Git lacks reftable initialization');
-  const branch = f.git('symbolic-ref', 'HEAD');
-  const head = f.git('rev-parse', 'HEAD');
-  const refs = f.git('show-ref', '--head');
-  const log = f.git('reflog', 'show', '--all');
-  const entry = new URL('../runtime/project-blueprint-head.mjs', import.meta.url).href;
-  const interrupt = `
-    const [entry, root, head] = process.argv.slice(1);
-    const { withVerifiedBlueprintHead } = await import(entry);
-    await withVerifiedBlueprintHead(root, head, () => process.exit(73));
-  `;
-  // Exit with Git prepared, before JS can send abort. Git must abort on EOF.
-  const child = spawnSync(process.execPath, ['--input-type=module', '-e', interrupt, entry, f.root, head], {
-    env: workerEnvironment(),
-    encoding: 'utf8',
-    timeout: 15000,
-    windowsHide: true,
+  test(`an interrupted registration preserves the linked ${refFormat} branch and its reflog`, async t => {
+    const f = await registrationFixture(t, { refFormat, linked: true });
+    if (refFormat === 'reftable' && f.git('config', '--get', '--default', 'files', 'extensions.refStorage') === 'files')
+      return t.skip('Git lacks reftable initialization');
+    const branch = f.git('symbolic-ref', 'HEAD');
+    const head = f.git('rev-parse', 'HEAD');
+    const refs = f.git('show-ref', '--head');
+    const log = f.git('reflog', 'show', '--all');
+    const entry = new URL('../runtime/project-blueprint-head.mjs', import.meta.url).href;
+    const interrupt = `
+      const [entry, root, head] = process.argv.slice(1);
+      const { withVerifiedBlueprintHead } = await import(entry);
+      await withVerifiedBlueprintHead(root, head, () => process.exit(73));
+    `;
+    // Exit with Git prepared, before JS can send abort. Git must abort on EOF.
+    const child = spawnSync(process.execPath, ['--input-type=module', '-e', interrupt, entry, f.root, head], {
+      env: workerEnvironment(),
+      encoding: 'utf8',
+      timeout: 15000,
+      windowsHide: true,
+    });
+    assert.ifError(child.error);
+    assert.equal(child.status, 73, child.stderr);
+    assert.equal(f.git('show-ref', '--head'), refs);
+    assert.equal(f.git('reflog', 'show', '--all'), log);
+    const next = f.git('rev-parse', 'without-pin');
+    f.mainGit(
+      '-c',
+      'core.filesRefLockTimeout=5000',
+      '-c',
+      'reftable.lockTimeout=5000',
+      'update-ref',
+      branch,
+      next,
+      head,
+    );
+    assert.equal(f.git('rev-parse', 'HEAD'), next);
   });
-  assert.ifError(child.error);
-  assert.equal(child.status, 73, child.stderr);
-  assert.equal(f.git('show-ref', '--head'), refs);
-  assert.equal(f.git('reflog', 'show', '--all'), log);
-  f.mainGit('-c', 'reftable.lockTimeout=5000', 'update-ref', branch, f.git('rev-parse', 'without-pin'), head);
-});
+}
 
 test('apply-spec releases a detached linked HEAD after a Store rollback', async t => {
   const f = await registrationFixture(t, { refFormat: 'reftable', linked: true });

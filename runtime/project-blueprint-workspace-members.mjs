@@ -5,32 +5,20 @@ import {
   cargoPackageTable,
   collectManifestDependencies,
   compileCargoGlob,
-  normalizeWorkspacePath,
   parseWorkspaceDependencies,
   resolveDepTargetDir,
+  resolveManifestDir,
   resolvePackageEdition,
-  resolveRelativeDir,
+  workspaceExclusionMatcher,
+  workspaceMemberPattern,
 } from './cargo-workspace.mjs';
 import { readBlueprintCargoTree, readOptionalBlueprintMetadata } from './project-blueprint-io.mjs';
-import { pathParents } from './project-blueprint-scope-index.mjs';
+import { pathAndAncestors } from './scope-paths.mjs';
 import { BLUEPRINT_LIMITS, failure, isPlain } from './project-blueprint-shared.mjs';
 
 const manifestFile = dir => (dir ? dir + '/Cargo.toml' : 'Cargo.toml');
 const hasGlob = pattern => /[*?[]/.test(pattern);
 const isWithin = (root, dir) => !root || dir === root || dir.startsWith(root + '/');
-const joinDir = (dir, path) => (dir && path ? dir + '/' + path : dir || path);
-
-// Resolve the literal prefix against the project boundary before using a
-// Cargo member glob. No parent segment reaches a tree walk or Git pathspec.
-function memberPattern(root, raw) {
-  if (typeof raw !== 'string' || raw.length > 1024) return null;
-  const parts = raw.trim().split('/');
-  const end = parts.lastIndexOf('..') + 1;
-  const base = end ? resolveRelativeDir(root, parts.slice(0, end).join('/')) : root;
-  const suffix = end ? parts.slice(end).filter(Boolean).join('/') || '.' : raw;
-  const pattern = normalizeWorkspacePath(suffix, { allowGlob: true });
-  return base === null || pattern === null ? null : joinDir(base, pattern);
-}
 
 export function blueprintManifestReader(root, revision, tree) {
   const docs = new Map();
@@ -69,7 +57,7 @@ export function blueprintManifestReader(root, revision, tree) {
 function workspaceRules(root, rootDoc) {
   const ws = isPlain(rootDoc.workspace) ? rootDoc.workspace : null;
   const declared = (Array.isArray(ws?.members) ? ws.members : [])
-    .map(item => memberPattern(root, item))
+    .map(item => workspaceMemberPattern(root, item))
     .filter(pattern => pattern !== null);
   const literal = new Set(declared.filter(pattern => !hasGlob(pattern)));
   const globPatterns = declared.filter(hasGlob);
@@ -78,25 +66,18 @@ function workspaceRules(root, rootDoc) {
     const name = pattern.slice(pattern.lastIndexOf('/') + 1);
     return matcher ? [{ matcher, namesMember: /[^*?]/.test(name) }] : [];
   });
-  // Cargo compares excludes as literal subtree prefixes under this root.
-  const excluded = (Array.isArray(ws?.exclude) ? ws.exclude : [])
-    .map(item => normalizeWorkspacePath(item))
-    .filter(pattern => pattern !== null)
-    .map(pattern => joinDir(root, pattern));
-  const isExcluded = dir => excluded.some(path => isWithin(path, dir));
-  const allows = dir => dir === root || (ws !== null && (literal.has(dir) || !isExcluded(dir)));
+  const isExcluded = workspaceExclusionMatcher(root, ws);
+  const allows = dir => dir === root || (ws !== null && !isExcluded(dir));
   // A catch-all member glob alone does not establish the type of an absent
   // source or manifest. A literal member or a named pattern such as *.rs can.
-  const matchesGlob = (dir, requireName = false) =>
-    !isExcluded(dir) && globs.some(({ matcher, namesMember }) => (!requireName || namesMember) && matcher.test(dir));
-  const declares = (dir, requireName = false) => literal.has(dir) || matchesGlob(dir, requireName);
-  return { ws, literal, globPatterns, isExcluded, allows, matchesGlob, declares };
+  const declares = (dir, requireName = false) =>
+    !isExcluded(dir) &&
+    (literal.has(dir) || globs.some(({ matcher, namesMember }) => (!requireName || namesMember) && matcher.test(dir)));
+  return { ws, literal, globPatterns, isExcluded, allows, declares };
 }
 
 function* enclosingWorkspaces(dir, workspaces) {
-  if (dir && workspaces.has(dir)) yield dir;
-  for (const parent of pathParents(dir)) if (workspaces.has(parent)) yield parent;
-  if (workspaces.has('')) yield '';
+  for (const parent of pathAndAncestors(dir)) if (workspaces.has(parent)) yield parent;
 }
 
 async function loadWorkspaceRules(reader, workspaces, roots) {
@@ -146,7 +127,7 @@ function scaffoldWorkspace(dir, workspaces) {
 function eligibleMember(dir, doc, root) {
   const pkg = cargoPackageTable(doc);
   if (!pkg || (dir !== root && isPlain(doc.workspace))) return false;
-  return pkg.workspace === undefined ? isWithin(root, dir) : resolveRelativeDir(dir, pkg.workspace) === root;
+  return pkg.workspace === undefined ? isWithin(root, dir) : resolveManifestDir(dir, pkg.workspace) === root;
 }
 
 function memberEdition(dir, doc, ws) {
@@ -160,7 +141,7 @@ function memberEdition(dir, doc, ws) {
 }
 
 async function reachablePackages(reader, rules, root, candidates, needsPath) {
-  const { ws, literal, globPatterns, matchesGlob, declares, allows } = rules;
+  const { ws, literal, globPatterns, declares, allows } = rules;
   const rootDoc = reader.docs.get(root);
   const reached = new Set();
   if (candidates.has(root) && cargoPackageTable(rootDoc)) reached.add(root);
@@ -174,10 +155,10 @@ async function reachablePackages(reader, rules, root, candidates, needsPath) {
   // Only a path dependency can still make a candidate a member. Start at
   // the root package and declared members, following Cargo's dependency
   // tables (including inherited paths and edition-specific table aliases).
-  const frontier = new Set(literal);
+  const frontier = new Set([...literal].filter(allows));
   if (cargoPackageTable(rootDoc)) frontier.add(root);
   if (globPatterns.length) {
-    for (const dir of await reader.discover(globPatterns)) if (matchesGlob(dir)) frontier.add(dir);
+    for (const dir of await reader.discover(globPatterns)) if (declares(dir)) frontier.add(dir);
   }
   const dependencies = parseWorkspaceDependencies(ws?.dependencies);
   const visited = new Set();
@@ -245,7 +226,7 @@ export async function blueprintWorkspaceOwners(
   const bindings = new Map();
   for (const dir of existing) {
     const explicit = cargoPackageTable(reader.docs.get(dir))?.workspace;
-    bindings.set(dir, explicit === undefined ? undefined : resolveRelativeDir(dir, explicit));
+    bindings.set(dir, explicit === undefined ? undefined : resolveManifestDir(dir, explicit));
   }
   await loadWorkspaceRules(reader, workspaces, new Set(bindings.values()));
   const query = (root, dir) => {

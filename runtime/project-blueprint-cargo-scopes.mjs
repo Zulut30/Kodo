@@ -1,7 +1,13 @@
 // A planned file has the same nearest Cargo manifest as a committed file.
 // A directory alone supplies Rust source evidence only under its package's src subtree.
 import path from 'node:path';
-import { blueprintScopeBranches, resolveRelativeDir, unwrapContractPathGroups } from './cargo-workspace.mjs';
+import {
+  canDeferLiteralList,
+  expandBlueprintScope,
+  resolveRelativeDir,
+  scopeClassEnd as classEnd,
+  unwrapContractPathGroups,
+} from './cargo-workspace.mjs';
 import { braceBeforeExtglob, ownsPath, scopeBraceGroup, scopeGlobSyntax } from './scope-paths.mjs';
 import { pathParents, scopeOwnership } from './project-blueprint-scope-index.mjs';
 
@@ -10,36 +16,9 @@ const braceRange = /^(-?\d+)\.\.(-?\d+)(?:\.\.(-?\d+))?$|^([A-Za-z])\.\.([A-Za-z
 const dotFragment = /(?:^|[/{},])\.{1,2}(?=$|[/{},])/;
 const hasNavigationFragment = text => dotFragment.test(text) || /[{,](?=[,}])/.test(text);
 
-function classEnd(text, start) {
-  let i = start + 1;
-  if (text[i] === '!' || text[i] === '^') i++;
-  if (text[i] === ']') i++;
-  for (; i < text.length; i++) {
-    if (text[i] === ']') return i;
-    if (text.startsWith('[:', i)) {
-      const end = text.indexOf(':]', i + 2);
-      if (end !== -1) i = end + 1;
-    }
-  }
-  return -1;
-}
-
-// Plain filename fragments leave extglob arms intact, so the matcher can
-// discard a sibling before expanding its suffixes. Inside a character class
-// even an empty fragment can turn the first closing bracket into a literal.
-function canDeferLiteralList(pattern, index, arms) {
-  if (!arms.every(arm => /^[\p{L}\p{N}._-]*$/u.test(arm))) return false;
-  for (let open = pattern.indexOf('['); open !== -1 && open < index;) {
-    const close = classEnd(pattern, open);
-    if (close < 0 || index < close) return false;
-    open = pattern.indexOf('[', close + 1);
-  }
-  return true;
-}
-
 // Locate an entire group before inspecting its alternatives. A component-local
 // extglob always goes to matchesGlob intact, including under +(), *() and !().
-function groupAt(text, start) {
+function groupAt(text, start, keepBraces = false) {
   if (text[start] === '{') return scopeBraceGroup(text, start);
   const arms = [];
   let depth = 1;
@@ -47,6 +26,9 @@ function groupAt(text, start) {
   for (let i = from; i < text.length; i++) {
     const ch = text[i];
     if (ch === '[') i = Math.max(i, classEnd(text, i));
+    // While pruning a written arm, keep its braces intact. The subsequent
+    // expansion decides which '|' or ')' the brace actually contributes.
+    else if (keepBraces && ch === '{') i = scopeBraceGroup(text, i)?.end ?? i;
     else if (ch === '(') depth++;
     else if (ch === ')' && --depth === 0) {
       arms.push(text.slice(from, i));
@@ -161,11 +143,53 @@ function* manifestParentPatterns(scope) {
   if (name.includes('/')) yield* directorySelectors(name, prefix);
 }
 
+// Past the limit, give each arm one slot per written alternative. A product
+// that fills the original budget by itself must still leave its literal
+// sibling reachable. Shared groups stay factored until the final bounded pass.
+function smallerDirectoryPattern(pattern) {
+  let result = '';
+  let from = 0;
+  for (let i = 0; i < pattern.length; i++) {
+    if (pattern[i] === '[') i = Math.max(i, classEnd(pattern, i));
+    const brace = pattern[i] === '{';
+    if (!brace && !pattern.startsWith('@(', i)) continue;
+    const group = groupAt(pattern, brace ? i : i + 1, true);
+    if (!group) continue;
+    const arms = [];
+    let changed = false;
+    for (const arm of group.arms) {
+      if (expandBlueprintScope(arm, 1) !== null) arms.push(arm);
+      else {
+        changed = true;
+        const smaller = smallerDirectoryPattern(arm);
+        if (smaller !== null) arms.push(smaller);
+      }
+    }
+    if (!arms.length) return null;
+    if (changed) {
+      const replacement = brace
+        ? arms.length === 1
+          ? arms[0]
+          : '{' + arms.join(',') + '}'
+        : '@(' + arms.join('|') + ')';
+      result += pattern.slice(from, i) + replacement;
+      from = group.end + 1;
+    }
+    i = group.end;
+  }
+  return from ? result + pattern.slice(from) : null;
+}
+
 export function* selectedManifestRoots(scope, knownWorkspace = false) {
   if (/\.[\w-]+$/.test(scope) && !/\.toml$/i.test(scope)) return;
   const seen = new Set();
   for (const parent of manifestParentPatterns(scope)) {
-    for (const dir of parent ? blueprintScopeBranches(parent) : ['']) {
+    let dirs = expandBlueprintScope(parent);
+    if (!dirs) {
+      const smaller = smallerDirectoryPattern(parent);
+      dirs = smaller === null ? [] : (expandBlueprintScope(smaller) ?? []);
+    }
+    for (const dir of dirs) {
       if (scopeGlobSyntax.test(dir)) continue;
       const root =
         dir && dir.split('/').some(part => !part || part === '.' || part === '..') ? resolveRelativeDir('', dir) : dir;
@@ -199,6 +223,22 @@ export function scopedDirectoryMatcher(scopes) {
   );
 }
 
+// Adjacent literal choices attached to a fixed filename stem cannot produce a
+// navigation component or join two glob tokens (as in "@{,x}(read|write)").
+// Leave the entire run in the component passed to the canonical matcher.
+function literalAffixEnd(pattern, start, group) {
+  if (!canDeferLiteralList(pattern, start, group.arms)) return start;
+  let end = group.end;
+  while (pattern[end + 1] === '{') {
+    const next = scopeBraceGroup(pattern, end + 1);
+    if (!next || next.arms.length < 2 || !canDeferLiteralList(pattern, end + 1, next.arms)) break;
+    end = next.end;
+  }
+  return /[\p{L}\p{N}_-]\.*$/u.test(pattern.slice(0, start)) || /^\.*[\p{L}\p{N}_-]/u.test(pattern.slice(end + 1))
+    ? end
+    : start;
+}
+
 // Resolve only choices that change component boundaries. Usually the walker
 // needs just the next component; later choices remain shared continuations.
 // When an alternative introduces "." or "..", resolve the layout before
@@ -206,11 +246,22 @@ export function scopedDirectoryMatcher(scopes) {
 function* pathLayouts(pattern, wholePath = false) {
   const slash = pattern.indexOf('/');
   const stop = wholePath || slash < 0 ? pattern.length : slash;
+  let singleBraceEnd = -1;
   for (let i = 0; i < stop; i++) {
     if (pattern[i] !== '{') continue;
     const group = groupAt(pattern, i);
     if (!group) continue;
-    if (group.arms.length > 1 && group.arms.some(arm => arm.includes('/') || /^\.{0,2}$/.test(arm))) {
+    if (group.arms.length < 2) {
+      // An inner empty arm can turn the enclosing word into a brace range.
+      singleBraceEnd = Math.max(singleBraceEnd, group.end);
+      continue;
+    }
+    const end = i < singleBraceEnd ? i : literalAffixEnd(pattern, i, group);
+    if (end > i) {
+      i = end;
+      continue;
+    }
+    if (group.arms.some(arm => arm.includes('/') || /^\.{0,2}$/.test(arm))) {
       for (const arm of group.arms)
         yield* pathLayouts(pattern.slice(0, i) + arm + pattern.slice(group.end + 1), wholePath);
       return;

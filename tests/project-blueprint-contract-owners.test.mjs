@@ -769,6 +769,37 @@ test('a file-directed glob can select the existing workspace manifest when addin
   }
 });
 
+test('draft and registration require Wave 0 for equivalent nested manifest directory spellings', async t => {
+  const f = await fixture(t);
+  sequenceModuleWrites(f.draft);
+  f.draft.tasks.find(task => task.id === 'scaffold').writePaths = ['package.json', 'tooling'];
+  await f.put('architecture.policy.json', JSON.stringify(policy));
+  await f.put('Cargo.toml', '[workspace]\nmembers=["crates/host", "crates/codec"]\n');
+  for (const [dir, name] of [
+    ['host', 'host'],
+    ['codec', 'wire-contracts'],
+  ]) {
+    await f.put('crates/' + dir + '/Cargo.toml', manifest(name));
+    await f.put('crates/' + dir + '/src/lib.rs', '');
+  }
+  f.git('init', '-q');
+  f.save('Two packages before the exporter is created');
+  const alias = 'crates/host/{plugins,plugins/}/';
+  const suffix = '@(|-cli|-web)@(|-win|-linux|-mac|-ios|-android|-bsd)/Cargo.toml';
+  const names = ['exporter', 'writer', 'reader'];
+  const scopes = [
+    'Cargo.toml',
+    'crates/host/src/lib.rs',
+    'crates/codec/src/lib.rs',
+    'crates/host/plugins/exporter/src/lib.rs',
+  ];
+  for (const forRegistration of [false, true]) {
+    for (const group of [[alias + '@(' + names.join('|') + ')' + suffix], names.map(name => alias + name + suffix)]) {
+      assert.deepEqual(codes(await f.compile([...scopes, ...group], { forRegistration })), ['contract_crate_required']);
+    }
+  }
+});
+
 test('a planned manifest identifies its exact plugin package below a crates directory', () => {
   const host = 'crates/host';
   const child = host + '/plugins/exporter';

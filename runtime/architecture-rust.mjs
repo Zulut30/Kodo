@@ -6,7 +6,7 @@ import {
   decodeUtf8,
   isPlainObject,
   resolveCargoWorkspace,
-  resolveRelativeDir,
+  resolveManifestDir,
 } from './cargo-workspace.mjs';
 
 const compare = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
@@ -60,7 +60,7 @@ function resolveDependencySpec({ crate, dep, workspaceDeps, crateByDir, unknown 
       return null;
     }
     if (inherited.path !== null) {
-      const targetDir = resolveRelativeDir('', inherited.path);
+      const targetDir = resolveManifestDir('', inherited.path);
       if (targetDir === null) {
         unknown('dependency', 'Cargo.toml', 'unsafe-path');
         return null;
@@ -101,7 +101,7 @@ function resolveDependencySpec({ crate, dep, workspaceDeps, crateByDir, unknown 
       unknown('dependency', crate.manifest, 'invalid-dependency-spec');
       return null;
     }
-    const targetDir = resolveRelativeDir(crate.root, spec.path);
+    const targetDir = resolveManifestDir(crate.root, spec.path);
     if (targetDir === null) {
       unknown('dependency', crate.manifest, 'unsafe-path');
       return null;

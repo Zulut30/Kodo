@@ -3,6 +3,16 @@ import path from 'node:path';
 // +, @ and ! begin a glob operator only when immediately followed by '('.
 export const scopeGlobSyntax = /[*?[{]|[+@!]\(/;
 
+/** Visit a normalized project-relative path, then its parents through the root (''). */
+export function* pathAndAncestors(name) {
+  for (;;) {
+    yield name;
+    if (!name) return;
+    const slash = name.lastIndexOf('/');
+    name = slash < 0 ? '' : name.slice(0, slash);
+  }
+}
+
 // Brace expansion precedes glob parsing, so commas inside classes and
 // extglobs still delimit brace alternatives at the current brace depth.
 export function scopeBraceGroup(pattern, start) {

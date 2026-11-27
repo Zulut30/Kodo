@@ -2,7 +2,7 @@
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { parse as parseToml } from 'smol-toml';
-import { braceBeforeExtglob, ownsPath, scopeBraceGroup, scopeGlobSyntax } from './scope-paths.mjs';
+import { braceBeforeExtglob, ownsPath, pathAndAncestors, scopeBraceGroup, scopeGlobSyntax } from './scope-paths.mjs';
 
 const compare = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
@@ -27,11 +27,51 @@ function literalScopePrefix(scope) {
 
 const MAX_SCOPE_BRACE_EXPANSIONS = 64;
 
+export function scopeClassEnd(text, start) {
+  let i = start + 1;
+  if (text[i] === '!' || text[i] === '^') i++;
+  if (text[i] === ']') i++;
+  for (; i < text.length; i++) {
+    if (text[i] === ']') return i;
+    if (text.startsWith('[:', i)) {
+      const end = text.indexOf(':]', i + 2);
+      if (end !== -1) i = end + 1;
+    }
+  }
+  return -1;
+}
+
+// A list of plain fragments cannot introduce an extglob delimiter. Inside a
+// class even an empty fragment can change which ']' closes the class.
+export function canDeferLiteralList(pattern, index, arms) {
+  if (!arms.every(arm => /^[\p{L}\p{N}._-]*$/u.test(arm))) return false;
+  for (let open = pattern.indexOf('['); open !== -1 && open < index;) {
+    const close = scopeClassEnd(pattern, open);
+    if (close < 0 || index < close) return false;
+    open = pattern.indexOf('[', close + 1);
+  }
+  return true;
+}
+
+// Normalize the resolved directory prefix before combining it with more
+// choices. Normalizing across an unopened group could cancel a different
+// arm's parent (e.g. "{a/b,c}/../x").
+function canonicalScopeBranch(pattern) {
+  const separated = pattern.replace(/\/{2,}/g, '/');
+  if (!/(?:^|\/)\.{1,2}(?:\/|$)/.test(separated)) return separated;
+  // Leave a stray closing brace for the parser to reject.
+  const meta = separated.search(/[*?[{}]|[+@!]\(/);
+  const end = meta < 0 ? separated.length : separated.lastIndexOf('/', meta) + 1;
+  if (!end) return separated;
+  const prefix = path.posix.normalize(separated.slice(0, end));
+  if (prefix === './') return separated.slice(end) || '.';
+  return prefix + separated.slice(end);
+}
+
 /**
  * Expand brace alternation expressions `{a,b}` (including nested braces and
  * alternatives containing `/`) into full normalized scope strings.
- * Returns `null` if braces are unbalanced or the number of distinct
- * normalized scopes exceeds `maxBranches`.
+ * Returns `null` for unbalanced braces or when bounded expansion is exhausted.
  * @param {string} rawScope
  * @param {number} [maxBranches]
  * @returns {string[] | null}
@@ -47,8 +87,11 @@ export function expandScopeAlternatives(rawScope, maxBranches = MAX_SCOPE_BRACE_
   if (!scope) return [];
   const visited = new Set();
   const expanded = new Set();
+  // Independent choices can all disappear behind a later "..". Bound the
+  // intermediate work as well as the number of distinct emitted paths.
+  const maxStates = (maxBranches + 1) * (1 + (scope.match(/[{},|]|@\(/g)?.length ?? 0));
   const expandOne = (pattern, offset = 0) => {
-    const mixed = extglobs && braceBeforeExtglob(pattern, offset);
+    const mixed = extglobs && braceBeforeExtglob(pattern, offset, canDeferLiteralList);
     if (mixed) return expandParts(pattern, mixed.start, mixed.end, mixed.arms);
     const group = extglobs ? /\[[^\]]*\]|@\(|[{}]/g : /[{}]/g;
     group.lastIndex = offset;
@@ -96,22 +139,27 @@ export function expandScopeAlternatives(rawScope, maxBranches = MAX_SCOPE_BRACE_
     const prefix = pattern.slice(0, start);
     const suffix = pattern.slice(close + 1);
     for (const part of parts) {
-      const next = prefix + part + suffix;
+      const next = canonicalScopeBranch(prefix + part + suffix);
       if (visited.has(next)) continue;
+      if (visited.size >= maxStates) return false;
       visited.add(next);
       if (!expandOne(next)) return false;
     }
     return true;
   }
-  return expandOne(scope) ? [...expanded] : null;
+  return expandOne(canonicalScopeBranch(scope)) ? [...expanded] : null;
 }
 
 // Enumerate alternatives written out in a blueprint, even in a long flat list.
 // Products of independent groups still have a bound proportional to the input.
-export function blueprintScopeBranches(scope) {
+export function expandBlueprintScope(scope, minimum = MAX_SCOPE_BRACE_EXPANSIONS) {
   if (!scope.includes('{') && !scope.includes('@(')) return [scope];
   const alternatives = 1 + (scope.match(/[,|]/g)?.length ?? 0);
-  return expandScopeAlternatives(scope, Math.max(MAX_SCOPE_BRACE_EXPANSIONS, alternatives)) ?? [scope];
+  return expandScopeAlternatives(scope, Math.max(minimum, alternatives));
+}
+
+export function blueprintScopeBranches(scope) {
+  return expandBlueprintScope(scope) ?? [scope];
 }
 
 export function scopeMatchesPath(rawScope, rawFile) {
@@ -265,6 +313,13 @@ export function resolveRelativeDir(fromDir, rawPath) {
     } else stack.push(part);
   }
   return stack.join('/');
+}
+
+// Cargo resolves manifest path values with the host OS. Git tree keys and
+// task scopes use slash-separated paths on every platform.
+export function resolveManifestDir(fromDir, rawPath) {
+  if (path.sep === '\\' && typeof rawPath === 'string') rawPath = rawPath.replaceAll('\\', '/');
+  return resolveRelativeDir(fromDir, rawPath);
 }
 
 const hasGlobMeta = pattern => /[*?[]/.test(pattern);
@@ -444,16 +499,16 @@ function relativeToRoot(rootDir, dir) {
   return null;
 }
 
-function ancestorsOf(dir) {
-  const result = [];
-  let current = dir;
-  while (true) {
-    result.push(current);
-    if (!current) break;
-    const slash = current.lastIndexOf('/');
-    current = slash === -1 ? '' : current.slice(0, slash);
-  }
-  return result;
+// Resolve the literal prefix of a member glob inside the caller's tree.
+// No parent component is passed to a tree walk or Git pathspec.
+export function workspaceMemberPattern(root, raw) {
+  if (typeof raw !== 'string' || raw.length > 1024) return null;
+  const parts = raw.trim().split('/');
+  const end = parts.lastIndexOf('..') + 1;
+  const base = end ? resolveRelativeDir(root, parts.slice(0, end).join('/')) : root;
+  const suffix = end ? parts.slice(end).filter(Boolean).join('/') || '.' : raw;
+  const pattern = normalizeWorkspacePath(suffix, { allowGlob: true });
+  return base === null || pattern === null ? null : joinRel(base, pattern);
 }
 
 function toManifestMap(manifests) {
@@ -487,10 +542,9 @@ function parseManifestEntry(raw) {
 }
 
 function findCandidateRoots(startDir, manifestDirs, parsedCache) {
-  const chain = ancestorsOf(startDir);
   let workspaceCandidate = null;
   let packageCandidate = null;
-  for (const dir of chain) {
+  for (const dir of pathAndAncestors(startDir)) {
     if (!manifestDirs.has(dir)) continue;
     const entry = parsedCache(dir);
     if (entry.error) {
@@ -513,7 +567,7 @@ function findCandidateRoots(startDir, manifestDirs, parsedCache) {
           };
         }
         if (workspaceCandidate === null) {
-          const explicitDir = resolveRelativeDir(dir, entry.doc.package.workspace);
+          const explicitDir = resolveManifestDir(dir, entry.doc.package.workspace);
           if (explicitDir === null) {
             return {
               workspaceCandidate: null,
@@ -551,27 +605,41 @@ function isNestedWorkspaceRoot(rootDir, candidateDir, manifestDirs, parsedCache)
   return !parsed.error && isPlainObject(parsed.doc.workspace);
 }
 
-function parseExcludePrefixes(workspace, rootDir, rootManifest, unknown) {
-  const prefixes = [];
-  if (workspace.exclude === undefined) return prefixes;
-  if (!Array.isArray(workspace.exclude)) {
-    unknown('workspace', rootManifest, 'invalid-workspace-config');
-    return prefixes;
+function workspacePaths(items, parse, onInvalid) {
+  const paths = [];
+  if (items === undefined) return paths;
+  if (!Array.isArray(items)) {
+    onInvalid?.('invalid-workspace-config');
+    return paths;
   }
-  for (const item of workspace.exclude) {
-    const normalized = normalizeWorkspacePath(item, { allowGlob: true });
-    if (normalized === null) {
-      unknown('workspace', rootManifest, 'unsafe-path');
-      continue;
-    }
-    // Cargo `exclude` matches directory subtrees literally (not as globs).
-    if (!hasGlobMeta(normalized)) prefixes.push(joinRel(rootDir, normalized));
+  for (const item of items) {
+    const normalized = parse(item);
+    if (normalized === null) onInvalid?.('unsafe-path');
+    else paths.push(normalized);
   }
-  return prefixes;
+  return paths;
+}
+
+// Cargo compares both lists as literal path prefixes for exclusion. A member
+// glob or path dependency must still independently select a nested package.
+export function workspaceExclusionMatcher(root, workspace, onInvalid = undefined) {
+  // For the prefix comparison Cargo keeps the original spelling of '..'.
+  // Such an entry cannot be a prefix of a normalized manifest path.
+  const prefix = raw => {
+    const rel = normalizeWorkspacePath(raw, { allowGlob: true });
+    return rel === null ? null : joinRel(root, rel);
+  };
+  const excluded = new Set(workspacePaths(workspace?.exclude, prefix, onInvalid));
+  if (!excluded.size) return () => false;
+  const declared = new Set(workspacePaths(workspace?.members, prefix, undefined));
+  return dir => {
+    const ancestors = [...pathAndAncestors(joinRel(dir, 'Cargo.toml'))];
+    return ancestors.some(p => excluded.has(p)) && !ancestors.some(p => declared.has(p));
+  };
 }
 
 function collectDeclaredMembers({
-  workspace,
+  patterns,
   rootDir,
   rootManifest,
   manifestDirs,
@@ -582,19 +650,11 @@ function collectDeclaredMembers({
   unknown,
 }) {
   const selected = new Set();
-  if (workspace.members === undefined) return selected;
-  if (!Array.isArray(workspace.members)) {
-    unknown('workspace', rootManifest, 'invalid-workspace-config');
-    return selected;
-  }
-  for (const item of workspace.members) {
-    const pattern = normalizeWorkspacePath(item, { allowGlob: true });
-    if (pattern === null) {
-      unknown('workspace', rootManifest, 'unsafe-path');
-      continue;
-    }
+  for (const pattern of patterns) {
     if (!hasGlobMeta(pattern)) {
       const memberDir = joinRel(rootDir, pattern);
+      // The root package, if present, is added once after member selection.
+      if (memberDir === rootDir || isExcluded(memberDir)) continue;
       if (!manifestDirs.has(memberDir)) {
         unknown('workspace', rootManifest, 'missing-workspace-member');
         continue;
@@ -657,7 +717,7 @@ export function resolveDepTargetDir(dep, dir, rootDir, workspaceDependencies, bo
     depPath = inherited.path;
   }
   const base = relativeToRoot(boundary, from);
-  const resolved = base === null ? null : resolveRelativeDir(base, depPath);
+  const resolved = base === null ? null : resolveManifestDir(base, depPath);
   return resolved === null ? null : joinRel(boundary, resolved);
 }
 
@@ -708,7 +768,7 @@ function loadMemberPackages(selected, rootDir, parsedCache, workspacePackage, un
       if (isPlainObject(parsed.doc.workspace) || typeof parsed.doc.package.workspace !== 'string') {
         unknown('manifest', manifest, 'invalid-workspace-config');
       } else {
-        const declaredWs = resolveRelativeDir(dir, parsed.doc.package.workspace);
+        const declaredWs = resolveManifestDir(dir, parsed.doc.package.workspace);
         if (declaredWs === null) unknown('manifest', manifest, 'unsafe-path');
         else if (declaredWs !== rootDir) unknown('workspace', manifest, 'wrong-workspace-root');
       }
@@ -755,7 +815,7 @@ function collectSnapshotEntries(rawMap, files) {
     if (!cleaned) return;
     snapshotFiles.add(cleaned);
     const parent = path.posix.dirname(cleaned);
-    for (const dir of ancestorsOf(parent === '.' ? '' : parent)) snapshotDirs.add(dir);
+    for (const dir of pathAndAncestors(parent === '.' ? '' : parent)) snapshotDirs.add(dir);
   };
   for (const file of rawMap.keys()) addFile(file);
   if (Array.isArray(files)) {
@@ -806,12 +866,13 @@ function resolveWorkspaceAtRoot({ rootDir, rootEntry, manifestDirs, snapshotDirs
   const workspace = hasWorkspace ? rootDoc.workspace : {};
   const workspaceDependencies = parseWorkspaceDependencies(workspace.dependencies);
   const workspacePackage = isPlainObject(workspace.package) ? workspace.package : null;
-  const excludePrefixes = parseExcludePrefixes(workspace, rootDir, rootManifest, unknown);
-  const isExcluded = dir => excludePrefixes.some(ex => (ex === '' ? true : dir === ex || dir.startsWith(`${ex}/`)));
+  const invalid = reason => unknown('workspace', rootManifest, reason);
+  const patterns = workspacePaths(workspace.members, raw => workspaceMemberPattern('', raw), invalid);
+  const isExcluded = workspaceExclusionMatcher(rootDir, workspace, invalid);
 
   const selected = hasWorkspace
     ? collectDeclaredMembers({
-        workspace,
+        patterns,
         rootDir,
         rootManifest,
         manifestDirs,

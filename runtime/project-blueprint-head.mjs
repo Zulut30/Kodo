@@ -36,7 +36,15 @@ export async function withVerifiedBlueprintHead(root, headSha, register) {
     ],
     process.env,
   );
-  const child = spawn('git', args, { cwd: root, env, windowsHide: true, stdio: ['pipe', 'pipe', 'ignore'] });
+  const child = spawn('git', args, {
+    cwd: root,
+    env,
+    windowsHide: true,
+    // On Windows the Git process must survive the caller long enough to see
+    // EOF, abort its prepared transaction and remove its ref locks.
+    detached: process.platform === 'win32',
+    stdio: ['pipe', 'pipe', 'ignore'],
+  });
   const closed = new Promise(resolve => child.once('close', resolve));
   const replies = createInterface({ input: child.stdout, crlfDelay: Infinity });
   const unavailable = () => replies.close();

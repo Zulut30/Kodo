@@ -37,6 +37,35 @@ test('Cargo normalizes current-directory components in member and exclude paths'
   }
 });
 
+test('a literal workspace member overrides exclude below it when its plugin is selected', () => {
+  const host = 'crates/host';
+  const plugin = host + '/plugins/exporter';
+  const glob = host + '/plugins/*';
+  for (const [members, dependencies, expected, exclude = [plugin]] of [
+    [[host, glob], {}, ['host', 'exporter']],
+    [[host], { exporter: { path: 'plugins/exporter' } }, ['host', 'exporter']],
+    [[host], {}, ['host']],
+    [['crates/hos?', glob], {}, ['host']],
+    [['crates/hos?', glob], { exporter: { path: 'plugins/exporter' } }, ['host']],
+    [['crates/other/../host', glob], {}, ['host']],
+    [['crates/hos?', glob], {}, ['host'], [plugin + '/Cargo.toml']],
+    [['.', host, glob], {}, ['host', 'exporter']],
+  ]) {
+    const manifests = {
+      'Cargo.toml': { workspace: { members, exclude } },
+      [host + '/Cargo.toml']: { package: { name: 'host' }, dependencies },
+      [plugin + '/Cargo.toml']: { package: { name: 'exporter' } },
+    };
+    const result = resolveCargoWorkspace({ manifests });
+    assert.deepEqual(result.unsupported, []);
+    assert.deepEqual(
+      result.members.map(pkg => pkg.name),
+      expected,
+      JSON.stringify(members),
+    );
+  }
+});
+
 test('contract scopes recognize Node glob syntax in a package name and preserve literal directories', () => {
   const packages = new Map([
     ['native/codec', 'wire-contracts'],

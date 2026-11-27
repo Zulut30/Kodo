@@ -3,6 +3,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { expandScopeAlternatives } from '../runtime/cargo-workspace.mjs';
 import {
+  createPackageFileOwnerResolver,
   plannedPackageDirs,
   scopedDirectoryMatcher,
   selectedManifestRoots,
@@ -50,6 +51,146 @@ test('choosing a manifest avoids multiplying literal suffix choices in a sibling
   for (const name of ['Cargo.toml', 'Cargo.tom*'])
     for (const reverse of [false, true])
       assert.equal(count(name, 'release' + suffixes + '.md', reverse), count(name, 'release.md', reverse));
+});
+
+test('the expansion limit counts canonical directory paths before visiting their suffix choices', () => {
+  const prefix = 'crates/host/plugins/';
+  const alias = 'crates/host/{plugins,plugins/}/';
+  const suffix = '@(|-cli)@(|-win|-linux|-mac|-web|-ios|-android)';
+  const combined = '@(exporter|{exporter-cli|reader|reader-cli|writer-cli,writer})' + suffix;
+  const names = ['exporter', 'exporter-cli', 'reader', 'reader-cli', 'writer-cli', 'writer'];
+  const split = names.flatMap(name => [...selectedManifestRoots(prefix + name + suffix + '/Cargo.toml')]);
+  const expected = new Set(split);
+  assert.equal(expected.size, 63);
+  for (const dir of expected) assert.ok(ownsPath([alias + combined + '/Cargo.toml'], dir + '/Cargo.toml'));
+  for (const limit of [63, 64]) assert.deepEqual(new Set(expandScopeAlternatives(alias + combined, limit)), expected);
+  assert.deepEqual(new Set(selectedManifestRoots(alias + combined + '/Cargo.toml')), expected);
+
+  for (const count of [63, 64, 65]) {
+    const members = Array.from({ length: count }, (_, i) => 'm' + i);
+    const pattern = 'native/{stage/../plugins,plugins/./,plugins}/@(' + members.join('|') + ')';
+    const dirs = members.map(name => 'native/plugins/' + name);
+    for (const limit of [63, 64, 65]) {
+      const branches = expandScopeAlternatives(pattern, limit);
+      if (count > limit) assert.equal(branches, null);
+      else assert.deepEqual(new Set(branches), new Set(dirs));
+    }
+  }
+});
+
+test('file owner lookup matches a materialized child once per filename pattern', t => {
+  const root = 'crates/host/plugins/exporter';
+  const docs = root + '/release-win-en.md';
+  const owners = createPackageFileOwnerResolver(
+    new Map([
+      [root, '1'],
+      [docs, '2'],
+    ]),
+    new Map(),
+  );
+  const matcher = t.mock.method(path.posix, 'matchesGlob');
+  const tags = ['win', 'x64', 'debug', 'en', 'signed', 'bundle', 'local', 'ci'];
+  for (const n of [0, 4, 8]) {
+    const suffix = tags
+      .slice(0, n)
+      .map(tag => '{,-' + tag + '}')
+      .join('');
+    const pattern = '@(Cargo.tom*|release' + suffix + '.md)';
+    const before = matcher.mock.callCount();
+    const found = owners(root + '/' + pattern);
+    const calls = matcher.mock.calls
+      .slice(before)
+      .filter(({ arguments: [name, glob] }) => name === 'src' && glob.includes('release'));
+    assert.ok(calls.length <= 1, n + ' suffixes compared with src ' + calls.length + ' times');
+    assert.deepEqual(found, new Set(n ? [root, docs] : [root]));
+  }
+});
+
+test('an oversized directory product leaves an independently named manifest reachable in either arm order', () => {
+  const literal = 'crates/host/plugins/exporter';
+  const prefix = 'crates/host/{plugins,plugins/}/';
+  for (const choices of [6, 8]) {
+    const bulk = 'archive' + '{a,b}'.repeat(choices);
+    for (const arms of [
+      [bulk, 'exporter'],
+      ['exporter', bulk],
+    ]) {
+      for (const group of ['{' + arms.join(',') + '}', '@(' + arms.join('|') + ')']) {
+        const scope = prefix + group + '/Cargo.toml';
+        assert.equal(expandScopeAlternatives(prefix + group, 64), null);
+        assert.ok(ownsPath([scope], literal + '/Cargo.toml'));
+        assert.deepEqual([...selectedManifestRoots(scope)], [literal]);
+      }
+    }
+  }
+});
+
+test('an empty choice may expose an extglob operator, a brace range or a parent directory', () => {
+  for (const [pattern, file] of [
+    ['native/src/@{,old}(read.rs|write.rs)', 'native/src/read.rs'],
+    ['native/generated/file{1{,x}..3}.rs', 'native/generated/file1.rs'],
+    ['stage/.{,old}./native/src/read.rs', 'native/src/read.rs'],
+  ]) {
+    assert.ok(ownsPath([pattern], file));
+    assert.deepEqual(candidates([pattern], ['native']), new Set(['native']));
+  }
+});
+
+test('literal suffixes in separate directory arms stay within the distinct path budget', () => {
+  const plugins = Array.from({ length: 32 }, (_, i) => 'plugin' + i);
+  const pattern = 'native/@(' + plugins.map(name => name + '{,-cli}').join('|') + ')';
+  const dirs = plugins.flatMap(name => ['native/' + name, 'native/' + name + '-cli']);
+  assert.deepEqual(new Set(expandScopeAlternatives(pattern, 64)), new Set(dirs));
+  assert.equal(expandScopeAlternatives(pattern, 63), null);
+});
+
+test('large independent directory lists leave their product unexpanded', t => {
+  const width = 24;
+  const list = '@(' + Array.from({ length: width }, (_, i) => 'm' + i).join('|') + ')';
+  const product = 'archive/' + [list, list, list].join('/') + '/stage/..';
+  const normalize = t.mock.method(path.posix, 'normalize');
+  assert.deepEqual([...selectedManifestRoots('native/' + product + '/Cargo.toml')], []);
+  // Three lists with 72 written entries would produce 13,824 distinct paths.
+  assert.ok(normalize.mock.callCount() <= 2 * 3 * width);
+  for (const arms of [
+    [product, 'exporter'],
+    ['exporter', product],
+  ]) {
+    const scope = 'native/{' + arms.join(',') + '}/Cargo.toml';
+    assert.ok(ownsPath([scope], 'native/exporter/Cargo.toml'));
+    assert.deepEqual([...selectedManifestRoots(scope)], ['native/exporter']);
+  }
+});
+
+test('an oversized directory arm preserves an explicit sibling with a shared navigation suffix', () => {
+  const parent = 'crates/host/{plugins,plugins/}/';
+  const packageDir = 'crates/host/plugins/exporter';
+  const bulk = 'archive' + '@(a|b)'.repeat(12);
+  for (const arms of [
+    [bulk, 'exporter'],
+    ['exporter', bulk],
+  ]) {
+    const scope = parent + '@(' + arms.join('|') + ')/{tmp/..,cache/..}/Cargo.toml';
+    assert.ok(ownsPath([scope], packageDir + '/Cargo.toml'));
+    assert.deepEqual([...selectedManifestRoots(scope)], [packageDir]);
+  }
+  const nested = '{exporter|reader,writer}';
+  const named = ['exporter', 'reader', 'writer'].map(name => 'crates/host/plugins/' + name);
+  for (const arms of [
+    [bulk, nested],
+    [nested, bulk],
+  ]) {
+    const scope = parent + '@(' + arms.join('|') + ')/Cargo.toml';
+    for (const dir of named) assert.ok(ownsPath([scope], dir + '/Cargo.toml'));
+    assert.deepEqual(new Set(selectedManifestRoots(scope)), new Set(named));
+  }
+  const differentDepths = 'native/{layouts/v2,plugins}/../{host,worker}';
+  const expected = ['native/layouts/host', 'native/layouts/worker', 'native/host', 'native/worker'];
+  assert.deepEqual(new Set(expandScopeAlternatives(differentDepths, 4)), new Set(expected));
+  assert.deepEqual(new Set(selectedManifestRoots(differentDepths + '/Cargo.toml')), new Set(expected));
+  const rootChoice = '{assets/../,configs}/Cargo.toml';
+  assert.ok(ownsPath([rootChoice], 'Cargo.toml'));
+  assert.deepEqual(new Set(selectedManifestRoots(rootChoice)), new Set(['', 'configs']));
 });
 
 test('directory and filename choices discover the same manifest roots after brace expansion', () => {
