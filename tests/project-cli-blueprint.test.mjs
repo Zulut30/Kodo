@@ -596,10 +596,14 @@ function fixtureGit(root, env) {
 }
 
 // Both commits are clean and plan a new .rs file in an existing nested package.
-// Only main has its pinned toolchain. The command id is stable across attempts.
-async function registrationFixture(t) {
+// Only the registration tip has its pinned toolchain. The command id is stable across attempts.
+async function registrationFixture(t, { refFormat, linked = false } = {}) {
   const f = await fixture(t);
-  const root = await f.root();
+  if (refFormat) f.env.GIT_DEFAULT_REF_FORMAT = refFormat;
+  const main = await f.root();
+  const mainGit = fixtureGit(main, f.env);
+  const root = linked ? path.join(f.dir, 'linked') : main;
+  if (linked) mainGit('worktree', 'add', '-qb', 'registration', root);
   const git = fixtureGit(root, f.env);
   const specFile = path.join(await writeBlueprint(root), 'spec.json');
   const spec = JSON.parse(await readFile(specFile, 'utf8'));
@@ -617,7 +621,7 @@ async function registrationFixture(t) {
   git('add', 'rust-toolchain.toml');
   git('commit', '-qm', 'Pin toolchain');
   const args = ['apply-spec', '--root', root, '--command-id', randomUUID()];
-  return { root, home: f.home, direct: f.direct, git, apply: extra => f.run(args, extra) };
+  return { root, home: f.home, direct: f.direct, git, mainGit, apply: extra => f.run(args, extra) };
 }
 
 function duringTreeRead(t, name, switchHead, restore) {
@@ -926,24 +930,30 @@ test('apply-spec rejects a clean HEAD switch after evidence, then retries and re
   assert.equal(projects(), 1);
 });
 
-test('apply-spec holds HEAD and its branch through the SQLite create transaction and releases both', async t => {
-  const f = await registrationFixture(t);
+function attemptRefMove(move) {
+  try {
+    move();
+    return 'moved';
+  } catch (error) {
+    return String(error.stderr);
+  }
+}
+
+async function checkRegistrationLocks(t, refFormat, linked) {
+  const f = await registrationFixture(t, { refFormat, linked });
+  const format = f.git('config', '--get', '--default', 'files', 'extensions.refStorage');
+  if (refFormat === 'reftable' && format === 'files') return t.skip('Git lacks reftable initialization');
+  assert.equal(format, refFormat);
   const { store } = await f.direct();
-  const pinned = f.git('rev-parse', 'main');
+  const ref = f.git('symbolic-ref', 'HEAD');
+  const pinned = f.git('rev-parse', 'HEAD');
   const unpinned = f.git('rev-parse', 'without-pin');
   const attempts = [];
+  let headBeforeCommit;
   store.db.function('try_moving_head', () => {
-    for (const args of [
-      ['update-ref', 'refs/heads/main', unpinned, pinned],
-      ['symbolic-ref', 'HEAD', 'refs/heads/without-pin'],
-    ]) {
-      try {
-        f.git(...args);
-        attempts.push('moved');
-      } catch (error) {
-        attempts.push(String(error.stderr));
-      }
-    }
+    attempts.push(attemptRefMove(() => f.mainGit('update-ref', ref, unpinned, pinned)));
+    attempts.push(attemptRefMove(() => f.git('symbolic-ref', 'HEAD', 'refs/heads/without-pin')));
+    headBeforeCommit = f.git('rev-parse', 'HEAD');
     return 1;
   });
   store.db.exec(
@@ -958,14 +968,83 @@ test('apply-spec holds HEAD and its branch through the SQLite create transaction
   const created = await f.apply({ store });
   assert.equal(created.exitCode, 0, registrationOutcome(created));
   assert.equal(created.report.revision, 1);
+  assert.equal(registeredProjects(f.home), 1, 'project visible to another SQLite connection after COMMIT');
+  assert.equal(headBeforeCommit, pinned, 'HEAD during registration: ' + attempts.join(' / '));
   assert.equal(attempts.length, 2);
   for (const error of attempts) assert.match(error, /lock/i);
   assert.equal(f.git('show-ref', '--head'), refs);
   assert.equal(f.git('reflog', 'show', '--all'), log);
   assert.ok(indexBefore.equals(await readFile(index)), 'registration preserves the index');
   f.git('checkout', '-q', 'without-pin');
-  f.git('update-ref', 'refs/heads/main', unpinned, pinned);
+  f.mainGit('update-ref', ref, unpinned, pinned);
   assert.equal(f.git('status', '--porcelain'), '');
+}
+
+for (const refFormat of ['files', 'reftable']) {
+  for (const linked of [false, true]) {
+    test(`apply-spec holds HEAD and its branch through SQLite COMMIT (${refFormat}, ${linked ? 'linked' : 'main'})`, t =>
+      checkRegistrationLocks(t, refFormat, linked));
+  }
+}
+
+test('an interrupted registration preserves the linked reftable branch and its reflog', async t => {
+  const f = await registrationFixture(t, { refFormat: 'reftable', linked: true });
+  if (f.git('config', '--get', '--default', 'files', 'extensions.refStorage') !== 'reftable')
+    return t.skip('Git lacks reftable initialization');
+  const branch = f.git('symbolic-ref', 'HEAD');
+  const head = f.git('rev-parse', 'HEAD');
+  const refs = f.git('show-ref', '--head');
+  const log = f.git('reflog', 'show', '--all');
+  const entry = new URL('../runtime/project-blueprint-head.mjs', import.meta.url).href;
+  const interrupt = `
+    const [entry, root, head] = process.argv.slice(1);
+    const { withVerifiedBlueprintHead } = await import(entry);
+    await withVerifiedBlueprintHead(root, head, () => process.exit(73));
+  `;
+  // Exit with Git prepared, before JS can send abort. Git must abort on EOF.
+  const child = spawnSync(process.execPath, ['--input-type=module', '-e', interrupt, entry, f.root, head], {
+    env: workerEnvironment(),
+    encoding: 'utf8',
+    timeout: 15000,
+    windowsHide: true,
+  });
+  assert.ifError(child.error);
+  assert.equal(child.status, 73, child.stderr);
+  assert.equal(f.git('show-ref', '--head'), refs);
+  assert.equal(f.git('reflog', 'show', '--all'), log);
+  f.mainGit('-c', 'reftable.lockTimeout=5000', 'update-ref', branch, f.git('rev-parse', 'without-pin'), head);
+});
+
+test('apply-spec releases a detached linked HEAD after a Store rollback', async t => {
+  const f = await registrationFixture(t, { refFormat: 'reftable', linked: true });
+  const branch = f.git('symbolic-ref', 'HEAD');
+  f.git('checkout', '-q', '--detach');
+  const pinned = f.git('rev-parse', 'HEAD');
+  const unpinned = f.git('rev-parse', 'without-pin');
+  const moveHead = () => f.git('update-ref', '--no-deref', 'HEAD', unpinned, pinned);
+  const log = f.git('reflog', 'show', 'HEAD');
+  const { store } = await f.direct();
+  let headAttempt;
+  store.db.function('try_moving_detached', () => {
+    headAttempt = attemptRefMove(moveHead);
+    f.mainGit('update-ref', branch, unpinned, pinned);
+    return 1;
+  });
+  store.db.exec(
+    `CREATE TEMP TRIGGER reject_create AFTER INSERT ON kodo_project_commands BEGIN
+       SELECT try_moving_detached();
+       SELECT RAISE(ABORT,'fixture rollback');
+     END`,
+  );
+  const failed = await f.apply({ store });
+  assert.equal(failed.exitCode, 2, registrationOutcome(failed));
+  assert.equal(failed.report.result.code, 'project_blocked');
+  assert.equal(registeredProjects(f.home), 0);
+  assert.match(headAttempt, /lock/i);
+  assert.equal(f.mainGit('rev-parse', branch), unpinned, 'the detached checkout no longer owns the branch');
+  assert.equal(f.git('rev-parse', 'HEAD'), pinned);
+  assert.equal(f.git('reflog', 'show', 'HEAD'), log);
+  moveHead();
 });
 
 test('append-milestone appends to an accepted wave project and keeps prior history', async t => {
