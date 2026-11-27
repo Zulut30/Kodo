@@ -1,3 +1,4 @@
+/// <reference path="./quality-config.mjs" />
 /** Offline discovery/planning. No process, installer, provider or state startup. */
 import path from 'node:path';
 import { lstat, readFile, readdir, realpath } from 'node:fs/promises';

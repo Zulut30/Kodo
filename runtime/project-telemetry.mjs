@@ -1,3 +1,4 @@
+/// <reference path="./project-telemetry-samples.mjs" />
 /**
  * Project-level operational KPIs for `kodo report --project` (16C):
  * throughput, taskDuration (p50/p95), time breakdown (agent, task-fast,

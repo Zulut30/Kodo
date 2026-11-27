@@ -1,3 +1,4 @@
+/// <reference path="./quality-runner-tools.mjs" />
 /** Read-only source checks through the existing owned-process execution port.
  * Configured project commands are trusted executable code, not an OS sandbox.
  * Passing receipts require unchanged inventory/head and intact private evidence.
@@ -604,7 +605,7 @@ export async function runQuality(options = {}) {
 }
 
 /** Current-head validation is for callers reusing a receipt; Engine is unchanged.
- * @param {Awaited<ReturnType<typeof runQuality>>} report
+ * @param {Awaited<ReturnType<typeof runQuality>> | null} [report]
  * @param {{project?: string, toolHome?: string, runner?: QualityCommand, resolve?: typeof resolveTool, nativeResolve?: typeof nativeTool}} [options]
  */
 // oxlint-disable-next-line complexity -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md

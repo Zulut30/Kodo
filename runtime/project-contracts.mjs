@@ -1,3 +1,4 @@
+/// <reference path="./project-contracts-normalize.mjs" />
 import { createHash } from 'node:crypto';
 import {
   MAX_BYTES,

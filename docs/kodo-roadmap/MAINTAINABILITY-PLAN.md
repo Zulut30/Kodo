@@ -227,6 +227,8 @@ T1–T4 независимы друг от друга. T5–T8 начинают�
 | `runtime/quality.mjs` | 1 079 | `quality-config.mjs` |
 | `runtime/quality-runner.mjs` | 981 | `quality-runner-tools.mjs` |
 
+Пять публичных модулей `runtime/` указывают TypeScript на вынесенные исходники через `/// <reference path="…" />`. Установочная проверка пакета компилирует строгий NodeNext-потребитель с `maxNodeModuleJsDepth` 1 и 2.
+
 Кроме того, в коде остаются 25 точечных меток `max-lines-per-function` или `complexity` из T3.
 
 ## Итоговые критерии плана
