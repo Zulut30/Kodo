@@ -131,6 +131,25 @@ test('a literal Cargo member does not require listing a separate dot glob subtre
   assert.deepEqual(enumerations, []);
 });
 
+test('a future Cargo member may supply its own parent step without enrolling its sibling', async t => {
+  const f = await fixture(t, workspace([...mainMembers.slice(1), 'addons/*/*/.?/Bridge']));
+  await f.write('addons/live/pivot/marker', '');
+  await f.write('addons/live/Bridge/Cargo.toml', manifest('anchor'));
+  await f.write('addons/live/Bridge/src/lib.rs', '');
+  f.commit();
+  const sources = mainMembers.slice(1).map(dir => dir + '/src/lib.rs');
+  const paths = dir => [...sources, dir + '/Cargo.toml', dir + '/src/lib.rs'];
+  const planned = 'addons/next/Bridge';
+  for (const forRegistration of [false, true]) {
+    assert.deepEqual(await f.compile(paths(planned), { forRegistration }), threshold);
+    assert.deepEqual(await f.compile(paths('addons/next/Peer'), { forRegistration }), []);
+  }
+  await f.write(planned + '/Cargo.toml', manifest('new-member'));
+  await f.write(planned + '/src/lib.rs', '');
+  f.commit();
+  assert.deepEqual(await f.compile(paths(planned), { forRegistration: true }), threshold);
+});
+
 test('Wave 0 counts packages selected by a Unicode wildcard or another recursive walk', async t => {
   const roots = mainMembers.slice(1);
   const scalar = 'extras/📦/Exporter';

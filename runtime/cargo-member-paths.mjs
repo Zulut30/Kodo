@@ -323,17 +323,32 @@ function parentSearchRoot(parts, navigation) {
 // each normalized spelling for Cargo's subsequent exclusion comparison.
 function navigationMatcher(parts, steps, navigation, names, directoriesOnly) {
   let generation = -1;
-  const cache = steps.map(() => new Map());
-  function prefixes(pos, dir, directory) {
+  const rows = () => steps.map(() => new Map());
+  const shared = { rows: rows(), children: dir => names.childDirs(dir) };
+  const searchRoot = parentSearchRoot(parts, navigation);
+  function walkFor(dir) {
+    if (!dir || names.paths.has(dir)) return shared;
+    // A planned directory implies its own ancestors. Include just that path
+    // as a possible detour and keep its memoized results local to the query.
+    const projected = new Map();
+    if (searchRoot !== null) {
+      for (let child = dir; child && !names.paths.has(child); child = parentDir(child)) {
+        const parent = parentDir(child);
+        projected.set(parent, [...names.childDirs(parent), child]);
+      }
+    }
+    return { rows: rows(), children: parent => projected.get(parent) ?? names.childDirs(parent) };
+  }
+  function prefixes(pos, dir, directory, walk) {
     if (!pos) return dir ? [] : [''];
-    const stored = directory && (!dir || names.paths.has(dir)) ? cache[pos - 1] : null;
+    const stored = directory ? walk.rows[pos - 1] : null;
     if (stored?.has(dir)) return stored.get(dir);
     const result = new Set();
     const step = steps[pos - 1];
     if (step === null) {
       // A globstar consumes real entries with their snapshot spelling.
       for (let ancestor = dir; ; ancestor = parentDir(ancestor)) {
-        for (const prior of prefixes(pos - 1, ancestor, true))
+        for (const prior of prefixes(pos - 1, ancestor, true, walk))
           result.add(ancestor === dir ? prior : join(prior, dir.slice(ancestor ? ancestor.length + 1 : 0)));
         if (!ancestor) break;
       }
@@ -342,15 +357,15 @@ function navigationMatcher(parts, steps, navigation, names, directoriesOnly) {
       const entry = dir.slice(dir.lastIndexOf('/') + 1);
       const emitted = dir ? step(entry) : null;
       if (emitted !== null) {
-        const prior = prefixes(pos - 1, parent, true);
+        const prior = prefixes(pos - 1, parent, true, walk);
         if (prior.length && names.matches(parent, entry, emitted))
           for (const spelling of prior) result.add(join(spelling, emitted));
       }
       if (directory && navigation[pos - 1]?.self)
-        for (const spelling of prefixes(pos - 1, dir, true)) result.add(spelling);
+        for (const spelling of prefixes(pos - 1, dir, true, walk)) result.add(spelling);
       if (directory && navigation[pos - 1]?.up)
-        for (const child of names.childDirs(dir))
-          for (const spelling of prefixes(pos - 1, child, true)) result.add(parentDir(spelling));
+        for (const child of walk.children(dir))
+          for (const spelling of prefixes(pos - 1, child, true, walk)) result.add(parentDir(spelling));
     }
     const spellings = [...result];
     stored?.set(dir, spellings);
@@ -358,16 +373,16 @@ function navigationMatcher(parts, steps, navigation, names, directoriesOnly) {
   }
   function* spellings(dir, directory = true) {
     if (generation !== names.paths.size) {
-      for (const row of cache) row.clear();
+      for (const row of shared.rows) row.clear();
       generation = names.paths.size;
     }
-    const matches = prefixes(steps.length, dir, directory);
+    const matches = prefixes(steps.length, dir, directory, walkFor(directory ? dir : parentDir(dir)));
     if (matches.includes(dir)) yield dir;
     for (const match of matches) if (match !== dir) yield match;
   }
   return Object.assign((dir, directory = true) => spellings(dir, directory).next().value ?? null, {
     directoriesOnly,
-    parentSearchRoot: parentSearchRoot(parts, navigation),
+    parentSearchRoot: searchRoot,
     spellings,
   });
 }

@@ -301,6 +301,23 @@ test('a descending Cargo character range contributes no characters to its class'
   }
 });
 
+test('Cargo dot patterns memoize a planned path without adding its directories to the snapshot', t => {
+  const steps = 10;
+  const future = 'vault/' + Array(5).fill('.slot').join('/') + '/.pkg';
+  const names = new CargoDirectoryNames(['vault']);
+  const calls = t.mock.method(names, 'childDirs');
+  const match = cargoMemberMatcher('vault/' + Array(steps).fill('.*').join('/') + '/**', names);
+  assert.equal(match(future), future);
+  // Each pattern position can ask for children at most once per ancestor.
+  assert.ok(calls.mock.callCount() <= steps * (future.split('/').length + 1));
+  assert.equal(names.paths.has(future), false);
+
+  const reached = cargoMemberMatcher('vault/slots/.?/Bridge', names);
+  assert.equal(reached('vault/Bridge'), null);
+  names.add('vault/slots');
+  assert.equal(reached('vault/Bridge'), 'vault/Bridge');
+});
+
 test('a single Cargo member lookup prefers the exact spelling across recursive walks', () => {
   const dir = 'extras/plugins/exporter/vendor/plugins/Exporter/Unit';
   const alternate = dir.replace('plugins/exporter', 'plugins/Exporter');
