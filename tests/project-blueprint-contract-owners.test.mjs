@@ -155,6 +155,23 @@ async function schemaProject(t) {
   return { ...f, head: f.save('Schema owners and pinned toolchain') };
 }
 
+test('contract lint treats braces around a package path as broad in draft and registration', async t => {
+  const f = await schemaProject(t);
+  sequenceModuleWrites(f.draft);
+  for (const [scope, expected] of [
+    ['{native/codec}/schemas/api.proto', broad],
+    ['{{native/codec},native/control}/schemas/api.proto', broad],
+    ['{native/control}/schemas/api.proto', []],
+    ['native/{codec}/schemas/api.proto', []],
+    ['native/codec/{schemas,src}/**', []],
+  ]) {
+    for (const forRegistration of [false, true]) {
+      const result = await f.compile([scope], { forRegistration });
+      assert.deepEqual(codes(result), expected, scope);
+    }
+  }
+});
+
 test('compileBlueprint resolves committed and draft schema owners independently and honors explicit packageNames', async t => {
   const f = await schemaProject(t);
   await f.put('native/codec/Cargo.toml', manifest('draft-codec'));
@@ -202,6 +219,7 @@ test('registration reads the same selected blobs when unrelated packages share t
 
 test('project apply-spec rejects the broad committed schema owner and registers the explicit schema path', async t => {
   const f = await schemaProject(t);
+  sequenceModuleWrites(f.draft);
   const home = path.join(f.dir, 'state');
   const cli = fileURLToPath(new URL('../cli/index.mjs', import.meta.url));
   const apply = async scope => {
@@ -215,7 +233,9 @@ test('project apply-spec rejects the broad committed schema owner and registers 
     const { result } = JSON.parse(run.stdout);
     return [run.status, result.status, result.findings?.map(row => [row.code, row.taskIds]) ?? []];
   };
-  assert.deepEqual(await apply(schemaScope), [1, 'invalid', [['contract_scope_too_broad', ['storage-module']]]]);
+  for (const scope of [schemaScope, '{native/codec}/schemas/api.proto']) {
+    assert.deepEqual(await apply(scope), [1, 'invalid', [['contract_scope_too_broad', ['storage-module']]]], scope);
+  }
   assert.equal(existsSync(home), false);
   assert.deepEqual(await apply('native/codec/schemas/api.proto'), [0, 'created', []]);
 });

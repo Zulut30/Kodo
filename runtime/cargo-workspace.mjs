@@ -2,7 +2,7 @@
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { parse as parseToml } from 'smol-toml';
-import { braceBeforeExtglob, ownsPath, scopeGlobSyntax } from './scope-paths.mjs';
+import { braceBeforeExtglob, ownsPath, scopeBraceGroup, scopeGlobSyntax } from './scope-paths.mjs';
 
 const compare = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
@@ -173,6 +173,20 @@ function branchIntersectsSubtree(branch, crateRoot) {
   return segmentsIntersectSubtree(branch.split('/'), crateRoot.split('/'));
 }
 
+// Contract lint also checks the legacy spelling {crates/name} for a whole path.
+// Keep single-component literals and ranges intact. Task ownership uses the original scope.
+export function unwrapContractPathGroups(scope) {
+  let start = scope.indexOf('{');
+  while (start !== -1) {
+    const group = scopeBraceGroup(scope, start);
+    if (group?.arms.length === 1 && group.arms[0].includes('/')) {
+      scope = scope.slice(0, start) + group.arms[0] + scope.slice(group.end + 1);
+      start = scope.indexOf('{', start);
+    } else start = scope.indexOf('{', start + 1);
+  }
+  return scope;
+}
+
 /**
  * Returns true if `rawScope` (or any brace-expanded alternative of it) can intersect
  * any path inside `rawCrateRoot`'s subtree WITHOUT explicitly naming `rawCrateRoot`
@@ -191,7 +205,7 @@ export function isBroadContractScope(rawScope, rawCrateRoot) {
   // before trying alternatives such as {apps/api,libs/core} that cross '/'.
   if (branchIntersectsSubtree(scope, crateRoot)) return true;
   if (!scope.includes('{')) return false;
-  const branches = expandScopeBraces(scope);
+  const branches = expandScopeBraces(unwrapContractPathGroups(scope));
   if (branches === null) {
     const literal = literalScopePrefix(scope);
     return !literal || crateRoot === literal || crateRoot.startsWith(`${literal}/`);

@@ -1,7 +1,7 @@
 // A planned file has the same nearest Cargo manifest as a committed file.
 // A directory alone supplies Rust source evidence only under its package's src subtree.
 import path from 'node:path';
-import { blueprintScopeBranches, resolveRelativeDir } from './cargo-workspace.mjs';
+import { blueprintScopeBranches, resolveRelativeDir, unwrapContractPathGroups } from './cargo-workspace.mjs';
 import { braceBeforeExtglob, ownsPath, scopeBraceGroup, scopeGlobSyntax } from './scope-paths.mjs';
 import { pathParents, scopeOwnership } from './project-blueprint-scope-index.mjs';
 
@@ -630,7 +630,11 @@ export function createPackageFileOwnerResolver(manifests, entryKinds) {
   return scope => {
     if (scope === '.') return new Set(manifests.keys());
     const owners = new Set();
-    if (manifests.size) visitScope(scope, root, owners, entryKinds, true);
+    if (manifests.size) {
+      visitScope(scope, root, owners, entryKinds, true);
+      const grouped = unwrapContractPathGroups(scope);
+      if (grouped !== scope) visitScope(grouped, root, owners, entryKinds, true);
+    }
     return owners;
   };
 }
