@@ -96,6 +96,31 @@ test('Wave 0 follows Cargo member spellings and exclusions in draft and registra
   }
 });
 
+test('Wave 0 counts packages selected by a Unicode wildcard or another recursive walk', async t => {
+  const roots = mainMembers.slice(1);
+  const scalar = 'extras/📦/Exporter';
+  const nested = 'extras/plugins/Exporter/vendor/plugins/exporter/Unit';
+  const alternate = nested.replace('vendor/plugins/exporter', 'vendor/plugins/Exporter');
+  const recursive = 'extras/**/plugins/Exporter/**/Unit';
+  const f = await fixture(t);
+  for (const [i, dir] of [scalar, 'extras/ab/Exporter', nested, 'extras/anchor/plugins/Exporter/Unit'].entries()) {
+    await f.write(dir + '/Cargo.toml', manifest('extension-' + i));
+    await f.write(dir + '/src/lib.rs', '');
+  }
+  for (const [pattern, dir, exclude, required] of [
+    ['extras/?/Exporter', scalar, [], true],
+    ['extras/??/Exporter', scalar, [], false],
+    [recursive, nested, [nested], path.sep === '\\'],
+    [recursive, nested, [nested, alternate], false],
+  ]) {
+    await f.write('Cargo.toml', workspace([...roots, pattern], exclude));
+    f.commit();
+    const paths = [...roots, dir].map(root => root + '/src/lib.rs');
+    for (const forRegistration of [false, true])
+      assert.deepEqual(await f.compile(paths, { forRegistration }), required ? threshold : [], pattern);
+  }
+});
+
 test('Cargo path dependencies use native separators when counting workspace packages', async t => {
   const members = ['native/client', 'native/server'];
   const f = await fixture(t, workspace(members));

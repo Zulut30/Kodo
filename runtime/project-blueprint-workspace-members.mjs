@@ -128,8 +128,7 @@ function workspaceRules(root, rootDoc, names) {
       if (names.samePath(dir, spelled) && !excludedSpelling(spelled)) yield spelled;
     for (const { matcher, namesMember } of globs) {
       if (requireName && !namesMember) continue;
-      const spelled = matcher(dir);
-      if (spelled !== null && !excludedSpelling(spelled)) yield spelled;
+      for (const spelled of matcher.spellings(dir)) if (!excludedSpelling(spelled)) yield spelled;
     }
   }
   const declares = (dir, requireName = false) => !spellings(dir, requireName).next().done;

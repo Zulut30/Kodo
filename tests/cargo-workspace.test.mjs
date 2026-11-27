@@ -99,6 +99,92 @@ test('a recursive Cargo member glob compares the next component with the enumera
   }
 });
 
+test('Cargo member globs count Unicode scalars in wildcards and character classes', () => {
+  const parts = ['a', 'ab', 'é', 'e\u0301', '📦', '📮', '📦x', '𠮷'];
+  const packages = Object.fromEntries(
+    parts.map((part, i) => [`extras/${part}/Cargo.toml`, { package: { name: 'pkg' + i } }]),
+  );
+  for (const [pattern, matches] of [
+    ['?', ['a', 'é', '📦', '📮', '𠮷']],
+    ['??', ['ab', 'e\u0301', '📦x']],
+    ['[📦-📮]', ['📦', '📮']],
+    ['[!📦]', ['a', 'é', '📮', '𠮷']],
+    ['?x', ['📦x']],
+  ]) {
+    const ws = resolveCargoWorkspace({
+      manifests: { 'Cargo.toml': { workspace: { members: ['extras/' + pattern] } }, ...packages },
+    });
+    assert.deepEqual(ws.unsupported, [], pattern);
+    assert.deepEqual(ws.members.map(pkg => pkg.root).sort(), matches.map(part => 'extras/' + part).sort(), pattern);
+  }
+});
+
+test('recursive Cargo member walks apply exclusions to each spelling of a package', () => {
+  const pattern = 'extras/**/plugins/Exporter/**/Unit';
+  const dir = 'extras/plugins/Exporter/vendor/plugins/exporter/Unit';
+  const alias = dir.replace('vendor/plugins/exporter', 'vendor/plugins/Exporter');
+  const windows = path.sep === '\\';
+  for (const [exclude, expected] of [
+    [[dir], windows ? [dir] : []],
+    [[alias], [dir]],
+    [[dir, alias], []],
+  ]) {
+    const ws = resolveCargoWorkspace({
+      manifests: {
+        'Cargo.toml': { workspace: { members: [pattern], exclude } },
+        [dir + '/Cargo.toml']: { package: { name: 'exporter' } },
+      },
+    });
+    assert.deepEqual(ws.unsupported, [], JSON.stringify(exclude));
+    assert.deepEqual(
+      ws.members.map(pkg => pkg.root),
+      expected,
+      JSON.stringify(exclude),
+    );
+  }
+  const duplicate = resolveCargoWorkspace({
+    manifests: {
+      'Cargo.toml': { workspace: { members: [pattern] } },
+      [dir + '/Cargo.toml']: { package: { name: 'exporter' } },
+    },
+  });
+  assert.deepEqual(
+    duplicate.unsupported.map(row => row.reason),
+    windows ? ['duplicate-crate-name'] : [],
+  );
+});
+
+test('Cargo only probes native aliases on paths that can match the whole member pattern', () => {
+  const dir = 'extras/plugins/exporter/vendor/plugins/exporter/Unit';
+  const unrelated = Array.from({ length: 32 }, (_, i) => [
+    'other/' + i + '/exporter/Cargo.toml',
+    { package: { name: 'other-' + i } },
+  ]);
+  const probes = [];
+  const ws = resolveCargoWorkspace({
+    manifests: {
+      ...Object.fromEntries(unrelated),
+      'Cargo.toml': { workspace: { members: ['addons/*/Exporter', 'extras/**/plugins/Exporter/**/Unit'] } },
+      [dir + '/Cargo.toml']: { package: { name: 'exporter' } },
+      'extras/anchor/plugins/Exporter/Unit/Cargo.toml': { package: { name: 'anchor' } },
+      'addons/control/Exporter/Cargo.toml': { package: { name: 'control' } },
+    },
+    probeAlias: original => {
+      probes.push(original);
+      return !original.includes('/vendor/plugins/');
+    },
+  });
+  assert.deepEqual(ws.unsupported, []);
+  assert.deepEqual(
+    ws.members.map(pkg => pkg.name).sort(),
+    path.sep === '\\' ? ['anchor', 'control', 'exporter'] : ['anchor', 'control'],
+  );
+  assert.equal(
+    probes.some(p => p.startsWith('other/')),
+    false,
+  );
+});
+
 test('Cargo preserves distinct snapshot entries and detects two member spellings for one package', () => {
   const manifests = {
     'native/Codec/Cargo.toml': { package: { name: 'upper' } },

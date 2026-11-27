@@ -7,6 +7,9 @@ const windows = path.sep === '\\';
 export const nativeManifestPath = raw => (windows && typeof raw === 'string' ? raw.replaceAll('\\', '/') : raw);
 export const hasCargoGlob = name => /[*?[]/.test(name);
 export const cargoNameKey = name => (windows ? name.toUpperCase() : name);
+const maySpell = (actual, requested) =>
+  actual === requested ||
+  (windows && actual.length === requested.length && cargoNameKey(actual) === cargoNameKey(requested));
 const join = (parent, name) => (parent ? parent + '/' + name : name);
 
 export class CargoDirectoryNames {
@@ -34,8 +37,7 @@ export class CargoDirectoryNames {
 
   matches(parent, actual, requested) {
     if (actual === requested) return true;
-    if (!windows || actual.length !== requested.length || cargoNameKey(actual) !== cargoNameKey(requested))
-      return false;
+    if (!maySpell(actual, requested)) return false;
     const known = this.aliases.get(join(parent, cargoNameKey(requested)));
     if (known === null || (known !== undefined && known !== actual)) return false;
     if (!this.probeAlias) return true;
@@ -120,6 +122,10 @@ function compileGlobSegment(segment) {
   return regex;
 }
 
+function globParts(pattern) {
+  return pattern.split('/').filter((part, i, all) => part !== '**' || all[i - 1] !== '**');
+}
+
 /**
  * Compile a Cargo member glob pattern following the Rust `glob` crate semantics:
  * `*` matches 0+ chars in a segment, `?` matches 1 char, `[...]` / `[!...]` character class,
@@ -128,9 +134,9 @@ function compileGlobSegment(segment) {
  * @param {string} pattern
  * @returns {RegExp | null}
  */
-function globRegex(pattern, literals = undefined) {
+export function compileCargoGlob(pattern) {
   if (pattern === '') return /^$/;
-  const parts = pattern.split('/').filter((part, i, all) => part !== '**' || all[i - 1] !== '**');
+  const parts = globParts(pattern);
   let expr = '^';
   for (let i = 0; i < parts.length; i++) {
     const part = parts[i];
@@ -148,45 +154,137 @@ function globRegex(pattern, literals = undefined) {
     if (i > 0) {
       expr += parts[i - 1] === '**' ? (i - 1 === 0 ? '' : '/') : '/';
     }
-    // A recursive walk compares its next pattern with names from read_dir.
-    // Only a subsequent literal component goes back to a native path lookup.
-    if (literals && parts[i - 1] !== '**' && !hasCargoGlob(part)) {
-      literals.push(part);
-      expr += `((?i:${compiled}))`;
-    } else expr += compiled;
+    expr += compiled;
   }
   expr += '$';
   try {
-    return new RegExp(expr, literals ? 'd' : '');
+    return new RegExp(expr, 'su');
   } catch {
     return null;
   }
 }
 
-export function compileCargoGlob(pattern) {
-  return globRegex(pattern);
+function memberSteps(parts) {
+  return parts.map((part, i) => {
+    if (part === '**') return null;
+    if (hasCargoGlob(part)) {
+      const matcher = new RegExp('^' + compileGlobSegment(part) + '$', 'u');
+      return actual => (matcher.test(actual) ? actual : null);
+    }
+    // The component after ** is compared with entries from read_dir. Later
+    // literal components use native lookup and retain the manifest's spelling.
+    if (parts[i - 1] === '**') return actual => (part === actual ? actual : null);
+    return actual => (maySpell(actual, part) ? part : null);
+  });
+}
+
+// With at most one ** the directory length determines its entire span.
+function singleMemberSpelling(steps, recursive, dir, names) {
+  const entries = dir.split('/');
+  const span = entries.length - steps.length + 1;
+  if (recursive < 0 ? span !== 1 : span < 0) return null;
+  const changes = [];
+  let depth = 0;
+  for (const step of steps) {
+    if (step === null) {
+      depth += span;
+      continue;
+    }
+    const actual = entries[depth];
+    const spelling = step(actual);
+    if (spelling === null) return null;
+    if (spelling !== actual) changes.push({ depth, parent: entries.slice(0, depth).join('/'), spelling });
+    depth++;
+  }
+  for (const change of changes) {
+    if (!names.matches(change.parent, entries[change.depth], change.spelling)) return null;
+    entries[change.depth] = change.spelling;
+  }
+  return changes.length ? entries.join('/') : dir;
+}
+
+// Row d contains the pattern positions that can match entries[d..]. A literal
+// records its emitted spelling. A globstar can stay put or advance without
+// consuming an entry. Dead suffixes never generate alternative paths.
+function memberSuffixes(steps, entries, checkAlias = undefined) {
+  let hasAlias = false;
+  const rows = [];
+  let next = new Map([[steps.length, '']]);
+  if (steps.at(-1) === null) next.set(steps.length - 1, '');
+  rows[entries.length] = next;
+  for (let d = entries.length - 1; d >= 0; d--) {
+    const row = new Map();
+    for (const pos of next.keys()) {
+      if (steps[pos] === null) row.set(pos, '');
+      const previous = steps[pos - 1];
+      if (!previous) continue;
+      const spelling = previous(entries[d]);
+      if (spelling === null) continue;
+      if (spelling !== entries[d]) {
+        if (checkAlias && !checkAlias(d, spelling)) continue;
+        hasAlias = true;
+      }
+      row.set(pos - 1, spelling);
+      if (steps[pos - 2] === null) row.set(pos - 2, '');
+    }
+    if (!row.size) return null;
+    rows[d] = next = row;
+  }
+  return next.has(0) ? { rows, hasAlias } : null;
+}
+
+function* walkMemberSpellings(steps, dir, names) {
+  const entries = dir ? dir.split('/') : [];
+  const possible = memberSuffixes(steps, entries);
+  if (!possible) return;
+  if (!possible.hasAlias) {
+    yield dir;
+    return;
+  }
+  // Filesystem lookups are only needed for a directory that matches an entire
+  // pattern with a case variant. Verify those lookups before enumerating paths.
+  let parent = '';
+  const parents = entries.map(entry => {
+    const current = parent;
+    parent = join(parent, entry);
+    return current;
+  });
+  const confirmed = memberSuffixes(steps, entries, (d, spelling) => names.matches(parents[d], entries[d], spelling));
+  if (!confirmed) return;
+  const { rows } = confirmed;
+  const seen = Array.from({ length: steps.length + 1 }, () => new Set());
+  const pending = [{ pos: 0, depth: 0, spelling: '' }];
+  while (pending.length) {
+    const { pos, depth, spelling } = pending.pop();
+    if (seen[pos].has(spelling)) continue;
+    seen[pos].add(spelling);
+    if (pos === steps.length) yield spelling;
+    else if (steps[pos] === null) {
+      if (rows[depth + 1]?.has(pos)) pending.push({ pos, depth: depth + 1, spelling: join(spelling, entries[depth]) });
+      if (rows[depth].has(pos + 1)) pending.push({ pos: pos + 1, depth, spelling });
+    } else {
+      pending.push({ pos: pos + 1, depth: depth + 1, spelling: join(spelling, rows[depth].get(pos)) });
+    }
+  }
 }
 
 export function cargoMemberMatcher(pattern, names) {
   const exact = compileCargoGlob(pattern);
   if (!exact) return null;
-  const literals = [];
-  // Only literal components inherit the directory lookup semantics. Keep the
-  // exact spelling of components selected by *, ? or a class for exclusions.
-  const native = windows ? globRegex(pattern, literals) : null;
-  return dir => {
+  const parts = globParts(pattern);
+  const steps = memberSteps(parts);
+  const recursive = parts.indexOf('**');
+  if (recursive !== parts.lastIndexOf('**')) {
+    const spellings = dir => walkMemberSpellings(steps, dir, names);
+    return Object.assign(dir => spellings(dir).next().value ?? null, { spellings });
+  }
+  const match = dir => {
     if (exact.test(dir)) return dir;
-    const match = native?.exec(dir);
-    if (!match) return null;
-    let spelling = '';
-    let offset = 0;
-    for (const [i, literal] of literals.entries()) {
-      const [start, end] = match.indices[i + 1];
-      const parent = start ? dir.slice(0, start - 1) : '';
-      if (!names.matches(parent, match[i + 1], literal)) return null;
-      spelling += dir.slice(offset, start) + literal;
-      offset = end;
-    }
-    return spelling + dir.slice(offset);
+    return windows ? singleMemberSpelling(steps, recursive, dir, names) : null;
   };
+  function* spellings(dir) {
+    const result = match(dir);
+    if (result !== null) yield result;
+  }
+  return Object.assign(match, { spellings });
 }

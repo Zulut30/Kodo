@@ -562,9 +562,12 @@ function collectDeclaredMembers({
 }) {
   const selected = new Map();
   const select = (dir, spelling) => {
-    if (selected.has(dir) && selected.get(dir) !== spelling)
+    if (selected.has(dir) && selected.get(dir) !== spelling) {
       unknown('workspace', joinRel(dir, 'Cargo.toml'), 'duplicate-crate-name');
-    else selected.set(dir, spelling);
+      return false;
+    }
+    selected.set(dir, spelling);
+    return true;
   };
   for (const pattern of patterns) {
     const spelling = joinRel(rootDir, pattern);
@@ -591,15 +594,19 @@ function collectDeclaredMembers({
     let matched = false;
     for (const dir of snapshotDirs) {
       if (dir === rootDir || relativeToRoot(rootDir, dir) === null) continue;
-      const chosen = match(dir);
-      if (chosen === null) continue;
-      matched = true;
-      if (isExcluded(chosen)) continue;
-      if (!manifestDirs.has(dir)) {
-        unknown('workspace', joinRel(dir, 'Cargo.toml'), 'member-without-manifest');
-      } else if (isNestedWorkspaceRoot(rootDir, dir, manifestDirs, parsedCache)) {
-        unknown('workspace', `${dir}/Cargo.toml`, 'nested-workspace-root');
-      } else select(dir, chosen);
+      for (const chosen of match.spellings(dir)) {
+        matched = true;
+        if (isExcluded(chosen)) continue;
+        if (!manifestDirs.has(dir)) {
+          unknown('workspace', joinRel(dir, 'Cargo.toml'), 'member-without-manifest');
+          break;
+        }
+        if (isNestedWorkspaceRoot(rootDir, dir, manifestDirs, parsedCache)) {
+          unknown('workspace', `${dir}/Cargo.toml`, 'nested-workspace-root');
+          break;
+        }
+        if (!select(dir, chosen)) break;
+      }
     }
     if (!matched && ![...snapshotFiles].some(file => relativeToRoot(rootDir, file) !== null && match(file) !== null))
       unknown('workspace', rootManifest, 'member-glob-no-match');
