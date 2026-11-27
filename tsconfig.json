@@ -11,6 +11,6 @@
     "resolveJsonModule": true,
     "types": ["node"]
   },
-  "include": ["adapters/**/*.mjs", "cli/**/*.mjs", "runtime/**/*.mjs", "scripts/**/*.mjs", "tests/types/**/*.mts"],
+  "include": ["adapters/**/*.mjs", "cli/**/*.mjs", "runtime/**/*.mjs", "scripts/**/*.mjs", "tests/types"],
   "exclude": ["node_modules", "**/fixtures/**"]
 }
