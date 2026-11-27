@@ -14,6 +14,19 @@ config.mode.replace(/^./, first => first.toUpperCase());
 emptyContainers([{ id: 'first' }], [], []).map(container => container.kind.toUpperCase());
 await isCurrentQualityReceipt();
 
+export function verifyReceipt(
+  report: unknown,
+  project: string | null,
+  readHead: (
+    command: 'git',
+    args: string[],
+    options: { cwd: string; timeoutMs: number; maxOutputBytes: number },
+  ) => { code: number; stdout: string },
+) {
+  const options = { project, runner: readHead };
+  return isCurrentQualityReceipt(report, options);
+}
+
 export function formatSummary(
   bootstrap: Awaited<ReturnType<typeof prepareBootstrap>>,
   telemetry: ReturnType<typeof buildProjectTelemetry>,

@@ -604,9 +604,22 @@ export async function runQuality(options = {}) {
   });
 }
 
-/** Current-head validation is for callers reusing a receipt; Engine is unchanged.
+/** Read HEAD with the arguments and bounds supplied by the receipt validator.
+ * @callback ReceiptHeadRunner
+ * @param {'git'} command
+ * @param {['rev-parse', '--verify', 'HEAD']} args
+ * @param {{cwd: string, timeoutMs: 10000, maxOutputBytes: 1024}} options
+ * @returns {ReturnType<typeof executeProcess> | Awaited<ReturnType<typeof executeProcess>>}
+ */
+
+/** Check a saved receipt against the current Git head and its evidence.
  * @param {Awaited<ReturnType<typeof runQuality>> | null} [report]
- * @param {{project?: string, toolHome?: string, runner?: QualityCommand, resolve?: typeof resolveTool, nativeResolve?: typeof nativeTool}} [options]
+ * @param {object} [options]
+ * @param {string | null | undefined} [options.project]
+ * @param {string | null | undefined} [options.toolHome]
+ * @param {ReceiptHeadRunner | undefined} [options.runner]
+ * @param {typeof resolveTool | undefined} [options.resolve]
+ * @param {typeof nativeTool | undefined} [options.nativeResolve]
  */
 // oxlint-disable-next-line complexity -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md
 export async function isCurrentQualityReceipt(
