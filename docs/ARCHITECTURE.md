@@ -1,6 +1,6 @@
 # Architecture Guardian: ограниченный MVP
 
-Этап 04 добавляет offline-проверку объявленных границ модулей и контрактов. Локальные A–E и независимый CLI oracle интегрированы; общая приёмка этапа, интеграция gate G, fresh security/review и required CI ещё **pending**. Принятое разделение ответственности описано в [ADR-0007](decisions/0007-architecture-guardian.md); состояние доказательств — в [phase-04](kodo-roadmap/phase-04.md).
+Этап 04 добавляет offline-проверку объявленных границ модулей и контрактов. Этап принят: [PR #13](https://github.com/Zulut30/Kodo/pull/13), merge `a674091`, CI обеих ОС success; gate G подключён к Engine и delivery (`architecture.enabled`, по умолчанию `false`). Этап 15E1 добавил политику v2 для Rust Cargo workspace. Принятое разделение ответственности описано в [ADR-0007](decisions/0007-architecture-guardian.md); состояние доказательств — в [phase-04](kodo-roadmap/phase-04.md).
 
 ## Поддерживаемая область
 

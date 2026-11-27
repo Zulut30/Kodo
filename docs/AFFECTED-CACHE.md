@@ -1,8 +1,7 @@
 # Affected graph и приватный кеш команд
 
-Phase 03 draft. Этот модуль не меняет обязательные `npm run check`, UI/security,
-Windows/Linux CI, package smoke или release gates. Интеграция разрешена только
-после приёмки phase 02 (принят, PR #11 / `dabecb7`). Локальные тесты не доказывают native/provider, CI,
+Модуль этапа 03 (принят: [PR #12](https://github.com/Zulut30/Kodo/pull/12) / `b3304b4`). Он не меняет обязательные `npm run check`, UI/security,
+Windows/Linux CI, package smoke или release gates. Локальные тесты не доказывают native/provider, CI,
 опубликованный artifact или deployment.
 
 ## Граф

@@ -1,6 +1,6 @@
 # План: сопровождаемость Kodo после PR #16
 
-Статус: черновик, 2026-11-06. Опирается на повторный анализ ветки `quality/maintainability` (`c2d3940`, CI зелёный на ubuntu и windows).
+На 2026-11-26 **T1–T8 выполнены**. Шаги T4c, T5, T6, T8, декомпозиции этапов 15–16 и храповик `max-lines: 900` вошли в `main` коммитом `46fffa2`. У шести файлов пока есть исключения по длине. План составлен 2026-11-06 по ветке `quality/maintainability` (`c2d3940`, CI зелёный на Ubuntu и Windows). [PR #34](https://github.com/Zulut30/Kodo/pull/34) · [Храповик размера файлов и остаток долга](#храповик-размера-файлов-и-остаток-долга).
 
 ## Цель
 
@@ -16,7 +16,7 @@
 
 ## Границы и правила
 
-- Корень: `D:\AIToolkit`. Каждая задача делается в отдельном worktree на ветке `quality/<slug>` от свежего `main`, один PR на задачу.
+- Корень: `C:\Users\zulut\Kodo`. Каждая задача делается в отдельном worktree на ветке `quality/<slug>` от свежего `main`, один PR на задачу.
 - Перед работой прочитать `AGENTS.md`, `docs/ARCHITECTURE.md` и `docs/README.md` (раздел «Разработка Kodo»).
 - Не трогать: `prompts/` (пользовательский, неотслеживаемый), `skills/**`, фикстуры, `runtime/tool-catalog.json` и замороженные oracle/acceptance-файлы.
 - Перед PR выполнить полный `npm run check`. Для быстрой обратной связи при правке — `npm run test:fast`.
@@ -99,7 +99,7 @@ T1–T4 независимы друг от друга. T5–T8 начинают�
 
 ---
 
-## T4. Типы, которые проверяют (M, три PR)
+## T4. Типы, которые проверяют (M, три PR) — сделано
 
 **Проблема.** В baseline 302 диагностики, из них 268 — TS2339 и TS2353. Они возникают из-за того, что `tsc` выводит тип из `options = {}` и из узких сигнатур по умолчанию. Вот откуда берётся шум:
 - исполнитель команд `execute(command, args, { cwd, env, signal, input, timeoutMs, allowFailure, secrets, rawOutput })` в `runtime/command.mjs`. Подменяемые `runner` получают более узкий выведенный тип, отсюда минимум 25 случаев TS2353;
@@ -119,7 +119,7 @@ T1–T4 независимы друг от друга. T5–T8 начинают�
 - Итог: в четырёх файлах 3 диагностики (было 78, цель не больше 15). Весь baseline: 251 → 155.
 - JSDoc ставится над меткой `oxlint-disable-next-line`, а не между ней и функцией, иначе метка перестаёт действовать. Lint с `--report-unused-disable-directives` это ловит.
 
-**4c. Запись запуска.** `@typedef {object} KodoRun` в `runtime/store.mjs` (там создаются записи `run`). Аннотировать `run` в методах `EngineCore`, `EnginePlanning`, `EngineExecution` и `EngineVerification`. Приёмка: baseline не больше 150.
+**4c. Запись запуска — сделано (`78a0dd1`).** `@typedef {object} KodoRun` в `runtime/store.mjs` (там создаются записи `run`), `run` аннотирован в методах `EngineCore`, `EnginePlanning`, `EngineExecution` и `EngineVerification`. Итог: baseline 143 → 108 диагностик (92 записи по паре «файл + сообщение», 46 уникальных пар «файл + код»), цель была не больше 150.
 
 **Проверка каждой подзадачи.** `npm run typecheck`, `npm run lint`, `npm run test:fast`, затем `npm run check` перед PR.
 
@@ -127,9 +127,9 @@ T1–T4 независимы друг от друга. T5–T8 начинают�
 
 ---
 
-## T5. Декомпозиция `openProjectStore` (L)
+## T5. Декомпозиция `openProjectStore` (L) — сделано
 
-**Статус: в основном сделано.**
+**Статус: сделано (`78a0dd1`).** Модули `runtime/project-store-records.mjs`, `runtime/project-store-validation.mjs` и `runtime/project-store-transitions.mjs` вынесены и внесены в `pins()`. В `runtime/project-store*.mjs` нет ни одной метки `max-lines-per-function` или `complexity`: lint проходит с общими порогами 150/40, а `overrides` в `.oxlintrc.json` теперь касается только `tests/**`. `openProjectStore` — 65 строк. Ниже — история предыдущих шагов.
 - Замыкания подняты на уровень модуля с явным `ctx` (`5e99e8e`): `openProjectStore` сократилась с 696 строк до 51.
 - Команды `apply()` вынесены в таблицу обработчиков `operations` (`6d67894`): `apply` сократилась с 245 строк до 108.
 - Осталась одна метка: сложность транзакции в `installRun` (49).
@@ -158,9 +158,9 @@ T1–T4 независимы друг от друга. T5–T8 начинают�
 
 ---
 
-## T6. Декомпозиция `createProjectDirector` (L)
+## T6. Декомпозиция `createProjectDirector` (L) — сделано
 
-**Статус: частично.** Замыкания подняты тем же codemod (`4ab4bfb`): `createProjectDirector` сократилась с 657 строк до 19. Осталось разбить `foreground` (239 строк) на фазы (шаг 4).
+**Статус: сделано (`78a0dd1`).** Замыкания подняты codemod (`4ab4bfb`): `createProjectDirector` сократилась с 657 строк до 19. Затем вынесены `runtime/project-director-scheduling.mjs`, `runtime/project-director-progress.mjs` и `runtime/project-director-proofs.mjs`, а `foreground` разбит на фазы `selectWork`, `admitWork`, `executeWork` и `settleWork` — сам цикл занимает 76 строк (цель не больше 80). Меток сложности в `runtime/project-director*.mjs` нет.
 
 **Сейчас.** `runtime/project-director.mjs`: функция `createProjectDirector({ repo, engine, planner, evaluator, clock })` на 657 строк, 143 ветвления, 20 внутренних функций. Единственное состояние — `store`. Возвращает `{ plan, run, resume, cancel, pause, reprioritize, approveRisk }`. Самая большая внутренняя функция — `foreground` (242 строки).
 
@@ -189,9 +189,11 @@ T1–T4 независимы друг от друга. T5–T8 начинают�
 
 ---
 
-## T8. `Engine.run` и связность `engine-core` (M)
+## T8. `Engine.run` и связность `engine-core` (M) — сделано
 
-**Сейчас.** `Engine.run` в `runtime/engine.mjs` занимает 271 строку. `runtime/engine-core.mjs` импортирует 21 локальный модуль и остаётся центром, через который проходит всё.
+**Статус: сделано (`78a0dd1`).** Окружение worker вынесено в `runtime/worker-environment.mjs`, подготовка запуска — в `runtime/engine-run-preparation.mjs`, помощники проверки — в `runtime/engine-verification-helpers.mjs`. `Engine.run` — около 50 строк и вызывает фазы `#prepareRunPhase`, `#planPhase` и `#executePhase` (отдельная `verifyPhase` не понадобилась). `engine-core.mjs` импортирует 14 локальных модулей (цель не больше 15). `pins()` и `metadata().sources` обновлены.
+
+**Было.** `Engine.run` в `runtime/engine.mjs` занимает 271 строку. `runtime/engine-core.mjs` импортирует 21 локальный модуль и остаётся центром, через который проходит всё.
 
 **Шаги**
 1. Подготовку окружения worker (`executionEnvironment`: npm cache, rtk, PATH) перенести из `EngineCore` в `runtime/worker-environment.mjs` как функцию с явными параметрами `(store, run, cwd, tools)`. В `EngineCore` остаётся тонкая обёртка.
@@ -206,10 +208,31 @@ T1–T4 независимы друг от друга. T5–T8 начинают�
 
 ---
 
+## Храповик размера файлов и остаток долга
+
+**Сделано (`bd3b6f0`).** В `.oxlintrc.json` включено `"max-lines": ["error", { "max": 900, "skipBlankLines": true, "skipComments": true }]`; для `tests/**` правило выключено. Новый файл длиннее 900 строк кода роняет `npm run lint`. В `pins()` архитектурного гейта учтены фасады `project-external`, `project-blueprint`, `project-director-waves` и их части. После [PR #34](https://github.com/Zulut30/Kodo/pull/34) `metadata().sources` бенчмарка включает фасад `api-cards` и три его модуля.
+
+**Декомпозиции этапов 15–16 — сделано.**
+- `4e4f33c`: `project-external` → `-integration`/`-shared`/`-submission`/`-wave`; `project-blueprint` → `-io`/`-lint`/`-rust`/`-shared`/`-spec`; `project-director-waves` → `project-wave-gates`/`-integration`/`-shared`.
+- `f93c97d`: `api-cards` → `-js`/`-lexical`/`-rust`; `behavior-gate` → `behavior-scanners`; `behavior-rust` → `behavior-rust-registry`; `task-fast-checks` → `task-fast-counting`.
+
+**Остаток: шесть файлов длиннее 900 строк.** Каждый начинается с `/* oxlint-disable max-lines -- debt: docs/kodo-roadmap/MAINTAINABILITY-PLAN.md */`. Разбиение файла снимает метку, а устаревшую метку lint сам потребует удалить (`--report-unused-disable-directives`). Число строк — физическое, на 2026-11-26:
+
+| Файл | Строк |
+| --- | ---: |
+| `runtime/project-bootstrap.mjs` | 1 252 |
+| `runtime/project-contracts.mjs` | 1 210 |
+| `scripts/overhead-bench.mjs` | 1 151 |
+| `runtime/project-telemetry.mjs` | 1 085 |
+| `runtime/quality.mjs` | 1 079 |
+| `runtime/quality-runner.mjs` | 981 |
+
+Кроме того, в коде остаются 25 точечных меток `max-lines-per-function` или `complexity` из T3.
+
 ## Итоговые критерии плана
 
-- В `.oxlintrc.json` блок `overrides` из T3 пуст или содержит только файлы с записанным обоснованием.
-- Baseline типов не больше 150 (было 302).
+- В `.oxlintrc.json` блок `overrides` из T3 пуст или содержит только файлы с записанным обоснованием. **Выполнено:** остался только `tests/**`.
+- Baseline типов не больше 150 (было 302). **Выполнено:** 108.
 - Покрытие измерено, а цифры по модулям из T5–T7 не ниже исходных.
 - Публичный API модулей, формат хранилища и замороженные oracle/acceptance-файлы не изменились.
 - Каждый PR прошёл `npm run check` локально и в CI.
