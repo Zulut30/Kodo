@@ -608,7 +608,11 @@ function collectDeclaredMembers({
         if (!select(dir, chosen)) break;
       }
     }
-    if (!matched && ![...snapshotFiles].some(file => relativeToRoot(rootDir, file) !== null && match(file) !== null))
+    if (
+      !matched &&
+      (match.directoriesOnly ||
+        ![...snapshotFiles].some(file => relativeToRoot(rootDir, file) !== null && match(file) !== null))
+    )
       unknown('workspace', rootManifest, 'member-glob-no-match');
   }
   return selected;

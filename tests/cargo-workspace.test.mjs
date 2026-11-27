@@ -182,6 +182,55 @@ test('recursive Cargo member walks apply exclusions to each spelling of a packag
   );
 });
 
+test('a trailing Cargo globstar enumerates descendants of each matched directory', () => {
+  const hub = 'vault/node/Hub';
+  const leaf = hub + '/branch/node/hub';
+  const roots = [hub, hub + '/branch', hub + '/branch/node', leaf];
+  const names = new CargoDirectoryNames(roots);
+  for (const pattern of [hub + '/**', hub + '/**/**', 'vault/**/node/Hub/**']) {
+    const match = cargoMemberMatcher(pattern, names);
+    assert.deepEqual([...match.spellings(hub)], [], pattern);
+    assert.deepEqual([...match.spellings(leaf)], [leaf], pattern);
+  }
+  const current = cargoMemberMatcher('vault/**/node/Hub', names);
+  assert.equal(current(hub), hub);
+  const packages = roots.map((dir, i) => [dir + '/Cargo.toml', { package: { name: 'crate-' + i } }]);
+  for (const exclude of [[], [leaf]]) {
+    const result = resolveCargoWorkspace({
+      manifests: {
+        'Cargo.toml': { workspace: { members: ['vault/[n]ode/Hub', 'vault/**/node/Hub/**'], exclude } },
+        ...Object.fromEntries(packages),
+      },
+    });
+    assert.deepEqual(result.unsupported, []);
+    assert.deepEqual(
+      result.members.map(member => member.root).sort(),
+      roots.filter(dir => !exclude.includes(dir)).sort(),
+    );
+  }
+});
+
+test('a terminal Cargo globstar needs a directory entry even when ordinary files exist', () => {
+  const dir = 'vault/leaf';
+  const resolve = member =>
+    resolveCargoWorkspace({
+      manifests: {
+        'Cargo.toml': { workspace: { members: [member] } },
+        [dir + '/Cargo.toml']: { package: { name: 'leaf' }, lib: { path: 'unit.rs' } },
+      },
+      files: ['Cargo.toml', dir + '/Cargo.toml', dir + '/unit.rs'],
+    });
+  const recursive = resolve(dir + '/**');
+  assert.deepEqual(recursive.members, []);
+  assert.deepEqual(
+    recursive.unsupported.map(row => row.reason),
+    ['member-glob-no-match'],
+  );
+  const ordinary = resolve(dir + '/*');
+  assert.deepEqual(ordinary.members, []);
+  assert.deepEqual(ordinary.unsupported, []);
+});
+
 test('a single Cargo member lookup prefers the exact spelling across recursive walks', () => {
   const dir = 'extras/plugins/exporter/vendor/plugins/Exporter/Unit';
   const alternate = dir.replace('plugins/exporter', 'plugins/Exporter');
@@ -219,6 +268,38 @@ test('Cargo only probes native aliases on paths that can match the whole member 
     probes.some(p => p.startsWith('other/')),
     false,
   );
+});
+
+test('recursive Cargo walks probe aliases only on reachable path components', () => {
+  const pattern = 'addons/*/unit/depot/**/unit/Depot/**/Leaf';
+  const branches = ['east', 'north', 'south', 'west'];
+  const dirs = branches.map(branch => 'addons/' + branch + '/unit/depot/area/unit/Depot/Leaf');
+  const lower = 'addons/live/unit/depot/area/unit/depot/Leaf';
+  const upper = lower.replace('area/unit/depot', 'area/unit/Depot');
+  for (const allow of [false, true]) {
+    const probes = [];
+    const names = new CargoDirectoryNames([...dirs, lower], actual => {
+      probes.push(actual);
+      return allow;
+    });
+    const matcher = cargoMemberMatcher(pattern, names);
+    for (const dir of dirs) assert.deepEqual([...matcher.spellings(dir)], [dir]);
+    assert.deepEqual(probes, []);
+    assert.deepEqual([...matcher.spellings(lower)], path.sep === '\\' && allow ? [upper] : []);
+    assert.deepEqual(probes, path.sep === '\\' ? [lower.slice(0, -'/Leaf'.length)] : []);
+  }
+});
+
+test('recursive Cargo walks stop probing after a required directory alias fails', () => {
+  const dir = 'addons/live/depot/a/unit/shelf/b/Leaf';
+  const probes = [];
+  const names = new CargoDirectoryNames([dir], actual => {
+    probes.push(actual);
+    return false;
+  });
+  const matcher = cargoMemberMatcher('addons/*/Depot/**/unit/Shelf/**/Leaf', names);
+  assert.deepEqual([...matcher.spellings(dir)], []);
+  assert.deepEqual(probes, path.sep === '\\' ? ['addons/live/depot'] : []);
 });
 
 test('Cargo preserves distinct snapshot entries and detects two member spellings for one package', () => {

@@ -234,6 +234,35 @@ function memberSuffixes(steps, entries, checkAlias = undefined) {
   return next.has(0) ? { rows, hasAlias } : null;
 }
 
+function confirmMemberAliases(steps, entries, rows, names) {
+  const aliases = [];
+  let positions = new Set([0]);
+  let parent = '';
+  for (const [depth, entry] of entries.entries()) {
+    const next = new Set();
+    for (const pos of positions) {
+      // The prefix has reached this position. Only probe it if the suffix fits too.
+      if (!rows[depth].has(pos)) continue;
+      if (steps[pos] === null) {
+        positions.add(pos + 1);
+        if (rows[depth + 1].has(pos)) next.add(pos);
+        continue;
+      }
+      const spelling = rows[depth].get(pos);
+      if (spelling !== entry) {
+        if (!names.matches(parent, entry, spelling)) continue;
+        (aliases[depth] ??= new Set()).add(spelling);
+      }
+      next.add(pos + 1);
+    }
+    if (!next.size) return null;
+    positions = next;
+    parent = join(parent, entry);
+  }
+  // Prune walks that would eventually hit a rejected alias before emitting spellings.
+  return aliases.length ? memberSuffixes(steps, entries, (d, spelling) => aliases[d]?.has(spelling)) : null;
+}
+
 function* walkMemberSpellings(steps, dir, names) {
   const entries = dir ? dir.split('/') : [];
   const possible = memberSuffixes(steps, entries);
@@ -246,15 +275,7 @@ function* walkMemberSpellings(steps, dir, names) {
   // available. Other walks remain available to callers applying exclusions.
   const exact = memberSuffixes(steps, entries, () => false) !== null;
   if (exact) yield dir;
-  // Filesystem lookups are only needed for a directory that matches an entire
-  // pattern with a case variant. Verify those lookups before enumerating paths.
-  let parent = '';
-  const parents = entries.map(entry => {
-    const current = parent;
-    parent = join(parent, entry);
-    return current;
-  });
-  const confirmed = memberSuffixes(steps, entries, (d, spelling) => names.matches(parents[d], entries[d], spelling));
+  const confirmed = confirmMemberAliases(steps, entries, possible.rows, names);
   if (!confirmed?.hasAlias) return;
   const { rows } = confirmed;
   const seen = Array.from({ length: steps.length + 1 }, () => new Set());
@@ -275,14 +296,18 @@ function* walkMemberSpellings(steps, dir, names) {
 }
 
 export function cargoMemberMatcher(pattern, names) {
-  const exact = compileCargoGlob(pattern);
+  // Cargo's directory walk emits descendants for a terminal **. Even the
+  // shortest such walk must consume one nonempty directory name.
+  const directoriesOnly = pattern === '**' || pattern.endsWith('/**');
+  const member = directoriesOnly ? pattern + '/?*' : pattern;
+  const exact = compileCargoGlob(member);
   if (!exact) return null;
-  const parts = globParts(pattern);
+  const parts = globParts(member);
   const steps = memberSteps(parts);
   const recursive = parts.indexOf('**');
   if (recursive !== parts.lastIndexOf('**')) {
     const spellings = dir => walkMemberSpellings(steps, dir, names);
-    return Object.assign(dir => spellings(dir).next().value ?? null, { spellings });
+    return Object.assign(dir => spellings(dir).next().value ?? null, { spellings, directoriesOnly });
   }
   const match = dir => {
     if (exact.test(dir)) return dir;
@@ -292,5 +317,5 @@ export function cargoMemberMatcher(pattern, names) {
     const result = match(dir);
     if (result !== null) yield result;
   }
-  return Object.assign(match, { spellings });
+  return Object.assign(match, { spellings, directoriesOnly });
 }
