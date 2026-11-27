@@ -231,6 +231,76 @@ test('a terminal Cargo globstar needs a directory entry even when ordinary files
   assert.deepEqual(ordinary.unsupported, []);
 });
 
+test('Cargo expands dot entries only at a directory that the member pattern actually reached', () => {
+  const packages = {
+    'vault/slots': 'slots',
+    'vault/slots/.plugin': 'bridge',
+    'vault/slots/.plugin/driver': 'driver',
+    'vault/reader': 'reader',
+  };
+  const resolve = pattern =>
+    resolveCargoWorkspace({
+      manifests: {
+        'Cargo.toml': { workspace: { members: [pattern] } },
+        ...Object.fromEntries(
+          Object.entries(packages).map(([dir, name]) => [dir + '/Cargo.toml', { package: { name } }]),
+        ),
+      },
+    });
+  for (const [pattern, members] of [
+    ['vault/slots/.*/**', ['bridge', 'driver', 'reader', 'slots']],
+    ['vault/slots/[.]*/**', ['driver']],
+    ['vault/slots/.p*/**', ['driver']],
+    ['vault/**/.*/driver', ['driver']],
+    ['vault/*/./.plugin', ['bridge']],
+  ]) {
+    const result = resolve(pattern);
+    assert.deepEqual(result.members.map(pkg => pkg.name).sort(), members, pattern);
+    assert.deepEqual(result.unsupported, [], pattern);
+  }
+  const invalid = resolve('vault/**/./.plugin/driver');
+  assert.deepEqual(invalid.members, []);
+  assert.deepEqual(
+    invalid.unsupported.map(row => row.reason),
+    ['member-glob-no-match'],
+  );
+});
+
+test('Cargo parent matches need a directory witness and normalize before exclusion', () => {
+  const packages = { 'vault/yes/Bridge': 'included', 'vault/no/Bridge': 'file', 'vault/absent/Bridge': 'absent' };
+  const manifests = Object.fromEntries(
+    Object.entries(packages).map(([dir, name]) => [dir + '/Cargo.toml', { package: { name } }]),
+  );
+  for (const exclude of [[], ['vault/yes/Bridge']]) {
+    const result = resolveCargoWorkspace({
+      manifests: { 'Cargo.toml': { workspace: { members: ['vault/*/slots/.[.]/Bridge'], exclude } }, ...manifests },
+      files: [...Object.keys(manifests), 'vault/yes/slots/marker', 'vault/no/slots'],
+    });
+    assert.deepEqual(
+      result.members.map(pkg => pkg.name),
+      exclude.length ? [] : ['included'],
+    );
+    assert.deepEqual(result.unsupported, []);
+  }
+});
+
+test('a descending Cargo character range contributes no characters to its class', () => {
+  for (const [pattern, accepted, rejected] of [
+    ['?[z-a0]pkg', ['𠮷0pkg'], ['𠮷zpkg', '𠮷apkg']],
+    ['[z-a0]]', ['0]'], ['z]', '0']],
+    ['[z-a0**]', ['0', '*'], ['z', 'a', '/']],
+    ['[[]-]', ['[-]'], ['[-', '-]']],
+    ['?[!z-a0]pkg', ['𠮷apkg', '𠮷zpkg'], ['𠮷0pkg', 'a/pkg']],
+    ['[🦀-🐈]x', [], ['🦀x', '🐈x']],
+    ['[!🦀-🐈]x', ['🦀x', '🐈x'], ['/x']],
+  ]) {
+    const re = compileCargoGlob(pattern);
+    assert.ok(re, pattern);
+    for (const input of accepted) assert.equal(re.test(input), true, input);
+    for (const input of rejected) assert.equal(re.test(input), false, input);
+  }
+});
+
 test('a single Cargo member lookup prefers the exact spelling across recursive walks', () => {
   const dir = 'extras/plugins/exporter/vendor/plugins/Exporter/Unit';
   const alternate = dir.replace('plugins/exporter', 'plugins/Exporter');

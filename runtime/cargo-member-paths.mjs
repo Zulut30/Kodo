@@ -11,28 +11,37 @@ const maySpell = (actual, requested) =>
   actual === requested ||
   (windows && actual.length === requested.length && cargoNameKey(actual) === cargoNameKey(requested));
 const join = (parent, name) => (parent ? parent + '/' + name : name);
+const parentDir = dir => dir.slice(0, Math.max(0, dir.lastIndexOf('/')));
 
 export class CargoDirectoryNames {
   paths = new Set();
   aliases = new Map();
   observations = new Map();
+  children = null;
 
   constructor(dirs, probeAlias = undefined) {
     this.probeAlias = probeAlias;
-    if (windows) for (const dir of dirs) this.add(dir);
+    for (const dir of dirs) this.add(dir);
   }
 
   add(dir) {
-    if (!windows) return;
     while (dir && !this.paths.has(dir)) {
       this.paths.add(dir);
+      this.children = null;
       const slash = dir.lastIndexOf('/');
       const parent = slash < 0 ? '' : dir.slice(0, slash);
       const name = dir.slice(slash + 1);
-      const key = join(parent, cargoNameKey(name));
-      this.aliases.set(key, this.aliases.has(key) ? null : name);
+      if (windows) {
+        const key = join(parent, cargoNameKey(name));
+        this.aliases.set(key, this.aliases.has(key) ? null : name);
+      }
       dir = parent;
     }
+  }
+
+  childDirs(parent) {
+    this.children ??= Map.groupBy(this.paths, parentDir);
+    return this.children.get(parent) ?? [];
   }
 
   matches(parent, actual, requested) {
@@ -74,48 +83,39 @@ function escapeRegexChar(ch) {
   return ch.replace(/[.+^${}()|[\]\\]/g, '\\$&');
 }
 
+// The glob crate reads a-b as one range of Unicode scalar values. A
+// descending range matches nothing, including when it is one arm of a class.
+function cargoClass(text, negated) {
+  const chars = Array.from(text);
+  const escaped = code => '\\u{' + code.toString(16) + '}';
+  let members = '';
+  for (let i = 0; i < chars.length; i++) {
+    const start = chars[i].codePointAt(0);
+    if (chars[i + 1] === '-' && i + 2 < chars.length) {
+      const end = chars[i + 2].codePointAt(0);
+      if (start <= end) members += escaped(start) + '-' + escaped(end);
+      i += 2;
+    } else members += escaped(start);
+  }
+  return '(?!/)[' + (negated ? '^' : '') + members + ']';
+}
+
 function compileGlobSegment(segment) {
   let regex = '';
   for (let i = 0; i < segment.length; i++) {
     const ch = segment[i];
     if (ch === '*') {
+      if (segment[i + 1] === '*') return null;
       regex += '[^/]*';
     } else if (ch === '?') {
       regex += '[^/]';
     } else if (ch === '[') {
-      let j = i + 1;
-      if (j >= segment.length) return null;
-      let cls = '[';
-      if (segment[j] === '!') {
-        cls += '^';
-        j++;
-      } else if (segment[j] === '^') {
-        cls += '\\^';
-        j++;
-      }
-      if (j < segment.length && segment[j] === ']') {
-        cls += '\\]';
-        j++;
-      }
-      let closed = false;
-      while (j < segment.length) {
-        const inner = segment[j];
-        if (inner === ']') {
-          closed = true;
-          break;
-        }
-        if (inner === '\\') cls += '\\\\';
-        else if (inner === '[') cls += '\\[';
-        else cls += inner;
-        j++;
-      }
-      if (!closed) return null;
-      cls += ']';
-      // A negated class or a range such as [.-0] can include the separator.
-      regex += '(?!/)' + cls;
-      i = j;
-    } else if (ch === ']') {
-      return null;
+      const negated = segment[i + 1] === '!';
+      const first = i + (negated ? 2 : 1);
+      const end = segment.indexOf(']', first + 1);
+      if (end < 0) return null;
+      regex += cargoClass(segment.slice(first, end), negated);
+      i = end;
     } else {
       regex += escapeRegexChar(ch);
     }
@@ -149,7 +149,6 @@ export function compileCargoGlob(pattern) {
       }
       continue;
     }
-    if (part.includes('**')) return null;
     const compiled = compileGlobSegment(part);
     if (compiled === null) return null;
     if (i > 0) {
@@ -295,6 +294,84 @@ function* walkMemberSpellings(steps, dir, names) {
   }
 }
 
+// The glob crate offers . and .. when a directory listing has a pattern
+// beginning with a literal dot. A globstar's own iterator yields real entries.
+function memberNavigation(parts, steps) {
+  return parts.map((part, i) => {
+    if (!part.startsWith('.') || parts[i - 1] === '**') return null;
+    const self = steps[i]('.') !== null;
+    const up = steps[i]('..') !== null;
+    return self || up ? { self, up } : null;
+  });
+}
+
+function parentSearchRoot(parts, navigation) {
+  if (!navigation.some(step => step?.up)) return null;
+  const prefix = parts.findIndex(hasCargoGlob);
+  let lowest = prefix;
+  let depth = prefix;
+  for (let i = prefix; i < parts.length; i++) {
+    if (navigation[i]?.up) depth = Math.max(0, depth - 1);
+    else if (parts[i] !== '**' && !navigation[i]?.self) depth++;
+    lowest = Math.min(lowest, depth);
+  }
+  return parts.slice(0, lowest).join('/');
+}
+
+// Work backwards from the requested path. A parent step needs a real
+// child directory where the preceding pattern could have arrived. Keep
+// each normalized spelling for Cargo's subsequent exclusion comparison.
+function navigationMatcher(parts, steps, navigation, names, directoriesOnly) {
+  let generation = -1;
+  const cache = steps.map(() => new Map());
+  function prefixes(pos, dir, directory) {
+    if (!pos) return dir ? [] : [''];
+    const stored = directory && (!dir || names.paths.has(dir)) ? cache[pos - 1] : null;
+    if (stored?.has(dir)) return stored.get(dir);
+    const result = new Set();
+    const step = steps[pos - 1];
+    if (step === null) {
+      // A globstar consumes real entries with their snapshot spelling.
+      for (let ancestor = dir; ; ancestor = parentDir(ancestor)) {
+        for (const prior of prefixes(pos - 1, ancestor, true))
+          result.add(ancestor === dir ? prior : join(prior, dir.slice(ancestor ? ancestor.length + 1 : 0)));
+        if (!ancestor) break;
+      }
+    } else {
+      const parent = parentDir(dir);
+      const entry = dir.slice(dir.lastIndexOf('/') + 1);
+      const emitted = dir ? step(entry) : null;
+      if (emitted !== null) {
+        const prior = prefixes(pos - 1, parent, true);
+        if (prior.length && names.matches(parent, entry, emitted))
+          for (const spelling of prior) result.add(join(spelling, emitted));
+      }
+      if (directory && navigation[pos - 1]?.self)
+        for (const spelling of prefixes(pos - 1, dir, true)) result.add(spelling);
+      if (directory && navigation[pos - 1]?.up)
+        for (const child of names.childDirs(dir))
+          for (const spelling of prefixes(pos - 1, child, true)) result.add(parentDir(spelling));
+    }
+    const spellings = [...result];
+    stored?.set(dir, spellings);
+    return spellings;
+  }
+  function* spellings(dir, directory = true) {
+    if (generation !== names.paths.size) {
+      for (const row of cache) row.clear();
+      generation = names.paths.size;
+    }
+    const matches = prefixes(steps.length, dir, directory);
+    if (matches.includes(dir)) yield dir;
+    for (const match of matches) if (match !== dir) yield match;
+  }
+  return Object.assign((dir, directory = true) => spellings(dir, directory).next().value ?? null, {
+    directoriesOnly,
+    parentSearchRoot: parentSearchRoot(parts, navigation),
+    spellings,
+  });
+}
+
 export function cargoMemberMatcher(pattern, names) {
   // Cargo's directory walk emits descendants for a terminal **. Even the
   // shortest such walk must consume one nonempty directory name.
@@ -304,6 +381,10 @@ export function cargoMemberMatcher(pattern, names) {
   if (!exact) return null;
   const parts = globParts(member);
   const steps = memberSteps(parts);
+  if (parts.some(part => part.startsWith('.'))) {
+    const navigation = memberNavigation(parts, steps);
+    if (navigation.some(Boolean)) return navigationMatcher(parts, steps, navigation, names, directoriesOnly);
+  }
   const recursive = parts.indexOf('**');
   if (recursive !== parts.lastIndexOf('**')) {
     const spellings = dir => walkMemberSpellings(steps, dir, names);

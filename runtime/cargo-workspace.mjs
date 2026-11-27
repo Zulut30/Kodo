@@ -323,14 +323,15 @@ export function resolveManifestDir(fromDir, rawPath) {
   return resolveRelativeDir(fromDir, nativeManifestPath(rawPath));
 }
 
-export function normalizeWorkspacePath(raw, { allowGlob = false } = {}) {
+export function normalizeWorkspacePath(raw, { allowGlob = false, preserveMemberDots = false } = {}) {
   if (typeof raw !== 'string') return null;
   const trimmed = nativeManifestPath(raw).trim();
   if (!trimmed || trimmed.length > 1024 || /[\\:\x00-\x1f\x7f]/.test(trimmed) || trimmed.startsWith('/')) return null;
   if (!allowGlob && hasCargoGlob(trimmed)) return null;
   const parts = trimmed.split('/');
   if (parts.includes('..')) return null;
-  return parts.filter(part => part && part !== '.').join('/');
+  const firstGlob = preserveMemberDots ? parts.findIndex(hasCargoGlob) : -1;
+  return parts.filter((part, i) => part && (part !== '.' || (firstGlob >= 0 && i > firstGlob))).join('/');
 }
 
 export function parseWorkspaceDependencies(rawDeps) {
@@ -417,7 +418,7 @@ export function workspaceMemberPattern(root, raw) {
   const end = parts.lastIndexOf('..') + 1;
   const base = end ? resolveRelativeDir(root, parts.slice(0, end).join('/')) : root;
   const suffix = end ? parts.slice(end).filter(Boolean).join('/') || '.' : raw;
-  const pattern = normalizeWorkspacePath(suffix, { allowGlob: true });
+  const pattern = normalizeWorkspacePath(suffix, { allowGlob: true, preserveMemberDots: true });
   return base === null || pattern === null ? null : joinRel(base, pattern);
 }
 
@@ -591,7 +592,8 @@ function collectDeclaredMembers({
       unknown('workspace', rootManifest, 'unsupported-member-glob');
       continue;
     }
-    let matched = false;
+    // A dot entry can select the root itself, whose package is handled below.
+    let matched = 'parentSearchRoot' in match && match(rootDir) !== null;
     for (const dir of snapshotDirs) {
       if (dir === rootDir || relativeToRoot(rootDir, dir) === null) continue;
       for (const chosen of match.spellings(dir)) {
@@ -611,7 +613,7 @@ function collectDeclaredMembers({
     if (
       !matched &&
       (match.directoriesOnly ||
-        ![...snapshotFiles].some(file => relativeToRoot(rootDir, file) !== null && match(file) !== null))
+        ![...snapshotFiles].some(file => relativeToRoot(rootDir, file) !== null && match(file, false) !== null))
     )
       unknown('workspace', rootManifest, 'member-glob-no-match');
   }

@@ -96,6 +96,41 @@ test('Wave 0 follows Cargo member spellings and exclusions in draft and registra
   }
 });
 
+test('Wave 0 reads directory witnesses for a Cargo parent step from the selected tree', async t => {
+  const f = await fixture(t, workspace([...mainMembers.slice(1), 'vault/*/slots/.[.]/Bridge']));
+  await f.write(
+    'vault/site/Bridge/Cargo.toml',
+    manifest('bridge') + '[dependencies]\nwire-contracts={path="../../../native/codec"}\n',
+  );
+  await f.write('vault/site/Bridge/src/lib.rs', '');
+  await f.write('vault/site/slots', 'regular file');
+  f.commit();
+  const paths = mainMembers.map(dir => dir + '/src/lib.rs');
+  assert.deepEqual(await f.compile(paths, { forRegistration: true }), []);
+  await rename(path.join(f.root, 'vault/site/slots'), path.join(f.root, 'vault/site/old'));
+  await f.write('vault/site/slots/marker', '');
+  f.git('add', 'vault/site');
+  assert.deepEqual(await f.compile(paths), threshold);
+  assert.deepEqual(await f.compile(paths, { forRegistration: true }), []);
+  f.commit();
+  assert.deepEqual(await f.compile(paths, { forRegistration: true }), threshold);
+});
+
+test('a literal Cargo member does not require listing a separate dot glob subtree', async t => {
+  const f = await fixture(t, workspace([...mainMembers, 'vault/*/pivot/.?/Bridge']));
+  await f.write('vault/site/pivot/marker', '');
+  await f.write('vault/site/Bridge/Cargo.toml', manifest('bridge'));
+  await f.write('vault/site/Bridge/src/lib.rs', '');
+  f.commit();
+  const spawn = t.mock.method(ChildProcess.prototype, 'spawn');
+  const codes = await f.compile(['native/client/src/lib.rs'], { forRegistration: true });
+  const enumerations = spawn.mock.calls
+    .map(call => call.arguments[0].args)
+    .filter(args => args.includes('ls-tree') && args.includes('-r') && args.includes('vault'));
+  assert.deepEqual(codes, []);
+  assert.deepEqual(enumerations, []);
+});
+
 test('Wave 0 counts packages selected by a Unicode wildcard or another recursive walk', async t => {
   const roots = mainMembers.slice(1);
   const scalar = 'extras/📦/Exporter';

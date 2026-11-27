@@ -451,7 +451,7 @@ function cargoSearchLeads(scopes) {
 // A draft may predate Git or include ignored manifests. Walk only the literal
 // leads of the plan and their subtrees. Record names and types without following
 // links or opening a manifest before its ownership is known.
-async function draftCargoTree(root, scopes) {
+async function draftCargoTree(root, scopes, directoryNames = undefined) {
   const manifests = new Map(),
     sources = [],
     entryKinds = new Map();
@@ -474,7 +474,10 @@ async function draftCargoTree(root, scopes) {
         manifests.set(dir || '.', '');
       } else if (entry.isDirectory()) {
         const below = subtree || leads.has(file);
-        if (below || ancestors.has(file)) await visit(file, below);
+        if (below || ancestors.has(file)) {
+          directoryNames?.add(file);
+          await visit(file, below);
+        }
       } else if (entry.isFile() && file.endsWith('.rs')) sources.push(file);
     }
   }
@@ -501,7 +504,7 @@ function unresolvedTreeParents(files, entryKinds) {
 
 // Git returns paths relative to the blueprint root. Keep scope matching outside
 // the stdout callback so repository size cannot turn a match into a Git timeout.
-async function committedCargoTree(root, revision, scopes, includePlanned = true) {
+async function committedCargoTree(root, revision, scopes, includePlanned = true, directoryNames = undefined) {
   const options = {
     cwd: root,
     env: { ...workerEnvironment(), LC_ALL: 'C', GIT_NO_LAZY_FETCH: '1' },
@@ -520,6 +523,7 @@ async function committedCargoTree(root, revision, scopes, includePlanned = true)
     for (const row of rows) {
       const split = row.indexOf('\t');
       const name = row.slice(split + 1);
+      if (directoryNames && row.startsWith('040000 tree ')) directoryNames.add(name);
       // Only exact names and ancestors from the plan need their Git type.
       if (named.has(name)) entryKinds.set(name, row.startsWith('040000 tree ') ? 'tree' : 'leaf');
       const regular = row.startsWith('100644 blob ') || row.startsWith('100755 blob ');
@@ -547,10 +551,10 @@ async function committedCargoTree(root, revision, scopes, includePlanned = true)
   return { manifests, sources, entryKinds };
 }
 
-export async function readBlueprintCargoTree(root, scopes, revision) {
-  if (!revision) return draftCargoTree(root, scopes);
+export async function readBlueprintCargoTree(root, scopes, revision, directoryNames = undefined) {
+  if (!revision) return draftCargoTree(root, scopes, directoryNames);
   try {
-    return await committedCargoTree(root, revision, scopes);
+    return await committedCargoTree(root, revision, scopes, true, directoryNames);
   } catch {
     throw cargoEvidenceFailure();
   }
