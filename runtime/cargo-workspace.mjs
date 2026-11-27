@@ -30,7 +30,8 @@ const MAX_SCOPE_BRACE_EXPANSIONS = 64;
 /**
  * Expand brace alternation expressions `{a,b}` (including nested braces and
  * alternatives containing `/`) into full normalized scope strings.
- * Returns `null` if braces are unbalanced or expansion exceeds `maxBranches`.
+ * Returns `null` if braces are unbalanced or the number of distinct
+ * normalized scopes exceeds `maxBranches`.
  * @param {string} rawScope
  * @param {number} [maxBranches]
  * @returns {string[] | null}
@@ -44,18 +45,23 @@ export function expandScopeBraces(rawScope, maxBranches = MAX_SCOPE_BRACE_EXPANS
 export function expandScopeAlternatives(rawScope, maxBranches = MAX_SCOPE_BRACE_EXPANSIONS, extglobs = true) {
   const scope = normalizeScopePath(rawScope);
   if (!scope) return [];
-  const expansions = new Map();
+  const visited = new Set();
+  const expanded = new Set();
   const expandOne = (pattern, offset = 0) => {
     const mixed = extglobs && braceBeforeExtglob(pattern, offset);
-    if (mixed) return expandParts(pattern, mixed.start, mixed.end, mixed.arms, true);
+    if (mixed) return expandParts(pattern, mixed.start, mixed.end, mixed.arms);
     const group = extglobs ? /\[[^\]]*\]|@\(|[{}]/g : /[{}]/g;
     group.lastIndex = offset;
     let match;
     do {
       match = group.exec(pattern);
     } while (match?.[0].startsWith('['));
-    if (!match) return [pattern];
-    if (match[0] === '}') return null;
+    if (!match) {
+      const value = normalizeScopePath(pattern);
+      if (value) expanded.add(value);
+      return expanded.size <= maxBranches;
+    }
+    if (match[0] === '}') return false;
     const brace = match[0] === '{';
     const closers = [brace ? '}' : ')'];
     let close = -1;
@@ -80,36 +86,24 @@ export function expandScopeAlternatives(rawScope, maxBranches = MAX_SCOPE_BRACE_
         start = i + 1;
       }
     }
-    if (close === -1) return null;
+    if (close === -1) return false;
     // A range and a single braced word have no alternatives to split.
     // Node distinguishes e.g. {a..c} and the literal filename {codec}.
     if (!extglobs && brace && parts.length === 1) return expandOne(pattern, close + 1);
     return expandParts(pattern, match.index, close, parts);
   };
-  function expandParts(pattern, start, close, parts, distributed = false) {
+  function expandParts(pattern, start, close, parts) {
     const prefix = pattern.slice(0, start);
     const suffix = pattern.slice(close + 1);
-    const out = [];
-    // In @(shared|{a,b}), brace expansion produces the same "shared" arm
-    // twice. Count and expand that alternative once against the branch budget.
-    const seen = distributed ? new Set() : null;
     for (const part of parts) {
       const next = prefix + part + suffix;
-      if (!expansions.has(next)) expansions.set(next, expandOne(next));
-      const nested = expansions.get(next);
-      if (nested === null) return null;
-      for (const item of nested) {
-        if (seen?.has(item)) continue;
-        seen?.add(item);
-        out.push(item);
-        if (out.length > maxBranches) return null;
-      }
+      if (visited.has(next)) continue;
+      visited.add(next);
+      if (!expandOne(next)) return false;
     }
-    return out;
+    return true;
   }
-  const expanded = expandOne(scope);
-  if (expanded === null) return null;
-  return [...new Set(expanded.map(normalizeScopePath).filter(Boolean))];
+  return expandOne(scope) ? [...expanded] : null;
 }
 
 // Enumerate alternatives written out in a blueprint, even in a long flat list.

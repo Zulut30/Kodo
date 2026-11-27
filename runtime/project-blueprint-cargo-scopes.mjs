@@ -24,6 +24,19 @@ function classEnd(text, start) {
   return -1;
 }
 
+// Plain filename fragments leave extglob arms intact, so the matcher can
+// discard a sibling before expanding its suffixes. Inside a character class
+// even an empty fragment can turn the first closing bracket into a literal.
+function canDeferLiteralList(pattern, index, arms) {
+  if (!arms.every(arm => /^[\p{L}\p{N}._-]*$/u.test(arm))) return false;
+  for (let open = pattern.indexOf('['); open !== -1 && open < index;) {
+    const close = classEnd(pattern, open);
+    if (close < 0 || index < close) return false;
+    open = pattern.indexOf('[', close + 1);
+  }
+  return true;
+}
+
 // Locate an entire group before inspecting its alternatives. A component-local
 // extglob always goes to matchesGlob intact, including under +(), *() and !().
 function groupAt(text, start) {
@@ -53,7 +66,7 @@ function terminalSelector(pattern, includeDirectoryChoices) {
   const start = terminalPathStart(pattern);
   const name = pattern.slice(start);
   const from = includeDirectoryChoices ? 0 : start;
-  const brace = braceBeforeExtglob(pattern, from);
+  const brace = braceBeforeExtglob(pattern, from, canDeferLiteralList);
   if (brace) return { name, choice: brace, unbounded: false };
   let choice = null;
   let unbounded = false;

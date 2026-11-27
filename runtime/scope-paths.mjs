@@ -23,13 +23,16 @@ export function scopeBraceGroup(pattern, start) {
   return null;
 }
 
-// Expand one brace list before interpreting extglobs. Its alternatives can
-// change where an operator or class ends. Callers retain their branch limits.
-export function braceBeforeExtglob(pattern, start) {
+/** Find a brace list to expand before interpreting extglob delimiters.
+ * @param {string} pattern
+ * @param {number} start
+ * @param {(pattern: string, start: number, arms: string[]) => boolean} [canDefer]
+ */
+export function braceBeforeExtglob(pattern, start, canDefer) {
   if (!pattern.includes('(', start)) return null;
   for (let i = pattern.indexOf('{', start); i !== -1; i = pattern.indexOf('{', i + 1)) {
     const group = scopeBraceGroup(pattern, i);
-    if (group && group.arms.length > 1) return { ...group, start: i };
+    if (group && group.arms.length > 1 && !canDefer?.(pattern, i, group.arms)) return { ...group, start: i };
   }
   return null;
 }

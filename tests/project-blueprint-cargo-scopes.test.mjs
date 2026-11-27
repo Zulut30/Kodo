@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import test from 'node:test';
+import { expandScopeAlternatives } from '../runtime/cargo-workspace.mjs';
 import {
   plannedPackageDirs,
   scopedDirectoryMatcher,
   selectedManifestRoots,
+  selectsCargoManifest,
 } from '../runtime/project-blueprint-cargo-scopes.mjs';
 import { ownsPath } from '../runtime/scope-paths.mjs';
 
@@ -12,6 +14,43 @@ function candidates(scopes, dirs) {
   const manifests = new Map(dirs.map((dir, i) => [dir, String(i + 1).padStart(40, '0')]));
   return plannedPackageDirs(new Set(scopes), manifests);
 }
+
+test('overlapping Cargo directory choices consume one budget entry per distinct path', () => {
+  const prefix = 'crates/host/plugins/';
+  const platforms = ['', '-win', '-linux', '-mac', '-web', '-ios', '-android'];
+  const names = ['exporter', 'exporter-cli', 'reader', 'reader-cli', 'writer-cli', 'writer'];
+  const directories = new Set(
+    names.flatMap(name => ['', '-cli'].flatMap(suffix => platforms.map(platform => prefix + name + suffix + platform))),
+  );
+  const pattern =
+    prefix + '@(exporter|{exporter-cli|reader|reader-cli|writer-cli,writer})@(|-cli)@(' + platforms.join('|') + ')';
+  assert.equal(directories.size, 63);
+  assert.equal(expandScopeAlternatives(pattern, 62), null);
+  for (const limit of [63, 64]) assert.deepEqual(new Set(expandScopeAlternatives(pattern, limit)), directories);
+  assert.deepEqual(new Set(selectedManifestRoots(pattern + '/Cargo.toml')), directories);
+  assert.deepEqual(expandScopeAlternatives('{lib,./lib,lib/}', 1), ['lib']);
+});
+
+test('choosing a manifest avoids multiplying literal suffix choices in a sibling filename', t => {
+  const matcher = t.mock.method(path.posix, 'matchesGlob');
+  const manifest = 'plugins/exporter/Cargo.toml';
+  const options = { concreteDirectory: true, finiteName: true };
+  function count(name, sibling, reverse) {
+    const choices = reverse ? [sibling, name] : [name, sibling];
+    const before = matcher.mock.callCount();
+    assert.equal(
+      selectsCargoManifest('plugins/exporter/@(' + choices.join('|') + ')', manifest, options),
+      name === 'Cargo.toml',
+    );
+    return matcher.mock.callCount() - before;
+  }
+  const suffixes = ['win', 'x64', 'debug', 'en', 'signed', 'bundle', 'local', 'ci']
+    .map(tag => '{,-' + tag + '}')
+    .join('');
+  for (const name of ['Cargo.toml', 'Cargo.tom*'])
+    for (const reverse of [false, true])
+      assert.equal(count(name, 'release' + suffixes + '.md', reverse), count(name, 'release.md', reverse));
+});
 
 test('directory and filename choices discover the same manifest roots after brace expansion', () => {
   const parent = 'crates/host/plugins/';
@@ -35,6 +74,15 @@ test('directory and filename choices discover the same manifest roots after brac
   const members = Array.from({ length: 33 }, (_, index) => 'member' + index);
   const grouped = parent + '@(shared|{' + members.join(',') + '})/Cargo.toml';
   assert.deepEqual(new Set(selectedManifestRoots(grouped)), new Set(['shared', ...members].map(name => parent + name)));
+});
+
+test('an empty brace alternative inside a class can change the closing bracket', () => {
+  const root = 'plugins/exporter';
+  const manifest = root + '/Cargo.toml';
+  const pattern = root + '/Cargo.tom@([{x,}]*|l])';
+  const options = { concreteDirectory: true, finiteName: true };
+  assert.ok(ownsPath([pattern], manifest));
+  assert.equal(selectsCargoManifest(pattern, manifest, options), true);
 });
 
 test('checking a member directory costs the same with optional filename suffixes', t => {
